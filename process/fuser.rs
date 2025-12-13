@@ -324,7 +324,11 @@ mod linux {
         }
     }
 
-    pub fn get_matched_procs(file: Vec<PathBuf>, mount: bool) -> Result<Vec<Names>, io::Error> {
+    pub fn get_matched_procs(
+        file: Vec<PathBuf>,
+        mount: bool,
+        named_files: bool,
+    ) -> Result<Vec<Names>, io::Error> {
         let (
             mut names,
             mut unix_socket_list,
@@ -343,6 +347,7 @@ mod linux {
                 NameSpace::File => handle_file_namespace(
                     name,
                     mount,
+                    named_files,
                     &mut mount_list,
                     &mut inode_list,
                     &mut device_list,
@@ -1087,7 +1092,8 @@ mod linux {
     /// # Arguments
     ///
     /// * `names` - A mutable reference to a `Names` object containing the file path.
-    /// * `mount` - A boolean indicating whether to handle mount information or not.
+    /// * `mount` - A boolean indicating whether to handle mount information or not (-c flag).
+    /// * `named_files` - A boolean indicating report only for named files (-f flag).
     /// * `mount_list` - A mutable reference to a `MountList` for reading mount points.
     /// * `inode_list` - A mutable reference to an `InodeList` for updating inode information.
     /// * `device_list` - A mutable reference to a `DeviceList` for updating device information.
@@ -1102,6 +1108,7 @@ mod linux {
     fn handle_file_namespace(
         names: &mut Names,
         mount: bool,
+        named_files: bool,
         mount_list: &mut MountList,
         inode_list: &mut InodeList,
         device_list: &mut DeviceList,
@@ -1112,7 +1119,14 @@ mod linux {
         let st = timeout(&names.filename.to_string_lossy(), 5)?;
         read_proc_mounts(mount_list)?;
 
-        if mount {
+        // POSIX: For block special devices, all processes using any file on
+        // that device are listed (unless -f is specified).
+        // -c (mount): Treat file as mount point, report on any files in filesystem.
+        // -f (named_files): Report only for the named files.
+        let is_block_device = (st.mode() & libc::S_IFMT) == libc::S_IFBLK;
+        let use_device_mode = mount || (is_block_device && !named_files);
+
+        if use_device_mode {
             *device_list = DeviceList::new(names.clone(), st.dev());
             *need_check_map = true;
         } else {
@@ -1302,6 +1316,7 @@ mod macos {
     pub fn get_matched_procs(
         file: Vec<PathBuf>,
         mount: bool,
+        named_files: bool,
     ) -> Result<Vec<Names>, Box<dyn std::error::Error>> {
         let mut names: Vec<Names> = file
             .iter()
@@ -1312,10 +1327,17 @@ mod macos {
             let st = timeout(&name.filename.to_string_lossy(), 5)?;
             let uid = st.uid();
 
+            // POSIX: For block special devices, all processes using any file on
+            // that device are listed (unless -f is specified).
+            // -c (mount): Treat file as mount point, report on any files in filesystem.
+            // -f (named_files): Report only for the named files.
+            let is_block_device = (st.mode() & libc::S_IFMT) == libc::S_IFBLK;
+            let is_volume = mount || (is_block_device && !named_files);
+
             let pids = listpidspath(
                 osx_libproc_bindings::PROC_ALL_PIDS,
                 Path::new(&name.filename),
-                mount,
+                is_volume,
                 false,
             )?;
 
@@ -1416,17 +1438,19 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
 
         eprint!("{}", access);
         if user {
-            let owner = unsafe {
+            let owner_str: String = unsafe {
                 let pw_entry = libc::getpwuid(uid);
                 if pw_entry.is_null() {
-                    "unknownr"
+                    // POSIX: if user name cannot be resolved, print the real user ID
+                    uid.to_string()
                 } else {
                     CStr::from_ptr((*pw_entry).pw_name)
                         .to_str()
-                        .unwrap_or("invalid_string")
+                        .unwrap_or(&uid.to_string())
+                        .to_string()
                 }
             };
-            eprint!("({})", owner);
+            eprint!("({})", owner_str);
         }
         io::stderr().flush()?;
     }
@@ -1480,7 +1504,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let Args {
-        mount, user, file, ..
+        mount,
+        named_files,
+        user,
+        file,
     } = Args::try_parse().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
             print!("{err}");
@@ -1496,10 +1523,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     #[cfg(target_os = "linux")]
-    let mut names = linux::get_matched_procs(file, mount)?;
+    let mut names = linux::get_matched_procs(file, mount, named_files)?;
 
     #[cfg(target_os = "macos")]
-    let mut names = macos::get_matched_procs(file, mount)?;
+    let mut names = macos::get_matched_procs(file, mount, named_files)?;
 
     for name in names.iter_mut() {
         print_matches(name, user)?;

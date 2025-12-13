@@ -163,22 +163,29 @@ fn get_current_date() -> String {
     let mut tm = MaybeUninit::<libc::tm>::uninit();
 
     unsafe {
-        libc::localtime_r(&now, tm.as_mut_ptr());
-        let tm = tm.assume_init();
-        let format = std::ffi::CString::new("%a %b %e %H:%M:%S %Z %Y").unwrap();
-        let len = libc::strftime(
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            format.as_ptr(),
-            &tm,
-        );
-        if len > 0 {
-            String::from_utf8_lossy(&buf[..len]).to_string()
-        } else {
-            // Fallback to chrono if strftime fails
+        let tm_ptr = libc::localtime_r(&now, tm.as_mut_ptr());
+        if tm_ptr.is_null() {
+            // Fallback to chrono if localtime_r fails
             chrono::Local::now()
                 .format("%a %b %e %H:%M:%S %z %Y")
                 .to_string()
+        } else {
+            let tm = tm.assume_init();
+            let format = std::ffi::CString::new("%a %b %e %H:%M:%S %Z %Y").unwrap();
+            let len = libc::strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                format.as_ptr(),
+                &tm,
+            );
+            if len > 0 {
+                String::from_utf8_lossy(&buf[..len]).to_string()
+            } else {
+                // Fallback to chrono if strftime fails
+                chrono::Local::now()
+                    .format("%a %b %e %H:%M:%S %z %Y")
+                    .to_string()
+            }
         }
     }
 }
@@ -289,6 +296,14 @@ fn read_proc_sem() -> io::Result<Vec<SemInfo>> {
 // macOS-specific IPC enumeration
 // ============================================================================
 
+/// Default value for kern.sysv.semmni on macOS (max semaphore identifiers)
+#[cfg(target_os = "macos")]
+const MACOS_DEFAULT_SEMMNI: i32 = 87381;
+
+/// Maximum number of IPC slots to check (caps iteration for performance)
+#[cfg(target_os = "macos")]
+const MAX_IPC_SLOTS_TO_CHECK: i32 = 256;
+
 /// Query a sysctl integer value by name
 #[cfg(target_os = "macos")]
 fn get_sysctl_int(name: &str) -> Option<i32> {
@@ -340,8 +355,8 @@ fn read_macos_shm() -> Vec<ShmInfo> {
 
     // kern.sysv.shmmni is the max number of shared memory identifiers (typically 32)
     let max_slots = get_sysctl_int("kern.sysv.shmmni").unwrap_or(32);
-    // Each slot can have multiple sequences; check first 256 sequences per slot
-    let seqs_per_slot = 256;
+    // Each slot can have multiple sequences
+    let seqs_per_slot = MAX_IPC_SLOTS_TO_CHECK;
 
     for shmid in iter_macos_ipc_ids(max_slots, seqs_per_slot) {
         if unsafe { shmctl(shmid, IPC_STAT, &mut shmbuf) } == 0 {
@@ -374,10 +389,12 @@ fn read_macos_sem() -> Vec<SemInfo> {
     let mut sembuf: semid_ds = unsafe { std::mem::zeroed() };
 
     // kern.sysv.semmni is the max number of semaphore identifiers
-    // On macOS this can be very high (87381), so we cap the slots we check
-    let max_slots = get_sysctl_int("kern.sysv.semmni").unwrap_or(87381).min(256);
-    // Each slot can have multiple sequences; check first 256 sequences per slot
-    let seqs_per_slot = 256;
+    // On macOS this can be very high, so we cap the slots we check
+    let max_slots = get_sysctl_int("kern.sysv.semmni")
+        .unwrap_or(MACOS_DEFAULT_SEMMNI)
+        .min(MAX_IPC_SLOTS_TO_CHECK);
+    // Each slot can have multiple sequences
+    let seqs_per_slot = MAX_IPC_SLOTS_TO_CHECK;
 
     for semid in iter_macos_ipc_ids(max_slots, seqs_per_slot) {
         if unsafe { semctl(semid, 0, IPC_STAT, &mut sembuf) } == 0 {

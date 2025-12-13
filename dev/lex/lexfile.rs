@@ -293,12 +293,138 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
     Err("unterminated regular expression".to_string())
 }
 
+/// Translate POSIX escape sequences to forms that regex_syntax understands
+///
+/// This handles several POSIX compliance issues:
+/// 1. Octal escapes (\NNN): regex_syntax interprets these as backreferences,
+///    so we convert them to hex escapes (\xNN)
+/// 2. Backspace (\b): regex_syntax interprets \b as word boundary,
+///    so we convert to \x08
+/// 3. Single-digit hex escapes (\xN): regex_syntax requires two digits,
+///    so we pad to \x0N
+fn translate_escape_sequences(input: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+
+            // Handle \b -> \x08 (backspace, not word boundary)
+            // In POSIX lex, \b means backspace (0x08), but regex_syntax
+            // interprets \b as word boundary assertion
+            if next == 'b' {
+                result.push_str("\\x08");
+                i += 2;
+                continue;
+            }
+
+            // Handle \xN -> \x0N (pad single hex digit)
+            // POSIX says \x followed by "the longest sequence of hexadecimal-digit
+            // characters", which can be just one digit. regex_syntax requires two.
+            if next == 'x' && i + 2 < chars.len() {
+                let hex_start = i + 2;
+                let mut hex_digits = String::new();
+                let mut j = hex_start;
+
+                // Collect hex digits
+                while j < chars.len() && chars[j].is_ascii_hexdigit() {
+                    hex_digits.push(chars[j]);
+                    j += 1;
+                }
+
+                if hex_digits.len() == 1 {
+                    // Single hex digit - pad with leading zero
+                    result.push_str(&format!("\\x0{}", hex_digits));
+                    i = j;
+                    continue;
+                } else if hex_digits.len() >= 2 {
+                    // Two or more hex digits - take first two, leave rest as literal
+                    result.push_str(&format!("\\x{}", &hex_digits[..2]));
+                    // Any digits beyond the first two become literal characters
+                    result.push_str(&hex_digits[2..]);
+                    i = j;
+                    continue;
+                }
+                // No hex digits after \x - leave as-is (will error in regex_syntax)
+            }
+
+            // Handle octal escapes (\NNN) -> \xNN
+            // Check if this is an octal escape (digit 0-7)
+            if next.is_ascii_digit() && next < '8' {
+                // Consume up to 3 octal digits
+                let mut octal_str = String::new();
+                let mut j = i + 1;
+                while j < chars.len() && octal_str.len() < 3 {
+                    let c = chars[j];
+                    if c.is_ascii_digit() && c < '8' {
+                        octal_str.push(c);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Convert octal to byte value
+                if let Ok(byte_val) = u8::from_str_radix(&octal_str, 8) {
+                    // Output as hex escape \xNN
+                    result.push_str(&format!("\\x{:02x}", byte_val));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Check if a string looks like an interval expression: {m}, {m,}, or {m,n}
+/// Returns true if it contains only digits and at most one comma
+fn is_interval_expression(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    let mut has_comma = false;
+    let mut has_digit_before_comma = false;
+    let mut chars = s.chars().peekable();
+
+    // Must start with a digit
+    if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    for ch in chars {
+        if ch.is_ascii_digit() {
+            if !has_comma {
+                has_digit_before_comma = true;
+            }
+        } else if ch == ',' {
+            if has_comma {
+                return false; // More than one comma
+            }
+            if !has_digit_before_comma {
+                return false; // No digit before comma
+            }
+            has_comma = true;
+        } else {
+            return false; // Invalid character
+        }
+    }
+
+    has_digit_before_comma
+}
+
 // translate lex-specific regex syntax to regex crate syntax
 fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
     let mut re = String::new();
     let mut in_quotes = false;
-    let mut in_sub = false;
-    let mut sub_name = String::new();
+    let mut in_brace = false;
+    let mut brace_content = String::new();
 
     for ch in ere.chars() {
         if in_quotes && ch == '"' {
@@ -311,27 +437,39 @@ fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
                 '{' => re.push_str(r"\x7b"),
                 _ => re.push(ch),
             }
-        } else if in_sub && ch == '}' {
-            match state.subs.get(&sub_name) {
-                Some(value) => re.push_str(value),
-                None => {
-                    return Err(state.error(&format!("undefined substitution: {{{}}}", sub_name)));
+        } else if in_brace && ch == '}' {
+            // Determine if this is an interval expression or a substitution
+            if is_interval_expression(&brace_content) {
+                // Interval expression: pass through as-is
+                re.push('{');
+                re.push_str(&brace_content);
+                re.push('}');
+            } else {
+                // Substitution reference
+                match state.subs.get(&brace_content) {
+                    Some(value) => re.push_str(value),
+                    None => {
+                        return Err(
+                            state.error(&format!("undefined substitution: {{{}}}", brace_content))
+                        );
+                    }
                 }
             }
-            in_sub = false;
-            sub_name.clear();
-        } else if in_sub {
-            sub_name.push(ch);
+            in_brace = false;
+            brace_content.clear();
+        } else if in_brace {
+            brace_content.push(ch);
         } else if ch == '"' {
             in_quotes = true;
         } else if ch == '{' {
-            in_sub = true;
+            in_brace = true;
         } else {
             re.push(ch);
         }
     }
 
-    Ok(re)
+    // Translate POSIX escape sequences to regex_syntax compatible format
+    Ok(translate_escape_sequences(&re))
 }
 
 /// Extract start conditions from a pattern like `<STATE>pattern` or `<STATE1,STATE2>pattern`
@@ -1074,5 +1212,186 @@ DIGIT    [0-9]
             "Error message should mention undefined substitution: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_octal_basic() {
+        // \101 = 65 decimal = 'A'
+        assert_eq!(translate_escape_sequences(r"\101"), r"\x41");
+        // \141 = 97 decimal = 'a'
+        assert_eq!(translate_escape_sequences(r"\141"), r"\x61");
+        // \0 = 0 = NUL
+        assert_eq!(translate_escape_sequences(r"\0"), r"\x00");
+        // \7 = 7 = BEL
+        assert_eq!(translate_escape_sequences(r"\7"), r"\x07");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_octal_two_digits() {
+        // \12 = 10 decimal = newline
+        assert_eq!(translate_escape_sequences(r"\12"), r"\x0a");
+        // \40 = 32 decimal = space
+        assert_eq!(translate_escape_sequences(r"\40"), r"\x20");
+        // \77 = 63 decimal = '?'
+        assert_eq!(translate_escape_sequences(r"\77"), r"\x3f");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_octal_three_digits() {
+        // \377 = 255 decimal = max byte value
+        assert_eq!(translate_escape_sequences(r"\377"), r"\xff");
+        // \000 = 0
+        assert_eq!(translate_escape_sequences(r"\000"), r"\x00");
+        // \177 = 127 decimal = DEL
+        assert_eq!(translate_escape_sequences(r"\177"), r"\x7f");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_octal_in_pattern() {
+        // Octal escape in the middle of a pattern
+        assert_eq!(translate_escape_sequences(r"a\101b"), r"a\x41b");
+        // Multiple octal escapes
+        assert_eq!(translate_escape_sequences(r"\101\102\103"), r"\x41\x42\x43");
+        // Mixed with other escapes (note: \b becomes \x08)
+        assert_eq!(translate_escape_sequences(r"\101\n\102"), r"\x41\n\x42");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_non_octal() {
+        // \8 and \9 are not valid octal - should be left alone
+        assert_eq!(translate_escape_sequences(r"\8"), r"\8");
+        assert_eq!(translate_escape_sequences(r"\9"), r"\9");
+        // \n, \t, etc. should be left alone
+        assert_eq!(translate_escape_sequences(r"\n"), r"\n");
+        assert_eq!(translate_escape_sequences(r"\t"), r"\t");
+        // \x with two hex digits - normalized format
+        assert_eq!(translate_escape_sequences(r"\x41"), r"\x41");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_octal_stops_at_three_digits() {
+        // \1234 should be \x53 (octal 123 = 83) followed by '4'
+        assert_eq!(translate_escape_sequences(r"\1234"), r"\x534");
+        // \0009 should be \x00 followed by '9'
+        assert_eq!(translate_escape_sequences(r"\0009"), r"\x009");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_octal_stops_at_non_octal() {
+        // \128 - octal 12 = 10, then '8' (not octal)
+        assert_eq!(translate_escape_sequences(r"\128"), r"\x0a8");
+        // \1a - octal 1 = 1, then 'a'
+        assert_eq!(translate_escape_sequences(r"\1a"), r"\x01a");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_backspace() {
+        // \b in POSIX lex means backspace (0x08), not word boundary
+        assert_eq!(translate_escape_sequences(r"\b"), r"\x08");
+        // \b in a pattern
+        assert_eq!(translate_escape_sequences(r"a\bc"), r"a\x08c");
+        // Multiple \b
+        assert_eq!(translate_escape_sequences(r"\b\b"), r"\x08\x08");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_hex_padding() {
+        // Single hex digit should be padded
+        assert_eq!(translate_escape_sequences(r"\x4"), r"\x04");
+        assert_eq!(translate_escape_sequences(r"\xa"), r"\x0a");
+        assert_eq!(translate_escape_sequences(r"\xF"), r"\x0F");
+        // Two hex digits - no change
+        assert_eq!(translate_escape_sequences(r"\x41"), r"\x41");
+        assert_eq!(translate_escape_sequences(r"\xff"), r"\xff");
+        // More than two hex digits - take first two, rest as literal
+        // \x412 -> \x41 (hex byte 0x41='A') + literal '2'
+        assert_eq!(translate_escape_sequences(r"\x412"), r"\x412");
+        // \xabc -> \xab (hex byte 0xAB) + literal 'c'
+        assert_eq!(translate_escape_sequences(r"\xabc"), r"\xabc");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_hex_in_pattern() {
+        // \x4b has two hex digits ('4' and 'b'), so no padding needed
+        assert_eq!(translate_escape_sequences(r"a\x4b"), r"a\x4b");
+        assert_eq!(translate_escape_sequences(r"\x4B"), r"\x4B");
+        // Single hex digit followed by non-hex character
+        assert_eq!(translate_escape_sequences(r"\x4g"), r"\x04g");
+        assert_eq!(translate_escape_sequences(r"a\x4z"), r"a\x04z");
+    }
+
+    #[test]
+    fn test_translate_escape_sequences_mixed() {
+        // Mix of octal, hex, and backspace escapes
+        assert_eq!(
+            translate_escape_sequences(r"\101\x42\b\103"),
+            r"\x41\x42\x08\x43"
+        );
+        // Complex pattern
+        assert_eq!(
+            translate_escape_sequences(r"hello\bworld\x0a"),
+            r"hello\x08world\x0a"
+        );
+    }
+
+    #[test]
+    fn test_is_interval_expression() {
+        // Valid interval expressions
+        assert!(is_interval_expression("3"));
+        assert!(is_interval_expression("10"));
+        assert!(is_interval_expression("2,4"));
+        assert!(is_interval_expression("3,"));
+        assert!(is_interval_expression("1,100"));
+        assert!(is_interval_expression("0,5"));
+
+        // Invalid - not interval expressions (should be substitutions)
+        assert!(!is_interval_expression(""));
+        assert!(!is_interval_expression("abc"));
+        assert!(!is_interval_expression("DIGIT"));
+        assert!(!is_interval_expression("name123"));
+        assert!(!is_interval_expression(",3"));
+        assert!(!is_interval_expression("1,2,3"));
+        assert!(!is_interval_expression("1a"));
+    }
+
+    #[test]
+    fn test_interval_expressions_in_patterns() {
+        let test_content = r#"
+%%
+[a-z]{3}      printf("EXACTLY3\n");
+[a-z]{2,4}    printf("RANGE\n");
+[a-z]{5,}     printf("ATLEAST5\n");
+[a-z]+        printf("WORD\n");
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let lexinfo = parse(&input).expect("parse failed");
+
+        assert_eq!(lexinfo.rules.len(), 4);
+        // Verify interval expressions are preserved
+        assert_eq!(lexinfo.rules[0].ere, "[a-z]{3}");
+        assert_eq!(lexinfo.rules[1].ere, "[a-z]{2,4}");
+        assert_eq!(lexinfo.rules[2].ere, "[a-z]{5,}");
+        assert_eq!(lexinfo.rules[3].ere, "[a-z]+");
+    }
+
+    #[test]
+    fn test_mixed_substitution_and_interval() {
+        let test_content = r#"
+DIGIT    [0-9]
+%%
+{DIGIT}{3}     printf("3DIGITS\n");
+{DIGIT}{2,4}   printf("RANGE\n");
+{DIGIT}+       printf("DIGITS\n");
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let lexinfo = parse(&input).expect("parse failed");
+
+        assert_eq!(lexinfo.rules.len(), 3);
+        // Substitutions should be expanded, intervals preserved
+        assert_eq!(lexinfo.rules[0].ere, "[0-9]{3}");
+        assert_eq!(lexinfo.rules[1].ere, "[0-9]{2,4}");
+        assert_eq!(lexinfo.rules[2].ere, "[0-9]+");
     }
 }

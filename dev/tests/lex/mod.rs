@@ -1271,16 +1271,14 @@ int main() {
 
 #[test]
 fn test_escape_sequences_octal() {
-    // Note: Rust regex_syntax crate doesn't support POSIX-style \NNN octal escapes.
-    // It only supports \x{...} for Unicode code points and \xNN for hex bytes.
-    // This is a known limitation - POSIX lex implementations typically translate
-    // octal escapes during pattern parsing, which we don't currently do.
-    //
-    // For now, this test verifies that octal escapes in QUOTED strings work
-    // (since they become literal text that doesn't need regex interpretation).
+    // POSIX lex requires \NNN to be octal escapes (e.g., \101 = 'A').
+    // Our lexfile parser translates \NNN octal escapes to \xNN hex escapes
+    // before passing patterns to regex_syntax.
     let lex_input = r#"
 %%
-"\101"      printf("QUOTED_A\n");
+\101        printf("OCTAL_A\n");
+\102        printf("OCTAL_B\n");
+\103        printf("OCTAL_C\n");
 [A-Z]       printf("UPPERCASE: %s\n", yytext);
 .|\n        /* skip */
 %%
@@ -1292,19 +1290,78 @@ int main() {
 "#;
 
     let (c_code, success) = run_lex(lex_input);
-    // Quoted strings are converted to literal text, but \101 in quotes
-    // may or may not work depending on how translate_ere handles it.
-    // This test documents current behavior - future work could add
-    // octal escape translation in the lexfile parser.
-    if !success {
-        // If quoted octal doesn't work either, skip this test with a note
-        eprintln!("Note: Octal escapes not currently supported - future enhancement");
-        return;
-    }
+    assert!(success, "Lex should succeed with octal escapes");
 
-    // If we get here, test that 'A' matches
+    // Test that 'A' (octal 101) matches
     let result = compile_and_run(&c_code, "A");
     assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("OCTAL_A"),
+        "Should match 'A' with \\101: {}",
+        output
+    );
+
+    // Test that 'B' (octal 102) matches
+    let result = compile_and_run(&c_code, "B");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("OCTAL_B"),
+        "Should match 'B' with \\102: {}",
+        output
+    );
+
+    // Test that 'D' (octal 104, not defined) falls through to UPPERCASE
+    let result = compile_and_run(&c_code, "D");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("UPPERCASE"),
+        "Should match 'D' with UPPERCASE: {}",
+        output
+    );
+}
+
+#[test]
+fn test_escape_sequences_octal_two_digit() {
+    // Test 2-digit octal escapes
+    // \12 = 10 decimal = newline, \11 = 9 decimal = tab
+    let lex_input = r#"
+%%
+\12         printf("NEWLINE\n");
+\11         printf("TAB\n");
+.           printf("OTHER: %s\n", yytext);
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "Lex should succeed with 2-digit octal escapes");
+
+    // Test that newline matches \12
+    let result = compile_and_run(&c_code, "\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("NEWLINE"),
+        "Should match newline with \\12: {}",
+        output
+    );
+
+    // Test that tab matches \11
+    let result = compile_and_run(&c_code, "\t");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("TAB"),
+        "Should match tab with \\11: {}",
+        output
+    );
 }
 
 #[test]
@@ -1335,6 +1392,187 @@ int main() {
     assert!(
         output.contains("HEX_A") || output.contains("UPPERCASE: A"),
         "Should match 'A' via hex or uppercase rule, got: {}",
+        output
+    );
+}
+
+#[test]
+fn test_interval_expression_exact() {
+    // Test {n} exact repetition
+    let lex_input = r#"
+%%
+[a-z]{3}      printf("EXACT3: %s\n", yytext);
+[a-z]+        printf("WORD: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "ab abc abcd\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // "ab" doesn't match {3}, matches [a-z]+
+    // "abc" matches {3}
+    // "abcd" has 4 chars, {3} should take first 3, then 'd' matches [a-z]+
+    assert!(
+        output.contains("WORD: ab"),
+        "Should match 'ab' as WORD: {}",
+        output
+    );
+    assert!(
+        output.contains("EXACT3: abc"),
+        "Should match 'abc' as EXACT3: {}",
+        output
+    );
+}
+
+#[test]
+fn test_interval_expression_range() {
+    // Test {m,n} range repetition
+    let lex_input = r#"
+%%
+[a-z]{2,4}    printf("RANGE: %s\n", yytext);
+[a-z]+        printf("WORD: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "a ab abc abcd abcde\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // "a" = 1 char, doesn't match {2,4}, matches [a-z]+
+    // "ab" = 2 chars, matches {2,4}
+    // "abc" = 3 chars, matches {2,4}
+    // "abcd" = 4 chars, matches {2,4}
+    // "abcde" = 5 chars, {2,4} takes 4, then 'e' matches [a-z]+
+    assert!(
+        output.contains("WORD: a"),
+        "Should match 'a' as WORD: {}",
+        output
+    );
+    assert!(
+        output.contains("RANGE: ab"),
+        "Should match 'ab' as RANGE: {}",
+        output
+    );
+    assert!(
+        output.contains("RANGE: abc"),
+        "Should match 'abc' as RANGE: {}",
+        output
+    );
+    assert!(
+        output.contains("RANGE: abcd"),
+        "Should match 'abcd' as RANGE: {}",
+        output
+    );
+}
+
+#[test]
+fn test_interval_expression_unbounded() {
+    // Test {m,} unbounded repetition
+    let lex_input = r#"
+%%
+[a-z]{3,}     printf("ATLEAST3: %s\n", yytext);
+[a-z]+        printf("WORD: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "a ab abc abcd abcdefg\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // "a" = 1 char, doesn't match {3,}, matches [a-z]+
+    // "ab" = 2 chars, doesn't match {3,}, matches [a-z]+
+    // "abc" = 3 chars, matches {3,}
+    // "abcd" = 4 chars, matches {3,}
+    // "abcdefg" = 7 chars, matches {3,}
+    assert!(
+        output.contains("WORD: a"),
+        "Should match 'a' as WORD: {}",
+        output
+    );
+    assert!(
+        output.contains("WORD: ab"),
+        "Should match 'ab' as WORD: {}",
+        output
+    );
+    assert!(
+        output.contains("ATLEAST3: abc"),
+        "Should match 'abc' as ATLEAST3: {}",
+        output
+    );
+    assert!(
+        output.contains("ATLEAST3: abcd"),
+        "Should match 'abcd' as ATLEAST3: {}",
+        output
+    );
+    assert!(
+        output.contains("ATLEAST3: abcdefg"),
+        "Should match 'abcdefg' as ATLEAST3: {}",
+        output
+    );
+}
+
+#[test]
+fn test_interval_expression_with_substitution() {
+    // Test interval expressions combined with substitutions
+    let lex_input = r#"
+DIGIT    [0-9]
+%%
+{DIGIT}{3}       printf("3DIGITS: %s\n", yytext);
+{DIGIT}{1,2}     printf("1OR2DIGITS: %s\n", yytext);
+{DIGIT}+         printf("DIGITS: %s\n", yytext);
+[ \t\n]+         /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "1 12 123 1234\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("1OR2DIGITS: 1"),
+        "Should match '1': {}",
+        output
+    );
+    assert!(
+        output.contains("1OR2DIGITS: 12"),
+        "Should match '12': {}",
+        output
+    );
+    assert!(
+        output.contains("3DIGITS: 123"),
+        "Should match '123': {}",
         output
     );
 }

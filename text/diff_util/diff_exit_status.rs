@@ -2,7 +2,6 @@ use std::process::Termination;
 
 use super::constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE, EXIT_STATUS_TROUBLE};
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum DiffExitStatus {
     NotDifferent,

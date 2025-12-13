@@ -40,6 +40,8 @@ There are several ways to contribute to posixutils-rs:
    uncommented code.
 5. Write small functions. Break up large functions.
    The compiler can inline as needed.
+6. **No `#[allow(dead_code)]` markers.**  Code should compile without warnings.
+   If code is unused, delete it.  If code is only used in tests, use `#[cfg(test)]`.
 
 ### Testing, POSIX compliance and programmatic goals
 

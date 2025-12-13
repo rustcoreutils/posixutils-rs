@@ -113,40 +113,6 @@ impl Hunk {
         }
     }
 
-    pub fn print_debug(&mut self, file1: &FileData, file2: &FileData) {
-        println!(
-            "{}-{} ({}) <> {}-{} ({})",
-            self.ln1_start,
-            self.ln1_end,
-            self.f1_range(false),
-            self.ln2_start,
-            self.ln2_end,
-            self.f2_range(false)
-        );
-
-        match &self.kind {
-            Change::None => {}
-            Change::Insert => {
-                for i in self.ln2_start..self.ln2_end {
-                    println!("+ \"{}\"", file2.line(i));
-                }
-            }
-            Change::Delete => {
-                for i in self.ln1_start..self.ln1_end {
-                    println!("- \"{}\"", file1.line(i));
-                }
-            }
-            Change::Substitute => {
-                for i in self.ln1_start..self.ln1_end {
-                    println!("- \"{}\"", file1.line(i));
-                }
-                for i in self.ln2_start..self.ln2_end {
-                    println!("+ \"{}\"", file2.line(i));
-                }
-            }
-        }
-    }
-
     pub fn print_edit_script(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
         match &self.kind {
             Change::None => {}

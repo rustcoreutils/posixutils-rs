@@ -40,21 +40,12 @@ pub enum Action {
 pub struct LALRAutomaton {
     /// LR(0) automaton
     pub lr0: LR0Automaton,
-    /// Lookahead sets for reduce items: (state, item) -> lookahead set
-    #[allow(dead_code)]
-    pub lookaheads: HashMap<(StateId, Item), HashSet<SymbolId>>,
     /// ACTION table: state -> (terminal -> action)
     pub action_table: Vec<BTreeMap<SymbolId, Action>>,
     /// GOTO table: state -> (non-terminal -> state)
     pub goto_table: Vec<BTreeMap<SymbolId, StateId>>,
     /// Conflict information: (state, symbol) -> list of conflicting actions
     pub conflicts: HashMap<(StateId, SymbolId), Vec<Action>>,
-    /// Shift/reduce conflicts resolved by precedence
-    #[allow(dead_code)]
-    pub resolved_sr_conflicts: usize,
-    /// Reduce/reduce conflicts resolved by rule order
-    #[allow(dead_code)]
-    pub resolved_rr_conflicts: usize,
 }
 
 impl LALRAutomaton {
@@ -85,21 +76,12 @@ impl LALRAutomaton {
     }
 
     /// Get action for state and terminal
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn action(&self, state: StateId, terminal: SymbolId) -> &Action {
         self.action_table
             .get(state)
             .and_then(|m| m.get(&terminal))
             .unwrap_or(&Action::Error)
-    }
-
-    /// Get goto for state and non-terminal
-    #[allow(dead_code)]
-    pub fn goto(&self, state: StateId, nonterminal: SymbolId) -> Option<StateId> {
-        self.goto_table
-            .get(state)
-            .and_then(|m| m.get(&nonterminal))
-            .copied()
     }
 }
 
@@ -113,12 +95,9 @@ pub fn compute(lr0: &LR0Automaton, grammar: &Grammar, ff: &FirstFollow) -> LALRA
 
     LALRAutomaton {
         lr0: clone_lr0(lr0),
-        lookaheads,
         action_table,
         goto_table,
         conflicts,
-        resolved_sr_conflicts: 0,
-        resolved_rr_conflicts: 0,
     }
 }
 

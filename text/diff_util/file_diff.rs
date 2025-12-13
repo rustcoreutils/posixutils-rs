@@ -185,7 +185,6 @@ impl<'a> FileDiff<'a> {
             for hunk_index in 0..hunks_count {
                 let hunk = self.hunks.hunk_at_mut(hunk_index);
                 match self.format_options.output_format {
-                    OutputFormat::Debug => hunk.print_debug(self.file1, self.file2),
                     OutputFormat::Default => {
                         hunk.print_default(self.file1, self.file2, hunk_index == hunks_count - 1)
                     }
@@ -348,7 +347,6 @@ impl<'a> FileDiff<'a> {
 
     fn order_hunks_by_output_format(&mut self) {
         match self.format_options.output_format {
-            OutputFormat::Debug => self.order_hunks_ascending(),
             OutputFormat::Default => self.order_hunks_ascending(),
             OutputFormat::Context(_) => self.order_hunks_ascending(),
             OutputFormat::EditScript => self.order_hunks_descending(),

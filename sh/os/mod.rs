@@ -120,10 +120,9 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
     Ok(dup_result)
 }
 
-#[allow(dead_code)]
 pub enum WaitStatus {
     Exited { exit_status: libc::c_int },
-    Signaled { signal: Signal, core_dumped: bool },
+    Signaled { signal: Signal },
     Stopped { signal: Signal },
     StillAlive,
 }
@@ -147,10 +146,8 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
         Ok(WaitStatus::Exited { exit_status })
     } else if libc::WIFSIGNALED(status) {
         let raw_signal = libc::WTERMSIG(status);
-        let core_dumped = libc::WCOREDUMP(status);
         Ok(WaitStatus::Signaled {
             signal: Signal::try_from(raw_signal).expect("invalid signal"),
-            core_dumped,
         })
     } else if libc::WIFSTOPPED(status) {
         let raw_stop_signal = libc::WSTOPSIG(status);

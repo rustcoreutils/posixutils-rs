@@ -128,9 +128,6 @@ pub struct Editor {
     ex_insert_mode: Option<ExInsertMode>,
     /// Accumulated text for ex insert mode.
     ex_insert_text: Vec<String>,
-    /// Whether running in headless mode (for testing).
-    #[allow(dead_code)]
-    headless: bool,
     /// Whether running in ex standalone mode (line-oriented).
     ex_standalone_mode: bool,
     /// Silent/batch mode (suppress prompts and messages).
@@ -173,7 +170,6 @@ impl Editor {
             last_macro_register: None,
             ex_insert_mode: None,
             ex_insert_text: Vec::new(),
-            headless: false,
             ex_standalone_mode: false,
             silent_mode: false,
         })
@@ -236,7 +232,6 @@ impl Editor {
             last_macro_register: None,
             ex_insert_mode: None,
             ex_insert_text: Vec::new(),
-            headless: false,
             ex_standalone_mode: true,
             silent_mode: true,
         })
@@ -279,7 +274,6 @@ impl Editor {
             last_macro_register: None,
             ex_insert_mode: None,
             ex_insert_text: Vec::new(),
-            headless: true,
             ex_standalone_mode: false,
             silent_mode: false,
         }

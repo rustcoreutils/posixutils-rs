@@ -90,9 +90,6 @@ impl<'a> DirDiff<'a> {
                         let mut show_if_different = String::from("diff ");
 
                         match self.format_options.output_format {
-                            crate::diff_util::common::OutputFormat::Debug => {
-                                show_if_different.push_str("--debug ")
-                            }
                             crate::diff_util::common::OutputFormat::Default => {}
                             crate::diff_util::common::OutputFormat::Context(ctx) => {
                                 show_if_different.push_str(format!("-C {} ", ctx).as_str())

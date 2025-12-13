@@ -28,14 +28,6 @@ impl ScreenRow {
             self.dirty = true;
         }
     }
-
-    #[allow(dead_code)]
-    fn clear(&mut self) {
-        if !self.content.is_empty() {
-            self.content.clear();
-            self.dirty = true;
-        }
-    }
 }
 
 /// Screen buffer for managing display output.

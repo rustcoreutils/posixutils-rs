@@ -97,23 +97,10 @@ impl GpOperand {
 }
 
 // ============================================================================
-// FP/SIMD Operands
-// ============================================================================
-
-/// AArch64 FP/SIMD operand (register)
-#[allow(dead_code)] // Documents full instruction set
-#[derive(Debug, Clone, PartialEq)]
-pub enum FpOperand {
-    /// FP register operand
-    Reg(VReg),
-}
-
-// ============================================================================
 // Condition Codes
 // ============================================================================
 
 /// AArch64 condition codes for comparisons and conditional operations
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cond {
     /// Equal (Z=1)
@@ -124,14 +111,6 @@ pub enum Cond {
     Cs,
     /// Carry clear / unsigned lower (C=0)
     Cc,
-    /// Minus / negative (N=1)
-    Mi,
-    /// Plus / positive or zero (N=0)
-    Pl,
-    /// Overflow (V=1)
-    Vs,
-    /// No overflow (V=0)
-    Vc,
     /// Unsigned higher (C=1 and Z=0)
     Hi,
     /// Unsigned lower or same (C=0 or Z=1)
@@ -144,10 +123,6 @@ pub enum Cond {
     Gt,
     /// Signed less than or equal (Z=1 or N!=V)
     Le,
-    /// Always (unconditional)
-    Al,
-    /// Never (unconditional inverse, rarely used)
-    Nv,
 }
 
 impl Cond {
@@ -158,18 +133,12 @@ impl Cond {
             Cond::Ne => "ne",
             Cond::Cs => "cs",
             Cond::Cc => "cc",
-            Cond::Mi => "mi",
-            Cond::Pl => "pl",
-            Cond::Vs => "vs",
-            Cond::Vc => "vc",
             Cond::Hi => "hi",
             Cond::Ls => "ls",
             Cond::Ge => "ge",
             Cond::Lt => "lt",
             Cond::Gt => "gt",
             Cond::Le => "le",
-            Cond::Al => "al",
-            Cond::Nv => "nv",
         }
     }
 }
@@ -181,61 +150,14 @@ impl fmt::Display for Cond {
 }
 
 // ============================================================================
-// Shift Type
-// ============================================================================
-
-/// Shift type for shifted register operands
-#[allow(dead_code)] // Documents full instruction set
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShiftType {
-    /// Logical shift left
-    Lsl,
-    /// Logical shift right
-    Lsr,
-    /// Arithmetic shift right
-    Asr,
-    /// Rotate right
-    Ror,
-}
-
-// ============================================================================
-// Extend Type
-// ============================================================================
-
-/// Extend type for extended register operands
-#[allow(dead_code)] // Documents full instruction set
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExtendType {
-    /// Unsigned extend byte
-    Uxtb,
-    /// Unsigned extend halfword
-    Uxth,
-    /// Unsigned extend word
-    Uxtw,
-    /// Unsigned extend doubleword (same as LSL for 64-bit)
-    Uxtx,
-    /// Signed extend byte
-    Sxtb,
-    /// Signed extend halfword
-    Sxth,
-    /// Signed extend word
-    Sxtw,
-    /// Signed extend doubleword
-    Sxtx,
-}
-
-// ============================================================================
 // Call Target
 // ============================================================================
 
 /// Target for call instructions
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallTarget {
     /// Direct call to symbol
     Direct(Symbol),
-    /// Indirect call through register
-    Indirect(Reg),
 }
 
 // ============================================================================
@@ -243,7 +165,6 @@ pub enum CallTarget {
 // ============================================================================
 
 /// AArch64 Low-level IR instruction
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone)]
 pub enum Aarch64Inst {
     // ========================================================================
@@ -269,14 +190,6 @@ pub enum Aarch64Inst {
         size: OperandSize,
         imm: u16,
         shift: u8, // 0, 16, 32, or 48
-        dst: Reg,
-    },
-
-    /// MOVN - Move wide with NOT (inverted immediate)
-    Movn {
-        size: OperandSize,
-        imm: u16,
-        shift: u8,
         dst: Reg,
     },
 
@@ -453,14 +366,6 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
-    /// ROR - Rotate right
-    Ror {
-        size: OperandSize,
-        src: Reg,
-        amount: GpOperand,
-        dst: Reg,
-    },
-
     /// REV - Reverse bytes (byte swap)
     Rev {
         size: OperandSize,
@@ -494,13 +399,6 @@ pub enum Aarch64Inst {
     // ========================================================================
     /// CMP - Compare (sets flags based on dst - src)
     Cmp {
-        size: OperandSize,
-        src1: Reg,
-        src2: GpOperand,
-    },
-
-    /// TST - Test (sets flags based on AND)
-    Tst {
         size: OperandSize,
         src1: Reg,
         src2: GpOperand,
@@ -555,9 +453,6 @@ pub enum Aarch64Inst {
 
     /// BL - Branch with link (function call)
     Bl { target: CallTarget },
-
-    /// BLR - Branch to register with link
-    Blr { target: Reg },
 
     /// RET - Return from subroutine
     Ret,
@@ -784,26 +679,6 @@ impl EmitAsm for Aarch64Inst {
                     imm,
                     shift
                 );
-            }
-
-            Aarch64Inst::Movn {
-                size,
-                imm,
-                shift,
-                dst,
-            } => {
-                let sz = size.bits().max(32);
-                if *shift == 0 {
-                    let _ = writeln!(out, "    movn {}, #{}", dst.name_for_size(sz), imm);
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "    movn {}, #{}, lsl #{}",
-                        dst.name_for_size(sz),
-                        imm,
-                        shift
-                    );
-                }
             }
 
             Aarch64Inst::Ldr { size, addr, dst } => {
@@ -1166,22 +1041,6 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
-            Aarch64Inst::Ror {
-                size,
-                src,
-                amount,
-                dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    ror {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz),
-                    amount.format(OperandSize::from_bits(sz))
-                );
-            }
-
             Aarch64Inst::Rev { size, src, dst } => {
                 let sz = size.bits().max(32);
                 // rev for 32-bit uses w registers, rev for 64-bit uses x registers
@@ -1229,16 +1088,6 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(
                     out,
                     "    cmp {}, {}",
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
-            Aarch64Inst::Tst { size, src1, src2 } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    tst {}, {}",
                     src1.name_for_size(sz),
                     src2.format(OperandSize::from_bits(sz))
                 );
@@ -1305,14 +1154,7 @@ impl EmitAsm for Aarch64Inst {
                     let sym_name = sym.format_for_target(target);
                     let _ = writeln!(out, "    bl {}", sym_name);
                 }
-                CallTarget::Indirect(reg) => {
-                    let _ = writeln!(out, "    blr {}", reg.name64());
-                }
             },
-
-            Aarch64Inst::Blr { target: reg } => {
-                let _ = writeln!(out, "    blr {}", reg.name64());
-            }
 
             Aarch64Inst::Ret => {
                 let _ = writeln!(out, "    ret");

@@ -187,15 +187,6 @@ struct EvalContext<'a> {
     metadata: &'a Metadata,
     /// Raw symlink metadata (for -type l checks with -L)
     link_metadata: Option<&'a Metadata>,
-    /// Is this a command-line argument? (reserved for future use)
-    #[allow(dead_code)]
-    is_cmdline: bool,
-    /// Symlink mode (reserved for future use)
-    #[allow(dead_code)]
-    symlink_mode: SymlinkMode,
-    /// The device ID of the starting point (for -xdev) (reserved for future use)
-    #[allow(dead_code)]
-    root_dev: u64,
     /// Initialization time (for -atime, -mtime, -ctime)
     init_time: SystemTime,
 }
@@ -985,9 +976,6 @@ fn walk_tree(
         path,
         metadata: &metadata,
         link_metadata: link_metadata.as_ref(),
-        is_cmdline,
-        symlink_mode,
-        root_dev,
         init_time,
     };
 

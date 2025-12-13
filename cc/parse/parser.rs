@@ -310,7 +310,7 @@ impl<'a> Parser<'a> {
 
     /// Check if we're at end of input
     fn is_eof(&self) -> bool {
-        matches!(self.peek(), TokenType::Eof | TokenType::StreamEnd)
+        matches!(self.peek(), TokenType::StreamEnd)
     }
 
     /// Check if current token is __attribute__ or __attribute

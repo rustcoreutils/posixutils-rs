@@ -22,10 +22,7 @@ pub use crate::diag::Position;
 
 /// Token types following sparse's model
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Enum completeness for lexer model
 pub enum TokenType {
-    Eof,
-    Error,
     Ident,
     Number,
     Char,
@@ -905,8 +902,6 @@ pub fn show_special(value: u32) -> String {
 /// Format a token for display
 pub fn show_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
-        TokenType::Eof => "<EOF>".to_string(),
-        TokenType::Error => "<ERROR>".to_string(),
         TokenType::StreamBegin => "<STREAM_BEGIN>".to_string(),
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
         TokenType::Ident => {
@@ -964,8 +959,6 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
 /// Format token type name
 pub fn token_type_name(typ: TokenType) -> &'static str {
     match typ {
-        TokenType::Eof => "EOF",
-        TokenType::Error => "ERROR",
         TokenType::Ident => "IDENT",
         TokenType::Number => "NUMBER",
         TokenType::Char => "CHAR",

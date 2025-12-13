@@ -23,7 +23,6 @@ use std::fmt::{self, Write};
 // ============================================================================
 
 /// x86-64 memory addressing mode
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemAddr {
     /// [base + offset] - Register indirect with displacement
@@ -31,17 +30,6 @@ pub enum MemAddr {
 
     /// [rip + symbol] - PC-relative addressing for position-independent code
     RipRelative(Symbol),
-
-    /// [base + index * scale + offset] - Full SIB addressing
-    Sib {
-        base: Reg,
-        index: Reg,
-        scale: u8, // 1, 2, 4, or 8
-        offset: i32,
-    },
-
-    /// [offset] - Absolute address (rare, mainly for globals on some platforms)
-    Absolute(i64),
 }
 
 impl MemAddr {
@@ -57,21 +45,6 @@ impl MemAddr {
             }
             MemAddr::RipRelative(sym) => {
                 format!("{}(%rip)", sym.format_for_target(target))
-            }
-            MemAddr::Sib {
-                base,
-                index,
-                scale,
-                offset,
-            } => {
-                if *offset == 0 {
-                    format!("({},{},{})", base.name64(), index.name64(), scale)
-                } else {
-                    format!("{}({},{},{})", offset, base.name64(), index.name64(), scale)
-                }
-            }
-            MemAddr::Absolute(addr) => {
-                format!("{:#x}", addr)
             }
         }
     }
@@ -131,7 +104,6 @@ impl XmmOperand {
 // ============================================================================
 
 /// Integer condition codes for comparisons and conditional jumps/sets
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntCC {
     /// Equal (ZF=1)
@@ -154,14 +126,6 @@ pub enum IntCC {
     A,
     /// Above or equal (unsigned) (CF=0)
     Ae,
-    /// Sign (SF=1)
-    S,
-    /// Not sign (SF=0)
-    Ns,
-    /// Parity (PF=1) - for FP unordered
-    P,
-    /// Not parity (PF=0) - for FP ordered
-    Np,
 }
 
 impl IntCC {
@@ -178,10 +142,6 @@ impl IntCC {
             IntCC::Be => "be",
             IntCC::A => "a",
             IntCC::Ae => "ae",
-            IntCC::S => "s",
-            IntCC::Ns => "ns",
-            IntCC::P => "p",
-            IntCC::Np => "np",
         }
     }
 }
@@ -210,15 +170,10 @@ pub enum ShiftCount {
 // ============================================================================
 
 /// Target for call instructions
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallTarget {
     /// Direct call to symbol
     Direct(Symbol),
-    /// Indirect call through register
-    Indirect(Reg),
-    /// Indirect call through memory
-    IndirectMem(MemAddr),
 }
 
 // ============================================================================
@@ -226,7 +181,6 @@ pub enum CallTarget {
 // ============================================================================
 
 /// x86-64 Low-level IR instruction
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone)]
 pub enum X86Inst {
     // ========================================================================
@@ -267,9 +221,6 @@ pub enum X86Inst {
     /// POP - Pop value from stack
     Pop { dst: Reg },
 
-    /// XCHG - Exchange register contents
-    Xchg { size: OperandSize, r1: Reg, r2: Reg },
-
     // ========================================================================
     // Integer Arithmetic
     // ========================================================================
@@ -294,12 +245,6 @@ pub enum X86Inst {
         dst: Reg,
     },
 
-    /// IMUL - Signed multiply (1-operand form: RDX:RAX = RAX * src)
-    IMul1 { size: OperandSize, src: GpOperand },
-
-    /// MUL - Unsigned multiply (1-operand form: RDX:RAX = RAX * src)
-    Mul1 { size: OperandSize, src: GpOperand },
-
     /// IDIV - Signed divide (RDX:RAX / src -> RAX quotient, RDX remainder)
     IDiv {
         size: OperandSize,
@@ -314,12 +259,6 @@ pub enum X86Inst {
 
     /// NEG - Two's complement negation
     Neg { size: OperandSize, dst: Reg },
-
-    /// INC - Increment by 1
-    Inc { size: OperandSize, dst: GpOperand },
-
-    /// DEC - Decrement by 1
-    Dec { size: OperandSize, dst: GpOperand },
 
     // ========================================================================
     // Bitwise Operations
@@ -643,16 +582,6 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    popq {}", dst.name64());
             }
 
-            X86Inst::Xchg { size, r1, r2 } => {
-                let _ = writeln!(
-                    out,
-                    "    xchg{} {}, {}",
-                    size.x86_suffix(),
-                    r1.name_for_size(size.bits()),
-                    r2.name_for_size(size.bits())
-                );
-            }
-
             // Integer Arithmetic
             X86Inst::Add { size, src, dst } => {
                 let _ = writeln!(
@@ -684,24 +613,6 @@ impl EmitAsm for X86Inst {
                 );
             }
 
-            X86Inst::IMul1 { size, src } => {
-                let _ = writeln!(
-                    out,
-                    "    imul{} {}",
-                    size.x86_suffix(),
-                    src.format(*size, target)
-                );
-            }
-
-            X86Inst::Mul1 { size, src } => {
-                let _ = writeln!(
-                    out,
-                    "    mul{} {}",
-                    size.x86_suffix(),
-                    src.format(*size, target)
-                );
-            }
-
             X86Inst::IDiv { size, divisor } => {
                 let _ = writeln!(
                     out,
@@ -726,24 +637,6 @@ impl EmitAsm for X86Inst {
                     "    neg{} {}",
                     size.x86_suffix(),
                     dst.name_for_size(size.bits())
-                );
-            }
-
-            X86Inst::Inc { size, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    inc{} {}",
-                    size.x86_suffix(),
-                    dst.format(*size, target)
-                );
-            }
-
-            X86Inst::Dec { size, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    dec{} {}",
-                    size.x86_suffix(),
-                    dst.format(*size, target)
                 );
             }
 
@@ -902,12 +795,6 @@ impl EmitAsm for X86Inst {
                             let _ = writeln!(out, "    call {}", sym_name);
                         }
                     }
-                }
-                CallTarget::Indirect(reg) => {
-                    let _ = writeln!(out, "    call *{}", reg.name64());
-                }
-                CallTarget::IndirectMem(addr) => {
-                    let _ = writeln!(out, "    call *{}", addr.format(target));
                 }
             },
 

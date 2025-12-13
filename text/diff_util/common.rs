@@ -33,9 +33,7 @@ impl FormatOptions {
     }
 }
 
-#[allow(dead_code)]
 pub enum OutputFormat {
-    Debug,
     Default,
     Context(usize),
     EditScript,

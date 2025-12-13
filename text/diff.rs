@@ -14,7 +14,11 @@
 
 mod diff_util;
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs::{self, File},
+    io::{self, Read, Write},
+    path::PathBuf,
+};
 
 use clap::Parser;
 use diff_util::{
@@ -102,14 +106,49 @@ impl From<&Args> for OutputFormat {
     }
 }
 
+/// Read stdin and write to a temporary file, returning the path
+fn read_stdin_to_temp() -> io::Result<PathBuf> {
+    let mut stdin_content = Vec::new();
+    io::stdin().read_to_end(&mut stdin_content)?;
+
+    // Create a temporary file
+    let temp_path = std::env::temp_dir().join(format!("diff_stdin_{}", std::process::id()));
+    let mut temp_file = File::create(&temp_path)?;
+    temp_file.write_all(&stdin_content)?;
+
+    Ok(temp_path)
+}
+
 fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
-    let path1 = PathBuf::from(&args.file1);
-    let path2 = PathBuf::from(&args.file2);
+    let is_stdin1 = args.file1 == "-";
+    let is_stdin2 = args.file2 == "-";
 
-    let path1_exists = check_existance(&path1)?;
-    let path2_exists = check_existance(&path2)?;
+    // Cannot compare stdin to itself
+    if is_stdin1 && is_stdin2 {
+        eprintln!("diff: cannot compare stdin to itself");
+        return Ok(DiffExitStatus::Trouble);
+    }
 
-    if !path1_exists || !path2_exists {
+    // Handle stdin by reading to temp file
+    let (path1, temp_path1) = if is_stdin1 {
+        let temp = read_stdin_to_temp()?;
+        (temp.clone(), Some(temp))
+    } else {
+        (PathBuf::from(&args.file1), None)
+    };
+
+    let (path2, temp_path2) = if is_stdin2 {
+        let temp = read_stdin_to_temp()?;
+        (temp.clone(), Some(temp))
+    } else {
+        (PathBuf::from(&args.file2), None)
+    };
+
+    // Check existence (skip for stdin which is now a temp file)
+    if !is_stdin1 && !check_existance(&path1)? {
+        return Ok(DiffExitStatus::Trouble);
+    }
+    if !is_stdin2 && !check_existance(&path2)? {
         return Ok(DiffExitStatus::Trouble);
     }
 
@@ -130,13 +169,23 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     let path1_is_file = fs::metadata(&path1)?.is_file();
     let path2_is_file = fs::metadata(&path2)?.is_file();
 
-    if path1_is_file && path2_is_file {
+    let result = if path1_is_file && path2_is_file {
         FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
         DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
         FileDiff::file_dir_diff(path1, path2, &format_options)
+    };
+
+    // Clean up temp files
+    if let Some(temp) = temp_path1 {
+        let _ = fs::remove_file(temp);
     }
+    if let Some(temp) = temp_path2 {
+        let _ = fs::remove_file(temp);
+    }
+
+    result
 }
 
 fn main() -> DiffExitStatus {

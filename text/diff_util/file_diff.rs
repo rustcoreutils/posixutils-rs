@@ -3,7 +3,9 @@ use super::{
     constants::COULD_NOT_UNWRAP_FILENAME,
     diff_exit_status::DiffExitStatus,
     file_data::{FileData, LineReader},
-    functions::{check_existance, is_binary, system_time_to_rfc2822},
+    functions::{
+        check_existance, is_binary, system_time_to_context_format, system_time_to_unified_format,
+    },
     hunks::Hunks,
 };
 
@@ -64,28 +66,19 @@ impl<'a> FileDiff<'a> {
             let content1 = read_to_string(&path1)?.into_bytes();
             let linereader1 = LineReader::new(&content1);
             let ends_with_newline1 = linereader1.ends_with_newline();
-            let mut lines1 = Vec::new();
-            for line in linereader1 {
-                if !format_options.ignore_trailing_white_spaces {
-                    lines1.push(line);
-                } else {
-                    lines1.push(line.trim_end());
-                }
-            }
+            let lines1: Vec<&str> = linereader1.collect();
 
             let content2 = read_to_string(&path2)?.into_bytes();
             let linereader2 = LineReader::new(&content2);
             let ends_with_newline2 = linereader2.ends_with_newline();
-            let mut lines2 = Vec::new();
-            for line in linereader2 {
-                if !format_options.ignore_trailing_white_spaces {
-                    lines2.push(line);
-                } else {
-                    lines2.push(line.trim_end());
-                }
-            }
-            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
-            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
+            let lines2: Vec<&str> = linereader2.collect();
+
+            // Pass whitespace normalization flag to FileData
+            // When -b is set, hashes are computed using normalized whitespace for comparison
+            // but original lines are stored for output
+            let normalize_ws = format_options.ignore_trailing_white_spaces;
+            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1, normalize_ws)?;
+            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2, normalize_ws)?;
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
@@ -205,7 +198,7 @@ impl<'a> FileDiff<'a> {
                         eprintln!("OutputFormat::Context should be handled in other place");
                         return Ok(DiffExitStatus::Trouble);
                     }
-                    OutputFormat::ForwardEditScript => hunk.print_edit_script(
+                    OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
                         self.file1,
                         self.file2,
                         hunk_index == hunks_count - 1,
@@ -331,7 +324,7 @@ impl<'a> FileDiff<'a> {
                 for i in x0..x1 {
                     if file1.line_hash(i) == target_hash {
                         for j in y0..y1 {
-                            if file2.line_hash(j) == target_hash && file1.line(i) == file2.line(j) {
+                            if file2.line_hash(j) == target_hash && file1.lines_equal(i, file2, j) {
                                 lcs_indices[i] = j as i32;
                                 FileDiff::histogram_lcs(file1, file2, x0, i, y0, j, lcs_indices);
                                 FileDiff::histogram_lcs(
@@ -379,11 +372,11 @@ impl<'a> FileDiff<'a> {
     fn print_context(&mut self, context: usize) -> Result<(), std::fmt::Error> {
         println!(
             "*** {}",
-            Self::get_header(self.file1, self.format_options.label1())
+            Self::get_context_header(self.file1, self.format_options.label1())
         );
         println!(
             "--- {}",
-            Self::get_header(self.file2, self.format_options.label2())
+            Self::get_context_header(self.file2, self.format_options.label2())
         );
 
         let mut diff_disp = ContextDiffDisplay::default();
@@ -506,11 +499,11 @@ impl<'a> FileDiff<'a> {
     fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
         println!(
             "--- {}",
-            Self::get_header(self.file1, self.format_options.label1())
+            Self::get_unified_header(self.file1, self.format_options.label1())
         );
         println!(
             "+++ {}",
-            Self::get_header(self.file2, self.format_options.label2())
+            Self::get_unified_header(self.file2, self.format_options.label2())
         );
 
         let mut diff_disp = UnifiedDiffDisplay::default();
@@ -568,14 +561,26 @@ impl<'a> FileDiff<'a> {
         Ok(())
     }
 
-    pub fn get_header(file: &FileData, label: &Option<String>) -> String {
+    pub fn get_context_header(file: &FileData, label: &Option<String>) -> String {
         if let Some(label) = label {
             label.to_string()
         } else {
             format!(
                 "{}\t{}",
                 file.path(),
-                system_time_to_rfc2822(file.modified())
+                system_time_to_context_format(file.modified())
+            )
+        }
+    }
+
+    pub fn get_unified_header(file: &FileData, label: &Option<String>) -> String {
+        if let Some(label) = label {
+            label.to_string()
+        } else {
+            format!(
+                "{}\t{}",
+                file.path(),
+                system_time_to_unified_format(file.modified())
             )
         }
     }

@@ -160,7 +160,7 @@ impl<'a> DirDiff<'a> {
                             )?;
                         } else {
                             println!(
-                                "Common subdirectories: \"{}\" and \"{}\"",
+                                "Common subdirectories: {} and {}",
                                 self.dir1
                                     .path()
                                     .join(file_name)

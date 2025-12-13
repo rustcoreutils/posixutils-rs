@@ -11,6 +11,12 @@
 
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Pre-compiled regex for hunk headers to avoid recompilation on each parse.
+static HUNK_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("invalid regex")
+});
 
 /// Parse a unified diff from the given lines.
 pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -44,10 +50,7 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
         pos += 1;
     }
 
-    // Parse hunks
-    let hunk_header_re =
-        Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("invalid regex");
-
+    // Parse hunks using pre-compiled static regex
     while pos < lines.len() {
         let line = lines[pos];
 
@@ -62,7 +65,7 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
         }
 
         // Parse hunk header
-        if let Some(caps) = hunk_header_re.captures(line) {
+        if let Some(caps) = HUNK_HEADER_RE.captures(line) {
             let old_start: usize = caps[1].parse().unwrap_or(1);
             let old_count: usize = caps.get(2).map_or(1, |m| m.as_str().parse().unwrap_or(1));
             let new_start: usize = caps[3].parse().unwrap_or(1);

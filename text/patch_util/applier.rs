@@ -73,7 +73,8 @@ impl<'a> PatchApplier<'a> {
 
         Ok(ApplyResult {
             rejected_hunks,
-            content: self.file_lines.clone(),
+            // Use mem::take to avoid cloning the entire file content
+            content: std::mem::take(&mut self.file_lines),
             had_offset,
             had_fuzz,
         })
@@ -92,10 +93,10 @@ impl<'a> PatchApplier<'a> {
                     .min(self.file_lines.len())
             };
 
-            let new_lines = hunk.get_new_lines();
-            for (i, line) in new_lines.iter().enumerate() {
-                self.file_lines.insert(insert_pos + i, line.to_string());
-            }
+            let new_lines: Vec<String> =
+                hunk.get_new_lines().iter().map(|s| s.to_string()).collect();
+            // Use splice for O(n) instead of multiple insert() which is O(n²)
+            self.file_lines.splice(insert_pos..insert_pos, new_lines);
             return HunkResult::Applied { offset: 0, fuzz: 0 };
         }
 
@@ -237,9 +238,9 @@ impl<'a> PatchApplier<'a> {
 
     /// Perform changes normally (delete old, insert new).
     fn perform_normal_changes(&mut self, hunk: &Hunk, pos: usize) {
-        // Count deletes and build new lines
+        // Count deletes and build new lines with pre-allocated capacity
         let mut delete_count = 0;
-        let mut new_lines: Vec<String> = Vec::new();
+        let mut new_lines: Vec<String> = Vec::with_capacity(hunk.lines.len());
 
         for op in &hunk.lines {
             match op {
@@ -256,26 +257,25 @@ impl<'a> PatchApplier<'a> {
             }
         }
 
-        // Remove old lines
+        // Use splice for O(n) instead of drain() + multiple insert() which is O(n²)
         let remove_end = (pos + delete_count).min(self.file_lines.len());
-        self.file_lines.drain(pos..remove_end);
-
-        // Insert new lines
-        for (i, line) in new_lines.into_iter().enumerate() {
-            self.file_lines.insert(pos + i, line);
-        }
+        self.file_lines.splice(pos..remove_end, new_lines);
     }
 
     /// Perform changes with #ifdef wrapping.
     fn perform_ifdef_changes(&mut self, hunk: &Hunk, pos: usize, define: &str) {
-        let mut result: Vec<String> = Vec::new();
+        // Pre-allocate: worst case each line becomes 3 lines (ifdef wrapped)
+        let mut result: Vec<String> = Vec::with_capacity(hunk.lines.len() * 3);
+        let mut delete_count = 0;
 
         for op in &hunk.lines {
             match op {
                 LineOp::Context(s) => {
+                    delete_count += 1;
                     result.push(s.clone());
                 }
                 LineOp::Delete(s) => {
+                    delete_count += 1;
                     result.push(format!("#ifndef {}", define));
                     result.push(s.clone());
                     result.push(format!("#endif /* !{} */", define));
@@ -288,21 +288,9 @@ impl<'a> PatchApplier<'a> {
             }
         }
 
-        // Count how many lines we need to remove
-        let delete_count = hunk
-            .lines
-            .iter()
-            .filter(|op| matches!(op, LineOp::Context(_) | LineOp::Delete(_)))
-            .count();
-
-        // Remove old lines
+        // Use splice for O(n) instead of drain() + multiple insert() which is O(n²)
         let remove_end = (pos + delete_count).min(self.file_lines.len());
-        self.file_lines.drain(pos..remove_end);
-
-        // Insert new lines
-        for (i, line) in result.into_iter().enumerate() {
-            self.file_lines.insert(pos + i, line);
-        }
+        self.file_lines.splice(pos..remove_end, result);
     }
 }
 

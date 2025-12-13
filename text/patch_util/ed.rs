@@ -11,6 +11,15 @@
 
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Pre-compiled regex for ed commands to avoid recompilation on each parse.
+static CMD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+)(?:,(\d+))?([acd])$").expect("invalid regex"));
+
+/// Pre-compiled regex for detecting ed commands.
+static DETECT_CMD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]$").expect("invalid regex"));
 
 /// Parse an ed script from the given lines.
 pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -30,9 +39,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
         }
     }
 
-    // Parse ed commands: Na, Nd, Nc, N,Ma, N,Md, N,Mc
-    let cmd_re = Regex::new(r"^(\d+)(?:,(\d+))?([acd])$").expect("invalid regex");
-
+    // Parse ed commands using pre-compiled static regex: Na, Nd, Nc, N,Ma, N,Md, N,Mc
     while pos < lines.len() {
         let line = lines[pos];
 
@@ -41,7 +48,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
             break;
         }
 
-        if let Some(caps) = cmd_re.captures(line) {
+        if let Some(caps) = CMD_RE.captures(line) {
             let start_line: usize = caps[1].parse().unwrap_or(1);
             let end_line: usize = caps
                 .get(2)
@@ -114,14 +121,12 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
 
 /// Check if a line looks like an ed script command.
 pub fn looks_like_ed(lines: &[&str]) -> bool {
-    let cmd_re = Regex::new(r"^\d+(?:,\d+)?[acd]$").expect("invalid regex");
-
     for line in lines.iter().take(20) {
         // Skip Index: and diff lines
         if line.starts_with("Index: ") || line.starts_with("diff ") {
             continue;
         }
-        if cmd_re.is_match(line) {
+        if DETECT_CMD_RE.is_match(line) {
             return true;
         }
         // If we hit content that's not an ed command, it's probably not ed

@@ -11,6 +11,15 @@
 
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Pre-compiled regex for old range headers to avoid recompilation on each parse.
+static OLD_RANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\*\*\* (\d+)(?:,(\d+))? \*\*\*\*").expect("invalid regex"));
+
+/// Pre-compiled regex for new range headers to avoid recompilation on each parse.
+static NEW_RANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^--- (\d+)(?:,(\d+))? ----").expect("invalid regex"));
 
 /// Parse a context diff from the given lines.
 pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -44,10 +53,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
         pos += 1;
     }
 
-    // Parse hunks
-    let old_range_re = Regex::new(r"^\*\*\* (\d+)(?:,(\d+))? \*\*\*\*").expect("invalid regex");
-    let new_range_re = Regex::new(r"^--- (\d+)(?:,(\d+))? ----").expect("invalid regex");
-
+    // Parse hunks using pre-compiled static regexes
     while pos < lines.len() {
         let line = lines[pos];
 
@@ -72,7 +78,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
 
             // Parse old section: *** start,end ****
             let old_line = lines[pos];
-            let (old_start, old_end) = if let Some(caps) = old_range_re.captures(old_line) {
+            let (old_start, old_end) = if let Some(caps) = OLD_RANGE_RE.captures(old_line) {
                 let start: usize = caps[1].parse().unwrap_or(1);
                 let end: usize = caps
                     .get(2)
@@ -88,7 +94,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             let mut old_lines: Vec<(char, String)> = Vec::new();
             while pos < lines.len() {
                 let l = lines[pos];
-                if l.starts_with("--- ") && new_range_re.is_match(l) {
+                if l.starts_with("--- ") && NEW_RANGE_RE.is_match(l) {
                     break;
                 }
                 if l.len() >= 2 {
@@ -106,7 +112,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                 break;
             }
             let new_line = lines[pos];
-            let (new_start, new_end) = if let Some(caps) = new_range_re.captures(new_line) {
+            let (new_start, new_end) = if let Some(caps) = NEW_RANGE_RE.captures(new_line) {
                 let start: usize = caps[1].parse().unwrap_or(1);
                 let end: usize = caps
                     .get(2)

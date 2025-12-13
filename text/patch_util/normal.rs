@@ -11,6 +11,16 @@
 
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Pre-compiled regex for normal diff commands to avoid recompilation on each parse.
+static CMD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\d+)(?:,(\d+))?([acd])(\d+)(?:,(\d+))?$").expect("invalid regex")
+});
+
+/// Pre-compiled regex for detecting normal diff commands.
+static DETECT_CMD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\d+(?:,\d+)?$").expect("invalid regex"));
 
 /// Parse a normal diff from the given lines.
 pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -31,9 +41,7 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
         }
     }
 
-    // Parse commands: NaN (add), NdN (delete), NcN (change)
-    let cmd_re = Regex::new(r"^(\d+)(?:,(\d+))?([acd])(\d+)(?:,(\d+))?$").expect("invalid regex");
-
+    // Parse commands using pre-compiled static regex: NaN (add), NdN (delete), NcN (change)
     while pos < lines.len() {
         let line = lines[pos];
 
@@ -42,7 +50,7 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
             break;
         }
 
-        if let Some(caps) = cmd_re.captures(line) {
+        if let Some(caps) = CMD_RE.captures(line) {
             let old_start: usize = caps[1].parse().unwrap_or(1);
             let old_end: usize = caps
                 .get(2)
@@ -113,10 +121,8 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
 
 /// Check if a line looks like a normal diff command.
 pub fn looks_like_normal(lines: &[&str]) -> bool {
-    let cmd_re = Regex::new(r"^\d+(?:,\d+)?[acd]\d+(?:,\d+)?$").expect("invalid regex");
-
     for line in lines.iter().take(20) {
-        if cmd_re.is_match(line) {
+        if DETECT_CMD_RE.is_match(line) {
             return true;
         }
     }

@@ -23,6 +23,12 @@ pub enum LineOp {
     Delete(String),
 }
 
+impl Default for LineOp {
+    fn default() -> Self {
+        LineOp::Context(String::new())
+    }
+}
+
 /// A hunk represents a contiguous region of changes.
 #[derive(Debug, Clone)]
 pub struct Hunk {
@@ -39,30 +45,32 @@ pub struct Hunk {
 }
 
 impl Hunk {
-    /// Create a new empty hunk.
+    /// Create a new empty hunk with pre-allocated capacity.
     pub fn new(old_start: usize, old_count: usize, new_start: usize, new_count: usize) -> Self {
+        // Pre-allocate: typically need old_count + new_count lines
+        // (context lines counted in both, plus adds and deletes)
+        let estimated_lines = old_count.saturating_add(new_count);
         Self {
             old_start,
             old_count,
             new_start,
             new_count,
-            lines: Vec::new(),
+            lines: Vec::with_capacity(estimated_lines),
         }
     }
 
-    /// Reverse this hunk (swap add/delete operations).
+    /// Reverse this hunk (swap add/delete operations) in place without cloning.
     pub fn reverse(&mut self) {
         std::mem::swap(&mut self.old_start, &mut self.new_start);
         std::mem::swap(&mut self.old_count, &mut self.new_count);
-        self.lines = self
-            .lines
-            .iter()
-            .map(|op| match op {
-                LineOp::Context(s) => LineOp::Context(s.clone()),
-                LineOp::Add(s) => LineOp::Delete(s.clone()),
-                LineOp::Delete(s) => LineOp::Add(s.clone()),
-            })
-            .collect();
+        // Mutate in place using mem::take to avoid cloning strings
+        for op in &mut self.lines {
+            *op = match std::mem::take(op) {
+                LineOp::Context(s) => LineOp::Context(s),
+                LineOp::Add(s) => LineOp::Delete(s),
+                LineOp::Delete(s) => LineOp::Add(s),
+            };
+        }
     }
 
     /// Get context lines for matching (Delete and Context lines).
@@ -132,14 +140,15 @@ pub struct FilePatch {
 }
 
 impl FilePatch {
-    /// Create a new empty file patch.
+    /// Create a new empty file patch with pre-allocated hunk capacity.
     pub fn new(format: DiffFormat) -> Self {
         Self {
             old_path: None,
             new_path: None,
             index_path: None,
             format,
-            hunks: Vec::new(),
+            // Pre-allocate for typical patch size (1-20 hunks is common)
+            hunks: Vec::with_capacity(8),
             is_new_file: false,
             is_delete_file: false,
         }

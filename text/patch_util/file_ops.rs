@@ -12,7 +12,7 @@
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchConfig, PatchError};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -93,10 +93,17 @@ fn strip_path(path: &str, strip_count: Option<usize>) -> String {
 }
 
 /// Read a file into a vector of lines.
+/// Optimized to read the entire file at once and split, avoiding
+/// per-line allocations and system calls.
 pub fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    reader.lines().collect()
+    let content = fs::read_to_string(path)?;
+    // Count lines for pre-allocation
+    let line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
+    let mut lines = Vec::with_capacity(line_count);
+    for line in content.lines() {
+        lines.push(line.to_string());
+    }
+    Ok(lines)
 }
 
 /// Write content to the output file, handling backup if needed.
@@ -128,20 +135,13 @@ pub fn write_output(content: &[String], target: &Path, config: &PatchConfig) -> 
         }
     }
 
-    // Write content
-    let mut file = File::create(output_path)?;
-    for (i, line) in content.iter().enumerate() {
-        if i > 0 || !content.is_empty() {
-            write!(file, "{}", line)?;
-            // Add newline except possibly for last line
-            if i < content.len() - 1 {
-                writeln!(file)?;
-            } else {
-                // For the last line, add newline (most files end with newline)
-                writeln!(file)?;
-            }
-        }
+    // Write content using BufWriter for better I/O performance
+    let file = File::create(output_path)?;
+    let mut writer = BufWriter::new(file);
+    for line in content {
+        writeln!(writer, "{}", line)?;
     }
+    writer.flush()?;
 
     Ok(())
 }
@@ -163,40 +163,42 @@ pub fn write_rejects(
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}.rej", target.display())));
 
-    let mut file = File::create(&reject_path)?;
+    let file = File::create(&reject_path)?;
+    let mut writer = BufWriter::new(file);
 
     // Write rejects in context diff format per POSIX
     // (even if input was unified, rejects should be in context format)
     for (hunk_num, hunk, _reason) in rejects {
-        write_hunk_as_context(&mut file, hunk, *hunk_num, format)?;
+        write_hunk_as_context(&mut writer, hunk, *hunk_num, format)?;
     }
+    writer.flush()?;
 
     Ok(())
 }
 
 /// Write a hunk in context diff format.
-fn write_hunk_as_context(
-    file: &mut File,
+fn write_hunk_as_context<W: Write>(
+    writer: &mut W,
     hunk: &Hunk,
     _hunk_num: usize,
     _format: DiffFormat,
 ) -> io::Result<()> {
     // Write separator
-    writeln!(file, "***************")?;
+    writeln!(writer, "***************")?;
 
     // Write old section header
     let old_end = hunk.old_start + hunk.old_count.saturating_sub(1);
     if hunk.old_count == 0 {
-        writeln!(file, "*** {} ****", hunk.old_start)?;
+        writeln!(writer, "*** {} ****", hunk.old_start)?;
     } else {
-        writeln!(file, "*** {},{} ****", hunk.old_start, old_end)?;
+        writeln!(writer, "*** {},{} ****", hunk.old_start, old_end)?;
     }
 
     // Write old section lines
     for op in &hunk.lines {
         match op {
-            LineOp::Context(s) => writeln!(file, "  {}", s)?,
-            LineOp::Delete(s) => writeln!(file, "- {}", s)?,
+            LineOp::Context(s) => writeln!(writer, "  {}", s)?,
+            LineOp::Delete(s) => writeln!(writer, "- {}", s)?,
             LineOp::Add(_) => {} // Skip adds in old section
         }
     }
@@ -204,17 +206,17 @@ fn write_hunk_as_context(
     // Write new section header
     let new_end = hunk.new_start + hunk.new_count.saturating_sub(1);
     if hunk.new_count == 0 {
-        writeln!(file, "--- {} ----", hunk.new_start)?;
+        writeln!(writer, "--- {} ----", hunk.new_start)?;
     } else {
-        writeln!(file, "--- {},{} ----", hunk.new_start, new_end)?;
+        writeln!(writer, "--- {},{} ----", hunk.new_start, new_end)?;
     }
 
     // Write new section lines
     for op in &hunk.lines {
         match op {
-            LineOp::Context(s) => writeln!(file, "  {}", s)?,
+            LineOp::Context(s) => writeln!(writer, "  {}", s)?,
             LineOp::Delete(_) => {} // Skip deletes in new section
-            LineOp::Add(s) => writeln!(file, "+ {}", s)?,
+            LineOp::Add(s) => writeln!(writer, "+ {}", s)?,
         }
     }
 

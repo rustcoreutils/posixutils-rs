@@ -1,4 +1,13 @@
-use std::{fs::File, io, mem::take, path::PathBuf, str::from_utf8, time::SystemTime};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs::File,
+    hash::{Hash, Hasher},
+    io,
+    mem::take,
+    path::PathBuf,
+    str::from_utf8,
+    time::SystemTime,
+};
 
 use super::constants::COULD_NOT_UNWRAP_FILENAME;
 
@@ -6,6 +15,7 @@ use super::constants::COULD_NOT_UNWRAP_FILENAME;
 pub struct FileData<'a> {
     path: PathBuf,
     lines: Vec<&'a str>,
+    hashes: Vec<u64>, // Pre-computed line hashes for O(1) comparison
     modified: SystemTime,
     ends_with_newline: bool,
 }
@@ -23,9 +33,20 @@ impl<'a> FileData<'a> {
         let file = File::open(&path)?;
         let modified = file.metadata()?.modified()?;
 
+        // Pre-compute hashes for O(1) line comparison
+        let hashes: Vec<u64> = lines
+            .iter()
+            .map(|line| {
+                let mut hasher = DefaultHasher::new();
+                line.hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect();
+
         Ok(Self {
             path,
             lines,
+            hashes,
             modified,
             ends_with_newline,
         })
@@ -37,6 +58,10 @@ impl<'a> FileData<'a> {
 
     pub fn line(&self, index: usize) -> &str {
         self.lines[index]
+    }
+
+    pub fn line_hash(&self, index: usize) -> u64 {
+        self.hashes[index]
     }
 
     pub fn modified(&self) -> SystemTime {

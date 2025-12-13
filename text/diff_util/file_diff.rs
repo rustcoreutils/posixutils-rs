@@ -19,6 +19,16 @@ use std::{
     path::PathBuf,
 };
 
+/// Entry for histogram-based LCS algorithm.
+/// Stores occurrence counts and last positions for lines in both files.
+#[derive(Clone, Copy, Default)]
+struct HistEntry {
+    cnt1: i32,
+    pos1: i32,
+    cnt2: i32,
+    pos2: i32,
+}
+
 pub struct FileDiff<'a> {
     file1: &'a mut FileData<'a>,
     file2: &'a mut FileData<'a>,
@@ -219,6 +229,11 @@ impl<'a> FileDiff<'a> {
     /// Indices in lcs_indices will be the line number in file1 while values will
     /// be the corresponding line number in file2. If the value is -1, then the
     /// line is not part of the LCS.
+    ///
+    /// Optimizations:
+    /// - Uses pre-computed line hashes for O(1) initial comparison
+    /// - Uses hash-keyed HashMap with stack-allocated HistEntry structs
+    /// - Pre-allocates HashMap capacity to reduce rehashing
     pub fn histogram_lcs(
         file1: &FileData,
         file2: &FileData,
@@ -228,8 +243,12 @@ impl<'a> FileDiff<'a> {
         mut y1: usize,
         lcs_indices: &mut Vec<i32>,
     ) {
-        // collect common elements at the beginning
-        while (x0 < x1) && (y0 < y1) && (file1.line(x0) == file2.line(y0)) {
+        // Collect common elements at the beginning using hash comparison first
+        while (x0 < x1)
+            && (y0 < y1)
+            && file1.line_hash(x0) == file2.line_hash(y0)
+            && file1.line(x0) == file2.line(y0)
+        {
             lcs_indices[x0] = y0 as i32;
             x0 += 1;
             y0 += 1;
@@ -240,52 +259,96 @@ impl<'a> FileDiff<'a> {
             return;
         }
 
-        // collect common elements at the end
-        while (x0 < x1) && (y0 < y1) && (file1.line(x1 - 1) == file2.line(y1 - 1)) {
+        // Collect common elements at the end using hash comparison first
+        while (x0 < x1)
+            && (y0 < y1)
+            && file1.line_hash(x1 - 1) == file2.line_hash(y1 - 1)
+            && file1.line(x1 - 1) == file2.line(y1 - 1)
+        {
             lcs_indices[x1 - 1] = (y1 - 1) as i32;
             x1 -= 1;
             y1 -= 1;
         }
 
-        // build histogram
-        let mut hist: HashMap<&str, Vec<i32>> = HashMap::new();
+        if (x0 == x1) || (y0 == y1) {
+            return;
+        }
+
+        // Build histogram using hash-keyed map with pre-allocated capacity
+        let capacity = (x1 - x0) + (y1 - y0);
+        let mut hist: HashMap<u64, HistEntry> = HashMap::with_capacity(capacity);
+
         for i in x0..x1 {
-            if let Some(rec) = hist.get_mut(file1.line(i)) {
-                rec[0] += 1_i32;
-                rec[1] = i as i32;
-            } else {
-                hist.insert(file1.line(i), vec![1, i as i32, 0, -1]);
-            }
+            let h = file1.line_hash(i);
+            hist.entry(h)
+                .and_modify(|e| {
+                    e.cnt1 += 1;
+                    e.pos1 = i as i32;
+                })
+                .or_insert(HistEntry {
+                    cnt1: 1,
+                    pos1: i as i32,
+                    cnt2: 0,
+                    pos2: -1,
+                });
         }
+
         for i in y0..y1 {
-            if let Some(rec) = hist.get_mut(file2.line(i)) {
-                rec[2] += 1_i32;
-                rec[3] = i as i32;
-            } else {
-                hist.insert(file2.line(i), vec![0, -1, 1, i as i32]);
-            }
+            let h = file2.line_hash(i);
+            hist.entry(h)
+                .and_modify(|e| {
+                    e.cnt2 += 1;
+                    e.pos2 = i as i32;
+                })
+                .or_insert(HistEntry {
+                    cnt1: 0,
+                    pos1: -1,
+                    cnt2: 1,
+                    pos2: i as i32,
+                });
         }
 
-        // find lowest-occurrence item that appears in both files
-        let key = hist
+        // Find lowest-occurrence item that appears in both files
+        let pivot = hist
             .iter()
-            .filter(|(_k, v)| (v[0] > 0) && (v[2] > 0))
-            .min_by(|a, b| {
-                let c = a.1[0] + a.1[2];
-                let d = b.1[0] + b.1[2];
-                c.cmp(&d)
-            })
-            .map(|(k, _v)| *k);
+            .filter(|(_, v)| v.cnt1 > 0 && v.cnt2 > 0)
+            .min_by_key(|(_, v)| v.cnt1 + v.cnt2);
 
-        match key {
-            None => {}
-            Some(k) => {
-                let rec = hist.get(k).unwrap();
-                let x1_new = rec[1] as usize;
-                let y1_new = rec[3] as usize;
+        if let Some((hash, entry)) = pivot {
+            let x1_new = entry.pos1 as usize;
+            let y1_new = entry.pos2 as usize;
+
+            // Verify that lines actually match (handles hash collisions)
+            // This check is important for correctness
+            if file1.line(x1_new) == file2.line(y1_new) {
                 lcs_indices[x1_new] = y1_new as i32;
                 FileDiff::histogram_lcs(file1, file2, x0, x1_new, y0, y1_new, lcs_indices);
                 FileDiff::histogram_lcs(file1, file2, x1_new + 1, x1, y1_new + 1, y1, lcs_indices);
+            } else {
+                // Hash collision: need to find actual matching lines
+                // Fall back to scanning for a true match with this hash
+                let target_hash = *hash;
+                for i in x0..x1 {
+                    if file1.line_hash(i) == target_hash {
+                        for j in y0..y1 {
+                            if file2.line_hash(j) == target_hash && file1.line(i) == file2.line(j) {
+                                lcs_indices[i] = j as i32;
+                                FileDiff::histogram_lcs(file1, file2, x0, i, y0, j, lcs_indices);
+                                FileDiff::histogram_lcs(
+                                    file1,
+                                    file2,
+                                    i + 1,
+                                    x1,
+                                    j + 1,
+                                    y1,
+                                    lcs_indices,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+                // No actual match found despite hash match - rare case, skip pivot
             }
         }
     }

@@ -80,19 +80,21 @@ struct DiffTestHelper {
 
 impl DiffTestHelper {
     fn new(options: &str, file1_path: String, file2_path: String) -> Self {
-        let args = format!(
-            "run --release --bin diff --{} {} {}",
-            options, file1_path, file2_path
-        );
+        // Use the test binary directly instead of cargo run for performance
+        let binary = env!("CARGO_BIN_EXE_diff");
 
-        let args_list = args.split(' ').collect::<Vec<&str>>();
+        let mut args: Vec<&str> = Vec::new();
+        if !options.is_empty() {
+            args.extend(options.split_whitespace());
+        }
+        args.push(&file1_path);
+        args.push(&file2_path);
 
-        let output = std::process::Command::new("cargo")
-            .args(args_list)
-            // .stdout(output_file)
+        let output = std::process::Command::new(binary)
+            .args(&args)
             .stdout(Stdio::piped())
             .output()
-            .expect("Could not run cargo command!");
+            .expect("Could not run diff binary!");
 
         let content = String::from_utf8(output.stdout).expect("Failed to read output of Command!");
 

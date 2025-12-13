@@ -32,7 +32,7 @@ pub fn login_name() -> String {
     username
 }
 
-pub fn tty() -> String {
+pub fn tty() -> Option<String> {
     // Try to get the tty name from STDIN, STDOUT, STDERR in that order
     for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO].iter() {
         unsafe {
@@ -42,12 +42,12 @@ pub fn tty() -> String {
                 let c_str = CStr::from_ptr(c_str);
 
                 return match c_str.to_str() {
-                    Ok(s) => s.to_owned(),
-                    Err(e) => panic!("Failed to convert tty name to a Rust String: {}", e),
+                    Ok(s) => Some(s.to_owned()),
+                    Err(_) => None,
                 };
             }
         }
     }
 
-    panic!("Failed to get tty name from any file descriptor");
+    None
 }

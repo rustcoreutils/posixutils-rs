@@ -17,7 +17,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let ttyname = tty();
-
-    println!("{}", ttyname);
+    match tty() {
+        Some(ttyname) => println!("{}", ttyname),
+        None => {
+            println!("not a tty");
+            std::process::exit(1);
+        }
+    }
 }

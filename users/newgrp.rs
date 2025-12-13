@@ -503,7 +503,7 @@ fn logger(name: &str, gid: u32) {
     let loginname = plib::curuser::login_name();
 
     // Get the current tty device name
-    let tty = plib::curuser::tty();
+    let tty = plib::curuser::tty().unwrap_or_else(|| "???".to_string());
 
     // Log the message
     eprintln!(

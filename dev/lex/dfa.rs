@@ -35,6 +35,10 @@ pub struct DfaState {
     /// All accepting rules for this state, sorted by priority (lowest index first)
     /// Used for REJECT support
     pub accepting_rules: Vec<usize>,
+    /// For variable-length trailing context: rules for which this state
+    /// contains a main pattern end (where yytext should end)
+    /// Used for runtime tracking of where to truncate matched text
+    pub main_pattern_end_rules: Vec<usize>,
     /// The set of NFA states this DFA state represents (for debugging)
     #[allow(dead_code)]
     pub nfa_states: BTreeSet<usize>,
@@ -45,11 +49,13 @@ impl DfaState {
         nfa_states: BTreeSet<usize>,
         accepting: Option<usize>,
         accepting_rules: Vec<usize>,
+        main_pattern_end_rules: Vec<usize>,
     ) -> Self {
         DfaState {
             transitions: BTreeMap::new(),
             accepting,
             accepting_rules,
+            main_pattern_end_rules,
             nfa_states,
         }
     }
@@ -140,12 +146,14 @@ impl Dfa {
         let initial_nfa_states = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
         let initial_accepting = nfa.get_accepting(&initial_nfa_states);
         let initial_accepting_rules = nfa.get_all_accepting(&initial_nfa_states);
+        let initial_main_end_rules = get_main_pattern_end_rules(nfa, &initial_nfa_states);
 
         state_map.insert(initial_nfa_states.clone(), 0);
         dfa.states.push(DfaState::new(
             initial_nfa_states.clone(),
             initial_accepting,
             initial_accepting_rules,
+            initial_main_end_rules,
         ));
         worklist.push(initial_nfa_states);
 
@@ -177,11 +185,13 @@ impl Dfa {
                     let idx = dfa.states.len();
                     let accepting = nfa.get_accepting(&target_nfa_states);
                     let accepting_rules = nfa.get_all_accepting(&target_nfa_states);
+                    let main_end_rules = get_main_pattern_end_rules(nfa, &target_nfa_states);
                     state_map.insert(target_nfa_states.clone(), idx);
                     dfa.states.push(DfaState::new(
                         target_nfa_states.clone(),
                         accepting,
                         accepting_rules,
+                        main_end_rules,
                     ));
                     worklist.push(target_nfa_states);
                     idx
@@ -210,22 +220,25 @@ impl Dfa {
             };
         }
 
-        // Initial partition: separate accepting states by their full accepting rules list
-        // This ensures states with different secondary rules (for REJECT/start conditions) are kept separate
+        // Initial partition: separate accepting states by their full accepting rules list AND
+        // main pattern end rules. This ensures states with different semantic meaning are kept separate
         let mut partitions: Vec<BTreeSet<usize>> = Vec::new();
         let mut state_to_partition: Vec<usize> = vec![0; self.states.len()];
 
-        // Group states by their full accepting rules list (not just the primary rule)
-        // This preserves information needed for REJECT and start condition handling
-        let mut accepting_groups: BTreeMap<Vec<usize>, BTreeSet<usize>> = BTreeMap::new();
+        // Group states by (accepting_rules, main_pattern_end_rules) tuple
+        // This preserves information needed for REJECT, start conditions, and trailing context
+        let mut state_groups: BTreeMap<(Vec<usize>, Vec<usize>), BTreeSet<usize>> = BTreeMap::new();
         for (idx, state) in self.states.iter().enumerate() {
-            accepting_groups
-                .entry(state.accepting_rules.clone())
+            state_groups
+                .entry((
+                    state.accepting_rules.clone(),
+                    state.main_pattern_end_rules.clone(),
+                ))
                 .or_default()
                 .insert(idx);
         }
 
-        for (_, states) in accepting_groups {
+        for (_, states) in state_groups {
             let partition_idx = partitions.len();
             for &s in &states {
                 state_to_partition[s] = partition_idx;
@@ -332,6 +345,7 @@ impl Dfa {
                 transitions,
                 accepting: old_state.accepting,
                 accepting_rules: old_state.accepting_rules.clone(),
+                main_pattern_end_rules: old_state.main_pattern_end_rules.clone(),
                 nfa_states: partition.clone(),
             });
         }
@@ -358,6 +372,20 @@ impl Dfa {
     pub fn num_transitions(&self) -> usize {
         self.states.iter().map(|s| s.transitions.len()).sum()
     }
+}
+
+/// Get all main pattern end rules for a set of NFA states
+/// Used during DFA construction to track variable-length trailing context
+fn get_main_pattern_end_rules(nfa: &Nfa, nfa_states: &BTreeSet<usize>) -> Vec<usize> {
+    let mut rules: Vec<usize> = nfa_states
+        .iter()
+        .filter_map(|&state| nfa.main_pattern_end.get(&state))
+        .flatten()
+        .copied()
+        .collect();
+    rules.sort();
+    rules.dedup();
+    rules
 }
 
 /// Build the alphabet (set of all characters used in transitions) from an NFA

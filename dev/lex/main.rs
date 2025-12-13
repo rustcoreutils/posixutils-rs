@@ -84,6 +84,9 @@ pub struct ParsedRule {
     /// Fixed length of the main pattern (if computable)
     /// Used to determine yyleng when trailing context is present
     pub main_pattern_len: Option<usize>,
+    /// True if this rule has variable-length trailing context
+    /// (i.e., trailing context exists but main pattern length is not fixed)
+    pub has_variable_trailing_context: bool,
 }
 
 /// Parse all rule patterns and return them with their indices and start conditions
@@ -95,16 +98,19 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
             .map_err(|e| format!("Failed to parse regular expression '{}': {}", rule.ere, e))?;
 
         // Parse trailing context if present
-        let (trailing_context, main_pattern_len) = if let Some(ref tc) = rule.trailing_context {
-            let tc_hir = regex_syntax::parse(tc)
-                .map_err(|e| format!("Failed to parse trailing context '{}': {}", tc, e))?;
-            // Compute fixed length of MAIN pattern (for setting yyleng correctly)
-            // If main pattern has fixed length, we can set yyleng to that value
-            let main_len = compute_fixed_length(&hir);
-            (Some(tc_hir), main_len)
-        } else {
-            (None, None)
-        };
+        let (trailing_context, main_pattern_len, has_variable_tc) =
+            if let Some(ref tc) = rule.trailing_context {
+                let tc_hir = regex_syntax::parse(tc)
+                    .map_err(|e| format!("Failed to parse trailing context '{}': {}", tc, e))?;
+                // Compute fixed length of MAIN pattern (for setting yyleng correctly)
+                // If main pattern has fixed length, we can set yyleng to that value
+                let main_len = compute_fixed_length(&hir);
+                // Variable-length TC means main pattern doesn't have fixed length
+                let has_var_tc = main_len.is_none();
+                (Some(tc_hir), main_len, has_var_tc)
+            } else {
+                (None, None, false)
+            };
 
         rules.push(ParsedRule {
             hir,
@@ -113,6 +119,7 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
             bol_anchor: rule.bol_anchor,
             trailing_context,
             main_pattern_len,
+            has_variable_trailing_context: has_variable_tc,
         });
     }
 
@@ -225,23 +232,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // For simplicity, we build a single combined NFA/DFA but track which rules are active per condition
     // The code generator will handle selecting the right rules based on the current start condition
 
-    // Build rules in the format expected by NFA (HIR, rule_index)
-    // For rules with trailing context, concatenate main pattern with trailing context
-    let nfa_rules: Vec<(Hir, usize)> = rules
+    // Build rules in the format expected by NFA with trailing context support
+    // This tracks main pattern end states for variable-length trailing context
+    let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
         .iter()
-        .map(|r| {
-            if let Some(ref tc) = r.trailing_context {
-                // Concatenate main pattern with trailing context for matching
-                let combined = Hir::concat(vec![r.hir.clone(), tc.clone()]);
-                (combined, r.index)
-            } else {
-                (r.hir.clone(), r.index)
-            }
-        })
+        .map(|r| (r.hir.clone(), r.trailing_context.clone(), r.index))
         .collect();
 
     // Build NFA from rules using Thompson's construction
-    let nfa = Nfa::from_rules(&nfa_rules)?;
+    // This version properly tracks main pattern end states for trailing context
+    let nfa = Nfa::from_rules_with_trailing_context(&nfa_rules)?;
 
     // Convert NFA to DFA using subset construction
     let dfa = Dfa::from_nfa(&nfa);
@@ -263,6 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bol_anchor: r.bol_anchor,
             main_pattern_len: r.main_pattern_len,
             has_trailing_context: r.trailing_context.is_some(),
+            has_variable_trailing_context: r.has_variable_trailing_context,
         })
         .collect();
 

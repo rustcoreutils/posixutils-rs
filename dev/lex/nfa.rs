@@ -13,7 +13,7 @@
 //! into NFAs, which can then be converted to DFAs for efficient lexical analysis.
 
 use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind, Literal, Repetition};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Represents a transition in the NFA
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,6 +54,10 @@ pub struct Nfa {
     pub states: Vec<NfaState>,
     /// The start state
     pub start: usize,
+    /// For trailing context: maps NFA state index to rule indices for which
+    /// this state marks the end of the main pattern (where yytext should end)
+    /// Used for variable-length trailing context support
+    pub main_pattern_end: BTreeMap<usize, Vec<usize>>,
 }
 
 impl Nfa {
@@ -62,6 +66,7 @@ impl Nfa {
         let mut nfa = Nfa {
             states: Vec::new(),
             start: 0,
+            main_pattern_end: BTreeMap::new(),
         };
         nfa.add_state(); // Add start state
         nfa
@@ -80,6 +85,9 @@ impl Nfa {
     }
 
     /// Build an NFA from a list of rules (patterns with rule indices)
+    /// Note: Kept for backward compatibility and testing. Use from_rules_with_trailing_context
+    /// for rules that may have trailing context.
+    #[allow(dead_code)]
     pub fn from_rules(rules: &[(Hir, usize)]) -> Result<Self, String> {
         let mut nfa = Nfa::new();
         let start = nfa.start;
@@ -93,6 +101,52 @@ impl Nfa {
 
             // Mark rule's end as accepting with rule index
             nfa.states[rule_end].accepting = Some(*rule_idx);
+        }
+
+        Ok(nfa)
+    }
+
+    /// Build an NFA from rules with explicit trailing context support
+    /// Each rule is (main_pattern, optional_trailing_context, rule_index)
+    /// For rules with trailing context, tracks the main pattern end state
+    pub fn from_rules_with_trailing_context(
+        rules: &[(Hir, Option<Hir>, usize)],
+    ) -> Result<Self, String> {
+        let mut nfa = Nfa::new();
+        let start = nfa.start;
+
+        for (main_hir, trailing_opt, rule_idx) in rules {
+            match trailing_opt {
+                Some(trailing_hir) => {
+                    // Build NFA for main pattern
+                    let (main_start, main_end) = nfa.build_hir(main_hir)?;
+
+                    // Mark the main pattern end state for this rule
+                    // This is where yytext should end for variable-length TC
+                    nfa.main_pattern_end
+                        .entry(main_end)
+                        .or_default()
+                        .push(*rule_idx);
+
+                    // Build NFA for trailing context
+                    let (tc_start, tc_end) = nfa.build_hir(trailing_hir)?;
+
+                    // Connect main pattern end to trailing context start
+                    nfa.add_transition(main_end, Transition::Epsilon, tc_start);
+
+                    // Connect NFA start to main pattern start
+                    nfa.add_transition(start, Transition::Epsilon, main_start);
+
+                    // Mark trailing context end as accepting
+                    nfa.states[tc_end].accepting = Some(*rule_idx);
+                }
+                None => {
+                    // No trailing context - simple rule
+                    let (rule_start, rule_end) = nfa.build_hir(main_hir)?;
+                    nfa.add_transition(start, Transition::Epsilon, rule_start);
+                    nfa.states[rule_end].accepting = Some(*rule_idx);
+                }
+            }
         }
 
         Ok(nfa)

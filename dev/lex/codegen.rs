@@ -25,6 +25,9 @@ pub struct RuleMetadata {
     pub main_pattern_len: Option<usize>,
     /// True if this rule has trailing context
     pub has_trailing_context: bool,
+    /// True if this rule has variable-length trailing context
+    /// (main pattern length is not fixed, requires runtime tracking)
+    pub has_variable_trailing_context: bool,
 }
 
 /// Configuration for code generation
@@ -67,6 +70,7 @@ pub fn generate<W: Write>(
     write_char_class_table(output, dfa)?;
     write_rule_condition_table(output, lexinfo, config)?;
     write_rule_metadata_tables(output, lexinfo, config)?;
+    write_main_pattern_end_table(output, dfa, config)?;
     write_internal_definitions(output, lexinfo)?;
     write_helper_functions(output)?;
     write_yylex_function(output, dfa, lexinfo, config)?;
@@ -182,12 +186,16 @@ fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> i
     writeln!(output, "static int yy_full_match_pos = 0;")?;
     writeln!(output, "static int yy_full_match_state = 0;")?;
     writeln!(output, "static int yy_full_match_rule_idx = 0;")?;
+    writeln!(
+        output,
+        "static int yy_saved_buffer_pos = 0; /* Buffer pos before action */"
+    )?;
     writeln!(output)?;
 
     writeln!(output, "#ifndef REJECT")?;
     writeln!(
         output,
-        "#define REJECT {{ yy_reject_flag = 1; goto yy_find_next_match; }}"
+        "#define REJECT {{ yy_reject_flag = 1; yy_buffer_pos = yy_saved_buffer_pos; goto yy_find_next_match; }}"
     )?;
     writeln!(output, "#endif\n")?;
 
@@ -195,6 +203,18 @@ fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> i
     writeln!(output, "/* yymore support */")?;
     writeln!(output, "static int yy_more_flag = 0;")?;
     writeln!(output, "static int yy_more_len = 0;")?;
+    writeln!(output)?;
+
+    // Variable-length trailing context support
+    writeln!(output, "/* Variable-length trailing context support */")?;
+    writeln!(
+        output,
+        "static int yy_main_end_pos = 0; /* Position where main pattern ended */"
+    )?;
+    writeln!(
+        output,
+        "static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */"
+    )?;
     writeln!(output)?;
 
     writeln!(output, "#ifndef yymore")?;
@@ -523,6 +543,87 @@ fn write_rule_metadata_tables<W: Write>(
     Ok(())
 }
 
+/// Write table mapping DFA states to main pattern end rules (for variable-length trailing context)
+/// This allows runtime tracking of where the main pattern ends during DFA simulation
+fn write_main_pattern_end_table<W: Write>(
+    output: &mut W,
+    dfa: &Dfa,
+    config: &CodeGenConfig,
+) -> io::Result<()> {
+    // Check if any rules have variable-length trailing context
+    let has_var_tc = config
+        .rule_metadata
+        .iter()
+        .any(|m| m.has_variable_trailing_context);
+    if !has_var_tc {
+        return Ok(());
+    }
+
+    // Generate the table: yy_state_main_end[state] = rule whose main pattern ends at this state
+    // -1 means no main pattern ends at this state
+    // For simplicity, if multiple rules have main pattern ends at same state, we use the lowest index
+    writeln!(
+        output,
+        "/* Main pattern end table (for variable-length trailing context) */"
+    )?;
+    writeln!(
+        output,
+        "/* yy_state_main_end[state] = rule whose main pattern ends at this state (-1 = none) */"
+    )?;
+    write!(
+        output,
+        "static const short yy_state_main_end[YY_NUM_STATES] = {{ "
+    )?;
+
+    for (state_idx, state) in dfa.states.iter().enumerate() {
+        if state_idx > 0 {
+            write!(output, ", ")?;
+        }
+        // Get the first (lowest) rule that has main pattern end at this state
+        let main_end_rule = state.main_pattern_end_rules.first().copied().unwrap_or(!0);
+        if main_end_rule == !0 {
+            write!(output, "-1")?;
+        } else {
+            write!(output, "{}", main_end_rule)?;
+        }
+    }
+
+    writeln!(output, " }};\n")?;
+
+    // Also generate table marking which rules have variable-length trailing context
+    writeln!(output, "/* Variable trailing context flag table */")?;
+    writeln!(
+        output,
+        "/* yy_rule_var_tc[rule] = 1 if rule has variable-length trailing context */"
+    )?;
+    let num_rules = config.rule_metadata.len();
+    write!(
+        output,
+        "static const unsigned char yy_rule_var_tc[{}] = {{ ",
+        num_rules.max(1)
+    )?;
+    for (i, meta) in config.rule_metadata.iter().enumerate() {
+        if i > 0 {
+            write!(output, ", ")?;
+        }
+        write!(
+            output,
+            "{}",
+            if meta.has_variable_trailing_context {
+                1
+            } else {
+                0
+            }
+        )?;
+    }
+    if num_rules == 0 {
+        write!(output, "0")?;
+    }
+    writeln!(output, " }};\n")?;
+
+    Ok(())
+}
+
 fn write_internal_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Result<()> {
     if !lexinfo.internal_defs.is_empty() {
         writeln!(output, "/* User internal definitions */")?;
@@ -656,6 +757,21 @@ fn write_yylex_function<W: Write>(
     writeln!(output, "        yy_full_match_rule_idx = 0;")?;
     writeln!(output)?;
 
+    // Reset variable-length trailing context tracking
+    let has_var_tc = config
+        .rule_metadata
+        .iter()
+        .any(|m| m.has_variable_trailing_context);
+    if has_var_tc {
+        writeln!(
+            output,
+            "        /* Reset variable-length trailing context tracking */"
+        )?;
+        writeln!(output, "        yy_main_end_pos = yy_buffer_pos;")?;
+        writeln!(output, "        yy_main_end_rule = -1;")?;
+        writeln!(output)?;
+    }
+
     // Start from initial state (DFA state 0)
     writeln!(output, "        yy_current_state = 0;")?;
     writeln!(output, "        yy_cp = yy_buffer_pos;")?;
@@ -711,6 +827,33 @@ fn write_yylex_function<W: Write>(
     )?;
     writeln!(output, "                yy_last_accepting_cpos = yy_cp;")?;
     writeln!(output, "            }}")?;
+
+    // Track main pattern end for variable-length trailing context
+    if has_var_tc {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "            /* Track main pattern end for variable-length trailing context */"
+        )?;
+        writeln!(output, "            {{")?;
+        writeln!(
+            output,
+            "                short yy_me_rule = yy_state_main_end[yy_current_state];"
+        )?;
+        writeln!(
+            output,
+            "                if (yy_me_rule >= 0 && yy_rule_var_tc[yy_me_rule]) {{"
+        )?;
+        writeln!(
+            output,
+            "                    /* This state marks end of main pattern for a var TC rule */"
+        )?;
+        writeln!(output, "                    yy_main_end_pos = yy_cp;")?;
+        writeln!(output, "                    yy_main_end_rule = yy_me_rule;")?;
+        writeln!(output, "                }}")?;
+        writeln!(output, "            }}")?;
+    }
+
     writeln!(output, "        }}")?;
     writeln!(output)?;
 
@@ -816,6 +959,14 @@ fn write_yylex_function<W: Write>(
     )?;
     writeln!(output, "                    yy_current_state = 0;")?;
     writeln!(output, "                    yy_last_accepting_state = -1;")?;
+    // Reset variable-length trailing context tracking for re-run
+    if has_var_tc {
+        writeln!(
+            output,
+            "                    yy_main_end_pos = yy_buffer_pos;"
+        )?;
+        writeln!(output, "                    yy_main_end_rule = -1;")?;
+    }
     writeln!(
         output,
         "                    for (yy_cp = yy_buffer_pos; yy_cp < yy_last_accepting_cpos + 1 && yy_cp < yy_buffer_len; yy_cp++) {{"
@@ -846,6 +997,28 @@ fn write_yylex_function<W: Write>(
         "                            yy_last_accepting_state = yy_current_state;"
     )?;
     writeln!(output, "                        }}")?;
+    // Track main pattern end in re-run loop for variable-length trailing context
+    if has_var_tc {
+        writeln!(output, "                        {{")?;
+        writeln!(
+            output,
+            "                            short yy_me_rule = yy_state_main_end[yy_current_state];"
+        )?;
+        writeln!(
+            output,
+            "                            if (yy_me_rule >= 0 && yy_rule_var_tc[yy_me_rule]) {{"
+        )?;
+        writeln!(
+            output,
+            "                                yy_main_end_pos = yy_cp;"
+        )?;
+        writeln!(
+            output,
+            "                                yy_main_end_rule = yy_me_rule;"
+        )?;
+        writeln!(output, "                            }}")?;
+        writeln!(output, "                        }}")?;
+    }
     writeln!(output, "                    }}")?;
     writeln!(
         output,
@@ -957,12 +1130,27 @@ fn write_yylex_function<W: Write>(
         writeln!(output, "            }} else if (yy_main_len == -2) {{")?;
         writeln!(
             output,
-            "                /* Variable-length main pattern with trailing context - not fully supported */"
+            "                /* Variable-length main pattern with trailing context */"
         )?;
         writeln!(
             output,
-            "                /* Would need two-DFA approach to find where main pattern ends */"
+            "                /* Use tracked main pattern end position */"
         )?;
+        writeln!(
+            output,
+            "                if (yy_main_end_rule == yy_act && yy_main_end_pos > yy_buffer_pos) {{"
+        )?;
+        writeln!(
+            output,
+            "                    int yy_actual_main_len = yy_main_end_pos - yy_buffer_pos;"
+        )?;
+        writeln!(
+            output,
+            "                    yy_tc_adjustment = yyleng - yy_actual_main_len;"
+        )?;
+        writeln!(output, "                    yyleng = yy_actual_main_len;")?;
+        writeln!(output, "                    yytext[yyleng] = '\\0';")?;
+        writeln!(output, "                }}")?;
         writeln!(output, "            }}")?;
         writeln!(output, "        }}")?;
         writeln!(output)?;
@@ -978,9 +1166,13 @@ fn write_yylex_function<W: Write>(
     writeln!(output, "        }}")?;
     writeln!(output)?;
 
-    // Advance buffer position BEFORE executing action (but save for REJECT)
+    // Save buffer position for REJECT, then advance
     // For trailing context, only advance past the main pattern, not the trailing context
-    writeln!(output, "        /* Advance past matched text */")?;
+    writeln!(
+        output,
+        "        /* Save buffer position for REJECT, then advance past matched text */"
+    )?;
+    writeln!(output, "        yy_saved_buffer_pos = yy_buffer_pos;")?;
     if has_trailing_context {
         writeln!(output, "        yy_buffer_pos = yy_cp - yy_tc_adjustment;")?;
     } else {
@@ -1069,6 +1261,7 @@ mod tests {
             yyt_is_ptr: true,
             user_subs: vec![],
             rules: vec![],
+            table_sizes: HashMap::new(),
         }
     }
 

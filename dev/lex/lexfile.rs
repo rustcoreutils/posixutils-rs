@@ -51,6 +51,11 @@ pub struct LexInfo {
     pub yyt_is_ptr: bool,
     pub user_subs: Vec<String>,
     pub rules: Vec<LexRule>,
+    /// Table size declarations (%p, %n, %a, %e, %k, %o)
+    /// Key is the single character (p, n, a, e, k, o), value is the declared size
+    /// These are preserved for POSIX compliance but ignored in modern dynamic allocation
+    #[allow(dead_code)]
+    pub table_sizes: HashMap<char, usize>,
 }
 
 impl LexInfo {
@@ -64,6 +69,7 @@ impl LexInfo {
             yyt_is_ptr: state.yyt_is_ptr,
             user_subs: state.user_subs.clone(),
             rules: state.rules.clone(),
+            table_sizes: state.table_sizes.clone(),
         }
     }
 }
@@ -90,6 +96,10 @@ struct ParseState {
     yyt_is_ptr: bool,
     rules: Vec<LexRule>,
     tmp_rule: LexRule,
+    /// Table size declarations (%p, %n, %a, %e, %k, %o)
+    table_sizes: HashMap<char, usize>,
+    /// Current line number (1-based)
+    line_number: usize,
 }
 
 impl ParseState {
@@ -108,7 +118,19 @@ impl ParseState {
             yyt_is_ptr: true,
             rules: Vec::new(),
             tmp_rule: LexRule::new(),
+            table_sizes: HashMap::new(),
+            line_number: 0,
         }
+    }
+
+    /// Format an error message with line number
+    fn error(&self, msg: &str) -> String {
+        format!("lex: line {}: error: {}", self.line_number, msg)
+    }
+
+    /// Format a warning message with line number
+    fn warning(&self, msg: &str) -> String {
+        format!("lex: line {}: warning: {}", self.line_number, msg)
     }
 
     fn push_rule(
@@ -167,10 +189,20 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 state.yyt_is_ptr = true;
             }
             "%p" | "%n" | "%a" | "%e" | "%k" | "%o" => {
-                // do nothing; skip these
+                // Parse table size declarations (POSIX compliance)
+                // These are preserved but ignored (modern implementations use dynamic allocation)
+                let table_char = cmd.chars().nth(1).unwrap();
+                if let Some(size_str) = words.first() {
+                    if let Ok(size) = size_str.parse::<usize>() {
+                        state.table_sizes.insert(table_char, size);
+                    }
+                }
             }
             _ => {
-                eprintln!("Unexpected command in definitions section: {}", cmd);
+                eprintln!(
+                    "{}",
+                    state.warning(&format!("unknown command in definitions section: {}", cmd))
+                );
             }
         }
     } else if state.in_def || (first_char.is_whitespace() && line.len() > 1) {
@@ -180,21 +212,23 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
         let value = caps.get(2).unwrap().as_str();
         state.subs.insert(String::from(name), String::from(value));
     } else if !line.trim().is_empty() {
-        let msg = format!("Unexpected line in definitions section: {}", line);
-        return Err(msg);
+        return Err(state.error(&format!(
+            "unexpected line in definitions section: {}",
+            line.trim()
+        )));
     }
     Ok(())
 }
 
 // parse continued action line, counting open braces
-fn parse_braces(open_braces: u32, line: &str) -> Result<u32, &'static str> {
+fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
     let mut open_braces = open_braces;
     for c in line.chars() {
         if c == '{' {
             open_braces += 1;
         } else if c == '}' {
             if open_braces == 0 {
-                return Err("Unmatched closing brace");
+                return Err("unmatched closing brace in action".to_string());
             }
             open_braces -= 1;
         }
@@ -210,7 +244,7 @@ enum RegexType {
 }
 
 // find the end of the regex in a rule line, by matching [ and ( and { and }
-fn find_ere_end(line: &str) -> Result<usize, &'static str> {
+fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
 
@@ -235,17 +269,17 @@ fn find_ere_end(line: &str) -> Result<usize, &'static str> {
             ']' => {
                 inside_brackets = false;
                 if stack.pop() != Some(RegexType::Square) {
-                    return Err("Unmatched closing square bracket");
+                    return Err("unmatched closing square bracket in pattern".to_string());
                 }
             }
             ')' => {
                 if !inside_brackets && stack.pop() != Some(RegexType::Paren) {
-                    return Err("Unmatched closing parenthesis");
+                    return Err("unmatched closing parenthesis in pattern".to_string());
                 }
             }
             '}' => {
                 if !inside_brackets && stack.pop() != Some(RegexType::Curly) {
-                    return Err("Unmatched closing curly brace");
+                    return Err("unmatched closing curly brace in pattern".to_string());
                 }
             }
             _ => {
@@ -256,7 +290,7 @@ fn find_ere_end(line: &str) -> Result<usize, &'static str> {
         }
     }
 
-    Err("Unterminated regular expression")
+    Err("unterminated regular expression".to_string())
 }
 
 // translate lex-specific regex syntax to regex crate syntax
@@ -281,8 +315,7 @@ fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
             match state.subs.get(&sub_name) {
                 Some(value) => re.push_str(value),
                 None => {
-                    let msg = format!("Unknown substitution: {}", sub_name);
-                    return Err(msg);
+                    return Err(state.error(&format!("undefined substitution: {{{}}}", sub_name)));
                 }
             }
             in_sub = false;
@@ -434,6 +467,106 @@ fn find_trailing_context_slash(pattern: &str) -> Option<usize> {
     None
 }
 
+/// Count the number of unescaped trailing context operators / in a pattern
+fn count_trailing_context_slashes(pattern: &str) -> usize {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_brackets = false;
+    let mut in_quotes = false;
+    let mut escape_next = false;
+    let mut count = 0;
+
+    for ch in chars.iter() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' => escape_next = true,
+            '"' if !in_brackets => in_quotes = !in_quotes,
+            '[' if !in_quotes => in_brackets = true,
+            ']' if !in_quotes && in_brackets => in_brackets = false,
+            '/' if !in_brackets && !in_quotes => count += 1,
+            _ => {}
+        }
+    }
+
+    count
+}
+
+/// Validate pattern restrictions per POSIX specification
+/// Returns Ok(()) if valid, Err(message) if invalid
+fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_brackets = false;
+    let mut in_quotes = false;
+    let mut escape_next = false;
+    let mut dollar_positions: Vec<usize> = Vec::new();
+    let mut caret_positions: Vec<usize> = Vec::new();
+
+    // First pass: find trailing context operator
+    let has_trailing_context = find_trailing_context_slash(pattern).is_some();
+
+    // Second pass: find all unescaped ^ and $ positions
+    for (idx, ch) in chars.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' => escape_next = true,
+            '"' if !in_brackets => in_quotes = !in_quotes,
+            '[' if !in_quotes => in_brackets = true,
+            ']' if !in_quotes && in_brackets => in_brackets = false,
+            '^' if !in_brackets && !in_quotes => {
+                // ^ inside [] is a negation character, which is valid anywhere
+                caret_positions.push(idx);
+            }
+            '$' if !in_brackets && !in_quotes => {
+                dollar_positions.push(idx);
+            }
+            _ => {}
+        }
+    }
+
+    // Validate ^ positions - only valid at beginning
+    for pos in &caret_positions {
+        if *pos != 0 {
+            return Err(format!(
+                "'^' operator only valid at beginning of pattern, found at position {}",
+                pos
+            ));
+        }
+    }
+
+    // Validate $ positions - only valid at end (and not with trailing context)
+    for pos in &dollar_positions {
+        // $ must be at the very end of the pattern
+        if *pos != chars.len() - 1 {
+            return Err(format!(
+                "'$' operator only valid at end of pattern, found at position {}",
+                pos
+            ));
+        }
+        // $ cannot be used with trailing context
+        if has_trailing_context {
+            return Err(
+                "'$' cannot be used with trailing context '/'; $ is equivalent to /\\n".to_string(),
+            );
+        }
+    }
+
+    // Validate only one trailing context operator
+    let tc_count = count_trailing_context_slashes(pattern);
+    if tc_count > 1 {
+        return Err(format!(
+            "Only one trailing context operator '/' allowed per pattern, found {}",
+            tc_count
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parsed rule information
 struct ParsedRuleInfo {
     ere: String,
@@ -449,17 +582,20 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     // First extract any start conditions
     let (start_conditions, remaining) = extract_start_conditions(line);
 
-    let pos = find_ere_end(remaining)?;
+    let pos = find_ere_end(remaining).map_err(|e| state.error(&e))?;
     let ere_raw = String::from(&remaining[..pos]);
+
+    // Validate pattern restrictions per POSIX before processing
+    validate_pattern_restrictions(&ere_raw).map_err(|e| state.error(&e))?;
 
     // Parse anchoring and trailing context before translating
     let (bol_anchor, ere_main, trailing_context, _eol_anchor) =
         parse_anchoring_and_trailing_context(&ere_raw);
 
-    // Translate the main pattern
+    // Translate the main pattern (translate_ere already adds line numbers)
     let ere = translate_ere(state, &ere_main)?;
 
-    // Translate trailing context if present
+    // Translate trailing context if present (translate_ere already adds line numbers)
     let trailing_context = match trailing_context {
         Some(tc) => Some(translate_ere(state, &tc)?),
         None => None,
@@ -467,7 +603,7 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
 
     let action_ws = String::from(&remaining[pos..]);
     let action = action_ws.trim_start();
-    let open_braces = parse_braces(0, action)?;
+    let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
 
     Ok(ParsedRuleInfo {
         ere,
@@ -505,12 +641,15 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 state.section = LexSection::UserCode;
             }
             _ => {
-                eprintln!("Unexpected command in Rules section: {}", cmd);
+                eprintln!(
+                    "{}",
+                    state.warning(&format!("unknown command in rules section: {}", cmd))
+                );
             }
         }
     } else if state.open_braces > 0 {
         state.tmp_rule.action.push_str(line);
-        state.open_braces = parse_braces(state.open_braces, line)?;
+        state.open_braces = parse_braces(state.open_braces, line).map_err(|e| state.error(&e))?;
         if state.open_braces == 0 {
             let ere = state.tmp_rule.ere.clone();
             let action = state.tmp_rule.action.clone();
@@ -564,7 +703,8 @@ fn parse_user_line(state: &mut ParseState, line: &str) -> Result<(), &'static st
 pub fn parse(input: &[String]) -> Result<LexInfo, String> {
     let mut state = ParseState::new();
 
-    for line in input {
+    for (idx, line) in input.iter().enumerate() {
+        state.line_number = idx + 1; // Line numbers are 1-based
         match state.section {
             LexSection::Definitions => parse_def_line(&mut state, line)?,
             LexSection::Rules => parse_rule_line(&mut state, line)?,
@@ -764,5 +904,175 @@ int main(int argc, char *argv[])
 
         // Fourth rule: no explicit conditions
         assert!(lexinfo.rules[3].start_conditions.is_empty());
+    }
+
+    #[test]
+    fn test_pattern_validation_caret_at_beginning() {
+        // Valid: ^ at beginning
+        assert!(validate_pattern_restrictions("^abc").is_ok());
+        assert!(validate_pattern_restrictions("^[a-z]+").is_ok());
+
+        // Invalid: ^ in middle
+        let result = validate_pattern_restrictions("abc^def");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("'^' operator only valid at beginning"));
+    }
+
+    #[test]
+    fn test_pattern_validation_caret_in_brackets() {
+        // Valid: ^ inside brackets (negation) at any position
+        assert!(validate_pattern_restrictions("[^a-z]+").is_ok());
+        assert!(validate_pattern_restrictions("abc[^0-9]def").is_ok());
+    }
+
+    #[test]
+    fn test_pattern_validation_dollar_at_end() {
+        // Valid: $ at end
+        assert!(validate_pattern_restrictions("abc$").is_ok());
+        assert!(validate_pattern_restrictions("[a-z]+$").is_ok());
+
+        // Invalid: $ in middle
+        let result = validate_pattern_restrictions("abc$def");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("'$' operator only valid at end"));
+    }
+
+    #[test]
+    fn test_pattern_validation_dollar_with_trailing_context() {
+        // Invalid: $ cannot be used with trailing context
+        // Note: abc$/def would fail because $ is not at end (position 3 vs 7)
+        // So we test abc/def$ where $ is at end but trailing context exists
+        let result = validate_pattern_restrictions("abc/def$");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("'$' cannot be used with trailing context"));
+
+        // Also test $ in middle with trailing context - hits "$ not at end" first
+        let result2 = validate_pattern_restrictions("abc$/def");
+        assert!(result2.is_err());
+        assert!(result2
+            .unwrap_err()
+            .contains("'$' operator only valid at end"));
+    }
+
+    #[test]
+    fn test_pattern_validation_multiple_trailing_context() {
+        // Valid: one trailing context operator
+        assert!(validate_pattern_restrictions("abc/def").is_ok());
+
+        // Invalid: multiple trailing context operators
+        let result = validate_pattern_restrictions("abc/def/ghi");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Only one trailing context operator"));
+    }
+
+    #[test]
+    fn test_pattern_validation_slash_in_brackets() {
+        // Valid: / inside brackets is not a trailing context operator
+        assert!(validate_pattern_restrictions("[a/b]+").is_ok());
+        assert!(validate_pattern_restrictions("[/]+/abc").is_ok()); // One TC op, the second one
+    }
+
+    #[test]
+    fn test_pattern_validation_slash_in_quotes() {
+        // Valid: / inside quotes is not a trailing context operator
+        assert!(validate_pattern_restrictions("\"a/b\"").is_ok());
+        assert!(validate_pattern_restrictions("\"abc\"/def").is_ok()); // / after quote is TC
+    }
+
+    #[test]
+    fn test_pattern_validation_escaped_operators() {
+        // Valid: escaped ^ and $ and / are not operators
+        assert!(validate_pattern_restrictions(r"abc\^def").is_ok());
+        assert!(validate_pattern_restrictions(r"abc\$def").is_ok());
+        assert!(validate_pattern_restrictions(r"abc\/def\/ghi").is_ok());
+    }
+
+    #[test]
+    fn test_pattern_validation_parse_integration() {
+        // Test that invalid patterns are rejected during parsing
+        let test_content = r#"
+%%
+abc^def    return 1;
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let result = parse(&input);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("'^' operator only valid at beginning"));
+    }
+
+    #[test]
+    fn test_pattern_validation_multiple_tc_parse_integration() {
+        // Test that multiple trailing context operators are rejected during parsing
+        let test_content = r#"
+%%
+abc/def/ghi    return 1;
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let result = parse(&input);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Only one trailing context operator"));
+    }
+
+    #[test]
+    fn test_error_messages_include_line_numbers() {
+        // Test that error messages include line numbers
+        let test_content = r#"
+%%
+abc^def    return 1;
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let result = parse(&input);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        // Should contain "line 3:" since the error is on line 3
+        assert!(
+            err_msg.contains("line 3:"),
+            "Error message should contain line number: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("error:"),
+            "Error message should contain 'error:': {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_undefined_substitution_error_has_line_number() {
+        let test_content = r#"
+DIGIT    [0-9]
+%%
+{UNDEFINED}    return 1;
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let result = parse(&input);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("line 4:"),
+            "Error message should contain line number: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("undefined substitution"),
+            "Error message should mention undefined substitution: {}",
+            err_msg
+        );
     }
 }

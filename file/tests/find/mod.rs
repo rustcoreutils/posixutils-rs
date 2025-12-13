@@ -1,5 +1,6 @@
 use std::fs::{remove_file, File};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 use plib::testing::{run_test, TestPlan};
 
@@ -19,6 +20,42 @@ fn run_test_find(
         expected_err: String::from(expected_error),
         expected_exit_code,
     });
+}
+
+/// Run find and compare outputs after sorting lines (for order-independent comparison)
+fn run_test_find_sorted(
+    args: &[&str],
+    expected_lines: &[&str],
+    expected_error: &str,
+    expected_exit_code: i32,
+) {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let find_path = format!("{}/../target/release/find", project_root);
+
+    let output = Command::new(&find_path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute find");
+
+    let actual_stdout = String::from_utf8_lossy(&output.stdout);
+    let actual_stderr = String::from_utf8_lossy(&output.stderr);
+    let actual_exit_code = output.status.code().unwrap_or(-1);
+
+    // Sort actual output lines
+    let mut actual_lines: Vec<&str> = actual_stdout.lines().collect();
+    actual_lines.sort();
+
+    // Sort expected lines
+    let mut expected_sorted: Vec<&str> = expected_lines.to_vec();
+    expected_sorted.sort();
+
+    assert_eq!(
+        actual_lines, expected_sorted,
+        "stdout mismatch (sorted comparison)"
+    );
+    assert_eq!(actual_stderr, expected_error, "stderr mismatch");
+    assert_eq!(actual_exit_code, expected_exit_code, "exit code mismatch");
 }
 
 #[test]
@@ -54,14 +91,14 @@ fn find_name_test() {
 fn find_type_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-type", "f"];
+    let args: [&str; 3] = [&test_dir, "-type", "f"];
 
-    let expected_output = format!(
-        "{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n",
-        test_dir, test_dir, test_dir, test_dir
-    );
+    let file1 = format!("{}/empty_file.txt", test_dir);
+    let file2 = format!("{}/file with space.txt", test_dir);
+    let file3 = format!("{}/file1.txt", test_dir);
+    let file4 = format!("{}/rust_file.rs", test_dir);
 
-    run_test_find(&args, &expected_output, "", 0)
+    run_test_find_sorted(&args, &[&file1, &file2, &file3, &file4], "", 0)
 }
 
 #[test]
@@ -98,25 +135,26 @@ fn find_combination_test() {
 fn find_not_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "!", "-path", "*.txt"];
+    let args: [&str; 4] = [&test_dir, "!", "-path", "*.txt"];
 
-    let expected_output = format!("{}\n{}/rust_file.rs\n", test_dir, test_dir);
+    let dir = test_dir.clone();
+    let file = format!("{}/rust_file.rs", test_dir);
 
-    run_test_find(&args, &expected_output, "", 0)
+    run_test_find_sorted(&args, &[&dir, &file], "", 0)
 }
 
 #[test]
 fn find_or_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-path", "*.rs", "-o", "-path", "*.txt"];
+    let args: [&str; 6] = [&test_dir, "-path", "*.rs", "-o", "-path", "*.txt"];
 
-    let expected_output = format!(
-        "{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n",
-        test_dir, test_dir, test_dir, test_dir
-    );
+    let file1 = format!("{}/empty_file.txt", test_dir);
+    let file2 = format!("{}/file with space.txt", test_dir);
+    let file3 = format!("{}/file1.txt", test_dir);
+    let file4 = format!("{}/rust_file.rs", test_dir);
 
-    run_test_find(&args, &expected_output, "", 0)
+    run_test_find_sorted(&args, &[&file1, &file2, &file3, &file4], "", 0)
 }
 
 #[test]
@@ -163,14 +201,15 @@ fn find_no_group_test() {
 fn find_x_dev_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-xdev"];
+    let args: [&str; 2] = [&test_dir, "-xdev"];
 
-    let expected_output = format!(
-        "{}\n{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n",
-        test_dir, test_dir, test_dir, test_dir, test_dir
-    );
+    let dir = test_dir.clone();
+    let file1 = format!("{}/empty_file.txt", test_dir);
+    let file2 = format!("{}/file with space.txt", test_dir);
+    let file3 = format!("{}/file1.txt", test_dir);
+    let file4 = format!("{}/rust_file.rs", test_dir);
 
-    run_test_find(&args, &expected_output, "", 0)
+    run_test_find_sorted(&args, &[&dir, &file1, &file2, &file3, &file4], "", 0)
 }
 
 #[test]
@@ -186,14 +225,14 @@ fn find_perm_test() {
 fn find_links_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-links", "1"];
+    let args: [&str; 3] = [&test_dir, "-links", "1"];
 
-    let expected_output = format!(
-        "{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n",
-        test_dir, test_dir, test_dir, test_dir
-    );
+    let file1 = format!("{}/empty_file.txt", test_dir);
+    let file2 = format!("{}/file with space.txt", test_dir);
+    let file3 = format!("{}/file1.txt", test_dir);
+    let file4 = format!("{}/rust_file.rs", test_dir);
 
-    run_test_find(&args, &expected_output, "", 0)
+    run_test_find_sorted(&args, &[&file1, &file2, &file3, &file4], "", 0)
 }
 
 #[test]

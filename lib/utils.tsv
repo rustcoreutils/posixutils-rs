@@ -1,3 +1,4 @@
+# util <tab> source file or directory
 admin	sccs/admin.rs
 ar	dev/ar.rs
 asa	text/asa.rs

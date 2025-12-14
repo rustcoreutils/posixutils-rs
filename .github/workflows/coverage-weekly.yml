@@ -1,0 +1,48 @@
+name: Weekly coverage
+
+on:
+  schedule:
+    # GitHub Actions cron is UTC.
+    # Sundays 05:00 UTC = ~12:00am ET (standard time) / ~1:00am ET (daylight time).
+    - cron: "0 5 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        run: rustup update stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate LCOV (workspace)
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - name: Generate HTML report
+        run: cargo llvm-cov --workspace --all-features --html
+
+      - name: Upload HTML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+          # For public OSS + Codecov GitHub App, leave token unset.
+          # If Codecov ever complains "token required", add CODECOV_TOKEN
+          # in GitHub Secrets and uncomment:
+          # token: ${{ secrets.CODECOV_TOKEN }}

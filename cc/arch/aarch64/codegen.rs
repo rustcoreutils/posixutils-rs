@@ -19,29 +19,15 @@
 
 use crate::arch::aarch64::lir::{Aarch64Inst, CallTarget, Cond, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
-use crate::arch::codegen::{escape_string, is_variadic_function, CodeGenerator};
-use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::codegen::{
+    escape_string, is_variadic_function, BswapSize, CodeGenerator, UnaryOp,
+};
+use crate::arch::lir::{complex_fp_info, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeModifiers, TypeTable};
 use std::collections::HashMap;
-
-// ============================================================================
-// Complex Type Helpers
-// ============================================================================
-
-/// Get FpSize and element offset for a complex type's components.
-/// Returns (FpSize for each component, byte offset to imaginary part).
-fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
-    let base = types.complex_base(complex_typ);
-    match types.kind(base) {
-        TypeKind::Float => (FpSize::Single, 4),
-        TypeKind::Double => (FpSize::Double, 8),
-        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
-        _ => (FpSize::Double, 8),                    // fallback
-    }
-}
 
 // ============================================================================
 // AArch64 Code Generator
@@ -1154,13 +1140,8 @@ impl Aarch64CodeGen {
                 self.emit_compare(insn, *total_frame);
             }
 
-            Opcode::Neg => {
-                self.emit_neg(insn, *total_frame);
-            }
-
-            Opcode::Not => {
-                self.emit_not(insn, *total_frame);
-            }
+            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, *total_frame),
+            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, *total_frame),
 
             Opcode::Load => {
                 self.emit_load(insn, *total_frame, types);
@@ -1313,53 +1294,21 @@ impl Aarch64CodeGen {
                 self.emit_va_copy(insn, *total_frame);
             }
 
-            // ================================================================
             // Byte-swapping builtins
-            // ================================================================
-            Opcode::Bswap16 => {
-                self.emit_bswap16(insn, *total_frame);
-            }
-
-            Opcode::Bswap32 => {
-                self.emit_bswap32(insn, *total_frame);
-            }
-
-            Opcode::Bswap64 => {
-                self.emit_bswap64(insn, *total_frame);
-            }
+            Opcode::Bswap16 => self.emit_bswap(insn, *total_frame, BswapSize::B16),
+            Opcode::Bswap32 => self.emit_bswap(insn, *total_frame, BswapSize::B32),
+            Opcode::Bswap64 => self.emit_bswap(insn, *total_frame, BswapSize::B64),
 
             // ================================================================
             // Count trailing zeros builtins
-            // ================================================================
-            Opcode::Ctz32 => {
-                self.emit_ctz32(insn, *total_frame);
-            }
-
-            Opcode::Ctz64 => {
-                self.emit_ctz64(insn, *total_frame);
-            }
-
-            // ================================================================
+            Opcode::Ctz32 => self.emit_ctz(insn, *total_frame, OperandSize::B32),
+            Opcode::Ctz64 => self.emit_ctz(insn, *total_frame, OperandSize::B64),
             // Count leading zeros builtins
-            // ================================================================
-            Opcode::Clz32 => {
-                self.emit_clz32(insn, *total_frame);
-            }
-
-            Opcode::Clz64 => {
-                self.emit_clz64(insn, *total_frame);
-            }
-
-            // ================================================================
+            Opcode::Clz32 => self.emit_clz(insn, *total_frame, OperandSize::B32),
+            Opcode::Clz64 => self.emit_clz(insn, *total_frame, OperandSize::B64),
             // Population count builtins
-            // ================================================================
-            Opcode::Popcount32 => {
-                self.emit_popcount32(insn, *total_frame);
-            }
-
-            Opcode::Popcount64 => {
-                self.emit_popcount64(insn, *total_frame);
-            }
+            Opcode::Popcount32 => self.emit_popcount(insn, *total_frame, OperandSize::B32),
+            Opcode::Popcount64 => self.emit_popcount(insn, *total_frame, OperandSize::B64),
 
             Opcode::Alloca => {
                 self.emit_alloca(insn, *total_frame);
@@ -1822,7 +1771,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_neg(&mut self, insn: &Instruction, frame_size: i32) {
+    fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp, frame_size: i32) {
         let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
@@ -1840,39 +1789,17 @@ impl Aarch64CodeGen {
         };
 
         self.emit_move(src, work_reg, size, frame_size);
-        self.push_lir(Aarch64Inst::Neg {
-            size: op_size,
-            src: work_reg,
-            dst: work_reg,
-        });
-
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, size, frame_size);
-        }
-    }
-
-    fn emit_not(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-        let work_reg = match &dst_loc {
-            Loc::Reg(r) => *r,
-            _ => Reg::X9,
-        };
-
-        self.emit_move(src, work_reg, size, frame_size);
-        self.push_lir(Aarch64Inst::Mvn {
-            size: op_size,
-            src: work_reg,
-            dst: work_reg,
+        self.push_lir(match op {
+            UnaryOp::Neg => Aarch64Inst::Neg {
+                size: op_size,
+                src: work_reg,
+                dst: work_reg,
+            },
+            UnaryOp::Not => Aarch64Inst::Mvn {
+                size: op_size,
+                src: work_reg,
+                dst: work_reg,
+            },
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
@@ -3675,9 +3602,8 @@ impl Aarch64CodeGen {
     // Byte-swapping builtins
     // =========================================================================
 
-    /// Emit bswap16: Byte-swap a 16-bit value
-    /// ARM64 uses rev16 to reverse bytes within each 16-bit halfword
-    fn emit_bswap16(&mut self, insn: &Instruction, frame_size: i32) {
+    /// Emit byte-swap instruction for 16/32/64-bit values
+    fn emit_bswap(&mut self, insn: &Instruction, frame_size: i32, swap_size: BswapSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -3690,21 +3616,31 @@ impl Aarch64CodeGen {
         let src_loc = self.get_location(src);
         let dst_loc = self.get_location(dst);
         let scratch = Reg::X9;
+        let op_size = match swap_size {
+            BswapSize::B16 => OperandSize::B16,
+            BswapSize::B32 => OperandSize::B32,
+            BswapSize::B64 => OperandSize::B64,
+        };
+        // For moves, 16-bit uses 32-bit register operations
+        let mov_size = if matches!(swap_size, BswapSize::B16) {
+            OperandSize::B32
+        } else {
+            op_size
+        };
 
         // Load source into scratch register
-        match src_loc {
+        match &src_loc {
             Loc::Reg(r) => {
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(r),
+                    size: mov_size,
+                    src: GpOperand::Reg(*r),
                     dst: scratch,
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
                 let adjusted = frame_size + off;
                 self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B16,
+                    size: op_size,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: adjusted,
@@ -3714,43 +3650,51 @@ impl Aarch64CodeGen {
             }
             Loc::Imm(v) => {
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Imm(v),
+                    size: mov_size,
+                    src: GpOperand::Imm(*v),
                     dst: scratch,
                 });
             }
             _ => return,
         }
 
-        // rev16 reverses bytes within each halfword
-        self.push_lir(Aarch64Inst::Rev16 {
-            size: OperandSize::B32,
-            src: scratch,
-            dst: scratch,
-        });
-
-        // Mask to 16 bits
-        self.push_lir(Aarch64Inst::And {
-            size: OperandSize::B32,
-            src1: scratch,
-            src2: GpOperand::Imm(0xFFFF),
-            dst: scratch,
-        });
+        // Perform byte-swap: 16-bit uses Rev16+mask, 32/64-bit uses Rev
+        match swap_size {
+            BswapSize::B16 => {
+                self.push_lir(Aarch64Inst::Rev16 {
+                    size: OperandSize::B32,
+                    src: scratch,
+                    dst: scratch,
+                });
+                self.push_lir(Aarch64Inst::And {
+                    size: OperandSize::B32,
+                    src1: scratch,
+                    src2: GpOperand::Imm(0xFFFF),
+                    dst: scratch,
+                });
+            }
+            BswapSize::B32 | BswapSize::B64 => {
+                self.push_lir(Aarch64Inst::Rev {
+                    size: op_size,
+                    src: scratch,
+                    dst: scratch,
+                });
+            }
+        }
 
         // Store result
-        match dst_loc {
+        match &dst_loc {
             Loc::Reg(r) => {
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
+                    size: mov_size,
                     src: GpOperand::Reg(scratch),
-                    dst: r,
+                    dst: *r,
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
                 let adjusted = frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B16,
+                    size: op_size,
                     src: scratch,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
@@ -3762,174 +3706,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit bswap32: Byte-swap a 32-bit value
-    fn emit_bswap32(&mut self, insn: &Instruction, frame_size: i32) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-        let scratch = Reg::X9;
-
-        // Load source into scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(r),
-                    dst: scratch,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B32,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                    dst: scratch,
-                });
-            }
-            Loc::Imm(v) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Imm(v),
-                    dst: scratch,
-                });
-            }
-            _ => return,
-        }
-
-        // rev reverses all bytes in the register
-        self.push_lir(Aarch64Inst::Rev {
-            size: OperandSize::B32,
-            src: scratch,
-            dst: scratch,
-        });
-
-        // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(scratch),
-                    dst: r,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B32,
-                    src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit bswap64: Byte-swap a 64-bit value
-    fn emit_bswap64(&mut self, insn: &Instruction, frame_size: i32) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-        let scratch = Reg::X9;
-
-        // Load source into scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(r),
-                    dst: scratch,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B64,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                    dst: scratch,
-                });
-            }
-            Loc::Imm(v) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(v),
-                    dst: scratch,
-                });
-            }
-            _ => return,
-        }
-
-        // rev reverses all bytes in the 64-bit register
-        self.push_lir(Aarch64Inst::Rev {
-            size: OperandSize::B64,
-            src: scratch,
-            dst: scratch,
-        });
-
-        // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(scratch),
-                    dst: r,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
-    fn emit_ctz32(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_ctz(insn, frame_size, OperandSize::B32);
-    }
-
-    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
-    fn emit_ctz64(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_ctz(insn, frame_size, OperandSize::B64);
-    }
-
-    /// Emit count trailing zeros - shared implementation
-    /// On AArch64, CTZ is computed as CLZ(RBIT(x))
+    /// Emit count trailing zeros: on AArch64, CTZ = CLZ(RBIT(x))
     fn emit_ctz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -4014,18 +3791,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit __builtin_clz - count leading zeros for 32-bit value
-    fn emit_clz32(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_clz(insn, frame_size, OperandSize::B32);
-    }
-
-    /// Emit __builtin_clzl/__builtin_clzll - count leading zeros for 64-bit value
-    fn emit_clz64(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_clz(insn, frame_size, OperandSize::B64);
-    }
-
-    /// Emit count leading zeros - shared implementation
-    /// AArch64 has a direct CLZ instruction
+    /// Emit count leading zeros (AArch64 has a direct CLZ instruction)
     fn emit_clz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -4100,22 +3866,8 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit __builtin_popcount - population count for 32-bit value
-    fn emit_popcount32(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_popcount(insn, frame_size, OperandSize::B32);
-    }
-
-    /// Emit __builtin_popcountl/__builtin_popcountll - population count for 64-bit value
-    fn emit_popcount64(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_popcount(insn, frame_size, OperandSize::B64);
-    }
-
-    /// Emit population count - shared implementation
-    /// On AArch64, popcount is computed as:
-    /// 1. fmov d0, x0   ; move GP to SIMD register
-    /// 2. cnt v0.8b, v0.8b  ; count bits per byte
-    /// 3. addv b0, v0.8b  ; sum all bytes
-    /// 4. fmov w0, s0   ; move result back to GP
+    /// Emit population count. On AArch64:
+    /// fmov d0, x0; cnt v0.8b, v0.8b; addv b0, v0.8b; fmov w0, s0
     fn emit_popcount(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,

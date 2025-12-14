@@ -13,6 +13,29 @@ use crate::ir::{Function, Module, Opcode};
 use crate::target::Target;
 use crate::types::TypeTable;
 
+// ============================================================================
+// Shared Helper Types
+// ============================================================================
+
+/// Unary integer operation type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+/// Byte-swap size
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BswapSize {
+    B16,
+    B32,
+    B64,
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
 /// pcc version string for assembly header
 pub const PCC_VERSION: &str = env!("CARGO_PKG_VERSION");
 

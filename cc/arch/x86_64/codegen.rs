@@ -12,9 +12,11 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
-use crate::arch::codegen::{escape_string, is_variadic_function, CodeGenerator};
+use crate::arch::codegen::{
+    escape_string, is_variadic_function, BswapSize, CodeGenerator, UnaryOp,
+};
 #[allow(unused_imports)]
-use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{complex_fp_info, Directive, FpSize, Label, OperandSize, Symbol};
 #[allow(unused_imports)]
 use crate::arch::x86_64::lir::{
     CallTarget, GpOperand, IntCC, MemAddr, ShiftCount, X86Inst, XmmOperand,
@@ -23,24 +25,8 @@ use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeModifiers, TypeTable};
 use std::collections::HashMap;
-
-// ============================================================================
-// Complex Type Helpers
-// ============================================================================
-
-/// Get FpSize and element offset for a complex type's components.
-/// Returns (FpSize for each component, byte offset to imaginary part).
-fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
-    let base = types.complex_base(complex_typ);
-    match types.kind(base) {
-        TypeKind::Float => (FpSize::Single, 4),
-        TypeKind::Double => (FpSize::Double, 8),
-        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
-        _ => (FpSize::Double, 8),                    // fallback
-    }
-}
 
 // ============================================================================
 // x86-64 Code Generator
@@ -913,13 +899,8 @@ impl X86_64CodeGen {
                 self.emit_compare(insn);
             }
 
-            Opcode::Neg => {
-                self.emit_neg(insn);
-            }
-
-            Opcode::Not => {
-                self.emit_not(insn);
-            }
+            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg),
+            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not),
 
             Opcode::Load => {
                 self.emit_load(insn, types);
@@ -1036,53 +1017,21 @@ impl X86_64CodeGen {
                 self.emit_va_copy(insn);
             }
 
-            // ================================================================
             // Byte-swapping builtins
-            // ================================================================
-            Opcode::Bswap16 => {
-                self.emit_bswap16(insn);
-            }
-
-            Opcode::Bswap32 => {
-                self.emit_bswap32(insn);
-            }
-
-            Opcode::Bswap64 => {
-                self.emit_bswap64(insn);
-            }
+            Opcode::Bswap16 => self.emit_bswap(insn, BswapSize::B16),
+            Opcode::Bswap32 => self.emit_bswap(insn, BswapSize::B32),
+            Opcode::Bswap64 => self.emit_bswap(insn, BswapSize::B64),
 
             // ================================================================
             // Count trailing zeros builtins
-            // ================================================================
-            Opcode::Ctz32 => {
-                self.emit_ctz32(insn);
-            }
-
-            Opcode::Ctz64 => {
-                self.emit_ctz64(insn);
-            }
-
-            // ================================================================
+            Opcode::Ctz32 => self.emit_ctz(insn, OperandSize::B32),
+            Opcode::Ctz64 => self.emit_ctz(insn, OperandSize::B64),
             // Count leading zeros builtins
-            // ================================================================
-            Opcode::Clz32 => {
-                self.emit_clz32(insn);
-            }
-
-            Opcode::Clz64 => {
-                self.emit_clz64(insn);
-            }
-
-            // ================================================================
+            Opcode::Clz32 => self.emit_clz(insn, OperandSize::B32),
+            Opcode::Clz64 => self.emit_clz(insn, OperandSize::B64),
             // Population count builtins
-            // ================================================================
-            Opcode::Popcount32 => {
-                self.emit_popcount32(insn);
-            }
-
-            Opcode::Popcount64 => {
-                self.emit_popcount64(insn);
-            }
+            Opcode::Popcount32 => self.emit_popcount(insn, OperandSize::B32),
+            Opcode::Popcount64 => self.emit_popcount(insn, OperandSize::B64),
 
             Opcode::Alloca => {
                 self.emit_alloca(insn);
@@ -1476,7 +1425,7 @@ impl X86_64CodeGen {
         self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
     }
 
-    fn emit_neg(&mut self, insn: &Instruction) {
+    fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp) {
         let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
@@ -1493,37 +1442,15 @@ impl X86_64CodeGen {
             _ => Reg::Rax,
         };
         self.emit_move(src, work_reg, size);
-        // LIR: negate instruction
-        self.push_lir(X86Inst::Neg {
-            size: op_size,
-            dst: work_reg,
-        });
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, size);
-        }
-    }
-
-    fn emit_not(&mut self, insn: &Instruction) {
-        let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-        let work_reg = match &dst_loc {
-            Loc::Reg(r) => *r,
-            _ => Reg::Rax,
-        };
-        self.emit_move(src, work_reg, size);
-        // LIR: bitwise not instruction
-        self.push_lir(X86Inst::Not {
-            size: op_size,
-            dst: work_reg,
+        self.push_lir(match op {
+            UnaryOp::Neg => X86Inst::Neg {
+                size: op_size,
+                dst: work_reg,
+            },
+            UnaryOp::Not => X86Inst::Not {
+                size: op_size,
+                dst: work_reg,
+            },
         });
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
             self.emit_move_to_loc(work_reg, &dst_loc, size);
@@ -4183,9 +4110,8 @@ impl X86_64CodeGen {
     // Byte-swapping builtins
     // =========================================================================
 
-    /// Emit bswap16: Byte-swap a 16-bit value
-    /// x86-64 doesn't have bswap for 16-bit, use ror $8 (rotate right 8 bits)
-    fn emit_bswap16(&mut self, insn: &Instruction) {
+    /// Emit byte-swap instruction for 16/32/64-bit values
+    fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -4197,154 +4123,120 @@ impl X86_64CodeGen {
 
         let src_loc = self.get_location(src);
         let dst_loc = self.get_location(dst);
+        let op_size = match swap_size {
+            BswapSize::B16 => OperandSize::B16,
+            BswapSize::B32 => OperandSize::B32,
+            BswapSize::B64 => OperandSize::B64,
+        };
 
-        // Load source into %ax
-        match src_loc {
-            Loc::Reg(r) => {
-                if r != Reg::Rax {
-                    // LIR: zero-extend 16-bit to 32-bit
-                    self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::B16,
-                        dst_size: OperandSize::B32,
-                        src: GpOperand::Reg(r),
-                        dst: Reg::Rax,
-                    });
-                }
+        // Load source into RAX
+        match (&src_loc, &swap_size) {
+            // 16-bit: use zero-extending moves
+            (Loc::Reg(r), BswapSize::B16) if *r != Reg::Rax => {
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::B16,
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Reg(*r),
+                    dst: Reg::Rax,
+                });
             }
-            Loc::Stack(off) => {
-                // LIR: zero-extend load from stack
+            (Loc::Stack(off), BswapSize::B16) => {
                 self.push_lir(X86Inst::Movzx {
                     src_size: OperandSize::B16,
                     dst_size: OperandSize::B32,
                     src: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: off,
+                        offset: *off,
                     }),
                     dst: Reg::Rax,
                 });
             }
-            Loc::Imm(v) => {
-                // LIR: load immediate
+            // 32/64-bit: use regular moves
+            (Loc::Reg(r), _) if *r != Reg::Rax => {
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Imm(v),
+                    size: op_size,
+                    src: GpOperand::Reg(*r),
                     dst: GpOperand::Reg(Reg::Rax),
                 });
             }
+            (Loc::Stack(off), _) => {
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *off,
+                    }),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+            }
+            (Loc::Imm(v), _) => {
+                self.push_lir(X86Inst::Mov {
+                    size: if matches!(swap_size, BswapSize::B16) {
+                        OperandSize::B32
+                    } else {
+                        op_size
+                    },
+                    src: GpOperand::Imm(*v),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+            }
+            (Loc::Reg(_), _) => {} // Already in RAX
             _ => return,
         }
 
-        // Rotate 8 bits right to swap bytes
-        // LIR: ror
-        self.push_lir(X86Inst::Ror {
-            size: OperandSize::B16,
-            count: ShiftCount::Imm(8),
-            dst: Reg::Rax,
-        });
+        // Perform byte-swap: 16-bit uses ROR, 32/64-bit uses BSWAP
+        match swap_size {
+            BswapSize::B16 => {
+                self.push_lir(X86Inst::Ror {
+                    size: OperandSize::B16,
+                    count: ShiftCount::Imm(8),
+                    dst: Reg::Rax,
+                });
+            }
+            BswapSize::B32 | BswapSize::B64 => {
+                self.push_lir(X86Inst::Bswap {
+                    size: op_size,
+                    reg: Reg::Rax,
+                });
+            }
+        }
 
         // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::Rax {
-                    // LIR: zero-extend result
-                    self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::B16,
-                        dst_size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: r,
-                    });
-                }
+        match (&dst_loc, &swap_size) {
+            // 16-bit: use zero-extending move for register destination
+            (Loc::Reg(r), BswapSize::B16) if *r != Reg::Rax => {
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::B16,
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: *r,
+                });
             }
-            Loc::Stack(off) => {
-                // LIR: store 16-bit result
+            (Loc::Stack(off), BswapSize::B16) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B16,
                     src: GpOperand::Reg(Reg::Rax),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: off,
+                        offset: *off,
                     }),
                 });
             }
-            _ => {}
-        }
-    }
-
-    /// Emit bswap32: Byte-swap a 32-bit value
-    fn emit_bswap32(&mut self, insn: &Instruction) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-
-        // Load source into %eax
-        match src_loc {
-            Loc::Reg(r) => {
-                if r != Reg::Rax {
-                    // LIR: move 32-bit value to rax
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(r),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                // LIR: load 32-bit from stack
+            // 32/64-bit: use regular moves
+            (Loc::Reg(r), _) if *r != Reg::Rax => {
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    size: op_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(*r),
                 });
             }
-            Loc::Imm(v) => {
-                // LIR: load immediate
+            (Loc::Stack(off), _) => {
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Imm(v),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-            }
-            _ => return,
-        }
-
-        // Byte-swap 32-bit value
-        // LIR: bswap
-        self.push_lir(X86Inst::Bswap {
-            size: OperandSize::B32,
-            reg: Reg::Rax,
-        });
-
-        // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::Rax {
-                    // LIR: move result
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                // LIR: store to stack
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
+                    size: op_size,
                     src: GpOperand::Reg(Reg::Rax),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: off,
+                        offset: *off,
                     }),
                 });
             }
@@ -4352,93 +4244,7 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit bswap64: Byte-swap a 64-bit value
-    fn emit_bswap64(&mut self, insn: &Instruction) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-
-        // Load source into %rax
-        match src_loc {
-            Loc::Reg(r) => {
-                if r != Reg::Rax {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(r),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-            }
-            Loc::Imm(v) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(v),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-            }
-            _ => return,
-        }
-
-        // Byte-swap 64-bit value
-        self.push_lir(X86Inst::Bswap {
-            size: OperandSize::B64,
-            reg: Reg::Rax,
-        });
-
-        // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::Rax {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: off,
-                    }),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
-    fn emit_ctz32(&mut self, insn: &Instruction) {
-        self.emit_ctz(insn, OperandSize::B32);
-    }
-
-    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
-    fn emit_ctz64(&mut self, insn: &Instruction) {
-        self.emit_ctz(insn, OperandSize::B64);
-    }
-
-    /// Emit count trailing zeros - shared implementation
+    /// Emit count trailing zeros
     fn emit_ctz(&mut self, insn: &Instruction, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -4514,18 +4320,7 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit __builtin_clz - count leading zeros for 32-bit value
-    fn emit_clz32(&mut self, insn: &Instruction) {
-        self.emit_clz(insn, OperandSize::B32);
-    }
-
-    /// Emit __builtin_clzl/__builtin_clzll - count leading zeros for 64-bit value
-    fn emit_clz64(&mut self, insn: &Instruction) {
-        self.emit_clz(insn, OperandSize::B64);
-    }
-
-    /// Emit count leading zeros - shared implementation
-    /// CLZ(x) = operand_bits - 1 - BSR(x)
+    /// Emit count leading zeros: CLZ(x) = operand_bits - 1 - BSR(x)
     fn emit_clz(&mut self, insn: &Instruction, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -4611,17 +4406,7 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit __builtin_popcount - population count for 32-bit value
-    fn emit_popcount32(&mut self, insn: &Instruction) {
-        self.emit_popcount(insn, OperandSize::B32);
-    }
-
-    /// Emit __builtin_popcountl/__builtin_popcountll - population count for 64-bit value
-    fn emit_popcount64(&mut self, insn: &Instruction) {
-        self.emit_popcount(insn, OperandSize::B64);
-    }
-
-    /// Emit population count - shared implementation
+    /// Emit population count
     fn emit_popcount(&mut self, insn: &Instruction, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,

@@ -1,3 +1,7 @@
+#: text/patch.rs:116
+msgid "-R cannot be used with ed scripts"
+msgstr ""
+
 #: text/sed.rs:43
 msgid "A pathname of a file whose contents are read and edited."
 msgstr ""
@@ -88,8 +92,12 @@ msgstr ""
 msgid "Arguments for the utility"
 msgstr ""
 
-#: process/timeout.rs:53
+#: process/timeout.rs:50
 msgid "Arguments to pass to the utility."
+msgstr ""
+
+#: text/patch.rs:89
+msgid "Assume the patch was created with old and new files swapped"
 msgstr ""
 
 #: man/man.rs:115
@@ -110,6 +118,10 @@ msgstr ""
 
 #: fs/df.rs:147
 msgid "Capacity"
+msgstr ""
+
+#: text/patch.rs:49
+msgid "Change to directory before processing"
 msgstr ""
 
 #: cc/main.rs:89
@@ -178,18 +190,6 @@ msgstr ""
 msgid "Error deleting file"
 msgstr ""
 
-#: sys/getconf.rs:107 sys/getconf.rs:119 sys/getconf.rs:136
-msgid "Error: Unknown configuration string variable"
-msgstr ""
-
-#: sys/getconf.rs:158 sys/getconf.rs:171
-msgid "Error: Unknown path configuration variable"
-msgstr ""
-
-#: sys/getconf.rs:64 sys/getconf.rs:76
-msgid "Error: Unknown system configuration variable"
-msgstr ""
-
 #: display/more.rs:70
 msgid ""
 "Execute the more command(s) in the command arguments in the order specified"
@@ -229,6 +229,10 @@ msgstr ""
 msgid "File to be split"
 msgstr ""
 
+#: text/patch.rs:97
+msgid "File to patch"
+msgstr ""
+
 #: file/cat.rs:34
 msgid "Files to read as input. Use '-' or no-args for stdin"
 msgstr ""
@@ -261,6 +265,10 @@ msgstr ""
 msgid ""
 "If prefixed with '+', Display the current time in the given FORMAT, as in "
 "strftime(3). Otherwise, set the current time to the given string"
+msgstr ""
+
+#: text/patch.rs:73
+msgid "Ignore patches that appear to be already applied"
 msgstr ""
 
 #: file/tee.rs:23
@@ -328,6 +336,22 @@ msgstr ""
 msgid "Interpret the following operands as users"
 msgstr ""
 
+#: text/patch.rs:45
+msgid "Interpret the patch file as a context difference"
+msgstr ""
+
+#: text/patch.rs:69
+msgid "Interpret the patch file as a normal difference"
+msgstr ""
+
+#: text/patch.rs:93
+msgid "Interpret the patch file as a unified difference"
+msgstr ""
+
+#: text/patch.rs:57
+msgid "Interpret the patch file as an ed script"
+msgstr ""
+
 #: file/od.rs:72
 msgid "Interpret words (two-byte units) in hexadecimal"
 msgstr ""
@@ -392,7 +416,7 @@ msgstr ""
 msgid "June"
 msgstr ""
 
-#: sys/who.rs:161
+#: sys/who.rs:244
 msgid "LINE"
 msgstr ""
 
@@ -418,6 +442,14 @@ msgstr ""
 msgid "March"
 msgstr ""
 
+#: text/patch.rs:53
+msgid "Mark changes with #ifdef/#endif using DEFINE"
+msgstr ""
+
+#: text/patch.rs:65
+msgid "Match any sequence of blanks in the diff to any sequence in the file"
+msgstr ""
+
 #: text/sed.rs:31
 msgid "Match using extended regular expressions."
 msgstr ""
@@ -426,11 +458,11 @@ msgstr ""
 msgid "May"
 msgstr ""
 
-#: sys/ipcs.rs:459 sys/ipcs.rs:466
+#: sys/ipcs.rs:556
 msgid "Message Queue facility not in system."
 msgstr ""
 
-#: sys/ipcs.rs:411
+#: sys/ipcs.rs:505
 msgid "Message Queues"
 msgstr ""
 
@@ -450,6 +482,10 @@ msgstr ""
 msgid "Must supply a source and target for move"
 msgstr ""
 
+#: sys/who.rs:243
+msgid "NAME"
+msgstr ""
+
 #: process/env.rs:31
 msgid "NAME=VALUE pairs, the utility to invoke, and its arguments"
 msgstr ""
@@ -460,6 +496,10 @@ msgstr ""
 
 #: man/man.rs:150
 msgid "Names of the utilities or keywords to display documentation for"
+msgstr ""
+
+#: text/patch.rs:207
+msgid "No such file or directory"
 msgstr ""
 
 #: users/write.rs:49
@@ -502,7 +542,7 @@ msgstr ""
 msgid "Only show pages for the specified machine(1) architecture"
 msgstr ""
 
-#: process/timeout.rs:35
+#: process/timeout.rs:32
 msgid "Only time out the utility itself, not its descendants."
 msgstr ""
 
@@ -550,7 +590,7 @@ msgstr ""
 msgid "Preprocess only, output to stdout"
 msgstr ""
 
-#: process/timeout.rs:38
+#: process/timeout.rs:35
 msgid "Preserve the exit status of the utility."
 msgstr ""
 
@@ -574,29 +614,33 @@ msgstr ""
 msgid "Read only the specified number of bytes"
 msgstr ""
 
-#: sys/ipcrm.rs:58
+#: text/patch.rs:61
+msgid "Read the patch from PATCHFILE"
+msgstr ""
+
+#: sys/ipcrm.rs:70
 msgid "Remove the message queue identifier msgid from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:66
+#: sys/ipcrm.rs:78
 msgid ""
 "Remove the message queue identifier, created with key msgkey, from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:29
+#: sys/ipcrm.rs:40
 msgid "Remove the semaphore identifier semid from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:36
+#: sys/ipcrm.rs:48
 msgid ""
 "Remove the semaphore identifier, created with key semkey, from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:43
+#: sys/ipcrm.rs:55
 msgid "Remove the shared memory identifier shmid from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:50
+#: sys/ipcrm.rs:63
 msgid ""
 "Remove the shared memory identifier, created with key shmkey, from the system"
 msgstr ""
@@ -605,19 +649,19 @@ msgstr ""
 msgid "SCCS file names must begin with 's.'"
 msgstr ""
 
+#: text/patch.rs:41
+msgid "Save a copy of the original file with .orig suffix"
+msgstr ""
+
 #: file/od.rs:37
 msgid "Select the output format"
 msgstr ""
 
-#: sys/ipcs.rs:559
-msgid "Semaphore facility not in system."
-msgstr ""
-
-#: sys/ipcs.rs:575
+#: sys/ipcs.rs:655
 msgid "Semaphores"
 msgstr ""
 
-#: process/timeout.rs:41
+#: process/timeout.rs:38
 msgid ""
 "Send a SIGKILL signal if the child process has not terminated after the time "
 "period."
@@ -627,12 +671,8 @@ msgstr ""
 msgid "September"
 msgstr ""
 
-#: sys/ipcs.rs:502
+#: sys/ipcs.rs:587
 msgid "Shared Memory"
-msgstr ""
-
-#: sys/ipcs.rs:480
-msgid "Shared Memory facility not in system."
 msgstr ""
 
 #: file/od.rs:31
@@ -681,7 +721,7 @@ msgstr ""
 msgid "Specify the program files"
 msgstr ""
 
-#: process/timeout.rs:44
+#: process/timeout.rs:41
 msgid "Specify the signal to send when the time limit is reached."
 msgstr ""
 
@@ -697,6 +737,10 @@ msgstr ""
 
 #: display/more.rs:78
 msgid "Squeeze multiple blank lines into one"
+msgstr ""
+
+#: text/patch.rs:81
+msgid "Strip NUM leading path components from file names"
 msgstr ""
 
 #: datetime/cal.rs:56
@@ -717,7 +761,7 @@ msgstr ""
 msgid "Suppress underlining and bold"
 msgstr ""
 
-#: sys/who.rs:162
+#: sys/who.rs:245
 msgid "TIME"
 msgstr ""
 
@@ -743,7 +787,7 @@ msgid ""
 "specified size"
 msgstr ""
 
-#: process/timeout.rs:47
+#: process/timeout.rs:44
 msgid ""
 "The maximum amount of time to allow the utility to run, specified as a "
 "decimal number with an optional decimal fraction and an optional suffix."
@@ -751,6 +795,12 @@ msgstr ""
 
 #: display/more.rs:102
 msgid "The number of lines per screenful"
+msgstr ""
+
+#: text/patch.rs:37
+msgid ""
+"The patch utility reads a source (patch) file containing difference listings "
+"and applies those differences to a file."
 msgstr ""
 
 #: pathnames/pathchk.rs:43
@@ -767,16 +817,12 @@ msgstr ""
 msgid "The utility to be invoked"
 msgstr ""
 
-#: process/timeout.rs:50
+#: process/timeout.rs:47
 msgid "The utility to execute."
 msgstr ""
 
 #: process/xargs.rs:89
 msgid "Trace mode: print each command before execution"
-msgstr ""
-
-#: sys/who.rs:160
-msgid "USER"
 msgstr ""
 
 #: screen/tput.rs:91
@@ -867,8 +913,16 @@ msgstr ""
 msgid "Write nothing for differing files; return exit status only"
 msgstr ""
 
+#: text/patch.rs:77
+msgid "Write output to OUTFILE instead of patching in place"
+msgstr ""
+
 #: sys/ipcs.rs:45
 msgid "Write process number information"
+msgstr ""
+
+#: text/patch.rs:85
+msgid "Write rejects to REJECTFILE instead of .rej"
 msgstr ""
 
 #: file/cmp.rs:26
@@ -993,7 +1047,7 @@ msgstr ""
 msgid "df - report free storage space"
 msgstr ""
 
-#: text/diff.rs:31
+#: text/diff.rs:35
 msgid "diff - compare two files"
 msgstr ""
 
@@ -1090,7 +1144,7 @@ msgstr ""
 msgid "invalid flag"
 msgstr ""
 
-#: sys/ipcrm.rs:76 sys/ipcrm.rs:109 sys/ipcrm.rs:141
+#: sys/ipcrm.rs:88 sys/ipcrm.rs:121 sys/ipcrm.rs:153
 msgid "invalid key: IPC_PRIVATE"
 msgstr ""
 
@@ -1102,7 +1156,7 @@ msgstr ""
 msgid "io error"
 msgstr ""
 
-#: sys/ipcrm.rs:23
+#: sys/ipcrm.rs:34
 msgid ""
 "ipcrm - remove an XSI message queue, semaphore set, or shared memory segment "
 "identifier"
@@ -1152,12 +1206,16 @@ msgstr ""
 msgid "mesg - permit or deny messages"
 msgstr ""
 
-#: sys/ipcrm.rs:261
+#: sys/ipcrm.rs:273 sys/ipcrm.rs:294
 msgid "message queue id"
 msgstr ""
 
-#: sys/ipcrm.rs:242 sys/ipcrm.rs:249
+#: sys/ipcrm.rs:254 sys/ipcrm.rs:261 sys/ipcrm.rs:285
 msgid "message queue key"
+msgstr ""
+
+#: sys/ipcrm.rs:287 sys/ipcrm.rs:296
+msgid "message queues not supported on this system"
 msgstr ""
 
 #: misc/test.rs:596
@@ -1240,12 +1298,20 @@ msgstr ""
 msgid "od - dump files in octal and other formats"
 msgstr ""
 
+#: text/patch.rs:111
+msgid "only one of -c, -e, -n, -u may be specified"
+msgstr ""
+
 #: make/src/error_code.rs:82 make/src/special_target.rs:120
 msgid "parse error"
 msgstr ""
 
 #: text/paste.rs:25
 msgid "paste - merge corresponding or subsequent lines of files"
+msgstr ""
+
+#: text/patch.rs:36
+msgid "patch - apply changes to files"
 msgstr ""
 
 #: pathnames/pathchk.rs:20
@@ -1308,19 +1374,19 @@ msgstr ""
 msgid "sed - stream editor"
 msgstr ""
 
-#: sys/ipcrm.rs:200
+#: sys/ipcrm.rs:212
 msgid "semaphore id"
 msgstr ""
 
-#: sys/ipcrm.rs:181 sys/ipcrm.rs:188
+#: sys/ipcrm.rs:193 sys/ipcrm.rs:200
 msgid "semaphore key"
 msgstr ""
 
-#: sys/ipcrm.rs:229
+#: sys/ipcrm.rs:241
 msgid "shared memory id"
 msgstr ""
 
-#: sys/ipcrm.rs:210 sys/ipcrm.rs:217
+#: sys/ipcrm.rs:222 sys/ipcrm.rs:229
 msgid "shared memory key"
 msgstr ""
 
@@ -1396,7 +1462,7 @@ msgstr ""
 msgid "time - time a simple command or give resource usage"
 msgstr ""
 
-#: process/timeout.rs:33
+#: process/timeout.rs:30
 msgid "timeout - execute a utility with a time limit"
 msgstr ""
 
@@ -1456,11 +1522,19 @@ msgstr ""
 msgid "unlink - call the unlink function"
 msgstr ""
 
+#: sys/getconf.rs:62 sys/getconf.rs:98 sys/getconf.rs:110 sys/getconf.rs:167
+msgid "unrecognized variable"
+msgstr ""
+
 #: i18n/xgettext.rs:282
 msgid "unsupported file type"
 msgstr ""
 
-#: uucp/uucp.rs:30
+#: sys/getconf.rs:524
+msgid "unsupported specification"
+msgstr ""
+
+#: uucp/uucp.rs:28
 msgid "uucp - system-to-system copy"
 msgstr ""
 
@@ -1472,11 +1546,11 @@ msgstr ""
 msgid "uuencode - encode a binary file"
 msgstr ""
 
-#: uucp/uustat.rs:26
+#: uucp/uustat.rs:24
 msgid "uustat - uucp status inquiry and job control"
 msgstr ""
 
-#: uucp/uux.rs:29
+#: uucp/uux.rs:27
 msgid "uux - remote command execution"
 msgstr ""
 
@@ -1492,7 +1566,7 @@ msgstr ""
 msgid "who - display who is on the system"
 msgstr ""
 
-#: sys/who.rs:218
+#: sys/who.rs:301
 msgid "who: -f option not yet implemented"
 msgstr ""
 

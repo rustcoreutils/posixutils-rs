@@ -17,6 +17,7 @@ pub mod priority;
 pub mod regex;
 pub mod sccsfile;
 pub mod testing;
+pub mod user;
 pub mod utmpx;
 
 pub const BUFSZ: usize = 8 * 1024;

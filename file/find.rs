@@ -511,7 +511,7 @@ fn parse_size(s: &str) -> Result<(NumericComparison, bool), String> {
 /// Resolve username to UID
 fn resolve_user(name: &str) -> Result<u32, String> {
     // Try by name first
-    if let Some(user) = users::get_user_by_name(name) {
+    if let Some(user) = plib::user::get_by_name(name) {
         return Ok(user.uid());
     }
     // Try as numeric UID
@@ -522,7 +522,7 @@ fn resolve_user(name: &str) -> Result<u32, String> {
 /// Resolve group name to GID
 fn resolve_group(name: &str) -> Result<u32, String> {
     // Try by name first
-    if let Some(group) = users::get_group_by_name(name) {
+    if let Some(group) = plib::group::get_by_name(name) {
         return Ok(group.gid());
     }
     // Try as numeric GID
@@ -792,11 +792,11 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         }
         Primary::NoUser => {
             let uid = ctx.metadata.uid();
-            EvalResult::new(users::get_user_by_uid(uid).is_none())
+            EvalResult::new(plib::user::get_by_uid(uid).is_none())
         }
         Primary::NoGroup => {
             let gid = ctx.metadata.gid();
-            EvalResult::new(users::get_group_by_gid(gid).is_none())
+            EvalResult::new(plib::group::get_by_gid(gid).is_none())
         }
         Primary::Print => {
             let stdout = io::stdout();

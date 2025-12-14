@@ -91,6 +91,16 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Warn about unsupported wildcard expansion in remote destination
+    if !dest_is_local
+        && (dest_path.contains('*') || dest_path.contains('?') || dest_path.contains('['))
+    {
+        eprintln!(
+            "uucp: warning: wildcard expansion not supported for remote paths: {}",
+            dest_path
+        );
+    }
+
     // Determine if destination is a directory
     let is_dir = source_specs.len() > 1 || dest_path.ends_with('/');
 
@@ -115,6 +125,16 @@ fn main() -> ExitCode {
         }
 
         let src_is_local = is_local_system(&src_system);
+
+        // Warn about unsupported wildcard expansion in remote paths
+        if !src_is_local
+            && (src_path.contains('*') || src_path.contains('?') || src_path.contains('['))
+        {
+            eprintln!(
+                "uucp: warning: wildcard expansion not supported for remote paths: {}",
+                src_path
+            );
+        }
 
         // Expand source path
         let src_path_expanded = if src_is_local {

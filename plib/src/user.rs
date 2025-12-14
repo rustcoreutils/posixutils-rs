@@ -26,6 +26,23 @@ impl User {
     pub fn gid(&self) -> u32 {
         self.gid
     }
+
+    /// Construct a User from a raw libc::passwd pointer.
+    ///
+    /// # Safety
+    /// The pointer must be non-null and point to a valid libc::passwd struct.
+    unsafe fn from_raw(passwd: *const libc::passwd) -> Self {
+        let passwd_ref = &*passwd;
+        let name = CStr::from_ptr(passwd_ref.pw_name)
+            .to_string_lossy()
+            .to_string();
+
+        User {
+            name,
+            uid: passwd_ref.pw_uid,
+            gid: passwd_ref.pw_gid,
+        }
+    }
 }
 
 /// Look up a user by name.
@@ -37,17 +54,7 @@ pub fn get_by_name(name: &str) -> Option<User> {
         if passwd.is_null() {
             return None;
         }
-
-        let passwd_ref = &*passwd;
-        let user_name = CStr::from_ptr(passwd_ref.pw_name)
-            .to_string_lossy()
-            .to_string();
-
-        Some(User {
-            name: user_name,
-            uid: passwd_ref.pw_uid,
-            gid: passwd_ref.pw_gid,
-        })
+        Some(User::from_raw(passwd))
     }
 }
 
@@ -58,16 +65,6 @@ pub fn get_by_uid(uid: u32) -> Option<User> {
         if passwd.is_null() {
             return None;
         }
-
-        let passwd_ref = &*passwd;
-        let user_name = CStr::from_ptr(passwd_ref.pw_name)
-            .to_string_lossy()
-            .to_string();
-
-        Some(User {
-            name: user_name,
-            uid: passwd_ref.pw_uid,
-            gid: passwd_ref.pw_gid,
-        })
+        Some(User::from_raw(passwd))
     }
 }

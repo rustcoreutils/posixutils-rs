@@ -14,6 +14,7 @@
 //
 
 use crate::target::{Os, Target};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::fmt::{self, Write};
 
 // ============================================================================
@@ -117,6 +118,22 @@ impl fmt::Display for FpSize {
             FpSize::Single => write!(f, "f32"),
             FpSize::Double => write!(f, "f64"),
         }
+    }
+}
+
+// ============================================================================
+// Complex Type Helpers
+// ============================================================================
+
+/// Get FpSize and element offset for a complex type's components.
+/// Returns (FpSize for each component, byte offset to imaginary part).
+pub fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
+    let base = types.complex_base(complex_typ);
+    match types.kind(base) {
+        TypeKind::Float => (FpSize::Single, 4),
+        TypeKind::Double => (FpSize::Double, 8),
+        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
+        _ => (FpSize::Double, 8),                    // fallback
     }
 }
 

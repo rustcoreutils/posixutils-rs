@@ -157,7 +157,12 @@ fn process_file(
                 );
             } else {
                 let text = show_token(token, &strings);
-                if !text.starts_with('<') {
+                // Skip stream markers (e.g., <STREAM_BEGIN>, <STREAM_END>)
+                // but NOT the '<' operator or '<=', etc.
+                if !(text.starts_with("<STREAM")
+                    || text.starts_with("<ident")
+                    || text.starts_with("<special"))
+                {
                     print!("{} ", text);
                 }
             }
@@ -184,7 +189,12 @@ fn process_file(
                 );
             } else {
                 let text = show_token(token, &strings);
-                if !text.starts_with('<') {
+                // Skip stream markers (e.g., <STREAM_BEGIN>, <STREAM_END>)
+                // but NOT the '<' operator or '<=', etc.
+                if !(text.starts_with("<STREAM")
+                    || text.starts_with("<ident")
+                    || text.starts_with("<special"))
+                {
                     print!("{} ", text);
                 }
             }

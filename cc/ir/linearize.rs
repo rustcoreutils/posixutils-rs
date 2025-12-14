@@ -978,6 +978,83 @@ impl<'a> Linearizer<'a> {
     // Statement linearization
     // ========================================================================
 
+    /// Emit large struct return via hidden pointer (sret)
+    fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
+        let src_addr = self.linearize_lvalue(e);
+        let struct_bytes = struct_size as i64 / 8;
+        let mut byte_offset = 0i64;
+
+        while byte_offset < struct_bytes {
+            let temp = self.alloc_pseudo();
+            let temp_pseudo = Pseudo::reg(temp, temp.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(temp_pseudo);
+            }
+            self.emit(Instruction::load(
+                temp,
+                src_addr,
+                byte_offset,
+                self.types.long_id,
+                64,
+            ));
+            self.emit(Instruction::store(
+                temp,
+                sret_ptr,
+                byte_offset,
+                self.types.long_id,
+                64,
+            ));
+            byte_offset += 8;
+        }
+
+        self.emit(Instruction::ret_typed(
+            Some(sret_ptr),
+            self.types.void_ptr_id,
+            64,
+        ));
+    }
+
+    /// Emit two-register struct return (9-16 bytes)
+    fn emit_two_reg_return(&mut self, e: &Expr, ret_type: TypeId) {
+        let src_addr = self.linearize_lvalue(e);
+        let struct_size = self.types.size_bits(ret_type);
+
+        // Load first 8 bytes
+        let low_temp = self.alloc_pseudo();
+        let low_pseudo = Pseudo::reg(low_temp, low_temp.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(low_pseudo);
+        }
+        self.emit(Instruction::load(
+            low_temp,
+            src_addr,
+            0,
+            self.types.long_id,
+            64,
+        ));
+
+        // Load second portion (remaining bytes, up to 8)
+        let high_temp = self.alloc_pseudo();
+        let high_pseudo = Pseudo::reg(high_temp, high_temp.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(high_pseudo);
+        }
+        let high_size = std::cmp::min(64, struct_size - 64);
+        self.emit(Instruction::load(
+            high_temp,
+            src_addr,
+            8,
+            self.types.long_id,
+            high_size,
+        ));
+
+        // Emit return with both values and two_reg_return flag
+        let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
+        ret_insn.src.push(high_temp);
+        ret_insn.is_two_reg_return = true;
+        self.emit(ret_insn);
+    }
+
     fn linearize_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Empty => {}
@@ -1024,91 +1101,11 @@ impl<'a> Linearizer<'a> {
                 if let Some(e) = expr {
                     let typ = self.expr_type(e);
 
-                    // Check if this is a large struct return with hidden pointer
                     if let Some(sret_ptr) = self.struct_return_ptr {
-                        let struct_size = self.struct_return_size;
-                        // Get address of the struct being returned
-                        let src_addr = self.linearize_lvalue(e);
-
-                        // Copy the struct to the hidden return pointer
-                        // struct_size is in bits, so /8 gives bytes
-                        let struct_bytes = struct_size as i64 / 8;
-                        let mut byte_offset = 0i64;
-                        while byte_offset < struct_bytes {
-                            // Load 8 bytes from source
-                            let temp = self.alloc_pseudo();
-                            let temp_pseudo = Pseudo::reg(temp, temp.0);
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(temp_pseudo);
-                            }
-                            self.emit(Instruction::load(
-                                temp,
-                                src_addr,
-                                byte_offset,
-                                self.types.long_id,
-                                64,
-                            ));
-                            // Store to destination
-                            self.emit(Instruction::store(
-                                temp,
-                                sret_ptr,
-                                byte_offset,
-                                self.types.long_id,
-                                64,
-                            ));
-                            byte_offset += 8;
-                        }
-
-                        // Return the hidden pointer (ABI requirement)
-                        self.emit(Instruction::ret_typed(
-                            Some(sret_ptr),
-                            self.types.void_ptr_id,
-                            64,
-                        ));
+                        self.emit_sret_return(e, sret_ptr, self.struct_return_size);
                     } else if let Some(ret_type) = self.two_reg_return_type {
-                        // Two-register struct return (9-16 bytes)
-                        // Load struct data into two temps and emit ret with is_two_reg_return=true
-                        let src_addr = self.linearize_lvalue(e);
-                        let struct_size = self.types.size_bits(ret_type);
-
-                        // Load first 8 bytes
-                        let low_temp = self.alloc_pseudo();
-                        let low_pseudo = Pseudo::reg(low_temp, low_temp.0);
-                        if let Some(func) = &mut self.current_func {
-                            func.add_pseudo(low_pseudo);
-                        }
-                        self.emit(Instruction::load(
-                            low_temp,
-                            src_addr,
-                            0,
-                            self.types.long_id,
-                            64,
-                        ));
-
-                        // Load second portion (remaining bytes, up to 8)
-                        let high_temp = self.alloc_pseudo();
-                        let high_pseudo = Pseudo::reg(high_temp, high_temp.0);
-                        if let Some(func) = &mut self.current_func {
-                            func.add_pseudo(high_pseudo);
-                        }
-                        // Load up to 8 bytes for the high part (may be less for structs < 16 bytes)
-                        let high_size = std::cmp::min(64, struct_size - 64);
-                        self.emit(Instruction::load(
-                            high_temp,
-                            src_addr,
-                            8,
-                            self.types.long_id,
-                            high_size,
-                        ));
-
-                        // Emit return with both values and two_reg_return flag
-                        let mut ret_insn =
-                            Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
-                        ret_insn.src.push(high_temp); // High part in src[1]
-                        ret_insn.is_two_reg_return = true;
-                        self.emit(ret_insn);
+                        self.emit_two_reg_return(e, ret_type);
                     } else if self.types.is_complex(typ) {
-                        // Complex return: codegen expects an address (pointer to the complex value)
                         let addr = self.linearize_lvalue(e);
                         let typ_size = self.types.size_bits(typ);
                         self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));

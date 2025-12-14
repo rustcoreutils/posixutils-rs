@@ -115,6 +115,30 @@ impl Macro {
         }
     }
 
+    /// Create a predefined type macro (value is tokenized as identifiers)
+    /// This is used for macros like __PTRDIFF_TYPE__ that expand to type names
+    pub fn predefined_type(name: &str, value: &str) -> Self {
+        // Tokenize the value into separate identifier tokens
+        let words: Vec<&str> = value.split_whitespace().collect();
+        let body: Vec<MacroToken> = words
+            .into_iter()
+            .enumerate()
+            .map(|(i, word)| MacroToken {
+                typ: TokenType::Ident,
+                value: MacroTokenValue::Ident(word.to_string()),
+                whitespace: i > 0, // Add whitespace before all but the first token
+            })
+            .collect();
+        Self {
+            name: name.to_string(),
+            body,
+            is_function: false,
+            params: vec![],
+            _is_variadic: false,
+            builtin: None,
+        }
+    }
+
     /// Create a keyword alias macro (value is treated as an identifier/keyword)
     pub fn keyword_alias(name: &str, value: &str) -> Self {
         let body = if value.is_empty() {
@@ -380,8 +404,9 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Type definition macros (for <stdint.h> and <stddef.h>)
+        // These expand to type names, so they need to be tokenized properly
         for (name, value) in arch::get_type_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
+            self.define_macro(Macro::predefined_type(name, value));
         }
 
         // Fixed-width integer limit macros (for <stdint.h>)
@@ -788,6 +813,7 @@ impl<'a> Preprocessor<'a> {
                         if let TokenValue::Ident(id) = &tokens[i + 1].value {
                             if let Some(name) = idents.get_opt(*id) {
                                 // Check if it's a parameter
+                                let mut found_param = false;
                                 for param in params {
                                     if param.name == name {
                                         body.push(MacroToken {
@@ -795,9 +821,13 @@ impl<'a> Preprocessor<'a> {
                                             value: MacroTokenValue::Stringify(param.index),
                                             whitespace: token.pos.whitespace,
                                         });
-                                        i += 2;
-                                        continue;
+                                        found_param = true;
+                                        break;
                                     }
+                                }
+                                if found_param {
+                                    i += 2;
+                                    continue;
                                 }
                                 // Check for __VA_ARGS__
                                 if name == "__VA_ARGS__" {
@@ -1574,6 +1604,7 @@ impl<'a> Preprocessor<'a> {
                                 continue;
                             }
                             tok.pos = *pos;
+                            tok.pos.newline = false;
                             result.push(tok);
                         }
                     }
@@ -1599,6 +1630,7 @@ impl<'a> Preprocessor<'a> {
                                     continue;
                                 }
                                 tok.pos = *pos;
+                                tok.pos.newline = false;
                                 result.push(tok);
                             }
                         }
@@ -1665,6 +1697,7 @@ impl<'a> Preprocessor<'a> {
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .map(|mut t| {
                 t.pos = *pos;
+                t.pos.newline = false;
                 t
             })
             .collect();
@@ -1744,6 +1777,7 @@ impl<'a> Preprocessor<'a> {
     ) -> Token {
         let mut new_pos = *pos;
         new_pos.whitespace = mt.whitespace;
+        new_pos.newline = false;
 
         let value = match &mt.value {
             MacroTokenValue::Number(n) => TokenValue::Number(n.clone()),

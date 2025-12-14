@@ -19,29 +19,15 @@
 
 use crate::arch::aarch64::lir::{Aarch64Inst, CallTarget, Cond, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
-use crate::arch::codegen::{escape_string, is_variadic_function, CodeGenerator};
-use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::codegen::{
+    escape_string, is_variadic_function, BswapSize, CodeGenerator, UnaryOp,
+};
+use crate::arch::lir::{complex_fp_info, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeModifiers, TypeTable};
 use std::collections::HashMap;
-
-// ============================================================================
-// Complex Type Helpers
-// ============================================================================
-
-/// Get FpSize and element offset for a complex type's components.
-/// Returns (FpSize for each component, byte offset to imaginary part).
-fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
-    let base = types.complex_base(complex_typ);
-    match types.kind(base) {
-        TypeKind::Float => (FpSize::Single, 4),
-        TypeKind::Double => (FpSize::Double, 8),
-        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
-        _ => (FpSize::Double, 8),                    // fallback
-    }
-}
 
 // ============================================================================
 // AArch64 Code Generator
@@ -771,6 +757,323 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Emit return instruction: move return value and emit epilogue
+    fn emit_ret(
+        &mut self,
+        insn: &Instruction,
+        total_frame: i32,
+        callee_saved: &[Reg],
+        callee_saved_fp: &[VReg],
+        types: &TypeTable,
+    ) {
+        // Move return value to x0 (integer), v0 (float), or v0+v1 (complex) if present
+        if let Some(&src) = insn.src.first() {
+            let src_loc = self.get_location(src);
+            let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
+            let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
+
+            if insn.is_two_reg_return {
+                self.emit_move(src, Reg::X0, 64, total_frame);
+                if let Some(&src2) = insn.src.get(1) {
+                    self.emit_move(src2, Reg::X1, 64, total_frame);
+                }
+            } else if is_complex {
+                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+                match src_loc {
+                    Loc::Stack(offset) => {
+                        let actual_offset = self.stack_offset(total_frame, offset);
+                        self.push_lir(Aarch64Inst::Ldr {
+                            size: OperandSize::B64,
+                            dst: Reg::X9,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X29,
+                                offset: actual_offset,
+                            },
+                        });
+                        self.push_lir(Aarch64Inst::LdrFp {
+                            size: fp_size,
+                            dst: VReg::V0,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X9,
+                                offset: 0,
+                            },
+                        });
+                        self.push_lir(Aarch64Inst::LdrFp {
+                            size: fp_size,
+                            dst: VReg::V1,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X9,
+                                offset: imag_offset,
+                            },
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        self.push_lir(Aarch64Inst::LdrFp {
+                            size: fp_size,
+                            dst: VReg::V0,
+                            addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                        });
+                        self.push_lir(Aarch64Inst::LdrFp {
+                            size: fp_size,
+                            dst: VReg::V1,
+                            addr: MemAddr::BaseOffset {
+                                base: r,
+                                offset: imag_offset,
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            } else if is_fp {
+                self.emit_fp_move(src, VReg::V0, insn.size, total_frame);
+            } else {
+                self.emit_move(src, Reg::X0, insn.size, total_frame);
+            }
+        }
+
+        // Epilogue: reset SP to FP
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::X29),
+            dst: Reg::SP,
+        });
+
+        // Restore callee-saved registers
+        if total_frame > 16 {
+            let mut offset = 16;
+            let mut i = 0;
+            while i < callee_saved.len() {
+                if i + 1 < callee_saved.len() {
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::sp(),
+                            offset,
+                        },
+                        dst1: callee_saved[i],
+                        dst2: callee_saved[i + 1],
+                    });
+                    i += 2;
+                } else {
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::B64,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::sp(),
+                            offset,
+                        },
+                        dst: callee_saved[i],
+                    });
+                    i += 1;
+                }
+                offset += 16;
+            }
+
+            // Restore FP callee-saved registers (d8-d15)
+            let mut i = 0;
+            while i < callee_saved_fp.len() {
+                if i + 1 < callee_saved_fp.len() {
+                    self.push_lir(Aarch64Inst::LdpFp {
+                        size: FpSize::Double,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::sp(),
+                            offset,
+                        },
+                        dst1: callee_saved_fp[i],
+                        dst2: callee_saved_fp[i + 1],
+                    });
+                    i += 2;
+                } else {
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: FpSize::Double,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::sp(),
+                            offset,
+                        },
+                        dst: callee_saved_fp[i],
+                    });
+                    i += 1;
+                }
+                offset += 16;
+            }
+        }
+
+        // Restore fp/lr and deallocate stack
+        let dealloc = if total_frame > 0 { total_frame } else { 16 };
+        self.push_lir(Aarch64Inst::Ldp {
+            size: OperandSize::B64,
+            addr: MemAddr::PostIndex {
+                base: Reg::sp(),
+                offset: dealloc,
+            },
+            dst1: Reg::fp(),
+            dst2: Reg::lr(),
+        });
+        self.push_lir(Aarch64Inst::Ret);
+    }
+
+    /// Emit conditional branch: test condition and branch accordingly
+    /// Returns true if an early return was taken (for constant conditions)
+    fn emit_cbr(&mut self, insn: &Instruction, total_frame: i32) -> bool {
+        let Some(&cond) = insn.src.first() else {
+            return false;
+        };
+
+        let loc = self.get_location(cond);
+        let (scratch0, _) = Reg::scratch_regs();
+
+        match &loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: OperandSize::B64,
+                    src1: *r,
+                    src2: GpOperand::Imm(0),
+                });
+            }
+            Loc::Stack(offset) => {
+                let actual_offset = self.stack_offset(total_frame, *offset);
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: actual_offset,
+                    },
+                    dst: scratch0,
+                });
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: OperandSize::B64,
+                    src1: scratch0,
+                    src2: GpOperand::Imm(0),
+                });
+            }
+            Loc::Imm(v) => {
+                let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
+                if let Some(target) = target {
+                    self.push_lir(Aarch64Inst::B {
+                        target: Label::new(&self.current_fn, target.0),
+                    });
+                }
+                return true;
+            }
+            Loc::Global(name) => {
+                self.emit_load_global(name, scratch0, OperandSize::B64);
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: OperandSize::B64,
+                    src1: scratch0,
+                    src2: GpOperand::Imm(0),
+                });
+            }
+            Loc::VReg(v) => {
+                self.push_lir(Aarch64Inst::FcmpZero {
+                    size: FpSize::Double,
+                    src: *v,
+                });
+            }
+            Loc::FImm(f, _) => {
+                let target = if *f != 0.0 {
+                    insn.bb_true
+                } else {
+                    insn.bb_false
+                };
+                if let Some(target) = target {
+                    self.push_lir(Aarch64Inst::B {
+                        target: Label::new(&self.current_fn, target.0),
+                    });
+                }
+                return true;
+            }
+        }
+
+        if let Some(target) = insn.bb_true {
+            self.push_lir(Aarch64Inst::BCond {
+                cond: Cond::Ne,
+                target: Label::new(&self.current_fn, target.0),
+            });
+        }
+        if let Some(target) = insn.bb_false {
+            self.push_lir(Aarch64Inst::B {
+                target: Label::new(&self.current_fn, target.0),
+            });
+        }
+        false
+    }
+
+    /// Emit switch statement: compare value against cases and branch
+    fn emit_switch(&mut self, insn: &Instruction, total_frame: i32) {
+        let Some(val) = insn.target else { return };
+
+        let loc = self.get_location(val);
+        let (scratch0, scratch1) = Reg::scratch_regs();
+        let size = insn.size.max(32);
+        let op_size = OperandSize::from_bits(size);
+
+        // Move switch value to scratch0
+        match &loc {
+            Loc::Reg(r) => {
+                if *r != scratch0 {
+                    self.push_lir(Aarch64Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(*r),
+                        dst: scratch0,
+                    });
+                }
+            }
+            Loc::Stack(offset) => {
+                let actual_offset = self.stack_offset(total_frame, *offset);
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: op_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: actual_offset,
+                    },
+                    dst: scratch0,
+                });
+            }
+            Loc::Imm(v) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(*v),
+                    dst: scratch0,
+                });
+            }
+            Loc::Global(name) => {
+                self.emit_load_global(name, scratch0, op_size);
+            }
+            Loc::VReg(_) | Loc::FImm(..) => {}
+        }
+
+        // Generate comparisons for each case
+        for (case_val, target_bb) in &insn.switch_cases {
+            if *case_val >= 0 && *case_val < 4096 {
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: op_size,
+                    src1: scratch0,
+                    src2: GpOperand::Imm(*case_val),
+                });
+            } else {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(*case_val),
+                    dst: scratch1,
+                });
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: op_size,
+                    src1: scratch0,
+                    src2: GpOperand::Reg(scratch1),
+                });
+            }
+            self.push_lir(Aarch64Inst::BCond {
+                cond: Cond::Eq,
+                target: Label::new(&self.current_fn, target_bb.0),
+            });
+        }
+
+        if let Some(default_bb) = insn.switch_default {
+            self.push_lir(Aarch64Inst::B {
+                target: Label::new(&self.current_fn, default_bb.0),
+            });
+        }
+    }
+
     fn emit_insn(
         &mut self,
         insn: &Instruction,
@@ -788,366 +1091,21 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Ret => {
-                // Move return value to x0 (integer), v0 (float), or v0+v1 (complex) if present
-                // Two-register struct returns (9-16 bytes) go in X0+X1
-                if let Some(&src) = insn.src.first() {
-                    let src_loc = self.get_location(src);
-                    let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
-                    let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
-
-                    if insn.is_two_reg_return {
-                        // Two-register struct return: src[0] -> X0, src[1] -> X1
-                        self.emit_move(src, Reg::X0, 64, *total_frame);
-                        if let Some(&src2) = insn.src.get(1) {
-                            self.emit_move(src2, Reg::X1, 64, *total_frame);
-                        }
-                    } else if is_complex {
-                        // Complex return value: load real into V0, imag into V1
-                        // The source is a pointer to the complex value
-                        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
-                        match src_loc {
-                            Loc::Stack(offset) => {
-                                // Stack slot contains a pointer to the complex value
-                                let actual_offset = self.stack_offset(*total_frame, offset);
-                                self.push_lir(Aarch64Inst::Ldr {
-                                    size: OperandSize::B64,
-                                    dst: Reg::X9,
-                                    addr: MemAddr::BaseOffset {
-                                        base: Reg::X29,
-                                        offset: actual_offset,
-                                    },
-                                });
-                                self.push_lir(Aarch64Inst::LdrFp {
-                                    size: fp_size,
-                                    dst: VReg::V0,
-                                    addr: MemAddr::BaseOffset {
-                                        base: Reg::X9,
-                                        offset: 0,
-                                    },
-                                });
-                                self.push_lir(Aarch64Inst::LdrFp {
-                                    size: fp_size,
-                                    dst: VReg::V1,
-                                    addr: MemAddr::BaseOffset {
-                                        base: Reg::X9,
-                                        offset: imag_offset,
-                                    },
-                                });
-                            }
-                            Loc::Reg(r) => {
-                                // Address in register - load through it
-                                self.push_lir(Aarch64Inst::LdrFp {
-                                    size: fp_size,
-                                    dst: VReg::V0,
-                                    addr: MemAddr::BaseOffset { base: r, offset: 0 },
-                                });
-                                self.push_lir(Aarch64Inst::LdrFp {
-                                    size: fp_size,
-                                    dst: VReg::V1,
-                                    addr: MemAddr::BaseOffset {
-                                        base: r,
-                                        offset: imag_offset,
-                                    },
-                                });
-                            }
-                            _ => {}
-                        }
-                    } else if is_fp {
-                        // FP return value goes in V0
-                        self.emit_fp_move(src, VReg::V0, insn.size, *total_frame);
-                    } else {
-                        // Integer return value goes in X0
-                        self.emit_move(src, Reg::X0, insn.size, *total_frame);
-                    }
-                }
-
-                // Epilogue: reset SP to FP first (required for alloca support, since
-                // alloca may have moved SP during function execution)
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::X29),
-                    dst: Reg::SP,
-                });
-
-                // Restore callee-saved registers (now safe since SP == FP)
-                if *total_frame > 16 {
-                    let mut offset = 16;
-                    let mut i = 0;
-                    while i < callee_saved.len() {
-                        if i + 1 < callee_saved.len() {
-                            // LIR: ldp pair restore
-                            self.push_lir(Aarch64Inst::Ldp {
-                                size: OperandSize::B64,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::sp(),
-                                    offset,
-                                },
-                                dst1: callee_saved[i],
-                                dst2: callee_saved[i + 1],
-                            });
-                            i += 2;
-                        } else {
-                            // LIR: ldr single restore
-                            self.push_lir(Aarch64Inst::Ldr {
-                                size: OperandSize::B64,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::sp(),
-                                    offset,
-                                },
-                                dst: callee_saved[i],
-                            });
-                            i += 1;
-                        }
-                        offset += 16;
-                    }
-
-                    // Restore FP callee-saved registers (d8-d15)
-                    let mut i = 0;
-                    while i < callee_saved_fp.len() {
-                        if i + 1 < callee_saved_fp.len() {
-                            self.push_lir(Aarch64Inst::LdpFp {
-                                size: FpSize::Double,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::sp(),
-                                    offset,
-                                },
-                                dst1: callee_saved_fp[i],
-                                dst2: callee_saved_fp[i + 1],
-                            });
-                            i += 2;
-                        } else {
-                            self.push_lir(Aarch64Inst::LdrFp {
-                                size: FpSize::Double,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::sp(),
-                                    offset,
-                                },
-                                dst: callee_saved_fp[i],
-                            });
-                            i += 1;
-                        }
-                        offset += 16;
-                    }
-                }
-
-                // Restore fp/lr and deallocate stack
-                let fp = Reg::fp();
-                let lr = Reg::lr();
-                let dealloc = if *total_frame > 0 { *total_frame } else { 16 };
-                // LIR: ldp with post-increment to restore fp/lr and deallocate
-                self.push_lir(Aarch64Inst::Ldp {
-                    size: OperandSize::B64,
-                    addr: MemAddr::PostIndex {
-                        base: Reg::sp(),
-                        offset: dealloc,
-                    },
-                    dst1: fp,
-                    dst2: lr,
-                });
-                // LIR: ret
-                self.push_lir(Aarch64Inst::Ret);
+                self.emit_ret(insn, *total_frame, callee_saved, callee_saved_fp, types);
             }
 
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
-                    // LIR: unconditional branch
                     self.push_lir(Aarch64Inst::B {
                         target: Label::new(&self.current_fn, target.0),
                     });
                 }
             }
 
-            Opcode::Cbr => {
-                if let Some(&cond) = insn.src.first() {
-                    let loc = self.get_location(cond);
-                    let (scratch0, _) = Reg::scratch_regs();
-                    match &loc {
-                        Loc::Reg(r) => {
-                            // LIR: compare register with zero
-                            self.push_lir(Aarch64Inst::Cmp {
-                                size: OperandSize::B64,
-                                src1: *r,
-                                src2: GpOperand::Imm(0),
-                            });
-                        }
-                        Loc::Stack(offset) => {
-                            let actual_offset = self.stack_offset(*total_frame, *offset);
-                            // LIR: load from stack (FP-relative for alloca safety)
-                            self.push_lir(Aarch64Inst::Ldr {
-                                size: OperandSize::B64,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::X29,
-                                    offset: actual_offset,
-                                },
-                                dst: scratch0,
-                            });
-                            // LIR: compare with zero
-                            self.push_lir(Aarch64Inst::Cmp {
-                                size: OperandSize::B64,
-                                src1: scratch0,
-                                src2: GpOperand::Imm(0),
-                            });
-                        }
-                        Loc::Imm(v) => {
-                            if *v != 0 {
-                                if let Some(target) = insn.bb_true {
-                                    // LIR: unconditional branch (constant true)
-                                    self.push_lir(Aarch64Inst::B {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            } else {
-                                if let Some(target) = insn.bb_false {
-                                    // LIR: unconditional branch (constant false)
-                                    self.push_lir(Aarch64Inst::B {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            }
-                        }
-                        Loc::Global(name) => {
-                            self.emit_load_global(name, scratch0, OperandSize::B64);
-                            // LIR: compare with zero
-                            self.push_lir(Aarch64Inst::Cmp {
-                                size: OperandSize::B64,
-                                src1: scratch0,
-                                src2: GpOperand::Imm(0),
-                            });
-                        }
-                        Loc::VReg(v) => {
-                            // LIR: compare FP register with zero
-                            self.push_lir(Aarch64Inst::FcmpZero {
-                                size: FpSize::Double,
-                                src: *v,
-                            });
-                        }
-                        Loc::FImm(f, _) => {
-                            // FP immediate as condition - branch based on non-zero
-                            if *f != 0.0 {
-                                if let Some(target) = insn.bb_true {
-                                    // LIR: unconditional branch (constant true)
-                                    self.push_lir(Aarch64Inst::B {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            } else {
-                                if let Some(target) = insn.bb_false {
-                                    // LIR: unconditional branch (constant false)
-                                    self.push_lir(Aarch64Inst::B {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    if let Some(target) = insn.bb_true {
-                        // LIR: conditional branch (not equal = true)
-                        self.push_lir(Aarch64Inst::BCond {
-                            cond: Cond::Ne,
-                            target: Label::new(&self.current_fn, target.0),
-                        });
-                    }
-                    if let Some(target) = insn.bb_false {
-                        // LIR: unconditional branch (fallthrough to false)
-                        self.push_lir(Aarch64Inst::B {
-                            target: Label::new(&self.current_fn, target.0),
-                        });
-                    }
-                }
-            }
+            Opcode::Cbr => if self.emit_cbr(insn, *total_frame) {},
 
             Opcode::Switch => {
-                // Switch uses target as the value to switch on
-                if let Some(val) = insn.target {
-                    let loc = self.get_location(val);
-                    let (scratch0, scratch1) = Reg::scratch_regs();
-                    let size = insn.size.max(32);
-                    let op_size = OperandSize::from_bits(size);
-
-                    // Move switch value to scratch0
-                    match &loc {
-                        Loc::Reg(r) => {
-                            if *r != scratch0 {
-                                // LIR: move register to scratch
-                                self.push_lir(Aarch64Inst::Mov {
-                                    size: op_size,
-                                    src: GpOperand::Reg(*r),
-                                    dst: scratch0,
-                                });
-                            }
-                        }
-                        Loc::Stack(offset) => {
-                            let actual_offset = self.stack_offset(*total_frame, *offset);
-                            // LIR: load from stack (FP-relative for alloca safety)
-                            self.push_lir(Aarch64Inst::Ldr {
-                                size: op_size,
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::X29,
-                                    offset: actual_offset,
-                                },
-                                dst: scratch0,
-                            });
-                        }
-                        Loc::Imm(v) => {
-                            // LIR: move immediate
-                            self.push_lir(Aarch64Inst::Mov {
-                                size: op_size,
-                                src: GpOperand::Imm(*v),
-                                dst: scratch0,
-                            });
-                        }
-                        Loc::Global(name) => {
-                            self.emit_load_global(name, scratch0, op_size);
-                        }
-                        Loc::VReg(_) | Loc::FImm(..) => {
-                            // FP values shouldn't be used in switch statements
-                            // This is unreachable in valid C code
-                        }
-                    }
-
-                    // Generate comparisons for each case
-                    for (case_val, target_bb) in &insn.switch_cases {
-                        // Load case value to scratch1 if it doesn't fit in immediate
-                        if *case_val >= 0 && *case_val < 4096 {
-                            // LIR: compare with immediate
-                            self.push_lir(Aarch64Inst::Cmp {
-                                size: op_size,
-                                src1: scratch0,
-                                src2: GpOperand::Imm(*case_val),
-                            });
-                        } else {
-                            // LIR: load large constant
-                            self.push_lir(Aarch64Inst::Mov {
-                                size: op_size,
-                                src: GpOperand::Imm(*case_val),
-                                dst: scratch1,
-                            });
-                            // LIR: compare registers
-                            self.push_lir(Aarch64Inst::Cmp {
-                                size: op_size,
-                                src1: scratch0,
-                                src2: GpOperand::Reg(scratch1),
-                            });
-                        }
-                        // LIR: conditional branch on equal
-                        self.push_lir(Aarch64Inst::BCond {
-                            cond: Cond::Eq,
-                            target: Label::new(&self.current_fn, target_bb.0),
-                        });
-                    }
-
-                    // Jump to default
-                    if let Some(default_bb) = insn.switch_default {
-                        // LIR: unconditional branch to default
-                        self.push_lir(Aarch64Inst::B {
-                            target: Label::new(&self.current_fn, default_bb.0),
-                        });
-                    }
-                }
+                self.emit_switch(insn, *total_frame);
             }
 
             Opcode::Add
@@ -1182,13 +1140,8 @@ impl Aarch64CodeGen {
                 self.emit_compare(insn, *total_frame);
             }
 
-            Opcode::Neg => {
-                self.emit_neg(insn, *total_frame);
-            }
-
-            Opcode::Not => {
-                self.emit_not(insn, *total_frame);
-            }
+            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, *total_frame),
+            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, *total_frame),
 
             Opcode::Load => {
                 self.emit_load(insn, *total_frame, types);
@@ -1341,53 +1294,21 @@ impl Aarch64CodeGen {
                 self.emit_va_copy(insn, *total_frame);
             }
 
-            // ================================================================
             // Byte-swapping builtins
-            // ================================================================
-            Opcode::Bswap16 => {
-                self.emit_bswap16(insn, *total_frame);
-            }
-
-            Opcode::Bswap32 => {
-                self.emit_bswap32(insn, *total_frame);
-            }
-
-            Opcode::Bswap64 => {
-                self.emit_bswap64(insn, *total_frame);
-            }
+            Opcode::Bswap16 => self.emit_bswap(insn, *total_frame, BswapSize::B16),
+            Opcode::Bswap32 => self.emit_bswap(insn, *total_frame, BswapSize::B32),
+            Opcode::Bswap64 => self.emit_bswap(insn, *total_frame, BswapSize::B64),
 
             // ================================================================
             // Count trailing zeros builtins
-            // ================================================================
-            Opcode::Ctz32 => {
-                self.emit_ctz32(insn, *total_frame);
-            }
-
-            Opcode::Ctz64 => {
-                self.emit_ctz64(insn, *total_frame);
-            }
-
-            // ================================================================
+            Opcode::Ctz32 => self.emit_ctz(insn, *total_frame, OperandSize::B32),
+            Opcode::Ctz64 => self.emit_ctz(insn, *total_frame, OperandSize::B64),
             // Count leading zeros builtins
-            // ================================================================
-            Opcode::Clz32 => {
-                self.emit_clz32(insn, *total_frame);
-            }
-
-            Opcode::Clz64 => {
-                self.emit_clz64(insn, *total_frame);
-            }
-
-            // ================================================================
+            Opcode::Clz32 => self.emit_clz(insn, *total_frame, OperandSize::B32),
+            Opcode::Clz64 => self.emit_clz(insn, *total_frame, OperandSize::B64),
             // Population count builtins
-            // ================================================================
-            Opcode::Popcount32 => {
-                self.emit_popcount32(insn, *total_frame);
-            }
-
-            Opcode::Popcount64 => {
-                self.emit_popcount64(insn, *total_frame);
-            }
+            Opcode::Popcount32 => self.emit_popcount(insn, *total_frame, OperandSize::B32),
+            Opcode::Popcount64 => self.emit_popcount(insn, *total_frame, OperandSize::B64),
 
             Opcode::Alloca => {
                 self.emit_alloca(insn, *total_frame);
@@ -1850,7 +1771,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_neg(&mut self, insn: &Instruction, frame_size: i32) {
+    fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp, frame_size: i32) {
         let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
@@ -1868,39 +1789,17 @@ impl Aarch64CodeGen {
         };
 
         self.emit_move(src, work_reg, size, frame_size);
-        self.push_lir(Aarch64Inst::Neg {
-            size: op_size,
-            src: work_reg,
-            dst: work_reg,
-        });
-
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, size, frame_size);
-        }
-    }
-
-    fn emit_not(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-        let work_reg = match &dst_loc {
-            Loc::Reg(r) => *r,
-            _ => Reg::X9,
-        };
-
-        self.emit_move(src, work_reg, size, frame_size);
-        self.push_lir(Aarch64Inst::Mvn {
-            size: op_size,
-            src: work_reg,
-            dst: work_reg,
+        self.push_lir(match op {
+            UnaryOp::Neg => Aarch64Inst::Neg {
+                size: op_size,
+                src: work_reg,
+                dst: work_reg,
+            },
+            UnaryOp::Not => Aarch64Inst::Mvn {
+                size: op_size,
+                src: work_reg,
+                dst: work_reg,
+            },
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
@@ -3703,9 +3602,8 @@ impl Aarch64CodeGen {
     // Byte-swapping builtins
     // =========================================================================
 
-    /// Emit bswap16: Byte-swap a 16-bit value
-    /// ARM64 uses rev16 to reverse bytes within each 16-bit halfword
-    fn emit_bswap16(&mut self, insn: &Instruction, frame_size: i32) {
+    /// Emit byte-swap instruction for 16/32/64-bit values
+    fn emit_bswap(&mut self, insn: &Instruction, frame_size: i32, swap_size: BswapSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -3718,21 +3616,31 @@ impl Aarch64CodeGen {
         let src_loc = self.get_location(src);
         let dst_loc = self.get_location(dst);
         let scratch = Reg::X9;
+        let op_size = match swap_size {
+            BswapSize::B16 => OperandSize::B16,
+            BswapSize::B32 => OperandSize::B32,
+            BswapSize::B64 => OperandSize::B64,
+        };
+        // For moves, 16-bit uses 32-bit register operations
+        let mov_size = if matches!(swap_size, BswapSize::B16) {
+            OperandSize::B32
+        } else {
+            op_size
+        };
 
         // Load source into scratch register
-        match src_loc {
+        match &src_loc {
             Loc::Reg(r) => {
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(r),
+                    size: mov_size,
+                    src: GpOperand::Reg(*r),
                     dst: scratch,
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
                 let adjusted = frame_size + off;
                 self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B16,
+                    size: op_size,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: adjusted,
@@ -3742,43 +3650,51 @@ impl Aarch64CodeGen {
             }
             Loc::Imm(v) => {
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Imm(v),
+                    size: mov_size,
+                    src: GpOperand::Imm(*v),
                     dst: scratch,
                 });
             }
             _ => return,
         }
 
-        // rev16 reverses bytes within each halfword
-        self.push_lir(Aarch64Inst::Rev16 {
-            size: OperandSize::B32,
-            src: scratch,
-            dst: scratch,
-        });
-
-        // Mask to 16 bits
-        self.push_lir(Aarch64Inst::And {
-            size: OperandSize::B32,
-            src1: scratch,
-            src2: GpOperand::Imm(0xFFFF),
-            dst: scratch,
-        });
+        // Perform byte-swap: 16-bit uses Rev16+mask, 32/64-bit uses Rev
+        match swap_size {
+            BswapSize::B16 => {
+                self.push_lir(Aarch64Inst::Rev16 {
+                    size: OperandSize::B32,
+                    src: scratch,
+                    dst: scratch,
+                });
+                self.push_lir(Aarch64Inst::And {
+                    size: OperandSize::B32,
+                    src1: scratch,
+                    src2: GpOperand::Imm(0xFFFF),
+                    dst: scratch,
+                });
+            }
+            BswapSize::B32 | BswapSize::B64 => {
+                self.push_lir(Aarch64Inst::Rev {
+                    size: op_size,
+                    src: scratch,
+                    dst: scratch,
+                });
+            }
+        }
 
         // Store result
-        match dst_loc {
+        match &dst_loc {
             Loc::Reg(r) => {
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
+                    size: mov_size,
                     src: GpOperand::Reg(scratch),
-                    dst: r,
+                    dst: *r,
                 });
             }
             Loc::Stack(off) => {
-                // FP-relative for alloca safety
                 let adjusted = frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B16,
+                    size: op_size,
                     src: scratch,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
@@ -3790,174 +3706,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit bswap32: Byte-swap a 32-bit value
-    fn emit_bswap32(&mut self, insn: &Instruction, frame_size: i32) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-        let scratch = Reg::X9;
-
-        // Load source into scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(r),
-                    dst: scratch,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B32,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                    dst: scratch,
-                });
-            }
-            Loc::Imm(v) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Imm(v),
-                    dst: scratch,
-                });
-            }
-            _ => return,
-        }
-
-        // rev reverses all bytes in the register
-        self.push_lir(Aarch64Inst::Rev {
-            size: OperandSize::B32,
-            src: scratch,
-            dst: scratch,
-        });
-
-        // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(scratch),
-                    dst: r,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B32,
-                    src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit bswap64: Byte-swap a 64-bit value
-    fn emit_bswap64(&mut self, insn: &Instruction, frame_size: i32) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-        let scratch = Reg::X9;
-
-        // Load source into scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(r),
-                    dst: scratch,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B64,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                    dst: scratch,
-                });
-            }
-            Loc::Imm(v) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(v),
-                    dst: scratch,
-                });
-            }
-            _ => return,
-        }
-
-        // rev reverses all bytes in the 64-bit register
-        self.push_lir(Aarch64Inst::Rev {
-            size: OperandSize::B64,
-            src: scratch,
-            dst: scratch,
-        });
-
-        // Store result
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(scratch),
-                    dst: r,
-                });
-            }
-            Loc::Stack(off) => {
-                // FP-relative for alloca safety
-                let adjusted = frame_size + off;
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: scratch,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: adjusted,
-                    },
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
-    fn emit_ctz32(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_ctz(insn, frame_size, OperandSize::B32);
-    }
-
-    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
-    fn emit_ctz64(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_ctz(insn, frame_size, OperandSize::B64);
-    }
-
-    /// Emit count trailing zeros - shared implementation
-    /// On AArch64, CTZ is computed as CLZ(RBIT(x))
+    /// Emit count trailing zeros: on AArch64, CTZ = CLZ(RBIT(x))
     fn emit_ctz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -4042,18 +3791,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit __builtin_clz - count leading zeros for 32-bit value
-    fn emit_clz32(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_clz(insn, frame_size, OperandSize::B32);
-    }
-
-    /// Emit __builtin_clzl/__builtin_clzll - count leading zeros for 64-bit value
-    fn emit_clz64(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_clz(insn, frame_size, OperandSize::B64);
-    }
-
-    /// Emit count leading zeros - shared implementation
-    /// AArch64 has a direct CLZ instruction
+    /// Emit count leading zeros (AArch64 has a direct CLZ instruction)
     fn emit_clz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -4128,22 +3866,8 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit __builtin_popcount - population count for 32-bit value
-    fn emit_popcount32(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_popcount(insn, frame_size, OperandSize::B32);
-    }
-
-    /// Emit __builtin_popcountl/__builtin_popcountll - population count for 64-bit value
-    fn emit_popcount64(&mut self, insn: &Instruction, frame_size: i32) {
-        self.emit_popcount(insn, frame_size, OperandSize::B64);
-    }
-
-    /// Emit population count - shared implementation
-    /// On AArch64, popcount is computed as:
-    /// 1. fmov d0, x0   ; move GP to SIMD register
-    /// 2. cnt v0.8b, v0.8b  ; count bits per byte
-    /// 3. addv b0, v0.8b  ; sum all bytes
-    /// 4. fmov w0, s0   ; move result back to GP
+    /// Emit population count. On AArch64:
+    /// fmov d0, x0; cnt v0.8b, v0.8b; addv b0, v0.8b; fmov w0, s0
     fn emit_popcount(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
         let src = match insn.src.first() {
             Some(&s) => s,

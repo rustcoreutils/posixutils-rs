@@ -18,6 +18,7 @@ mod ctz;
 mod debug;
 mod has_feature;
 mod inline;
+mod macros;
 mod noreturn;
 mod optimization;
 mod popcount;

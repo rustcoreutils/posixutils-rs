@@ -139,6 +139,23 @@ impl Macro {
         }
     }
 
+    /// Create a predefined macro with a string value (for -D NAME="value")
+    pub fn predefined_string(name: &str, value: &str) -> Self {
+        let body = vec![MacroToken {
+            typ: TokenType::String,
+            value: MacroTokenValue::String(value.to_string()),
+            whitespace: false,
+        }];
+        Self {
+            name: name.to_string(),
+            body,
+            is_function: false,
+            params: vec![],
+            _is_variadic: false,
+            builtin: None,
+        }
+    }
+
     /// Create a keyword alias macro (value is treated as an identifier/keyword)
     pub fn keyword_alias(name: &str, value: &str) -> Self {
         let body = if value.is_empty() {
@@ -201,6 +218,8 @@ struct Conditional {
     state: CondState,
     /// Has this conditional had a true branch?
     had_true: bool,
+    /// Position of the #if/#ifdef/#ifndef directive
+    pos: Position,
 }
 
 // ============================================================================
@@ -253,6 +272,9 @@ pub struct Preprocessor<'a> {
 
     /// Compilation time string for __TIME__ (format: "hh:mm:ss")
     compile_time: String,
+
+    /// Preprocess call depth (0 = top level, >0 = recursive for macros/includes)
+    preprocess_depth: u32,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -348,6 +370,7 @@ impl<'a> Preprocessor<'a> {
             expanding: HashSet::new(),
             compile_date,
             compile_time,
+            preprocess_depth: 0,
         };
 
         // Initialize predefined macros
@@ -513,6 +536,7 @@ impl<'a> Preprocessor<'a> {
 
     /// Process tokens through the preprocessor
     pub fn preprocess(&mut self, tokens: Vec<Token>, idents: &mut IdentTable) -> Vec<Token> {
+        self.preprocess_depth += 1;
         let mut output = Vec::new();
         let mut iter = tokens.into_iter().peekable();
 
@@ -564,17 +588,17 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Check for unterminated conditionals (only at top level)
-        // During includes, the cond_stack is saved/restored by include_file
-        if self.include_depth == 0 && !self.cond_stack.is_empty() {
-            let msg = format!(
-                "{}: {} unterminated #if directive(s)",
-                self.current_file,
-                self.cond_stack.len()
-            );
-            let eof_pos = Position::new(0, 0, 0);
-            diag::warning(eof_pos, &msg);
+        // - preprocess_depth == 1: we're at the outermost preprocess call (not recursive)
+        // - include_depth == 0: we're not inside an included file
+        // Recursive calls happen during macro expansion and include file processing
+        if self.preprocess_depth == 1 && self.include_depth == 0 && !self.cond_stack.is_empty() {
+            // Report location of first unterminated #if directive
+            let first_pos = self.cond_stack.first().map(|c| c.pos).unwrap_or_default();
+            let msg = format!("{} unterminated #if directive(s)", self.cond_stack.len());
+            diag::warning(first_pos, &msg);
         }
 
+        self.preprocess_depth -= 1;
         output
     }
 
@@ -618,9 +642,9 @@ impl<'a> Preprocessor<'a> {
         match directive.as_str() {
             "define" => self.handle_define(iter, idents),
             "undef" => self.handle_undef(iter, idents),
-            "ifdef" => self.handle_ifdef(iter, idents),
-            "ifndef" => self.handle_ifndef(iter, idents),
-            "if" => self.handle_if(iter, idents),
+            "ifdef" => self.handle_ifdef(iter, idents, hash_token.pos),
+            "ifndef" => self.handle_ifndef(iter, idents, hash_token.pos),
+            "if" => self.handle_if(iter, idents, hash_token.pos),
             "elif" => self.handle_elif(iter, idents),
             "else" => self.handle_else(iter),
             "endif" => self.handle_endif(iter),
@@ -946,8 +970,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #ifdef
-    fn handle_ifdef<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
-    where
+    fn handle_ifdef<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &IdentTable,
+        pos: Position,
+    ) where
         I: Iterator<Item = Token>,
     {
         let defined = if let Some(token) = iter.next() {
@@ -969,12 +997,16 @@ impl<'a> Preprocessor<'a> {
         };
 
         self.skip_to_eol(iter);
-        self.push_conditional(defined);
+        self.push_conditional(defined, pos);
     }
 
     /// Handle #ifndef
-    fn handle_ifndef<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
-    where
+    fn handle_ifndef<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &IdentTable,
+        pos: Position,
+    ) where
         I: Iterator<Item = Token>,
     {
         let defined = if let Some(token) = iter.next() {
@@ -996,12 +1028,16 @@ impl<'a> Preprocessor<'a> {
         };
 
         self.skip_to_eol(iter);
-        self.push_conditional(!defined);
+        self.push_conditional(!defined, pos);
     }
 
     /// Handle #if
-    fn handle_if<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
-    where
+    fn handle_if<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &IdentTable,
+        pos: Position,
+    ) where
         I: Iterator<Item = Token>,
     {
         let tokens = self.collect_to_eol(iter);
@@ -1011,7 +1047,7 @@ impl<'a> Preprocessor<'a> {
             self.evaluate_expression(&tokens, idents)
         };
 
-        self.push_conditional(value);
+        self.push_conditional(value, pos);
     }
 
     /// Handle #elif
@@ -1091,7 +1127,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Push a new conditional
-    fn push_conditional(&mut self, condition: bool) {
+    fn push_conditional(&mut self, condition: bool, pos: Position) {
         // If we're already skipping, new conditional starts in skip mode
         let parent_skipping = self.is_skipping();
 
@@ -1107,6 +1143,7 @@ impl<'a> Preprocessor<'a> {
             state,
             // When parent is skipping, mark had_true so #else/#elif won't activate
             had_true: parent_skipping || condition,
+            pos,
         });
     }
 
@@ -2418,18 +2455,41 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 // ============================================================================
 // Public API
 // ============================================================================
-
-/// Preprocess tokens
+/// Preprocess tokens with command-line defines and undefines
 ///
 /// This is the main entry point for preprocessing.
 /// Takes lexer output and returns preprocessed tokens.
-pub fn preprocess(
+pub fn preprocess_with_defines(
     tokens: Vec<Token>,
     target: &Target,
     idents: &mut IdentTable,
     filename: &str,
+    defines: &[String],
+    undefines: &[String],
 ) -> Vec<Token> {
     let mut pp = Preprocessor::new(target, filename);
+
+    // Process -D defines
+    for def in defines {
+        if let Some(eq_pos) = def.find('=') {
+            // -DNAME=VALUE
+            let name = &def[..eq_pos];
+            let value = &def[eq_pos + 1..];
+            // Create macro with string value (treated as tokens during expansion)
+            let mac = Macro::predefined_string(name, value);
+            pp.define_macro(mac);
+        } else {
+            // -DNAME (define to 1)
+            let mac = Macro::predefined(def, Some("1"));
+            pp.define_macro(mac);
+        }
+    }
+
+    // Process -U undefines
+    for undef in undefines {
+        pp.undef_macro(undef);
+    }
+
     pp.preprocess(tokens, idents)
 }
 

@@ -489,13 +489,19 @@ impl<'a> Linearizer<'a> {
 
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
+            let modifiers = self.types.modifiers(declarator.typ);
+
+            // Skip typedef declarations - they don't define storage
+            if modifiers.contains(TypeModifiers::TYPEDEF) {
+                continue;
+            }
+
             // Skip function declarations (they're just forward declarations for external functions)
             if self.types.kind(declarator.typ) == TypeKind::Function {
                 continue;
             }
 
             // Skip extern declarations - they don't define storage
-            let modifiers = self.types.modifiers(declarator.typ);
             if modifiers.contains(TypeModifiers::EXTERN) {
                 continue;
             }
@@ -767,7 +773,7 @@ impl<'a> Linearizer<'a> {
         let modifiers = self.types.modifiers(func.return_type);
         let is_static = modifiers.contains(TypeModifiers::STATIC);
         let is_inline = modifiers.contains(TypeModifiers::INLINE);
-        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
+        let _is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
         // Track non-static inline functions for semantic restriction checks
@@ -779,8 +785,11 @@ impl<'a> Linearizer<'a> {
         // For linkage:
         // - static inline: internal linkage (same as static)
         // - inline (without extern): inline definition only, internal linkage
-        // - extern inline: external linkage (provides external definition)
-        ir_func.is_static = is_static || (is_inline && !is_extern);
+        // - extern inline: per C99, provides external definition, but since we
+        //   don't support function inlining, treat as internal to avoid
+        //   duplicate symbol errors when same inline function is defined in
+        //   multiple translation units
+        ir_func.is_static = is_static || is_inline;
         ir_func.is_noreturn = is_noreturn;
 
         let ret_kind = self.types.kind(func.return_type);

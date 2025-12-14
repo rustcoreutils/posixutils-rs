@@ -301,9 +301,9 @@ impl<'a> Parser<'a> {
         self.idents.get(id)
     }
 
-    /// Skip StreamBegin/StreamEnd tokens
+    /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
     pub fn skip_stream_tokens(&mut self) {
-        while self.peek() == TokenType::StreamBegin || self.peek() == TokenType::StreamEnd {
+        while self.peek() == TokenType::StreamBegin {
             self.advance();
         }
     }
@@ -508,6 +508,43 @@ impl<'a> Parser<'a> {
                 }
                 self.advance();
             }
+        }
+    }
+
+    /// Skip GCC extended inline assembly statement
+    /// Format: __asm__ [volatile] ( "template" [: outputs [: inputs [: clobbers]]] );
+    fn skip_asm_statement(&mut self) {
+        self.advance(); // consume __asm/__asm__
+
+        // Skip optional 'volatile' or '__volatile__'
+        if self.peek() == TokenType::Ident {
+            if let Some(name) = self.get_ident_name(self.current()) {
+                if name == "volatile" || name == "__volatile__" {
+                    self.advance();
+                }
+            }
+        }
+
+        // Expect '('
+        if !self.is_special(b'(') {
+            return;
+        }
+        self.advance(); // consume '('
+
+        // Skip contents until matching ')', handling nested parens
+        let mut depth = 1;
+        while depth > 0 && !self.is_eof() {
+            if self.is_special(b'(') {
+                depth += 1;
+            } else if self.is_special(b')') {
+                depth -= 1;
+            }
+            self.advance();
+        }
+
+        // Consume trailing semicolon
+        if self.is_special(b';') {
+            self.advance();
         }
     }
 
@@ -1520,6 +1557,46 @@ impl<'a> Parser<'a> {
             result_id = self.types.intern(Type::pointer(result_id));
         }
 
+        // Handle function pointer declarators: void (*)(int), int (*)(void), etc.
+        // Syntax: return_type (*)(param_types)
+        if self.is_special(b'(') {
+            // Look ahead to check for (*) pattern indicating function pointer
+            let saved_pos = self.pos;
+            self.advance(); // consume '('
+            if self.is_special(b'*') {
+                self.advance(); // consume '*'
+                if self.is_special(b')') {
+                    self.advance(); // consume ')'
+                                    // Now expect parameter list
+                    if self.is_special(b'(') {
+                        self.advance(); // consume '('
+                                        // Parse parameter types (simplified - just skip them for now)
+                                        // Full implementation would build proper function type
+                        let mut param_depth = 1;
+                        while param_depth > 0 && !self.is_eof() {
+                            if self.is_special(b'(') {
+                                param_depth += 1;
+                            } else if self.is_special(b')') {
+                                param_depth -= 1;
+                            }
+                            if param_depth > 0 {
+                                self.advance();
+                            }
+                        }
+                        self.advance(); // consume final ')'
+                                        // Create function pointer type: pointer to function returning result_id
+                                        // For now, create a generic function pointer (void -> result_id)
+                        let fn_type = Type::function(result_id, vec![], false);
+                        let fn_type_id = self.types.intern(fn_type);
+                        result_id = self.types.intern(Type::pointer(fn_type_id));
+                        return Some(result_id);
+                    }
+                }
+            }
+            // Not a function pointer, backtrack
+            self.pos = saved_pos;
+        }
+
         // Handle array declarators: int[10], char[20], int[], etc.
         while self.is_special(b'[') {
             self.advance();
@@ -2191,20 +2268,40 @@ impl<'a> Parser<'a> {
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
                     // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
-                    let typ = if name_str == "__func__" {
+                    if name_str == "__func__" {
                         // __func__ behaves like a string literal (const char[])
-                        self.types.char_ptr_id
+                        return Ok(Self::typed_expr(
+                            ExprKind::Ident { name: name_id },
+                            self.types.char_ptr_id,
+                            token_pos,
+                        ));
+                    }
+
+                    // Check if this is an enum constant - if so, return IntLit
+                    if let Some(sym) = self.symbols.lookup(name_id, Namespace::Ordinary) {
+                        if sym.is_enum_constant() {
+                            if let Some(value) = sym.enum_value {
+                                return Ok(Self::typed_expr(
+                                    ExprKind::IntLit(value),
+                                    self.types.int_id,
+                                    token_pos,
+                                ));
+                            }
+                        }
+                        // Regular variable/function
+                        Ok(Self::typed_expr(
+                            ExprKind::Ident { name: name_id },
+                            sym.typ,
+                            token_pos,
+                        ))
                     } else {
-                        self.symbols
-                            .lookup(name_id, Namespace::Ordinary)
-                            .map(|s| s.typ)
-                            .unwrap_or(self.types.int_id) // Default to int if not found
-                    };
-                    Ok(Self::typed_expr(
-                        ExprKind::Ident { name: name_id },
-                        typ,
-                        token_pos,
-                    ))
+                        // Unknown identifier - default to int
+                        Ok(Self::typed_expr(
+                            ExprKind::Ident { name: name_id },
+                            self.types.int_id,
+                            token_pos,
+                        ))
+                    }
                 } else {
                     Err(ParseError::new("invalid identifier token", token.pos))
                 }
@@ -2601,6 +2698,11 @@ impl Parser<'_> {
                     "switch" => return self.parse_switch_stmt(),
                     "case" => return self.parse_case_label(),
                     "default" => return self.parse_default_label(),
+                    // GCC extended inline assembly - skip for now
+                    "__asm__" | "__asm" | "asm" => {
+                        self.skip_asm_statement();
+                        return Ok(Stmt::Empty);
+                    }
                     _ => {}
                 }
             }

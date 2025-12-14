@@ -664,19 +664,20 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 
     /// Skip a block comment (/* ... */)
+    /// Based on sparse's drop_stream_comment implementation
     fn skip_block_comment(&mut self) {
+        // Track both current and next character to properly detect */
+        // This handles cases like /***/ or /**/
+        let mut next = self.nextchar();
         loop {
-            let c = self.nextchar();
-            if c == EOF {
+            let curr = next;
+            if curr == EOF {
                 // Unterminated comment
                 break;
             }
-            if c == b'*' as i32 {
-                let next = self.nextchar();
-                if next == b'/' as i32 {
-                    break;
-                }
-                // Don't unget - just continue looking for */
+            next = self.nextchar();
+            if curr == b'*' as i32 && next == b'/' as i32 {
+                break;
             }
         }
     }

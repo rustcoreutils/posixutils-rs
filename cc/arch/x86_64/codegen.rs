@@ -609,6 +609,188 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Emit return instruction: move return value to registers and emit epilogue
+    fn emit_ret(&mut self, insn: &Instruction, types: &TypeTable) {
+        // Move return value to appropriate register if present
+        // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
+        // Two-register struct returns (9-16 bytes) go in RAX+RDX
+        if let Some(src) = insn.src.first() {
+            let src_loc = self.get_location(*src);
+            let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
+            let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
+                || insn.typ.is_some_and(|t| types.is_float(t));
+            if insn.is_two_reg_return {
+                // Two-register struct return: src[0] -> RAX, src[1] -> RDX
+                self.emit_move(*src, Reg::Rax, 64);
+                if let Some(&src2) = insn.src.get(1) {
+                    self.emit_move(src2, Reg::Rdx, 64);
+                }
+            } else if is_complex {
+                // Complex return value: load real into XMM0, imag into XMM1
+                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+                match src_loc {
+                    Loc::Stack(offset) => {
+                        let adjusted = offset + self.callee_saved_offset;
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rbp,
+                                offset: -adjusted,
+                            }),
+                            dst: GpOperand::Reg(Reg::Rax),
+                        });
+                        self.push_lir(X86Inst::MovFp {
+                            size: fp_size,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rax,
+                                offset: 0,
+                            }),
+                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                        });
+                        self.push_lir(X86Inst::MovFp {
+                            size: fp_size,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rax,
+                                offset: imag_offset,
+                            }),
+                            dst: XmmOperand::Reg(XmmReg::Xmm1),
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        self.push_lir(X86Inst::MovFp {
+                            size: fp_size,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
+                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                        });
+                        self.push_lir(X86Inst::MovFp {
+                            size: fp_size,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: r,
+                                offset: imag_offset,
+                            }),
+                            dst: XmmOperand::Reg(XmmReg::Xmm1),
+                        });
+                    }
+                    _ => {}
+                }
+            } else if is_fp {
+                self.emit_fp_move(*src, XmmReg::Xmm0, insn.size);
+            } else {
+                self.emit_move(*src, Reg::Rax, insn.size);
+            }
+        }
+
+        // Epilogue: restore callee-saved registers and return
+        let bp = Reg::bp();
+        let num_callee_saved = self.callee_saved_regs.len();
+        if num_callee_saved > 0 {
+            let offset = num_callee_saved * 8;
+            self.push_lir(X86Inst::Lea {
+                addr: MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: -(offset as i32),
+                },
+                dst: Reg::Rsp,
+            });
+            let callee_saved: Vec<Reg> = self.callee_saved_regs.iter().rev().copied().collect();
+            for reg in callee_saved {
+                self.push_lir(X86Inst::Pop { dst: reg });
+            }
+        } else {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rbp),
+                dst: GpOperand::Reg(Reg::Rsp),
+            });
+        }
+        self.push_lir(X86Inst::Pop { dst: bp });
+        self.push_lir(X86Inst::Ret);
+    }
+
+    /// Emit conditional branch: test condition and branch accordingly
+    /// Returns true if an early return was taken (for constant conditions)
+    fn emit_cbr(&mut self, insn: &Instruction) -> bool {
+        let Some(&cond) = insn.src.first() else {
+            return false;
+        };
+
+        let loc = self.get_location(cond);
+        let size = insn.size.max(32);
+        let op_size = OperandSize::from_bits(size);
+
+        match &loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Test {
+                    size: op_size,
+                    src: GpOperand::Reg(*r),
+                    dst: GpOperand::Reg(*r),
+                });
+            }
+            Loc::Stack(offset) => {
+                let adjusted = offset + self.callee_saved_offset;
+                self.push_lir(X86Inst::Cmp {
+                    size: op_size,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -adjusted,
+                    }),
+                });
+            }
+            Loc::Imm(v) => {
+                let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
+                if let Some(target) = target {
+                    self.push_lir(X86Inst::Jmp {
+                        target: Label::new(&self.current_fn, target.0),
+                    });
+                }
+                return true;
+            }
+            Loc::Global(_) => {
+                self.emit_move(cond, Reg::Rax, size);
+                self.push_lir(X86Inst::Test {
+                    size: op_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+            }
+            Loc::Xmm(x) => {
+                self.push_lir(X86Inst::XorpsSelf { reg: XmmReg::Xmm15 });
+                self.push_lir(X86Inst::UComiFp {
+                    size: FpSize::Single,
+                    src: XmmOperand::Reg(*x),
+                    dst: XmmReg::Xmm15,
+                });
+            }
+            Loc::FImm(v, _) => {
+                let target = if *v != 0.0 {
+                    insn.bb_true
+                } else {
+                    insn.bb_false
+                };
+                if let Some(target) = target {
+                    self.push_lir(X86Inst::Jmp {
+                        target: Label::new(&self.current_fn, target.0),
+                    });
+                }
+                return true;
+            }
+        }
+
+        if let Some(target) = insn.bb_true {
+            self.push_lir(X86Inst::Jcc {
+                cc: IntCC::Ne,
+                target: Label::new(&self.current_fn, target.0),
+            });
+        }
+        if let Some(target) = insn.bb_false {
+            self.push_lir(X86Inst::Jmp {
+                target: Label::new(&self.current_fn, target.0),
+            });
+        }
+        false
+    }
+
     fn emit_insn(&mut self, insn: &Instruction, types: &TypeTable) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
@@ -619,229 +801,18 @@ impl X86_64CodeGen {
             }
 
             Opcode::Ret => {
-                // Move return value to appropriate register if present
-                // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
-                // Two-register struct returns (9-16 bytes) go in RAX+RDX
-                if let Some(src) = insn.src.first() {
-                    let src_loc = self.get_location(*src);
-                    let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
-                    let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
-                        || insn.typ.is_some_and(|t| types.is_float(t));
-                    if insn.is_two_reg_return {
-                        // Two-register struct return: src[0] -> RAX, src[1] -> RDX
-                        self.emit_move(*src, Reg::Rax, 64);
-                        if let Some(&src2) = insn.src.get(1) {
-                            self.emit_move(src2, Reg::Rdx, 64);
-                        }
-                    } else if is_complex {
-                        // Complex return value: load real into XMM0, imag into XMM1
-                        // The source is a pointer to the complex value
-                        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
-                        match src_loc {
-                            Loc::Stack(offset) => {
-                                // Stack slot contains a pointer to the complex value
-                                // Load the pointer first, then load through it
-                                let adjusted = offset + self.callee_saved_offset;
-                                self.push_lir(X86Inst::Mov {
-                                    size: OperandSize::B64,
-                                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                                        base: Reg::Rbp,
-                                        offset: -adjusted,
-                                    }),
-                                    dst: GpOperand::Reg(Reg::Rax),
-                                });
-                                self.push_lir(X86Inst::MovFp {
-                                    size: fp_size,
-                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                        base: Reg::Rax,
-                                        offset: 0,
-                                    }),
-                                    dst: XmmOperand::Reg(XmmReg::Xmm0),
-                                });
-                                self.push_lir(X86Inst::MovFp {
-                                    size: fp_size,
-                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                        base: Reg::Rax,
-                                        offset: imag_offset,
-                                    }),
-                                    dst: XmmOperand::Reg(XmmReg::Xmm1),
-                                });
-                            }
-                            Loc::Reg(r) => {
-                                // Address in register - load through it
-                                self.push_lir(X86Inst::MovFp {
-                                    size: fp_size,
-                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                        base: r,
-                                        offset: 0,
-                                    }),
-                                    dst: XmmOperand::Reg(XmmReg::Xmm0),
-                                });
-                                self.push_lir(X86Inst::MovFp {
-                                    size: fp_size,
-                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                        base: r,
-                                        offset: imag_offset,
-                                    }),
-                                    dst: XmmOperand::Reg(XmmReg::Xmm1),
-                                });
-                            }
-                            _ => {}
-                        }
-                    } else if is_fp {
-                        // Float return value goes in XMM0
-                        self.emit_fp_move(*src, XmmReg::Xmm0, insn.size);
-                    } else {
-                        // Integer return value goes in RAX
-                        self.emit_move(*src, Reg::Rax, insn.size);
-                    }
-                }
-                // Epilogue: restore callee-saved registers and return
-                let bp = Reg::bp();
-                let num_callee_saved = self.callee_saved_regs.len();
-                if num_callee_saved > 0 {
-                    // Set rsp to point to the first callee-saved register (pushed after rbp setup)
-                    let offset = num_callee_saved * 8;
-                    // LIR: lea to restore rsp
-                    self.push_lir(X86Inst::Lea {
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -(offset as i32),
-                        },
-                        dst: Reg::Rsp,
-                    });
-                    // Pop callee-saved registers in reverse order
-                    // Collect to avoid borrow conflict with push_lir
-                    let callee_saved: Vec<Reg> =
-                        self.callee_saved_regs.iter().rev().copied().collect();
-                    for reg in callee_saved {
-                        // LIR: pop callee-saved register
-                        self.push_lir(X86Inst::Pop { dst: reg });
-                    }
-                } else {
-                    // No callee-saved registers, just restore rsp from rbp
-                    // LIR: mov rbp to rsp
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rbp),
-                        dst: GpOperand::Reg(Reg::Rsp),
-                    });
-                }
-                // LIR: pop rbp
-                self.push_lir(X86Inst::Pop { dst: bp });
-                // LIR: ret
-                self.push_lir(X86Inst::Ret);
+                self.emit_ret(insn, types);
             }
 
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
-                    // LIR: unconditional jump
                     self.push_lir(X86Inst::Jmp {
                         target: Label::new(&self.current_fn, target.0),
                     });
                 }
             }
 
-            Opcode::Cbr => {
-                if let Some(&cond) = insn.src.first() {
-                    let loc = self.get_location(cond);
-                    let size = insn.size.max(32);
-                    let op_size = OperandSize::from_bits(size);
-                    match &loc {
-                        Loc::Reg(r) => {
-                            // LIR: test register with itself
-                            self.push_lir(X86Inst::Test {
-                                size: op_size,
-                                src: GpOperand::Reg(*r),
-                                dst: GpOperand::Reg(*r),
-                            });
-                        }
-                        Loc::Stack(offset) => {
-                            let adjusted = offset + self.callee_saved_offset;
-                            // LIR: compare stack location with 0
-                            self.push_lir(X86Inst::Cmp {
-                                size: op_size,
-                                src: GpOperand::Imm(0),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -adjusted,
-                                }),
-                            });
-                        }
-                        Loc::Imm(v) => {
-                            if *v != 0 {
-                                if let Some(target) = insn.bb_true {
-                                    // LIR: unconditional jump (constant true)
-                                    self.push_lir(X86Inst::Jmp {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            } else {
-                                if let Some(target) = insn.bb_false {
-                                    // LIR: unconditional jump (constant false)
-                                    self.push_lir(X86Inst::Jmp {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            }
-                        }
-                        Loc::Global(_) => {
-                            self.emit_move(cond, Reg::Rax, size);
-                            // LIR: test rax with itself
-                            self.push_lir(X86Inst::Test {
-                                size: op_size,
-                                src: GpOperand::Reg(Reg::Rax),
-                                dst: GpOperand::Reg(Reg::Rax),
-                            });
-                        }
-                        Loc::Xmm(x) => {
-                            // Compare XMM register with zero
-                            // LIR: xorps to zero xmm15, then ucomiss
-                            self.push_lir(X86Inst::XorpsSelf { reg: XmmReg::Xmm15 });
-                            self.push_lir(X86Inst::UComiFp {
-                                size: FpSize::Single,
-                                src: XmmOperand::Reg(*x),
-                                dst: XmmReg::Xmm15,
-                            });
-                        }
-                        Loc::FImm(v, _) => {
-                            // Float immediate - check if non-zero
-                            if *v != 0.0 {
-                                if let Some(target) = insn.bb_true {
-                                    // LIR: unconditional jump (constant true)
-                                    self.push_lir(X86Inst::Jmp {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            } else {
-                                if let Some(target) = insn.bb_false {
-                                    // LIR: unconditional jump (constant false)
-                                    self.push_lir(X86Inst::Jmp {
-                                        target: Label::new(&self.current_fn, target.0),
-                                    });
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    if let Some(target) = insn.bb_true {
-                        // LIR: conditional jump if not equal (non-zero)
-                        self.push_lir(X86Inst::Jcc {
-                            cc: IntCC::Ne,
-                            target: Label::new(&self.current_fn, target.0),
-                        });
-                    }
-                    if let Some(target) = insn.bb_false {
-                        // LIR: unconditional jump to false branch
-                        self.push_lir(X86Inst::Jmp {
-                            target: Label::new(&self.current_fn, target.0),
-                        });
-                    }
-                }
-            }
+            Opcode::Cbr => if self.emit_cbr(insn) {},
 
             Opcode::Switch => {
                 // Switch uses target as the value to switch on
@@ -3562,6 +3533,303 @@ impl X86_64CodeGen {
     }
 
     /// Emit va_arg: Get the next variadic argument
+    /// Helper for emit_va_arg: stores float value from XMM15 to destination
+    fn emit_va_arg_store_float(&mut self, dst_loc: &Loc, fp_size: FpSize) {
+        match dst_loc {
+            Loc::Xmm(x) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Reg(*x),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Helper for emit_va_arg: stores int value to destination
+    fn emit_va_arg_store_int(&mut self, dst_loc: &Loc, src_reg: Reg, arg_size: OperandSize) {
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Mov {
+                    size: arg_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: src_reg,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(*r),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: src_reg,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Helper for emit_va_arg: emit float path for va_arg
+    /// ap_base: base register for va_list access
+    /// ap_base_offset: added to all va_list field offsets (0 for Reg, ap_offset for Stack)
+    fn emit_va_arg_float(
+        &mut self,
+        ap_base: Reg,
+        ap_base_offset: i32,
+        dst_loc: &Loc,
+        arg_type: TypeId,
+        label_suffix: u32,
+        types: &TypeTable,
+    ) {
+        let overflow_label = Label::new("va_fp_overflow", label_suffix);
+        let done_label = Label::new("va_fp_done", label_suffix);
+
+        let fp_size = types.size_bits(arg_type);
+        let lir_fp_size = if fp_size <= 32 {
+            FpSize::Single
+        } else {
+            FpSize::Double
+        };
+
+        // Load fp_offset from va_list (at offset 4)
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 4,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        // Compare with 176 (end of XMM save area)
+        self.push_lir(X86Inst::Cmp {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(176),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        // Jump if above or equal (fp_offset >= 176 means use overflow)
+        self.push_lir(X86Inst::Jcc {
+            cc: IntCC::Ae,
+            target: overflow_label.clone(),
+        });
+
+        // Register save area path: load from reg_save_area + fp_offset
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 16,
+            }),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Movsx {
+            src_size: OperandSize::B32,
+            dst_size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+
+        // Load float value from save area
+        self.push_lir(X86Inst::MovFp {
+            size: lir_fp_size,
+            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R10,
+                offset: 0,
+            }),
+            dst: XmmOperand::Reg(XmmReg::Xmm15),
+        });
+        self.emit_va_arg_store_float(dst_loc, lir_fp_size);
+
+        // Increment fp_offset by 16 (XMM slot size)
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(16),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 4,
+            }),
+        });
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+
+        // Overflow path: use overflow_arg_area
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 8,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+
+        self.push_lir(X86Inst::MovFp {
+            size: lir_fp_size,
+            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::Rax,
+                offset: 0,
+            }),
+            dst: XmmOperand::Reg(XmmReg::Xmm15),
+        });
+        self.emit_va_arg_store_float(dst_loc, lir_fp_size);
+
+        // Advance overflow_arg_area by 8
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(8),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 8,
+            }),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+    }
+
+    /// Helper for emit_va_arg: emit integer path for va_arg
+    fn emit_va_arg_int(
+        &mut self,
+        ap_base: Reg,
+        ap_base_offset: i32,
+        dst_loc: &Loc,
+        arg_size: u32,
+        arg_bytes: i32,
+        label_suffix: u32,
+    ) {
+        let overflow_label = Label::new("va_overflow", label_suffix);
+        let done_label = Label::new("va_done", label_suffix);
+        let lir_arg_size = OperandSize::from_bits(arg_size);
+
+        // Load gp_offset
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        // Compare with 48
+        self.push_lir(X86Inst::Cmp {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(48),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: IntCC::Ae,
+            target: overflow_label.clone(),
+        });
+
+        // Register save area path
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 16,
+            }),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Movsx {
+            src_size: OperandSize::B32,
+            dst_size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+
+        self.emit_va_arg_store_int(dst_loc, Reg::R10, lir_arg_size);
+
+        // Increment gp_offset by 8
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(8),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset,
+            }),
+        });
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+
+        // Overflow path
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 8,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+
+        self.emit_va_arg_store_int(dst_loc, Reg::Rax, lir_arg_size);
+
+        // Advance overflow_arg_area
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(arg_bytes as i64),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 8,
+            }),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+    }
+
     fn emit_va_arg(&mut self, insn: &Instruction, types: &TypeTable) {
         let ap_addr = match insn.src.first() {
             Some(&s) => s,
@@ -3574,711 +3842,41 @@ impl X86_64CodeGen {
 
         let arg_type = insn.typ.unwrap_or(types.int_id);
         let arg_size = types.size_bits(arg_type).max(32);
-        let arg_bytes = (arg_size / 8).max(8) as i32; // Minimum 8 bytes per slot
+        let arg_bytes = (arg_size / 8).max(8) as i32;
 
         let ap_loc = self.get_location(ap_addr);
         let dst_loc = self.get_location(target);
 
-        // Generate unique label for this va_arg call
         let label_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
 
         match &ap_loc {
             Loc::Stack(ap_offset) => {
                 if types.is_float(arg_type) {
-                    // For float args, check fp_offset to see if we use reg_save_area or overflow
-                    // fp_offset < 176 means we have saved XMM registers to read
-                    let overflow_label = Label::new("va_fp_overflow", label_suffix);
-                    let done_label = Label::new("va_fp_done", label_suffix);
-
-                    let fp_size = types.size_bits(arg_type);
-                    let lir_fp_size = if fp_size <= 32 {
-                        FpSize::Single
-                    } else {
-                        FpSize::Double
-                    };
-
-                    // LIR: load fp_offset from va_list (at offset 4)
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 4,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: compare with 176 (end of XMM save area)
-                    self.push_lir(X86Inst::Cmp {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(176),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: jump if above or equal (fp_offset >= 176 means use overflow)
-                    self.push_lir(X86Inst::Jcc {
-                        cc: IntCC::Ae,
-                        target: overflow_label.clone(),
-                    });
-
-                    // Register save area path: load from reg_save_area + fp_offset
-                    // LIR: load reg_save_area pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 16,
-                        }),
-                        dst: GpOperand::Reg(Reg::R10),
-                    });
-                    // LIR: sign-extend fp_offset to 64-bit
-                    self.push_lir(X86Inst::Movsx {
-                        src_size: OperandSize::B32,
-                        dst_size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: Reg::R11,
-                    });
-                    // LIR: calculate reg_save_area + fp_offset
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R11),
-                        dst: Reg::R10,
-                    });
-
-                    // Load float value from save area
-                    self.push_lir(X86Inst::MovFp {
-                        size: lir_fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R10,
-                            offset: 0,
-                        }),
-                        dst: XmmOperand::Reg(XmmReg::Xmm15),
-                    });
-
-                    // Store to destination
-                    match &dst_loc {
-                        Loc::Xmm(x) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Reg(*x),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Increment fp_offset by 16 (XMM slot size)
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(16),
-                        dst: Reg::Rax,
-                    });
-                    // Store updated fp_offset
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 4,
-                        }),
-                    });
-                    // Jump to done
-                    self.push_lir(X86Inst::Jmp {
-                        target: done_label.clone(),
-                    });
-
-                    // Overflow path: use overflow_arg_area
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
-                    // LIR: load overflow_arg_area pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 8,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-
-                    // Load float value from overflow area
-                    self.push_lir(X86Inst::MovFp {
-                        size: lir_fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rax,
-                            offset: 0,
-                        }),
-                        dst: XmmOperand::Reg(XmmReg::Xmm15),
-                    });
-
-                    // Store to destination
-                    match &dst_loc {
-                        Loc::Xmm(x) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Reg(*x),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Advance overflow_arg_area by 8 (double is 8 bytes on stack)
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(8),
-                        dst: Reg::Rax,
-                    });
-                    // Store updated overflow_arg_area
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 8,
-                        }),
-                    });
-
-                    // Done label
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+                    self.emit_va_arg_float(
+                        Reg::Rbp,
+                        *ap_offset,
+                        &dst_loc,
+                        arg_type,
+                        label_suffix,
+                        types,
+                    );
                 } else {
-                    // For integer args, check gp_offset to see if we use reg_save_area or overflow
-                    // gp_offset < 48 means we have saved registers to read
-                    let overflow_label = Label::new("va_overflow", label_suffix);
-                    let done_label = Label::new("va_done", label_suffix);
-
-                    // LIR: load gp_offset
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: *ap_offset,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: compare with 48
-                    self.push_lir(X86Inst::Cmp {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(48),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: jump if above or equal
-                    self.push_lir(X86Inst::Jcc {
-                        cc: IntCC::Ae,
-                        target: overflow_label.clone(),
-                    });
-
-                    // Use register save area: load from reg_save_area + gp_offset
-                    // LIR: load reg_save_area
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 16,
-                        }),
-                        dst: GpOperand::Reg(Reg::R10),
-                    });
-                    // LIR: sign-extend gp_offset
-                    self.push_lir(X86Inst::Movsx {
-                        src_size: OperandSize::B32,
-                        dst_size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: Reg::R11,
-                    });
-                    // LIR: calculate reg_save_area + gp_offset
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R11),
-                        dst: Reg::R10,
-                    });
-
-                    // Load value from save area
-                    let lir_arg_size = OperandSize::from_bits(arg_size);
-                    match &dst_loc {
-                        Loc::Reg(r) => {
-                            // LIR: load from save area to destination register
-                            self.push_lir(X86Inst::Mov {
-                                size: lir_arg_size,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R10,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(*r),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            // LIR: load to temp then store to stack
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R10,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Reg(Reg::R11),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Increment gp_offset by 8
-                    // LIR: add 8 to gp_offset
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(8),
-                        dst: Reg::Rax,
-                    });
-                    // LIR: store updated gp_offset
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: *ap_offset,
-                        }),
-                    });
-                    // LIR: jump to done
-                    self.push_lir(X86Inst::Jmp {
-                        target: done_label.clone(),
-                    });
-
-                    // Overflow path: use overflow_arg_area
-                    // LIR: overflow label
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
-                    // LIR: load overflow_arg_area
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 8,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-
-                    match &dst_loc {
-                        Loc::Reg(r) => {
-                            // LIR: load from overflow area
-                            self.push_lir(X86Inst::Mov {
-                                size: lir_arg_size,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rax,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(*r),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            // LIR: load to temp then store
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rax,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Reg(Reg::R11),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Advance overflow_arg_area
-                    // LIR: add arg_bytes
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(arg_bytes as i64),
-                        dst: Reg::Rax,
-                    });
-                    // LIR: store updated pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 8,
-                        }),
-                    });
-
-                    // Done label
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+                    self.emit_va_arg_int(
+                        Reg::Rbp,
+                        *ap_offset,
+                        &dst_loc,
+                        arg_size,
+                        arg_bytes,
+                        label_suffix,
+                    );
                 }
             }
             Loc::Reg(ap_reg) => {
-                // Similar logic for when va_list address is in a register
                 if types.is_float(arg_type) {
-                    // For float args, check fp_offset to see if we use reg_save_area or overflow
-                    // fp_offset < 176 means we have saved XMM registers to read
-                    let overflow_label = Label::new("va_fp_overflow", label_suffix);
-                    let done_label = Label::new("va_fp_done", label_suffix);
-
-                    let fp_size = types.size_bits(arg_type);
-                    let lir_fp_size = if fp_size <= 32 {
-                        FpSize::Single
-                    } else {
-                        FpSize::Double
-                    };
-
-                    // LIR: load fp_offset from va_list (at offset 4)
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 4,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: compare with 176 (end of XMM save area)
-                    self.push_lir(X86Inst::Cmp {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(176),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: jump if above or equal (fp_offset >= 176 means use overflow)
-                    self.push_lir(X86Inst::Jcc {
-                        cc: IntCC::Ae,
-                        target: overflow_label.clone(),
-                    });
-
-                    // Register save area path: load from reg_save_area + fp_offset
-                    // LIR: load reg_save_area pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 16,
-                        }),
-                        dst: GpOperand::Reg(Reg::R10),
-                    });
-                    // LIR: sign-extend fp_offset to 64-bit
-                    self.push_lir(X86Inst::Movsx {
-                        src_size: OperandSize::B32,
-                        dst_size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: Reg::R11,
-                    });
-                    // LIR: calculate reg_save_area + fp_offset
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R11),
-                        dst: Reg::R10,
-                    });
-
-                    // Load float value from save area
-                    self.push_lir(X86Inst::MovFp {
-                        size: lir_fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R10,
-                            offset: 0,
-                        }),
-                        dst: XmmOperand::Reg(XmmReg::Xmm15),
-                    });
-
-                    // Store to destination
-                    match &dst_loc {
-                        Loc::Xmm(x) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Reg(*x),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Increment fp_offset by 16 (XMM slot size)
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(16),
-                        dst: Reg::Rax,
-                    });
-                    // Store updated fp_offset
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 4,
-                        }),
-                    });
-                    // Jump to done
-                    self.push_lir(X86Inst::Jmp {
-                        target: done_label.clone(),
-                    });
-
-                    // Overflow path: use overflow_arg_area
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
-                    // LIR: load overflow_arg_area pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 8,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-
-                    // Load float value from overflow area
-                    self.push_lir(X86Inst::MovFp {
-                        size: lir_fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rax,
-                            offset: 0,
-                        }),
-                        dst: XmmOperand::Reg(XmmReg::Xmm15),
-                    });
-
-                    // Store to destination
-                    match &dst_loc {
-                        Loc::Xmm(x) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Reg(*x),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            self.push_lir(X86Inst::MovFp {
-                                size: lir_fp_size,
-                                src: XmmOperand::Reg(XmmReg::Xmm15),
-                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Advance overflow_arg_area by 8 (double is 8 bytes on stack)
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(8),
-                        dst: Reg::Rax,
-                    });
-                    // Store updated overflow_arg_area
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 8,
-                        }),
-                    });
-
-                    // Done label
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+                    self.emit_va_arg_float(*ap_reg, 0, &dst_loc, arg_type, label_suffix, types);
                 } else {
-                    // Check gp_offset
-                    let overflow_label = Label::new("va_overflow", label_suffix);
-                    let done_label = Label::new("va_done", label_suffix);
-
-                    // LIR: load gp_offset
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 0,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: compare with 48
-                    self.push_lir(X86Inst::Cmp {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(48),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    // LIR: conditional jump
-                    self.push_lir(X86Inst::Jcc {
-                        cc: IntCC::Ae,
-                        target: overflow_label.clone(),
-                    });
-
-                    // Use register save area
-                    // LIR: load reg_save_area (at offset 16)
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 16,
-                        }),
-                        dst: GpOperand::Reg(Reg::R10),
-                    });
-                    // LIR: sign-extend gp_offset
-                    self.push_lir(X86Inst::Movsx {
-                        src_size: OperandSize::B32,
-                        dst_size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: Reg::R11,
-                    });
-                    // LIR: add offset to base
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R11),
-                        dst: Reg::R10,
-                    });
-
-                    let lir_arg_size = OperandSize::from_bits(arg_size);
-                    match &dst_loc {
-                        Loc::Reg(r) => {
-                            // LIR: load from save area
-                            self.push_lir(X86Inst::Mov {
-                                size: lir_arg_size,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R10,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(*r),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            // LIR: load to temp then store
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R10,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Reg(Reg::R11),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Increment gp_offset by 8
-                    // LIR: add 8
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(8),
-                        dst: Reg::Rax,
-                    });
-                    // LIR: store updated gp_offset
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 0,
-                        }),
-                    });
-                    // LIR: jump to done
-                    self.push_lir(X86Inst::Jmp {
-                        target: done_label.clone(),
-                    });
-
-                    // Overflow path: use overflow_arg_area
-                    // LIR: overflow label
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
-                    // LIR: load overflow_arg_area
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 8,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-
-                    match &dst_loc {
-                        Loc::Reg(r) => {
-                            // LIR: load from overflow area
-                            self.push_lir(X86Inst::Mov {
-                                size: lir_arg_size,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rax,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(*r),
-                            });
-                        }
-                        Loc::Stack(dst_offset) => {
-                            // LIR: load to temp then store
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rax,
-                                    offset: 0,
-                                }),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B32,
-                                src: GpOperand::Reg(Reg::R11),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: *dst_offset,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Advance overflow_arg_area
-                    // LIR: add arg_bytes
-                    self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(arg_bytes as i64),
-                        dst: Reg::Rax,
-                    });
-                    // LIR: store updated pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 8,
-                        }),
-                    });
-
-                    // Done label
-                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+                    self.emit_va_arg_int(*ap_reg, 0, &dst_loc, arg_size, arg_bytes, label_suffix);
                 }
             }
             _ => {}

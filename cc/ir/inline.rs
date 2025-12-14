@@ -778,7 +778,7 @@ mod tests {
     use crate::types::TypeTable;
 
     fn make_simple_func(name: &str, is_inline: bool) -> Function {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new(name, types.int_id);
         func.is_inline = is_inline;
         func.is_static = is_inline; // inline implies static for our purposes

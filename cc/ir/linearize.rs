@@ -1127,7 +1127,12 @@ impl<'a> Linearizer<'a> {
                         self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));
                     } else {
                         let val = self.linearize_expr(e);
-                        let typ_size = self.types.size_bits(typ);
+                        // Function types decay to pointers when returned
+                        let typ_size = if self.types.kind(typ) == TypeKind::Function {
+                            self.target.pointer_width
+                        } else {
+                            self.types.size_bits(typ)
+                        };
                         self.emit(Instruction::ret_typed(Some(val), typ, typ_size));
                     }
                 } else {
@@ -5199,7 +5204,7 @@ mod tests {
     #[test]
     fn test_linearize_empty_function() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(test_id, Stmt::Block(vec![]), &types);
         let tu = TranslationUnit {
@@ -5215,7 +5220,7 @@ mod tests {
     #[test]
     fn test_linearize_return() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(test_id, Stmt::Return(Some(Expr::int(42, &types))), &types);
         let tu = TranslationUnit {
@@ -5230,7 +5235,7 @@ mod tests {
     #[test]
     fn test_linearize_if() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(
             test_id,
@@ -5253,7 +5258,7 @@ mod tests {
     #[test]
     fn test_linearize_while() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(
             test_id,
@@ -5274,7 +5279,7 @@ mod tests {
     #[test]
     fn test_linearize_for() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let i_id = strings.intern("i");
         // for (int i = 0; i < 10; i++) { }
@@ -5317,7 +5322,7 @@ mod tests {
     #[test]
     fn test_linearize_binary_expr() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         // return 1 + 2 * 3;
         let func = make_simple_func(
@@ -5348,7 +5353,7 @@ mod tests {
     #[test]
     fn test_linearize_function_with_params() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let add_id = strings.intern("add");
         let a_id = strings.intern("a");
         let b_id = strings.intern("b");
@@ -5388,7 +5393,7 @@ mod tests {
     #[test]
     fn test_linearize_call() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let foo_id = strings.intern("foo");
         let func = make_simple_func(
@@ -5413,7 +5418,7 @@ mod tests {
     #[test]
     fn test_linearize_comparison() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(
             test_id,
@@ -5437,7 +5442,7 @@ mod tests {
     #[test]
     fn test_linearize_unsigned_comparison() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
 
         // Create unsigned comparison: (unsigned)1 < (unsigned)2
@@ -5467,7 +5472,7 @@ mod tests {
     #[test]
     fn test_display_module() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let main_id = strings.intern("main");
         let func = make_simple_func(main_id, Stmt::Return(Some(Expr::int(0, &types))), &types);
         let tu = TranslationUnit {
@@ -5487,7 +5492,7 @@ mod tests {
     #[test]
     fn test_type_propagation_expr_type() {
         let strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
 
         // Create an expression with a type annotation
         let mut expr = Expr::int(42, &types);
@@ -5511,7 +5516,7 @@ mod tests {
     #[test]
     fn test_type_propagation_double_literal() {
         let strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
 
         // Create a double literal
         let mut expr = Expr::new(ExprKind::FloatLit(3.14), test_pos());
@@ -5539,7 +5544,7 @@ mod tests {
     #[test]
     fn test_local_var_emits_load_store() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let x_id = strings.intern("x");
         // int test() { int x = 1; return x; }
@@ -5583,7 +5588,7 @@ mod tests {
     #[test]
     fn test_ssa_converts_local_to_phi() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let cond_id = strings.intern("cond");
         let x_id = strings.intern("x");
@@ -5645,7 +5650,7 @@ mod tests {
     #[test]
     fn test_ssa_loop_variable() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let i_id = strings.intern("i");
         // int test() {
@@ -5700,7 +5705,7 @@ mod tests {
     #[test]
     fn test_short_circuit_and() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let a_id = strings.intern("a");
         let b_id = strings.intern("b");
@@ -5756,7 +5761,7 @@ mod tests {
     #[test]
     fn test_short_circuit_or() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let a_id = strings.intern("a");
         let b_id = strings.intern("b");

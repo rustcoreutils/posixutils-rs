@@ -176,10 +176,7 @@ int main(void) {
 // Function Returning Function Pointer
 // ============================================================================
 
-// TODO: Fix parser to support complex function returning function pointer syntax:
-// int (*get_op(int which))(int, int)
 #[test]
-#[ignore]
 fn function_returning_function_pointer() {
     let code = r#"
 int add(int a, int b) { return a + b; }

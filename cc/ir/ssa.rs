@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_analyze_variable() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let func = make_simple_if_cfg(&types);
 
         let info = analyze_variable(&func, &types, "x").unwrap();
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_ssa_convert_creates_phi() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = make_simple_if_cfg(&types);
         ssa_convert(&mut func, &types);
 
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_domtree_built() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = make_simple_if_cfg(&types);
         domtree_build(&mut func);
 

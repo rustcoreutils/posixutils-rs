@@ -309,7 +309,7 @@ mod tests {
     use crate::types::TypeTable;
 
     fn make_simple_func() -> Function {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_live_instruction_preserved() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_transitive_liveness() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_unreachable_block_removed() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         // Entry block
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_store_is_live() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));

@@ -107,7 +107,7 @@ mod tests {
     use crate::types::TypeTable;
 
     fn make_test_func() -> Function {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         // Add some pseudos

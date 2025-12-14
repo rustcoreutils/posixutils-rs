@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_int_literal() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let expr = Expr::int(42, &types);
         match expr.kind {
             ExprKind::IntLit(v) => assert_eq!(v, 42),
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_binary_expr() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         // 1 + 2
         let expr = Expr::binary(
             BinaryOp::Add,
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_nested_binary() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         // 1 + 2 * 3 (represented as 1 + (2 * 3))
         let mul = Expr::binary(
             BinaryOp::Mul,
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn test_unary_expr() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let x_id = strings.intern("x");
         // -x
         let expr = Expr::unary(UnaryOp::Neg, Expr::var(x_id), &types);
@@ -839,7 +839,7 @@ mod tests {
     #[test]
     fn test_assignment() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let x_id = strings.intern("x");
         // x = 5
         let expr = Expr::assign(Expr::var(x_id), Expr::int(5, &types), &types);
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn test_function_call() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let foo_id = strings.intern("foo");
         // foo(1, 2)
         let expr = Expr::call(
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn test_if_stmt() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let x_id = strings.intern("x");
         // if (x) return 1;
         let stmt = Stmt::If {
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn test_declaration() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let x_id = strings.intern("x");
         // int x = 5;
         let decl = Declaration::simple(x_id, types.int_id, Some(Expr::int(5, &types)));
@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn test_translation_unit() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let x_id = strings.intern("x");
         let mut tu = TranslationUnit::new();
 
@@ -980,7 +980,7 @@ mod tests {
     #[test]
     fn test_for_loop() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let i_id = strings.intern("i");
         // for (int i = 0; i < 10; i++) {}
         let init = ForInit::Declaration(Declaration::simple(

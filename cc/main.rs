@@ -227,7 +227,7 @@ fn process_file(
     // Create symbol table and type table BEFORE parsing
     // symbols are bound during parsing
     let mut symbols = SymbolTable::new();
-    let mut types = types::TypeTable::new();
+    let mut types = types::TypeTable::new(target.pointer_width);
 
     // Parse (this also binds symbols to the symbol table)
     let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);

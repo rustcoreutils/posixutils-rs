@@ -576,6 +576,8 @@ pub struct TypeTable {
     types: Vec<Type>,
     /// Lookup map for deduplication
     lookup: HashMap<TypeKey, TypeId>,
+    /// Pointer size in bits (target-dependent, defaults to 64 for LP64)
+    pointer_width: u32,
 
     // Pre-computed common type IDs for fast access
     pub void_id: TypeId,
@@ -603,10 +605,11 @@ pub struct TypeTable {
 
 impl TypeTable {
     /// Create a new type table with common types pre-interned
-    pub fn new() -> Self {
+    pub fn new(pointer_width: u32) -> Self {
         let mut table = Self {
             types: Vec::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             lookup: HashMap::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
+            pointer_width,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
             char_id: TypeId::INVALID,
@@ -979,7 +982,7 @@ impl TypeTable {
             TypeKind::Float => 32 * multiplier,
             TypeKind::Double => 64 * multiplier,
             TypeKind::LongDouble => 128 * multiplier,
-            TypeKind::Pointer => 64,
+            TypeKind::Pointer => self.pointer_width,
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0);
                 let count = typ.array_size.unwrap_or(0) as u32;
@@ -1154,12 +1157,6 @@ impl TypeTable {
     }
 }
 
-impl Default for TypeTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1170,7 +1167,7 @@ mod tests {
 
     #[test]
     fn test_basic_types() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         assert!(types.is_integer(types.int_id));
         assert!(types.is_arithmetic(types.int_id));
         assert!(types.is_scalar(types.int_id));
@@ -1179,7 +1176,7 @@ mod tests {
 
     #[test]
     fn test_pointer_type() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let int_ptr_id = types.intern(Type::pointer(types.int_id));
         assert_eq!(types.kind(int_ptr_id), TypeKind::Pointer);
         assert!(types.is_scalar(int_ptr_id));
@@ -1191,7 +1188,7 @@ mod tests {
 
     #[test]
     fn test_array_type() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let int_arr_id = types.intern(Type::array(types.int_id, 10));
         assert_eq!(types.kind(int_arr_id), TypeKind::Array);
         assert_eq!(types.array_size(int_arr_id), Some(10));
@@ -1202,7 +1199,7 @@ mod tests {
 
     #[test]
     fn test_function_type() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let func_id = types.intern(Type::function(
             types.int_id,
             vec![types.int_id, types.char_id],
@@ -1219,21 +1216,21 @@ mod tests {
 
     #[test]
     fn test_unsigned_modifier() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
     }
 
     #[test]
     fn test_type_format() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         assert_eq!(types.format_type(types.int_id), "int");
         assert_eq!(types.format_type(types.uint_id), "unsigned int");
     }
 
     #[test]
     fn test_nested_pointer() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         // int **pp
         let int_ptr_id = types.intern(Type::pointer(types.int_id));
         let int_ptr_ptr_id = types.intern(Type::pointer(int_ptr_id));
@@ -1248,7 +1245,7 @@ mod tests {
 
     #[test]
     fn test_pointer_to_array() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         // int (*p)[10] - pointer to array of 10 ints
         let arr_id = types.intern(Type::array(types.int_id, 10));
         let ptr_to_arr_id = types.intern(Type::pointer(arr_id));
@@ -1307,7 +1304,7 @@ mod tests {
 
     #[test]
     fn test_types_compatible_pointers() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let int_ptr = Type::pointer(types.int_id);
         let int_ptr2 = Type::pointer(types.int_id);
         assert!(int_ptr.types_compatible(&int_ptr2));
@@ -1318,7 +1315,7 @@ mod tests {
 
     #[test]
     fn test_types_compatible_arrays() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let arr10 = Type::array(types.int_id, 10);
         let arr10_2 = Type::array(types.int_id, 10);
         assert!(arr10.types_compatible(&arr10_2));
@@ -1329,7 +1326,7 @@ mod tests {
 
     #[test]
     fn test_type_deduplication() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         // Interning the same type should return the same ID
         let int_ptr1 = types.intern(Type::pointer(types.int_id));
         let int_ptr2 = types.intern(Type::pointer(types.int_id));
@@ -1342,7 +1339,7 @@ mod tests {
 
     #[test]
     fn test_type_table_pre_interned() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         // Pre-interned types should be valid
         assert!(types.int_id.is_valid());
         assert!(types.char_id.is_valid());

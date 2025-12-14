@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_instruction_binop() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_instruction_display() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1387,7 +1387,7 @@ mod tests {
 
     #[test]
     fn test_function_display() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("main", types.int_id);
         func.add_param("argc", types.int_id);
 
@@ -1417,7 +1417,7 @@ mod tests {
 
     #[test]
     fn test_call_instruction() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let char_ptr = types.intern(Type::pointer(types.char_id));
         let arg_types = vec![char_ptr, types.int_id];
         let call = Instruction::call(
@@ -1436,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_load_store() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
 
         let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, 32);
         assert_eq!(load.op, Opcode::Load);
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_module() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut module = Module::new();
 
         module.add_global("counter", types.int_id, Initializer::Int(0));

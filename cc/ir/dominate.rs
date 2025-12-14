@@ -514,7 +514,7 @@ mod tests {
         //          v
         //        exit(4)
 
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.void_id);
 
         let mut entry = BasicBlock::new(BasicBlockId(0));

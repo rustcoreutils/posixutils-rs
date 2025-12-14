@@ -662,6 +662,23 @@ impl RegAlloc {
                     }
                 }
 
+                // For indirect calls, the indirect_target pseudo is also used
+                if let Some(indirect) = insn.indirect_target {
+                    if let Some(info) = intervals.get_mut(&indirect) {
+                        info.last_use = info.last_use.max(pos);
+                    } else {
+                        intervals.insert(
+                            indirect,
+                            IntervalInfo {
+                                pseudo: indirect,
+                                first_def: pos,
+                                last_def: pos,
+                                last_use: pos,
+                            },
+                        );
+                    }
+                }
+
                 for (src_bb, pseudo) in &insn.phi_list {
                     phi_sources.push((*src_bb, *pseudo));
                     if let Some(target) = insn.target {

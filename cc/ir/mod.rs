@@ -494,6 +494,9 @@ pub struct Instruction {
     /// For calls/returns: true if this returns a 9-16 byte struct via two registers
     /// (RAX+RDX on x86-64, X0+X1 on AArch64) per ABI.
     pub is_two_reg_return: bool,
+    /// For indirect calls: pseudo containing the function pointer address.
+    /// When this is Some, the call is indirect (call through function pointer).
+    pub indirect_target: Option<PseudoId>,
     /// Source position for debug info
     pub pos: Option<Position>,
 }
@@ -519,6 +522,7 @@ impl Default for Instruction {
             is_sret_call: false,
             is_noreturn_call: false,
             is_two_reg_return: false,
+            indirect_target: None,
             pos: None,
         }
     }
@@ -703,6 +707,26 @@ impl Instruction {
         let mut insn = Self::new(Opcode::Call)
             .with_func(func)
             .with_type_and_size(ret_type, ret_size);
+        if let Some(t) = target {
+            insn.target = Some(t);
+        }
+        insn.src = args;
+        insn.arg_types = arg_types;
+        insn
+    }
+
+    /// Create an indirect call instruction (call through function pointer)
+    pub fn call_indirect(
+        target: Option<PseudoId>,
+        func_addr: PseudoId,
+        args: Vec<PseudoId>,
+        arg_types: Vec<TypeId>,
+        ret_type: TypeId,
+        ret_size: u32,
+    ) -> Self {
+        let mut insn = Self::new(Opcode::Call).with_type_and_size(ret_type, ret_size);
+        insn.indirect_target = Some(func_addr);
+        insn.func_name = Some("<indirect>".to_string());
         if let Some(t) = target {
             insn.target = Some(t);
         }

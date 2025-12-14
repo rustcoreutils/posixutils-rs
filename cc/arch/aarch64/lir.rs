@@ -145,6 +145,8 @@ impl fmt::Display for Cond {
 pub enum CallTarget {
     /// Direct call to symbol
     Direct(Symbol),
+    /// Indirect call through register (blr xN)
+    Indirect(Reg),
 }
 
 // ============================================================================
@@ -1140,6 +1142,10 @@ impl EmitAsm for Aarch64Inst {
                 CallTarget::Direct(sym) => {
                     let sym_name = sym.format_for_target(target);
                     let _ = writeln!(out, "    bl {}", sym_name);
+                }
+                CallTarget::Indirect(reg) => {
+                    // Branch with link to register (indirect call)
+                    let _ = writeln!(out, "    blr {}", reg.name64());
                 }
             },
 

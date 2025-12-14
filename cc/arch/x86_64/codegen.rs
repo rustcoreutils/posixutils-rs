@@ -2714,10 +2714,24 @@ impl X86_64CodeGen {
     }
 
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
-        let func_name = match &insn.func_name {
-            Some(n) => n.clone(),
-            None => return,
+        // Check if this is an indirect call (through function pointer)
+        let is_indirect = insn.indirect_target.is_some();
+
+        // For direct calls, we need a function name
+        let func_name = if is_indirect {
+            "<indirect>".to_string()
+        } else {
+            match &insn.func_name {
+                Some(n) => n.clone(),
+                None => return,
+            }
         };
+
+        // For indirect calls, load function pointer address into R11 before argument setup
+        // R11 is caller-saved and not used for arguments in System V AMD64 ABI
+        if let Some(func_addr) = insn.indirect_target {
+            self.emit_move(func_addr, Reg::R11, 64);
+        }
 
         // System V AMD64 ABI:
         // - Integer arguments: RDI, RSI, RDX, RCX, R8, R9 (6 registers)
@@ -2943,9 +2957,17 @@ impl X86_64CodeGen {
         }
 
         // Emit the call
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(func_name.clone())),
-        });
+        if is_indirect {
+            // Indirect call through R11 (function pointer was loaded there earlier)
+            self.push_lir(X86Inst::Call {
+                target: CallTarget::Indirect(Reg::R11),
+            });
+        } else {
+            // Direct call to named function
+            self.push_lir(X86Inst::Call {
+                target: CallTarget::Direct(Symbol::global(func_name.clone())),
+            });
+        }
 
         // Clean up stack arguments (including padding if any)
         let stack_cleanup = stack_args * 8 + if needs_padding { 8 } else { 0 };

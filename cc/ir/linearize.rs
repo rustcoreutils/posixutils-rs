@@ -347,6 +347,12 @@ impl<'a> Linearizer<'a> {
             return val;
         }
 
+        // Function to pointer conversion (decay) - no actual conversion needed
+        // Function name decays to function pointer (64-bit address)
+        if from_kind == TypeKind::Function && to_kind == TypeKind::Pointer {
+            return val;
+        }
+
         // Pointer to pointer conversion - no actual conversion needed
         // All pointers are the same size (64-bit)
         if from_kind == TypeKind::Pointer && to_kind == TypeKind::Pointer {
@@ -2693,10 +2699,55 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a function call expression
     fn linearize_call(&mut self, expr: &Expr, func_expr: &Expr, args: &[Expr]) -> PseudoId {
-        // Get function name
-        let func_name = match &func_expr.kind {
-            ExprKind::Ident { name, .. } => self.str(*name).to_string(),
-            _ => "<indirect>".to_string(),
+        // Determine if this is a direct or indirect call.
+        // We need to check the TYPE of the function expression:
+        // - If it's TypeKind::Function, it's a direct call to a function
+        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
+        let is_function_pointer = func_expr.typ.is_some_and(|t| {
+            let typ = self.types.get(t);
+            typ.kind == TypeKind::Pointer
+        });
+
+        let (func_name, indirect_target) = match &func_expr.kind {
+            ExprKind::Ident { name, .. } if !is_function_pointer => {
+                // Direct call to named function (not a function pointer variable)
+                (self.str(*name).to_string(), None)
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } => {
+                // Explicit dereference form: (*fp)(args) or (*fpp)(args)
+                // Check the type of the operand to determine behavior:
+                // - If operand is function pointer (*fn): call through operand value
+                // - If operand is pointer-to-function-pointer (**fn): dereference first
+                let operand_type = self.expr_type(operand);
+                let operand_kind = self.types.kind(operand_type);
+                if operand_kind == TypeKind::Pointer {
+                    // Check what it points to
+                    let base_type = self.types.base_type(operand_type);
+                    let base_kind = base_type.map(|t| self.types.kind(t));
+                    if base_kind == Some(TypeKind::Function) {
+                        // Operand is function pointer - use its value directly
+                        let func_addr = self.linearize_expr(operand);
+                        ("<indirect>".to_string(), Some(func_addr))
+                    } else {
+                        // Operand is pointer-to-pointer - dereference to get function pointer
+                        let func_addr = self.linearize_expr(func_expr);
+                        ("<indirect>".to_string(), Some(func_addr))
+                    }
+                } else {
+                    // Unknown case - try to linearize the full expression
+                    let func_addr = self.linearize_expr(func_expr);
+                    ("<indirect>".to_string(), Some(func_addr))
+                }
+            }
+            _ => {
+                // Indirect call through function pointer variable: fp(args)
+                // This includes identifiers that are function pointer variables
+                let func_addr = self.linearize_expr(func_expr);
+                ("<indirect>".to_string(), Some(func_addr))
+            }
         };
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
@@ -2814,6 +2865,11 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
                 arg_types_vec.push(self.types.pointer_to(elem_type));
                 self.linearize_expr(a)
+            } else if arg_kind == TypeKind::Function {
+                // Function decay to pointer (C99 6.3.2.1)
+                // Function names passed as arguments decay to function pointers
+                arg_types_vec.push(self.types.pointer_to(arg_type));
+                self.linearize_expr(a)
             } else {
                 arg_types_vec.push(arg_type);
                 self.linearize_expr(a)
@@ -2830,14 +2886,27 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(result_pseudo);
             }
             let ptr_typ = self.types.pointer_to(typ);
-            let mut call_insn = Instruction::call(
-                Some(result),
-                &func_name,
-                arg_vals,
-                arg_types_vec,
-                ptr_typ,
-                64, // pointers are 64-bit
-            );
+            let mut call_insn = if let Some(func_addr) = indirect_target {
+                // Indirect call through function pointer
+                Instruction::call_indirect(
+                    Some(result),
+                    func_addr,
+                    arg_vals,
+                    arg_types_vec,
+                    ptr_typ,
+                    64, // pointers are 64-bit
+                )
+            } else {
+                // Direct call
+                Instruction::call(
+                    Some(result),
+                    &func_name,
+                    arg_vals,
+                    arg_types_vec,
+                    ptr_typ,
+                    64, // pointers are 64-bit
+                )
+            };
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_sret_call = true;
             call_insn.is_noreturn_call = is_noreturn_call;
@@ -2846,14 +2915,27 @@ impl<'a> Linearizer<'a> {
             result_sym
         } else {
             let ret_size = self.types.size_bits(typ);
-            let mut call_insn = Instruction::call(
-                Some(result_sym),
-                &func_name,
-                arg_vals,
-                arg_types_vec,
-                typ,
-                ret_size,
-            );
+            let mut call_insn = if let Some(func_addr) = indirect_target {
+                // Indirect call through function pointer
+                Instruction::call_indirect(
+                    Some(result_sym),
+                    func_addr,
+                    arg_vals,
+                    arg_types_vec,
+                    typ,
+                    ret_size,
+                )
+            } else {
+                // Direct call
+                Instruction::call(
+                    Some(result_sym),
+                    &func_name,
+                    arg_vals,
+                    arg_types_vec,
+                    typ,
+                    ret_size,
+                )
+            };
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.is_two_reg_return = returns_two_reg_struct;
@@ -3312,11 +3394,19 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(pseudo);
             }
             let typ = self.expr_type(expr);
+            let type_kind = self.types.kind(typ);
             // Arrays decay to pointers - get address, not value
-            if self.types.kind(typ) == TypeKind::Array {
+            if type_kind == TypeKind::Array {
                 let result = self.alloc_pseudo();
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
+                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                result
+            }
+            // Functions decay to function pointers - get address, not value
+            else if type_kind == TypeKind::Function {
+                let result = self.alloc_pseudo();
+                let ptr_type = self.types.pointer_to(typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             } else {
@@ -3395,7 +3485,12 @@ impl<'a> Linearizer<'a> {
 
                 let result = self.alloc_pseudo();
                 let typ = self.expr_type(expr); // Use evaluated type
-                let size = self.types.size_bits(typ);
+                                                // Function types in ternary expressions decay to pointers (64-bit)
+                let size = if self.types.kind(typ) == TypeKind::Function {
+                    64
+                } else {
+                    self.types.size_bits(typ)
+                };
 
                 self.emit(Instruction::select(
                     result, cond_val, then_val, else_val, typ, size,

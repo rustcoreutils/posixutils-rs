@@ -2252,10 +2252,24 @@ impl Aarch64CodeGen {
     }
 
     fn emit_call(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
-        let func_name = match &insn.func_name {
-            Some(n) => n.clone(),
-            None => return,
+        // Check if this is an indirect call (through function pointer)
+        let is_indirect = insn.indirect_target.is_some();
+
+        // For direct calls, we need a function name
+        let func_name = if is_indirect {
+            "<indirect>".to_string()
+        } else {
+            match &insn.func_name {
+                Some(n) => n.clone(),
+                None => return,
+            }
         };
+
+        // For indirect calls, load function pointer address into X16 (IP0)
+        // X16 is the intra-procedure-call scratch register per AAPCS64
+        if let Some(func_addr) = insn.indirect_target {
+            self.emit_move(func_addr, Reg::X16, 64, frame_size);
+        }
 
         // AAPCS64 calling convention:
         // - Integer arguments: X0-X7 (8 registers)
@@ -2511,9 +2525,17 @@ impl Aarch64CodeGen {
         }
 
         // Call the function
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(&func_name)),
-        });
+        if is_indirect {
+            // Indirect call through X16 (function pointer was loaded there earlier)
+            self.push_lir(Aarch64Inst::Bl {
+                target: CallTarget::Indirect(Reg::X16),
+            });
+        } else {
+            // Direct call to named function
+            self.push_lir(Aarch64Inst::Bl {
+                target: CallTarget::Direct(Symbol::global(&func_name)),
+            });
+        }
 
         // Clean up stack arguments
         if stack_args > 0 {

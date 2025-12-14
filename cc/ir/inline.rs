@@ -459,6 +459,10 @@ fn clone_instruction(
                 .iter()
                 .map(|s| ctx.remap_pseudo(*s, callee_pseudos))
                 .collect();
+            // For indirect calls, also remap the function pointer pseudo
+            new_insn.indirect_target = insn
+                .indirect_target
+                .map(|t| ctx.remap_pseudo(t, callee_pseudos));
             // Keep func_name and other call metadata unchanged
             vec![new_insn]
         }

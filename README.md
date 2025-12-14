@@ -18,7 +18,7 @@ Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (O
 
 ## WANTED:  Volunteers!
 
-Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details, and [WANTED](WANTED.md) for recommended coding tasks for newcomers.
+Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
 
 ### Non-goals
 

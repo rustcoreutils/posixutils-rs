@@ -7,6 +7,14 @@ There are several ways to contribute to posixutils-rs:
 * writing documentation
 * testing, especially POSIX compliance testing
 
+### Quick start
+
+Build: `cargo build --release`
+
+Test all (long, more than 15 minutes on some hosts) `cargo test --release`
+
+Test (one module): `cargo test --release -p posixutils-SOMECRATE`
+
 ### Utility lifecycle:  Stages of Maturity
 
 1. Rough draft:  Core algorithm implemented.  Bugs may exist.  Many options not yet implemented.

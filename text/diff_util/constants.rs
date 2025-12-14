@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub const EXIT_STATUS_NO_DIFFERENCE: u8 = 0;
 pub const EXIT_STATUS_DIFFERENCE: u8 = 1;
 pub const EXIT_STATUS_TROUBLE: u8 = 2;

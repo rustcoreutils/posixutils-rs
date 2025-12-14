@@ -10,14 +10,12 @@
 //!
 //! POSIX-compliant implementation using SSH for transport.
 
-mod common;
-
 use clap::Parser;
-use common::{
-    expand_remote_path, is_local_system, parse_path_spec, send_mail, shell_escape, ssh_exec,
-    ssh_fetch_file,
-};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use posixutils_uucp::common::{
+    expand_remote_path, generate_job_id, is_local_system, parse_path_spec, send_mail, shell_escape,
+    ssh_exec, ssh_fetch_file, ssh_send_file,
+};
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
@@ -113,7 +111,7 @@ fn main() -> ExitCode {
     };
 
     // Generate job ID
-    let job_id = common::generate_job_id();
+    let job_id = generate_job_id();
 
     if args.print_job_id {
         println!("{}", job_id);
@@ -302,7 +300,7 @@ fn execute_uux(
                 .map_err(|e| format!("failed to fetch {}: {}", file.path, e))?;
 
             let remote_path = format!("{}/{}", work_dir, basename);
-            common::ssh_send_file(&parsed.exec_host, &temp_path, &remote_path, true)
+            ssh_send_file(&parsed.exec_host, &temp_path, &remote_path, true)
                 .map_err(|e| format!("failed to send to exec host: {}", e))?;
 
             let _ = std::fs::remove_file(&temp_path);

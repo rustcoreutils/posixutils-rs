@@ -249,13 +249,12 @@ fn write_state_tables<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
         let mut class_transitions: Vec<i16> = vec![-1; num_classes];
 
         for (input, &target) in &state.transitions {
-            if let DfaInput::Char(ch) = input {
-                // Only handle ASCII characters (0-255)
-                let ch_code = *ch as u32;
-                if ch_code < 256 {
-                    let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
-                    class_transitions[class_idx] = target as i16;
-                }
+            let DfaInput::Char(ch) = input;
+            // Only handle ASCII characters (0-255)
+            let ch_code = *ch as u32;
+            if ch_code < 256 {
+                let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
+                class_transitions[class_idx] = target as i16;
             }
         }
 

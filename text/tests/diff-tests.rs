@@ -8,14 +8,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-#[path = "../diff_util/constants.rs"]
-mod constants;
-
-use constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE};
 use plib::testing::{run_test, TestPlan};
+
+const EXIT_STATUS_NO_DIFFERENCE: i32 = 0;
+const EXIT_STATUS_DIFFERENCE: i32 = 1;
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::LazyLock};
 
-fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8) {
+fn diff_test(args: &[&str], expected_output: &str, expected_exit_code: i32) {
     let str_args = args.iter().cloned().map(str::to_owned).collect();
 
     run_test(TestPlan {
@@ -24,7 +23,7 @@ fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8
         stdin_data: String::from(""),
         expected_out: String::from(expected_output),
         expected_err: String::from(""),
-        expected_exit_code: i32::from(expected_diff_exit_status),
+        expected_exit_code,
     });
 }
 

@@ -10,14 +10,12 @@
 //!
 //! POSIX-compliant implementation using SSH for transport.
 
-mod common;
-
 use clap::Parser;
-use common::{
-    expand_local_path, expand_remote_path, is_local_system, parse_path_spec, send_mail,
-    send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
-};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use posixutils_uucp::common::{
+    expand_local_path, expand_remote_path, generate_job_id, is_local_system, parse_path_spec,
+    send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
+};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -93,6 +91,16 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Warn about unsupported wildcard expansion in remote destination
+    if !dest_is_local
+        && (dest_path.contains('*') || dest_path.contains('?') || dest_path.contains('['))
+    {
+        eprintln!(
+            "uucp: warning: wildcard expansion not supported for remote paths: {}",
+            dest_path
+        );
+    }
+
     // Determine if destination is a directory
     let is_dir = source_specs.len() > 1 || dest_path.ends_with('/');
 
@@ -117,6 +125,16 @@ fn main() -> ExitCode {
         }
 
         let src_is_local = is_local_system(&src_system);
+
+        // Warn about unsupported wildcard expansion in remote paths
+        if !src_is_local
+            && (src_path.contains('*') || src_path.contains('?') || src_path.contains('['))
+        {
+            eprintln!(
+                "uucp: warning: wildcard expansion not supported for remote paths: {}",
+                src_path
+            );
+        }
 
         // Expand source path
         let src_path_expanded = if src_is_local {
@@ -212,7 +230,7 @@ fn main() -> ExitCode {
 
     // Print job ID if requested (for immediate execution, generate one)
     if args.print_job_id {
-        println!("{}", common::generate_job_id());
+        println!("{}", generate_job_id());
     }
 
     // Send mail to requester if -m specified and successful

@@ -25,6 +25,8 @@ workspace = true
 [dev-dependencies]
 sysinfo = "0.31"
 
+[lib]
+path = "lib.rs"
 
 [[bin]]
 name = "batch"

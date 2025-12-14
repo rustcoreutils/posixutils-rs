@@ -18,6 +18,9 @@ tempfile = "3.10"
 [lints]
 workspace = true
 
+[lib]
+path = "lib.rs"
+
 [[bin]]
 name = "uucp"
 path = "./uucp.rs"

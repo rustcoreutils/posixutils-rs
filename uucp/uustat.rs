@@ -10,11 +10,9 @@
 //!
 //! POSIX-compliant implementation.
 
-mod common;
-
 use clap::Parser;
-use common::{find_job, list_jobs, spool_dir};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use posixutils_uucp::common::{find_job, list_jobs, spool_dir};
 use std::collections::HashMap;
 use std::env;
 use std::process::ExitCode;

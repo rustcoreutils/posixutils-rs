@@ -16,6 +16,7 @@
 
 pub mod dce;
 pub mod dominate;
+pub mod inline;
 pub mod instcombine;
 pub mod linearize;
 pub mod lower;
@@ -984,6 +985,8 @@ pub struct Function {
     pub is_static: bool,
     /// Is this function noreturn (never returns)?
     pub is_noreturn: bool,
+    /// Is this function declared with the inline keyword?
+    pub is_inline: bool,
 }
 
 impl Default for Function {
@@ -999,6 +1002,7 @@ impl Default for Function {
             max_dom_level: 0,
             is_static: false,
             is_noreturn: false,
+            is_inline: false,
         }
     }
 }

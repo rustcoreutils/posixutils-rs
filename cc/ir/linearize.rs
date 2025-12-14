@@ -786,11 +786,12 @@ impl<'a> Linearizer<'a> {
         // - static inline: internal linkage (same as static)
         // - inline (without extern): inline definition only, internal linkage
         // - extern inline: per C99, provides external definition, but since we
-        //   don't support function inlining, treat as internal to avoid
-        //   duplicate symbol errors when same inline function is defined in
-        //   multiple translation units
+        //   treat inline functions as internal linkage candidates for inlining,
+        //   avoid duplicate symbol errors when same inline function is defined
+        //   in multiple translation units
         ir_func.is_static = is_static || is_inline;
         ir_func.is_noreturn = is_noreturn;
+        ir_func.is_inline = is_inline;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct

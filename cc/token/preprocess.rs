@@ -2508,7 +2508,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
-        let result = preprocess(tokens, &target, &mut strings, "<test>");
+        let result = preprocess_with_defines(tokens, &target, &mut strings, "<test>", &[], &[]);
         (result, strings)
     }
 

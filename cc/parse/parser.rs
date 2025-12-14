@@ -2924,6 +2924,8 @@ impl Parser<'_> {
         if !self.is_special(b';') {
             loop {
                 let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
+                // Skip GCC extensions like __asm("...") or __attribute__((...))
+                self.skip_extensions();
                 let init = if self.is_special(b'=') {
                     self.advance();
                     Some(self.parse_initializer()?)
@@ -2971,6 +2973,8 @@ impl Parser<'_> {
         if !self.is_special(b';') {
             loop {
                 let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
+                // Skip GCC extensions like __asm("...") or __attribute__((...))
+                self.skip_extensions();
 
                 let init = if self.is_special(b'=') {
                     if is_typedef {
@@ -3344,6 +3348,30 @@ impl Parser<'_> {
                 }
 
                 loop {
+                    // Check for unnamed bitfield (can appear after ',' too)
+                    // e.g., "int a : 1, : 2, b : 3;"
+                    if self.is_special(b':') {
+                        // Unnamed bitfield: parse width only
+                        self.advance(); // consume ':'
+                        let width = self.parse_bitfield_width()?;
+
+                        members.push(StructMember {
+                            name: StringId::EMPTY,
+                            typ: member_base_type_id,
+                            offset: 0,
+                            bit_offset: None,
+                            bit_width: Some(width),
+                            storage_unit_size: None,
+                        });
+
+                        if self.is_special(b',') {
+                            self.advance();
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+
                     // VLAs are not allowed in struct members
                     let (name, typ, vla_sizes) = self.parse_declarator(member_base_type_id)?;
 
@@ -3520,8 +3548,20 @@ impl Parser<'_> {
                 (self.expect_identifier()?, None)
             }
         } else {
-            // Get the name directly
-            (self.expect_identifier()?, None)
+            // Get the name directly, or use empty for abstract declarators
+            // Abstract declarators have no name: void (*)(int) - the * has no identifier
+            if self.peek() == TokenType::Ident {
+                (self.expect_identifier()?, None)
+            } else if self.is_special(b')')
+                || self.is_special(b'[')
+                || self.is_special(b'(')
+                || self.is_special(b',')
+            {
+                // No identifier - abstract declarator (e.g., void (*)(int), const char * restrict)
+                (StringId::EMPTY, None)
+            } else {
+                (self.expect_identifier()?, None)
+            }
         };
 
         // Handle array declarators - collect all dimensions first
@@ -3530,8 +3570,46 @@ impl Parser<'_> {
         let mut vla_exprs: Vec<Expr> = Vec::new();
         while self.is_special(b'[') {
             self.advance();
+
+            // Parse optional qualifiers and static (C99 6.7.5.3)
+            // These are valid in function parameter array declarators
+            while self.peek() == TokenType::Ident {
+                if let Some(name) = self.get_ident_name(self.current()) {
+                    match name.as_str() {
+                        "static" | "const" | "volatile" | "restrict" => {
+                            self.advance();
+                        }
+                        _ => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Check for [*] VLA unspecified size (C99 6.7.5.2)
+            // This is used in function prototypes: void f(int n, int arr[*])
             let size = if self.is_special(b']') {
                 None
+            } else if self.is_special(b'*') {
+                // Check if it's [*] (VLA star) or just a multiplication expression
+                let saved_pos = self.pos;
+                self.advance();
+                if self.is_special(b']') {
+                    // It's [*] - VLA with unspecified size
+                    None
+                } else {
+                    // It's an expression starting with * (e.g., [*ptr])
+                    self.pos = saved_pos;
+                    let expr = self.parse_assignment_expr()?;
+                    match self.eval_const_expr(&expr) {
+                        Some(n) if n >= 0 => Some(n as usize),
+                        Some(_) => None,
+                        None => {
+                            vla_exprs.push(expr);
+                            None
+                        }
+                    }
+                }
             } else {
                 // Parse constant expression for array size (C99 6.7.5.2)
                 let expr = self.parse_assignment_expr()?;
@@ -3827,177 +3905,26 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_type = self.parse_type_specifier()?;
-            let mut typ_id = self.types.intern(param_type);
+            let base_type_id = self.types.intern(param_type);
 
-            // Handle pointer with qualifiers (const, volatile, restrict)
-            while self.is_special(b'*') {
-                self.advance();
-                let mut ptr_modifiers = TypeModifiers::empty();
+            // Use parse_declarator to handle all declarator forms including:
+            // - Simple pointers: void *, int *
+            // - Grouped declarators: void (*)(int), int (*)[10]
+            // - Arrays: int arr[], int arr[10]
+            // Note: parse_declarator returns (name, type, vla_sizes)
+            let (param_name, mut typ_id, _vla_sizes) = self.parse_declarator(base_type_id)?;
 
-                // Parse pointer qualifiers
-                while self.peek() == TokenType::Ident {
-                    if let Some(name) = self.get_ident_name(self.current()) {
-                        match name.as_str() {
-                            "const" => {
-                                self.advance();
-                                ptr_modifiers |= TypeModifiers::CONST;
-                            }
-                            "volatile" => {
-                                self.advance();
-                                ptr_modifiers |= TypeModifiers::VOLATILE;
-                            }
-                            "restrict" => {
-                                self.advance();
-                                ptr_modifiers |= TypeModifiers::RESTRICT;
-                            }
-                            _ => break,
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
+            // C99 6.7.5.3: Array parameters are adjusted to pointers
+            // parse_declarator already gives us the array type, we need to convert
+            // the outermost array dimension to a pointer
+            let typ = self.types.get(typ_id);
+            if typ.kind == TypeKind::Array {
+                // Convert array to pointer to element type
+                let element_type = typ.base.unwrap_or(self.types.void_id);
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
-                    modifiers: ptr_modifiers,
-                    base: Some(typ_id),
-                    array_size: None,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
-                };
-                typ_id = self.types.intern(ptr_type);
-            }
-
-            // Parse optional parameter name
-            let param_name = if self.peek() == TokenType::Ident {
-                // Check if it's actually a name (not a type keyword)
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    if !self.is_declaration_start() {
-                        self.advance();
-                        Some(name_id)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Handle array declarator in parameter: int arr[] becomes int *arr
-            // C99 6.7.5.3: "A declaration of a parameter as 'array of type' shall be
-            // adjusted to 'qualified pointer to type'"
-            // For multi-dimensional arrays like int mat[*][*], the outer dimension
-            // becomes a pointer, inner dimensions remain as array dimensions.
-            if self.is_special(b'[') {
-                // First, collect all array dimensions (for multi-dimensional arrays)
-                // We need to parse them all before building the type, since C declarators
-                // are "inside-out" - the innermost dimension is closest to element type.
-                let mut dimensions: Vec<(TypeModifiers, Option<usize>)> = Vec::new();
-                let mut first_dimension = true;
-
-                while self.is_special(b'[') {
-                    self.advance();
-
-                    // Parse optional qualifiers and static (C99 6.7.5.3)
-                    // Note: qualifiers/static only valid in first dimension for parameters
-                    let mut array_qualifiers = TypeModifiers::empty();
-                    let mut has_static = false;
-                    let mut is_vla_star = false;
-
-                    if first_dimension {
-                        // Parse type qualifiers and static keyword
-                        while self.peek() == TokenType::Ident {
-                            if let Some(name) = self.get_ident_name(self.current()) {
-                                match name.as_str() {
-                                    "static" => {
-                                        if has_static {
-                                            diag::error(
-                                                self.current().pos,
-                                                "duplicate 'static' in array declarator",
-                                            );
-                                        }
-                                        self.advance();
-                                        has_static = true;
-                                    }
-                                    "const" => {
-                                        self.advance();
-                                        array_qualifiers |= TypeModifiers::CONST;
-                                    }
-                                    "volatile" => {
-                                        self.advance();
-                                        array_qualifiers |= TypeModifiers::VOLATILE;
-                                    }
-                                    "restrict" => {
-                                        self.advance();
-                                        array_qualifiers |= TypeModifiers::RESTRICT;
-                                    }
-                                    _ => break,
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Check for [*] VLA unspecified size (C99 6.7.5.2)
-                    if self.is_special(b'*') {
-                        let saved_pos = self.pos;
-                        self.advance();
-                        if self.is_special(b']') {
-                            is_vla_star = true;
-                        } else {
-                            self.pos = saved_pos; // Backtrack - it's an expression
-                        }
-                    }
-
-                    // Parse optional size expression and try to evaluate as constant
-                    let size = if is_vla_star || self.is_special(b']') {
-                        None // VLA or empty brackets
-                    } else {
-                        let expr = self.parse_assignment_expr()?;
-                        // Try to evaluate as constant expression
-                        match self.eval_const_expr(&expr) {
-                            Some(n) if n >= 0 => Some(n as usize),
-                            _ => None, // VLA (non-constant or negative)
-                        }
-                    };
-
-                    self.expect_special(b']')?;
-
-                    dimensions.push((array_qualifiers, size));
-                    first_dimension = false;
-                }
-
-                // Build the type from innermost to outermost
-                // For int arr[M][N], we have dimensions = [(qualifiers, M), (empty, N)]
-                // Result type should be: pointer(qualifiers) -> array[N] -> int
-                // So we process dimensions in reverse, then make the first a pointer
-
-                // First, build array types for all inner dimensions (skip the first)
-                for (_qualifiers, size) in dimensions.iter().skip(1).rev() {
-                    let arr_type = Type {
-                        kind: TypeKind::Array,
-                        modifiers: TypeModifiers::empty(),
-                        base: Some(typ_id),
-                        array_size: *size,
-                        params: None,
-                        variadic: false,
-                        noreturn: false,
-                        composite: None,
-                    };
-                    typ_id = self.types.intern(arr_type);
-                }
-
-                // The outermost (first) dimension becomes a pointer (C99 6.7.5.3)
-                let first_qualifiers = dimensions.first().map(|(q, _)| *q).unwrap_or_default();
-                let ptr_type = Type {
-                    kind: TypeKind::Pointer,
-                    modifiers: first_qualifiers,
-                    base: Some(typ_id),
+                    modifiers: TypeModifiers::empty(),
+                    base: Some(element_type),
                     array_size: None,
                     params: None,
                     variadic: false,
@@ -4008,7 +3935,11 @@ impl Parser<'_> {
             }
 
             params.push(Parameter {
-                name: param_name,
+                name: if param_name == StringId::EMPTY {
+                    None
+                } else {
+                    Some(param_name)
+                },
                 typ: typ_id,
             });
 
@@ -4276,6 +4207,8 @@ impl Parser<'_> {
                 }));
             } else {
                 // Function declaration
+                // Skip __asm("...") symbol aliasing which can appear after function declarator
+                self.skip_extensions();
                 self.expect_special(b';')?;
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type =

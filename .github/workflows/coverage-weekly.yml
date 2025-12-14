@@ -25,6 +25,13 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install system deps (awk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gawk
+          command -v awk
+          awk --version | head -n 1
+
       - name: Generate LCOV (workspace)
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
 

@@ -621,12 +621,15 @@ impl<'a> Parser<'a> {
 
             // Right-to-left associativity: parse the right side as another assignment
             let right = self.parse_assignment_expr()?;
-            Ok(Expr::new(
+            // In C, assignment expression type is the type of the left operand
+            let assign_type = left.typ.unwrap_or(self.types.int_id);
+            Ok(Self::typed_expr(
                 ExprKind::Assign {
                     op: assign_op,
                     target: Box::new(left),
                     value: Box::new(right),
                 },
+                assign_type,
                 assign_pos,
             ))
         } else {

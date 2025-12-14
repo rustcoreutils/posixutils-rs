@@ -1235,7 +1235,20 @@ impl X86_64CodeGen {
             }
         } else {
             let src2_loc = self.get_location(src2);
-            let src2_gp = self.loc_to_gp_operand(&src2_loc);
+            // For 64-bit operations, check if immediate fits in 32-bit signed range.
+            // x86-64 binary ops (add, sub, and, or, xor) only support 32-bit sign-extended immediates.
+            // If the immediate doesn't fit, load it into R11 first.
+            let src2_gp = match &src2_loc {
+                Loc::Imm(v) if size == 64 && (*v > i32::MAX as i64 || *v < i32::MIN as i64) => {
+                    // Large 64-bit immediate - load into R11 first
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: *v,
+                        dst: Reg::R11,
+                    });
+                    GpOperand::Reg(Reg::R11)
+                }
+                _ => self.loc_to_gp_operand(&src2_loc),
+            };
             // LIR: binary operation (add, sub, and, or, xor)
             match insn.op {
                 Opcode::Add => self.push_lir(X86Inst::Add {

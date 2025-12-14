@@ -23,7 +23,6 @@ use std::fmt::{self, Write};
 // ============================================================================
 
 /// AArch64 memory addressing mode
-#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemAddr {
     /// [base] - Register indirect
@@ -31,12 +30,6 @@ pub enum MemAddr {
 
     /// [base, #offset] - Register indirect with immediate offset
     BaseOffset { base: Reg, offset: i32 },
-
-    /// [base, Xm] - Register indirect with register offset
-    BaseReg { base: Reg, index: Reg },
-
-    /// [base, Xm, LSL #shift] - Register indirect with shifted register offset
-    BaseRegShift { base: Reg, index: Reg, shift: u8 },
 
     /// [base, #offset]! - Pre-indexed (base updated before access)
     PreIndex { base: Reg, offset: i32 },
@@ -56,12 +49,6 @@ impl MemAddr {
                 } else {
                     format!("[{}, #{}]", base.name64(), offset)
                 }
-            }
-            MemAddr::BaseReg { base, index } => {
-                format!("[{}, {}]", base.name64(), index.name64())
-            }
-            MemAddr::BaseRegShift { base, index, shift } => {
-                format!("[{}, {}, lsl #{}]", base.name64(), index.name64(), shift)
             }
             MemAddr::PreIndex { base, offset } => {
                 format!("[{}, #{}]!", base.name64(), offset)

@@ -20,9 +20,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub enum DfaInput {
     /// A specific character
     Char(char),
-    /// Default transition (any character not explicitly listed) - reserved for future use
-    #[allow(dead_code)]
-    Default,
 }
 
 /// A state in the DFA
@@ -39,14 +36,10 @@ pub struct DfaState {
     /// contains a main pattern end (where yytext should end)
     /// Used for runtime tracking of where to truncate matched text
     pub main_pattern_end_rules: Vec<usize>,
-    /// The set of NFA states this DFA state represents (for debugging)
-    #[allow(dead_code)]
-    pub nfa_states: BTreeSet<usize>,
 }
 
 impl DfaState {
     fn new(
-        nfa_states: BTreeSet<usize>,
         accepting: Option<usize>,
         accepting_rules: Vec<usize>,
         main_pattern_end_rules: Vec<usize>,
@@ -56,7 +49,6 @@ impl DfaState {
             accepting,
             accepting_rules,
             main_pattern_end_rules,
-            nfa_states,
         }
     }
 }
@@ -150,7 +142,6 @@ impl Dfa {
 
         state_map.insert(initial_nfa_states.clone(), 0);
         dfa.states.push(DfaState::new(
-            initial_nfa_states.clone(),
             initial_accepting,
             initial_accepting_rules,
             initial_main_end_rules,
@@ -187,12 +178,8 @@ impl Dfa {
                     let accepting_rules = nfa.get_all_accepting(&target_nfa_states);
                     let main_end_rules = get_main_pattern_end_rules(nfa, &target_nfa_states);
                     state_map.insert(target_nfa_states.clone(), idx);
-                    dfa.states.push(DfaState::new(
-                        target_nfa_states.clone(),
-                        accepting,
-                        accepting_rules,
-                        main_end_rules,
-                    ));
+                    dfa.states
+                        .push(DfaState::new(accepting, accepting_rules, main_end_rules));
                     worklist.push(target_nfa_states);
                     idx
                 };
@@ -251,10 +238,7 @@ impl Dfa {
             .states
             .iter()
             .flat_map(|s| s.transitions.keys())
-            .filter_map(|i| match i {
-                DfaInput::Char(c) => Some(*c),
-                DfaInput::Default => None,
-            })
+            .map(|DfaInput::Char(c)| *c)
             .collect();
 
         // Refine partitions until fixed point
@@ -346,7 +330,6 @@ impl Dfa {
                 accepting: old_state.accepting,
                 accepting_rules: old_state.accepting_rules.clone(),
                 main_pattern_end_rules: old_state.main_pattern_end_rules.clone(),
-                nfa_states: partition.clone(),
             });
         }
 
@@ -412,14 +395,6 @@ fn build_alphabet(nfa: &Nfa) -> Vec<char> {
                             for c in lo_clamped..=hi_clamped {
                                 chars.insert(char::from_u32(c).unwrap_or('\0'));
                             }
-                        }
-                    }
-                }
-                Transition::Any => {
-                    // Add all ASCII characters except newline
-                    for c in 0u8..=255 {
-                        if c != b'\n' {
-                            chars.insert(c as char);
                         }
                     }
                 }

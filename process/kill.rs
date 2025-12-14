@@ -7,11 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-mod signal;
-
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-
-use crate::signal::{list_signals, lookup_signum};
+use posixutils_process::signal::{list_signals, lookup_signum};
 
 enum ConfigMode {
     Signal(i32),

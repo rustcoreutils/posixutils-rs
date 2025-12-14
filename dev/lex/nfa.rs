@@ -13,7 +13,7 @@
 //! into NFAs, which can then be converted to DFAs for efficient lexical analysis.
 
 use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind, Literal, Repetition};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Represents a transition in the NFA
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -24,9 +24,6 @@ pub enum Transition {
     Char(char),
     /// Match any character in a set of ranges
     CharClass(Vec<(char, char)>),
-    /// Match any character except newline (for '.') - reserved for future use
-    #[allow(dead_code)]
-    Any,
 }
 
 /// A state in the NFA
@@ -87,7 +84,7 @@ impl Nfa {
     /// Build an NFA from a list of rules (patterns with rule indices)
     /// Note: Kept for backward compatibility and testing. Use from_rules_with_trailing_context
     /// for rules that may have trailing context.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn from_rules(rules: &[(Hir, usize)]) -> Result<Self, String> {
         let mut nfa = Nfa::new();
         let start = nfa.start;
@@ -397,7 +394,6 @@ impl Nfa {
                     Transition::CharClass(ranges) => {
                         ranges.iter().any(|(lo, hi)| ch >= *lo && ch <= *hi)
                     }
-                    Transition::Any => ch != '\n',
                     Transition::Epsilon => false,
                 };
                 if matches {
@@ -407,44 +403,6 @@ impl Nfa {
         }
 
         result
-    }
-
-    /// Get all characters/character classes that can be matched from a set of states
-    /// Reserved for future use in optimizations
-    #[allow(dead_code)]
-    pub fn get_alphabet(&self) -> Vec<Transition> {
-        let mut alphabet: Vec<Transition> = Vec::new();
-        let mut seen_chars: HashSet<char> = HashSet::new();
-        let mut seen_classes: HashSet<Vec<(char, char)>> = HashSet::new();
-        let mut has_any = false;
-
-        for state in &self.states {
-            for (trans, _) in &state.transitions {
-                match trans {
-                    Transition::Char(c) => {
-                        if !seen_chars.contains(c) {
-                            seen_chars.insert(*c);
-                            alphabet.push(trans.clone());
-                        }
-                    }
-                    Transition::CharClass(ranges) => {
-                        if !seen_classes.contains(ranges) {
-                            seen_classes.insert(ranges.clone());
-                            alphabet.push(trans.clone());
-                        }
-                    }
-                    Transition::Any => {
-                        if !has_any {
-                            has_any = true;
-                            alphabet.push(Transition::Any);
-                        }
-                    }
-                    Transition::Epsilon => {}
-                }
-            }
-        }
-
-        alphabet
     }
 
     /// Get the highest priority accepting rule for a set of states (lowest index = highest priority)

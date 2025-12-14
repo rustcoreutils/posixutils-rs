@@ -8,7 +8,6 @@
 //
 
 // `kill` and `timeout` bins
-#![allow(dead_code)]
 
 pub fn list_signals() {
     let mut output = String::new();

@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-mod signal;
-
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -20,8 +18,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-
-use crate::signal::parse_signal;
+use posixutils_process::signal::parse_signal;
 
 static FOREGROUND: AtomicBool = AtomicBool::new(false);
 static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(libc::SIGTERM);

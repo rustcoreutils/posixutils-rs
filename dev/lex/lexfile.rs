@@ -546,15 +546,14 @@ fn pattern_ends_with_unescaped_dollar(pattern: &str) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
     let len = chars.len();
 
-    // Count backslashes before the final $
+    // Count consecutive backslashes before the final $
     let mut backslash_count = 0;
-    let mut i = len - 2; // Start from character before $
-    while i < len && chars[i] == '\\' {
-        backslash_count += 1;
-        if i == 0 {
+    for i in (0..len.saturating_sub(1)).rev() {
+        if chars[i] == '\\' {
+            backslash_count += 1;
+        } else {
             break;
         }
-        i = i.saturating_sub(1);
     }
 
     // $ is escaped if preceded by odd number of backslashes

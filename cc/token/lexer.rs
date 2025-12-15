@@ -603,18 +603,32 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let pos = self.pos();
         let mut content = String::new();
         let mut escape = false;
+        let mut want_hex = false; // Track if we just saw \x
 
         loop {
             let c = self.nextchar();
             if c == EOF {
-                // Unterminated string/char
+                // Unterminated string/char - emit warning
+                diag::warning(pos, "End of file in middle of string");
                 break;
             }
             let cu = c as u8;
 
+            // Check for \x without hex digits
+            if want_hex {
+                if !cu.is_ascii_hexdigit() {
+                    diag::warning(pos, "\\x used with no following hex digits");
+                }
+                want_hex = false;
+            }
+
             if escape {
                 content.push(cu as char);
                 escape = false;
+                // Track if this is \x escape
+                if cu == b'x' {
+                    want_hex = true;
+                }
                 continue;
             }
 
@@ -630,12 +644,21 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
 
             if cu == b'\n' {
-                // Error: newline in string/char literal
-                // For now, just end the literal
+                // Error: newline in string/char literal - emit warning
+                let delim_char = if delim == b'"' { '"' } else { '\'' };
+                diag::warning(
+                    pos,
+                    &format!("missing terminating {} character", delim_char),
+                );
                 break;
             }
 
             content.push(cu as char);
+        }
+
+        // Check for trailing \x at end of string
+        if want_hex {
+            diag::warning(pos, "\\x used with no following hex digits");
         }
 
         let (typ, value) = if delim == b'"' {
@@ -666,13 +689,15 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     /// Skip a block comment (/* ... */)
     /// Based on sparse's drop_stream_comment implementation
     fn skip_block_comment(&mut self) {
+        let pos = self.pos(); // Save position for warning
         // Track both current and next character to properly detect */
         // This handles cases like /***/ or /**/
         let mut next = self.nextchar();
         loop {
             let curr = next;
             if curr == EOF {
-                // Unterminated comment
+                // Unterminated comment - emit warning
+                diag::warning(pos, "End of file in the middle of a comment");
                 break;
             }
             next = self.nextchar();
@@ -1565,5 +1590,99 @@ mod tests {
         // UCN with lowercase hex digits
         let (tokens, idents) = tokenize_str("caf\\u00e9");
         assert_eq!(show_token(&tokens[1], &idents), "café");
+    }
+
+    // ========================================================================
+    // Diagnostic warning tests (sparse compatibility)
+    // ========================================================================
+
+    #[test]
+    fn test_unterminated_string() {
+        // Unterminated string should still produce a token (warning emitted)
+        let (tokens, _) = tokenize_str("\"hello");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "hello");
+        }
+    }
+
+    #[test]
+    fn test_unterminated_char() {
+        // Unterminated char should still produce a token (warning emitted)
+        let (tokens, _) = tokenize_str("'a");
+        assert_eq!(tokens[1].typ, TokenType::Char);
+        if let TokenValue::Char(s) = &tokens[1].value {
+            assert_eq!(s, "a");
+        }
+    }
+
+    #[test]
+    fn test_newline_in_string() {
+        // Newline terminates string literal (warning emitted)
+        let (tokens, _) = tokenize_str("\"hello\nworld\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "hello");
+        }
+        // 'world"' becomes identifier 'world' and unterminated string
+        assert_eq!(tokens[2].typ, TokenType::Ident);
+    }
+
+    #[test]
+    fn test_unterminated_block_comment() {
+        // Unterminated block comment (warning emitted)
+        let (tokens, idents) = tokenize_str("a /* unterminated");
+        assert_eq!(tokens.len(), 3); // StreamBegin, a, StreamEnd
+        assert_eq!(show_token(&tokens[1], &idents), "a");
+    }
+
+    #[test]
+    fn test_hex_escape_no_digits() {
+        // \x without hex digits should warn
+        let (tokens, _) = tokenize_str("\"\\xg\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "\\xg"); // Raw escape preserved
+        }
+    }
+
+    #[test]
+    fn test_hex_escape_at_end() {
+        // \x at end of string should warn
+        let (tokens, _) = tokenize_str("\"\\x\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "\\x");
+        }
+    }
+
+    #[test]
+    fn test_hex_escape_valid() {
+        // Valid \x escape (no warning)
+        let (tokens, _) = tokenize_str("\"\\x41\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "\\x41"); // Raw escape preserved
+        }
+    }
+
+    #[test]
+    fn test_octal_escape_preserved() {
+        // Octal escapes should be preserved as raw
+        let (tokens, _) = tokenize_str("\"\\0\\377\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "\\0\\377");
+        }
+    }
+
+    #[test]
+    fn test_standard_escapes_preserved() {
+        // Standard escapes should be preserved as raw
+        let (tokens, _) = tokenize_str("\"\\n\\t\\r\\\\\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+        if let TokenValue::String(s) = &tokens[1].value {
+            assert_eq!(s, "\\n\\t\\r\\\\");
+        }
     }
 }

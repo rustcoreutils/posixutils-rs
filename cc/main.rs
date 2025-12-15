@@ -421,6 +421,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_files: Vec<&String> = args.files.iter().filter(|f| is_source_file(f)).collect();
     let object_files: Vec<&String> = args.files.iter().filter(|f| is_object_file(f)).collect();
 
+    // Warn about unrecognized file types
+    for file in &args.files {
+        if !is_source_file(file) && !is_object_file(file) {
+            eprintln!("pcc: warning: unrecognized file type: {}", file);
+        }
+    }
+
     // If we only have object files and an output is specified, just link them
     if source_files.is_empty() && !object_files.is_empty() && args.output.is_some() {
         let exe_file = args.output.clone().unwrap();

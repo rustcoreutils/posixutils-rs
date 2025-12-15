@@ -139,13 +139,42 @@ impl Macro {
         }
     }
 
-    /// Create a predefined macro with a string value (for -D NAME="value")
-    pub fn predefined_string(name: &str, value: &str) -> Self {
-        let body = vec![MacroToken {
-            typ: TokenType::String,
-            value: MacroTokenValue::String(value.to_string()),
-            whitespace: false,
-        }];
+    /// Create a predefined macro from a command-line -D value.
+    /// The value is tokenized properly so -DFOO=123 becomes a number token,
+    /// -DFOO=bar becomes an identifier token, etc.
+    pub fn from_cmdline_define(name: &str, value: &str) -> Self {
+        // Tokenize the value string
+        let mut idents = IdentTable::new();
+        let mut tokenizer = Tokenizer::new(value.as_bytes(), 0, &mut idents);
+        let tokens = tokenizer.tokenize();
+
+        // Convert tokens to macro tokens, skipping stream markers
+        let body: Vec<MacroToken> = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .enumerate()
+            .map(|(i, token)| {
+                let value = match &token.value {
+                    TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
+                    TokenValue::Ident(id) => {
+                        let ident_name = idents.get_opt(*id).unwrap_or("").to_string();
+                        MacroTokenValue::Ident(ident_name)
+                    }
+                    TokenValue::String(s) => MacroTokenValue::String(s.clone()),
+                    TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
+                    TokenValue::Special(code) => MacroTokenValue::Special(*code),
+                    TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
+                    TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+                    TokenValue::None => MacroTokenValue::None,
+                };
+                MacroToken {
+                    typ: token.typ,
+                    value,
+                    whitespace: i > 0 && token.pos.whitespace,
+                }
+            })
+            .collect();
+
         Self {
             name: name.to_string(),
             body,
@@ -2472,11 +2501,10 @@ pub fn preprocess_with_defines(
     // Process -D defines
     for def in defines {
         if let Some(eq_pos) = def.find('=') {
-            // -DNAME=VALUE
+            // -DNAME=VALUE - tokenize the value properly
             let name = &def[..eq_pos];
             let value = &def[eq_pos + 1..];
-            // Create macro with string value (treated as tokens during expansion)
-            let mac = Macro::predefined_string(name, value);
+            let mac = Macro::from_cmdline_define(name, value);
             pp.define_macro(mac);
         } else {
             // -DNAME (define to 1)

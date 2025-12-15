@@ -2098,6 +2098,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             let true_val = self.expr_ternary();
             if self.is_special(b':' as u32) {
                 self.advance();
+            } else {
+                let pos = self.current().map(|t| t.pos).unwrap_or_default();
+                diag::error(pos, "expected ':' in conditional expression");
             }
             let false_val = self.expr_ternary();
             if cond != 0 {

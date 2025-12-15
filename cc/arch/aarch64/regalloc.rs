@@ -9,6 +9,31 @@
 // AArch64 Register Allocator
 // Linear scan register allocation for AArch64
 //
+// ============================================================================
+// REGISTER ALLOCATION POLICY
+// ============================================================================
+//
+// Scratch registers (NEVER allocated to pseudos):
+//   X9, X10, X11 - Reserved for codegen temporaries
+//   X16, X17     - Linker scratch (IP0/IP1 per AAPCS64)
+//
+// Codegen MUST use only scratch registers (X9, X10, X11) for temporaries.
+// Using allocatable registers (X0-X7, X12-X15, X19-X28) risks clobbering
+// live values that were assigned by the register allocator.
+//
+// Reserved registers:
+//   X8          - Indirect result register (large struct returns)
+//   X18         - Platform reserved
+//   X29 (FP)    - Frame pointer
+//   X30 (LR)    - Link register
+//   SP          - Stack pointer
+//
+// Calling convention (AAPCS64):
+//   X0-X7       - Integer/pointer arguments and return values
+//   V0-V7       - FP/SIMD arguments and return values
+//   X19-X28     - Callee-saved
+//   V8-V15      - Callee-saved (lower 64 bits)
+// ============================================================================
 
 use crate::arch::regalloc::{
     expire_intervals, find_call_positions, interval_crosses_call, LiveInterval,
@@ -179,8 +204,8 @@ impl Reg {
     }
 
     /// All allocatable registers
-    /// Excludes: x8 (indirect result), x16/x17 (linker scratch),
-    ///           x18 (platform), x29 (fp), x30 (lr), sp
+    /// Excludes: x8 (indirect result), x9/x10/x11 (codegen scratch),
+    ///           x16/x17 (linker scratch), x18 (platform), x29 (fp), x30 (lr), sp
     pub fn allocatable() -> &'static [Reg] {
         &[
             Reg::X0,
@@ -192,9 +217,7 @@ impl Reg {
             Reg::X6,
             Reg::X7,
             // Skip x8 (indirect result register for large struct returns per AAPCS64)
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
+            // Skip x9, x10, x11 (codegen scratch registers)
             Reg::X12,
             Reg::X13,
             Reg::X14,
@@ -216,9 +239,10 @@ impl Reg {
     }
 
     /// Scratch registers for codegen (not allocatable, used for temporaries)
+    /// x9, x10, x11 are reserved for codegen scratch
     /// x16 (IP0) and x17 (IP1) are linker scratch registers
-    pub fn scratch_regs() -> (Reg, Reg) {
-        (Reg::X16, Reg::X17)
+    pub fn scratch_regs() -> (Reg, Reg, Reg) {
+        (Reg::X9, Reg::X10, Reg::X11)
     }
 
     /// Frame pointer register
@@ -539,6 +563,19 @@ pub enum Loc {
 // Register Allocator (Linear Scan)
 // ============================================================================
 
+/// Information about an argument spilled from a caller-saved register to stack
+#[derive(Debug, Clone)]
+pub struct SpilledArg {
+    /// The pseudo that was spilled
+    pub pseudo: PseudoId,
+    /// The GP register the argument originally arrived in (if integer arg)
+    pub from_gp_reg: Option<Reg>,
+    /// The FP register the argument originally arrived in (if FP arg)
+    pub from_fp_reg: Option<VReg>,
+    /// The stack offset where it was spilled to
+    pub to_stack_offset: i32,
+}
+
 /// Simple linear scan register allocator for AArch64
 pub struct RegAlloc {
     /// Mapping from pseudo to location
@@ -559,6 +596,8 @@ pub struct RegAlloc {
     used_callee_saved_fp: Vec<VReg>,
     /// Set of pseudos that need FP registers (determined by analyzing the IR)
     fp_pseudos: HashSet<PseudoId>,
+    /// Arguments spilled from caller-saved registers to stack
+    spilled_args: Vec<SpilledArg>,
 }
 
 impl RegAlloc {
@@ -573,6 +612,7 @@ impl RegAlloc {
             used_callee_saved: Vec::new(),
             used_callee_saved_fp: Vec::new(),
             fp_pseudos: HashSet::new(),
+            spilled_args: Vec::new(),
         }
     }
 
@@ -583,10 +623,11 @@ impl RegAlloc {
         self.allocate_arguments(func, types);
 
         let intervals = self.compute_live_intervals(func);
+        let call_positions = find_call_positions(func);
 
-        self.spill_args_across_calls(func, &intervals);
+        self.spill_args_across_calls(func, &intervals, &call_positions);
         self.allocate_alloca_to_stack(func);
-        self.run_linear_scan(func, types, intervals);
+        self.run_linear_scan(func, types, intervals, &call_positions);
 
         self.locations.clone()
     }
@@ -602,6 +643,7 @@ impl RegAlloc {
         self.used_callee_saved.clear();
         self.used_callee_saved_fp.clear();
         self.fp_pseudos.clear();
+        self.spilled_args.clear();
     }
 
     /// Pre-allocate argument registers per AAPCS64
@@ -675,21 +717,33 @@ impl RegAlloc {
     }
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
-    fn spill_args_across_calls(&mut self, func: &Function, intervals: &[LiveInterval]) {
-        let call_positions = find_call_positions(func);
-
+    fn spill_args_across_calls(
+        &mut self,
+        _func: &Function,
+        intervals: &[LiveInterval],
+        call_positions: &[usize],
+    ) {
         // Check GP arguments in caller-saved registers (x0-x7)
         let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
-                if int_arg_regs_set.contains(reg)
-                    && interval_crosses_call(interval, &call_positions)
+                if int_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
                 {
-                    let reg_to_restore = *reg;
+                    let from_reg = *reg;
                     self.stack_offset += 8;
+                    let to_stack_offset = -self.stack_offset;
+
+                    // Record the spill for codegen to emit stores in prologue
+                    self.spilled_args.push(SpilledArg {
+                        pseudo: interval.pseudo,
+                        from_gp_reg: Some(from_reg),
+                        from_fp_reg: None,
+                        to_stack_offset,
+                    });
+
                     self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
-                    self.free_regs.push(reg_to_restore);
+                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                    self.free_regs.push(from_reg);
                 }
             }
         }
@@ -698,16 +752,31 @@ impl RegAlloc {
         let fp_arg_regs_set: Vec<VReg> = VReg::arg_regs().to_vec();
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
-                if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, &call_positions)
+                if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
                 {
-                    let reg_to_restore = *reg;
+                    let from_reg = *reg;
                     self.stack_offset += 8;
+                    let to_stack_offset = -self.stack_offset;
+
+                    // Record the spill for codegen to emit stores in prologue
+                    self.spilled_args.push(SpilledArg {
+                        pseudo: interval.pseudo,
+                        from_gp_reg: None,
+                        from_fp_reg: Some(from_reg),
+                        to_stack_offset,
+                    });
+
                     self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
-                    self.free_fp_regs.push(reg_to_restore);
+                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                    self.free_fp_regs.push(from_reg);
                 }
             }
         }
+    }
+
+    /// Get arguments that were spilled from caller-saved registers
+    pub fn spilled_args(&self) -> &[SpilledArg] {
+        &self.spilled_args
     }
 
     /// Run the linear scan allocation algorithm
@@ -716,6 +785,7 @@ impl RegAlloc {
         func: &Function,
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
+        call_positions: &[usize],
     ) {
         for interval in intervals {
             self.expire_old_intervals(interval.start);
@@ -768,9 +838,25 @@ impl RegAlloc {
 
             // Allocate register based on type
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
+            let crosses_call = interval_crosses_call(&interval, call_positions);
 
             if needs_fp {
-                if let Some(reg) = self.free_fp_regs.pop() {
+                if crosses_call {
+                    // FP interval crosses a call - must use callee-saved FP register or spill
+                    if let Some(idx) = self.free_fp_regs.iter().position(|r| r.is_callee_saved()) {
+                        let reg = self.free_fp_regs.remove(idx);
+                        if !self.used_callee_saved_fp.contains(&reg) {
+                            self.used_callee_saved_fp.push(reg);
+                        }
+                        self.locations.insert(interval.pseudo, Loc::VReg(reg));
+                        self.active_fp.push((interval.clone(), reg));
+                        self.active_fp.sort_by_key(|(i, _)| i.end);
+                    } else {
+                        self.stack_offset += 8;
+                        self.locations
+                            .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                    }
+                } else if let Some(reg) = self.free_fp_regs.pop() {
                     if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
                         self.used_callee_saved_fp.push(reg);
                     }
@@ -782,17 +868,44 @@ impl RegAlloc {
                     self.locations
                         .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
                 }
-            } else if let Some(reg) = self.free_regs.pop() {
-                if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
-                    self.used_callee_saved.push(reg);
+            } else if crosses_call {
+                // GP interval crosses a call - must use callee-saved register or spill
+                if let Some(idx) = self.free_regs.iter().position(|r| r.is_callee_saved()) {
+                    let reg = self.free_regs.remove(idx);
+                    if !self.used_callee_saved.contains(&reg) {
+                        self.used_callee_saved.push(reg);
+                    }
+                    self.locations.insert(interval.pseudo, Loc::Reg(reg));
+                    self.active.push((interval.clone(), reg));
+                    self.active.sort_by_key(|(i, _)| i.end);
+                } else {
+                    // No callee-saved registers available - spill to stack
+                    self.stack_offset += 8;
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
                 }
-                self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                self.active.push((interval.clone(), reg));
-                self.active.sort_by_key(|(i, _)| i.end);
             } else {
-                self.stack_offset += 8;
-                self.locations
-                    .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                // Interval doesn't cross a call - prefer caller-saved registers
+                // to minimize callee-saved register usage and stack conflicts
+                let reg_opt =
+                    if let Some(idx) = self.free_regs.iter().position(|r| !r.is_callee_saved()) {
+                        Some(self.free_regs.remove(idx))
+                    } else {
+                        self.free_regs.pop()
+                    };
+
+                if let Some(reg) = reg_opt {
+                    if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
+                        self.used_callee_saved.push(reg);
+                    }
+                    self.locations.insert(interval.pseudo, Loc::Reg(reg));
+                    self.active.push((interval.clone(), reg));
+                    self.active.sort_by_key(|(i, _)| i.end);
+                } else {
+                    self.stack_offset += 8;
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                }
             }
         }
     }
@@ -872,6 +985,22 @@ impl RegAlloc {
             block_start_pos.insert(block.id, temp_pos);
             temp_pos += block.insns.len();
             block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
+        }
+
+        // Pre-initialize intervals for argument pseudos with first_def = 0
+        // because arguments are live from function entry
+        for pseudo in &func.pseudos {
+            if let PseudoKind::Arg(_) = pseudo.kind {
+                intervals.insert(
+                    pseudo.id,
+                    IntervalInfo {
+                        pseudo: pseudo.id,
+                        first_def: 0,
+                        last_def: 0,
+                        last_use: 0,
+                    },
+                );
+            }
         }
 
         let mut phi_sources: Vec<(BasicBlockId, PseudoId)> = Vec::new();

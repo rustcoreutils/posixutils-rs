@@ -219,10 +219,7 @@ int main(void) {
     assert_eq!(compile_and_run("fp_as_arg", code), 0);
 }
 
-// TODO: Fix register allocator bug where caller-saved registers holding
-// function parameters are not preserved across calls in loops.
 #[test]
-#[ignore]
 fn function_pointer_callback() {
     let code = r#"
 void for_each(int *arr, int len, void (*callback)(int *)) {

@@ -3083,7 +3083,8 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
-                let (name, typ, vla_sizes, _func_params) = self.parse_declarator(base_type_id)?;
+                let (name, mut typ, vla_sizes, _func_params) =
+                    self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
 
@@ -3099,6 +3100,22 @@ impl Parser<'_> {
                 } else {
                     None
                 };
+
+                // For incomplete array types (int arr[] = {...}), infer size from initializer
+                if let Some(ref init_expr) = init {
+                    if let ExprKind::InitList { elements } = &init_expr.kind {
+                        if self.types.kind(typ) == TypeKind::Array {
+                            let array_size = self.types.get(typ).array_size;
+                            // Check if array size is incomplete (0 or None)
+                            if array_size == Some(0) || array_size.is_none() {
+                                // Update type with actual size from initializer count
+                                let elem_type =
+                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
+                                typ = self.types.intern(Type::array(elem_type, elements.len()));
+                            }
+                        }
+                    }
+                }
 
                 // Bind to symbol table (like sparse's bind_symbol)
                 // Note: StringId is Copy, check for empty by comparing to empty string

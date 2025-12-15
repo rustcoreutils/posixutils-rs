@@ -26,7 +26,7 @@ use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
 use crate::types::{TypeId, TypeModifiers, TypeTable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // x86-64 Code Generator
@@ -405,6 +405,20 @@ impl X86_64CodeGen {
             });
         }
 
+        // Emit stores for arguments spilled from caller-saved registers to stack
+        // These must be stored early before any call can clobber them
+        for spilled in alloc.spilled_args() {
+            let adjusted = spilled.to_stack_offset + self.callee_saved_offset;
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(spilled.from_reg),
+                dst: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: -adjusted,
+                }),
+            });
+        }
+
         // For variadic functions, save argument registers to the register save area
         // This must be done before any other code uses these registers
         // AMD64 ABI: rdi at offset 0, rsi at offset 8, rdx at offset 16, etc.
@@ -452,6 +466,11 @@ impl X86_64CodeGen {
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
 
+        // Track which pseudos were already spilled via spill_args_across_calls
+        // to avoid double-storing them here
+        let spilled_pseudos: HashSet<PseudoId> =
+            alloc.spilled_args().iter().map(|s| s.pseudo).collect();
+
         // Detect if there's a hidden return pointer (for functions returning large structs)
         // The __sret pseudo has arg_idx=0 and shifts all other arg indices by 1
         let has_sret = func
@@ -470,6 +489,20 @@ impl X86_64CodeGen {
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     if arg_idx == (i as u32) + arg_idx_offset {
+                        // Skip pseudos already stored via spilled_args
+                        if spilled_pseudos.contains(&pseudo.id) {
+                            // Still need to count this arg for register assignment tracking
+                            let is_fp = types.is_float(*typ);
+                            let is_complex = types.is_complex(*typ);
+                            if is_complex {
+                                fp_arg_idx += 2;
+                            } else if is_fp {
+                                fp_arg_idx += 1;
+                            } else {
+                                int_arg_idx += 1;
+                            }
+                            break;
+                        }
                         let is_fp = types.is_float(*typ);
                         let is_complex = types.is_complex(*typ);
                         if is_complex {
@@ -733,11 +766,11 @@ impl X86_64CodeGen {
                 return true;
             }
             Loc::Global(_) => {
-                self.emit_move(cond, Reg::Rax, size);
+                self.emit_move(cond, Reg::R10, size);
                 self.push_lir(X86Inst::Test {
                     size: op_size,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
             }
             Loc::Xmm(x) => {
@@ -805,8 +838,8 @@ impl X86_64CodeGen {
                 if let Some(val) = insn.target {
                     let size = insn.size.max(32);
                     let op_size = OperandSize::from_bits(size);
-                    // Move switch value to eax
-                    self.emit_move(val, Reg::Rax, size);
+                    // Move switch value to R10 (scratch register)
+                    self.emit_move(val, Reg::R10, size);
 
                     // Generate comparisons for each case
                     for (case_val, target_bb) in &insn.switch_cases {
@@ -814,7 +847,7 @@ impl X86_64CodeGen {
                         self.push_lir(X86Inst::Cmp {
                             size: op_size,
                             src: GpOperand::Imm(*case_val),
-                            dst: GpOperand::Reg(Reg::Rax),
+                            dst: GpOperand::Reg(Reg::R10),
                         });
                         // LIR: conditional jump on equal
                         self.push_lir(X86Inst::Jcc {
@@ -1183,11 +1216,13 @@ impl X86_64CodeGen {
             Loc::Reg(r) => *r,
             _ => Reg::Rax,
         };
-        self.emit_move(src1, work_reg, size);
+
         if matches!(insn.op, Opcode::Shl | Opcode::Lsr | Opcode::Asr) {
             let src2_loc = self.get_location(src2);
             match src2_loc {
                 Loc::Imm(v) => {
+                    // Immediate shift - can use work_reg directly
+                    self.emit_move(src1, work_reg, size);
                     // LIR: shift by immediate
                     let shift_count = ShiftCount::Imm(v as u8);
                     match insn.op {
@@ -1210,6 +1245,15 @@ impl X86_64CodeGen {
                     }
                 }
                 _ => {
+                    // Variable shift - shift count goes in Rcx/Cl
+                    // IMPORTANT: If work_reg is Rcx, we can't use it for the value
+                    // because emit_move(src2, Rcx) will clobber it. Use R10 instead.
+                    let shift_reg = if work_reg == Reg::Rcx {
+                        Reg::R10
+                    } else {
+                        work_reg
+                    };
+                    self.emit_move(src1, shift_reg, size);
                     self.emit_move(src2, Reg::Rcx, 8);
                     // LIR: shift by %cl
                     let shift_count = ShiftCount::Cl;
@@ -1217,23 +1261,33 @@ impl X86_64CodeGen {
                         Opcode::Shl => self.push_lir(X86Inst::Shl {
                             size: op_size,
                             count: shift_count,
-                            dst: work_reg,
+                            dst: shift_reg,
                         }),
                         Opcode::Lsr => self.push_lir(X86Inst::Shr {
                             size: op_size,
                             count: shift_count,
-                            dst: work_reg,
+                            dst: shift_reg,
                         }),
                         Opcode::Asr => self.push_lir(X86Inst::Sar {
                             size: op_size,
                             count: shift_count,
-                            dst: work_reg,
+                            dst: shift_reg,
                         }),
                         _ => {}
+                    }
+                    // If we used R10, move result back to work_reg (Rcx)
+                    if shift_reg != work_reg {
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Reg(shift_reg),
+                            dst: GpOperand::Reg(work_reg),
+                        });
                     }
                 }
             }
         } else {
+            // Non-shift binary ops: move src1 into work_reg first
+            self.emit_move(src1, work_reg, size);
             let src2_loc = self.get_location(src2);
             // For 64-bit operations, check if immediate fits in 32-bit signed range.
             // x86-64 binary ops (add, sub, and, or, xor) only support 32-bit sign-extended immediates.
@@ -1298,7 +1352,7 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10, // Use scratch register R10
         };
         self.emit_move(src1, dst_reg, size);
         let src2_loc = self.get_location(src2);
@@ -1325,7 +1379,24 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
+
+        // IMPORTANT: Check divisor location BEFORE cltd/cqto clobbers RDX!
+        // If divisor is in Rax or Rdx, we must save it to R10 first.
+        let src2_loc = self.get_location(src2);
+        let divisor_reg = match &src2_loc {
+            Loc::Reg(r) if *r != Reg::Rax && *r != Reg::Rdx => *r,
+            _ => {
+                // Divisor is in Rax, Rdx, stack, or immediate - move to R10 first
+                // This MUST happen before emit_move(src1, Rax) in case src2 is in Rax
+                self.emit_move(src2, Reg::R10, size);
+                Reg::R10
+            }
+        };
+
+        // Now safe to move dividend to Rax
         self.emit_move(src1, Reg::Rax, size);
+
+        // Sign-extend or zero-extend for division (this clobbers RDX)
         match insn.op {
             Opcode::DivS | Opcode::ModS => {
                 if size == 64 {
@@ -1346,14 +1417,6 @@ impl X86_64CodeGen {
             }
             _ => {}
         }
-        let src2_loc = self.get_location(src2);
-        let divisor_reg = match &src2_loc {
-            Loc::Reg(r) if *r != Reg::Rax && *r != Reg::Rdx => *r,
-            _ => {
-                self.emit_move(src2, Reg::R10, size);
-                Reg::R10
-            }
-        };
         // LIR: division instruction
         match insn.op {
             Opcode::DivS | Opcode::ModS => {
@@ -1389,28 +1452,54 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-        self.emit_move(src1, Reg::Rax, size);
+
+        // Get target location to determine work register
+        let dst_loc = self.get_location(target);
+        // Use target's register if available, otherwise use R11 as scratch
+        // This avoids clobbering other live registers (like Rax)
+        let work_reg = match &dst_loc {
+            Loc::Reg(r) => *r,
+            _ => Reg::R11,
+        };
+
+        // Get src1 location to see if we need to move it
+        let src1_loc = self.get_location(src1);
+        let cmp_reg = match &src1_loc {
+            Loc::Reg(r) => *r, // Compare directly in src1's register
+            _ => {
+                // src1 is not in a register, move to work_reg
+                self.emit_move(src1, work_reg, size);
+                work_reg
+            }
+        };
+
         let src2_loc = self.get_location(src2);
         // x86-64 cmp instruction only supports 32-bit signed immediates
         // For larger values, we need to load into a register first
         let src2_gp = match &src2_loc {
             Loc::Imm(v) if *v > i32::MAX as i64 || *v < i32::MIN as i64 => {
-                // Large immediate - load into rcx first
-                // LIR: movabsq for large immediate
+                // Large immediate - load into a different scratch register
+                let scratch = if work_reg == Reg::R10 {
+                    Reg::R11
+                } else {
+                    Reg::R10
+                };
                 self.push_lir(X86Inst::MovAbs {
                     imm: *v,
-                    dst: Reg::Rcx,
+                    dst: scratch,
                 });
-                GpOperand::Reg(Reg::Rcx)
+                GpOperand::Reg(scratch)
             }
             _ => self.loc_to_gp_operand(&src2_loc),
         };
+
         // LIR: compare instruction
         self.push_lir(X86Inst::Cmp {
             size: op_size,
             src: src2_gp,
-            dst: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(cmp_reg),
         });
+
         // Map opcode to condition code
         let cc = match insn.op {
             Opcode::SetEq => IntCC::E,
@@ -1425,17 +1514,21 @@ impl X86_64CodeGen {
             Opcode::SetAe => IntCC::Ae,
             _ => return,
         };
-        // LIR: setCC instruction
-        self.push_lir(X86Inst::SetCC { cc, dst: Reg::Rax });
-        // LIR: zero extend AL to EAX
+
+        // LIR: setCC instruction - use work_reg for the result
+        self.push_lir(X86Inst::SetCC { cc, dst: work_reg });
+        // LIR: zero extend low byte to 32-bit
         self.push_lir(X86Inst::Movzx {
             src_size: OperandSize::B8,
             dst_size: OperandSize::B32,
-            src: GpOperand::Reg(Reg::Rax),
-            dst: Reg::Rax,
+            src: GpOperand::Reg(work_reg),
+            dst: work_reg,
         });
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+
+        // Move to final destination if not already there
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
+            self.emit_move_to_loc(work_reg, &dst_loc, 32);
+        }
     }
 
     fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp) {
@@ -1452,7 +1545,7 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         let work_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10, // Use scratch register R10
         };
         self.emit_move(src, work_reg, size);
         self.push_lir(match op {
@@ -1960,8 +2053,8 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm0,
         };
 
-        // Move integer to RAX first
-        self.emit_move(src, Reg::Rax, src_size);
+        // Move integer to R10 first (scratch register)
+        self.emit_move(src, Reg::R10, src_size);
 
         // Convert using cvtsi2ss/cvtsi2sd
         let int_size = OperandSize::from_bits(src_size);
@@ -1969,7 +2062,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::CvtIntToFp {
             int_size,
             fp_size,
-            src: GpOperand::Reg(Reg::Rax),
+            src: GpOperand::Reg(Reg::R10),
             dst: dst_xmm,
         });
 
@@ -1997,7 +2090,7 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10, // Use scratch register R10
         };
 
         // Convert using cvttss2si/cvttsd2si (truncate toward zero)
@@ -2097,28 +2190,28 @@ impl X86_64CodeGen {
                 dst: xmm,
             });
         } else if size <= 32 {
-            // Float: load via integer register
+            // Float: load via integer register (use R10 scratch)
             let bits = (value as f32).to_bits();
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
                 src: GpOperand::Imm(bits as i64),
-                dst: GpOperand::Reg(Reg::Rax),
+                dst: GpOperand::Reg(Reg::R10),
             });
             self.push_lir(X86Inst::MovGpXmm {
                 size: OperandSize::B32,
-                src: Reg::Rax,
+                src: Reg::R10,
                 dst: xmm,
             });
         } else {
-            // Double: load via integer register
+            // Double: load via integer register (use R10 scratch)
             let bits = value.to_bits();
             self.push_lir(X86Inst::MovAbs {
                 imm: bits as i64,
-                dst: Reg::Rax,
+                dst: Reg::R10,
             });
             self.push_lir(X86Inst::MovGpXmm {
                 size: OperandSize::B64,
-                src: Reg::Rax,
+                src: Reg::R10,
                 dst: xmm,
             });
         }
@@ -2260,7 +2353,7 @@ impl X86_64CodeGen {
 
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10, // Use scratch register R10
         };
 
         // Determine if we need sign or zero extension for small types
@@ -2519,7 +2612,16 @@ impl X86_64CodeGen {
             return;
         }
 
-        self.emit_move(value, Reg::Rax, reg_size);
+        // Get the value to a register - use its existing register if available,
+        // otherwise use R10 as scratch (avoiding Rax which may hold other live values)
+        let value_reg = match &value_loc {
+            Loc::Reg(r) => *r,
+            _ => {
+                self.emit_move(value, Reg::R10, reg_size);
+                Reg::R10
+            }
+        };
+
         let addr_loc = self.get_location(addr);
         match addr_loc {
             Loc::Reg(r) => {
@@ -2527,7 +2629,7 @@ impl X86_64CodeGen {
                 // LIR: store through register
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(value_reg),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: r,
                         offset: insn.offset as i32,
@@ -2549,7 +2651,7 @@ impl X86_64CodeGen {
                     // LIR: store to stack slot
                     self.push_lir(X86Inst::Mov {
                         size: op_size,
-                        src: GpOperand::Reg(Reg::Rax),
+                        src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::Rbp,
                             offset: -total_offset,
@@ -2570,7 +2672,7 @@ impl X86_64CodeGen {
                     // LIR: store through loaded address
                     self.push_lir(X86Inst::Mov {
                         size: op_size,
-                        src: GpOperand::Reg(Reg::Rax),
+                        src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
                             offset: insn.offset as i32,
@@ -2583,7 +2685,7 @@ impl X86_64CodeGen {
                 // LIR: store to global via RIP-relative
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(value_reg),
                     dst: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
                 });
             }
@@ -2593,7 +2695,7 @@ impl X86_64CodeGen {
                 // LIR: store through R11
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(value_reg),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
                         offset: insn.offset as i32,
@@ -2848,7 +2950,84 @@ impl X86_64CodeGen {
             stack_args += 1;
         }
 
-        // Now handle register arguments
+        // Pre-pass: Save argument values that are in argument registers to avoid clobbering.
+        // If arg[j]'s source is in an argument register that will be written by arg[k] where k < j,
+        // we need to save arg[j]'s value before we start setting up arguments.
+        // Use a HashMap to track saved locations: original_reg -> scratch_reg
+        let mut saved_arg_regs: std::collections::HashMap<Reg, Reg> =
+            std::collections::HashMap::new();
+        let scratch_regs = [Reg::R10, Reg::R11]; // Available scratch registers
+        let mut scratch_idx = 0;
+
+        // Collect which argument registers we'll write to (in order)
+        let mut regs_to_write: Vec<Reg> = Vec::new();
+        let mut temp_int_idx2 = 0;
+        for i in 0..insn.src.len() {
+            if stack_arg_indices.contains(&i) {
+                continue;
+            }
+            let arg_type = insn.arg_types.get(i).copied();
+            let is_fp = if let Some(typ) = arg_type {
+                types.is_float(typ)
+            } else {
+                let arg_loc = self.get_location(insn.src[i]);
+                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
+            };
+            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+
+            if !is_fp && !is_complex {
+                if temp_int_idx2 < int_arg_regs.len() {
+                    regs_to_write.push(int_arg_regs[temp_int_idx2]);
+                }
+                temp_int_idx2 += 1;
+            }
+        }
+
+        // Now check which argument sources are in registers that will be clobbered
+        temp_int_idx2 = 0;
+        for i in 0..insn.src.len() {
+            if stack_arg_indices.contains(&i) {
+                continue;
+            }
+            let arg = insn.src[i];
+            let arg_type = insn.arg_types.get(i).copied();
+            let is_fp = if let Some(typ) = arg_type {
+                types.is_float(typ)
+            } else {
+                let arg_loc = self.get_location(arg);
+                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
+            };
+            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+
+            if !is_fp && !is_complex && temp_int_idx2 < int_arg_regs.len() {
+                let arg_loc = self.get_location(arg);
+                if let Loc::Reg(src_reg) = arg_loc {
+                    // Check if this source register will be written by an earlier argument
+                    let my_dest_idx = temp_int_idx2;
+                    for (write_idx, &write_reg) in regs_to_write.iter().enumerate() {
+                        if write_idx < my_dest_idx && write_reg == src_reg {
+                            // This source will be clobbered! Save it if not already saved
+                            if !saved_arg_regs.contains_key(&src_reg)
+                                && scratch_idx < scratch_regs.len()
+                            {
+                                let scratch = scratch_regs[scratch_idx];
+                                scratch_idx += 1;
+                                self.push_lir(X86Inst::Mov {
+                                    size: OperandSize::B64,
+                                    src: GpOperand::Reg(src_reg),
+                                    dst: GpOperand::Reg(scratch),
+                                });
+                                saved_arg_regs.insert(src_reg, scratch);
+                            }
+                            break;
+                        }
+                    }
+                }
+                temp_int_idx2 += 1;
+            }
+        }
+
+        // Now handle register arguments (with saved values)
         for i in 0..insn.src.len() {
             // Skip args that went to stack
             if stack_arg_indices.contains(&i) {
@@ -2941,7 +3120,22 @@ impl X86_64CodeGen {
                 fp_arg_idx += 1;
             } else {
                 // Integer args go in GP registers
-                self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
+                // Check if this arg's source was saved to a scratch register
+                let arg_loc = self.get_location(arg);
+                if let Loc::Reg(src_reg) = arg_loc {
+                    if let Some(&saved_reg) = saved_arg_regs.get(&src_reg) {
+                        // Use the saved register instead of the original (which may be clobbered)
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::from_bits(arg_size),
+                            src: GpOperand::Reg(saved_reg),
+                            dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                        });
+                    } else {
+                        self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
+                    }
+                } else {
+                    self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
+                }
                 int_arg_idx += 1;
             }
         }
@@ -3102,7 +3296,7 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10, // Use scratch register R10
         };
         self.emit_move(else_val, dst_reg, size);
         let cond_loc = self.get_location(cond);
@@ -3163,7 +3357,7 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10, // Use scratch register R10
         };
         match insn.op {
             Opcode::Zext => {
@@ -3344,12 +3538,12 @@ impl X86_64CodeGen {
                     }
                 }
                 Loc::Stack(_) => {
-                    self.emit_move(src, Reg::Rax, reg_size);
+                    self.emit_move(src, Reg::R10, reg_size);
                     // For narrow types stored to stack, use the actual size
                     if actual_size <= 16 {
-                        self.emit_move_to_loc(Reg::Rax, &dst_loc, actual_size);
+                        self.emit_move_to_loc(Reg::R10, &dst_loc, actual_size);
                     } else {
-                        self.emit_move_to_loc(Reg::Rax, &dst_loc, reg_size);
+                        self.emit_move_to_loc(Reg::R10, &dst_loc, reg_size);
                     }
                 }
                 _ => {}
@@ -3448,6 +3642,7 @@ impl X86_64CodeGen {
             }
             Loc::Reg(r) => {
                 // Register contains the address of the va_list struct
+                // Use R10 as scratch to avoid clobbering the va_list address if r == Rax
                 // gp_offset = offset to next variadic GP arg
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
@@ -3466,11 +3661,11 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: 16,
                     },
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
                 });
                 // reg_save_area = pointer to saved registers
@@ -3479,11 +3674,11 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: -reg_save_base,
                     },
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: r,
                         offset: 16,
@@ -3700,20 +3895,24 @@ impl X86_64CodeGen {
         let done_label = Label::new("va_done", label_suffix);
         let lir_arg_size = OperandSize::from_bits(arg_size);
 
-        // Load gp_offset
+        // This function uses Rax for reg_save_area/overflow pointer, Rcx for sign-extended offset.
+        // The constraint-aware register allocator ensures ap_base is never in Rax or Rcx
+        // by declaring VaArg as clobbering those registers in opcode_constraints().
+
+        // Load gp_offset into R10d (using R10 as scratch for gp_offset)
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B32,
             src: GpOperand::Mem(MemAddr::BaseOffset {
                 base: ap_base,
                 offset: ap_base_offset,
             }),
-            dst: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(Reg::R10),
         });
         // Compare with 48
         self.push_lir(X86Inst::Cmp {
             size: OperandSize::B32,
             src: GpOperand::Imm(48),
-            dst: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(Reg::R10),
         });
         self.push_lir(X86Inst::Jcc {
             cc: IntCC::Ae,
@@ -3721,37 +3920,39 @@ impl X86_64CodeGen {
         });
 
         // Register save area path
+        // Load reg_save_area into Rax
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Mem(MemAddr::BaseOffset {
                 base: ap_base,
                 offset: ap_base_offset + 16,
             }),
-            dst: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Reg(Reg::Rax),
         });
+        // Sign-extend gp_offset (in R10) to 64-bit and add to reg_save_area
         self.push_lir(X86Inst::Movsx {
             src_size: OperandSize::B32,
             dst_size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rax),
-            dst: Reg::R11,
+            src: GpOperand::Reg(Reg::R10),
+            dst: Reg::Rcx,
         });
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
-            dst: Reg::R10,
+            src: GpOperand::Reg(Reg::Rcx),
+            dst: Reg::Rax,
         });
 
-        self.emit_va_arg_store_int(dst_loc, Reg::R10, lir_arg_size);
+        self.emit_va_arg_store_int(dst_loc, Reg::Rax, lir_arg_size);
 
-        // Increment gp_offset by 8
+        // Increment gp_offset by 8 and store back
         self.push_lir(X86Inst::Add {
             size: OperandSize::B32,
             src: GpOperand::Imm(8),
-            dst: Reg::Rax,
+            dst: Reg::R10,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B32,
-            src: GpOperand::Reg(Reg::Rax),
+            src: GpOperand::Reg(Reg::R10),
             dst: GpOperand::Mem(MemAddr::BaseOffset {
                 base: ap_base,
                 offset: ap_base_offset,
@@ -4164,15 +4365,15 @@ impl X86_64CodeGen {
             BswapSize::B64 => OperandSize::B64,
         };
 
-        // Load source into RAX
+        // Load source into R10 (scratch register)
         match (&src_loc, &swap_size) {
             // 16-bit: use zero-extending moves
-            (Loc::Reg(r), BswapSize::B16) if *r != Reg::Rax => {
+            (Loc::Reg(r), BswapSize::B16) if *r != Reg::R10 => {
                 self.push_lir(X86Inst::Movzx {
                     src_size: OperandSize::B16,
                     dst_size: OperandSize::B32,
                     src: GpOperand::Reg(*r),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             (Loc::Stack(off), BswapSize::B16) => {
@@ -4183,15 +4384,15 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: *off,
                     }),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             // 32/64-bit: use regular moves
-            (Loc::Reg(r), _) if *r != Reg::Rax => {
+            (Loc::Reg(r), _) if *r != Reg::R10 => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
                     src: GpOperand::Reg(*r),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
             }
             (Loc::Stack(off), _) => {
@@ -4201,7 +4402,7 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: *off,
                     }),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
             }
             (Loc::Imm(v), _) => {
@@ -4212,10 +4413,10 @@ impl X86_64CodeGen {
                         op_size
                     },
                     src: GpOperand::Imm(*v),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
             }
-            (Loc::Reg(_), _) => {} // Already in RAX
+            (Loc::Reg(_), _) => {} // Already in R10
             _ => return,
         }
 
@@ -4225,13 +4426,13 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Ror {
                     size: OperandSize::B16,
                     count: ShiftCount::Imm(8),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             BswapSize::B32 | BswapSize::B64 => {
                 self.push_lir(X86Inst::Bswap {
                     size: op_size,
-                    reg: Reg::Rax,
+                    reg: Reg::R10,
                 });
             }
         }
@@ -4239,18 +4440,18 @@ impl X86_64CodeGen {
         // Store result
         match (&dst_loc, &swap_size) {
             // 16-bit: use zero-extending move for register destination
-            (Loc::Reg(r), BswapSize::B16) if *r != Reg::Rax => {
+            (Loc::Reg(r), BswapSize::B16) if *r != Reg::R10 => {
                 self.push_lir(X86Inst::Movzx {
                     src_size: OperandSize::B16,
                     dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: *r,
                 });
             }
             (Loc::Stack(off), BswapSize::B16) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B16,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: *off,
@@ -4258,17 +4459,17 @@ impl X86_64CodeGen {
                 });
             }
             // 32/64-bit: use regular moves
-            (Loc::Reg(r), _) if *r != Reg::Rax => {
+            (Loc::Reg(r), _) if *r != Reg::R10 => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Reg(*r),
                 });
             }
             (Loc::Stack(off), _) => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: *off,
@@ -4295,13 +4496,13 @@ impl X86_64CodeGen {
 
         // BSF (bit scan forward) finds index of least significant set bit
         // which is equivalent to count of trailing zeros
-        // Use RAX as scratch register
+        // Use R10 as scratch register
         match src_loc {
             Loc::Reg(r) => {
                 self.push_lir(X86Inst::Bsf {
                     size: src_size,
                     src: GpOperand::Reg(r),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             Loc::Stack(off) => {
@@ -4311,7 +4512,7 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: off,
                     }),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             Loc::Imm(v) => {
@@ -4319,12 +4520,12 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: src_size,
                     src: GpOperand::Imm(v),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
                 self.push_lir(X86Inst::Bsf {
                     size: src_size,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: Reg::Rax,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: Reg::R10,
                 });
             }
             _ => return,
@@ -4333,10 +4534,10 @@ impl X86_64CodeGen {
         // Store result (return type is int, always 32-bit)
         match dst_loc {
             Loc::Reg(r) => {
-                if r != Reg::Rax {
+                if r != Reg::R10 {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
+                        src: GpOperand::Reg(Reg::R10),
                         dst: GpOperand::Reg(r),
                     });
                 }
@@ -4344,7 +4545,7 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: off,
@@ -4371,13 +4572,13 @@ impl X86_64CodeGen {
 
         // BSR (bit scan reverse) finds index of most significant set bit
         // CLZ = (operand_size - 1) - BSR_result
-        // Use RAX as scratch register
+        // Use R10 as scratch register
         match src_loc {
             Loc::Reg(r) => {
                 self.push_lir(X86Inst::Bsr {
                     size: src_size,
                     src: GpOperand::Reg(r),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             Loc::Stack(off) => {
@@ -4387,7 +4588,7 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: off,
                     }),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             Loc::Imm(v) => {
@@ -4395,34 +4596,34 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: src_size,
                     src: GpOperand::Imm(v),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
                 self.push_lir(X86Inst::Bsr {
                     size: src_size,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: Reg::Rax,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: Reg::R10,
                 });
             }
             _ => return,
         }
 
-        // XOR RAX with (size - 1) to convert BSR result to CLZ
+        // XOR R10 with (size - 1) to convert BSR result to CLZ
         // Since BSR gives index from LSB, we need (size_bits - 1) - result
         // XOR with (size_bits - 1) achieves this for valid inputs (non-zero)
         let xor_value = (src_size.bits() - 1) as i64;
         self.push_lir(X86Inst::Xor {
             size: OperandSize::B32, // Result is always 32-bit int
             src: GpOperand::Imm(xor_value),
-            dst: Reg::Rax,
+            dst: Reg::R10,
         });
 
         // Store result (return type is int, always 32-bit)
         match dst_loc {
             Loc::Reg(r) => {
-                if r != Reg::Rax {
+                if r != Reg::R10 {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
+                        src: GpOperand::Reg(Reg::R10),
                         dst: GpOperand::Reg(r),
                     });
                 }
@@ -4430,7 +4631,7 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: off,
@@ -4456,12 +4657,13 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(dst);
 
         // POPCNT instruction directly counts set bits
+        // Use R10 as scratch register
         match src_loc {
             Loc::Reg(r) => {
                 self.push_lir(X86Inst::Popcnt {
                     size: src_size,
                     src: GpOperand::Reg(r),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             Loc::Stack(off) => {
@@ -4471,7 +4673,7 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: off,
                     }),
-                    dst: Reg::Rax,
+                    dst: Reg::R10,
                 });
             }
             Loc::Imm(v) => {
@@ -4479,12 +4681,12 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Mov {
                     size: src_size,
                     src: GpOperand::Imm(v),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(Reg::R10),
                 });
                 self.push_lir(X86Inst::Popcnt {
                     size: src_size,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: Reg::Rax,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: Reg::R10,
                 });
             }
             _ => return,
@@ -4493,10 +4695,10 @@ impl X86_64CodeGen {
         // Store result (return type is int, always 32-bit)
         match dst_loc {
             Loc::Reg(r) => {
-                if r != Reg::Rax {
+                if r != Reg::R10 {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::Rax),
+                        src: GpOperand::Reg(Reg::R10),
                         dst: GpOperand::Reg(r),
                     });
                 }
@@ -4504,7 +4706,7 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(Reg::R10),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: off,
@@ -4582,25 +4784,25 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        // Load size into RAX
-        self.emit_move(size, Reg::Rax, 64);
+        // Load size into R10 (scratch register)
+        self.emit_move(size, Reg::R10, 64);
 
         // Round up to 16-byte alignment: (size + 15) & ~15
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
             src: GpOperand::Imm(15),
-            dst: Reg::Rax,
+            dst: Reg::R10,
         });
         self.push_lir(X86Inst::And {
             size: OperandSize::B64,
             src: GpOperand::Imm(-16),
-            dst: Reg::Rax,
+            dst: Reg::R10,
         });
 
         // Subtract from stack pointer
         self.push_lir(X86Inst::Sub {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rax),
+            src: GpOperand::Reg(Reg::R10),
             dst: Reg::Rsp,
         });
 
@@ -4608,12 +4810,12 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(Reg::Rsp),
-            dst: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(Reg::R10),
         });
 
         // Store result
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
 }
 

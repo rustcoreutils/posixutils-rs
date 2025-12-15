@@ -112,7 +112,13 @@ pub fn compile_and_run_with_opts(name: &str, content: &str, extra_opts: &[String
     let c_file = create_c_file(name, content);
     let c_path = c_file.path().to_path_buf();
 
-    let exe_path = std::env::temp_dir().join(format!("pcc_exe_{}", name));
+    // Use thread ID to make exe path unique for parallel test execution
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let exe_path = std::env::temp_dir().join(format!(
+        "pcc_exe_{}_{}",
+        name,
+        thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
+    ));
 
     let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
     args.extend(extra_opts.iter().cloned());

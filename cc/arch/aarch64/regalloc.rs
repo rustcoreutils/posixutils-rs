@@ -969,9 +969,17 @@ impl RegAlloc {
                     .position(|r| !r.is_callee_saved() && !conflicting.contains(r))
                 {
                     Some(self.free_regs.remove(idx))
-                } else if let Some(idx) =
-                    self.free_regs.iter().position(|r| !conflicting.contains(r))
+                } else if conflicting.is_empty() {
+                    // No constraints - use pop() to maintain original allocation order
+                    // (takes from end of list, which preserves existing behavior)
+                    self.free_regs.pop()
+                } else if let Some(idx) = self
+                    .free_regs
+                    .iter()
+                    .rposition(|r| !conflicting.contains(r))
                 {
+                    // With constraints - use rposition to prefer registers from end
+                    // (like pop() but filtering out conflicting registers)
                     Some(self.free_regs.remove(idx))
                 } else {
                     None

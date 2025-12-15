@@ -11,8 +11,9 @@
 //
 
 use super::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, TranslationUnit, UnaryOp,
+    AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
+    ExternalDecl, ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt,
+    TranslationUnit, UnaryOp,
 };
 use crate::diag;
 use crate::strings::StringId;
@@ -517,41 +518,226 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip GCC extended inline assembly statement
-    /// Format: __asm__ [volatile] ( "template" [: outputs [: inputs [: clobbers]]] );
-    fn skip_asm_statement(&mut self) {
+    /// Parse GCC extended inline assembly statement
+    /// Format: __asm__ [volatile] [goto] ( "template" [: outputs [: inputs [: clobbers [: goto_labels]]]] );
+    fn parse_asm_statement(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume __asm/__asm__
 
-        // Skip optional 'volatile' or '__volatile__'
-        if self.peek() == TokenType::Ident {
+        // Parse optional qualifiers: 'volatile', '__volatile__', 'inline', '__inline__', 'goto'
+        let mut is_volatile = false;
+        let mut _is_goto = false;
+        while self.peek() == TokenType::Ident {
             if let Some(name) = self.get_ident_name(self.current()) {
-                if name == "volatile" || name == "__volatile__" {
-                    self.advance();
+                match name.as_str() {
+                    "volatile" | "__volatile__" => {
+                        is_volatile = true;
+                        self.advance();
+                    }
+                    "inline" | "__inline__" => {
+                        // inline qualifier - just consume it (affects inlining decisions)
+                        self.advance();
+                    }
+                    "goto" => {
+                        // goto qualifier - indicates asm can jump to C labels
+                        _is_goto = true;
+                        self.advance();
+                    }
+                    _ => break,
                 }
+            } else {
+                break;
             }
         }
 
-        // Expect '('
-        if !self.is_special(b'(') {
-            return;
-        }
-        self.advance(); // consume '('
+        self.expect_special(b'(')?;
 
-        // Skip contents until matching ')', handling nested parens
-        let mut depth = 1;
-        while depth > 0 && !self.is_eof() {
-            if self.is_special(b'(') {
-                depth += 1;
-            } else if self.is_special(b')') {
-                depth -= 1;
+        // Parse template string (may be multiple concatenated strings)
+        let template = self.parse_asm_string_literal()?;
+
+        // Parse outputs (after first ':')
+        let outputs = if self.is_special(b':') {
+            self.advance();
+            self.parse_asm_operands()?
+        } else {
+            vec![]
+        };
+
+        // Parse inputs (after second ':')
+        let inputs = if self.is_special(b':') {
+            self.advance();
+            self.parse_asm_operands()?
+        } else {
+            vec![]
+        };
+
+        // Parse clobbers (after third ':')
+        let clobbers = if self.is_special(b':') {
+            self.advance();
+            self.parse_asm_clobbers()?
+        } else {
+            vec![]
+        };
+
+        // Parse goto labels (after fourth ':')
+        let goto_labels = if self.is_special(b':') {
+            self.advance();
+            self.parse_asm_goto_labels()?
+        } else {
+            vec![]
+        };
+
+        self.expect_special(b')')?;
+        self.expect_special(b';')?;
+
+        // Note: is_volatile is parsed but not yet used (Phase 2 feature)
+        let _ = is_volatile;
+
+        Ok(Stmt::Asm {
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            goto_labels,
+        })
+    }
+
+    /// Parse an asm template string (handles string concatenation)
+    fn parse_asm_string_literal(&mut self) -> ParseResult<String> {
+        let mut result = String::new();
+
+        if self.peek() != TokenType::String {
+            return Err(ParseError::new(
+                "expected string literal in asm template",
+                self.current_pos(),
+            ));
+        }
+
+        // Parse first string
+        let token = self.consume();
+        if let TokenValue::String(s) = &token.value {
+            result.push_str(&Self::parse_string_literal(s));
+        }
+
+        // Handle string concatenation (adjacent string literals)
+        while self.peek() == TokenType::String {
+            let token = self.consume();
+            if let TokenValue::String(s) = &token.value {
+                result.push_str(&Self::parse_string_literal(s));
             }
-            self.advance();
         }
 
-        // Consume trailing semicolon
-        if self.is_special(b';') {
-            self.advance();
+        Ok(result)
+    }
+
+    /// Parse asm operand list: [name] "constraint" (expr), ...
+    fn parse_asm_operands(&mut self) -> ParseResult<Vec<AsmOperand>> {
+        let mut operands = Vec::new();
+
+        // Allow empty operand list
+        if self.is_special(b':') || self.is_special(b')') {
+            return Ok(operands);
         }
+
+        loop {
+            // Parse optional symbolic name: [name]
+            let name = if self.is_special(b'[') {
+                self.advance(); // consume '['
+                let name = self.expect_identifier()?;
+                self.expect_special(b']')?;
+                Some(name)
+            } else {
+                None
+            };
+
+            // Parse constraint string
+            if self.peek() != TokenType::String {
+                return Err(ParseError::new(
+                    "expected constraint string in asm operand",
+                    self.current_pos(),
+                ));
+            }
+            let constraint = self.parse_asm_string_literal()?;
+
+            // Parse expression in parentheses
+            self.expect_special(b'(')?;
+            let expr = self.parse_expression()?;
+            self.expect_special(b')')?;
+
+            operands.push(AsmOperand {
+                name,
+                constraint,
+                expr,
+            });
+
+            // Check for more operands
+            if self.is_special(b',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(operands)
+    }
+
+    /// Parse asm clobber list: "clobber", ...
+    fn parse_asm_clobbers(&mut self) -> ParseResult<Vec<String>> {
+        let mut clobbers = Vec::new();
+
+        // Allow empty clobber list
+        if self.is_special(b':') || self.is_special(b')') {
+            return Ok(clobbers);
+        }
+
+        loop {
+            if self.peek() != TokenType::String {
+                return Err(ParseError::new(
+                    "expected clobber string in asm statement",
+                    self.current_pos(),
+                ));
+            }
+            let clobber = self.parse_asm_string_literal()?;
+            clobbers.push(clobber);
+
+            if self.is_special(b',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(clobbers)
+    }
+
+    /// Parse asm goto label list: label1, label2, ...
+    fn parse_asm_goto_labels(&mut self) -> ParseResult<Vec<StringId>> {
+        let mut labels = Vec::new();
+
+        // Allow empty label list
+        if self.is_special(b')') {
+            return Ok(labels);
+        }
+
+        loop {
+            if self.peek() != TokenType::Ident {
+                return Err(ParseError::new(
+                    "expected label identifier in asm goto",
+                    self.current_pos(),
+                ));
+            }
+            let token = self.consume();
+            if let TokenValue::Ident(label_id) = token.value {
+                labels.push(label_id);
+            }
+
+            if self.is_special(b',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(labels)
     }
 
     /// Skip both __attribute__ and __asm extensions
@@ -2698,10 +2884,9 @@ impl Parser<'_> {
                     "switch" => return self.parse_switch_stmt(),
                     "case" => return self.parse_case_label(),
                     "default" => return self.parse_default_label(),
-                    // GCC extended inline assembly - skip for now
+                    // GCC extended inline assembly
                     "__asm__" | "__asm" | "asm" => {
-                        self.skip_asm_statement();
-                        return Ok(Stmt::Empty);
+                        return self.parse_asm_statement();
                     }
                     _ => {}
                 }

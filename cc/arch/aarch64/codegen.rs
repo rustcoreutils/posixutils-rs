@@ -1377,6 +1377,13 @@ impl Aarch64CodeGen {
                 self.emit_longjmp(insn, *total_frame);
             }
 
+            // ================================================================
+            // Inline Assembly
+            // ================================================================
+            Opcode::Asm => {
+                self.emit_inline_asm(insn, *total_frame);
+            }
+
             // Skip no-ops and unimplemented
             _ => {}
         }
@@ -4131,6 +4138,422 @@ impl Aarch64CodeGen {
         // Store result
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64, frame_size);
+    }
+
+    // ========================================================================
+    // Inline Assembly Support
+    // ========================================================================
+
+    /// Emit inline assembly instruction
+    fn emit_inline_asm(&mut self, insn: &Instruction, _frame_size: i32) {
+        let asm_data = match &insn.asm_data {
+            Some(data) => data,
+            None => return,
+        };
+
+        // Build operand strings for asm substitution
+        // We use the actual locations assigned by the register allocator
+        // so that subsequent Store instructions work correctly.
+        let mut operand_regs: Vec<Option<Reg>> = Vec::new();
+        let mut operand_mem: Vec<Option<String>> = Vec::new();
+        let mut operand_names: Vec<Option<String>> = Vec::new();
+
+        // Process output operands (they go first: %0, %1, etc.)
+        for output in &asm_data.outputs {
+            let loc = self.get_location(output.pseudo);
+            operand_names.push(output.name.clone());
+            match loc {
+                Loc::Reg(r) => {
+                    operand_regs.push(Some(r));
+                    operand_mem.push(None);
+                }
+                _ => {
+                    // Memory or other location - emit as memory operand
+                    let mem_str = self.loc_to_asm_string(&loc);
+                    operand_regs.push(None);
+                    operand_mem.push(Some(mem_str));
+                }
+            }
+        }
+
+        let num_outputs = asm_data.outputs.len();
+
+        // Process input operands
+        for input in &asm_data.inputs {
+            // Handle matching constraints - use the matched output's location
+            let loc = if let Some(match_idx) = input.matching_output {
+                if match_idx < num_outputs {
+                    self.get_location(asm_data.outputs[match_idx].pseudo)
+                } else {
+                    self.get_location(input.pseudo)
+                }
+            } else {
+                self.get_location(input.pseudo)
+            };
+
+            operand_names.push(input.name.clone());
+            match loc {
+                Loc::Reg(r) => {
+                    operand_regs.push(Some(r));
+                    operand_mem.push(None);
+                }
+                Loc::Imm(v) => {
+                    // Immediate value
+                    operand_regs.push(None);
+                    operand_mem.push(Some(format!("#{}", v)));
+                }
+                _ => {
+                    // Memory or other location
+                    let mem_str = self.loc_to_asm_string(&loc);
+                    operand_regs.push(None);
+                    operand_mem.push(Some(mem_str));
+                }
+            }
+        }
+
+        // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
+        let goto_labels_formatted: Vec<(String, String)> = asm_data
+            .goto_labels
+            .iter()
+            .map(|(bb_id, name)| {
+                // Format label as .Lfunc_bbid (same format as Label::name())
+                let label_str = format!(".L{}_{}", self.current_fn, bb_id.0);
+                (label_str, name.clone())
+            })
+            .collect();
+
+        // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
+        let asm_output = self.substitute_asm_operands(
+            &asm_data.template,
+            &operand_regs,
+            &operand_mem,
+            &operand_names,
+            &goto_labels_formatted,
+        );
+
+        // Emit the inline assembly as raw text
+        // Split by newlines and emit each line
+        for line in asm_output.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                self.push_lir(Aarch64Inst::Directive(Directive::Raw(trimmed.to_string())));
+            }
+        }
+
+        // Handle clobbers - for now just emit comments for documentation
+        // Our simple codegen doesn't do sophisticated register allocation across asm
+        for clobber in &asm_data.clobbers {
+            match clobber.as_str() {
+                "memory" => {
+                    // Memory clobber - acts as compiler memory barrier
+                    // Our codegen doesn't reorder loads/stores, so this is mostly informational
+                }
+                "cc" => {
+                    // Condition codes clobbered - informational for our simple codegen
+                }
+                _ => {
+                    // Register clobber - could save/restore if needed
+                    // For now, trust that the register allocator has handled this
+                }
+            }
+        }
+    }
+
+    /// Convert a location to an asm operand string for AArch64
+    fn loc_to_asm_string(&self, loc: &Loc) -> String {
+        match loc {
+            Loc::Reg(r) => asm_reg_name_64(*r).to_string(),
+            Loc::Stack(offset) => {
+                // AArch64 uses offsets from FP (x29)
+                format!("[x29, #-{}]", offset)
+            }
+            Loc::Imm(v) => format!("#{}", v),
+            Loc::VReg(vreg) => vreg.name_d().to_string(),
+            Loc::FImm(_, _) => {
+                // Float immediates not directly usable in inline asm
+                panic!("Float immediate not supported in inline asm operand")
+            }
+            Loc::Global(name) => name.clone(),
+        }
+    }
+
+    /// Substitute %0, %1, %[name], %l0, %l[name], etc. in asm template with actual operands
+    /// goto_labels: (label_string, label_name) - label_string is the fully formatted label
+    fn substitute_asm_operands(
+        &self,
+        template: &str,
+        operand_regs: &[Option<Reg>],
+        operand_mem: &[Option<String>],
+        operand_names: &[Option<String>],
+        goto_labels: &[(String, String)],
+    ) -> String {
+        let mut result = String::new();
+        let mut chars = template.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                if let Some(&next) = chars.peek() {
+                    if next == '%' {
+                        // Escaped %
+                        chars.next();
+                        result.push('%');
+                    } else if next == '[' {
+                        // %[name] - named operand reference
+                        chars.next(); // consume '['
+                        let mut name = String::new();
+                        while let Some(&ch) = chars.peek() {
+                            if ch == ']' {
+                                chars.next();
+                                break;
+                            }
+                            name.push(ch);
+                            chars.next();
+                        }
+                        // Look up the name in operand names
+                        if let Some(idx) = operand_names
+                            .iter()
+                            .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                        {
+                            if let Some(ref mem) = operand_mem[idx] {
+                                result.push_str(mem);
+                            } else if let Some(reg) = operand_regs[idx] {
+                                result.push_str(asm_reg_name_64(reg));
+                            }
+                        } else {
+                            // Unknown name, pass through
+                            result.push_str("%[");
+                            result.push_str(&name);
+                            result.push(']');
+                        }
+                    } else if next.is_ascii_digit() {
+                        // Operand reference
+                        chars.next();
+                        let mut num_str = String::new();
+                        num_str.push(next);
+                        // Check for multi-digit operand numbers
+                        while let Some(&digit) = chars.peek() {
+                            if digit.is_ascii_digit() {
+                                num_str.push(digit);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        let idx: usize = num_str.parse().unwrap_or(0);
+                        if idx < operand_regs.len() {
+                            if let Some(ref mem) = operand_mem[idx] {
+                                result.push_str(mem);
+                            } else if let Some(reg) = operand_regs[idx] {
+                                // Default to 64-bit register name for AArch64
+                                result.push_str(asm_reg_name_64(reg));
+                            }
+                        }
+                    } else if next == 'w' || next == 'x' {
+                        // Size modifier: %w0 = 32-bit, %x0 = 64-bit
+                        let size_mod = next;
+                        chars.next();
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch == '[' {
+                                // %w[name], %x[name], etc.
+                                chars.next(); // consume '['
+                                let mut name = String::new();
+                                while let Some(&ch) = chars.peek() {
+                                    if ch == ']' {
+                                        chars.next();
+                                        break;
+                                    }
+                                    name.push(ch);
+                                    chars.next();
+                                }
+                                if let Some(idx) = operand_names.iter().position(|n| {
+                                    n.as_ref().map(|s| s.as_str()) == Some(name.as_str())
+                                }) {
+                                    if let Some(ref mem) = operand_mem[idx] {
+                                        result.push_str(mem);
+                                    } else if let Some(reg) = operand_regs[idx] {
+                                        let reg_name = match size_mod {
+                                            'w' => asm_reg_name_32(reg),
+                                            _ => asm_reg_name_64(reg),
+                                        };
+                                        result.push_str(reg_name);
+                                    }
+                                } else {
+                                    result.push('%');
+                                    result.push(size_mod);
+                                    result.push('[');
+                                    result.push_str(&name);
+                                    result.push(']');
+                                }
+                            } else if next_ch.is_ascii_digit() {
+                                chars.next();
+                                let mut num_str = String::new();
+                                num_str.push(next_ch);
+                                while let Some(&d) = chars.peek() {
+                                    if d.is_ascii_digit() {
+                                        num_str.push(d);
+                                        chars.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                let idx: usize = num_str.parse().unwrap_or(0);
+                                if idx < operand_regs.len() {
+                                    if let Some(reg) = operand_regs[idx] {
+                                        let name = match size_mod {
+                                            'w' => asm_reg_name_32(reg),
+                                            _ => asm_reg_name_64(reg),
+                                        };
+                                        result.push_str(name);
+                                    }
+                                }
+                            } else {
+                                // Not a valid operand, emit literally
+                                result.push('%');
+                                result.push(size_mod);
+                            }
+                        } else {
+                            result.push('%');
+                            result.push(size_mod);
+                        }
+                    } else if next == 'l' {
+                        // %l - label reference for asm goto: %l0, %l1, %l[name]
+                        chars.next(); // consume 'l'
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch == '[' {
+                                // %l[name] - named label reference
+                                chars.next(); // consume '['
+                                let mut name = String::new();
+                                while let Some(&ch) = chars.peek() {
+                                    if ch == ']' {
+                                        chars.next();
+                                        break;
+                                    }
+                                    name.push(ch);
+                                    chars.next();
+                                }
+                                // Look up label by name (label_string, label_name)
+                                if let Some((label_str, _)) =
+                                    goto_labels.iter().find(|(_, n)| n == &name)
+                                {
+                                    result.push_str(label_str);
+                                } else {
+                                    // Unknown label, pass through
+                                    result.push_str("%l[");
+                                    result.push_str(&name);
+                                    result.push(']');
+                                }
+                            } else if next_ch.is_ascii_digit() {
+                                // %l0, %l1, etc. - numeric label reference
+                                chars.next();
+                                let idx = (next_ch as usize) - ('0' as usize);
+                                if idx < goto_labels.len() {
+                                    let (label_str, _) = &goto_labels[idx];
+                                    result.push_str(label_str);
+                                } else {
+                                    // Unknown label index, pass through
+                                    result.push_str("%l");
+                                    result.push(next_ch);
+                                }
+                            } else {
+                                // Just %l without number or name, pass through
+                                result.push_str("%l");
+                            }
+                        } else {
+                            result.push_str("%l");
+                        }
+                    } else {
+                        // Unknown modifier - emit literally
+                        result.push('%');
+                    }
+                } else {
+                    result.push('%');
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        result
+    }
+}
+
+// ============================================================================
+// Inline Assembly Helper Functions
+// ============================================================================
+
+/// Get the 64-bit register name for inline asm
+fn asm_reg_name_64(reg: Reg) -> &'static str {
+    match reg {
+        Reg::X0 => "x0",
+        Reg::X1 => "x1",
+        Reg::X2 => "x2",
+        Reg::X3 => "x3",
+        Reg::X4 => "x4",
+        Reg::X5 => "x5",
+        Reg::X6 => "x6",
+        Reg::X7 => "x7",
+        Reg::X8 => "x8",
+        Reg::X9 => "x9",
+        Reg::X10 => "x10",
+        Reg::X11 => "x11",
+        Reg::X12 => "x12",
+        Reg::X13 => "x13",
+        Reg::X14 => "x14",
+        Reg::X15 => "x15",
+        Reg::X16 => "x16",
+        Reg::X17 => "x17",
+        Reg::X18 => "x18",
+        Reg::X19 => "x19",
+        Reg::X20 => "x20",
+        Reg::X21 => "x21",
+        Reg::X22 => "x22",
+        Reg::X23 => "x23",
+        Reg::X24 => "x24",
+        Reg::X25 => "x25",
+        Reg::X26 => "x26",
+        Reg::X27 => "x27",
+        Reg::X28 => "x28",
+        Reg::X29 => "x29",
+        Reg::X30 => "x30",
+        Reg::SP => "sp",
+    }
+}
+
+/// Get the 32-bit register name for inline asm
+fn asm_reg_name_32(reg: Reg) -> &'static str {
+    match reg {
+        Reg::X0 => "w0",
+        Reg::X1 => "w1",
+        Reg::X2 => "w2",
+        Reg::X3 => "w3",
+        Reg::X4 => "w4",
+        Reg::X5 => "w5",
+        Reg::X6 => "w6",
+        Reg::X7 => "w7",
+        Reg::X8 => "w8",
+        Reg::X9 => "w9",
+        Reg::X10 => "w10",
+        Reg::X11 => "w11",
+        Reg::X12 => "w12",
+        Reg::X13 => "w13",
+        Reg::X14 => "w14",
+        Reg::X15 => "w15",
+        Reg::X16 => "w16",
+        Reg::X17 => "w17",
+        Reg::X18 => "w18",
+        Reg::X19 => "w19",
+        Reg::X20 => "w20",
+        Reg::X21 => "w21",
+        Reg::X22 => "w22",
+        Reg::X23 => "w23",
+        Reg::X24 => "w24",
+        Reg::X25 => "w25",
+        Reg::X26 => "w26",
+        Reg::X27 => "w27",
+        Reg::X28 => "w28",
+        Reg::X29 => "w29",
+        Reg::X30 => "w30",
+        Reg::SP => "wsp",
     }
 }
 

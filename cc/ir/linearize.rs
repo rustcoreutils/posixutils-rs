@@ -12,12 +12,13 @@
 
 use super::ssa::ssa_convert;
 use super::{
-    BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
+    Opcode, Pseudo, PseudoId,
 };
 use crate::diag::{error, Position};
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
+    AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
+    ExternalDecl, ForInit, FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::SymbolTable;
@@ -1195,6 +1196,16 @@ impl<'a> Linearizer<'a> {
                 // Case/Default labels are handled by linearize_switch
                 // If we encounter them outside a switch, ignore them
             }
+
+            Stmt::Asm {
+                template,
+                outputs,
+                inputs,
+                clobbers,
+                goto_labels,
+            } => {
+                self.linearize_asm(template, outputs, inputs, clobbers, goto_labels);
+            }
         }
     }
 
@@ -2122,6 +2133,186 @@ impl<'a> Linearizer<'a> {
                 self.linearize_stmt(stmt);
             }
         }
+    }
+
+    // ========================================================================
+    // Inline assembly linearization
+    // ========================================================================
+
+    /// Linearize an inline assembly statement
+    fn linearize_asm(
+        &mut self,
+        template: &str,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+        clobbers: &[String],
+        goto_labels: &[StringId],
+    ) {
+        let mut ir_outputs = Vec::new();
+        let mut ir_inputs = Vec::new();
+
+        // Process output operands
+        for op in outputs {
+            // Create a pseudo for the output
+            let pseudo = self.alloc_pseudo();
+
+            // Parse constraint to get flags
+            let (_is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
+
+            // Get symbolic name if present
+            let name = op.name.map(|n| self.str(n).to_string());
+
+            // For read-write outputs ("+r"), load the initial value into the SAME pseudo
+            // so that input and output use the same register
+            if is_readwrite {
+                let addr = self.linearize_lvalue(&op.expr);
+                let typ = self.expr_type(&op.expr);
+                let size = self.types.size_bits(typ);
+                // Load into the same pseudo that will be used for output
+                self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+
+                // Also add as input, using the SAME pseudo
+                ir_inputs.push(AsmConstraint {
+                    pseudo, // Same pseudo as output - ensures same register
+                    name: name.clone(),
+                    matching_output: None,
+                    constraint: op.constraint.clone(),
+                });
+            }
+
+            ir_outputs.push(AsmConstraint {
+                pseudo,
+                name,
+                matching_output: None,
+                constraint: op.constraint.clone(),
+            });
+        }
+
+        // Process input operands
+        for op in inputs {
+            let (is_memory, _, matching) = self.parse_asm_constraint(&op.constraint);
+
+            // Get symbolic name if present
+            let name = op.name.map(|n| self.str(n).to_string());
+
+            // For matching constraints (like "0"), we need to load the input value
+            // into the matched output's pseudo so they use the same register
+            let pseudo = if let Some(match_idx) = matching {
+                if match_idx < ir_outputs.len() {
+                    // Use the matched output's pseudo
+                    let out_pseudo = ir_outputs[match_idx].pseudo;
+                    // Load the input value into the output's pseudo
+                    let val = self.linearize_expr(&op.expr);
+                    let typ = self.expr_type(&op.expr);
+                    let size = self.types.size_bits(typ);
+                    // Copy val to out_pseudo so they share the same register
+                    self.emit(
+                        Instruction::new(Opcode::Copy)
+                            .with_target(out_pseudo)
+                            .with_src(val)
+                            .with_size(size),
+                    );
+                    out_pseudo
+                } else {
+                    self.linearize_expr(&op.expr)
+                }
+            } else if is_memory {
+                // For memory operands, get the address
+                self.linearize_lvalue(&op.expr)
+            } else {
+                // For register operands, evaluate the expression
+                self.linearize_expr(&op.expr)
+            };
+
+            ir_inputs.push(AsmConstraint {
+                pseudo,
+                name,
+                matching_output: matching,
+                constraint: op.constraint.clone(),
+            });
+        }
+
+        // Process goto labels - map label names to BasicBlockIds
+        let ir_goto_labels: Vec<(BasicBlockId, String)> = goto_labels
+            .iter()
+            .map(|label_id| {
+                let label_name = self.str(*label_id).to_string();
+                let bb = self.get_or_create_label(&label_name);
+                (bb, label_name)
+            })
+            .collect();
+
+        // Create the asm data
+        let asm_data = AsmData {
+            template: template.to_string(),
+            outputs: ir_outputs.clone(),
+            inputs: ir_inputs,
+            clobbers: clobbers.to_vec(),
+            goto_labels: ir_goto_labels.clone(),
+        };
+
+        // Emit the asm instruction
+        self.emit(Instruction::asm(asm_data));
+
+        // For asm goto: add edges to all possible label targets
+        // The asm may jump to any of these labels, so control flow can go there
+        if !ir_goto_labels.is_empty() {
+            if let Some(current) = self.current_bb {
+                // After the asm instruction, we need a basic block for fall-through
+                // and edges to all goto targets
+                let fall_through = self.alloc_bb();
+
+                // Add edges to all goto label targets
+                for (target_bb, _) in &ir_goto_labels {
+                    self.link_bb(current, *target_bb);
+                }
+
+                // Add edge to fall-through (normal case when asm doesn't jump)
+                self.link_bb(current, fall_through);
+
+                // Emit an explicit branch to the fallthrough block
+                // This is necessary because the asm goto acts as a conditional terminator
+                // Without this, code would fall through to whatever block comes next in layout
+                self.emit(Instruction::br(fall_through));
+
+                // Switch to fall-through block for subsequent instructions
+                self.current_bb = Some(fall_through);
+            }
+        }
+
+        // Store outputs back to their destinations
+        // store(value, addr, ...) - value first, then address
+        for (i, op) in outputs.iter().enumerate() {
+            let out_pseudo = ir_outputs[i].pseudo;
+            let addr = self.linearize_lvalue(&op.expr);
+            let typ = self.expr_type(&op.expr);
+            let size = self.types.size_bits(typ);
+            self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+        }
+    }
+
+    /// Parse an asm constraint string to extract flags
+    /// Returns (is_memory, is_readwrite, matching_output)
+    /// Note: Early clobber (&) is parsed but not used since our simple register
+    /// allocator doesn't share registers between inputs and outputs anyway
+    fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>) {
+        let mut is_memory = false;
+        let mut is_readwrite = false;
+        let mut matching = None;
+
+        for c in constraint.chars() {
+            match c {
+                '+' => is_readwrite = true,
+                '&' | '=' | '%' => {} // Early clobber, output-only, commutative
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' => {} // Register constraints
+                'm' | 'o' | 'V' | 'Q' => is_memory = true,
+                'i' | 'n' | 'g' | 'X' => {} // Immediate, general
+                '0'..='9' => matching = Some((c as u8 - b'0') as usize),
+                _ => {} // Ignore unknown constraints
+            }
+        }
+
+        (is_memory, is_readwrite, matching)
     }
 
     fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

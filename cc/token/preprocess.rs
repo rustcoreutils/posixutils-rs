@@ -3462,8 +3462,8 @@ PASTE(foo, bar)
 
     #[test]
     fn test_ternary_with_expressions() {
-        // (5 > 3) ? 10 : 20 = 10
-        let input = "#if (5 > 3) ? 10 : 20 == 10\nyes\n#endif";
+        // ((5 > 3) ? 10 : 20) == 10 = 1 (true)
+        let input = "#if ((5 > 3) ? 10 : 20) == 10\nyes\n#endif";
         let (tokens, idents) = preprocess_str(input);
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"yes".to_string()));

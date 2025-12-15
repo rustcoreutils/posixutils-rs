@@ -17,34 +17,26 @@
 // - Silencing "control reaches end of non-void function" warnings
 // - Enabling optimizations by asserting invariants
 //
+// Tests are aggregated to reduce compile/link cycles while maintaining coverage.
+//
 
 use crate::common::compile_and_run;
 
 // ============================================================================
-// Basic usage - unreachable in code paths that are never taken
+// Basic unreachable patterns (after return, in if branch)
 // ============================================================================
 
 #[test]
-fn unreachable_after_return() {
-    // Basic test: unreachable after a return that always executes
+fn unreachable_basic_patterns() {
     let code = r#"
-int foo(void) {
+// Basic test: unreachable after a return that always executes
+int foo_return(void) {
     return 42;
     __builtin_unreachable();  // Never reached
 }
 
-int main(void) {
-    return foo();
-}
-"#;
-    assert_eq!(compile_and_run("unreachable_after_return", code), 42);
-}
-
-#[test]
-fn unreachable_in_if_branch() {
-    // Unreachable in a branch that's never taken
-    let code = r#"
-int foo(int x) {
+// Unreachable in a branch that's never taken
+int foo_branch(int x) {
     if (x > 0) {
         return x;
     } else {
@@ -52,11 +44,37 @@ int foo(int x) {
     }
 }
 
+// Use unreachable to assert an invariant
+int divide(int a, int b) {
+    if (b == 0) {
+        __builtin_unreachable();  // Caller guarantees b != 0
+    }
+    return a / b;
+}
+
+// __builtin_unreachable() is a void expression
+void do_nothing(void) {
+    return;
+    __builtin_unreachable();
+}
+
 int main(void) {
-    return foo(42);  // Always positive, so unreachable branch is never taken
+    // Test 1: After return
+    if (foo_return() != 42) return 1;
+
+    // Test 2: In branch
+    if (foo_branch(42) != 42) return 2;
+
+    // Test 3: Assert invariant
+    if (divide(84, 2) != 42) return 3;
+
+    // Test 4: Void expression
+    do_nothing();
+
+    return 0;
 }
 "#;
-    assert_eq!(compile_and_run("unreachable_in_if_branch", code), 42);
+    assert_eq!(compile_and_run("unreachable_basic", code), 0);
 }
 
 // ============================================================================
@@ -64,11 +82,11 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn unreachable_switch_default() {
-    // Common pattern: unreachable default in exhaustive switch
+fn unreachable_switch_patterns() {
     let code = r#"
 enum Color { RED, GREEN, BLUE };
 
+// Common pattern: unreachable default in exhaustive switch
 int color_value(enum Color c) {
     switch (c) {
     case RED:   return 10;
@@ -79,20 +97,7 @@ int color_value(enum Color c) {
     }
 }
 
-int main(void) {
-    int r = color_value(RED);    // 10
-    int g = color_value(GREEN);  // 20
-    int b = color_value(BLUE);   // 30
-    return r + g + b - 18;       // 60 - 18 = 42
-}
-"#;
-    assert_eq!(compile_and_run("unreachable_switch_default", code), 42);
-}
-
-#[test]
-fn unreachable_after_switch_all_return() {
-    // When all switch cases return, code after switch is unreachable
-    let code = r#"
+// When all switch cases return, code after switch is unreachable
 int get_val(int x) {
     switch (x) {
     case 0: return 10;
@@ -104,41 +109,29 @@ int get_val(int x) {
 }
 
 int main(void) {
-    return get_val(0) + get_val(1) + get_val(2) - 18;  // 10 + 20 + 30 - 18 = 42
+    // Test 1-3: Color enum
+    int r = color_value(RED);    // 10
+    int g = color_value(GREEN);  // 20
+    int b = color_value(BLUE);   // 30
+    if (r + g + b - 18 != 42) return 1;
+
+    // Test 4-6: All cases return
+    if (get_val(0) + get_val(1) + get_val(2) - 18 != 42) return 2;
+
+    return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("unreachable_after_switch_all_return", code),
-        42
-    );
+    assert_eq!(compile_and_run("unreachable_switch", code), 0);
 }
 
 // ============================================================================
-// With conditional expressions
+// Conditional and control flow patterns
 // ============================================================================
 
 #[test]
-fn unreachable_assert_invariant() {
-    // Use unreachable to assert an invariant the compiler can't prove
+fn unreachable_control_flow() {
     let code = r#"
-int divide(int a, int b) {
-    if (b == 0) {
-        __builtin_unreachable();  // Caller guarantees b != 0
-    }
-    return a / b;
-}
-
-int main(void) {
-    return divide(84, 2);  // We guarantee b != 0
-}
-"#;
-    assert_eq!(compile_and_run("unreachable_assert_invariant", code), 42);
-}
-
-#[test]
-fn unreachable_in_else_chain() {
-    // Exhaustive else-if chain
-    let code = r#"
+// Exhaustive else-if chain
 int categorize(int x) {
     if (x < 0) {
         return -1;
@@ -151,26 +144,8 @@ int categorize(int x) {
     }
 }
 
-int main(void) {
-    int neg = categorize(-5);   // -1
-    int zero = categorize(0);   // 0
-    int pos = categorize(100);  // 1
-    // -1 + 0 + 1 + 42 = 42
-    return neg + zero + pos + 42;
-}
-"#;
-    assert_eq!(compile_and_run("unreachable_in_else_chain", code), 42);
-}
-
-// ============================================================================
-// Control flow patterns
-// ============================================================================
-
-#[test]
-fn unreachable_after_infinite_loop_break() {
-    // After a loop that always breaks, code is unreachable
-    let code = r#"
-int foo(void) {
+// After a loop that always breaks, code is unreachable
+int loop_return(void) {
     int i = 0;
     while (1) {
         i = i + 1;
@@ -181,20 +156,7 @@ int foo(void) {
     __builtin_unreachable();  // Loop either continues or returns
 }
 
-int main(void) {
-    return foo();
-}
-"#;
-    assert_eq!(
-        compile_and_run("unreachable_after_infinite_loop_break", code),
-        42
-    );
-}
-
-#[test]
-fn unreachable_multiple_in_function() {
-    // Multiple unreachable statements in different branches
-    let code = r#"
+// Multiple unreachable statements in different branches
 int classify(int x) {
     if (x < 0) {
         return 0;
@@ -210,37 +172,23 @@ int classify(int x) {
 }
 
 int main(void) {
+    // Test 1-3: Exhaustive else-if
+    int neg = categorize(-5);   // -1
+    int zero = categorize(0);   // 0
+    int pos = categorize(100);  // 1
+    if (neg + zero + pos + 42 != 42) return 1;
+
+    // Test 4: Loop return
+    if (loop_return() != 42) return 2;
+
+    // Test 5-7: Multiple unreachable
     int a = classify(-1);   // 0
     int b = classify(50);   // 1
     int c = classify(200);  // 2
-    // 0 + 1 + 2 + 39 = 42
-    return a + b + c + 39;
+    if (a + b + c + 39 != 42) return 3;
+
+    return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("unreachable_multiple_in_function", code),
-        42
-    );
-}
-
-// ============================================================================
-// Void expression context
-// ============================================================================
-
-#[test]
-fn unreachable_as_expression() {
-    // __builtin_unreachable() is a void expression
-    let code = r#"
-void do_nothing(void) {
-    // This function always returns normally
-    return;
-    __builtin_unreachable();
-}
-
-int main(void) {
-    do_nothing();
-    return 42;
-}
-"#;
-    assert_eq!(compile_and_run("unreachable_as_expression", code), 42);
+    assert_eq!(compile_and_run("unreachable_control_flow", code), 0);
 }

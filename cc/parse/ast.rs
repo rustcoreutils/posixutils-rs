@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Abstract Syntax Tree for pcc C99 compiler
-// Based on sparse's AST representation
+// Type-annotated AST for C99 with expressions, statements, and declarations
 //
 
 use crate::diag::Position;
@@ -108,15 +108,15 @@ pub enum AssignOp {
 // Expressions
 // ============================================================================
 
-/// An expression with type annotation (like sparse's expr->ctype)
+/// An expression with type annotation
 ///
-/// Following sparse's design, every expression carries its computed type.
-/// The type is filled in during type evaluation (after parsing, before linearization).
+/// Every expression carries its computed type, filled in during type evaluation
+/// (after parsing, before linearization).
 #[derive(Debug, Clone)]
 pub struct Expr {
     /// The expression kind/variant
     pub kind: ExprKind,
-    /// The computed type of this expression (like sparse's expr->ctype)
+    /// The computed type of this expression
     /// None before type evaluation, Some after (interned TypeId)
     pub typ: Option<TypeId>,
     /// Source position for debug info

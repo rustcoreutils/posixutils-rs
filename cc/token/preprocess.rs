@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // C Preprocessor
-// Based on the sparse compiler design by Linus Torvalds
+// Implements C99 preprocessing directives and macro expansion
 //
 // Main API: preprocess(tokens, target, idents) -> preprocessed_tokens
 //
@@ -86,6 +86,8 @@ pub enum BuiltinMacro {
     Date,
     Time,
     Counter,
+    IncludeLevel,
+    BaseFile,
     HasAttribute,
     HasBuiltin,
     HasFeature,
@@ -139,13 +141,42 @@ impl Macro {
         }
     }
 
-    /// Create a predefined macro with a string value (for -D NAME="value")
-    pub fn predefined_string(name: &str, value: &str) -> Self {
-        let body = vec![MacroToken {
-            typ: TokenType::String,
-            value: MacroTokenValue::String(value.to_string()),
-            whitespace: false,
-        }];
+    /// Create a predefined macro from a command-line -D value.
+    /// The value is tokenized properly so -DFOO=123 becomes a number token,
+    /// -DFOO=bar becomes an identifier token, etc.
+    pub fn from_cmdline_define(name: &str, value: &str) -> Self {
+        // Tokenize the value string
+        let mut idents = IdentTable::new();
+        let mut tokenizer = Tokenizer::new(value.as_bytes(), 0, &mut idents);
+        let tokens = tokenizer.tokenize();
+
+        // Convert tokens to macro tokens, skipping stream markers
+        let body: Vec<MacroToken> = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .enumerate()
+            .map(|(i, token)| {
+                let value = match &token.value {
+                    TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
+                    TokenValue::Ident(id) => {
+                        let ident_name = idents.get_opt(*id).unwrap_or("").to_string();
+                        MacroTokenValue::Ident(ident_name)
+                    }
+                    TokenValue::String(s) => MacroTokenValue::String(s.clone()),
+                    TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
+                    TokenValue::Special(code) => MacroTokenValue::Special(*code),
+                    TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
+                    TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+                    TokenValue::None => MacroTokenValue::None,
+                };
+                MacroToken {
+                    typ: token.typ,
+                    value,
+                    whitespace: i > 0 && token.pos.whitespace,
+                }
+            })
+            .collect();
+
         Self {
             name: name.to_string(),
             body,
@@ -245,6 +276,9 @@ pub struct Preprocessor<'a> {
 
     /// Current file name (for __FILE__)
     current_file: String,
+
+    /// Base file name (for __BASE_FILE__ - the main input file)
+    base_file: String,
 
     /// Current file directory (for relative includes)
     current_dir: String,
@@ -361,6 +395,7 @@ impl<'a> Preprocessor<'a> {
             system_include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             current_file: filename.to_string(),
+            base_file: filename.to_string(),
             current_dir,
             counter: 0,
             include_depth: 0,
@@ -472,6 +507,16 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::builtin("__DATE__", BuiltinMacro::Date, false));
         self.define_macro(Macro::builtin("__TIME__", BuiltinMacro::Time, false));
         self.define_macro(Macro::builtin("__COUNTER__", BuiltinMacro::Counter, false));
+        self.define_macro(Macro::builtin(
+            "__INCLUDE_LEVEL__",
+            BuiltinMacro::IncludeLevel,
+            false,
+        ));
+        self.define_macro(Macro::builtin(
+            "__BASE_FILE__",
+            BuiltinMacro::BaseFile,
+            false,
+        ));
 
         // Function-like builtins
         self.define_macro(Macro::builtin(
@@ -1649,6 +1694,25 @@ impl<'a> Preprocessor<'a> {
                 MacroTokenValue::VaArgs => {
                     // Variadic arguments
                     let start = mac.params.len();
+                    let va_args: Vec<_> = args.iter().skip(start).collect();
+                    let va_args_empty =
+                        va_args.is_empty() || (va_args.len() == 1 && va_args[0].is_empty());
+
+                    // GNU extension: ,##__VA_ARGS__ - suppress comma when VA_ARGS is empty
+                    if prev_was_paste && va_args_empty {
+                        // Check if the previous token (before ##) was a comma and remove it
+                        if let Some(last) = result.last() {
+                            if let TokenValue::Special(code) = &last.value {
+                                if *code == b',' as u32 {
+                                    result.pop(); // Remove the comma
+                                }
+                            }
+                        }
+                        // Skip emitting empty VA_ARGS
+                        i += 1;
+                        continue;
+                    }
+
                     for (j, arg) in args.iter().enumerate().skip(start) {
                         if j > start {
                             result.push(Token::with_value(
@@ -1873,6 +1937,16 @@ impl<'a> Preprocessor<'a> {
                     TokenValue::Number(val.to_string()),
                 )])
             }
+            BuiltinMacro::IncludeLevel => Some(vec![Token::with_value(
+                TokenType::Number,
+                *pos,
+                TokenValue::Number(self.include_depth.to_string()),
+            )]),
+            BuiltinMacro::BaseFile => Some(vec![Token::with_value(
+                TokenType::String,
+                *pos,
+                TokenValue::String(self.base_file.clone()),
+            )]),
             BuiltinMacro::HasAttribute
             | BuiltinMacro::HasBuiltin
             | BuiltinMacro::HasFeature
@@ -2013,7 +2087,30 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     fn evaluate(&mut self, tokens: &[Token]) -> i64 {
         self.tokens = tokens.to_vec();
         self.pos = 0;
-        self.expr_or()
+        self.expr_ternary()
+    }
+
+    /// Ternary operator has lowest precedence: cond ? true_val : false_val
+    fn expr_ternary(&mut self) -> i64 {
+        let cond = self.expr_or();
+        if self.is_special(b'?' as u32) {
+            self.advance();
+            let true_val = self.expr_ternary();
+            if self.is_special(b':' as u32) {
+                self.advance();
+            } else {
+                let pos = self.current().map(|t| t.pos).unwrap_or_default();
+                diag::error(pos, "expected ':' in conditional expression");
+            }
+            let false_val = self.expr_ternary();
+            if cond != 0 {
+                true_val
+            } else {
+                false_val
+            }
+        } else {
+            cond
+        }
     }
 
     fn current(&self) -> Option<&Token> {
@@ -2472,11 +2569,10 @@ pub fn preprocess_with_defines(
     // Process -D defines
     for def in defines {
         if let Some(eq_pos) = def.find('=') {
-            // -DNAME=VALUE
+            // -DNAME=VALUE - tokenize the value properly
             let name = &def[..eq_pos];
             let value = &def[eq_pos + 1..];
-            // Create macro with string value (treated as tokens during expansion)
-            let mac = Macro::predefined_string(name, value);
+            let mac = Macro::from_cmdline_define(name, value);
             pp.define_macro(mac);
         } else {
             // -DNAME (define to 1)
@@ -3304,5 +3400,136 @@ PASTE(foo, bar)
         let strs = get_token_strings(&tokens, &idents);
         // foobar should expand to 42
         assert!(strs.contains(&"42".to_string()));
+    }
+
+    // ========================================================================
+    // Tests for __INCLUDE_LEVEL__ macro
+    // ========================================================================
+
+    #[test]
+    fn test_include_level_macro() {
+        // At the top level, __INCLUDE_LEVEL__ should be 0
+        let (tokens, _idents) = preprocess_str("__INCLUDE_LEVEL__");
+        let nums: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::Number(n) = &t.value {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(nums.contains(&"0".to_string()));
+    }
+
+    // ========================================================================
+    // Tests for __BASE_FILE__ macro
+    // ========================================================================
+
+    #[test]
+    fn test_base_file_macro() {
+        // __BASE_FILE__ should return the base filename
+        let (tokens, _idents) = preprocess_str("__BASE_FILE__");
+        // Should have a string token
+        assert!(tokens.iter().any(|t| t.typ == TokenType::String));
+    }
+
+    // ========================================================================
+    // Tests for ternary operator in #if expressions
+    // ========================================================================
+
+    #[test]
+    fn test_ternary_true_branch() {
+        let (tokens, idents) = preprocess_str("#if 1 ? 1 : 0\nyes\n#endif");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"yes".to_string()));
+    }
+
+    #[test]
+    fn test_ternary_false_branch() {
+        let (tokens, idents) = preprocess_str("#if 0 ? 1 : 0\nyes\n#endif\nno");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(!strs.contains(&"yes".to_string()));
+        assert!(strs.contains(&"no".to_string()));
+    }
+
+    #[test]
+    fn test_ternary_nested() {
+        // Nested ternary: 1 ? (0 ? 1 : 2) : 3 = 2
+        let input = "#if (1 ? (0 ? 1 : 2) : 3) == 2\nyes\n#endif";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"yes".to_string()));
+    }
+
+    #[test]
+    fn test_ternary_with_expressions() {
+        // ((5 > 3) ? 10 : 20) == 10 = 1 (true)
+        let input = "#if ((5 > 3) ? 10 : 20) == 10\nyes\n#endif";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"yes".to_string()));
+    }
+
+    #[test]
+    fn test_ternary_with_defined() {
+        let input = "#define FOO\n#if defined(FOO) ? 1 : 0\nyes\n#endif";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"yes".to_string()));
+    }
+
+    // ========================================================================
+    // Tests for GNU ,##__VA_ARGS__ comma suppression
+    // ========================================================================
+
+    #[test]
+    fn test_va_args_basic() {
+        // Basic variadic macro with arguments
+        let input = "#define DEBUG(fmt, ...) fmt __VA_ARGS__\nDEBUG(hello, world)";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"hello".to_string()));
+        assert!(strs.contains(&"world".to_string()));
+    }
+
+    #[test]
+    fn test_va_args_comma_suppression_with_args() {
+        // ,##__VA_ARGS__ with arguments - comma should remain
+        let input = "#define DEBUG(fmt, ...) fmt, ##__VA_ARGS__\nDEBUG(hello, world)";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"hello".to_string()));
+        assert!(strs.contains(&",".to_string()));
+        assert!(strs.contains(&"world".to_string()));
+    }
+
+    #[test]
+    fn test_va_args_comma_suppression_no_args() {
+        // ,##__VA_ARGS__ without variadic arguments - comma should be suppressed
+        let input = "#define DEBUG(fmt, ...) fmt, ##__VA_ARGS__\nDEBUG(hello)";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"hello".to_string()));
+        // The comma should be suppressed when __VA_ARGS__ is empty
+        // Count commas - should be 0 or fewer than with args
+        let comma_count = strs.iter().filter(|s| *s == ",").count();
+        assert_eq!(
+            comma_count, 0,
+            "Comma should be suppressed when VA_ARGS is empty"
+        );
+    }
+
+    #[test]
+    fn test_va_args_comma_suppression_multiple_args() {
+        // ,##__VA_ARGS__ with multiple variadic arguments
+        let input = "#define DEBUG(fmt, ...) fmt, ##__VA_ARGS__\nDEBUG(hello, a, b, c)";
+        let (tokens, idents) = preprocess_str(input);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"hello".to_string()));
+        assert!(strs.contains(&"a".to_string()));
+        assert!(strs.contains(&"b".to_string()));
+        assert!(strs.contains(&"c".to_string()));
     }
 }

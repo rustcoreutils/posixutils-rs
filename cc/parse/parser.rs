@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Parser for pcc C99 compiler
-// Based on sparse's expression.c recursive descent design
+// Recursive descent parser with Pratt-style precedence climbing
 //
 
 use super::ast::{
@@ -181,15 +181,15 @@ impl fmt::Display for AttributeList {
 
 /// C expression parser using recursive descent with precedence climbing
 ///
-/// Following sparse's design, the parser binds symbols to the symbol table
-/// during parsing. This means that by the time parsing is complete, all
-/// declared symbols are in the table with their types.
+/// The parser binds symbols to the symbol table during parsing. This means
+/// that by the time parsing is complete, all declared symbols are in the
+/// table with their types.
 pub struct Parser<'a> {
     /// Token stream
     tokens: &'a [Token],
     /// Identifier table for looking up names
     idents: &'a IdentTable,
-    /// Symbol table for binding declarations (like sparse's bind_symbol)
+    /// Symbol table for binding declarations
     symbols: &'a mut SymbolTable,
     /// Type table for interning types
     types: &'a mut TypeTable,
@@ -1576,26 +1576,20 @@ impl<'a> Parser<'a> {
                                     // Now expect parameter list
                     if self.is_special(b'(') {
                         self.advance(); // consume '('
-                                        // Parse parameter types (simplified - just skip them for now)
-                                        // Full implementation would build proper function type
-                        let mut param_depth = 1;
-                        while param_depth > 0 && !self.is_eof() {
-                            if self.is_special(b'(') {
-                                param_depth += 1;
-                            } else if self.is_special(b')') {
-                                param_depth -= 1;
+                                        // Parse parameter types properly
+                        if let Ok((params, variadic)) = self.parse_parameter_list() {
+                            if !self.is_special(b')') {
+                                return None;
                             }
-                            if param_depth > 0 {
-                                self.advance();
-                            }
+                            self.advance(); // consume final ')'
+                                            // Create function pointer type with actual parameter types
+                            let param_type_ids: Vec<TypeId> =
+                                params.iter().map(|p| p.typ).collect();
+                            let fn_type = Type::function(result_id, param_type_ids, variadic);
+                            let fn_type_id = self.types.intern(fn_type);
+                            result_id = self.types.intern(Type::pointer(fn_type_id));
+                            return Some(result_id);
                         }
-                        self.advance(); // consume final ')'
-                                        // Create function pointer type: pointer to function returning result_id
-                                        // For now, create a generic function pointer (void -> result_id)
-                        let fn_type = Type::function(result_id, vec![], false);
-                        let fn_type_id = self.types.intern(fn_type);
-                        result_id = self.types.intern(Type::pointer(fn_type_id));
-                        return Some(result_id);
                     }
                 }
             }
@@ -2921,9 +2915,9 @@ impl Parser<'_> {
 
     /// Parse a compound statement (block) with its own scope
     ///
-    /// Like sparse, blocks create their own scope for local declarations.
-    /// This enters a new scope, parses the block, binds any declarations,
-    /// then leaves the scope.
+    /// Blocks create their own scope for local declarations. This enters a
+    /// new scope, parses the block, binds any declarations, then leaves
+    /// the scope.
     fn parse_block_stmt(&mut self) -> ParseResult<Stmt> {
         self.expect_special(b'{')?;
 
@@ -3066,8 +3060,8 @@ impl Parser<'_> {
 
     /// Parse a declaration and bind variables to symbol table
     ///
-    /// Following sparse's design, this binds each declared variable to the
-    /// symbol table immediately during parsing. Like sparse's bind_symbol().
+    /// Binds each declared variable to the symbol table immediately during
+    /// parsing, so the symbol is available for subsequent references.
     fn parse_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
         // Parse type specifiers
         let base_type = self.parse_type_specifier()?;
@@ -3117,7 +3111,7 @@ impl Parser<'_> {
                     }
                 }
 
-                // Bind to symbol table (like sparse's bind_symbol)
+                // Bind to symbol table
                 // Note: StringId is Copy, check for empty by comparing to empty string
                 let name_str = self.str(name);
                 if !name_str.is_empty() {
@@ -3945,9 +3939,9 @@ impl Parser<'_> {
 
     /// Parse a function definition
     ///
-    /// Following sparse's design, this binds the function to the symbol table
-    /// at global scope, then enters a new scope for the function body and
-    /// binds all parameters in that scope.
+    /// Binds the function to the symbol table at global scope, then enters
+    /// a new scope for the function body and binds all parameters in that
+    /// scope.
     #[cfg(test)]
     fn parse_function_def(&mut self) -> ParseResult<FunctionDef> {
         let func_pos = self.current_pos();
@@ -4010,7 +4004,6 @@ impl Parser<'_> {
         let func_type_id = self.types.intern(func_type);
 
         // Bind function to symbol table at current (global) scope
-        // Like sparse's bind_symbol() in parse.c
         let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
         let _ = self.symbols.declare(func_sym); // Ignore redefinition errors for now
 

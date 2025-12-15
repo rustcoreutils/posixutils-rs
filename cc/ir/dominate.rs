@@ -8,7 +8,7 @@
 //
 // Dominator tree computation for pcc C99 compiler
 //
-// Based on sparse's flowgraph.c and dominate.c:
+// Algorithms used:
 // - Dominator tree: "A simple, fast dominance algorithm" by Cooper, Harvey, Kennedy
 // - IDF computation: "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
 //
@@ -39,7 +39,7 @@ fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
         visited.insert(bb_id);
 
         if let Some(bb) = func.get_block(bb_id) {
-            // Visit children in reverse order (like sparse)
+            // Visit children in reverse order for consistent numbering
             for &child in bb.children.iter().rev() {
                 dfs(func, child, visited, postorder);
             }

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Symbol table for pcc C99 compiler
-// Based on sparse's scope-aware symbol management
+// Scope-aware symbol management with C99 namespace support
 //
 
 use crate::strings::StringId;

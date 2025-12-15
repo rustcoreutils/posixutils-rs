@@ -18,10 +18,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // Source Position
 // ============================================================================
 
-/// Source position tracking (mirrors sparse's struct position)
+/// Source position tracking for tokens and diagnostics.
 ///
-/// This is a compact structure that gets attached to every token.
-/// Following sparse's design where position fields are bit-packed.
+/// A compact structure attached to every token, tracking file, line,
+/// column, and preprocessor state (whitespace, newline flags).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Position {
     /// Stream/file index (which file this is in)
@@ -92,7 +92,7 @@ impl fmt::Display for Position {
 // Stream (Input Source)
 // ============================================================================
 
-/// Input stream information (following sparse's struct stream)
+/// Input stream information for tracking source files and includes.
 #[derive(Debug, Clone)]
 pub struct Stream {
     /// Filename

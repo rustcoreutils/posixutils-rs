@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Linearizer for pcc C99 compiler
-// Converts AST to SSA-style IR following sparse's design
+// Converts AST to SSA-form IR with basic blocks and typed pseudo-registers
 //
 
 use super::ssa::ssa_convert;
@@ -2143,7 +2143,7 @@ impl<'a> Linearizer<'a> {
 
     /// Get the type of an expression.
     /// PANICS if expression has no type - type evaluation pass must run first.
-    /// Following sparse's design: the IR should ALWAYS receive fully typed input.
+    /// The IR requires fully typed input from the type evaluation pass.
     fn expr_type(&self, expr: &Expr) -> TypeId {
         expr.typ.expect(
             "BUG: expression has no type. Type evaluation pass must run before linearization.",

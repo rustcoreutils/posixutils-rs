@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Intermediate Representation (IR) for pcc C99 compiler
-// Based on sparse's linearize.c SSA-style IR
+// SSA-form IR with basic blocks and typed pseudo-registers
 //
 // The IR uses Single Static Assignment (SSA) form where each variable
 // is assigned exactly once. This simplifies dataflow analysis and
@@ -45,10 +45,10 @@ impl InsnRef {
 }
 
 // ============================================================================
-// Opcodes - Following sparse's opcode.def
+// Opcodes
 // ============================================================================
 
-/// IR opcodes following sparse's design
+/// IR opcodes for the intermediate representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
     // Function entry

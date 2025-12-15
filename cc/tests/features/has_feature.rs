@@ -8,15 +8,20 @@
 //
 // Tests for __has_builtin, __has_attribute, __has_feature, __has_extension
 //
+// Tests are aggregated to reduce compile/link cycles while maintaining coverage.
+//
 
 use crate::common::compile_and_run;
 
-/// Test __has_builtin for supported builtins
+// ============================================================================
+// __has_builtin: Supported and unsupported builtins
+// ============================================================================
+
 #[test]
-fn has_builtin_supported() {
+fn has_builtin_tests() {
     let code = r#"
 int main(void) {
-    // Test supported builtins return 1
+    // Test 1-16: Supported builtins return 1
     #if !__has_builtin(__builtin_constant_p)
     return 1;
     #endif
@@ -81,48 +86,58 @@ int main(void) {
     return 16;
     #endif
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("has_builtin_supported", code), 0);
-}
-
-/// Test __has_builtin for unsupported builtins
-#[test]
-fn has_builtin_unsupported() {
-    let code = r#"
-int main(void) {
-    // Test unsupported/unknown builtins return 0
+    // Test 17-18: Unsupported/unknown builtins return 0
     #if __has_builtin(__builtin_nonexistent_thing)
-    return 1;
+    return 17;
     #endif
 
     #if __has_builtin(__builtin_xyz_unknown)
-    return 2;
+    return 18;
     #endif
 
-    return 0;
+    // Test 19-21: Complex expressions
+    #if __has_builtin(__builtin_constant_p) && __has_builtin(__builtin_bswap32)
+    int ok1 = 1;
+    #else
+    return 19;
+    #endif
+
+    #if __has_builtin(__builtin_nonexistent) || __has_builtin(__builtin_alloca)
+    int ok2 = 1;
+    #else
+    return 20;
+    #endif
+
+    #if !__has_builtin(__builtin_nonexistent)
+    int ok3 = 1;
+    #else
+    return 21;
+    #endif
+
+    return ok1 + ok2 + ok3 - 3;
 }
 "#;
-    assert_eq!(compile_and_run("has_builtin_unsupported", code), 0);
+    assert_eq!(compile_and_run("has_builtin", code), 0);
 }
 
-/// Test __has_attribute returns correctly for supported and unsupported attributes
+// ============================================================================
+// __has_attribute, __has_feature, __has_extension
+// ============================================================================
+
 #[test]
-fn has_attribute_support() {
+fn has_attribute_and_feature() {
     let code = r#"
 int main(void) {
-    // __has_attribute returns 1 for noreturn (supported)
+    // Test 1-2: __has_attribute for supported
     #if !__has_attribute(noreturn)
     return 1;
     #endif
 
-    // __has_attribute returns 1 for __noreturn__ (supported)
     #if !__has_attribute(__noreturn__)
     return 2;
     #endif
 
-    // __has_attribute returns 0 for unsupported attributes
+    // Test 3-4: __has_attribute for unsupported
     #if __has_attribute(unused)
     return 3;
     #endif
@@ -131,85 +146,30 @@ int main(void) {
     return 4;
     #endif
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("has_attribute_support", code), 0);
-}
-
-/// Test __has_feature always returns 0 (not yet implemented)
-#[test]
-fn has_feature_returns_zero() {
-    let code = r#"
-int main(void) {
-    // __has_feature currently returns 0 for all features
+    // Test 5-7: __has_feature returns 0 (not yet implemented)
     #if __has_feature(c_alignas)
-    return 1;
+    return 5;
     #endif
 
     #if __has_feature(c_static_assert)
-    return 2;
+    return 6;
     #endif
 
     #if __has_feature(c_generic_selections)
-    return 3;
+    return 7;
     #endif
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("has_feature_zero", code), 0);
-}
-
-/// Test __has_extension always returns 0 (not yet implemented)
-#[test]
-fn has_extension_returns_zero() {
-    let code = r#"
-int main(void) {
-    // __has_extension currently returns 0 for all extensions
+    // Test 8-9: __has_extension returns 0 (not yet implemented)
     #if __has_extension(c_alignas)
-    return 1;
+    return 8;
     #endif
 
     #if __has_extension(attribute_deprecated_with_message)
-    return 2;
+    return 9;
     #endif
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("has_extension_zero", code), 0);
-}
-
-/// Test __has_builtin in complex preprocessor expressions
-#[test]
-fn has_builtin_complex_expressions() {
-    let code = r#"
-int main(void) {
-    // Test in logical AND
-    #if __has_builtin(__builtin_constant_p) && __has_builtin(__builtin_bswap32)
-    int ok1 = 1;
-    #else
-    return 1;
-    #endif
-
-    // Test in logical OR
-    #if __has_builtin(__builtin_nonexistent) || __has_builtin(__builtin_alloca)
-    int ok2 = 1;
-    #else
-    return 2;
-    #endif
-
-    // Test negation
-    #if !__has_builtin(__builtin_nonexistent)
-    int ok3 = 1;
-    #else
-    return 3;
-    #endif
-
-    // Use the variables to avoid warnings
-    return ok1 + ok2 + ok3 - 3;
-}
-"#;
-    assert_eq!(compile_and_run("has_builtin_complex", code), 0);
+    assert_eq!(compile_and_run("has_attr_feature", code), 0);
 }

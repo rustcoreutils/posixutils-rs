@@ -4065,10 +4065,11 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // IMPORTANT: Load val first into X1, THEN env into X0.
-        // If we loaded env into X0 first and val was passed as the first
-        // function argument (in X0), it would get overwritten.
-        // Put val argument in X1 (second argument register) FIRST
+        // CONSTRAINT: Load val into X1 BEFORE loading env into X0.
+        // If env is loaded into X0 first and val happens to be in X0 (first
+        // function argument), it would be overwritten. This is a manual constraint
+        // that will be expressible through the constraint system when inline asm
+        // support is added.
         self.emit_move(val, Reg::X1, 32, frame_size);
 
         // Put env argument in X0 (first argument register)

@@ -43,6 +43,46 @@ use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
+// Register Constraints (for future inline asm support)
+// ============================================================================
+
+/// Register constraints for an instruction.
+///
+/// NOTE: Unlike x86-64, AArch64 has an orthogonal instruction set where most
+/// operations can use any register without implicit clobbers. However, this
+/// infrastructure exists for future GCC inline asm support, which requires
+/// constraint handling for clobber lists.
+#[derive(Debug, Clone, Default)]
+pub struct RegConstraints {
+    /// Registers that are clobbered (written) by this instruction
+    pub clobbers: &'static [Reg],
+}
+
+/// Get register constraints for an opcode.
+///
+/// AArch64 has no implicit register requirements for standard operations
+/// (unlike x86-64 which needs Rax/Rdx for division and Rcx for shifts).
+/// This will be extended when inline asm support is added.
+pub fn opcode_constraints(_op: Opcode) -> RegConstraints {
+    // AArch64 instructions have no implicit register clobbers
+    RegConstraints::default()
+}
+
+/// A point in the function where register constraints apply.
+/// Used during allocation to avoid assigning pseudos to registers
+/// that would be clobbered at this point.
+#[derive(Debug, Clone)]
+pub struct ConstraintPoint {
+    /// Instruction position in the function
+    pub position: usize,
+    /// Registers clobbered at this point
+    pub clobbers: Vec<Reg>,
+    /// Pseudos that ARE the operands of the constrained instruction
+    /// (these should NOT be evicted - they're the actual operands)
+    pub involved_pseudos: Vec<PseudoId>,
+}
+
+// ============================================================================
 // AArch64 Register Definitions
 // ============================================================================
 
@@ -622,12 +662,12 @@ impl RegAlloc {
         self.identify_fp_pseudos(func, types);
         self.allocate_arguments(func, types);
 
-        let intervals = self.compute_live_intervals(func);
+        let (intervals, constraint_points) = self.compute_live_intervals(func);
         let call_positions = find_call_positions(func);
 
         self.spill_args_across_calls(func, &intervals, &call_positions);
         self.allocate_alloca_to_stack(func);
-        self.run_linear_scan(func, types, intervals, &call_positions);
+        self.run_linear_scan(func, types, intervals, &call_positions, &constraint_points);
 
         self.locations.clone()
     }
@@ -716,6 +756,32 @@ impl RegAlloc {
         }
     }
 
+    /// Find registers that would conflict with this interval due to constraints.
+    /// If a pseudo is live at a constraint point and is NOT an operand of that
+    /// instruction, it cannot be allocated to any clobbered register.
+    fn find_conflicting_registers(
+        &self,
+        interval: &LiveInterval,
+        constraint_points: &[ConstraintPoint],
+    ) -> HashSet<Reg> {
+        let mut conflicts = HashSet::new();
+
+        for cp in constraint_points {
+            // If interval is live at this constraint point...
+            if interval.start <= cp.position && cp.position <= interval.end {
+                // ...and this pseudo is NOT involved in the constrained instruction...
+                if !cp.involved_pseudos.contains(&interval.pseudo) {
+                    // ...then it cannot be in any clobbered register
+                    for &reg in &cp.clobbers {
+                        conflicts.insert(reg);
+                    }
+                }
+            }
+        }
+
+        conflicts
+    }
+
     /// Spill arguments in caller-saved registers if their interval crosses a call
     fn spill_args_across_calls(
         &mut self,
@@ -786,6 +852,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
+        constraint_points: &[ConstraintPoint],
     ) {
         for interval in intervals {
             self.expire_old_intervals(interval.start);
@@ -793,6 +860,9 @@ impl RegAlloc {
             if self.locations.contains_key(&interval.pseudo) {
                 continue;
             }
+
+            // Find registers that would conflict with constraints at this interval
+            let conflicting = self.find_conflicting_registers(&interval, constraint_points);
 
             // Handle constants and symbols
             if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == interval.pseudo) {
@@ -870,7 +940,12 @@ impl RegAlloc {
                 }
             } else if crosses_call {
                 // GP interval crosses a call - must use callee-saved register or spill
-                if let Some(idx) = self.free_regs.iter().position(|r| r.is_callee_saved()) {
+                // Also exclude registers that conflict with constraints
+                if let Some(idx) = self
+                    .free_regs
+                    .iter()
+                    .position(|r| r.is_callee_saved() && !conflicting.contains(r))
+                {
                     let reg = self.free_regs.remove(idx);
                     if !self.used_callee_saved.contains(&reg) {
                         self.used_callee_saved.push(reg);
@@ -887,12 +962,20 @@ impl RegAlloc {
             } else {
                 // Interval doesn't cross a call - prefer caller-saved registers
                 // to minimize callee-saved register usage and stack conflicts
-                let reg_opt =
-                    if let Some(idx) = self.free_regs.iter().position(|r| !r.is_callee_saved()) {
-                        Some(self.free_regs.remove(idx))
-                    } else {
-                        self.free_regs.pop()
-                    };
+                // Also exclude registers that conflict with constraints
+                let reg_opt = if let Some(idx) = self
+                    .free_regs
+                    .iter()
+                    .position(|r| !r.is_callee_saved() && !conflicting.contains(r))
+                {
+                    Some(self.free_regs.remove(idx))
+                } else if let Some(idx) =
+                    self.free_regs.iter().position(|r| !conflicting.contains(r))
+                {
+                    Some(self.free_regs.remove(idx))
+                } else {
+                    None
+                };
 
                 if let Some(reg) = reg_opt {
                     if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
@@ -967,7 +1050,7 @@ impl RegAlloc {
         expire_intervals(&mut self.active_fp, &mut self.free_fp_regs, point);
     }
 
-    fn compute_live_intervals(&self, func: &Function) -> Vec<LiveInterval> {
+    fn compute_live_intervals(&self, func: &Function) -> (Vec<LiveInterval>, Vec<ConstraintPoint>) {
         struct IntervalInfo {
             pseudo: PseudoId,
             first_def: usize,
@@ -976,6 +1059,7 @@ impl RegAlloc {
         }
 
         let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
+        let mut constraint_points: Vec<ConstraintPoint> = Vec::new();
         let mut pos = 0usize;
 
         let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
@@ -1061,6 +1145,21 @@ impl RegAlloc {
                     if let Some(target) = insn.target {
                         phi_targets.push((*src_bb, target));
                     }
+                }
+
+                // Collect constraint points for instructions that clobber registers
+                let constraints = opcode_constraints(insn.op);
+                if !constraints.clobbers.is_empty() {
+                    let mut involved = Vec::new();
+                    if let Some(t) = insn.target {
+                        involved.push(t);
+                    }
+                    involved.extend(insn.src.iter().copied());
+                    constraint_points.push(ConstraintPoint {
+                        position: pos,
+                        clobbers: constraints.clobbers.to_vec(),
+                        involved_pseudos: involved,
+                    });
                 }
 
                 pos += 1;
@@ -1160,7 +1259,7 @@ impl RegAlloc {
             })
             .collect();
         result.sort_by_key(|i| i.start);
-        result
+        (result, constraint_points)
     }
 
     /// Get stack size needed (aligned to 16 bytes)

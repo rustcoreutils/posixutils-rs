@@ -71,22 +71,50 @@ fn run_command(input: &Path) -> std::process::Output {
         }
         b"args" => {
             let args = input_string;
-            let _cargo_build_output = std::process::Command::new("cargo")
-                .arg("build")
-                .output()
-                .unwrap();
+
+            // Get the workspace root from CARGO_MANIFEST_DIR (set at compile time)
+            // CARGO_MANIFEST_DIR points to the m4 crate directory, so parent is workspace root
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            let workspace_root = std::path::Path::new(manifest_dir)
+                .parent()
+                .expect("m4 crate should have parent directory");
 
             // Determine the target directory - cargo-llvm-cov uses a custom target dir
             let target_dir = std::env::var("CARGO_TARGET_DIR")
                 .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
                 .unwrap_or_else(|_| String::from("target"));
-            let m4_path = format!("../{}/debug/m4", target_dir);
 
+            // Check for release binary first (if running release tests), then debug
+            let release_path = workspace_root.join(&target_dir).join("release").join("m4");
+            let debug_path = workspace_root.join(&target_dir).join("debug").join("m4");
+
+            let m4_path = if release_path.exists() {
+                release_path
+            } else {
+                // Build debug binary if release doesn't exist
+                let cargo_build_output = std::process::Command::new("cargo")
+                    .arg("build")
+                    .arg("-p")
+                    .arg("posixutils-m4")
+                    .current_dir(workspace_root)
+                    .output()
+                    .unwrap();
+                if !cargo_build_output.status.success() {
+                    panic!(
+                        "cargo build failed: {}",
+                        String::from_utf8_lossy(&cargo_build_output.stderr)
+                    );
+                }
+                debug_path
+            };
+
+            log::info!("Using m4 binary at: {}", m4_path.display());
             log::info!("RUST_LOG is ignored for this test because it interferes with output");
             let output = std::process::Command::new("sh")
                 .env("RUST_LOG", "") // Disable rust log output because it interferes with the test.
                 .arg("-c")
-                .arg(format!("{m4_path} {args}"))
+                .arg(format!("{} {args}", m4_path.display()))
+                .current_dir(manifest_dir)
                 .output()
                 .unwrap();
 

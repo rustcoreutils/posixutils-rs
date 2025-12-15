@@ -1576,26 +1576,20 @@ impl<'a> Parser<'a> {
                                     // Now expect parameter list
                     if self.is_special(b'(') {
                         self.advance(); // consume '('
-                                        // Parse parameter types (simplified - just skip them for now)
-                                        // Full implementation would build proper function type
-                        let mut param_depth = 1;
-                        while param_depth > 0 && !self.is_eof() {
-                            if self.is_special(b'(') {
-                                param_depth += 1;
-                            } else if self.is_special(b')') {
-                                param_depth -= 1;
+                                        // Parse parameter types properly
+                        if let Ok((params, variadic)) = self.parse_parameter_list() {
+                            if !self.is_special(b')') {
+                                return None;
                             }
-                            if param_depth > 0 {
-                                self.advance();
-                            }
+                            self.advance(); // consume final ')'
+                                            // Create function pointer type with actual parameter types
+                            let param_type_ids: Vec<TypeId> =
+                                params.iter().map(|p| p.typ).collect();
+                            let fn_type = Type::function(result_id, param_type_ids, variadic);
+                            let fn_type_id = self.types.intern(fn_type);
+                            result_id = self.types.intern(Type::pointer(fn_type_id));
+                            return Some(result_id);
                         }
-                        self.advance(); // consume final ')'
-                                        // Create function pointer type: pointer to function returning result_id
-                                        // For now, create a generic function pointer (void -> result_id)
-                        let fn_type = Type::function(result_id, vec![], false);
-                        let fn_type_id = self.types.intern(fn_type);
-                        result_id = self.types.intern(Type::pointer(fn_type_id));
-                        return Some(result_id);
                     }
                 }
             }

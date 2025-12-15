@@ -14,41 +14,11 @@
 use crate::common::compile_and_run;
 
 // ============================================================================
-// setjmp/longjmp: Basic tests
+// setjmp/longjmp: Basic operations and multiple returns
 // ============================================================================
 
 #[test]
-fn setjmp_basic() {
-    // Basic setjmp/longjmp test - jump back with value 42
-    let code = r#"
-// Define jmp_buf as opaque array (platform-specific size)
-// macOS: 37 ints, Linux: ~50 ints - we use a larger buffer to be safe
-typedef int jmp_buf[64];
-
-// External libc functions
-extern int setjmp(jmp_buf);
-extern void longjmp(jmp_buf, int);
-
-jmp_buf env;
-
-int main(void) {
-    int val = setjmp(env);
-    if (val == 0) {
-        // First return - call longjmp
-        longjmp(env, 42);
-        // Should never reach here
-        return 1;
-    }
-    // Second return - val should be 42
-    return val == 42 ? 0 : 2;
-}
-"#;
-    assert_eq!(compile_and_run("setjmp_basic", code), 0);
-}
-
-#[test]
-fn setjmp_multiple_returns() {
-    // Test setjmp returning multiple times with different values
+fn setjmp_basic_and_multiple() {
     let code = r#"
 typedef int jmp_buf[64];
 extern int setjmp(jmp_buf);
@@ -58,51 +28,47 @@ jmp_buf env;
 int count = 0;
 
 int main(void) {
+    // Test 1: Basic setjmp/longjmp
     int val = setjmp(env);
-    count++;
-
-    if (count < 4) {
-        // Jump back with count * 10
-        longjmp(env, count * 10);
-        return 99;  // Should never reach here
+    if (val == 0) {
+        longjmp(env, 42);
+        return 1;  // Should never reach here
     }
+    if (val != 42) return 2;
 
-    // count should be 4, val should be 30 (from count=3 jump)
-    if (count != 4) return 1;
-    if (val != 30) return 2;
+    // Reset for next test
+    count = 0;
+
+    // Test 2: Multiple returns with different values
+    val = setjmp(env);
+    count++;
+    if (count < 4) {
+        longjmp(env, count * 10);
+        return 3;
+    }
+    if (count != 4) return 4;
+    if (val != 30) return 5;  // From count=3 jump
+
+    // Test 3: Per C standard, longjmp(env, 0) causes setjmp to return 1
+    val = setjmp(env);
+    if (val == 0) {
+        longjmp(env, 0);
+        return 6;
+    }
+    if (val != 1) return 7;
+
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("setjmp_multiple_returns", code), 0);
+    assert_eq!(compile_and_run("setjmp_basic", code), 0);
 }
+
+// ============================================================================
+// setjmp/longjmp: From functions and nested calls
+// ============================================================================
 
 #[test]
-fn setjmp_zero_becomes_one() {
-    // Per C standard, if longjmp is called with val=0, setjmp returns 1
-    let code = r#"
-typedef int jmp_buf[64];
-extern int setjmp(jmp_buf);
-extern void longjmp(jmp_buf, int);
-
-jmp_buf env;
-
-int main(void) {
-    int val = setjmp(env);
-    if (val == 0) {
-        // First return - call longjmp with 0
-        longjmp(env, 0);
-        return 1;
-    }
-    // Per C standard, longjmp(env, 0) causes setjmp to return 1
-    return val == 1 ? 0 : 2;
-}
-"#;
-    assert_eq!(compile_and_run("setjmp_zero_becomes_one", code), 0);
-}
-
-#[test]
-fn setjmp_from_function() {
-    // Test longjmp from a called function
+fn setjmp_from_functions() {
     let code = r#"
 typedef int jmp_buf[64];
 extern int setjmp(jmp_buf);
@@ -113,28 +79,6 @@ jmp_buf env;
 void do_longjmp(int val) {
     longjmp(env, val);
 }
-
-int main(void) {
-    int val = setjmp(env);
-    if (val == 0) {
-        do_longjmp(77);
-        return 1;
-    }
-    return val == 77 ? 0 : 2;
-}
-"#;
-    assert_eq!(compile_and_run("setjmp_from_function", code), 0);
-}
-
-#[test]
-fn setjmp_nested_calls() {
-    // Test longjmp from deeply nested function calls
-    let code = r#"
-typedef int jmp_buf[64];
-extern int setjmp(jmp_buf);
-extern void longjmp(jmp_buf, int);
-
-jmp_buf env;
 
 void level3(int val) {
     longjmp(env, val);
@@ -149,62 +93,64 @@ void level1(int val) {
 }
 
 int main(void) {
+    // Test 1: longjmp from called function
     int val = setjmp(env);
     if (val == 0) {
-        level1(123);
+        do_longjmp(77);
         return 1;
     }
-    return val == 123 ? 0 : 2;
+    if (val != 77) return 2;
+
+    // Test 2: longjmp from deeply nested calls
+    val = setjmp(env);
+    if (val == 0) {
+        level1(123);
+        return 3;
+    }
+    if (val != 123) return 4;
+
+    return 0;
 }
 "#;
-    assert_eq!(compile_and_run("setjmp_nested_calls", code), 0);
+    assert_eq!(compile_and_run("setjmp_functions", code), 0);
 }
 
+// ============================================================================
+// setjmp/longjmp: volatile, _setjmp variants
+// ============================================================================
+
 #[test]
-fn setjmp_volatile_preserved() {
-    // Test that volatile variables are preserved across longjmp
+fn setjmp_variants() {
     let code = r#"
 typedef int jmp_buf[64];
 extern int setjmp(jmp_buf);
 extern void longjmp(jmp_buf, int);
-
-jmp_buf env;
-
-int main(void) {
-    volatile int x = 5;
-
-    int val = setjmp(env);
-    if (val == 0) {
-        x = 10;
-        longjmp(env, 1);
-        return 1;
-    }
-
-    // Per C standard, volatile variable x should have value 10
-    return x == 10 ? 0 : 2;
-}
-"#;
-    assert_eq!(compile_and_run("setjmp_volatile_preserved", code), 0);
-}
-
-#[test]
-fn setjmp_underscore_variant() {
-    // Test _setjmp variant (no signal mask save/restore)
-    let code = r#"
-typedef int jmp_buf[64];
 extern int _setjmp(jmp_buf);
 extern void _longjmp(jmp_buf, int);
 
 jmp_buf env;
 
 int main(void) {
-    int val = _setjmp(env);
+    // Test 1: volatile variables are preserved across longjmp
+    volatile int x = 5;
+    int val = setjmp(env);
     if (val == 0) {
-        _longjmp(env, 55);
+        x = 10;
+        longjmp(env, 1);
         return 1;
     }
-    return val == 55 ? 0 : 2;
+    if (x != 10) return 2;
+
+    // Test 2: _setjmp variant (no signal mask save/restore)
+    val = _setjmp(env);
+    if (val == 0) {
+        _longjmp(env, 55);
+        return 3;
+    }
+    if (val != 55) return 4;
+
+    return 0;
 }
 "#;
-    assert_eq!(compile_and_run("setjmp_underscore_variant", code), 0);
+    assert_eq!(compile_and_run("setjmp_variants", code), 0);
 }

@@ -13,16 +13,14 @@
 use crate::common::compile_and_run;
 
 // ============================================================================
-// C99 Integer Promotions (6.3.1.1) - char/short promoted to int before comparison
+// Integer Promotions and Same-Rank Different-Sign Conversions
 // ============================================================================
 
 #[test]
-fn mixed_cmp_integer_promotions() {
+fn mixed_cmp_promotions_and_same_rank() {
     let code = r#"
 int main(void) {
-    // Test 1: signed char vs unsigned char
-    // Both promoted to int, then signed comparison
-    // -1 < 1 is true (1)
+    // Test 1-4: signed char vs unsigned char (both promoted to int)
     {
         signed char sc = -1;
         unsigned char uc = 1;
@@ -32,111 +30,89 @@ int main(void) {
         if ((sc != uc) != 1) return 4;
     }
 
-    // Test 2: short vs unsigned short
-    // Both promoted to int, then signed comparison
-    // -1 < 1 is true (1)
+    // Test 5-8: short vs unsigned short (both promoted to int)
     {
         short ss = -1;
         unsigned short us = 1;
-        if ((ss < us) != 1) return 11;
-        if ((ss > us) != 0) return 12;
-        if ((ss == us) != 0) return 13;
-        if ((ss != us) != 1) return 14;
+        if ((ss < us) != 1) return 5;
+        if ((ss > us) != 0) return 6;
+        if ((ss == us) != 0) return 7;
+        if ((ss != us) != 1) return 8;
     }
 
-    // Test 3: signed char vs short
-    // Both promoted to int
+    // Test 9-10: signed char vs short
     {
         signed char sc = -10;
         short ss = 5;
-        if ((sc < ss) != 1) return 21;
-        if ((sc > ss) != 0) return 22;
+        if ((sc < ss) != 1) return 9;
+        if ((sc > ss) != 0) return 10;
     }
 
-    // Test 4: unsigned char vs signed short
-    // Both promoted to int
+    // Test 11-12: unsigned char vs signed short
     {
         unsigned char uc = 200;
         short ss = 100;
-        if ((uc > ss) != 1) return 31;
-        if ((uc < ss) != 0) return 32;
+        if ((uc > ss) != 1) return 11;
+        if ((uc < ss) != 0) return 12;
     }
 
-    // Test 5: _Bool comparisons (promoted to int)
+    // Test 13-14: _Bool comparisons (promoted to int)
     {
         _Bool b = 1;
         char c = 2;
-        if ((b < c) != 1) return 41;
-        if ((b == c) != 0) return 42;
+        if ((b < c) != 1) return 13;
+        if ((b == c) != 0) return 14;
     }
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mixed_cmp_int_promo", code), 0);
-}
-
-// ============================================================================
-// C99 Usual Arithmetic Conversions (6.3.1.8) - same rank, different signedness
-// ============================================================================
-
-#[test]
-fn mixed_cmp_same_rank_different_sign() {
-    let code = r#"
-int main(void) {
-    // Test 1: int vs unsigned int
-    // C99: convert to unsigned int
+    // Test 15-17: int vs unsigned int (convert to unsigned)
     // -1 becomes 0xFFFFFFFF, so -1 > 1 as unsigned
     {
         int si = -1;
         unsigned int ui = 1;
-        if ((si < ui) != 0) return 1;   // -1 as unsigned is large
-        if ((si > ui) != 1) return 2;
-        if ((si == ui) != 0) return 3;
+        if ((si < ui) != 0) return 15;   // -1 as unsigned is large
+        if ((si > ui) != 1) return 16;
+        if ((si == ui) != 0) return 17;
     }
 
-    // Test 2: long vs unsigned long
-    // C99: convert to unsigned long
+    // Test 18-19: long vs unsigned long
     {
         long sl = -1;
         unsigned long ul = 1;
-        if ((sl < ul) != 0) return 11;  // -1 as unsigned is large
-        if ((sl > ul) != 1) return 12;
+        if ((sl < ul) != 0) return 18;
+        if ((sl > ul) != 1) return 19;
     }
 
-    // Test 3: long long vs unsigned long long
+    // Test 20-21: long long vs unsigned long long
     {
         long long sll = -1;
         unsigned long long ull = 1;
-        if ((sll < ull) != 0) return 21;
-        if ((sll > ull) != 1) return 22;
+        if ((sll < ull) != 0) return 20;
+        if ((sll > ull) != 1) return 21;
     }
 
-    // Test 4: Positive values should work normally
+    // Test 22-23: Positive values work normally
     {
         int si = 5;
         unsigned int ui = 10;
-        if ((si < ui) != 1) return 31;
-        if ((si > ui) != 0) return 32;
+        if ((si < ui) != 1) return 22;
+        if ((si > ui) != 0) return 23;
     }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("mixed_cmp_same_rank", code), 0);
+    assert_eq!(compile_and_run("mixed_cmp_promo", code), 0);
 }
 
 // ============================================================================
-// C99 Usual Arithmetic Conversions - different ranks
+// Different Ranks and Float vs Integer
 // ============================================================================
 
 #[test]
-fn mixed_cmp_different_ranks() {
+fn mixed_cmp_different_ranks_and_float() {
     let code = r#"
 int main(void) {
-    // Test 1: long vs unsigned int
-    // long (64-bit) can represent all unsigned int values
-    // So convert both to long (signed comparison)
+    // Test 1-2: long vs unsigned int (long can represent all unsigned int)
     {
         long sl = -1;
         unsigned int ui = 1;
@@ -144,203 +120,169 @@ int main(void) {
         if ((sl > ui) != 0) return 2;
     }
 
-    // Test 2: long long vs unsigned int
-    // long long can represent all unsigned int values
+    // Test 3-4: long long vs unsigned int
     {
         long long sll = -1;
         unsigned int ui = 1;
-        if ((sll < ui) != 1) return 11;
-        if ((sll > ui) != 0) return 12;
+        if ((sll < ui) != 1) return 3;
+        if ((sll > ui) != 0) return 4;
     }
 
-    // Test 3: int vs unsigned short
-    // int can represent all unsigned short values
+    // Test 5-6: int vs unsigned short
     {
         int si = -1;
         unsigned short us = 1;
-        if ((si < us) != 1) return 21;  // signed comparison after promotion
-        if ((si > us) != 0) return 22;
+        if ((si < us) != 1) return 5;
+        if ((si > us) != 0) return 6;
     }
 
-    // Test 4: long vs short
-    // Both signed, long is wider
+    // Test 7-8: long vs short
     {
         long sl = -1000000;
         short ss = 1;
-        if ((sl < ss) != 1) return 31;
-        if ((sl > ss) != 0) return 32;
+        if ((sl < ss) != 1) return 7;
+        if ((sl > ss) != 0) return 8;
     }
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mixed_cmp_diff_ranks", code), 0);
-}
-
-// ============================================================================
-// Float vs Integer comparisons
-// ============================================================================
-
-#[test]
-fn mixed_cmp_float_int() {
-    let code = r#"
-int main(void) {
-    // Test 1: int vs float
+    // Test 9-11: int vs float
     {
         int i = -5;
         float f = 2.5f;
-        if ((i < f) != 1) return 1;
-        if ((i > f) != 0) return 2;
-        if ((i == f) != 0) return 3;
+        if ((i < f) != 1) return 9;
+        if ((i > f) != 0) return 10;
+        if ((i == f) != 0) return 11;
     }
 
-    // Test 2: unsigned int vs float
+    // Test 12-13: unsigned int vs float
     {
         unsigned int ui = 10;
         float f = 5.5f;
-        if ((ui > f) != 1) return 11;
-        if ((ui < f) != 0) return 12;
+        if ((ui > f) != 1) return 12;
+        if ((ui < f) != 0) return 13;
     }
 
-    // Test 3: int vs double
+    // Test 14-15: int vs double
     {
         int i = 42;
         double d = 42.0;
-        if ((i == d) != 1) return 21;
-        if ((i != d) != 0) return 22;
+        if ((i == d) != 1) return 14;
+        if ((i != d) != 0) return 15;
     }
 
-    // Test 4: long vs double
+    // Test 16: long vs double
     {
         long l = -100;
         double d = -50.5;
-        if ((l < d) != 1) return 31;
+        if ((l < d) != 1) return 16;
     }
 
-    // Test 5: float vs double
+    // Test 17-18: float vs double
     {
         float f = 1.5f;
         double d = 2.5;
-        if ((f < d) != 1) return 41;
-        if ((f > d) != 0) return 42;
+        if ((f < d) != 1) return 17;
+        if ((f > d) != 0) return 18;
     }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("mixed_cmp_float_int", code), 0);
+    assert_eq!(compile_and_run("mixed_cmp_ranks_float", code), 0);
 }
 
 // ============================================================================
-// Edge cases and boundary values
+// Edge Cases and All Relational Operators
 // ============================================================================
 
 #[test]
-fn mixed_cmp_edge_cases() {
+fn mixed_cmp_edge_and_relational() {
     let code = r#"
 int main(void) {
-    // Test 1: Maximum unsigned char vs signed comparison
+    // Test 1-2: Maximum unsigned char vs signed
     {
         unsigned char uc = 255;
         signed char sc = -1;
-        // Both promoted to int: 255 vs -1
         if ((uc > sc) != 1) return 1;
         if ((uc == sc) != 0) return 2;
     }
 
-    // Test 2: Zero comparisons across types
+    // Test 3-5: Zero comparisons
     {
         int si = 0;
         unsigned int ui = 0;
         float f = 0.0f;
-        if ((si == ui) != 1) return 11;
-        if ((si == f) != 1) return 12;
-        if ((ui == f) != 1) return 13;
+        if ((si == ui) != 1) return 3;
+        if ((si == f) != 1) return 4;
+        if ((ui == f) != 1) return 5;
     }
 
-    // Test 3: Large unsigned vs negative signed (same rank)
+    // Test 6: Large unsigned vs negative signed (same rank)
     {
         unsigned int ui = 0xFFFFFFFF;
         int si = -1;
         // Both become unsigned, -1 becomes 0xFFFFFFFF
-        if ((ui == si) != 1) return 21;
+        if ((ui == si) != 1) return 6;
     }
 
-    // Test 4: Comparison result is always int (0 or 1)
+    // Test 7-8: Comparison result is int (0 or 1)
     {
         char a = 10;
         char b = 5;
         int result = (a > b);
-        if (result != 1) return 31;
+        if (result != 1) return 7;
         result = (a < b);
-        if (result != 0) return 32;
+        if (result != 0) return 8;
     }
 
-    // Test 5: Chained comparisons with mixed types
+    // Test 9-10: Chained comparisons
     {
         char c = 5;
         int i = 10;
         long l = 15;
-        // (c < i) is 1, (i < l) is 1
-        if ((c < i) != 1) return 41;
-        if ((i < l) != 1) return 42;
+        if ((c < i) != 1) return 9;
+        if ((i < l) != 1) return 10;
+    }
+
+    // Test 11-14: All relational operators with char vs int
+    {
+        char c = -10;
+        int i = 5;
+        if ((c < i) != 1) return 11;
+        if ((c <= i) != 1) return 12;
+        if ((c > i) != 0) return 13;
+        if ((c >= i) != 0) return 14;
+    }
+
+    // Test 15-18: All relational with int vs unsigned int
+    {
+        int si = -1;
+        unsigned int ui = 1;
+        if ((si < ui) != 0) return 15;  // -1 as unsigned is MAX
+        if ((si <= ui) != 0) return 16;
+        if ((si > ui) != 1) return 17;
+        if ((si >= ui) != 1) return 18;
+    }
+
+    // Test 19-22: All relational with int vs float
+    {
+        int i = 3;
+        float f = 3.5f;
+        if ((i < f) != 1) return 19;
+        if ((i <= f) != 1) return 20;
+        if ((i > f) != 0) return 21;
+        if ((i >= f) != 0) return 22;
+    }
+
+    // Test 23-24: Equality operators
+    {
+        short s = 100;
+        long l = 100;
+        if ((s == l) != 1) return 23;
+        if ((s != l) != 0) return 24;
     }
 
     return 0;
 }
 "#;
     assert_eq!(compile_and_run("mixed_cmp_edge", code), 0);
-}
-
-// ============================================================================
-// Relational operators (<, <=, >, >=) with all combinations
-// ============================================================================
-
-#[test]
-fn mixed_cmp_relational_all() {
-    let code = r#"
-int main(void) {
-    // Test all relational operators with char vs int
-    {
-        char c = -10;
-        int i = 5;
-        if ((c < i) != 1) return 1;
-        if ((c <= i) != 1) return 2;
-        if ((c > i) != 0) return 3;
-        if ((c >= i) != 0) return 4;
-    }
-
-    // Test all relational operators with int vs unsigned int
-    {
-        int si = -1;
-        unsigned int ui = 1;
-        // -1 as unsigned is MAX_UINT, so -1 > 1
-        if ((si < ui) != 0) return 11;
-        if ((si <= ui) != 0) return 12;
-        if ((si > ui) != 1) return 13;
-        if ((si >= ui) != 1) return 14;
-    }
-
-    // Test all relational operators with int vs float
-    {
-        int i = 3;
-        float f = 3.5f;
-        if ((i < f) != 1) return 21;
-        if ((i <= f) != 1) return 22;
-        if ((i > f) != 0) return 23;
-        if ((i >= f) != 0) return 24;
-    }
-
-    // Test all equality operators
-    {
-        short s = 100;
-        long l = 100;
-        if ((s == l) != 1) return 31;
-        if ((s != l) != 0) return 32;
-    }
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mixed_cmp_relational", code), 0);
 }

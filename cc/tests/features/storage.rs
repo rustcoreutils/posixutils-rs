@@ -12,6 +12,8 @@
 // - Storage duration (static vs automatic)
 // - Linkage (external vs internal vs none)
 //
+// Tests are aggregated to reduce compile/link cycles while maintaining coverage.
+//
 
 use crate::common::compile_and_run;
 
@@ -20,7 +22,7 @@ use crate::common::compile_and_run;
 // ============================================================================
 
 #[test]
-fn static_local_basic() {
+fn static_local_variables() {
     let code = r#"
 // Static local variable persists across function calls
 int counter(void) {
@@ -29,21 +31,6 @@ int counter(void) {
     return count;
 }
 
-int main(void) {
-    int a = counter();  // Should be 1
-    int b = counter();  // Should be 2
-    int c = counter();  // Should be 3
-
-    // Return the sum: 1 + 2 + 3 = 6
-    return a + b + c;
-}
-"#;
-    assert_eq!(compile_and_run("static_local_basic", code), 6);
-}
-
-#[test]
-fn static_local_initialized() {
-    let code = r#"
 // Static local with non-zero initializer
 int get_base(void) {
     static int base = 100;
@@ -51,20 +38,6 @@ int get_base(void) {
     return base;
 }
 
-int main(void) {
-    int a = get_base();  // 101
-    int b = get_base();  // 102
-    if (a != 101) return 1;
-    if (b != 102) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("static_local_initialized", code), 0);
-}
-
-#[test]
-fn static_local_multiple_functions() {
-    let code = r#"
 // Each function has its own static local
 int func_a(void) {
     static int x = 10;
@@ -78,25 +51,6 @@ int func_b(void) {
     return x;
 }
 
-int main(void) {
-    int a1 = func_a();  // 11
-    int b1 = func_b();  // 22
-    int a2 = func_a();  // 12
-    int b2 = func_b();  // 24
-
-    if (a1 != 11) return 1;
-    if (b1 != 22) return 2;
-    if (a2 != 12) return 3;
-    if (b2 != 24) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("static_local_multiple_functions", code), 0);
-}
-
-#[test]
-fn static_local_uninitialized() {
-    let code = r#"
 // Uninitialized static local is zero-initialized
 int get_count(void) {
     static int count;  // Should be 0
@@ -105,14 +59,38 @@ int get_count(void) {
 }
 
 int main(void) {
-    int a = get_count();  // 5
-    int b = get_count();  // 10
-    if (a != 5) return 1;
-    if (b != 10) return 2;
+    // Test 1-3: Basic persistence
+    int a = counter();  // Should be 1
+    int b = counter();  // Should be 2
+    int c = counter();  // Should be 3
+    if (a + b + c != 6) return 1;
+
+    // Test 4-5: Non-zero initializer
+    int d = get_base();  // 101
+    int e = get_base();  // 102
+    if (d != 101) return 2;
+    if (e != 102) return 3;
+
+    // Test 6-9: Multiple functions, same local name
+    int a1 = func_a();  // 11
+    int b1 = func_b();  // 22
+    int a2 = func_a();  // 12
+    int b2 = func_b();  // 24
+    if (a1 != 11) return 4;
+    if (b1 != 22) return 5;
+    if (a2 != 12) return 6;
+    if (b2 != 24) return 7;
+
+    // Test 10-11: Uninitialized (zero-initialized)
+    int f = get_count();  // 5
+    int g = get_count();  // 10
+    if (f != 5) return 8;
+    if (g != 10) return 9;
+
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_local_uninitialized", code), 0);
+    assert_eq!(compile_and_run("static_local_vars", code), 0);
 }
 
 // ============================================================================
@@ -120,23 +98,13 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn static_function_basic() {
+fn static_functions() {
     let code = r#"
 // Static function has internal linkage (not visible to linker)
 static int helper(int x) {
     return x * 2;
 }
 
-int main(void) {
-    return helper(21);  // Should return 42
-}
-"#;
-    assert_eq!(compile_and_run("static_function_basic", code), 42);
-}
-
-#[test]
-fn static_function_multiple() {
-    let code = r#"
 // Multiple static functions
 static int double_it(int x) {
     return x * 2;
@@ -146,18 +114,6 @@ static int triple_it(int x) {
     return x * 3;
 }
 
-int main(void) {
-    int a = double_it(10);  // 20
-    int b = triple_it(10);  // 30
-    return a + b;  // 50
-}
-"#;
-    assert_eq!(compile_and_run("static_function_multiple", code), 50);
-}
-
-#[test]
-fn static_function_calls_static() {
-    let code = r#"
 // Static function calling another static function
 static int add_one(int x) {
     return x + 1;
@@ -168,32 +124,33 @@ static int add_two(int x) {
 }
 
 int main(void) {
-    return add_two(40);  // 42
+    // Test 1: Basic static function
+    if (helper(21) != 42) return 1;
+
+    // Test 2-3: Multiple static functions
+    int a = double_it(10);  // 20
+    int b = triple_it(10);  // 30
+    if (a + b != 50) return 2;
+
+    // Test 4: Static function calls static function
+    if (add_two(40) != 42) return 3;
+
+    return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_function_calls_static", code), 42);
+    assert_eq!(compile_and_run("static_functions", code), 0);
 }
 
 // ============================================================================
-// Static Global Variables (already tested in globals/mod.rs but verify here)
+// Static Globals and Extern Declarations
 // ============================================================================
 
 #[test]
-fn static_global_basic() {
+fn static_globals_and_extern() {
     let code = r#"
 // Static global has internal linkage
 static int global_val = 42;
 
-int main(void) {
-    return global_val;
-}
-"#;
-    assert_eq!(compile_and_run("static_global_basic", code), 42);
-}
-
-#[test]
-fn static_global_modified() {
-    let code = r#"
 // Static global can be modified
 static int counter = 0;
 
@@ -201,32 +158,27 @@ void increment(void) {
     counter = counter + 1;
 }
 
-int main(void) {
-    increment();
-    increment();
-    increment();
-    return counter;  // Should be 3
-}
-"#;
-    assert_eq!(compile_and_run("static_global_modified", code), 3);
-}
-
-// ============================================================================
-// Extern declarations
-// ============================================================================
-
-#[test]
-fn extern_declaration_basic() {
-    let code = r#"
 // Global variable (external linkage by default)
-int shared_value = 42;
+int shared_value = 100;
 
 // Extern declaration references the same variable
 extern int shared_value;
 
 int main(void) {
-    return shared_value;
+    // Test 1: Static global basic
+    if (global_val != 42) return 1;
+
+    // Test 2: Static global modified
+    increment();
+    increment();
+    increment();
+    if (counter != 3) return 2;
+
+    // Test 3: Extern declaration
+    if (shared_value != 100) return 3;
+
+    return 0;
 }
 "#;
-    assert_eq!(compile_and_run("extern_declaration_basic", code), 42);
+    assert_eq!(compile_and_run("static_global_extern", code), 0);
 }

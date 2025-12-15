@@ -23,6 +23,8 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__NetBSD__", None),  // Not defined
         // Apple extensions
         ("__APPLE_CC__", Some("1")),
+        // Darwin/BSD feature test macros - enables SIGWINCH, SA_RESTART, etc.
+        ("_DARWIN_C_SOURCE", Some("1")),
         // POSIX threads
         ("_REENTRANT", Some("1")),
         // Version - match current macOS version (26.0.0 = macOS Tahoe)

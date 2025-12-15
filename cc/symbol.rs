@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn test_declare_and_lookup() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn test_scopes() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn test_shadowing() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn test_redefinition_error() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn test_function_symbol() {
         let mut strings = StringTable::new();
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let mut table = SymbolTable::new();
 
         let foo_id = strings.intern("foo");

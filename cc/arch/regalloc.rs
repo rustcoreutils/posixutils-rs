@@ -48,12 +48,14 @@ pub fn expire_intervals<R: Copy>(
 
 /// Find all positions of call instructions in a function.
 /// Used by spill_args_across_calls to identify where arguments may be clobbered.
+/// Includes Call, Longjmp, and Setjmp opcodes since they all invoke external functions
+/// and clobber caller-saved registers.
 pub fn find_call_positions(func: &Function) -> Vec<usize> {
     let mut call_positions = Vec::new();
     let mut pos = 0usize;
     for block in &func.blocks {
         for insn in &block.insns {
-            if insn.op == Opcode::Call {
+            if matches!(insn.op, Opcode::Call | Opcode::Longjmp | Opcode::Setjmp) {
                 call_positions.push(pos);
             }
             pos += 1;
@@ -63,8 +65,11 @@ pub fn find_call_positions(func: &Function) -> Vec<usize> {
 }
 
 /// Check if a live interval crosses any call position.
+/// Note: We use <= for the end check because values used as call arguments
+/// (where interval.end == call_pos) need to survive until after argument
+/// setup, which clobbers caller-saved registers before the actual call.
 pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) -> bool {
     call_positions
         .iter()
-        .any(|&call_pos| interval.start <= call_pos && call_pos < interval.end)
+        .any(|&call_pos| interval.start <= call_pos && call_pos <= interval.end)
 }

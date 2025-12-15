@@ -16,6 +16,7 @@ mod clz;
 mod constant_p;
 mod ctz;
 mod debug;
+mod function_pointers;
 mod has_feature;
 mod inline;
 mod macros;

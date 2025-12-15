@@ -546,7 +546,7 @@ msgstr ""
 msgid "Only time out the utility itself, not its descendants."
 msgstr ""
 
-#: cc/main.rs:113
+#: cc/main.rs:115
 msgid "Optimization level"
 msgstr ""
 

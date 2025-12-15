@@ -158,7 +158,7 @@ mod tests {
         // With phi node in cond block:
         //   %3 = phi [.L0: %1], [.L2: %2]
 
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let int_type = types.int_id;
         let mut func = Function::new("test", int_type);
 

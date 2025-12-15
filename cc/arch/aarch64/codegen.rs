@@ -27,7 +27,7 @@ use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
 use crate::types::{TypeId, TypeModifiers, TypeTable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // AArch64 Code Generator
@@ -395,7 +395,7 @@ impl Aarch64CodeGen {
         }
 
         // Prologue: save frame pointer and link register, allocate stack
-        let (scratch0, _scratch1) = Reg::scratch_regs();
+        let (scratch0, _scratch1, _) = Reg::scratch_regs();
         let fp = Reg::fp();
         let lr = Reg::lr();
         // Reference platform_reserved to acknowledge its existence
@@ -626,6 +626,33 @@ impl Aarch64CodeGen {
                 .count();
         }
 
+        // Emit stores for arguments spilled from caller-saved registers to stack
+        // These must be stored early before any call can clobber them
+        for spilled in alloc.spilled_args() {
+            // spilled.to_stack_offset is negative (e.g., -8, -16, etc.)
+            // Convert to FP-relative offset
+            let actual_offset = self.stack_offset(total_frame, spilled.to_stack_offset);
+            if let Some(gp_reg) = spilled.from_gp_reg {
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: gp_reg,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29, // fp
+                        offset: actual_offset,
+                    },
+                });
+            } else if let Some(fp_reg) = spilled.from_fp_reg {
+                self.push_lir(Aarch64Inst::StrFp {
+                    size: FpSize::Double,
+                    src: fp_reg,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29, // fp
+                        offset: actual_offset,
+                    },
+                });
+            }
+        }
+
         // Move arguments from registers to their allocated locations if needed
         // Note: On AAPCS64, sret uses X8, so regular args still start at X0
         // Complex parameters use two consecutive FP registers (D0+D1, D2+D3, etc.)
@@ -633,6 +660,11 @@ impl Aarch64CodeGen {
         let fp_arg_regs = VReg::arg_regs();
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
+
+        // Track which pseudos were already spilled via spill_args_across_calls
+        // to avoid double-storing them here
+        let spilled_pseudos: HashSet<PseudoId> =
+            alloc.spilled_args().iter().map(|s| s.pseudo).collect();
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex(*typ);
@@ -643,6 +675,18 @@ impl Aarch64CodeGen {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     // With sret, params have arg_idx = i + 1, but still use arg_regs[i]
                     if arg_idx == (i as u32) + arg_idx_offset {
+                        // Skip pseudos already stored via spilled_args
+                        if spilled_pseudos.contains(&pseudo.id) {
+                            // Still need to count this arg for register assignment tracking
+                            if is_complex {
+                                fp_arg_idx += 2;
+                            } else if is_fp {
+                                fp_arg_idx += 1;
+                            } else {
+                                int_arg_idx += 1;
+                            }
+                            break;
+                        }
                         if is_complex {
                             // Complex argument - uses TWO consecutive FP registers
                             // Look up the local variable for stack location
@@ -919,7 +963,7 @@ impl Aarch64CodeGen {
         };
 
         let loc = self.get_location(cond);
-        let (scratch0, _) = Reg::scratch_regs();
+        let (scratch0, _, _) = Reg::scratch_regs();
 
         match &loc {
             Loc::Reg(r) => {
@@ -1002,7 +1046,7 @@ impl Aarch64CodeGen {
         let Some(val) = insn.target else { return };
 
         let loc = self.get_location(val);
-        let (scratch0, scratch1) = Reg::scratch_regs();
+        let (scratch0, scratch1, _) = Reg::scratch_regs();
         let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
@@ -1167,7 +1211,7 @@ impl Aarch64CodeGen {
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
                                     // Load FP constant using integer register
-                                    let (scratch0, _) = Reg::scratch_regs();
+                                    let (scratch0, _, _) = Reg::scratch_regs();
                                     let bits = if insn.size <= 32 {
                                         (*f as f32).to_bits() as i64
                                     } else {
@@ -2032,7 +2076,7 @@ impl Aarch64CodeGen {
                 } else {
                     Symbol::global(&name)
                 };
-                let (scratch0, _) = Reg::scratch_regs();
+                let (scratch0, _, _) = Reg::scratch_regs();
                 self.push_lir(Aarch64Inst::Adrp {
                     sym: sym.clone(),
                     dst: scratch0,
@@ -2252,10 +2296,24 @@ impl Aarch64CodeGen {
     }
 
     fn emit_call(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
-        let func_name = match &insn.func_name {
-            Some(n) => n.clone(),
-            None => return,
+        // Check if this is an indirect call (through function pointer)
+        let is_indirect = insn.indirect_target.is_some();
+
+        // For direct calls, we need a function name
+        let func_name = if is_indirect {
+            "<indirect>".to_string()
+        } else {
+            match &insn.func_name {
+                Some(n) => n.clone(),
+                None => return,
+            }
         };
+
+        // For indirect calls, load function pointer address into X16 (IP0)
+        // X16 is the intra-procedure-call scratch register per AAPCS64
+        if let Some(func_addr) = insn.indirect_target {
+            self.emit_move(func_addr, Reg::X16, 64, frame_size);
+        }
 
         // AAPCS64 calling convention:
         // - Integer arguments: X0-X7 (8 registers)
@@ -2511,9 +2569,17 @@ impl Aarch64CodeGen {
         }
 
         // Call the function
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(&func_name)),
-        });
+        if is_indirect {
+            // Indirect call through X16 (function pointer was loaded there earlier)
+            self.push_lir(Aarch64Inst::Bl {
+                target: CallTarget::Indirect(Reg::X16),
+            });
+        } else {
+            // Direct call to named function
+            self.push_lir(Aarch64Inst::Bl {
+                target: CallTarget::Direct(Symbol::global(&func_name)),
+            });
+        }
 
         // Clean up stack arguments
         if stack_args > 0 {
@@ -2897,7 +2963,7 @@ impl Aarch64CodeGen {
             Loc::FImm(f, imm_size) => {
                 // Load FP constant using integer register
                 // Use the size from the FImm for correct constant representation
-                let (scratch0, _) = Reg::scratch_regs();
+                let (scratch0, _, _) = Reg::scratch_regs();
                 let bits = if imm_size <= 32 {
                     (f as f32).to_bits() as i64
                 } else {
@@ -2920,7 +2986,7 @@ impl Aarch64CodeGen {
             }
             Loc::Imm(v) => {
                 // Load integer immediate and move to FP
-                let (scratch0, _) = Reg::scratch_regs();
+                let (scratch0, _, _) = Reg::scratch_regs();
                 self.emit_mov_imm(scratch0, v, 64);
                 self.push_lir(Aarch64Inst::FmovFromGp {
                     size: fp_size,
@@ -2930,7 +2996,7 @@ impl Aarch64CodeGen {
             }
             Loc::Global(name) => {
                 // Load from global - use size matching FP precision
-                let (scratch0, _) = Reg::scratch_regs();
+                let (scratch0, _, _) = Reg::scratch_regs();
                 let load_size = match fp_size {
                     FpSize::Single => OperandSize::B32,
                     FpSize::Double => OperandSize::B64,
@@ -3148,7 +3214,7 @@ impl Aarch64CodeGen {
         };
 
         // Load source to integer register
-        let (scratch0, _) = Reg::scratch_regs();
+        let (scratch0, _, _) = Reg::scratch_regs();
         self.emit_move(src, scratch0, src_size, frame_size);
 
         // Convert integer to float
@@ -3305,7 +3371,7 @@ impl Aarch64CodeGen {
         };
 
         let ap_loc = self.get_location(ap_addr);
-        let (scratch0, scratch1) = Reg::scratch_regs();
+        let (scratch0, scratch1, _) = Reg::scratch_regs();
 
         // Compute address of first variadic argument
         let is_darwin = self.target.os == crate::target::Os::MacOS;
@@ -3377,7 +3443,7 @@ impl Aarch64CodeGen {
 
         let ap_loc = self.get_location(ap_addr);
         let dst_loc = self.get_location(target);
-        let (scratch0, scratch1) = Reg::scratch_regs();
+        let (scratch0, scratch1, _) = Reg::scratch_regs();
 
         // ap_loc contains the ADDRESS of the va_list variable (from symaddr)
         // First, get the address of ap into scratch1, then load ap value from there
@@ -3541,7 +3607,7 @@ impl Aarch64CodeGen {
 
         let dest_loc = self.get_location(dest_addr);
         let src_loc = self.get_location(src_addr);
-        let (scratch0, scratch1) = Reg::scratch_regs();
+        let (scratch0, scratch1, _) = Reg::scratch_regs();
 
         // Both src_loc and dest_loc contain ADDRESSES of va_list variables
         // Get the address of src va_list into scratch1
@@ -3999,10 +4065,11 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // IMPORTANT: Load val first into X1, THEN env into X0.
-        // If we loaded env into X0 first and val was passed as the first
-        // function argument (in X0), it would get overwritten.
-        // Put val argument in X1 (second argument register) FIRST
+        // CONSTRAINT: Load val into X1 BEFORE loading env into X0.
+        // If env is loaded into X0 first and val happens to be in X0 (first
+        // function argument), it would be overwritten. This is a manual constraint
+        // that will be expressible through the constraint system when inline asm
+        // support is added.
         self.emit_move(val, Reg::X1, 32, frame_size);
 
         // Put env argument in X0 (first argument register)

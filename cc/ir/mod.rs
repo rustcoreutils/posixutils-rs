@@ -16,6 +16,7 @@
 
 pub mod dce;
 pub mod dominate;
+pub mod inline;
 pub mod instcombine;
 pub mod linearize;
 pub mod lower;
@@ -493,6 +494,9 @@ pub struct Instruction {
     /// For calls/returns: true if this returns a 9-16 byte struct via two registers
     /// (RAX+RDX on x86-64, X0+X1 on AArch64) per ABI.
     pub is_two_reg_return: bool,
+    /// For indirect calls: pseudo containing the function pointer address.
+    /// When this is Some, the call is indirect (call through function pointer).
+    pub indirect_target: Option<PseudoId>,
     /// Source position for debug info
     pub pos: Option<Position>,
 }
@@ -518,6 +522,7 @@ impl Default for Instruction {
             is_sret_call: false,
             is_noreturn_call: false,
             is_two_reg_return: false,
+            indirect_target: None,
             pos: None,
         }
     }
@@ -702,6 +707,26 @@ impl Instruction {
         let mut insn = Self::new(Opcode::Call)
             .with_func(func)
             .with_type_and_size(ret_type, ret_size);
+        if let Some(t) = target {
+            insn.target = Some(t);
+        }
+        insn.src = args;
+        insn.arg_types = arg_types;
+        insn
+    }
+
+    /// Create an indirect call instruction (call through function pointer)
+    pub fn call_indirect(
+        target: Option<PseudoId>,
+        func_addr: PseudoId,
+        args: Vec<PseudoId>,
+        arg_types: Vec<TypeId>,
+        ret_type: TypeId,
+        ret_size: u32,
+    ) -> Self {
+        let mut insn = Self::new(Opcode::Call).with_type_and_size(ret_type, ret_size);
+        insn.indirect_target = Some(func_addr);
+        insn.func_name = Some("<indirect>".to_string());
         if let Some(t) = target {
             insn.target = Some(t);
         }
@@ -984,6 +1009,8 @@ pub struct Function {
     pub is_static: bool,
     /// Is this function noreturn (never returns)?
     pub is_noreturn: bool,
+    /// Is this function declared with the inline keyword?
+    pub is_inline: bool,
 }
 
 impl Default for Function {
@@ -999,6 +1026,7 @@ impl Default for Function {
             max_dom_level: 0,
             is_static: false,
             is_noreturn: false,
+            is_inline: false,
         }
     }
 }
@@ -1313,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_instruction_binop() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1329,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_instruction_display() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1359,7 +1387,7 @@ mod tests {
 
     #[test]
     fn test_function_display() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("main", types.int_id);
         func.add_param("argc", types.int_id);
 
@@ -1389,7 +1417,7 @@ mod tests {
 
     #[test]
     fn test_call_instruction() {
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let char_ptr = types.intern(Type::pointer(types.char_id));
         let arg_types = vec![char_ptr, types.int_id];
         let call = Instruction::call(
@@ -1408,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_load_store() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
 
         let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, 32);
         assert_eq!(load.op, Opcode::Load);
@@ -1421,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_module() {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut module = Module::new();
 
         module.add_global("counter", types.int_id, Initializer::Int(0));

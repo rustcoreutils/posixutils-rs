@@ -53,6 +53,12 @@ impl std::error::Error for ParseError {}
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
+/// Result of parsing a declarator: (name, type, VLA expressions, function parameters)
+type DeclaratorResult = (StringId, TypeId, Vec<Expr>, Option<Vec<Parameter>>);
+
+/// Function parameter type info: (type IDs, is_variadic)
+type FuncParamTypes = (Vec<TypeId>, bool);
+
 // ============================================================================
 // GCC __attribute__ Support
 // ============================================================================
@@ -301,9 +307,9 @@ impl<'a> Parser<'a> {
         self.idents.get(id)
     }
 
-    /// Skip StreamBegin/StreamEnd tokens
+    /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
     pub fn skip_stream_tokens(&mut self) {
-        while self.peek() == TokenType::StreamBegin || self.peek() == TokenType::StreamEnd {
+        while self.peek() == TokenType::StreamBegin {
             self.advance();
         }
     }
@@ -511,6 +517,43 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Skip GCC extended inline assembly statement
+    /// Format: __asm__ [volatile] ( "template" [: outputs [: inputs [: clobbers]]] );
+    fn skip_asm_statement(&mut self) {
+        self.advance(); // consume __asm/__asm__
+
+        // Skip optional 'volatile' or '__volatile__'
+        if self.peek() == TokenType::Ident {
+            if let Some(name) = self.get_ident_name(self.current()) {
+                if name == "volatile" || name == "__volatile__" {
+                    self.advance();
+                }
+            }
+        }
+
+        // Expect '('
+        if !self.is_special(b'(') {
+            return;
+        }
+        self.advance(); // consume '('
+
+        // Skip contents until matching ')', handling nested parens
+        let mut depth = 1;
+        while depth > 0 && !self.is_eof() {
+            if self.is_special(b'(') {
+                depth += 1;
+            } else if self.is_special(b')') {
+                depth -= 1;
+            }
+            self.advance();
+        }
+
+        // Consume trailing semicolon
+        if self.is_special(b';') {
+            self.advance();
+        }
+    }
+
     /// Skip both __attribute__ and __asm extensions
     fn skip_extensions(&mut self) {
         loop {
@@ -621,12 +664,15 @@ impl<'a> Parser<'a> {
 
             // Right-to-left associativity: parse the right side as another assignment
             let right = self.parse_assignment_expr()?;
-            Ok(Expr::new(
+            // In C, assignment expression type is the type of the left operand
+            let assign_type = left.typ.unwrap_or(self.types.int_id);
+            Ok(Self::typed_expr(
                 ExprKind::Assign {
                     op: assign_op,
                     target: Box::new(left),
                     value: Box::new(right),
                 },
+                assign_type,
                 assign_pos,
             ))
         } else {
@@ -1517,6 +1563,46 @@ impl<'a> Parser<'a> {
             result_id = self.types.intern(Type::pointer(result_id));
         }
 
+        // Handle function pointer declarators: void (*)(int), int (*)(void), etc.
+        // Syntax: return_type (*)(param_types)
+        if self.is_special(b'(') {
+            // Look ahead to check for (*) pattern indicating function pointer
+            let saved_pos = self.pos;
+            self.advance(); // consume '('
+            if self.is_special(b'*') {
+                self.advance(); // consume '*'
+                if self.is_special(b')') {
+                    self.advance(); // consume ')'
+                                    // Now expect parameter list
+                    if self.is_special(b'(') {
+                        self.advance(); // consume '('
+                                        // Parse parameter types (simplified - just skip them for now)
+                                        // Full implementation would build proper function type
+                        let mut param_depth = 1;
+                        while param_depth > 0 && !self.is_eof() {
+                            if self.is_special(b'(') {
+                                param_depth += 1;
+                            } else if self.is_special(b')') {
+                                param_depth -= 1;
+                            }
+                            if param_depth > 0 {
+                                self.advance();
+                            }
+                        }
+                        self.advance(); // consume final ')'
+                                        // Create function pointer type: pointer to function returning result_id
+                                        // For now, create a generic function pointer (void -> result_id)
+                        let fn_type = Type::function(result_id, vec![], false);
+                        let fn_type_id = self.types.intern(fn_type);
+                        result_id = self.types.intern(Type::pointer(fn_type_id));
+                        return Some(result_id);
+                    }
+                }
+            }
+            // Not a function pointer, backtrack
+            self.pos = saved_pos;
+        }
+
         // Handle array declarators: int[10], char[20], int[], etc.
         while self.is_special(b'[') {
             self.advance();
@@ -2188,20 +2274,40 @@ impl<'a> Parser<'a> {
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
                     // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
-                    let typ = if name_str == "__func__" {
+                    if name_str == "__func__" {
                         // __func__ behaves like a string literal (const char[])
-                        self.types.char_ptr_id
+                        return Ok(Self::typed_expr(
+                            ExprKind::Ident { name: name_id },
+                            self.types.char_ptr_id,
+                            token_pos,
+                        ));
+                    }
+
+                    // Check if this is an enum constant - if so, return IntLit
+                    if let Some(sym) = self.symbols.lookup(name_id, Namespace::Ordinary) {
+                        if sym.is_enum_constant() {
+                            if let Some(value) = sym.enum_value {
+                                return Ok(Self::typed_expr(
+                                    ExprKind::IntLit(value),
+                                    self.types.int_id,
+                                    token_pos,
+                                ));
+                            }
+                        }
+                        // Regular variable/function
+                        Ok(Self::typed_expr(
+                            ExprKind::Ident { name: name_id },
+                            sym.typ,
+                            token_pos,
+                        ))
                     } else {
-                        self.symbols
-                            .lookup(name_id, Namespace::Ordinary)
-                            .map(|s| s.typ)
-                            .unwrap_or(self.types.int_id) // Default to int if not found
-                    };
-                    Ok(Self::typed_expr(
-                        ExprKind::Ident { name: name_id },
-                        typ,
-                        token_pos,
-                    ))
+                        // Unknown identifier - default to int
+                        Ok(Self::typed_expr(
+                            ExprKind::Ident { name: name_id },
+                            self.types.int_id,
+                            token_pos,
+                        ))
+                    }
                 } else {
                     Err(ParseError::new("invalid identifier token", token.pos))
                 }
@@ -2598,6 +2704,11 @@ impl Parser<'_> {
                     "switch" => return self.parse_switch_stmt(),
                     "case" => return self.parse_case_label(),
                     "default" => return self.parse_default_label(),
+                    // GCC extended inline assembly - skip for now
+                    "__asm__" | "__asm" | "asm" => {
+                        self.skip_asm_statement();
+                        return Ok(Stmt::Empty);
+                    }
                     _ => {}
                 }
             }
@@ -2923,7 +3034,7 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
-                let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
+                let (name, typ, vla_sizes, _func_params) = self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
                 let init = if self.is_special(b'=') {
@@ -2972,7 +3083,8 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
-                let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
+                let (name, mut typ, vla_sizes, _func_params) =
+                    self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
 
@@ -2988,6 +3100,22 @@ impl Parser<'_> {
                 } else {
                     None
                 };
+
+                // For incomplete array types (int arr[] = {...}), infer size from initializer
+                if let Some(ref init_expr) = init {
+                    if let ExprKind::InitList { elements } = &init_expr.kind {
+                        if self.types.kind(typ) == TypeKind::Array {
+                            let array_size = self.types.get(typ).array_size;
+                            // Check if array size is incomplete (0 or None)
+                            if array_size == Some(0) || array_size.is_none() {
+                                // Update type with actual size from initializer count
+                                let elem_type =
+                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
+                                typ = self.types.intern(Type::array(elem_type, elements.len()));
+                            }
+                        }
+                    }
+                }
 
                 // Bind to symbol table (like sparse's bind_symbol)
                 // Note: StringId is Copy, check for empty by comparing to empty string
@@ -3373,7 +3501,8 @@ impl Parser<'_> {
                     }
 
                     // VLAs are not allowed in struct members
-                    let (name, typ, vla_sizes) = self.parse_declarator(member_base_type_id)?;
+                    let (name, typ, vla_sizes, _func_params) =
+                        self.parse_declarator(member_base_type_id)?;
 
                     // C99 6.7.5.2: VLAs cannot be members of structures or unions
                     if !vla_sizes.is_empty() {
@@ -3477,11 +3606,9 @@ impl Parser<'_> {
     /// - `[3]` after the parens means "to array of 3"
     ///   So p is "pointer to array of 3 ints"
     ///
-    /// Returns: (name, type, VLA size expressions from outer to inner dimensions)
-    fn parse_declarator(
-        &mut self,
-        base_type_id: TypeId,
-    ) -> ParseResult<(StringId, TypeId, Vec<Expr>)> {
+    /// Returns: (name, type, VLA size expressions, function parameters if declarator is function)
+    /// The function parameters include names for use in function definitions.
+    fn parse_declarator(&mut self, base_type_id: TypeId) -> ParseResult<DeclaratorResult> {
         // Collect pointer modifiers (they bind tighter than array/function)
         let mut pointer_modifiers: Vec<TypeModifiers> = Vec::new();
         while self.is_special(b'*') {
@@ -3515,7 +3642,7 @@ impl Parser<'_> {
 
         // Check for parenthesized declarator: int (*p)[3]
         // The paren comes AFTER pointers, e.g. int *(*p)[3] = pointer to (pointer to array of 3 ints)
-        let (name, inner_type_id) = if self.is_special(b'(') {
+        let (name, inner_type_id, inner_func_params) = if self.is_special(b'(') {
             // Check if this looks like a function parameter list or a grouped declarator
             // A grouped declarator will have * or identifier immediately after (
             let saved_pos = self.pos;
@@ -3535,32 +3662,32 @@ impl Parser<'_> {
                 // Parse the inner declarator with a placeholder type (void)
                 // Note: We ignore any VLA expression from inner declarators - VLAs would be
                 // in the outer array dimensions, not inner pointer/grouped declarators
-                let (inner_name, inner_decl_type_id, _inner_vla) =
+                let (inner_name, inner_decl_type_id, _inner_vla, inner_func_params) =
                     self.parse_declarator(self.types.void_id)?;
                 self.expect_special(b')')?;
 
                 // Now parse any suffix modifiers (arrays, function params)
                 // These apply to the base type, not the inner declarator
-                (inner_name, Some(inner_decl_type_id))
+                (inner_name, Some(inner_decl_type_id), inner_func_params)
             } else {
                 // Not a grouped declarator, restore position
                 self.pos = saved_pos;
-                (self.expect_identifier()?, None)
+                (self.expect_identifier()?, None, None)
             }
         } else {
             // Get the name directly, or use empty for abstract declarators
             // Abstract declarators have no name: void (*)(int) - the * has no identifier
             if self.peek() == TokenType::Ident {
-                (self.expect_identifier()?, None)
+                (self.expect_identifier()?, None, None)
             } else if self.is_special(b')')
                 || self.is_special(b'[')
                 || self.is_special(b'(')
                 || self.is_special(b',')
             {
                 // No identifier - abstract declarator (e.g., void (*)(int), const char * restrict)
-                (StringId::EMPTY, None)
+                (StringId::EMPTY, None, None)
             } else {
-                (self.expect_identifier()?, None)
+                (self.expect_identifier()?, None, None)
             }
         };
 
@@ -3630,14 +3757,17 @@ impl Parser<'_> {
 
         // Handle function declarators: void (*fp)(int, char)
         // This parses the parameter list after a grouped declarator
-        let func_params: Option<(Vec<TypeId>, bool)> = if self.is_special(b'(') {
-            self.advance();
-            let (params, variadic) = self.parse_parameter_list()?;
-            self.expect_special(b')')?;
-            Some((params.iter().map(|p| p.typ).collect(), variadic))
-        } else {
-            None
-        };
+        // We keep both the TypeIds (for building the type) and full Parameters (for function defs)
+        let (func_params, full_func_params): (Option<FuncParamTypes>, Option<Vec<Parameter>>) =
+            if self.is_special(b'(') {
+                self.advance();
+                let (params, variadic) = self.parse_parameter_list()?;
+                self.expect_special(b')')?;
+                let type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
+                (Some((type_ids, variadic)), Some(params))
+            } else {
+                (None, None)
+            };
 
         // Build the type from the base type
         let mut result_type_id = base_type_id;
@@ -3725,9 +3855,27 @@ impl Parser<'_> {
                 };
                 result_type_id = self.types.intern(arr_type);
             }
+
+            // Apply function parameters if present (for function declarators)
+            // For int get_op(int which): base is int, suffix (int) -> Function(int, [int])
+            // This is needed for nested declarators like int (*get_op(int))(int, int)
+            if let Some((param_type_ids, variadic)) = func_params {
+                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                result_type_id = self.types.intern(func_type);
+            }
         }
 
-        Ok((name, result_type_id, vla_exprs))
+        // Determine which function parameters to return:
+        // - For grouped declarator with inner function: return inner_func_params
+        //   (those are the params of the outer function after type substitution)
+        // - For simple declarator with function: return full_func_params
+        let returned_func_params = if inner_type_id.is_some() {
+            inner_func_params
+        } else {
+            full_func_params
+        };
+
+        Ok((name, result_type_id, vla_exprs, returned_func_params))
     }
 
     /// Substitute the actual base type into a declarator parsed with a placeholder
@@ -3769,6 +3917,27 @@ impl Parser<'_> {
                     composite: None,
                 };
                 self.types.intern(arr_type)
+            }
+            TypeKind::Function => {
+                // For function declarators like int (*get_op(int))(int, int)
+                // The inner declarator is Function(Pointer(Void), [int])
+                // We need to substitute Void with the actual return type
+                let inner_base_id = decl_type.base.unwrap(); // return type (placeholder)
+                let decl_params = decl_type.params.clone();
+                let decl_variadic = decl_type.variadic;
+                let decl_noreturn = decl_type.noreturn;
+                let new_ret_id = self.substitute_base_type(inner_base_id, actual_base_id);
+                let func_type = Type {
+                    kind: TypeKind::Function,
+                    modifiers: TypeModifiers::empty(),
+                    base: Some(new_ret_id),
+                    array_size: None,
+                    params: decl_params,
+                    variadic: decl_variadic,
+                    noreturn: decl_noreturn,
+                    composite: None,
+                };
+                self.types.intern(func_type)
             }
             _ => decl_type_id, // Other types don't need substitution
         }
@@ -3912,7 +4081,8 @@ impl Parser<'_> {
             // - Grouped declarators: void (*)(int), int (*)[10]
             // - Arrays: int arr[], int arr[10]
             // Note: parse_declarator returns (name, type, vla_sizes)
-            let (param_name, mut typ_id, _vla_sizes) = self.parse_declarator(base_type_id)?;
+            let (param_name, mut typ_id, _vla_sizes, _func_params) =
+                self.parse_declarator(base_type_id)?;
 
             // C99 6.7.5.3: Array parameters are adjusted to pointers
             // parse_declarator already gives us the array type, we need to convert
@@ -3997,7 +4167,8 @@ impl Parser<'_> {
             if self.is_special(b'*') {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
+                let (name, typ, vla_sizes, decl_func_params) =
+                    self.parse_declarator(base_type_id)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
                 if !vla_sizes.is_empty() {
@@ -4010,7 +4181,49 @@ impl Parser<'_> {
                 // Skip any __attribute__ after declarator
                 self.skip_extensions();
 
-                // Handle initializer
+                // Check if this is a function definition (function type followed by '{')
+                // This handles cases like: int (*get_op(int which))(int, int) { ... }
+                if self.types.kind(typ) == TypeKind::Function && self.is_special(b'{') {
+                    // Get the function's return type
+                    let func_type = self.types.get(typ);
+                    let return_type = func_type.base.unwrap();
+                    let _is_variadic = func_type.variadic;
+
+                    // Add function to symbol table
+                    let func_sym = Symbol::function(name, typ, self.symbols.depth());
+                    let _ = self.symbols.declare(func_sym);
+
+                    // Get parameters - use decl_func_params which has names
+                    let params = decl_func_params.unwrap_or_default();
+
+                    // Enter function scope for parameters
+                    self.symbols.enter_scope();
+
+                    // Bind parameters in function scope
+                    for param in &params {
+                        if let Some(param_name) = param.name {
+                            let param_sym =
+                                Symbol::parameter(param_name, param.typ, self.symbols.depth());
+                            let _ = self.symbols.declare(param_sym);
+                        }
+                    }
+
+                    // Parse body without creating another scope
+                    let body = self.parse_block_stmt_no_scope()?;
+
+                    // Leave function scope
+                    self.symbols.leave_scope();
+
+                    return Ok(ExternalDecl::FunctionDef(FunctionDef {
+                        return_type,
+                        name,
+                        params,
+                        body,
+                        pos: decl_pos,
+                    }));
+                }
+
+                // Handle initializer (for declarations, not function definitions)
                 let init = if self.is_special(b'=') {
                     if is_typedef {
                         return Err(ParseError::new(
@@ -4098,7 +4311,8 @@ impl Parser<'_> {
             if self.is_special(b'*') {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, full_typ, vla_sizes) = self.parse_declarator(typ_id)?;
+                let (name, full_typ, vla_sizes, decl_func_params) =
+                    self.parse_declarator(typ_id)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
                 if !vla_sizes.is_empty() {
@@ -4111,7 +4325,48 @@ impl Parser<'_> {
                 // Skip any __attribute__ after declarator
                 self.skip_extensions();
 
-                // Handle initializer
+                // Check if this is a function definition (function type followed by '{')
+                // This handles cases like: char *(*get_op(int which))(int, int) { ... }
+                if self.types.kind(full_typ) == TypeKind::Function && self.is_special(b'{') {
+                    // Get the function's return type
+                    let func_type = self.types.get(full_typ);
+                    let return_type = func_type.base.unwrap();
+
+                    // Add function to symbol table
+                    let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
+                    let _ = self.symbols.declare(func_sym);
+
+                    // Get parameters - use decl_func_params which has names
+                    let params = decl_func_params.unwrap_or_default();
+
+                    // Enter function scope for parameters
+                    self.symbols.enter_scope();
+
+                    // Bind parameters in function scope
+                    for param in &params {
+                        if let Some(param_name) = param.name {
+                            let param_sym =
+                                Symbol::parameter(param_name, param.typ, self.symbols.depth());
+                            let _ = self.symbols.declare(param_sym);
+                        }
+                    }
+
+                    // Parse body without creating another scope
+                    let body = self.parse_block_stmt_no_scope()?;
+
+                    // Leave function scope
+                    self.symbols.leave_scope();
+
+                    return Ok(ExternalDecl::FunctionDef(FunctionDef {
+                        return_type,
+                        name,
+                        params,
+                        body,
+                        pos: decl_pos,
+                    }));
+                }
+
+                // Handle initializer (for declarations, not function definitions)
                 let init = if self.is_special(b'=') {
                     if is_typedef {
                         return Err(ParseError::new(
@@ -4295,7 +4550,8 @@ impl Parser<'_> {
         // Handle additional declarators
         while self.is_special(b',') {
             self.advance();
-            let (decl_name, decl_type, vla_sizes) = self.parse_declarator(base_type_id)?;
+            let (decl_name, decl_type, vla_sizes, _decl_func_params) =
+                self.parse_declarator(base_type_id)?;
 
             // C99 6.7.5.2: VLAs must have block scope
             if !vla_sizes.is_empty() {
@@ -4505,7 +4761,7 @@ mod tests {
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let expr = parser.parse_expression()?;
@@ -5705,7 +5961,7 @@ mod tests {
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let stmt = parser.parse_statement()?;
@@ -5920,7 +6176,7 @@ mod tests {
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let decl = parser.parse_declaration()?;
@@ -5998,7 +6254,7 @@ mod tests {
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let func = parser.parse_function_def()?;
@@ -6052,7 +6308,7 @@ mod tests {
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new();
+        let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         let tu = parser.parse_translation_unit()?;
         Ok((tu, types, strings))
@@ -7098,6 +7354,64 @@ mod tests {
                         assert_eq!(params.len(), 1);
                         assert_eq!(types.kind(params[0]), TypeKind::Pointer);
                     }
+                }
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_returning_function_pointer() {
+        // Function returning function pointer: int (*get_op(int which))(int, int)
+        // This declares get_op as a function taking int and returning a pointer to
+        // a function (int, int) -> int
+        let (tu, types, strings) = parse_tu("int (*get_op(int which))(int, int);").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                check_name(&strings, decl.declarators[0].name, "get_op");
+
+                // get_op should be a Function type
+                let get_op_type = decl.declarators[0].typ;
+                assert_eq!(types.kind(get_op_type), TypeKind::Function);
+
+                // get_op takes one int parameter
+                if let Some(params) = types.params(get_op_type) {
+                    assert_eq!(params.len(), 1);
+                    assert_eq!(types.kind(params[0]), TypeKind::Int);
+                } else {
+                    panic!("Expected function parameters");
+                }
+
+                // Return type should be a pointer to a function
+                if let Some(ret_id) = types.base_type(get_op_type) {
+                    assert_eq!(types.kind(ret_id), TypeKind::Pointer);
+
+                    // The pointer's base should be a function
+                    if let Some(func_id) = types.base_type(ret_id) {
+                        assert_eq!(types.kind(func_id), TypeKind::Function);
+
+                        // The inner function returns int
+                        if let Some(inner_ret_id) = types.base_type(func_id) {
+                            assert_eq!(types.kind(inner_ret_id), TypeKind::Int);
+                        } else {
+                            panic!("Expected inner function return type");
+                        }
+
+                        // The inner function takes (int, int)
+                        if let Some(inner_params) = types.params(func_id) {
+                            assert_eq!(inner_params.len(), 2);
+                            assert_eq!(types.kind(inner_params[0]), TypeKind::Int);
+                            assert_eq!(types.kind(inner_params[1]), TypeKind::Int);
+                        } else {
+                            panic!("Expected inner function parameters");
+                        }
+                    } else {
+                        panic!("Expected function pointer base type");
+                    }
+                } else {
+                    panic!("Expected return type");
                 }
             }
             _ => panic!("Expected Declaration"),

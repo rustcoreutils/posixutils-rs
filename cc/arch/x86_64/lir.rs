@@ -174,6 +174,8 @@ pub enum ShiftCount {
 pub enum CallTarget {
     /// Direct call to symbol
     Direct(Symbol),
+    /// Indirect call through register (call *%reg)
+    Indirect(Reg),
 }
 
 // ============================================================================
@@ -795,6 +797,10 @@ impl EmitAsm for X86Inst {
                             let _ = writeln!(out, "    call {}", sym_name);
                         }
                     }
+                }
+                CallTarget::Indirect(reg) => {
+                    // Indirect call through register: call *%reg
+                    let _ = writeln!(out, "    call *{}", reg.name64());
                 }
             },
 

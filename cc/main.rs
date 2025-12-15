@@ -32,7 +32,7 @@ use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
 use target::Target;
-use token::{preprocess, show_token, token_type_name, StreamTable, Tokenizer};
+use token::{preprocess_with_defines, show_token, token_type_name, StreamTable, Tokenizer};
 
 // ============================================================================
 // CLI
@@ -109,9 +109,21 @@ struct Args {
     #[arg(long = "target", value_name = "triple", help = gettext("Target triple for cross-compilation"))]
     target: Option<String>,
 
-    /// Optimization level (0=none, 1=basic optimizations)
-    #[arg(short = 'O', default_value = "0", value_name = "level", help = gettext("Optimization level"))]
+    /// Optimization level (0=none, 1+=basic optimizations)
+    /// -O alone means -O1, -O0 means none, -O2/-O3 mapped to -O1
+    #[arg(short = 'O', default_value = "0", default_missing_value = "1",
+          num_args = 0..=1, value_name = "level", help = gettext("Optimization level"))]
     opt_level: u32,
+
+    /// Warning flags (e.g., -Wall, -Wextra, -Wno-unused)
+    /// Currently accepted but not enforced
+    #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
+          num_args = 0..=1, default_missing_value = "extra")]
+    warnings: Vec<String>,
+
+    /// Pedantic mode (compatibility, currently no-op)
+    #[arg(long = "pedantic", hide = true)]
+    pedantic: bool,
 }
 
 fn process_file(
@@ -174,7 +186,14 @@ fn process_file(
     }
 
     // Preprocess (may add new identifiers from included files)
-    let preprocessed = preprocess(tokens, target, &mut strings, path);
+    let preprocessed = preprocess_with_defines(
+        tokens,
+        target,
+        &mut strings,
+        path,
+        &args.defines,
+        &args.undefines,
+    );
 
     if args.preprocess_only {
         // Output preprocessed tokens
@@ -208,7 +227,7 @@ fn process_file(
     // Create symbol table and type table BEFORE parsing
     // symbols are bound during parsing
     let mut symbols = SymbolTable::new();
-    let mut types = types::TypeTable::new();
+    let mut types = types::TypeTable::new(target.pointer_width);
 
     // Parse (this also binds symbols to the symbol table)
     let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
@@ -345,12 +364,37 @@ fn process_file(
     Ok(())
 }
 
+/// Preprocess command-line arguments for gcc compatibility.
+/// Converts -Wall → -W all, -Wextra → -W extra, etc.
+fn preprocess_args() -> Vec<String> {
+    std::env::args()
+        .flat_map(|arg| {
+            if arg.starts_with("-W") && arg.len() > 2 {
+                // -Wall → -W all, -Wextra → -W extra, etc.
+                vec!["-W".to_string(), arg[2..].to_string()]
+            } else {
+                vec![arg]
+            }
+        })
+        .collect()
+}
+
+/// Check if a file is a C source file (by extension)
+fn is_source_file(path: &str) -> bool {
+    path.ends_with(".c") || path.ends_with(".i") || path == "-"
+}
+
+/// Check if a file is an object file (by extension)
+fn is_object_file(path: &str) -> bool {
+    path.ends_with(".o") || path.ends_with(".a")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = Args::parse();
+    let args = Args::parse_from(preprocess_args());
 
     // Handle --print-targets
     if args.print_targets {
@@ -373,9 +417,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Target::host()
     };
 
+    // Separate source files from object files
+    let source_files: Vec<&String> = args.files.iter().filter(|f| is_source_file(f)).collect();
+    let object_files: Vec<&String> = args.files.iter().filter(|f| is_object_file(f)).collect();
+
+    // If we only have object files and an output is specified, just link them
+    if source_files.is_empty() && !object_files.is_empty() && args.output.is_some() {
+        let exe_file = args.output.clone().unwrap();
+        let mut link_cmd = Command::new("cc");
+        link_cmd.args(["-o", &exe_file]);
+        for obj in &object_files {
+            link_cmd.arg(*obj);
+        }
+        let status = link_cmd.status()?;
+        if !status.success() {
+            eprintln!("pcc: linker failed");
+            std::process::exit(1);
+        }
+        if args.verbose {
+            eprintln!("Linked {} object files to {}", object_files.len(), exe_file);
+        }
+        return Ok(());
+    }
+
     let mut streams = StreamTable::new();
 
-    for path in &args.files {
+    for path in &source_files {
         if let Err(e) = process_file(path, &mut streams, &args, &target) {
             eprintln!("pcc: {}: {}", path, e);
             std::process::exit(1);

@@ -13,6 +13,7 @@
 //
 
 use crate::ir::dce;
+use crate::ir::inline;
 use crate::ir::instcombine;
 use crate::ir::{Function, Module};
 
@@ -66,12 +67,18 @@ fn is_const(func: &Function, id: PseudoId) -> bool {
 /// Optimize a module at the given optimization level.
 ///
 /// Level 0: No optimization
-/// Level 1+: Run InstCombine + DCE passes
+/// Level 1+: Run inlining, InstCombine, and DCE passes
 pub fn optimize_module(module: &mut Module, level: u32) {
     if level == 0 {
         return;
     }
 
+    // Phase 1: Function inlining (module-level pass)
+    // This inlines small functions at their call sites and removes
+    // dead static functions that were fully inlined.
+    inline::run(module, level);
+
+    // Phase 2: Per-function optimization (InstCombine + DCE)
     for func in &mut module.functions {
         optimize_function(func);
     }
@@ -100,7 +107,7 @@ mod tests {
     use crate::types::TypeTable;
 
     fn make_test_func() -> Function {
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
         // Add some pseudos

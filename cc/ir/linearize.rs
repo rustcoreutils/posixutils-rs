@@ -347,6 +347,12 @@ impl<'a> Linearizer<'a> {
             return val;
         }
 
+        // Function to pointer conversion (decay) - no actual conversion needed
+        // Function name decays to function pointer (64-bit address)
+        if from_kind == TypeKind::Function && to_kind == TypeKind::Pointer {
+            return val;
+        }
+
         // Pointer to pointer conversion - no actual conversion needed
         // All pointers are the same size (64-bit)
         if from_kind == TypeKind::Pointer && to_kind == TypeKind::Pointer {
@@ -489,13 +495,19 @@ impl<'a> Linearizer<'a> {
 
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
+            let modifiers = self.types.modifiers(declarator.typ);
+
+            // Skip typedef declarations - they don't define storage
+            if modifiers.contains(TypeModifiers::TYPEDEF) {
+                continue;
+            }
+
             // Skip function declarations (they're just forward declarations for external functions)
             if self.types.kind(declarator.typ) == TypeKind::Function {
                 continue;
             }
 
             // Skip extern declarations - they don't define storage
-            let modifiers = self.types.modifiers(declarator.typ);
             if modifiers.contains(TypeModifiers::EXTERN) {
                 continue;
             }
@@ -767,7 +779,7 @@ impl<'a> Linearizer<'a> {
         let modifiers = self.types.modifiers(func.return_type);
         let is_static = modifiers.contains(TypeModifiers::STATIC);
         let is_inline = modifiers.contains(TypeModifiers::INLINE);
-        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
+        let _is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
         // Track non-static inline functions for semantic restriction checks
@@ -779,9 +791,13 @@ impl<'a> Linearizer<'a> {
         // For linkage:
         // - static inline: internal linkage (same as static)
         // - inline (without extern): inline definition only, internal linkage
-        // - extern inline: external linkage (provides external definition)
-        ir_func.is_static = is_static || (is_inline && !is_extern);
+        // - extern inline: per C99, provides external definition, but since we
+        //   treat inline functions as internal linkage candidates for inlining,
+        //   avoid duplicate symbol errors when same inline function is defined
+        //   in multiple translation units
+        ir_func.is_static = is_static || is_inline;
         ir_func.is_noreturn = is_noreturn;
+        ir_func.is_inline = is_inline;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct
@@ -1111,7 +1127,12 @@ impl<'a> Linearizer<'a> {
                         self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));
                     } else {
                         let val = self.linearize_expr(e);
-                        let typ_size = self.types.size_bits(typ);
+                        // Function types decay to pointers when returned
+                        let typ_size = if self.types.kind(typ) == TypeKind::Function {
+                            self.target.pointer_width
+                        } else {
+                            self.types.size_bits(typ)
+                        };
                         self.emit(Instruction::ret_typed(Some(val), typ, typ_size));
                     }
                 } else {
@@ -2683,10 +2704,55 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a function call expression
     fn linearize_call(&mut self, expr: &Expr, func_expr: &Expr, args: &[Expr]) -> PseudoId {
-        // Get function name
-        let func_name = match &func_expr.kind {
-            ExprKind::Ident { name, .. } => self.str(*name).to_string(),
-            _ => "<indirect>".to_string(),
+        // Determine if this is a direct or indirect call.
+        // We need to check the TYPE of the function expression:
+        // - If it's TypeKind::Function, it's a direct call to a function
+        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
+        let is_function_pointer = func_expr.typ.is_some_and(|t| {
+            let typ = self.types.get(t);
+            typ.kind == TypeKind::Pointer
+        });
+
+        let (func_name, indirect_target) = match &func_expr.kind {
+            ExprKind::Ident { name, .. } if !is_function_pointer => {
+                // Direct call to named function (not a function pointer variable)
+                (self.str(*name).to_string(), None)
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } => {
+                // Explicit dereference form: (*fp)(args) or (*fpp)(args)
+                // Check the type of the operand to determine behavior:
+                // - If operand is function pointer (*fn): call through operand value
+                // - If operand is pointer-to-function-pointer (**fn): dereference first
+                let operand_type = self.expr_type(operand);
+                let operand_kind = self.types.kind(operand_type);
+                if operand_kind == TypeKind::Pointer {
+                    // Check what it points to
+                    let base_type = self.types.base_type(operand_type);
+                    let base_kind = base_type.map(|t| self.types.kind(t));
+                    if base_kind == Some(TypeKind::Function) {
+                        // Operand is function pointer - use its value directly
+                        let func_addr = self.linearize_expr(operand);
+                        ("<indirect>".to_string(), Some(func_addr))
+                    } else {
+                        // Operand is pointer-to-pointer - dereference to get function pointer
+                        let func_addr = self.linearize_expr(func_expr);
+                        ("<indirect>".to_string(), Some(func_addr))
+                    }
+                } else {
+                    // Unknown case - try to linearize the full expression
+                    let func_addr = self.linearize_expr(func_expr);
+                    ("<indirect>".to_string(), Some(func_addr))
+                }
+            }
+            _ => {
+                // Indirect call through function pointer variable: fp(args)
+                // This includes identifiers that are function pointer variables
+                let func_addr = self.linearize_expr(func_expr);
+                ("<indirect>".to_string(), Some(func_addr))
+            }
         };
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
@@ -2804,6 +2870,11 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
                 arg_types_vec.push(self.types.pointer_to(elem_type));
                 self.linearize_expr(a)
+            } else if arg_kind == TypeKind::Function {
+                // Function decay to pointer (C99 6.3.2.1)
+                // Function names passed as arguments decay to function pointers
+                arg_types_vec.push(self.types.pointer_to(arg_type));
+                self.linearize_expr(a)
             } else {
                 arg_types_vec.push(arg_type);
                 self.linearize_expr(a)
@@ -2820,14 +2891,27 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(result_pseudo);
             }
             let ptr_typ = self.types.pointer_to(typ);
-            let mut call_insn = Instruction::call(
-                Some(result),
-                &func_name,
-                arg_vals,
-                arg_types_vec,
-                ptr_typ,
-                64, // pointers are 64-bit
-            );
+            let mut call_insn = if let Some(func_addr) = indirect_target {
+                // Indirect call through function pointer
+                Instruction::call_indirect(
+                    Some(result),
+                    func_addr,
+                    arg_vals,
+                    arg_types_vec,
+                    ptr_typ,
+                    64, // pointers are 64-bit
+                )
+            } else {
+                // Direct call
+                Instruction::call(
+                    Some(result),
+                    &func_name,
+                    arg_vals,
+                    arg_types_vec,
+                    ptr_typ,
+                    64, // pointers are 64-bit
+                )
+            };
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_sret_call = true;
             call_insn.is_noreturn_call = is_noreturn_call;
@@ -2836,14 +2920,27 @@ impl<'a> Linearizer<'a> {
             result_sym
         } else {
             let ret_size = self.types.size_bits(typ);
-            let mut call_insn = Instruction::call(
-                Some(result_sym),
-                &func_name,
-                arg_vals,
-                arg_types_vec,
-                typ,
-                ret_size,
-            );
+            let mut call_insn = if let Some(func_addr) = indirect_target {
+                // Indirect call through function pointer
+                Instruction::call_indirect(
+                    Some(result_sym),
+                    func_addr,
+                    arg_vals,
+                    arg_types_vec,
+                    typ,
+                    ret_size,
+                )
+            } else {
+                // Direct call
+                Instruction::call(
+                    Some(result_sym),
+                    &func_name,
+                    arg_vals,
+                    arg_types_vec,
+                    typ,
+                    ret_size,
+                )
+            };
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.is_two_reg_return = returns_two_reg_struct;
@@ -3302,11 +3399,19 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(pseudo);
             }
             let typ = self.expr_type(expr);
+            let type_kind = self.types.kind(typ);
             // Arrays decay to pointers - get address, not value
-            if self.types.kind(typ) == TypeKind::Array {
+            if type_kind == TypeKind::Array {
                 let result = self.alloc_pseudo();
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
+                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                result
+            }
+            // Functions decay to function pointers - get address, not value
+            else if type_kind == TypeKind::Function {
+                let result = self.alloc_pseudo();
+                let ptr_type = self.types.pointer_to(typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             } else {
@@ -3385,7 +3490,12 @@ impl<'a> Linearizer<'a> {
 
                 let result = self.alloc_pseudo();
                 let typ = self.expr_type(expr); // Use evaluated type
-                let size = self.types.size_bits(typ);
+                                                // Function types in ternary expressions decay to pointers (64-bit)
+                let size = if self.types.kind(typ) == TypeKind::Function {
+                    64
+                } else {
+                    self.types.size_bits(typ)
+                };
 
                 self.emit(Instruction::select(
                     result, cond_val, then_val, else_val, typ, size,
@@ -5094,7 +5204,7 @@ mod tests {
     #[test]
     fn test_linearize_empty_function() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(test_id, Stmt::Block(vec![]), &types);
         let tu = TranslationUnit {
@@ -5110,7 +5220,7 @@ mod tests {
     #[test]
     fn test_linearize_return() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(test_id, Stmt::Return(Some(Expr::int(42, &types))), &types);
         let tu = TranslationUnit {
@@ -5125,7 +5235,7 @@ mod tests {
     #[test]
     fn test_linearize_if() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(
             test_id,
@@ -5148,7 +5258,7 @@ mod tests {
     #[test]
     fn test_linearize_while() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(
             test_id,
@@ -5169,7 +5279,7 @@ mod tests {
     #[test]
     fn test_linearize_for() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let i_id = strings.intern("i");
         // for (int i = 0; i < 10; i++) { }
@@ -5212,7 +5322,7 @@ mod tests {
     #[test]
     fn test_linearize_binary_expr() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         // return 1 + 2 * 3;
         let func = make_simple_func(
@@ -5243,7 +5353,7 @@ mod tests {
     #[test]
     fn test_linearize_function_with_params() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let add_id = strings.intern("add");
         let a_id = strings.intern("a");
         let b_id = strings.intern("b");
@@ -5283,7 +5393,7 @@ mod tests {
     #[test]
     fn test_linearize_call() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let foo_id = strings.intern("foo");
         let func = make_simple_func(
@@ -5308,7 +5418,7 @@ mod tests {
     #[test]
     fn test_linearize_comparison() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let func = make_simple_func(
             test_id,
@@ -5332,7 +5442,7 @@ mod tests {
     #[test]
     fn test_linearize_unsigned_comparison() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
 
         // Create unsigned comparison: (unsigned)1 < (unsigned)2
@@ -5362,7 +5472,7 @@ mod tests {
     #[test]
     fn test_display_module() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let main_id = strings.intern("main");
         let func = make_simple_func(main_id, Stmt::Return(Some(Expr::int(0, &types))), &types);
         let tu = TranslationUnit {
@@ -5382,7 +5492,7 @@ mod tests {
     #[test]
     fn test_type_propagation_expr_type() {
         let strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
 
         // Create an expression with a type annotation
         let mut expr = Expr::int(42, &types);
@@ -5406,7 +5516,7 @@ mod tests {
     #[test]
     fn test_type_propagation_double_literal() {
         let strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
 
         // Create a double literal
         let mut expr = Expr::new(ExprKind::FloatLit(3.14), test_pos());
@@ -5434,7 +5544,7 @@ mod tests {
     #[test]
     fn test_local_var_emits_load_store() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let x_id = strings.intern("x");
         // int test() { int x = 1; return x; }
@@ -5478,7 +5588,7 @@ mod tests {
     #[test]
     fn test_ssa_converts_local_to_phi() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let cond_id = strings.intern("cond");
         let x_id = strings.intern("x");
@@ -5540,7 +5650,7 @@ mod tests {
     #[test]
     fn test_ssa_loop_variable() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let i_id = strings.intern("i");
         // int test() {
@@ -5595,7 +5705,7 @@ mod tests {
     #[test]
     fn test_short_circuit_and() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let a_id = strings.intern("a");
         let b_id = strings.intern("b");
@@ -5651,7 +5761,7 @@ mod tests {
     #[test]
     fn test_short_circuit_or() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new();
+        let types = TypeTable::new(64);
         let test_id = strings.intern("test");
         let a_id = strings.intern("a");
         let b_id = strings.intern("b");

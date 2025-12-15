@@ -557,6 +557,11 @@ fn is_valid_tar_checksum(buf: &[u8]) -> bool {
         return false;
     }
 
+    // Reject if checksum contains a sign
+    if chksum_str.starts_with('+') || chksum_str.starts_with('-') {
+        return false;
+    }
+
     let stored = match u32::from_str_radix(chksum_str, 8) {
         Ok(v) => v,
         Err(_) => return false,

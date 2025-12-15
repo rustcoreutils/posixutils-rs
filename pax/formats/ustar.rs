@@ -273,6 +273,10 @@ fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     if s.is_empty() {
         return Ok(0);
     }
+    // Reject if the octal string contains a sign
+    if s.starts_with('+') || s.starts_with('-') {
+        return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
+    }
     u64::from_str_radix(&s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
 }
 

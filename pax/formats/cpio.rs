@@ -272,7 +272,12 @@ fn parse_header<R: Read>(header: &[u8; HEADER_SIZE], reader: &mut R) -> PaxResul
 fn parse_octal_field(bytes: &[u8]) -> PaxResult<u64> {
     let s = std::str::from_utf8(bytes)
         .map_err(|_| PaxError::InvalidHeader("invalid octal field".to_string()))?;
-    u64::from_str_radix(s.trim(), 8)
+    let s = s.trim();
+    // Reject if the octal string contains a sign
+    if s.starts_with('+') || s.starts_with('-') {
+        return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
+    }
+    u64::from_str_radix(s, 8)
         .map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
 }
 

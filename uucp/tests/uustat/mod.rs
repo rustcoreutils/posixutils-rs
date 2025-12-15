@@ -134,11 +134,16 @@ impl SpoolEnv {
     }
 
     fn run_uucp(&self, args: &[&str]) -> std::process::Output {
-        let relpath = if cfg!(debug_assertions) {
-            "target/debug/uucp"
+        // Determine the target directory - cargo-llvm-cov uses a custom target dir
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+            .unwrap_or_else(|_| String::from("target"));
+        let profile = if cfg!(debug_assertions) {
+            "debug"
         } else {
-            "target/release/uucp"
+            "release"
         };
+        let relpath = format!("{}/{}/uucp", target_dir, profile);
         let test_bin_path = std::env::current_dir()
             .unwrap()
             .parent()
@@ -154,11 +159,16 @@ impl SpoolEnv {
     }
 
     fn run_uustat(&self, args: &[&str]) -> std::process::Output {
-        let relpath = if cfg!(debug_assertions) {
-            "target/debug/uustat"
+        // Determine the target directory - cargo-llvm-cov uses a custom target dir
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+            .unwrap_or_else(|_| String::from("target"));
+        let profile = if cfg!(debug_assertions) {
+            "debug"
         } else {
-            "target/release/uustat"
+            "release"
         };
+        let relpath = format!("{}/{}/uustat", target_dir, profile);
         let test_bin_path = std::env::current_dir()
             .unwrap()
             .parent()

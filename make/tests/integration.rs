@@ -96,12 +96,18 @@ fn run_test_helper_with_setup_and_destruct(
 }
 
 fn manual_test_helper(args: &[&str]) -> Child {
-    // Determine the binary path based on the build profile
-    let relpath = if cfg!(debug_assertions) {
-        format!("target/debug/{}", "make")
+    // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    let target_dir = env::var("CARGO_TARGET_DIR")
+        .or_else(|_| env::var("CARGO_LLVM_COV_TARGET_DIR"))
+        .unwrap_or_else(|_| String::from("target"));
+
+    let profile = if cfg!(debug_assertions) {
+        "debug"
     } else {
-        format!("target/release/{}", "make")
+        "release"
     };
+
+    let relpath = format!("{}/{}/{}", target_dir, profile, "make");
 
     // Build the full path to the binary
     let test_bin_path = env::current_dir()

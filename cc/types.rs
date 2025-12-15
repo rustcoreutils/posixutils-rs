@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Type system for pcc C99 compiler
-// Based on sparse's compositional type model
+// Compositional type model with interning for efficient comparison
 //
 
 use crate::strings::StringId;
@@ -156,7 +156,7 @@ bitflags::bitflags! {
 // Type Kinds
 // ============================================================================
 
-/// Basic type kinds (mirrors sparse's SYM_* for types)
+/// Basic type kinds for C99 types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     // Basic types
@@ -217,7 +217,7 @@ impl fmt::Display for TypeKind {
 // Type Representation
 // ============================================================================
 
-/// A C type (compositional structure like sparse)
+/// A C type (compositional structure)
 ///
 /// Types are built compositionally using TypeId references:
 /// - `int *p` -> Pointer { base: TypeId(int) }

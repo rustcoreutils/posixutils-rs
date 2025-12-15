@@ -8,8 +8,7 @@
 //
 // SSA Conversion for pcc C99 compiler
 //
-// Based on sparse's ssa.c:
-// - Converts memory-based local variables to SSA form
+// Converts memory-based local variables to SSA form:
 // - Inserts phi nodes at dominance frontiers
 // - Renames variables to complete SSA construction
 //

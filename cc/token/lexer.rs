@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Lexer module for pcc - C99 Tokenizer
-// Based on the sparse compiler design by Linus Torvalds
+// Implements C99 preprocessing token lexing (pp-number, pp-tokens)
 //
 
 use crate::diag;
@@ -20,7 +20,7 @@ pub use crate::diag::Position;
 // Token Types
 // ============================================================================
 
-/// Token types following sparse's model
+/// Token types for C99 preprocessing tokens
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
     Ident,
@@ -85,7 +85,7 @@ pub type IdentTable = StringTable;
 // Token Value
 // ============================================================================
 
-/// Token value - union-like enum following sparse's model
+/// Token value - type-specific payload for each token kind
 #[derive(Debug, Clone)]
 pub enum TokenValue {
     None,
@@ -128,7 +128,7 @@ impl Token {
 // Character Classification
 // ============================================================================
 
-/// Character class flags (following sparse's cclass)
+/// Character class flags for lexer character classification
 const LETTER: u8 = 1;
 const DIGIT: u8 = 2;
 const HEX: u8 = 4;
@@ -200,7 +200,7 @@ impl Default for StreamTable {
 
 const EOF: i32 = -1;
 
-/// C Tokenizer following sparse's design
+/// C99 tokenizer with line splicing and position tracking
 pub struct Tokenizer<'a, 'b> {
     // Input
     buffer: &'a [u8],
@@ -687,7 +687,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 
     /// Skip a block comment (/* ... */)
-    /// Based on sparse's drop_stream_comment implementation
     fn skip_block_comment(&mut self) {
         let pos = self.pos(); // Save position for warning
         // Track both current and next character to properly detect */
@@ -1243,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_dotdot_operator() {
-        // .. is used in sparse (range), test it doesn't break
+        // .. is a two-character operator (range extension)
         let (tokens, idents) = tokenize_str("a .. b");
         let ops: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
@@ -1593,7 +1592,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Diagnostic warning tests (sparse compatibility)
+    // Diagnostic warning tests
     // ========================================================================
 
     #[test]

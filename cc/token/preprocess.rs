@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // C Preprocessor
-// Based on the sparse compiler design by Linus Torvalds
+// Implements C99 preprocessing directives and macro expansion
 //
 // Main API: preprocess(tokens, target, idents) -> preprocessed_tokens
 //

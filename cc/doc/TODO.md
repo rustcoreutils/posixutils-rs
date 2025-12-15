@@ -413,7 +413,7 @@ _Noreturn void exit(int status);
 
 ### Overview
 
-The compiler uses a sparse-style SSA IR, which is well-suited for classical optimizations. Passes are run iteratively until a fixed point is reached.
+The compiler uses an SSA-form IR, which is well-suited for classical optimizations. Passes are run iteratively until a fixed point is reached.
 
 ### Pass 1: SCCP - Sparse Conditional Constant Propagation
 

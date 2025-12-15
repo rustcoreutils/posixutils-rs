@@ -55,10 +55,7 @@ pub fn find_call_positions(func: &Function) -> Vec<usize> {
     let mut pos = 0usize;
     for block in &func.blocks {
         for insn in &block.insns {
-            if matches!(
-                insn.op,
-                Opcode::Call | Opcode::Longjmp | Opcode::Setjmp
-            ) {
+            if matches!(insn.op, Opcode::Call | Opcode::Longjmp | Opcode::Setjmp) {
                 call_positions.push(pos);
             }
             pos += 1;

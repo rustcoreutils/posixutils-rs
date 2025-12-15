@@ -15,11 +15,18 @@ use std::{
 use plib::testing::TestPlan;
 
 fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
-    let relpath = if cfg!(debug_assertions) {
-        format!("target/debug/{}", cmd)
+    // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+        .unwrap_or_else(|_| String::from("target"));
+
+    let profile = if cfg!(debug_assertions) {
+        "debug"
     } else {
-        format!("target/release/{}", cmd)
+        "release"
     };
+
+    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
     let test_bin_path = std::env::current_dir()
         .unwrap()
         .parent()

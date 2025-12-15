@@ -30,7 +30,16 @@ fn run_test_find_sorted(
     expected_exit_code: i32,
 ) {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let find_path = format!("{}/../target/release/find", project_root);
+    // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+        .unwrap_or_else(|_| String::from("target"));
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let find_path = format!("{}/../{}/{}/find", project_root, target_dir, profile);
 
     let output = Command::new(&find_path)
         .args(args)
@@ -261,7 +270,16 @@ fn find_newer_test() {
 /// Run find and compare null-delimited output (for -print0 testing)
 fn run_test_find_print0_sorted(args: &[&str], expected_paths: &[&str], expected_exit_code: i32) {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let find_path = format!("{}/../target/release/find", project_root);
+    // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+        .unwrap_or_else(|_| String::from("target"));
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let find_path = format!("{}/../{}/{}/find", project_root, target_dir, profile);
 
     let output = Command::new(&find_path)
         .args(args)

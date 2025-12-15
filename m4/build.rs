@@ -271,11 +271,17 @@ fn run_command(input: &Path) -> std::process::Output {
                 .output()
                 .unwrap();
 
+            // Determine the target directory - cargo-llvm-cov uses a custom target dir
+            let target_dir = std::env::var("CARGO_TARGET_DIR")
+                .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+                .unwrap_or_else(|_| String::from("target"));
+            let m4_path = format!("../{}/debug/m4", target_dir);
+
             log::info!("RUST_LOG is ignored for this test because it interferes with output");
             let output = std::process::Command::new("sh")
                 .env("RUST_LOG", "") // Disable rust log output because it interferes with the test.
                 .arg("-c")
-                .arg(format!("../target/debug/m4 {args}"))
+                .arg(format!("{m4_path} {args}"))
                 .output()
                 .unwrap();
 

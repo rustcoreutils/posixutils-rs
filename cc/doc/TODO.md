@@ -381,7 +381,6 @@ TLS is **significantly more complex** than alignment:
 |---------|-------------|------------|
 | `_Static_assert(expr, msg)` | Compile-time assertion | Easy |
 | `_Generic(expr, type: val, ...)` | Type-generic selection | Moderate |
-| `_Noreturn` | Function attribute (never returns) | Easy |
 | Anonymous structs/unions | `struct { struct { int x; }; };` | Moderate |
 | `<stdalign.h>` | `alignas`/`alignof` macros | Preprocessor only |
 
@@ -395,17 +394,6 @@ _Static_assert(sizeof(int) == 4, "int must be 32 bits");
 2. Semantic: evaluate expression at compile time
 3. If false: emit error with the string message
 4. No codegen needed - purely compile-time
-
-#### `_Noreturn` Implementation
-
-```c
-_Noreturn void exit(int status);
-```
-
-1. Parser: recognize as function specifier
-2. Type system: mark function type as noreturn
-3. Semantic: warn if function can return
-4. Codegen: can omit function epilogue, enable optimizations
 
 ---
 

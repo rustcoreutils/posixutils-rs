@@ -792,3 +792,13 @@ if (ptr == NULL) {
 
 **Standard Header Compatibility**:
 This builtin is compatible with GCC and Clang.
+
+## Not Yet Implemented
+
+The following builtins are planned but not yet available:
+
+| Builtin | Purpose |
+|---------|---------|
+| `__builtin_expect(expr, c)` | Branch prediction hint |
+| `__sync_synchronize()` | Full memory barrier |
+| `__sync_fetch_and_add(ptr, val)` | Atomic fetch-and-add |

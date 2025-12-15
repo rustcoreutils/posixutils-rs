@@ -35,13 +35,17 @@ Key source files:
 | `parse/ast.rs` | AST node definitions |
 | `types.rs` | C type system |
 | `symbol.rs` | Symbol table with scope management |
-| `linearize.rs` | AST → IR conversion, SSA construction |
-| `ir.rs` | Intermediate representation definitions |
-| `ssa.rs` | SSA phi node insertion |
-| `lower.rs` | IR lowering passes (phi elimination) |
-| `dominate.rs` | Dominator tree and dominance frontiers |
-| `codegen/x86_64/` | x86-64 code generator |
-| `codegen/aarch64/` | AArch64 code generator |
+| `ir/linearize.rs` | AST → IR conversion, SSA construction |
+| `ir/mod.rs` | Intermediate representation definitions |
+| `ir/ssa.rs` | SSA phi node insertion |
+| `ir/lower.rs` | IR lowering passes (phi elimination) |
+| `ir/dominate.rs` | Dominator tree and dominance frontiers |
+| `ir/dce.rs` | Dead code elimination |
+| `ir/instcombine.rs` | Instruction combining/simplification |
+| `arch/x86_64/` | x86-64 code generator |
+| `arch/aarch64/` | AArch64 code generator |
+| `arch/lir.rs` | Low-level IR (LIR) definitions |
+| `arch/regalloc.rs` | Register allocation |
 
 ## Debugging
 
@@ -74,6 +78,7 @@ EOF
 
 Supported:
 - C99 standard
+- GCC-compatible inline assembly (extended asm with constraints, clobbers, asm goto)
 
 Not yet implemented (exceptions to C99, or features we want to add):
 - Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)

@@ -21,6 +21,13 @@ This directory contains detailed documentation for the pcc C compiler.
   - `_Noreturn` - C11 noreturn specifier
   - `__has_attribute()` - Compile-time attribute query
 
+- **Inline Assembly**: See [../README.md](../README.md)
+  - GCC extended asm syntax (`__asm__`, `asm`)
+  - Constraints (`=r`, `+r`, `r`, `m`, register-specific)
+  - Clobbers (`memory`, `cc`, registers)
+  - Named operands, matching constraints
+  - `asm goto` with label references
+
 - **Builtins**: [BUILTIN.md](BUILTIN.md)
   - Variadic functions (`va_start`, `va_arg`, `va_end`, `va_copy`)
   - Byte swapping (`__builtin_bswap16/32/64`)

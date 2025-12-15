@@ -464,9 +464,11 @@ pub struct AsmConstraint {
     pub name: Option<String>,
     /// Matching output operand index (for constraints like "0")
     pub matching_output: Option<usize>,
-    /// Early clobber flag - output is written before inputs are read
-    /// This means the output cannot share a register with any input
-    pub is_earlyclobber: bool,
+    /// The constraint string (e.g., "r", "a", "=r", "+m")
+    /// Used by codegen to determine specific register requirements
+    /// Note: Early clobber (&) is parsed but not explicitly handled since our
+    /// simple register allocator doesn't share registers between inputs/outputs
+    pub constraint: String,
 }
 
 /// Data for an inline assembly instruction
@@ -480,6 +482,9 @@ pub struct AsmData {
     pub inputs: Vec<AsmConstraint>,
     /// Clobber list: registers and special values ("memory", "cc")
     pub clobbers: Vec<String>,
+    /// Goto labels for asm goto: BasicBlockIds the asm can jump to
+    /// Referenced in template as %l0, %l1, ... or %l[name]
+    pub goto_labels: Vec<(BasicBlockId, String)>,
 }
 
 // ============================================================================

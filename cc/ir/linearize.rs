@@ -1202,8 +1202,9 @@ impl<'a> Linearizer<'a> {
                 outputs,
                 inputs,
                 clobbers,
+                goto_labels,
             } => {
-                self.linearize_asm(template, outputs, inputs, clobbers);
+                self.linearize_asm(template, outputs, inputs, clobbers, goto_labels);
             }
         }
     }
@@ -2145,6 +2146,7 @@ impl<'a> Linearizer<'a> {
         outputs: &[AsmOperand],
         inputs: &[AsmOperand],
         clobbers: &[String],
+        goto_labels: &[StringId],
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
@@ -2155,8 +2157,7 @@ impl<'a> Linearizer<'a> {
             let pseudo = self.alloc_pseudo();
 
             // Parse constraint to get flags
-            let (_is_memory, is_readwrite, _matching, is_earlyclobber) =
-                self.parse_asm_constraint(&op.constraint);
+            let (_is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
@@ -2175,7 +2176,7 @@ impl<'a> Linearizer<'a> {
                     pseudo, // Same pseudo as output - ensures same register
                     name: name.clone(),
                     matching_output: None,
-                    is_earlyclobber: false, // Only outputs can be early clobber
+                    constraint: op.constraint.clone(),
                 });
             }
 
@@ -2183,13 +2184,13 @@ impl<'a> Linearizer<'a> {
                 pseudo,
                 name,
                 matching_output: None,
-                is_earlyclobber,
+                constraint: op.constraint.clone(),
             });
         }
 
         // Process input operands
         for op in inputs {
-            let (is_memory, _, matching, _) = self.parse_asm_constraint(&op.constraint);
+            let (is_memory, _, matching) = self.parse_asm_constraint(&op.constraint);
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
@@ -2227,9 +2228,19 @@ impl<'a> Linearizer<'a> {
                 pseudo,
                 name,
                 matching_output: matching,
-                is_earlyclobber: false, // Inputs are never early clobber
+                constraint: op.constraint.clone(),
             });
         }
+
+        // Process goto labels - map label names to BasicBlockIds
+        let ir_goto_labels: Vec<(BasicBlockId, String)> = goto_labels
+            .iter()
+            .map(|label_id| {
+                let label_name = self.str(*label_id).to_string();
+                let bb = self.get_or_create_label(&label_name);
+                (bb, label_name)
+            })
+            .collect();
 
         // Create the asm data
         let asm_data = AsmData {
@@ -2237,10 +2248,37 @@ impl<'a> Linearizer<'a> {
             outputs: ir_outputs.clone(),
             inputs: ir_inputs,
             clobbers: clobbers.to_vec(),
+            goto_labels: ir_goto_labels.clone(),
         };
 
         // Emit the asm instruction
         self.emit(Instruction::asm(asm_data));
+
+        // For asm goto: add edges to all possible label targets
+        // The asm may jump to any of these labels, so control flow can go there
+        if !ir_goto_labels.is_empty() {
+            if let Some(current) = self.current_bb {
+                // After the asm instruction, we need a basic block for fall-through
+                // and edges to all goto targets
+                let fall_through = self.alloc_bb();
+
+                // Add edges to all goto label targets
+                for (target_bb, _) in &ir_goto_labels {
+                    self.link_bb(current, *target_bb);
+                }
+
+                // Add edge to fall-through (normal case when asm doesn't jump)
+                self.link_bb(current, fall_through);
+
+                // Emit an explicit branch to the fallthrough block
+                // This is necessary because the asm goto acts as a conditional terminator
+                // Without this, code would fall through to whatever block comes next in layout
+                self.emit(Instruction::br(fall_through));
+
+                // Switch to fall-through block for subsequent instructions
+                self.current_bb = Some(fall_through);
+            }
+        }
 
         // Store outputs back to their destinations
         // store(value, addr, ...) - value first, then address
@@ -2254,18 +2292,18 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Parse an asm constraint string to extract flags
-    /// Returns (is_memory, is_readwrite, matching_output, is_earlyclobber)
-    fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>, bool) {
+    /// Returns (is_memory, is_readwrite, matching_output)
+    /// Note: Early clobber (&) is parsed but not used since our simple register
+    /// allocator doesn't share registers between inputs and outputs anyway
+    fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>) {
         let mut is_memory = false;
         let mut is_readwrite = false;
         let mut matching = None;
-        let mut is_earlyclobber = false;
 
         for c in constraint.chars() {
             match c {
                 '+' => is_readwrite = true,
-                '&' => is_earlyclobber = true,
-                '=' | '%' => {} // Output-only, commutative - handled elsewhere
+                '&' | '=' | '%' => {} // Early clobber, output-only, commutative
                 'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' => {} // Register constraints
                 'm' | 'o' | 'V' | 'Q' => is_memory = true,
                 'i' | 'n' | 'g' | 'X' => {} // Immediate, general
@@ -2274,7 +2312,7 @@ impl<'a> Linearizer<'a> {
             }
         }
 
-        (is_memory, is_readwrite, matching, is_earlyclobber)
+        (is_memory, is_readwrite, matching)
     }
 
     fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

@@ -4211,12 +4211,24 @@ impl Aarch64CodeGen {
             }
         }
 
-        // Substitute %0, %1, %[name], etc. in the template with actual operands
+        // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
+        let goto_labels_formatted: Vec<(String, String)> = asm_data
+            .goto_labels
+            .iter()
+            .map(|(bb_id, name)| {
+                // Format label as .Lfunc_bbid (same format as Label::name())
+                let label_str = format!(".L{}_{}", self.current_fn, bb_id.0);
+                (label_str, name.clone())
+            })
+            .collect();
+
+        // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
         let asm_output = self.substitute_asm_operands(
             &asm_data.template,
             &operand_regs,
             &operand_mem,
             &operand_names,
+            &goto_labels_formatted,
         );
 
         // Emit the inline assembly as raw text
@@ -4265,13 +4277,15 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Substitute %0, %1, %[name], etc. in asm template with actual operands
+    /// Substitute %0, %1, %[name], %l0, %l[name], etc. in asm template with actual operands
+    /// goto_labels: (label_string, label_name) - label_string is the fully formatted label
     fn substitute_asm_operands(
         &self,
         template: &str,
         operand_regs: &[Option<Reg>],
         operand_mem: &[Option<String>],
         operand_names: &[Option<String>],
+        goto_labels: &[(String, String)],
     ) -> String {
         let mut result = String::new();
         let mut chars = template.chars().peekable();
@@ -4400,6 +4414,52 @@ impl Aarch64CodeGen {
                         } else {
                             result.push('%');
                             result.push(size_mod);
+                        }
+                    } else if next == 'l' {
+                        // %l - label reference for asm goto: %l0, %l1, %l[name]
+                        chars.next(); // consume 'l'
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch == '[' {
+                                // %l[name] - named label reference
+                                chars.next(); // consume '['
+                                let mut name = String::new();
+                                while let Some(&ch) = chars.peek() {
+                                    if ch == ']' {
+                                        chars.next();
+                                        break;
+                                    }
+                                    name.push(ch);
+                                    chars.next();
+                                }
+                                // Look up label by name (label_string, label_name)
+                                if let Some((label_str, _)) =
+                                    goto_labels.iter().find(|(_, n)| n == &name)
+                                {
+                                    result.push_str(label_str);
+                                } else {
+                                    // Unknown label, pass through
+                                    result.push_str("%l[");
+                                    result.push_str(&name);
+                                    result.push(']');
+                                }
+                            } else if next_ch.is_ascii_digit() {
+                                // %l0, %l1, etc. - numeric label reference
+                                chars.next();
+                                let idx = (next_ch as usize) - ('0' as usize);
+                                if idx < goto_labels.len() {
+                                    let (label_str, _) = &goto_labels[idx];
+                                    result.push_str(label_str);
+                                } else {
+                                    // Unknown label index, pass through
+                                    result.push_str("%l");
+                                    result.push(next_ch);
+                                }
+                            } else {
+                                // Just %l without number or name, pass through
+                                result.push_str("%l");
+                            }
+                        } else {
+                            result.push_str("%l");
                         }
                     } else {
                         // Unknown modifier - emit literally

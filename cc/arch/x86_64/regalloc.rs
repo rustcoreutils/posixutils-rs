@@ -381,7 +381,7 @@ impl XmmReg {
 // ============================================================================
 
 /// Location of a value
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Loc {
     /// In a general-purpose register
     Reg(Reg),

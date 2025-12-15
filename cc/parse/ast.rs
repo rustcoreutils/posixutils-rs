@@ -637,7 +637,7 @@ pub enum Stmt {
     Default,
 
     /// Inline assembly statement (GCC extended asm)
-    /// Format: asm [volatile] ( "template" : outputs : inputs : clobbers );
+    /// Format: asm [volatile] [goto] ( "template" : outputs : inputs : clobbers [: goto_labels] );
     Asm {
         /// The assembly template string with %0, %1, etc. placeholders
         template: String,
@@ -647,6 +647,8 @@ pub enum Stmt {
         inputs: Vec<AsmOperand>,
         /// Clobber list: registers and special values ("memory", "cc")
         clobbers: Vec<String>,
+        /// Goto labels for asm goto (4th colon): labels the asm can jump to
+        goto_labels: Vec<StringId>,
     },
 }
 

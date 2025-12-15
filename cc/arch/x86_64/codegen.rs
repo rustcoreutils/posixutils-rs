@@ -4831,27 +4831,100 @@ impl X86_64CodeGen {
             None => return,
         };
 
+        // First pass: collect all specific register constraints to build reserved set
+        // This prevents non-specific operands from using registers needed by specific constraints
+        let mut reserved_regs: std::collections::HashSet<Reg> = std::collections::HashSet::new();
+        for output in &asm_data.outputs {
+            if let Some(r) = Self::constraint_to_specific_reg(&output.constraint) {
+                reserved_regs.insert(r);
+            }
+        }
+        for input in &asm_data.inputs {
+            if let Some(r) = Self::constraint_to_specific_reg(&input.constraint) {
+                reserved_regs.insert(r);
+            }
+        }
+
         // Build operand strings for asm substitution
-        // We use the actual locations assigned by the register allocator
-        // so that subsequent Store instructions work correctly.
+        // For constraints requiring specific registers (a,b,c,d,S,D), we use those registers
+        // and emit mov instructions to/from the actual locations.
         let mut operand_regs: Vec<Option<Reg>> = Vec::new();
         let mut operand_mem: Vec<Option<String>> = Vec::new();
         let mut operand_names: Vec<Option<String>> = Vec::new();
 
+        // Track which outputs need to be moved from specific registers after asm
+        // (output_idx, specific_reg, actual_loc)
+        let mut output_moves: Vec<(usize, Reg, Loc)> = Vec::new();
+
+        // Track which inputs need to be moved to specific registers before asm
+        // (specific_reg, actual_loc)
+        let mut input_moves: Vec<(Reg, Loc)> = Vec::new();
+
+        // Track register remaps: if an allocated reg conflicts with reserved, use temp
+        // (original_reg, temp_reg, actual_loc for restore)
+        let mut remap_setup: Vec<(Reg, Reg, Loc)> = Vec::new();
+        let mut remap_restore: Vec<(Reg, Reg, Loc)> = Vec::new();
+
+        // Track which pseudos have been assigned temp registers (for +r where input/output share pseudo)
+        let mut pseudo_to_temp: std::collections::HashMap<PseudoId, Reg> =
+            std::collections::HashMap::new();
+
+        // Helper to find a temp register not in reserved or already used
+        let find_temp_reg = |reserved: &std::collections::HashSet<Reg>,
+                             used: &std::collections::HashSet<Reg>|
+         -> Reg {
+            // Try R10, R11 first (caller-saved, rarely used for args)
+            for r in [Reg::R10, Reg::R11, Reg::R8, Reg::R9, Reg::Rsi, Reg::Rdi] {
+                if !reserved.contains(&r) && !used.contains(&r) {
+                    return r;
+                }
+            }
+            Reg::R10 // Fallback
+        };
+
+        let mut used_regs: std::collections::HashSet<Reg> = reserved_regs.clone();
+
         // Process output operands (they go first: %0, %1, etc.)
-        for output in &asm_data.outputs {
+        for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
             operand_names.push(output.name.clone());
-            match loc {
-                Loc::Reg(r) => {
-                    operand_regs.push(Some(r));
-                    operand_mem.push(None);
+
+            // Check for specific register constraint
+            if let Some(specific_reg) = Self::constraint_to_specific_reg(&output.constraint) {
+                // Output goes to specific register, then we'll move to actual loc after asm
+                operand_regs.push(Some(specific_reg));
+                operand_mem.push(None);
+                // Only need to move if actual loc is different from specific reg
+                if loc != Loc::Reg(specific_reg) {
+                    output_moves.push((idx, specific_reg, loc));
                 }
-                _ => {
-                    // Memory or other location - emit as memory operand
-                    let mem_str = self.loc_to_asm_string(&loc);
-                    operand_regs.push(None);
-                    operand_mem.push(Some(mem_str));
+            } else {
+                // No specific register - use allocated location
+                match loc {
+                    Loc::Reg(r) => {
+                        // Check if allocated reg conflicts with reserved
+                        if reserved_regs.contains(&r) {
+                            // Use a temp register instead
+                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            used_regs.insert(temp);
+                            operand_regs.push(Some(temp));
+                            operand_mem.push(None);
+                            // For outputs, move from temp to actual loc after asm
+                            remap_restore.push((temp, r, loc.clone()));
+                            // Track this pseudo -> temp mapping for +r inputs
+                            pseudo_to_temp.insert(output.pseudo, temp);
+                        } else {
+                            operand_regs.push(Some(r));
+                            operand_mem.push(None);
+                            used_regs.insert(r);
+                        }
+                    }
+                    _ => {
+                        // Memory or other location - emit as memory operand
+                        let mem_str = self.loc_to_asm_string(&loc);
+                        operand_regs.push(None);
+                        operand_mem.push(Some(mem_str));
+                    }
                 }
             }
         }
@@ -4860,43 +4933,104 @@ impl X86_64CodeGen {
 
         // Process input operands
         for input in &asm_data.inputs {
-            // Handle matching constraints - use the matched output's location
-            let loc = if let Some(match_idx) = input.matching_output {
+            // Handle matching constraints - use the matched output's location/register
+            let (loc, constraint_for_reg) = if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
-                    self.get_location(asm_data.outputs[match_idx].pseudo)
+                    // Use the same register/location as the matched output
+                    (
+                        self.get_location(asm_data.outputs[match_idx].pseudo),
+                        &asm_data.outputs[match_idx].constraint,
+                    )
                 } else {
-                    self.get_location(input.pseudo)
+                    (self.get_location(input.pseudo), &input.constraint)
                 }
             } else {
-                self.get_location(input.pseudo)
+                (self.get_location(input.pseudo), &input.constraint)
             };
 
             operand_names.push(input.name.clone());
-            match loc {
-                Loc::Reg(r) => {
-                    operand_regs.push(Some(r));
+
+            // Check for specific register constraint
+            if let Some(specific_reg) = Self::constraint_to_specific_reg(constraint_for_reg) {
+                // Input must go to specific register
+                operand_regs.push(Some(specific_reg));
+                operand_mem.push(None);
+                // Only need to move if actual loc is different from specific reg
+                if loc != Loc::Reg(specific_reg) {
+                    input_moves.push((specific_reg, loc));
+                }
+            } else {
+                // Check if this input shares a pseudo with an output that was remapped
+                // This happens with +r constraints where input and output share the same pseudo
+                if let Some(&temp) = pseudo_to_temp.get(&input.pseudo) {
+                    // Reuse the same temp register as the output
+                    operand_regs.push(Some(temp));
                     operand_mem.push(None);
-                }
-                Loc::Imm(v) => {
-                    // Immediate value
-                    operand_regs.push(None);
-                    operand_mem.push(Some(format!("${}", v)));
-                }
-                _ => {
-                    // Memory or other location
-                    let mem_str = self.loc_to_asm_string(&loc);
-                    operand_regs.push(None);
-                    operand_mem.push(Some(mem_str));
+                    // Add setup move to load value into temp
+                    remap_setup.push((temp, temp, loc.clone()));
+                } else {
+                    // No specific register - use allocated location
+                    match loc {
+                        Loc::Reg(r) => {
+                            // Check if allocated reg conflicts with reserved
+                            if reserved_regs.contains(&r) {
+                                // Use a temp register instead
+                                let temp = find_temp_reg(&reserved_regs, &used_regs);
+                                used_regs.insert(temp);
+                                operand_regs.push(Some(temp));
+                                operand_mem.push(None);
+                                // For inputs, move from actual loc to temp before asm
+                                remap_setup.push((r, temp, loc.clone()));
+                            } else {
+                                operand_regs.push(Some(r));
+                                operand_mem.push(None);
+                                used_regs.insert(r);
+                            }
+                        }
+                        Loc::Imm(v) => {
+                            // Immediate value
+                            operand_regs.push(None);
+                            operand_mem.push(Some(format!("${}", v)));
+                        }
+                        _ => {
+                            // Memory or other location
+                            let mem_str = self.loc_to_asm_string(&loc);
+                            operand_regs.push(None);
+                            operand_mem.push(Some(mem_str));
+                        }
+                    }
                 }
             }
         }
 
-        // Substitute %0, %1, %[name], etc. in the template with actual operands
+        // Emit remap setup moves (for inputs that conflicted with reserved regs)
+        for (_orig, temp, actual_loc) in &remap_setup {
+            self.emit_raw_mov_from_loc(actual_loc, *temp);
+        }
+
+        // Emit moves from actual locations to specific registers (for inputs)
+        for (specific_reg, actual_loc) in &input_moves {
+            self.emit_raw_mov_from_loc(actual_loc, *specific_reg);
+        }
+
+        // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
+        let goto_labels_formatted: Vec<(String, String)> = asm_data
+            .goto_labels
+            .iter()
+            .map(|(bb_id, name)| {
+                // Format label as .Lfunc_bbid (same format as Label::name())
+                let label_str = format!(".L{}_{}", self.current_fn, bb_id.0);
+                (label_str, name.clone())
+            })
+            .collect();
+
+        // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
         let asm_output = self.substitute_asm_operands(
             &asm_data.template,
             &operand_regs,
             &operand_mem,
             &operand_names,
+            &goto_labels_formatted,
         );
 
         // Emit the inline assembly as raw text
@@ -4906,6 +5040,16 @@ impl X86_64CodeGen {
             if !trimmed.is_empty() {
                 self.push_lir(X86Inst::Directive(Directive::Raw(trimmed.to_string())));
             }
+        }
+
+        // Emit moves from specific registers to actual locations (for outputs)
+        for (_idx, specific_reg, actual_loc) in &output_moves {
+            self.emit_raw_mov_to_loc(*specific_reg, actual_loc);
+        }
+
+        // Emit remap restore moves (for outputs that conflicted with reserved regs)
+        for (temp, _orig, actual_loc) in &remap_restore {
+            self.emit_raw_mov_to_loc(*temp, actual_loc);
         }
 
         // Handle clobbers - for now just emit comments for documentation
@@ -4923,6 +5067,87 @@ impl X86_64CodeGen {
                     // Register clobber - could save/restore if needed
                     // For now, trust that the register allocator has handled this
                 }
+            }
+        }
+    }
+
+    /// Emit a raw mov instruction from a location to a register (for asm input setup)
+    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg) {
+        let dest_name = self.reg_name_64(dest_reg);
+        match loc {
+            Loc::Reg(src_reg) => {
+                let src_name = self.reg_name_64(*src_reg);
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movq %{}, %{}",
+                    src_name, dest_name
+                ))));
+            }
+            Loc::Stack(offset) => {
+                let adjusted = offset + self.callee_saved_offset;
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl -{}(%rbp), %{}",
+                    adjusted,
+                    self.sized_reg_name(dest_reg, 'k') // 32-bit for int
+                ))));
+            }
+            Loc::Imm(v) => {
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl ${}, %{}",
+                    v,
+                    self.sized_reg_name(dest_reg, 'k')
+                ))));
+            }
+            Loc::Global(name) => {
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl {}(%rip), %{}",
+                    name,
+                    self.sized_reg_name(dest_reg, 'k')
+                ))));
+            }
+            _ => {
+                // Other locations - use generic string
+                let loc_str = self.loc_to_asm_string(loc);
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl {}, %{}",
+                    loc_str,
+                    self.sized_reg_name(dest_reg, 'k')
+                ))));
+            }
+        }
+    }
+
+    /// Emit a raw mov instruction from a register to a location (for asm output store)
+    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc) {
+        let src_name = self.sized_reg_name(src_reg, 'k'); // 32-bit for int
+        match loc {
+            Loc::Reg(dest_reg) => {
+                let dest_name = self.reg_name_64(*dest_reg);
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movq %{}, %{}",
+                    self.reg_name_64(src_reg),
+                    dest_name
+                ))));
+            }
+            Loc::Stack(offset) => {
+                let adjusted = offset + self.callee_saved_offset;
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl %{}, -{}(%rbp)",
+                    src_name, adjusted
+                ))));
+            }
+            Loc::Global(name) => {
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl %{}, {}(%rip)",
+                    src_name, name
+                ))));
+            }
+            _ => {
+                // Other locations - use generic string
+                let loc_str = self.loc_to_asm_string(loc);
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "movl %{}, {}",
+                    src_name, loc_str
+                ))));
             }
         }
     }
@@ -4967,13 +5192,35 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Substitute %0, %1, %[name], etc. with actual operand strings
+    /// Extract the specific register required by an x86 asm constraint.
+    /// Returns Some(Reg) if the constraint requires a specific register,
+    /// None if any register is acceptable (e.g., "r").
+    fn constraint_to_specific_reg(constraint: &str) -> Option<Reg> {
+        // Scan constraint for specific register indicators
+        // Skip modifiers like =, +, &, %
+        for c in constraint.chars() {
+            match c {
+                'a' => return Some(Reg::Rax),
+                'b' => return Some(Reg::Rbx),
+                'c' => return Some(Reg::Rcx),
+                'd' => return Some(Reg::Rdx),
+                'S' => return Some(Reg::Rsi),
+                'D' => return Some(Reg::Rdi),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Substitute %0, %1, %[name], %l0, %l[name], etc. with actual operand strings
+    /// goto_labels: (label_string, label_name) - label_string is the fully formatted label
     fn substitute_asm_operands(
         &self,
         template: &str,
         regs: &[Option<Reg>],
         mems: &[Option<String>],
         names: &[Option<String>],
+        goto_labels: &[(String, String)],
     ) -> String {
         let mut result = String::with_capacity(template.len() * 2);
         let mut chars = template.chars().peekable();
@@ -5033,6 +5280,53 @@ impl X86_64CodeGen {
                             // Unknown operand, pass through
                             result.push('%');
                             result.push(d);
+                        }
+                    }
+                    Some('l') => {
+                        // %l - label reference for asm goto: %l0, %l1, %l[name]
+                        chars.next(); // consume 'l'
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch == '[' {
+                                // %l[name] - named label reference
+                                chars.next(); // consume '['
+                                let mut name = String::new();
+                                while let Some(&ch) = chars.peek() {
+                                    if ch == ']' {
+                                        chars.next();
+                                        break;
+                                    }
+                                    name.push(ch);
+                                    chars.next();
+                                }
+                                // Look up label by name (label_string, label_name)
+                                if let Some((label_str, _)) =
+                                    goto_labels.iter().find(|(_, n)| n == &name)
+                                {
+                                    result.push_str(label_str);
+                                } else {
+                                    // Unknown label, pass through
+                                    result.push_str("%l[");
+                                    result.push_str(&name);
+                                    result.push(']');
+                                }
+                            } else if next_ch.is_ascii_digit() {
+                                // %l0, %l1, etc. - numeric label reference
+                                chars.next();
+                                let idx = (next_ch as usize) - ('0' as usize);
+                                if idx < goto_labels.len() {
+                                    let (label_str, _) = &goto_labels[idx];
+                                    result.push_str(label_str);
+                                } else {
+                                    // Unknown label index, pass through
+                                    result.push_str("%l");
+                                    result.push(next_ch);
+                                }
+                            } else {
+                                // Just %l without number or name, pass through
+                                result.push_str("%l");
+                            }
+                        } else {
+                            result.push_str("%l");
                         }
                     }
                     Some(&d) if d == 'b' || d == 'w' || d == 'k' || d == 'q' => {

@@ -519,12 +519,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse GCC extended inline assembly statement
-    /// Format: __asm__ [volatile] ( "template" [: outputs [: inputs [: clobbers]]] );
+    /// Format: __asm__ [volatile] [goto] ( "template" [: outputs [: inputs [: clobbers [: goto_labels]]]] );
     fn parse_asm_statement(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume __asm/__asm__
 
-        // Parse optional 'volatile' or '__volatile__' or 'inline' or '__inline__'
+        // Parse optional qualifiers: 'volatile', '__volatile__', 'inline', '__inline__', 'goto'
         let mut is_volatile = false;
+        let mut _is_goto = false;
         while self.peek() == TokenType::Ident {
             if let Some(name) = self.get_ident_name(self.current()) {
                 match name.as_str() {
@@ -534,6 +535,11 @@ impl<'a> Parser<'a> {
                     }
                     "inline" | "__inline__" => {
                         // inline qualifier - just consume it (affects inlining decisions)
+                        self.advance();
+                    }
+                    "goto" => {
+                        // goto qualifier - indicates asm can jump to C labels
+                        _is_goto = true;
                         self.advance();
                     }
                     _ => break,
@@ -572,14 +578,13 @@ impl<'a> Parser<'a> {
             vec![]
         };
 
-        // Skip fourth ':' for goto labels (Phase 2 - not yet supported)
-        if self.is_special(b':') {
+        // Parse goto labels (after fourth ':')
+        let goto_labels = if self.is_special(b':') {
             self.advance();
-            // Skip label names until ')'
-            while !self.is_special(b')') && !self.is_eof() {
-                self.advance();
-            }
-        }
+            self.parse_asm_goto_labels()?
+        } else {
+            vec![]
+        };
 
         self.expect_special(b')')?;
         self.expect_special(b';')?;
@@ -592,6 +597,7 @@ impl<'a> Parser<'a> {
             outputs,
             inputs,
             clobbers,
+            goto_labels,
         })
     }
 
@@ -701,6 +707,37 @@ impl<'a> Parser<'a> {
         }
 
         Ok(clobbers)
+    }
+
+    /// Parse asm goto label list: label1, label2, ...
+    fn parse_asm_goto_labels(&mut self) -> ParseResult<Vec<StringId>> {
+        let mut labels = Vec::new();
+
+        // Allow empty label list
+        if self.is_special(b')') {
+            return Ok(labels);
+        }
+
+        loop {
+            if self.peek() != TokenType::Ident {
+                return Err(ParseError::new(
+                    "expected label identifier in asm goto",
+                    self.current_pos(),
+                ));
+            }
+            let token = self.consume();
+            if let TokenValue::Ident(label_id) = token.value {
+                labels.push(label_id);
+            }
+
+            if self.is_special(b',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(labels)
     }
 
     /// Skip both __attribute__ and __asm extensions

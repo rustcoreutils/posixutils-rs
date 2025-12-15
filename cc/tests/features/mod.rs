@@ -19,6 +19,7 @@ mod debug;
 mod function_pointers;
 mod has_feature;
 mod inline;
+mod inline_asm;
 mod macros;
 mod noreturn;
 mod optimization;

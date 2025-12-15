@@ -560,6 +560,21 @@ impl Expr {
 }
 
 // ============================================================================
+// Inline Assembly Support (GCC Extended Asm)
+// ============================================================================
+
+/// An operand in an inline assembly statement
+/// Format: [name] "constraint" (expr)
+/// Note: named operands [name] are parsed but not yet used (Phase 2 feature)
+#[derive(Debug, Clone)]
+pub struct AsmOperand {
+    /// Constraint string (e.g., "=r", "+m", "r")
+    pub constraint: String,
+    /// The C expression (lvalue for outputs, rvalue for inputs)
+    pub expr: Expr,
+}
+
+// ============================================================================
 // Statements
 // ============================================================================
 
@@ -619,6 +634,18 @@ pub enum Stmt {
 
     /// Default label (within switch body)
     Default,
+
+    /// Inline assembly statement (GCC extended asm)
+    /// Format: asm [volatile] ( "template" : outputs : inputs : clobbers );
+    /// Note: volatile and clobbers are parsed but not yet used (Phase 2 feature)
+    Asm {
+        /// The assembly template string with %0, %1, etc. placeholders
+        template: String,
+        /// Output operands: [name] "=constraint" (lvalue)
+        outputs: Vec<AsmOperand>,
+        /// Input operands: [name] "constraint" (rvalue)
+        inputs: Vec<AsmOperand>,
+    },
 }
 
 /// Initializer for a for loop (can be declaration or expression)

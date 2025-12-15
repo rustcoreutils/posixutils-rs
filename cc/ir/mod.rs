@@ -165,6 +165,9 @@ pub enum Opcode {
     // Non-local jumps (setjmp/longjmp)
     Setjmp,  // Save execution context, returns 0 or value from longjmp
     Longjmp, // Restore execution context (never returns)
+
+    // Inline assembly
+    Asm, // Inline assembly statement
 }
 
 impl Opcode {
@@ -259,6 +262,7 @@ impl Opcode {
             Opcode::Unreachable => "unreachable",
             Opcode::Setjmp => "setjmp",
             Opcode::Longjmp => "longjmp",
+            Opcode::Asm => "asm",
         }
     }
 }
@@ -448,6 +452,28 @@ impl fmt::Display for BasicBlockId {
 }
 
 // ============================================================================
+// Inline Assembly Support
+// ============================================================================
+
+/// Constraint information for an inline asm operand
+#[derive(Debug, Clone)]
+pub struct AsmConstraint {
+    /// The pseudo (register or value) for this operand
+    pub pseudo: PseudoId,
+}
+
+/// Data for an inline assembly instruction
+#[derive(Debug, Clone)]
+pub struct AsmData {
+    /// The assembly template string
+    pub template: String,
+    /// Output operands
+    pub outputs: Vec<AsmConstraint>,
+    /// Input operands
+    pub inputs: Vec<AsmConstraint>,
+}
+
+// ============================================================================
 // Instruction
 // ============================================================================
 
@@ -499,6 +525,8 @@ pub struct Instruction {
     pub indirect_target: Option<PseudoId>,
     /// Source position for debug info
     pub pos: Option<Position>,
+    /// For inline assembly: the asm data (template, operands, clobbers)
+    pub asm_data: Option<Box<AsmData>>,
 }
 
 impl Default for Instruction {
@@ -524,6 +552,7 @@ impl Default for Instruction {
             is_two_reg_return: false,
             indirect_target: None,
             pos: None,
+            asm_data: None,
         }
     }
 }
@@ -763,6 +792,15 @@ impl Instruction {
             .with_target(target)
             .with_src3(cond, if_true, if_false)
             .with_type_and_size(typ, size)
+    }
+
+    /// Create an inline assembly instruction
+    pub fn asm(data: AsmData) -> Self {
+        Self {
+            op: Opcode::Asm,
+            asm_data: Some(Box::new(data)),
+            ..Default::default()
+        }
     }
 }
 

@@ -12,12 +12,13 @@
 
 use super::ssa::ssa_convert;
 use super::{
-    BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
+    Opcode, Pseudo, PseudoId,
 };
 use crate::diag::{error, Position};
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
+    AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
+    ExternalDecl, ForInit, FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::SymbolTable;
@@ -1195,6 +1196,14 @@ impl<'a> Linearizer<'a> {
                 // Case/Default labels are handled by linearize_switch
                 // If we encounter them outside a switch, ignore them
             }
+
+            Stmt::Asm {
+                template,
+                outputs,
+                inputs,
+            } => {
+                self.linearize_asm(template, outputs, inputs);
+            }
         }
     }
 
@@ -2122,6 +2131,98 @@ impl<'a> Linearizer<'a> {
                 self.linearize_stmt(stmt);
             }
         }
+    }
+
+    // ========================================================================
+    // Inline assembly linearization
+    // ========================================================================
+
+    /// Linearize an inline assembly statement
+    fn linearize_asm(&mut self, template: &str, outputs: &[AsmOperand], inputs: &[AsmOperand]) {
+        let mut ir_outputs = Vec::new();
+        let mut ir_inputs = Vec::new();
+
+        // Process output operands
+        for op in outputs {
+            // Create a pseudo for the output
+            let pseudo = self.alloc_pseudo();
+
+            // Parse constraint to get flags
+            let (_is_memory, is_readwrite) = self.parse_asm_constraint(&op.constraint);
+
+            // For read-write outputs ("+r"), load the initial value into the SAME pseudo
+            // so that input and output use the same register
+            if is_readwrite {
+                let addr = self.linearize_lvalue(&op.expr);
+                let typ = self.expr_type(&op.expr);
+                let size = self.types.size_bits(typ);
+                // Load into the same pseudo that will be used for output
+                self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+
+                // Also add as input, using the SAME pseudo
+                ir_inputs.push(AsmConstraint {
+                    pseudo, // Same pseudo as output - ensures same register
+                });
+            }
+
+            ir_outputs.push(AsmConstraint { pseudo });
+        }
+
+        // Process input operands
+        for op in inputs {
+            let (is_memory, _) = self.parse_asm_constraint(&op.constraint);
+
+            let pseudo = if is_memory {
+                // For memory operands, get the address
+                self.linearize_lvalue(&op.expr)
+            } else {
+                // For register operands, evaluate the expression
+                self.linearize_expr(&op.expr)
+            };
+
+            ir_inputs.push(AsmConstraint { pseudo });
+        }
+
+        // Create the asm data
+        let asm_data = AsmData {
+            template: template.to_string(),
+            outputs: ir_outputs.clone(),
+            inputs: ir_inputs,
+        };
+
+        // Emit the asm instruction
+        self.emit(Instruction::asm(asm_data));
+
+        // Store outputs back to their destinations
+        // store(value, addr, ...) - value first, then address
+        for (i, op) in outputs.iter().enumerate() {
+            let out_pseudo = ir_outputs[i].pseudo;
+            let addr = self.linearize_lvalue(&op.expr);
+            let typ = self.expr_type(&op.expr);
+            let size = self.types.size_bits(typ);
+            self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+        }
+    }
+
+    /// Parse an asm constraint string to extract flags
+    /// Returns (is_memory, is_readwrite)
+    fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool) {
+        let mut is_memory = false;
+        let mut is_readwrite = false;
+
+        for c in constraint.chars() {
+            match c {
+                '+' => is_readwrite = true,
+                '=' | '&' | '%' => {} // Output-only, early clobber, commutative - handled elsewhere
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' => {} // Register constraints
+                'm' | 'o' | 'V' | 'Q' => is_memory = true,
+                'i' | 'n' | 'g' | 'X' => {} // Immediate, general
+                '0'..='9' => {}             // Matching constraint
+                _ => {}                     // Ignore unknown constraints
+            }
+        }
+
+        (is_memory, is_readwrite)
     }
 
     fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

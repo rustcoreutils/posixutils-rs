@@ -565,9 +565,10 @@ impl Expr {
 
 /// An operand in an inline assembly statement
 /// Format: [name] "constraint" (expr)
-/// Note: named operands [name] are parsed but not yet used (Phase 2 feature)
 #[derive(Debug, Clone)]
 pub struct AsmOperand {
+    /// Optional symbolic name for the operand (e.g., [result])
+    pub name: Option<StringId>,
     /// Constraint string (e.g., "=r", "+m", "r")
     pub constraint: String,
     /// The C expression (lvalue for outputs, rvalue for inputs)
@@ -637,7 +638,6 @@ pub enum Stmt {
 
     /// Inline assembly statement (GCC extended asm)
     /// Format: asm [volatile] ( "template" : outputs : inputs : clobbers );
-    /// Note: volatile and clobbers are parsed but not yet used (Phase 2 feature)
     Asm {
         /// The assembly template string with %0, %1, etc. placeholders
         template: String,
@@ -645,6 +645,8 @@ pub enum Stmt {
         outputs: Vec<AsmOperand>,
         /// Input operands: [name] "constraint" (rvalue)
         inputs: Vec<AsmOperand>,
+        /// Clobber list: registers and special values ("memory", "cc")
+        clobbers: Vec<String>,
     },
 }
 

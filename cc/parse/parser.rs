@@ -584,14 +584,14 @@ impl<'a> Parser<'a> {
         self.expect_special(b')')?;
         self.expect_special(b';')?;
 
-        // Note: is_volatile and clobbers are parsed but not yet used (Phase 2 feature)
+        // Note: is_volatile is parsed but not yet used (Phase 2 feature)
         let _ = is_volatile;
-        let _ = clobbers;
 
         Ok(Stmt::Asm {
             template,
             outputs,
             inputs,
+            clobbers,
         })
     }
 
@@ -657,10 +657,11 @@ impl<'a> Parser<'a> {
             let expr = self.parse_expression()?;
             self.expect_special(b')')?;
 
-            // Note: named operand syntax [name] is parsed but name is discarded
-            // (Phase 2 feature - not yet implemented in code generation)
-            let _ = name;
-            operands.push(AsmOperand { constraint, expr });
+            operands.push(AsmOperand {
+                name,
+                constraint,
+                expr,
+            });
 
             // Check for more operands
             if self.is_special(b',') {

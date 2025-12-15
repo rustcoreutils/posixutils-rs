@@ -1201,8 +1201,9 @@ impl<'a> Linearizer<'a> {
                 template,
                 outputs,
                 inputs,
+                clobbers,
             } => {
-                self.linearize_asm(template, outputs, inputs);
+                self.linearize_asm(template, outputs, inputs, clobbers);
             }
         }
     }
@@ -2138,7 +2139,13 @@ impl<'a> Linearizer<'a> {
     // ========================================================================
 
     /// Linearize an inline assembly statement
-    fn linearize_asm(&mut self, template: &str, outputs: &[AsmOperand], inputs: &[AsmOperand]) {
+    fn linearize_asm(
+        &mut self,
+        template: &str,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+        clobbers: &[String],
+    ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
 
@@ -2148,7 +2155,11 @@ impl<'a> Linearizer<'a> {
             let pseudo = self.alloc_pseudo();
 
             // Parse constraint to get flags
-            let (_is_memory, is_readwrite) = self.parse_asm_constraint(&op.constraint);
+            let (_is_memory, is_readwrite, _matching, is_earlyclobber) =
+                self.parse_asm_constraint(&op.constraint);
+
+            // Get symbolic name if present
+            let name = op.name.map(|n| self.str(n).to_string());
 
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register
@@ -2162,17 +2173,49 @@ impl<'a> Linearizer<'a> {
                 // Also add as input, using the SAME pseudo
                 ir_inputs.push(AsmConstraint {
                     pseudo, // Same pseudo as output - ensures same register
+                    name: name.clone(),
+                    matching_output: None,
+                    is_earlyclobber: false, // Only outputs can be early clobber
                 });
             }
 
-            ir_outputs.push(AsmConstraint { pseudo });
+            ir_outputs.push(AsmConstraint {
+                pseudo,
+                name,
+                matching_output: None,
+                is_earlyclobber,
+            });
         }
 
         // Process input operands
         for op in inputs {
-            let (is_memory, _) = self.parse_asm_constraint(&op.constraint);
+            let (is_memory, _, matching, _) = self.parse_asm_constraint(&op.constraint);
 
-            let pseudo = if is_memory {
+            // Get symbolic name if present
+            let name = op.name.map(|n| self.str(n).to_string());
+
+            // For matching constraints (like "0"), we need to load the input value
+            // into the matched output's pseudo so they use the same register
+            let pseudo = if let Some(match_idx) = matching {
+                if match_idx < ir_outputs.len() {
+                    // Use the matched output's pseudo
+                    let out_pseudo = ir_outputs[match_idx].pseudo;
+                    // Load the input value into the output's pseudo
+                    let val = self.linearize_expr(&op.expr);
+                    let typ = self.expr_type(&op.expr);
+                    let size = self.types.size_bits(typ);
+                    // Copy val to out_pseudo so they share the same register
+                    self.emit(
+                        Instruction::new(Opcode::Copy)
+                            .with_target(out_pseudo)
+                            .with_src(val)
+                            .with_size(size),
+                    );
+                    out_pseudo
+                } else {
+                    self.linearize_expr(&op.expr)
+                }
+            } else if is_memory {
                 // For memory operands, get the address
                 self.linearize_lvalue(&op.expr)
             } else {
@@ -2180,7 +2223,12 @@ impl<'a> Linearizer<'a> {
                 self.linearize_expr(&op.expr)
             };
 
-            ir_inputs.push(AsmConstraint { pseudo });
+            ir_inputs.push(AsmConstraint {
+                pseudo,
+                name,
+                matching_output: matching,
+                is_earlyclobber: false, // Inputs are never early clobber
+            });
         }
 
         // Create the asm data
@@ -2188,6 +2236,7 @@ impl<'a> Linearizer<'a> {
             template: template.to_string(),
             outputs: ir_outputs.clone(),
             inputs: ir_inputs,
+            clobbers: clobbers.to_vec(),
         };
 
         // Emit the asm instruction
@@ -2205,24 +2254,27 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Parse an asm constraint string to extract flags
-    /// Returns (is_memory, is_readwrite)
-    fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool) {
+    /// Returns (is_memory, is_readwrite, matching_output, is_earlyclobber)
+    fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>, bool) {
         let mut is_memory = false;
         let mut is_readwrite = false;
+        let mut matching = None;
+        let mut is_earlyclobber = false;
 
         for c in constraint.chars() {
             match c {
                 '+' => is_readwrite = true,
-                '=' | '&' | '%' => {} // Output-only, early clobber, commutative - handled elsewhere
+                '&' => is_earlyclobber = true,
+                '=' | '%' => {} // Output-only, commutative - handled elsewhere
                 'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' => {} // Register constraints
                 'm' | 'o' | 'V' | 'Q' => is_memory = true,
                 'i' | 'n' | 'g' | 'X' => {} // Immediate, general
-                '0'..='9' => {}             // Matching constraint
-                _ => {}                     // Ignore unknown constraints
+                '0'..='9' => matching = Some((c as u8 - b'0') as usize),
+                _ => {} // Ignore unknown constraints
             }
         }
 
-        (is_memory, is_readwrite)
+        (is_memory, is_readwrite, matching, is_earlyclobber)
     }
 
     fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

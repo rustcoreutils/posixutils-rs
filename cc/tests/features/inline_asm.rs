@@ -129,6 +129,97 @@ int main(void) {
 "#;
         assert_eq!(compile_and_run("asm_spelling3_x86", code3), 0);
     }
+
+    // ========================================================================
+    // Phase 2 Tests - Matching Constraints, Named Operands, Clobbers
+    // ========================================================================
+
+    #[test]
+    fn asm_matching_constraint() {
+        // Test matching constraint "0" - use same register as output %0
+        let code = r#"
+int main(void) {
+    int x = 10;
+    __asm__("addl $5, %0" : "=r"(x) : "0"(x));
+    return x == 15 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_match_x86", code), 0);
+    }
+
+    #[test]
+    fn asm_named_operand() {
+        // Test named operand syntax [name]
+        let code = r#"
+int main(void) {
+    int result;
+    __asm__("movl $42, %[out]" : [out] "=r"(result));
+    return result == 42 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_named_x86", code), 0);
+    }
+
+    #[test]
+    fn asm_named_input_output() {
+        // Test named operands for both input and output
+        let code = r#"
+int main(void) {
+    int x = 10, y = 20;
+    int result;
+    __asm__("movl %[a], %[res]\n\t"
+            "addl %[b], %[res]"
+            : [res] "=r"(result)
+            : [a] "r"(x), [b] "r"(y));
+    return result == 30 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_named_inout_x86", code), 0);
+    }
+
+    #[test]
+    fn asm_memory_clobber() {
+        // Test memory clobber - prevents compiler from caching values
+        let code = r#"
+int main(void) {
+    int x = 10;
+    __asm__ volatile("" ::: "memory");
+    return x == 10 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_memclob_x86", code), 0);
+    }
+
+    #[test]
+    fn asm_cc_clobber() {
+        // Test cc (condition codes) clobber
+        let code = r#"
+int main(void) {
+    int x = 5;
+    __asm__ volatile("testl %0, %0" : : "r"(x) : "cc");
+    return 0;
+}
+"#;
+        assert_eq!(compile_and_run("asm_ccclob_x86", code), 0);
+    }
+
+    #[test]
+    fn asm_early_clobber() {
+        // Test early clobber (&) - output is written before inputs are read
+        // This means output cannot share register with inputs
+        let code = r#"
+int main(void) {
+    int x = 10, y = 20;
+    int result;
+    __asm__("movl %1, %0\n\t"
+            "addl %2, %0"
+            : "=&r"(result)
+            : "r"(x), "r"(y));
+    return result == 30 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_earlyclob_x86", code), 0);
+    }
 }
 
 // ============================================================================
@@ -244,5 +335,94 @@ int main(void) {
 }
 "#;
         assert_eq!(compile_and_run("asm_spelling3_aarch64", code3), 0);
+    }
+
+    // ========================================================================
+    // Phase 2 Tests - Matching Constraints, Named Operands, Clobbers
+    // ========================================================================
+
+    #[test]
+    fn asm_matching_constraint() {
+        // Test matching constraint "0" - use same register as output %0
+        let code = r#"
+int main(void) {
+    int x = 10;
+    __asm__("add %w0, %w0, #5" : "=r"(x) : "0"(x));
+    return x == 15 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_match_aarch64", code), 0);
+    }
+
+    #[test]
+    fn asm_named_operand() {
+        // Test named operand syntax [name]
+        let code = r#"
+int main(void) {
+    int result;
+    __asm__("mov %w[out], #42" : [out] "=r"(result));
+    return result == 42 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_named_aarch64", code), 0);
+    }
+
+    #[test]
+    fn asm_named_input_output() {
+        // Test named operands for both input and output
+        let code = r#"
+int main(void) {
+    int x = 10, y = 20;
+    int result;
+    __asm__("add %w[res], %w[a], %w[b]"
+            : [res] "=r"(result)
+            : [a] "r"(x), [b] "r"(y));
+    return result == 30 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_named_inout_aarch64", code), 0);
+    }
+
+    #[test]
+    fn asm_memory_clobber() {
+        // Test memory clobber - prevents compiler from caching values
+        let code = r#"
+int main(void) {
+    int x = 10;
+    __asm__ volatile("" ::: "memory");
+    return x == 10 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_memclob_aarch64", code), 0);
+    }
+
+    #[test]
+    fn asm_cc_clobber() {
+        // Test cc (condition codes) clobber
+        let code = r#"
+int main(void) {
+    int x = 5;
+    __asm__ volatile("cmp %w0, #0" : : "r"(x) : "cc");
+    return 0;
+}
+"#;
+        assert_eq!(compile_and_run("asm_ccclob_aarch64", code), 0);
+    }
+
+    #[test]
+    fn asm_early_clobber() {
+        // Test early clobber (&) - output is written before inputs are read
+        // This means output cannot share register with inputs
+        let code = r#"
+int main(void) {
+    int x = 10, y = 20;
+    int result;
+    __asm__("add %w0, %w1, %w2"
+            : "=&r"(result)
+            : "r"(x), "r"(y));
+    return result == 30 ? 0 : 1;
+}
+"#;
+        assert_eq!(compile_and_run("asm_earlyclob_aarch64", code), 0);
     }
 }

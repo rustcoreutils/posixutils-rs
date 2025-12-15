@@ -460,6 +460,13 @@ impl fmt::Display for BasicBlockId {
 pub struct AsmConstraint {
     /// The pseudo (register or value) for this operand
     pub pseudo: PseudoId,
+    /// Optional symbolic name for the operand (e.g., [result])
+    pub name: Option<String>,
+    /// Matching output operand index (for constraints like "0")
+    pub matching_output: Option<usize>,
+    /// Early clobber flag - output is written before inputs are read
+    /// This means the output cannot share a register with any input
+    pub is_earlyclobber: bool,
 }
 
 /// Data for an inline assembly instruction
@@ -471,6 +478,8 @@ pub struct AsmData {
     pub outputs: Vec<AsmConstraint>,
     /// Input operands
     pub inputs: Vec<AsmConstraint>,
+    /// Clobber list: registers and special values ("memory", "cc")
+    pub clobbers: Vec<String>,
 }
 
 // ============================================================================

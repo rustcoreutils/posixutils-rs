@@ -20,6 +20,10 @@ use libc::{semctl, semget, shmctl, shmget, shmid_ds};
 /// Parse an IPC key value that may be decimal or hexadecimal (0x prefix)
 fn parse_ipc_key(s: &str) -> Result<i32, String> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        // Reject if hex part starts with a sign
+        if hex.starts_with('+') || hex.starts_with('-') {
+            return Err("invalid hex key: unexpected sign after 0x prefix".to_string());
+        }
         u32::from_str_radix(hex, 16)
             .map(|v| v as i32)
             .map_err(|e| format!("invalid hex key: {}", e))

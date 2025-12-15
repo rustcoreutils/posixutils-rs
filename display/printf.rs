@@ -840,6 +840,10 @@ fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
         .or_else(|| num_str.strip_prefix("0X"))
     {
         // Hexadecimal
+        // Reject if hex part starts with a sign (after we already handled the sign above)
+        if hex.starts_with('+') || hex.starts_with('-') {
+            return Err(format!("invalid number: {arg_str}"));
+        }
         match i64::from_str_radix(hex, 16) {
             Ok(n) => (n, true),
             Err(_) => {
@@ -863,6 +867,10 @@ fn parse_integer_arg(arg: &[u8]) -> Result<(i64, bool), String> {
             .unwrap_or(false)
     {
         // Octal
+        // Reject if octal part starts with a sign (after we already handled the sign above)
+        if num_str.starts_with('+') || num_str.starts_with('-') {
+            return Err(format!("invalid number: {arg_str}"));
+        }
         let valid_len = num_str
             .chars()
             .take_while(|c| ('0'..='7').contains(c))

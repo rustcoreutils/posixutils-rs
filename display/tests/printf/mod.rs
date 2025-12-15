@@ -532,3 +532,26 @@ fn test_float_missing_arg() {
 fn test_float_char_constant() {
     printf_test(&["%f", "'A"], "65.000000");
 }
+
+// Regression tests for from_str_radix security issue
+// These should fail because double signs are invalid
+#[test]
+#[should_panic]
+fn test_reject_double_plus_hex() {
+    // This should fail: "+0x+55" should be rejected, not parsed as 0x55
+    printf_test(&["%d", "+0x+55"], "85");
+}
+
+#[test]
+#[should_panic]
+fn test_reject_double_minus_hex() {
+    // This should fail: "-0x-55" should be rejected
+    printf_test(&["%d", "-0x-55"], "-85");
+}
+
+#[test]
+#[should_panic]
+fn test_reject_double_plus_octal() {
+    // This should fail: "+0+55" should be rejected
+    printf_test(&["%d", "+0+55"], "45");
+}

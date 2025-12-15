@@ -56,6 +56,10 @@ impl BuiltinUtility for Umask {
         } else if option_parser.next_argument() == args.len() - 1 {
             // TODO: support symbolic umask
             let new_umask = &args[option_parser.next_argument()];
+            // Reject if umask contains a sign
+            if new_umask.starts_with('+') || new_umask.starts_with('-') {
+                return Err(format!("umask: invalid mask '{new_umask}'").into());
+            }
             let new_umask = u32::from_str_radix(new_umask, 8)
                 .map_err(|_| format!("umask: invalid mask '{new_umask}'"))?;
             if new_umask > 0o777 {

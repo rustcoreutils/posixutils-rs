@@ -186,3 +186,129 @@ fn asa_cjk_control_char() {
     // 3-byte CJK char as control: treated as unknown, like space
     asa_test("日test\n", "test\n");
 }
+
+// ===== FILE ARGUMENT TESTS =====
+
+fn asa_test_with_args(args: &[&str], expected_output: &str, expected_exit_code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test(TestPlan {
+        cmd: String::from("asa"),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code,
+    });
+}
+
+// Test single file argument
+#[test]
+fn asa_single_file() {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let file1 = format!("{}/tests/asa/file1.txt", project_root);
+    let expected = "Line 1 from file1\nLine 2 from file1\n\nLine 3 with double-space\n";
+    asa_test_with_args(&[file1.as_str()], expected, 0);
+}
+
+// Test multiple file arguments (files processed sequentially)
+#[test]
+fn asa_multiple_files() {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let file1 = format!("{}/tests/asa/file1.txt", project_root);
+    let file2 = format!("{}/tests/asa/file2.txt", project_root);
+    let expected = "Line 1 from file1\nLine 2 from file1\n\nLine 3 with double-space\n\x0cPage 1 from file2\nNormal line\rOverprint this\n";
+    asa_test_with_args(&[file1.as_str(), file2.as_str()], expected, 0);
+}
+
+// Test stdin with "-" argument
+#[test]
+fn asa_stdin_dash() {
+    run_test(TestPlan {
+        cmd: String::from("asa"),
+        args: vec![String::from("-")],
+        stdin_data: String::from(" test from stdin\n"),
+        expected_out: String::from("test from stdin\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// ===== EDGE CASE TESTS (POSIX COMPLIANCE) =====
+
+// Test lines with only newline (control char missing)
+#[test]
+fn asa_line_with_only_newline() {
+    // Empty line (just newline): first char is newline itself
+    // The implementation should handle this gracefully
+    asa_test("\n", "\n");
+}
+
+// Test very long lines (POSIX doesn't specify line length limits for asa)
+#[test]
+fn asa_long_line() {
+    let long_content = "x".repeat(5000);
+    let input = format!(" {}\n", long_content);
+    let expected = format!("{}\n", long_content);
+    asa_test(&input, &expected);
+}
+
+// Test tab character as control (treated as unknown, like space)
+#[test]
+fn asa_tab_control() {
+    asa_test("\ttext\n", "text\n");
+}
+
+// Test newline as control character (edge case)
+// When first character is newline, line is essentially empty
+#[test]
+fn asa_newline_control() {
+    asa_test("\n text\n", "\ntext\n");
+}
+
+// Test carriage return within content (not as control)
+#[test]
+fn asa_embedded_carriage_return() {
+    asa_test(" text\rwith\rcr\n", "text\rwith\rcr\n");
+}
+
+// Test form feed within content (not as control)
+#[test]
+fn asa_embedded_form_feed() {
+    asa_test(" text\x0cwith\x0cff\n", "text\x0cwith\x0cff\n");
+}
+
+// ===== SEQUENTIAL FILE PROCESSING =====
+
+// Test that each file starts as if it's independent
+// (first line of second file should be treated as first line)
+#[test]
+fn asa_file_independence() {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let file2 = format!("{}/tests/asa/file2.txt", project_root);
+    // file2.txt starts with '1' (form-feed) as first line
+    // Should output form-feed at start since it's the first line of the file
+    let expected = "\x0cPage 1 from file2\nNormal line\rOverprint this\n";
+    asa_test_with_args(&[file2.as_str()], expected, 0);
+}
+
+// ===== SPECIAL CHARACTER COMBINATIONS =====
+
+// Test all standard control characters in sequence
+#[test]
+fn asa_all_controls_sequence() {
+    let input = " space\n0zero\n1one\n+plus\n";
+    let expected = "space\n\nzero\n\x0cone\rplus\n";
+    asa_test(input, expected);
+}
+
+// Test repeated form-feeds
+#[test]
+fn asa_multiple_form_feeds() {
+    asa_test("1page1\n1page2\n1page3\n", "\x0cpage1\n\x0cpage2\n\x0cpage3\n");
+}
+
+// Test alternating double-space and normal
+#[test]
+fn asa_alternating_spacing() {
+    asa_test(" normal\n0double\n normal\n0double\n", "normal\n\ndouble\nnormal\n\ndouble\n");
+}

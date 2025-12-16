@@ -15,6 +15,18 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::io::input_reader;
 
 /// asa - interpret carriage-control characters
+///
+/// POSIX.2024 COMPLIANCE:
+/// - Interprets first character of each line as carriage-control character
+/// - Supported control characters per POSIX:
+///   - ' ' (space): Single spacing (advance one line)
+///   - '0': Double spacing (advance two lines with blank line before)
+///   - '1': New page (form-feed character)
+///   - '+': Overprint (carriage return without line advance)
+/// - Special rule: '+' as first character of first line treated as space
+/// - Extension: '-' for triple-spacing (non-POSIX)
+/// - Processes multiple files sequentially, each with independent state
+/// - Reads from stdin if no files specified or "-" given
 #[derive(Parser)]
 #[command(version, about = gettext("asa - interpret carriage-control characters"))]
 struct Args {
@@ -22,6 +34,14 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
+/// Process a single file according to POSIX asa rules
+///
+/// POSIX.2024 Requirements:
+/// - Each line's first character is interpreted as a carriage-control character
+/// - The remainder of the line (after first character) is written to stdout
+/// - Control character determines line spacing/positioning
+/// - First line of file has special handling: '+' treated as space
+/// - Each file is processed independently with its own state
 fn asa_file(pathname: &PathBuf) -> io::Result<()> {
     let mut reader = input_reader(pathname, true)?;
     let mut first_line = true;

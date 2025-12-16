@@ -15,7 +15,6 @@ pub mod modestr;
 pub mod platform;
 pub mod priority;
 pub mod regex;
-pub mod safe_parse;
 pub mod sccsfile;
 pub mod testing;
 pub mod user;

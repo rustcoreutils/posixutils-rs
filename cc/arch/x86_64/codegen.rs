@@ -5030,180 +5030,7 @@ impl X86_64CodeGen {
         names: &[Option<String>],
         goto_labels: &[(String, String)],
     ) -> String {
-        let mut result = String::with_capacity(template.len() * 2);
-        let mut chars = template.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                match chars.peek() {
-                    Some('%') => {
-                        // %% -> %
-                        chars.next();
-                        result.push('%');
-                    }
-                    Some('[') => {
-                        // %[name] - named operand reference
-                        chars.next(); // consume '['
-                        let mut name = String::new();
-                        while let Some(&ch) = chars.peek() {
-                            if ch == ']' {
-                                chars.next();
-                                break;
-                            }
-                            name.push(ch);
-                            chars.next();
-                        }
-                        // Look up the name in operand names
-                        if let Some(idx) = names
-                            .iter()
-                            .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
-                        {
-                            if let Some(ref mem) = mems[idx] {
-                                result.push_str(mem);
-                            } else if let Some(reg) = regs[idx] {
-                                result.push('%');
-                                result.push_str(self.sized_reg_name(reg, 'k')); // 32-bit default
-                            }
-                        } else {
-                            // Unknown name, pass through
-                            result.push_str("%[");
-                            result.push_str(&name);
-                            result.push(']');
-                        }
-                    }
-                    Some(&d) if d.is_ascii_digit() => {
-                        // %0, %1, etc. - default to 32-bit for GCC compatibility
-                        // (most inline asm uses 32-bit int operands)
-                        // Use %q0 for 64-bit
-                        chars.next();
-                        let idx = (d as usize) - ('0' as usize);
-                        if idx < regs.len() {
-                            if let Some(ref mem) = mems[idx] {
-                                result.push_str(mem);
-                            } else if let Some(reg) = regs[idx] {
-                                result.push('%');
-                                result.push_str(self.sized_reg_name(reg, 'k')); // 32-bit default
-                            }
-                        } else {
-                            // Unknown operand, pass through
-                            result.push('%');
-                            result.push(d);
-                        }
-                    }
-                    Some('l') => {
-                        // %l - label reference for asm goto: %l0, %l1, %l[name]
-                        chars.next(); // consume 'l'
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch == '[' {
-                                // %l[name] - named label reference
-                                chars.next(); // consume '['
-                                let mut name = String::new();
-                                while let Some(&ch) = chars.peek() {
-                                    if ch == ']' {
-                                        chars.next();
-                                        break;
-                                    }
-                                    name.push(ch);
-                                    chars.next();
-                                }
-                                // Look up label by name (label_string, label_name)
-                                if let Some((label_str, _)) =
-                                    goto_labels.iter().find(|(_, n)| n == &name)
-                                {
-                                    result.push_str(label_str);
-                                } else {
-                                    // Unknown label, pass through
-                                    result.push_str("%l[");
-                                    result.push_str(&name);
-                                    result.push(']');
-                                }
-                            } else if next_ch.is_ascii_digit() {
-                                // %l0, %l1, etc. - numeric label reference
-                                chars.next();
-                                let idx = (next_ch as usize) - ('0' as usize);
-                                if idx < goto_labels.len() {
-                                    let (label_str, _) = &goto_labels[idx];
-                                    result.push_str(label_str);
-                                } else {
-                                    // Unknown label index, pass through
-                                    result.push_str("%l");
-                                    result.push(next_ch);
-                                }
-                            } else {
-                                // Just %l without number or name, pass through
-                                result.push_str("%l");
-                            }
-                        } else {
-                            result.push_str("%l");
-                        }
-                    }
-                    Some(&d) if d == 'b' || d == 'w' || d == 'k' || d == 'q' => {
-                        // Size modifier: %b0, %w0, %k0, %q0
-                        chars.next();
-                        let size_mod = d;
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch == '[' {
-                                // %b[name], %w[name], etc.
-                                chars.next(); // consume '['
-                                let mut name = String::new();
-                                while let Some(&ch) = chars.peek() {
-                                    if ch == ']' {
-                                        chars.next();
-                                        break;
-                                    }
-                                    name.push(ch);
-                                    chars.next();
-                                }
-                                if let Some(idx) = names.iter().position(|n| {
-                                    n.as_ref().map(|s| s.as_str()) == Some(name.as_str())
-                                }) {
-                                    if let Some(ref mem) = mems[idx] {
-                                        result.push_str(mem);
-                                    } else if let Some(reg) = regs[idx] {
-                                        result.push('%');
-                                        result.push_str(self.sized_reg_name(reg, size_mod));
-                                    }
-                                } else {
-                                    result.push('%');
-                                    result.push(size_mod);
-                                    result.push('[');
-                                    result.push_str(&name);
-                                    result.push(']');
-                                }
-                            } else if next_ch.is_ascii_digit() {
-                                chars.next();
-                                let idx = (next_ch as usize) - ('0' as usize);
-                                if idx < regs.len() {
-                                    if let Some(ref mem) = mems[idx] {
-                                        result.push_str(mem);
-                                    } else if let Some(reg) = regs[idx] {
-                                        result.push('%');
-                                        result.push_str(self.sized_reg_name(reg, size_mod));
-                                    }
-                                } else {
-                                    result.push('%');
-                                    result.push(size_mod);
-                                    result.push(next_ch);
-                                }
-                            } else {
-                                result.push('%');
-                                result.push(size_mod);
-                            }
-                        } else {
-                            result.push('%');
-                            result.push(size_mod);
-                        }
-                    }
-                    _ => {
-                        result.push('%');
-                    }
-                }
-            } else {
-                result.push(c);
-            }
-        }
-
-        result
+        crate::arch::substitute_asm_operands(self, template, regs, mems, names, goto_labels)
     }
 
     /// Get a sized register name based on modifier
@@ -5257,6 +5084,27 @@ impl X86_64CodeGen {
             // 64-bit (q) - default
             _ => self.reg_name_64(reg),
         }
+    }
+}
+
+// ============================================================================
+// AsmOperandFormatter trait implementation
+// ============================================================================
+
+impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
+    type Reg = Reg;
+
+    fn size_modifiers(&self) -> &'static [char] {
+        &['b', 'w', 'k', 'q'] // 8, 16, 32, 64-bit
+    }
+
+    fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {
+        format!("%{}", self.sized_reg_name(reg, size_mod))
+    }
+
+    fn format_reg_default(&self, reg: Reg) -> String {
+        // x86 inline asm defaults to 32-bit for GCC compatibility
+        format!("%{}", self.sized_reg_name(reg, 'k'))
     }
 }
 

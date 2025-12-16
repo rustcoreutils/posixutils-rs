@@ -362,6 +362,236 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 }
 
 // ============================================================================
+// Inline Assembly Support
+// ============================================================================
+
+/// Trait for architecture-specific inline asm operand formatting.
+/// Implementations provide register formatting specific to their architecture.
+pub trait AsmOperandFormatter {
+    /// The register type for this architecture
+    type Reg: Copy;
+
+    /// Return the size modifier characters recognized by this architecture.
+    /// e.g., x86: ['b', 'w', 'k', 'q'], aarch64: ['w', 'x']
+    fn size_modifiers(&self) -> &'static [char];
+
+    /// Format a register with the given size modifier.
+    /// Returns the formatted register string (e.g., "%eax" for x86, "w0" for aarch64).
+    fn format_reg_sized(&self, reg: Self::Reg, size_mod: char) -> String;
+
+    /// Format a register at default size (for bare %0, %1 references).
+    fn format_reg_default(&self, reg: Self::Reg) -> String;
+}
+
+/// Substitute %N, %[name], %lN, %l[name], and size modifiers in asm template.
+/// Architecture-specific register formatting is handled via the AsmOperandFormatter trait.
+///
+/// Handles:
+/// - `%%` escape sequences -> `%`
+/// - `%N` numeric operand references (multi-digit supported)
+/// - `%[name]` named operand references
+/// - `%lN` and `%l[name]` goto label references
+/// - `%{modifier}N` and `%{modifier}[name]` sized register references
+pub fn substitute_asm_operands<F: AsmOperandFormatter>(
+    formatter: &F,
+    template: &str,
+    regs: &[Option<F::Reg>],
+    mems: &[Option<String>],
+    names: &[Option<String>],
+    goto_labels: &[(String, String)],
+) -> String {
+    let mut result = String::with_capacity(template.len() * 2);
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek() {
+                Some('%') => {
+                    // %% -> %
+                    chars.next();
+                    result.push('%');
+                }
+                Some('[') => {
+                    // %[name] - named operand reference
+                    chars.next(); // consume '['
+                    let mut name = String::new();
+                    while let Some(&ch) = chars.peek() {
+                        if ch == ']' {
+                            chars.next();
+                            break;
+                        }
+                        name.push(ch);
+                        chars.next();
+                    }
+                    // Look up the name in operand names
+                    if let Some(idx) = names
+                        .iter()
+                        .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                    {
+                        if let Some(ref mem) = mems[idx] {
+                            result.push_str(mem);
+                        } else if let Some(reg) = regs[idx] {
+                            result.push_str(&formatter.format_reg_default(reg));
+                        }
+                    } else {
+                        // Unknown name, pass through
+                        result.push_str("%[");
+                        result.push_str(&name);
+                        result.push(']');
+                    }
+                }
+                Some(&d) if d.is_ascii_digit() => {
+                    // %0, %1, %10, etc. - numeric operand reference (multi-digit supported)
+                    chars.next();
+                    let mut num_str = String::new();
+                    num_str.push(d);
+                    while let Some(&digit) = chars.peek() {
+                        if digit.is_ascii_digit() {
+                            num_str.push(digit);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let idx: usize = num_str.parse().unwrap_or(0);
+                    if idx < regs.len() {
+                        if let Some(ref mem) = mems[idx] {
+                            result.push_str(mem);
+                        } else if let Some(reg) = regs[idx] {
+                            result.push_str(&formatter.format_reg_default(reg));
+                        }
+                    } else {
+                        // Unknown operand, pass through
+                        result.push('%');
+                        result.push_str(&num_str);
+                    }
+                }
+                Some('l') => {
+                    // %l - label reference for asm goto: %l0, %l1, %l[name]
+                    chars.next(); // consume 'l'
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch == '[' {
+                            // %l[name] - named label reference
+                            chars.next(); // consume '['
+                            let mut name = String::new();
+                            while let Some(&ch) = chars.peek() {
+                                if ch == ']' {
+                                    chars.next();
+                                    break;
+                                }
+                                name.push(ch);
+                                chars.next();
+                            }
+                            // Look up label by name (label_string, label_name)
+                            if let Some((label_str, _)) =
+                                goto_labels.iter().find(|(_, n)| n == &name)
+                            {
+                                result.push_str(label_str);
+                            } else {
+                                // Unknown label, pass through
+                                result.push_str("%l[");
+                                result.push_str(&name);
+                                result.push(']');
+                            }
+                        } else if next_ch.is_ascii_digit() {
+                            // %l0, %l1, etc. - numeric label reference
+                            chars.next();
+                            let idx = (next_ch as usize) - ('0' as usize);
+                            if idx < goto_labels.len() {
+                                let (label_str, _) = &goto_labels[idx];
+                                result.push_str(label_str);
+                            } else {
+                                // Unknown label index, pass through
+                                result.push_str("%l");
+                                result.push(next_ch);
+                            }
+                        } else {
+                            // Just %l without number or name, pass through
+                            result.push_str("%l");
+                        }
+                    } else {
+                        result.push_str("%l");
+                    }
+                }
+                Some(&d) if formatter.size_modifiers().contains(&d) => {
+                    // Size modifier: %b0, %w0, %k0, %q0 (x86) or %w0, %x0 (aarch64)
+                    chars.next();
+                    let size_mod = d;
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch == '[' {
+                            // %b[name], %w[name], etc.
+                            chars.next(); // consume '['
+                            let mut name = String::new();
+                            while let Some(&ch) = chars.peek() {
+                                if ch == ']' {
+                                    chars.next();
+                                    break;
+                                }
+                                name.push(ch);
+                                chars.next();
+                            }
+                            if let Some(idx) = names
+                                .iter()
+                                .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                            {
+                                if let Some(ref mem) = mems[idx] {
+                                    result.push_str(mem);
+                                } else if let Some(reg) = regs[idx] {
+                                    result.push_str(&formatter.format_reg_sized(reg, size_mod));
+                                }
+                            } else {
+                                result.push('%');
+                                result.push(size_mod);
+                                result.push('[');
+                                result.push_str(&name);
+                                result.push(']');
+                            }
+                        } else if next_ch.is_ascii_digit() {
+                            chars.next();
+                            let mut num_str = String::new();
+                            num_str.push(next_ch);
+                            while let Some(&digit) = chars.peek() {
+                                if digit.is_ascii_digit() {
+                                    num_str.push(digit);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let idx: usize = num_str.parse().unwrap_or(0);
+                            if idx < regs.len() {
+                                if let Some(ref mem) = mems[idx] {
+                                    result.push_str(mem);
+                                } else if let Some(reg) = regs[idx] {
+                                    result.push_str(&formatter.format_reg_sized(reg, size_mod));
+                                }
+                            } else {
+                                result.push('%');
+                                result.push(size_mod);
+                                result.push_str(&num_str);
+                            }
+                        } else {
+                            result.push('%');
+                            result.push(size_mod);
+                        }
+                    } else {
+                        result.push('%');
+                        result.push(size_mod);
+                    }
+                }
+                _ => {
+                    result.push('%');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+// ============================================================================
 // CodeGenerator Trait
 // ============================================================================
 

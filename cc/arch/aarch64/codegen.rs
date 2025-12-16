@@ -4078,193 +4078,14 @@ impl Aarch64CodeGen {
         operand_names: &[Option<String>],
         goto_labels: &[(String, String)],
     ) -> String {
-        let mut result = String::new();
-        let mut chars = template.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                if let Some(&next) = chars.peek() {
-                    if next == '%' {
-                        // Escaped %
-                        chars.next();
-                        result.push('%');
-                    } else if next == '[' {
-                        // %[name] - named operand reference
-                        chars.next(); // consume '['
-                        let mut name = String::new();
-                        while let Some(&ch) = chars.peek() {
-                            if ch == ']' {
-                                chars.next();
-                                break;
-                            }
-                            name.push(ch);
-                            chars.next();
-                        }
-                        // Look up the name in operand names
-                        if let Some(idx) = operand_names
-                            .iter()
-                            .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
-                        {
-                            if let Some(ref mem) = operand_mem[idx] {
-                                result.push_str(mem);
-                            } else if let Some(reg) = operand_regs[idx] {
-                                result.push_str(asm_reg_name_64(reg));
-                            }
-                        } else {
-                            // Unknown name, pass through
-                            result.push_str("%[");
-                            result.push_str(&name);
-                            result.push(']');
-                        }
-                    } else if next.is_ascii_digit() {
-                        // Operand reference
-                        chars.next();
-                        let mut num_str = String::new();
-                        num_str.push(next);
-                        // Check for multi-digit operand numbers
-                        while let Some(&digit) = chars.peek() {
-                            if digit.is_ascii_digit() {
-                                num_str.push(digit);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                        let idx: usize = num_str.parse().unwrap_or(0);
-                        if idx < operand_regs.len() {
-                            if let Some(ref mem) = operand_mem[idx] {
-                                result.push_str(mem);
-                            } else if let Some(reg) = operand_regs[idx] {
-                                // Default to 64-bit register name for AArch64
-                                result.push_str(asm_reg_name_64(reg));
-                            }
-                        }
-                    } else if next == 'w' || next == 'x' {
-                        // Size modifier: %w0 = 32-bit, %x0 = 64-bit
-                        let size_mod = next;
-                        chars.next();
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch == '[' {
-                                // %w[name], %x[name], etc.
-                                chars.next(); // consume '['
-                                let mut name = String::new();
-                                while let Some(&ch) = chars.peek() {
-                                    if ch == ']' {
-                                        chars.next();
-                                        break;
-                                    }
-                                    name.push(ch);
-                                    chars.next();
-                                }
-                                if let Some(idx) = operand_names.iter().position(|n| {
-                                    n.as_ref().map(|s| s.as_str()) == Some(name.as_str())
-                                }) {
-                                    if let Some(ref mem) = operand_mem[idx] {
-                                        result.push_str(mem);
-                                    } else if let Some(reg) = operand_regs[idx] {
-                                        let reg_name = match size_mod {
-                                            'w' => asm_reg_name_32(reg),
-                                            _ => asm_reg_name_64(reg),
-                                        };
-                                        result.push_str(reg_name);
-                                    }
-                                } else {
-                                    result.push('%');
-                                    result.push(size_mod);
-                                    result.push('[');
-                                    result.push_str(&name);
-                                    result.push(']');
-                                }
-                            } else if next_ch.is_ascii_digit() {
-                                chars.next();
-                                let mut num_str = String::new();
-                                num_str.push(next_ch);
-                                while let Some(&d) = chars.peek() {
-                                    if d.is_ascii_digit() {
-                                        num_str.push(d);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                let idx: usize = num_str.parse().unwrap_or(0);
-                                if idx < operand_regs.len() {
-                                    if let Some(reg) = operand_regs[idx] {
-                                        let name = match size_mod {
-                                            'w' => asm_reg_name_32(reg),
-                                            _ => asm_reg_name_64(reg),
-                                        };
-                                        result.push_str(name);
-                                    }
-                                }
-                            } else {
-                                // Not a valid operand, emit literally
-                                result.push('%');
-                                result.push(size_mod);
-                            }
-                        } else {
-                            result.push('%');
-                            result.push(size_mod);
-                        }
-                    } else if next == 'l' {
-                        // %l - label reference for asm goto: %l0, %l1, %l[name]
-                        chars.next(); // consume 'l'
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch == '[' {
-                                // %l[name] - named label reference
-                                chars.next(); // consume '['
-                                let mut name = String::new();
-                                while let Some(&ch) = chars.peek() {
-                                    if ch == ']' {
-                                        chars.next();
-                                        break;
-                                    }
-                                    name.push(ch);
-                                    chars.next();
-                                }
-                                // Look up label by name (label_string, label_name)
-                                if let Some((label_str, _)) =
-                                    goto_labels.iter().find(|(_, n)| n == &name)
-                                {
-                                    result.push_str(label_str);
-                                } else {
-                                    // Unknown label, pass through
-                                    result.push_str("%l[");
-                                    result.push_str(&name);
-                                    result.push(']');
-                                }
-                            } else if next_ch.is_ascii_digit() {
-                                // %l0, %l1, etc. - numeric label reference
-                                chars.next();
-                                let idx = (next_ch as usize) - ('0' as usize);
-                                if idx < goto_labels.len() {
-                                    let (label_str, _) = &goto_labels[idx];
-                                    result.push_str(label_str);
-                                } else {
-                                    // Unknown label index, pass through
-                                    result.push_str("%l");
-                                    result.push(next_ch);
-                                }
-                            } else {
-                                // Just %l without number or name, pass through
-                                result.push_str("%l");
-                            }
-                        } else {
-                            result.push_str("%l");
-                        }
-                    } else {
-                        // Unknown modifier - emit literally
-                        result.push('%');
-                    }
-                } else {
-                    result.push('%');
-                }
-            } else {
-                result.push(c);
-            }
-        }
-
-        result
+        crate::arch::substitute_asm_operands(
+            self,
+            template,
+            operand_regs,
+            operand_mem,
+            operand_names,
+            goto_labels,
+        )
     }
 }
 
@@ -4345,6 +4166,31 @@ fn asm_reg_name_32(reg: Reg) -> &'static str {
         Reg::X29 => "w29",
         Reg::X30 => "w30",
         Reg::SP => "wsp",
+    }
+}
+
+// ============================================================================
+// AsmOperandFormatter trait implementation
+// ============================================================================
+
+impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
+    type Reg = Reg;
+
+    fn size_modifiers(&self) -> &'static [char] {
+        &['w', 'x'] // 32, 64-bit
+    }
+
+    fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {
+        // AArch64 doesn't use % prefix for register names
+        match size_mod {
+            'w' => asm_reg_name_32(reg).to_string(),
+            _ => asm_reg_name_64(reg).to_string(),
+        }
+    }
+
+    fn format_reg_default(&self, reg: Reg) -> String {
+        // AArch64 inline asm defaults to 64-bit
+        asm_reg_name_64(reg).to_string()
     }
 }
 

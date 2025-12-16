@@ -629,7 +629,7 @@ mod parsing {
                 if st.starts_with('+') || st.starts_with('-') {
                     return Err(format!("invalid repeat count '{st}' in [c*n] construct",));
                 }
-                
+
                 let radix = if st.starts_with('0') {
                     // Octal
                     8_u32

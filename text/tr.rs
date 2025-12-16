@@ -625,6 +625,11 @@ mod parsing {
         let char_repetition = match repeat_string.as_str() {
             "" => CharRepetition::AsManyAsNeeded,
             st => {
+                // Reject if repeat count starts with a sign
+                if st.starts_with('+') || st.starts_with('-') {
+                    return Err(format!("invalid repeat count '{st}' in [c*n] construct",));
+                }
+
                 let radix = if st.starts_with('0') {
                     // Octal
                     8_u32

@@ -124,6 +124,11 @@ fn is_valid_tar_checksum(header: &[u8]) -> bool {
         return false;
     }
 
+    // Reject if checksum contains a sign
+    if chksum_str.starts_with('+') || chksum_str.starts_with('-') {
+        return false;
+    }
+
     let stored = match u32::from_str_radix(chksum_str, 8) {
         Ok(v) => v,
         Err(_) => return false,
@@ -213,6 +218,10 @@ fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     let s = s.trim_matches(|c| c == ' ' || c == '\0');
     if s.is_empty() {
         return Ok(0);
+    }
+    // Reject if the octal string contains a sign
+    if s.starts_with('+') || s.starts_with('-') {
+        return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
     }
     u64::from_str_radix(s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
 }

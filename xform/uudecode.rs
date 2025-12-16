@@ -59,7 +59,12 @@ impl Header {
             panic!("Invalid encoding type");
         };
 
-        let lower_perm_bits = u32::from_str_radix(split[1], 8).expect("Invalid permission value");
+        let mode_str = split[1];
+        // Reject if mode contains a sign
+        if mode_str.starts_with('+') || mode_str.starts_with('-') {
+            panic!("Invalid permission value: unexpected sign");
+        }
+        let lower_perm_bits = u32::from_str_radix(mode_str, 8).expect("Invalid permission value");
         let out = PathBuf::from(split[2]);
 
         Self {

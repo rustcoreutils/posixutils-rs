@@ -219,9 +219,19 @@ fn parse_count<T: FromStr<Err = ParseIntError> + FromStrRadix>(
     count: &str,
 ) -> Result<T, Box<dyn std::error::Error>> {
     if count.starts_with("0x") || count.starts_with("0X") {
-        T::from_str_radix(&count[2..], 16).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        let hex_part = &count[2..];
+        // Reject if hex part contains a sign
+        if hex_part.starts_with('+') || hex_part.starts_with('-') {
+            return Err("invalid hexadecimal number".into());
+        }
+        T::from_str_radix(hex_part, 16).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     } else if count.starts_with('0') && count.len() > 1 {
-        T::from_str_radix(&count[1..], 8).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        let oct_part = &count[1..];
+        // Reject if octal part contains a sign
+        if oct_part.starts_with('+') || oct_part.starts_with('-') {
+            return Err("invalid octal number".into());
+        }
+        T::from_str_radix(oct_part, 8).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     } else {
         count
             .parse::<T>()
@@ -278,6 +288,11 @@ fn parse_offset(offset: &str) -> Result<u64, ParseIntError> {
     } else {
         offset
     };
+
+    // Reject if offset contains a sign (offsets should be unsigned)
+    if offset.starts_with('+') || offset.starts_with('-') {
+        return Err("invalid offset".parse::<u64>().unwrap_err());
+    }
 
     let parsed_offset = u64::from_str_radix(offset, base)?;
 

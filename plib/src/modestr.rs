@@ -72,8 +72,11 @@ enum ParseState {
 }
 
 pub fn parse(mode: &str) -> Result<ChmodMode, String> {
-    if let Ok(m) = u32::from_str_radix(mode, 8) {
-        return Ok(ChmodMode::Absolute(m, mode.len() as u32));
+    // Try parsing as octal, but reject if it starts with a sign
+    if !mode.starts_with('+') && !mode.starts_with('-') {
+        if let Ok(m) = u32::from_str_radix(mode, 8) {
+            return Ok(ChmodMode::Absolute(m, mode.len() as u32));
+        }
     }
 
     let mut done_with_char;

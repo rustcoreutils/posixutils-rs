@@ -476,12 +476,14 @@ fn parse_perm_mode(mode_str: &str) -> Result<PermMode, String> {
 
 /// Parse a mode value (octal or symbolic)
 fn parse_mode_value(mode_str: &str) -> Result<u32, String> {
-    // Try octal first
-    if let Ok(m) = u32::from_str_radix(mode_str, 8) {
-        if m > 0o7777 {
-            return Err(format!("invalid mode: {}", mode_str));
+    // Try octal first, but reject if it starts with a sign
+    if !mode_str.starts_with('+') && !mode_str.starts_with('-') {
+        if let Ok(m) = u32::from_str_radix(mode_str, 8) {
+            if m > 0o7777 {
+                return Err(format!("invalid mode: {}", mode_str));
+            }
+            return Ok(m);
         }
-        return Ok(m);
     }
 
     // Parse as symbolic mode starting from 0

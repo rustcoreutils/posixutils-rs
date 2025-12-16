@@ -1,7 +1,7 @@
 # ASA Utility - POSIX Compliance Audit Report
 
 **Date:** 2025-12-16  
-**Auditor:** GitHub Copilot  
+**Audited By:** posixutils-rs development team  
 **Standard:** POSIX.2024  
 
 ## Executive Summary

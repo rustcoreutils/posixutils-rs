@@ -216,7 +216,16 @@ fn asa_multiple_files() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let file1 = format!("{}/tests/asa/file1.txt", project_root);
     let file2 = format!("{}/tests/asa/file2.txt", project_root);
-    let expected = "Line 1 from file1\nLine 2 from file1\n\nLine 3 with double-space\n\x0cPage 1 from file2\nNormal line\rOverprint this\n";
+    let expected = concat!(
+        "Line 1 from file1\n",
+        "Line 2 from file1\n",
+        "\n",
+        "Line 3 with double-space\n",
+        "\x0c",
+        "Page 1 from file2\n",
+        "Normal line\r",
+        "Overprint this\n"
+    );
     asa_test_with_args(&[file1.as_str(), file2.as_str()], expected, 0);
 }
 
@@ -259,7 +268,8 @@ fn asa_tab_control() {
 }
 
 // Test newline as control character (edge case)
-// When first character is newline, line is essentially empty
+// First line is empty (just newline), second line has space control with "text"
+// Empty first line should output just a newline, then second line outputs normally
 #[test]
 fn asa_newline_control() {
     asa_test("\n text\n", "\ntext\n");

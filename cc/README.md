@@ -80,8 +80,7 @@ Supported:
 - C99 standard
 - GCC-compatible inline assembly (extended asm with constraints, clobbers, asm goto)
 
-Not yet implemented (exceptions to C99, or features we want to add):
-- Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
+Not yet implemented (features we want to add):
 - -fverbose-asm
 - top builtins to implement:
   __builtin_expect

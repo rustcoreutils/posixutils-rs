@@ -471,16 +471,20 @@ The compiler uses an SSA-form IR, which is well-suited for classical optimizatio
 
 ### Pass 6: Conservative Function Inlining
 
-**Status:** Not implemented
+**Status:** Implemented (`cc/ir/inline.rs`)
 
 **What it does:**
 - Inline small, non-recursive, non-varargs functions into callers
 - Exposes new optimization opportunities
 
-**Constraints:**
-- Only inline static/internal functions
-- Limit by IR size: e.g. ≤ N instructions, ≤ M basic blocks
-- Reject varargs, VLAs, alloca, weird control flow
+**Implementation details:**
+- Analyzes all functions for inlineability (size, inline hint, recursion, varargs, alloca)
+- Heuristic-based inlining decisions based on optimization level
+- Size thresholds: always inline ≤10 insns, inline hint ≤50 insns, -O2 single-call ≤100 insns
+- Clones callee IR with remapped pseudos and basic blocks
+- Handles return value propagation and CFG updates
+- Removes dead static functions that were fully inlined
+- Iterates up to 3 times for nested inlining
 
 **After inlining:** Re-run InstCombine → SCCP → DCE
 
@@ -535,16 +539,16 @@ Local CSE → InstCombine
 
 ### Implementation Priority
 
-| Priority | Pass | Complexity | Impact |
-|----------|------|------------|--------|
-| 1 | CFG simplify | Low | Medium |
-| 2 | Copy/φ cleanup | Low | Medium |
-| 3 | Local CSE | Medium | Medium |
-| 4 | SCCP | Medium | High |
-| 5 | GVN | High | Medium |
-| 6 | Inlining | High | High |
-| 7 | LICM | Medium | Medium |
-| 8 | Loop opts | High | Low |
+| Priority | Pass | Complexity | Impact | Status |
+|----------|------|------------|--------|--------|
+| 1 | CFG simplify | Low | Medium | Not started |
+| 2 | Copy/φ cleanup | Low | Medium | Not started |
+| 3 | Local CSE | Medium | Medium | Not started |
+| 4 | SCCP | Medium | High | Not started |
+| 5 | GVN | High | Medium | Not started |
+| 6 | Inlining | High | High | **Done** |
+| 7 | LICM | Medium | Medium | Not started |
+| 8 | Loop opts | High | Low | Not started |
 
 ---
 

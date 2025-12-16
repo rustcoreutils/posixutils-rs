@@ -1,0 +1,3 @@
+ Line 1 from file1
+ Line 2 from file1
+0Line 3 with double-space

@@ -314,11 +314,17 @@ fn asa_all_controls_sequence() {
 // Test repeated form-feeds
 #[test]
 fn asa_multiple_form_feeds() {
-    asa_test("1page1\n1page2\n1page3\n", "\x0cpage1\n\x0cpage2\n\x0cpage3\n");
+    asa_test(
+        "1page1\n1page2\n1page3\n",
+        "\x0cpage1\n\x0cpage2\n\x0cpage3\n",
+    );
 }
 
 // Test alternating double-space and normal
 #[test]
 fn asa_alternating_spacing() {
-    asa_test(" normal\n0double\n normal\n0double\n", "normal\n\ndouble\nnormal\n\ndouble\n");
+    asa_test(
+        " normal\n0double\n normal\n0double\n",
+        "normal\n\ndouble\nnormal\n\ndouble\n",
+    );
 }

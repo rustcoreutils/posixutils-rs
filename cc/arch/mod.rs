@@ -18,6 +18,9 @@ pub mod lir;
 pub mod regalloc;
 pub mod x86_64;
 
+// Re-export inline asm support traits and functions
+pub use codegen::{substitute_asm_operands, AsmOperandFormatter};
+
 use crate::target::{Arch, Target};
 
 /// Get architecture-specific predefined macros as (name, value) pairs

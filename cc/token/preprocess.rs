@@ -617,6 +617,65 @@ impl<'a> Preprocessor<'a> {
                                 self.try_expand_macro(&name, &token.pos, &mut iter, idents)
                             {
                                 output.extend(expanded);
+
+                                // Check if the last expanded token is a function-like macro
+                                // followed by '(' in the remaining input stream.
+                                // This handles cases like: CALL(ADD)(10, 32) where token paste
+                                // creates a function-like macro name and args come from outside.
+                                while let Some(last) = output.last() {
+                                    if last.typ != TokenType::Ident {
+                                        break;
+                                    }
+                                    let TokenValue::Ident(id) = &last.value else {
+                                        break;
+                                    };
+                                    let Some(macro_name) = idents.get_opt(*id) else {
+                                        break;
+                                    };
+                                    let macro_name = macro_name.to_string();
+
+                                    // Check if it's a function-like macro
+                                    let Some(mac) = self.macros.get(&macro_name) else {
+                                        break;
+                                    };
+                                    if !mac.is_function {
+                                        break;
+                                    }
+
+                                    // Check if next token is '('
+                                    let Some(next) = iter.peek() else { break };
+                                    let TokenValue::Special(code) = &next.value else {
+                                        break;
+                                    };
+                                    if *code != b'(' as u32 {
+                                        break;
+                                    }
+
+                                    // Check for recursion
+                                    if self.expanding.contains(&macro_name) {
+                                        break;
+                                    }
+
+                                    // Pop the identifier and expand as function-like macro
+                                    let last_token = output.pop().unwrap();
+                                    iter.next(); // consume '('
+                                    let args = self.collect_macro_args(&mut iter, idents);
+                                    let mac = mac.clone();
+                                    if let Some(more_expanded) = self.expand_function_macro(
+                                        &mac,
+                                        &args,
+                                        &last_token.pos,
+                                        idents,
+                                    ) {
+                                        output.extend(more_expanded);
+                                        // Loop to handle chained expansions
+                                    } else {
+                                        // Put back the identifier if expansion failed
+                                        output.push(last_token);
+                                        break;
+                                    }
+                                }
+
                                 continue;
                             }
                         }
@@ -3531,5 +3590,25 @@ PASTE(foo, bar)
         assert!(strs.contains(&"a".to_string()));
         assert!(strs.contains(&"b".to_string()));
         assert!(strs.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_chained_paste_expansion() {
+        // Token paste creates function-like macro name, arguments come from outside.
+        // This tests the case: CALL(ADD)(10, 32) where ## creates ADD_func,
+        // and then (10, 32) from outside should trigger ADD_func expansion.
+        let (tokens, idents) = preprocess_str(
+            "#define ADD_func(x, y) ((x) + (y))\n\
+             #define CONCAT(a, b) a ## b\n\
+             #define CALL(name) CONCAT(name, _func)\n\
+             CALL(ADD)(10, 32)",
+        );
+        let strs = get_token_strings(&tokens, &idents);
+        // Should expand to ((10) + (32))
+        assert!(strs.contains(&"10".to_string()));
+        assert!(strs.contains(&"32".to_string()));
+        assert!(strs.contains(&"+".to_string()));
+        // Should NOT contain ADD_func as unexpanded identifier
+        assert!(!strs.contains(&"ADD_func".to_string()));
     }
 }

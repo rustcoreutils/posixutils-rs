@@ -39,9 +39,10 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    expire_intervals, find_call_positions, interval_crosses_call, LiveInterval,
+    compute_live_intervals, expire_intervals, find_call_positions, find_conflicting_registers,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval,
 };
-use crate::ir::{Function, Opcode, PseudoId, PseudoKind};
+use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
 
@@ -276,18 +277,32 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
     }
 }
 
-/// A point in the function where register constraints apply.
-/// Used during allocation to avoid assigning pseudos to registers
-/// that would be clobbered at this point.
-#[derive(Debug, Clone)]
-pub struct ConstraintPoint {
-    /// Instruction position in the function
-    pub position: usize,
-    /// Registers clobbered at this point
-    pub clobbers: Vec<Reg>,
-    /// Pseudos that ARE the operands of the constrained instruction
-    /// (these should NOT be evicted - they're the actual div/mod operands)
-    pub involved_pseudos: Vec<PseudoId>,
+/// Get constraint info for an instruction (used by shared compute_live_intervals).
+/// Returns (clobbered_registers, involved_pseudos) if constraints apply, None otherwise.
+///
+/// For x86-64:
+/// - Division clobbers Rax/Rdx; all operands are involved (may be in clobbered regs)
+/// - VaArg clobbers Rax/Rcx; only target is involved (sources must NOT be in clobbered regs)
+pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
+    let constraints = opcode_constraints(insn.op);
+    if constraints.clobbers.is_empty() {
+        return None;
+    }
+
+    // Collect pseudos involved in this instruction.
+    // "Involved" pseudos are ALLOWED to be in clobbered registers.
+    let mut involved = Vec::new();
+    if let Some(t) = insn.target {
+        involved.push(t);
+    }
+
+    // For VaArg, sources should NOT be in clobbered registers,
+    // so we don't add them to involved_pseudos
+    if insn.op != Opcode::VaArg {
+        involved.extend(insn.src.iter().copied());
+    }
+
+    Some((constraints.clobbers.to_vec(), involved))
 }
 
 // ============================================================================
@@ -452,7 +467,8 @@ impl RegAlloc {
     /// Perform register allocation for a function
     pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
         self.reset_state();
-        self.identify_fp_pseudos(func, types);
+        // Use shared identify_fp_pseudos with type-checker closure
+        self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         self.allocate_arguments(func, types);
 
         let (intervals, constraint_points) = self.compute_live_intervals(func);
@@ -585,33 +601,6 @@ impl RegAlloc {
         }
     }
 
-    /// Find registers that would conflict with this interval due to constraints.
-    /// If a pseudo is live at a constraint point (e.g., division) and is NOT an operand
-    /// of that instruction, it cannot be allocated to any clobbered register (Rax/Rdx).
-    fn find_conflicting_registers(
-        &self,
-        interval: &LiveInterval,
-        constraint_points: &[ConstraintPoint],
-    ) -> HashSet<Reg> {
-        let mut conflicts = HashSet::new();
-
-        for cp in constraint_points {
-            // If interval is live at this constraint point...
-            // Use <= for end to handle case where interval ends exactly at constraint point
-            if interval.start <= cp.position && cp.position <= interval.end {
-                // ...and this pseudo is NOT involved in the constrained instruction...
-                if !cp.involved_pseudos.contains(&interval.pseudo) {
-                    // ...then it cannot be in any clobbered register
-                    for &reg in &cp.clobbers {
-                        conflicts.insert(reg);
-                    }
-                }
-            }
-        }
-
-        conflicts
-    }
-
     /// Run the linear scan allocation algorithm
     fn run_linear_scan(
         &mut self,
@@ -619,7 +608,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
-        constraint_points: &[ConstraintPoint],
+        constraint_points: &[ConstraintPoint<Reg>],
     ) {
         for interval in intervals {
             self.expire_old_intervals(interval.start);
@@ -675,7 +664,7 @@ impl RegAlloc {
             let crosses_call = interval_crosses_call(&interval, call_positions);
 
             // Find registers that conflict due to constraints (e.g., Rax/Rdx for division)
-            let conflicting_regs = self.find_conflicting_registers(&interval, constraint_points);
+            let conflicting_regs = find_conflicting_registers(&interval, constraint_points);
 
             if needs_fp {
                 if let Some(xmm) = self.free_xmm_regs.pop() {
@@ -744,67 +733,6 @@ impl RegAlloc {
         }
     }
 
-    /// Scan function to identify which pseudos need FP registers
-    fn identify_fp_pseudos(&mut self, func: &Function, types: &TypeTable) {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                let is_fp_op = matches!(
-                    insn.op,
-                    Opcode::FAdd
-                        | Opcode::FSub
-                        | Opcode::FMul
-                        | Opcode::FDiv
-                        | Opcode::FNeg
-                        | Opcode::FCmpOEq
-                        | Opcode::FCmpONe
-                        | Opcode::FCmpOLt
-                        | Opcode::FCmpOLe
-                        | Opcode::FCmpOGt
-                        | Opcode::FCmpOGe
-                        | Opcode::UCvtF
-                        | Opcode::SCvtF
-                        | Opcode::FCvtF
-                );
-
-                // Mark target as FP if this is an FP operation (except comparisons)
-                if is_fp_op
-                    && !matches!(
-                        insn.op,
-                        Opcode::FCmpOEq
-                            | Opcode::FCmpONe
-                            | Opcode::FCmpOLt
-                            | Opcode::FCmpOLe
-                            | Opcode::FCmpOGt
-                            | Opcode::FCmpOGe
-                    )
-                {
-                    if let Some(target) = insn.target {
-                        self.fp_pseudos.insert(target);
-                    }
-                }
-
-                // Also check the type if available
-                if let Some(typ) = insn.typ {
-                    if types.is_float(typ)
-                        && !matches!(
-                            insn.op,
-                            Opcode::FCmpOEq
-                                | Opcode::FCmpONe
-                                | Opcode::FCmpOLt
-                                | Opcode::FCmpOLe
-                                | Opcode::FCmpOGt
-                                | Opcode::FCmpOGe
-                        )
-                    {
-                        if let Some(target) = insn.target {
-                            self.fp_pseudos.insert(target);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn expire_old_intervals(&mut self, point: usize) {
         // Expire integer register intervals
         expire_intervals(&mut self.active, &mut self.free_regs, point);
@@ -816,231 +744,11 @@ impl RegAlloc {
     /// Returns (intervals, constraint_points) where:
     /// - intervals: Live ranges for each pseudo
     /// - constraint_points: Positions where register constraints apply (e.g., division clobbers)
-    fn compute_live_intervals(&self, func: &Function) -> (Vec<LiveInterval>, Vec<ConstraintPoint>) {
-        use crate::ir::BasicBlockId;
-
-        struct IntervalInfo {
-            pseudo: PseudoId,
-            first_def: usize,
-            last_def: usize,
-            last_use: usize,
-        }
-
-        let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
-        let mut constraint_points: Vec<ConstraintPoint> = Vec::new();
-        let mut pos = 0usize;
-
-        // First pass: compute block start and end positions
-        let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
-        let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::new();
-        let mut temp_pos = 0usize;
-        for block in &func.blocks {
-            block_start_pos.insert(block.id, temp_pos);
-            temp_pos += block.insns.len();
-            block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
-        }
-
-        // Pre-initialize intervals for argument pseudos with first_def = 0
-        // because arguments are live from function entry
-        for pseudo in &func.pseudos {
-            if let PseudoKind::Arg(_) = pseudo.kind {
-                intervals.insert(
-                    pseudo.id,
-                    IntervalInfo {
-                        pseudo: pseudo.id,
-                        first_def: 0,
-                        last_def: 0,
-                        last_use: 0,
-                    },
-                );
-            }
-        }
-
-        // Collect phi sources and targets
-        let mut phi_sources: Vec<(BasicBlockId, PseudoId)> = Vec::new();
-        let mut phi_targets: Vec<(BasicBlockId, PseudoId)> = Vec::new();
-
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if let Some(target) = insn.target {
-                    intervals
-                        .entry(target)
-                        .and_modify(|info| {
-                            info.first_def = info.first_def.min(pos);
-                            info.last_def = info.last_def.max(pos);
-                        })
-                        .or_insert(IntervalInfo {
-                            pseudo: target,
-                            first_def: pos,
-                            last_def: pos,
-                            last_use: pos,
-                        });
-                }
-
-                for &src in &insn.src {
-                    if let Some(info) = intervals.get_mut(&src) {
-                        info.last_use = info.last_use.max(pos);
-                    } else {
-                        intervals.insert(
-                            src,
-                            IntervalInfo {
-                                pseudo: src,
-                                first_def: pos,
-                                last_def: pos,
-                                last_use: pos,
-                            },
-                        );
-                    }
-                }
-
-                // For indirect calls, the indirect_target pseudo is also used
-                if let Some(indirect) = insn.indirect_target {
-                    if let Some(info) = intervals.get_mut(&indirect) {
-                        info.last_use = info.last_use.max(pos);
-                    } else {
-                        intervals.insert(
-                            indirect,
-                            IntervalInfo {
-                                pseudo: indirect,
-                                first_def: pos,
-                                last_def: pos,
-                                last_use: pos,
-                            },
-                        );
-                    }
-                }
-
-                for (src_bb, pseudo) in &insn.phi_list {
-                    phi_sources.push((*src_bb, *pseudo));
-                    if let Some(target) = insn.target {
-                        phi_targets.push((*src_bb, target));
-                    }
-                }
-
-                // Collect constraint points for instructions that clobber registers
-                let constraints = opcode_constraints(insn.op);
-                if !constraints.clobbers.is_empty() {
-                    // Collect pseudos involved in this instruction.
-                    // "Involved" pseudos are ALLOWED to be in clobbered registers.
-                    //
-                    // For division: dividend must be in Rax, so target and sources are involved
-                    // For VaArg: only target should be involved (result goes to Rax),
-                    //            sources (va_list pointer) must NOT be in Rax/Rcx
-                    let mut involved = Vec::new();
-                    if let Some(t) = insn.target {
-                        involved.push(t);
-                    }
-                    // For VaArg, sources should NOT be in clobbered registers,
-                    // so we don't add them to involved_pseudos
-                    if insn.op != Opcode::VaArg {
-                        involved.extend(insn.src.iter().copied());
-                    }
-
-                    constraint_points.push(ConstraintPoint {
-                        position: pos,
-                        clobbers: constraints.clobbers.to_vec(),
-                        involved_pseudos: involved,
-                    });
-                }
-
-                pos += 1;
-            }
-        }
-
-        // Extend phi source intervals to end of their source block
-        for (src_bb, pseudo) in phi_sources {
-            if let Some(&end_pos) = block_end_pos.get(&src_bb) {
-                if let Some(info) = intervals.get_mut(&pseudo) {
-                    info.last_use = info.last_use.max(end_pos);
-                } else {
-                    intervals.insert(
-                        pseudo,
-                        IntervalInfo {
-                            pseudo,
-                            first_def: end_pos,
-                            last_def: end_pos,
-                            last_use: end_pos,
-                        },
-                    );
-                }
-            }
-        }
-
-        // Extend phi target intervals
-        for (src_bb, target) in phi_targets {
-            if let Some(&end_pos) = block_end_pos.get(&src_bb) {
-                if let Some(info) = intervals.get_mut(&target) {
-                    info.last_def = info.last_def.max(end_pos);
-                } else {
-                    intervals.insert(
-                        target,
-                        IntervalInfo {
-                            pseudo: target,
-                            first_def: end_pos,
-                            last_def: end_pos,
-                            last_use: end_pos,
-                        },
-                    );
-                }
-            }
-        }
-
-        // Handle loop back edges
-        let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> = Vec::new();
-        for block in &func.blocks {
-            if let Some(last_insn) = block.insns.last() {
-                let mut targets = Vec::new();
-                if let Some(target) = last_insn.bb_true {
-                    targets.push(target);
-                }
-                if let Some(target) = last_insn.bb_false {
-                    targets.push(target);
-                }
-
-                let from_start = block_start_pos.get(&block.id).copied().unwrap_or(0);
-                for target_bb in targets {
-                    let target_start = block_start_pos.get(&target_bb).copied().unwrap_or(0);
-                    if target_start < from_start {
-                        let from_end = block_end_pos.get(&block.id).copied().unwrap_or(0);
-                        loop_back_edges.push((block.id, target_bb, from_end));
-                    }
-                }
-            }
-        }
-
-        // Extend lifetimes for loop variables
-        for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
-            let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
-
-            for info in intervals.values_mut() {
-                if info.first_def < loop_start
-                    && info.last_use >= loop_start
-                    && info.last_use <= *back_edge_pos
-                {
-                    info.last_use = info.last_use.max(*back_edge_pos);
-                }
-            }
-        }
-
-        let max_pos = pos.saturating_sub(1);
-
-        let mut result: Vec<_> = intervals
-            .into_values()
-            .map(|info| {
-                let end = if info.last_def > info.last_use {
-                    max_pos
-                } else {
-                    info.last_def.max(info.last_use)
-                };
-                LiveInterval {
-                    pseudo: info.pseudo,
-                    start: info.first_def,
-                    end,
-                }
-            })
-            .collect();
-        result.sort_by_key(|i| i.start);
-        (result, constraint_points)
+    fn compute_live_intervals(
+        &self,
+        func: &Function,
+    ) -> (Vec<LiveInterval>, Vec<ConstraintPoint<Reg>>) {
+        compute_live_intervals(func, get_constraint_info)
     }
 
     /// Get stack size needed (aligned to 16 bytes)

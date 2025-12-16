@@ -35,13 +35,17 @@ Key source files:
 | `parse/ast.rs` | AST node definitions |
 | `types.rs` | C type system |
 | `symbol.rs` | Symbol table with scope management |
-| `linearize.rs` | AST → IR conversion, SSA construction |
-| `ir.rs` | Intermediate representation definitions |
-| `ssa.rs` | SSA phi node insertion |
-| `lower.rs` | IR lowering passes (phi elimination) |
-| `dominate.rs` | Dominator tree and dominance frontiers |
-| `codegen/x86_64/` | x86-64 code generator |
-| `codegen/aarch64/` | AArch64 code generator |
+| `ir/linearize.rs` | AST → IR conversion, SSA construction |
+| `ir/mod.rs` | Intermediate representation definitions |
+| `ir/ssa.rs` | SSA phi node insertion |
+| `ir/lower.rs` | IR lowering passes (phi elimination) |
+| `ir/dominate.rs` | Dominator tree and dominance frontiers |
+| `ir/dce.rs` | Dead code elimination |
+| `ir/instcombine.rs` | Instruction combining/simplification |
+| `arch/x86_64/` | x86-64 code generator |
+| `arch/aarch64/` | AArch64 code generator |
+| `arch/lir.rs` | Low-level IR (LIR) definitions |
+| `arch/regalloc.rs` | Register allocation |
 
 ## Debugging
 
@@ -74,9 +78,9 @@ EOF
 
 Supported:
 - C99 standard
+- GCC-compatible inline assembly (extended asm with constraints, clobbers, asm goto)
 
-Not yet implemented (exceptions to C99, or features we want to add):
-- Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
+Not yet implemented (features we want to add):
 - -fverbose-asm
 - top builtins to implement:
   __builtin_expect
@@ -86,17 +90,6 @@ Not yet implemented (exceptions to C99, or features we want to add):
 - C11 Alignment Specifiers (_Alignas, _Alignof)
 - C11 Thread-Local Storage (_Thread_local) and atomics (_Atomic)
 - Other C11 features: _Static_assert, _Generic, anonymous structs
-
-## Known Issues
-
-### Preprocessor
-
-- **Chained macro expansion after token paste**: When a token paste (`##`) creates an identifier that is itself a function-like macro, the subsequent macro expansion may not work correctly. For example:
-  ```c
-  #define BAR_test(y) y
-  #define FOO(x) BAR_ ## x(1)
-  FOO(test)  // Should expand to 1, but may produce incorrect output
-  ```
 
 ## Code Quality
 

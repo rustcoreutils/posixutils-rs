@@ -650,7 +650,8 @@ mod special_targets {
         let pid = child.id() as i32;
 
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            // Give makefile time to execute through mkdir, touch, and start sleep
+            thread::sleep(Duration::from_millis(800));
             unsafe {
                 kill(pid, SIGINT);
             }

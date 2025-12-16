@@ -14,9 +14,11 @@
 //
 
 use super::regalloc::{Reg, VReg};
-use crate::arch::lir::{Directive, EmitAsm, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{
+    CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
+};
 use crate::target::{Os, Target};
-use std::fmt::{self, Write};
+use std::fmt::Write;
 
 // ============================================================================
 // Memory Addressing Modes
@@ -81,72 +83,6 @@ impl GpOperand {
             GpOperand::Imm(v) => format!("#{}", v),
         }
     }
-}
-
-// ============================================================================
-// Condition Codes
-// ============================================================================
-
-/// AArch64 condition codes for comparisons and conditional operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Cond {
-    /// Equal (Z=1)
-    Eq,
-    /// Not equal (Z=0)
-    Ne,
-    /// Carry set / unsigned higher or same (C=1)
-    Cs,
-    /// Carry clear / unsigned lower (C=0)
-    Cc,
-    /// Unsigned higher (C=1 and Z=0)
-    Hi,
-    /// Unsigned lower or same (C=0 or Z=1)
-    Ls,
-    /// Signed greater than or equal (N=V)
-    Ge,
-    /// Signed less than (N!=V)
-    Lt,
-    /// Signed greater than (Z=0 and N=V)
-    Gt,
-    /// Signed less than or equal (Z=1 or N!=V)
-    Le,
-}
-
-impl Cond {
-    /// AArch64 condition code suffix
-    pub fn suffix(&self) -> &'static str {
-        match self {
-            Cond::Eq => "eq",
-            Cond::Ne => "ne",
-            Cond::Cs => "cs",
-            Cond::Cc => "cc",
-            Cond::Hi => "hi",
-            Cond::Ls => "ls",
-            Cond::Ge => "ge",
-            Cond::Lt => "lt",
-            Cond::Gt => "gt",
-            Cond::Le => "le",
-        }
-    }
-}
-
-impl fmt::Display for Cond {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.suffix())
-    }
-}
-
-// ============================================================================
-// Call Target
-// ============================================================================
-
-/// Target for call instructions
-#[derive(Debug, Clone, PartialEq)]
-pub enum CallTarget {
-    /// Direct call to symbol
-    Direct(Symbol),
-    /// Indirect call through register (blr xN)
-    Indirect(Reg),
 }
 
 // ============================================================================
@@ -394,12 +330,12 @@ pub enum Aarch64Inst {
     },
 
     /// CSET - Conditional set (set to 1 if condition true, else 0)
-    Cset { cond: Cond, dst: Reg },
+    Cset { cond: CondCode, dst: Reg },
 
     /// CSEL - Conditional select
     Csel {
         size: OperandSize,
-        cond: Cond,
+        cond: CondCode,
         src_true: Reg,
         src_false: Reg,
         dst: Reg,
@@ -438,10 +374,10 @@ pub enum Aarch64Inst {
     B { target: Label },
 
     /// B.cond - Conditional branch
-    BCond { cond: Cond, target: Label },
+    BCond { cond: CondCode, target: Label },
 
     /// BL - Branch with link (function call)
-    Bl { target: CallTarget },
+    Bl { target: CallTarget<Reg> },
 
     /// RET - Return from subroutine
     Ret,
@@ -614,6 +550,16 @@ pub enum Aarch64Inst {
     // ========================================================================
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
     Directive(Directive),
+}
+
+// ============================================================================
+// LirInst Implementation
+// ============================================================================
+
+impl crate::arch::lir::LirInst for Aarch64Inst {
+    fn from_directive(dir: Directive) -> Self {
+        Aarch64Inst::Directive(dir)
+    }
 }
 
 // ============================================================================
@@ -1083,7 +1029,7 @@ impl EmitAsm for Aarch64Inst {
             }
 
             Aarch64Inst::Cset { cond, dst } => {
-                let _ = writeln!(out, "    cset {}, {}", dst.name64(), cond.suffix());
+                let _ = writeln!(out, "    cset {}, {}", dst.name64(), cond.aarch64_suffix());
             }
 
             Aarch64Inst::Csel {
@@ -1100,7 +1046,7 @@ impl EmitAsm for Aarch64Inst {
                     dst.name_for_size(sz),
                     src_true.name_for_size(sz),
                     src_false.name_for_size(sz),
-                    cond.suffix()
+                    cond.aarch64_suffix()
                 );
             }
 
@@ -1133,7 +1079,7 @@ impl EmitAsm for Aarch64Inst {
             }
 
             Aarch64Inst::BCond { cond, target: lbl } => {
-                let _ = writeln!(out, "    b.{} {}", cond.suffix(), lbl.name());
+                let _ = writeln!(out, "    b.{} {}", cond.aarch64_suffix(), lbl.name());
             }
 
             Aarch64Inst::Bl {
@@ -1571,7 +1517,7 @@ mod tests {
 
         let mut out = String::new();
         let inst = Aarch64Inst::Cset {
-            cond: Cond::Eq,
+            cond: CondCode::Eq,
             dst: Reg::X0,
         };
         inst.emit(&target, &mut out);
@@ -1591,7 +1537,7 @@ mod tests {
 
         let mut out = String::new();
         let inst = Aarch64Inst::BCond {
-            cond: Cond::Ne,
+            cond: CondCode::Ne,
             target: Label::new("main", 2),
         };
         inst.emit(&target, &mut out);

@@ -10,6 +10,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::sync::Once;
+
+static BUILD_ONCE: Once = Once::new();
 
 fn init() {
     let _ = env_logger::builder()
@@ -92,19 +95,23 @@ fn run_command(input: &Path) -> std::process::Output {
                 release_path
             } else {
                 // Build debug binary if release doesn't exist
-                let cargo_build_output = std::process::Command::new("cargo")
-                    .arg("build")
-                    .arg("-p")
-                    .arg("posixutils-m4")
-                    .current_dir(workspace_root)
-                    .output()
-                    .unwrap();
-                if !cargo_build_output.status.success() {
-                    panic!(
-                        "cargo build failed: {}",
-                        String::from_utf8_lossy(&cargo_build_output.stderr)
-                    );
-                }
+                // Use Once to ensure cargo build runs only once, avoiding race conditions
+                // when multiple .args tests run in parallel
+                BUILD_ONCE.call_once(|| {
+                    let cargo_build_output = std::process::Command::new("cargo")
+                        .arg("build")
+                        .arg("-p")
+                        .arg("posixutils-m4")
+                        .current_dir(workspace_root)
+                        .output()
+                        .unwrap();
+                    if !cargo_build_output.status.success() {
+                        panic!(
+                            "cargo build failed: {}",
+                            String::from_utf8_lossy(&cargo_build_output.stderr)
+                        );
+                    }
+                });
                 debug_path
             };
 

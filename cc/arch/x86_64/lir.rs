@@ -14,9 +14,11 @@
 //
 
 use super::regalloc::{Reg, XmmReg};
-use crate::arch::lir::{Directive, EmitAsm, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{
+    CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
+};
 use crate::target::{Os, Target};
-use std::fmt::{self, Write};
+use std::fmt::Write;
 
 // ============================================================================
 // Memory Addressing Modes
@@ -100,59 +102,6 @@ impl XmmOperand {
 }
 
 // ============================================================================
-// Condition Codes
-// ============================================================================
-
-/// Integer condition codes for comparisons and conditional jumps/sets
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IntCC {
-    /// Equal (ZF=1)
-    E,
-    /// Not equal (ZF=0)
-    Ne,
-    /// Less than (signed) (SF!=OF)
-    L,
-    /// Less than or equal (signed) (ZF=1 or SF!=OF)
-    Le,
-    /// Greater than (signed) (ZF=0 and SF=OF)
-    G,
-    /// Greater than or equal (signed) (SF=OF)
-    Ge,
-    /// Below (unsigned) (CF=1)
-    B,
-    /// Below or equal (unsigned) (CF=1 or ZF=1)
-    Be,
-    /// Above (unsigned) (CF=0 and ZF=0)
-    A,
-    /// Above or equal (unsigned) (CF=0)
-    Ae,
-}
-
-impl IntCC {
-    /// x86-64 condition code suffix
-    pub fn suffix(&self) -> &'static str {
-        match self {
-            IntCC::E => "e",
-            IntCC::Ne => "ne",
-            IntCC::L => "l",
-            IntCC::Le => "le",
-            IntCC::G => "g",
-            IntCC::Ge => "ge",
-            IntCC::B => "b",
-            IntCC::Be => "be",
-            IntCC::A => "a",
-            IntCC::Ae => "ae",
-        }
-    }
-}
-
-impl fmt::Display for IntCC {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.suffix())
-    }
-}
-
-// ============================================================================
 // Shift Count
 // ============================================================================
 
@@ -163,19 +112,6 @@ pub enum ShiftCount {
     Imm(u8),
     /// Use %cl register for count
     Cl,
-}
-
-// ============================================================================
-// Call Target
-// ============================================================================
-
-/// Target for call instructions
-#[derive(Debug, Clone, PartialEq)]
-pub enum CallTarget {
-    /// Direct call to symbol
-    Direct(Symbol),
-    /// Indirect call through register (call *%reg)
-    Indirect(Reg),
 }
 
 // ============================================================================
@@ -335,11 +271,11 @@ pub enum X86Inst {
     },
 
     /// SETcc - Set byte based on condition
-    SetCC { cc: IntCC, dst: Reg },
+    SetCC { cc: CondCode, dst: Reg },
 
     /// CMOVcc - Conditional move
     CMov {
-        cc: IntCC,
+        cc: CondCode,
         size: OperandSize,
         src: GpOperand,
         dst: Reg,
@@ -352,10 +288,10 @@ pub enum X86Inst {
     Jmp { target: Label },
 
     /// Jcc - Conditional jump
-    Jcc { cc: IntCC, target: Label },
+    Jcc { cc: CondCode, target: Label },
 
     /// CALL - Function call
-    Call { target: CallTarget },
+    Call { target: CallTarget<Reg> },
 
     /// RET - Return from function
     Ret,
@@ -501,6 +437,16 @@ pub enum X86Inst {
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
     /// These are architecture-independent and use the shared Directive type.
     Directive(Directive),
+}
+
+// ============================================================================
+// LirInst Implementation
+// ============================================================================
+
+impl crate::arch::lir::LirInst for X86Inst {
+    fn from_directive(dir: Directive) -> Self {
+        X86Inst::Directive(dir)
+    }
 }
 
 // ============================================================================
@@ -760,14 +706,14 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::SetCC { cc, dst } => {
-                let _ = writeln!(out, "    set{} {}", cc.suffix(), dst.name8());
+                let _ = writeln!(out, "    set{} {}", cc.x86_suffix(), dst.name8());
             }
 
             X86Inst::CMov { cc, size, src, dst } => {
                 let _ = writeln!(
                     out,
                     "    cmov{}{} {}, {}",
-                    cc.suffix(),
+                    cc.x86_suffix(),
                     size.x86_suffix(),
                     src.format(*size, target),
                     dst.name_for_size(size.bits())
@@ -780,7 +726,7 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::Jcc { cc, target: lbl } => {
-                let _ = writeln!(out, "    j{} {}", cc.suffix(), lbl.name());
+                let _ = writeln!(out, "    j{} {}", cc.x86_suffix(), lbl.name());
             }
 
             X86Inst::Call {
@@ -1132,12 +1078,12 @@ mod tests {
         let target = linux_target();
 
         for (cc, expected) in [
-            (IntCC::E, "je"),
-            (IntCC::Ne, "jne"),
-            (IntCC::L, "jl"),
-            (IntCC::G, "jg"),
-            (IntCC::B, "jb"),
-            (IntCC::A, "ja"),
+            (CondCode::Eq, "je"),
+            (CondCode::Ne, "jne"),
+            (CondCode::Slt, "jl"),
+            (CondCode::Sgt, "jg"),
+            (CondCode::Ult, "jb"),
+            (CondCode::Ugt, "ja"),
         ] {
             let mut out = String::new();
             let inst = X86Inst::Jcc {

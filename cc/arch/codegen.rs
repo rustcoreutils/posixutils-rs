@@ -9,9 +9,11 @@
 // Architecture-independent code generation interface
 //
 
-use crate::ir::{Function, Module, Opcode};
+use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
+use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
+use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
 use crate::target::Target;
-use crate::types::TypeTable;
+use crate::types::{TypeModifiers, TypeTable};
 
 // ============================================================================
 // Shared Helper Types
@@ -94,6 +96,504 @@ pub fn escape_string(s: &str) -> String {
     }
     result
 }
+
+// ============================================================================
+// CodeGenBase - Generic Code Generation Infrastructure
+// ============================================================================
+
+/// Common code generation state shared between all architectures.
+/// Generic over the LIR instruction type I, enabling type-safe architecture-specific
+/// instruction buffers while sharing common infrastructure.
+pub struct CodeGenBase<I: LirInst> {
+    /// Target platform information
+    pub target: Target,
+    /// Output buffer for emitted assembly
+    pub output: String,
+    /// LIR instruction buffer for deferred emission and peephole optimization
+    pub lir_buffer: Vec<I>,
+    /// Current function name (for label generation)
+    pub current_fn: String,
+    /// Whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
+    pub emit_unwind_tables: bool,
+    /// Last emitted source line (for avoiding duplicate .loc directives)
+    pub last_debug_line: u32,
+    /// Last emitted source file index
+    pub last_debug_file: u16,
+    /// Whether to emit debug info (.file/.loc directives)
+    pub emit_debug: bool,
+}
+
+impl<I: LirInst + EmitAsm> CodeGenBase<I> {
+    /// Create a new CodeGenBase for the given target
+    pub fn new(target: Target) -> Self {
+        Self {
+            target,
+            output: String::new(),
+            lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
+            current_fn: String::new(),
+            emit_unwind_tables: true,
+            last_debug_line: 0,
+            last_debug_file: 0,
+            emit_debug: false,
+        }
+    }
+
+    /// Push a LIR instruction to the buffer
+    #[inline]
+    pub fn push_lir(&mut self, inst: I) {
+        self.lir_buffer.push(inst);
+    }
+
+    /// Push a directive (convenience method)
+    #[inline]
+    pub fn push_directive(&mut self, dir: Directive) {
+        self.lir_buffer.push(I::from_directive(dir));
+    }
+
+    /// Emit all buffered LIR instructions to the output string
+    pub fn emit_all(&mut self) {
+        for inst in &self.lir_buffer {
+            inst.emit(&self.target, &mut self.output);
+        }
+    }
+
+    /// Clear LIR buffer (for reuse between functions)
+    pub fn clear_lir(&mut self) {
+        self.lir_buffer.clear();
+    }
+
+    /// Reset debug state for new module
+    pub fn reset_debug_state(&mut self) {
+        self.last_debug_line = 0;
+        self.last_debug_file = 0;
+    }
+
+    /// Emit file header with compiler info
+    pub fn emit_header(&mut self) {
+        for comment in generate_header_comments(&self.target) {
+            self.push_directive(Directive::Comment(comment));
+        }
+        self.push_directive(Directive::Text);
+    }
+
+    /// Emit .loc directive for source line tracking
+    /// Returns true if a directive was emitted
+    pub fn emit_loc(&mut self, insn: &Instruction) -> bool {
+        if !self.emit_debug {
+            return false;
+        }
+        if let Some(pos) = &insn.pos {
+            let file = pos.stream + 1; // DWARF file indices start at 1
+            let line = pos.line;
+            if line != self.last_debug_line || file != self.last_debug_file {
+                self.push_directive(Directive::loc(file.into(), line, pos.col.into()));
+                self.last_debug_line = line;
+                self.last_debug_file = file;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Emit a global variable definition
+    pub fn emit_global(
+        &mut self,
+        name: &str,
+        typ: &crate::types::TypeId,
+        init: &Initializer,
+        types: &TypeTable,
+    ) {
+        let size = types.size_bits(*typ) / 8;
+        let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
+
+        // Check storage class - skip .globl for static
+        let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
+
+        // Get alignment from type info
+        let align = types.alignment(*typ) as u32;
+
+        // Use .comm for uninitialized external (non-static) globals
+        let use_bss = matches!(init, Initializer::None) && !is_static;
+
+        if use_bss {
+            // Use .comm for uninitialized external globals
+            self.push_directive(Directive::comm(name, size, align));
+            return;
+        }
+
+        // Data section
+        self.push_directive(Directive::Data);
+
+        // Check if this is a local symbol (starts with '.')
+        let is_local = name.starts_with('.');
+
+        // Global visibility (if not static and not local)
+        if !is_static && !is_local {
+            self.push_directive(Directive::global(name));
+        }
+
+        // ELF-only type and size (handled by Directive::emit which skips on macOS)
+        self.push_directive(Directive::type_object(name));
+        self.push_directive(Directive::size(name, size));
+
+        // Alignment
+        if align > 1 {
+            self.push_directive(Directive::Align(align.trailing_zeros()));
+        }
+
+        // Label - use local_label for names starting with '.'
+        if is_local {
+            self.push_directive(Directive::local_label(name));
+        } else {
+            self.push_directive(Directive::global_label(name));
+        }
+
+        // Emit initializer
+        self.emit_initializer_data(init, size as usize);
+    }
+
+    /// Emit data for an initializer, recursively handling complex types
+    pub fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
+        match init {
+            Initializer::None => {
+                // Zero-fill
+                self.push_directive(Directive::Zero(size as u32));
+            }
+            Initializer::Int(val) => match size {
+                1 => self.push_directive(Directive::Byte(*val)),
+                2 => self.push_directive(Directive::Short(*val)),
+                4 => self.push_directive(Directive::Long(*val)),
+                _ => self.push_directive(Directive::Quad(*val)),
+            },
+            Initializer::Float(val) => {
+                if size == 4 {
+                    // float - emit as 32-bit IEEE 754
+                    let bits = (*val as f32).to_bits();
+                    self.push_directive(Directive::Long(bits as i64));
+                } else {
+                    // double - emit as 64-bit IEEE 754
+                    let bits = val.to_bits();
+                    self.push_directive(Directive::Quad(bits as i64));
+                }
+            }
+            Initializer::String(s) => {
+                // Emit string as .ascii (without null terminator)
+                // The array size will include space for null if needed
+                self.push_directive(Directive::Ascii(escape_string(s)));
+                // Zero-fill remaining bytes if array is larger than string
+                let string_len = s.len() + 1; // +1 for null terminator
+                if size > string_len {
+                    self.push_directive(Directive::Zero((size - string_len) as u32));
+                } else if size > s.len() {
+                    // Need null terminator
+                    self.push_directive(Directive::Byte(0));
+                }
+            }
+            Initializer::Array {
+                elem_size,
+                total_size,
+                elements,
+            } => {
+                // Emit array elements with gaps filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, elem_init) in elements {
+                    // Zero-fill gap before this element
+                    if *offset > current_offset {
+                        self.push_directive(Directive::Zero((*offset - current_offset) as u32));
+                    }
+
+                    // Emit element
+                    self.emit_initializer_data(elem_init, *elem_size);
+                    current_offset = offset + elem_size;
+                }
+
+                // Zero-fill remaining space
+                if *total_size > current_offset {
+                    self.push_directive(Directive::Zero((*total_size - current_offset) as u32));
+                }
+            }
+            Initializer::Struct { total_size, fields } => {
+                // Emit struct fields with gaps filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, field_size, field_init) in fields {
+                    // Zero-fill gap before this field
+                    if *offset > current_offset {
+                        self.push_directive(Directive::Zero((*offset - current_offset) as u32));
+                    }
+
+                    // Emit field
+                    self.emit_initializer_data(field_init, *field_size);
+                    current_offset = offset + field_size;
+                }
+
+                // Zero-fill remaining space
+                if *total_size > current_offset {
+                    self.push_directive(Directive::Zero((*total_size - current_offset) as u32));
+                }
+            }
+            Initializer::SymAddr(name) => {
+                let sym = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                self.push_directive(Directive::QuadSym(sym));
+            }
+        }
+    }
+
+    /// Emit string literals to the rodata section
+    pub fn emit_strings(&mut self, strings: &[(String, String)]) {
+        if strings.is_empty() {
+            return;
+        }
+
+        self.push_directive(Directive::Rodata);
+
+        for (label, content) in strings {
+            self.push_directive(Directive::local_label(label));
+            self.push_directive(Directive::Asciz(escape_string(content)));
+        }
+
+        self.push_directive(Directive::Text);
+    }
+}
+
+// ============================================================================
+// Inline Assembly Support
+// ============================================================================
+
+/// Trait for architecture-specific inline asm operand formatting.
+/// Implementations provide register formatting specific to their architecture.
+pub trait AsmOperandFormatter {
+    /// The register type for this architecture
+    type Reg: Copy;
+
+    /// Return the size modifier characters recognized by this architecture.
+    /// e.g., x86: ['b', 'w', 'k', 'q'], aarch64: ['w', 'x']
+    fn size_modifiers(&self) -> &'static [char];
+
+    /// Format a register with the given size modifier.
+    /// Returns the formatted register string (e.g., "%eax" for x86, "w0" for aarch64).
+    fn format_reg_sized(&self, reg: Self::Reg, size_mod: char) -> String;
+
+    /// Format a register at default size (for bare %0, %1 references).
+    fn format_reg_default(&self, reg: Self::Reg) -> String;
+}
+
+/// Substitute %N, %[name], %lN, %l[name], and size modifiers in asm template.
+/// Architecture-specific register formatting is handled via the AsmOperandFormatter trait.
+///
+/// Handles:
+/// - `%%` escape sequences -> `%`
+/// - `%N` numeric operand references (multi-digit supported)
+/// - `%[name]` named operand references
+/// - `%lN` and `%l[name]` goto label references
+/// - `%{modifier}N` and `%{modifier}[name]` sized register references
+pub fn substitute_asm_operands<F: AsmOperandFormatter>(
+    formatter: &F,
+    template: &str,
+    regs: &[Option<F::Reg>],
+    mems: &[Option<String>],
+    names: &[Option<String>],
+    goto_labels: &[(String, String)],
+) -> String {
+    let mut result = String::with_capacity(template.len() * 2);
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek() {
+                Some('%') => {
+                    // %% -> %
+                    chars.next();
+                    result.push('%');
+                }
+                Some('[') => {
+                    // %[name] - named operand reference
+                    chars.next(); // consume '['
+                    let mut name = String::new();
+                    while let Some(&ch) = chars.peek() {
+                        if ch == ']' {
+                            chars.next();
+                            break;
+                        }
+                        name.push(ch);
+                        chars.next();
+                    }
+                    // Look up the name in operand names
+                    if let Some(idx) = names
+                        .iter()
+                        .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                    {
+                        if let Some(ref mem) = mems[idx] {
+                            result.push_str(mem);
+                        } else if let Some(reg) = regs[idx] {
+                            result.push_str(&formatter.format_reg_default(reg));
+                        }
+                    } else {
+                        // Unknown name, pass through
+                        result.push_str("%[");
+                        result.push_str(&name);
+                        result.push(']');
+                    }
+                }
+                Some(&d) if d.is_ascii_digit() => {
+                    // %0, %1, %10, etc. - numeric operand reference (multi-digit supported)
+                    chars.next();
+                    let mut num_str = String::new();
+                    num_str.push(d);
+                    while let Some(&digit) = chars.peek() {
+                        if digit.is_ascii_digit() {
+                            num_str.push(digit);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let idx: usize = num_str.parse().unwrap_or(0);
+                    if idx < regs.len() {
+                        if let Some(ref mem) = mems[idx] {
+                            result.push_str(mem);
+                        } else if let Some(reg) = regs[idx] {
+                            result.push_str(&formatter.format_reg_default(reg));
+                        }
+                    } else {
+                        // Unknown operand, pass through
+                        result.push('%');
+                        result.push_str(&num_str);
+                    }
+                }
+                Some('l') => {
+                    // %l - label reference for asm goto: %l0, %l1, %l[name]
+                    chars.next(); // consume 'l'
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch == '[' {
+                            // %l[name] - named label reference
+                            chars.next(); // consume '['
+                            let mut name = String::new();
+                            while let Some(&ch) = chars.peek() {
+                                if ch == ']' {
+                                    chars.next();
+                                    break;
+                                }
+                                name.push(ch);
+                                chars.next();
+                            }
+                            // Look up label by name (label_string, label_name)
+                            if let Some((label_str, _)) =
+                                goto_labels.iter().find(|(_, n)| n == &name)
+                            {
+                                result.push_str(label_str);
+                            } else {
+                                // Unknown label, pass through
+                                result.push_str("%l[");
+                                result.push_str(&name);
+                                result.push(']');
+                            }
+                        } else if next_ch.is_ascii_digit() {
+                            // %l0, %l1, etc. - numeric label reference
+                            chars.next();
+                            let idx = (next_ch as usize) - ('0' as usize);
+                            if idx < goto_labels.len() {
+                                let (label_str, _) = &goto_labels[idx];
+                                result.push_str(label_str);
+                            } else {
+                                // Unknown label index, pass through
+                                result.push_str("%l");
+                                result.push(next_ch);
+                            }
+                        } else {
+                            // Just %l without number or name, pass through
+                            result.push_str("%l");
+                        }
+                    } else {
+                        result.push_str("%l");
+                    }
+                }
+                Some(&d) if formatter.size_modifiers().contains(&d) => {
+                    // Size modifier: %b0, %w0, %k0, %q0 (x86) or %w0, %x0 (aarch64)
+                    chars.next();
+                    let size_mod = d;
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch == '[' {
+                            // %b[name], %w[name], etc.
+                            chars.next(); // consume '['
+                            let mut name = String::new();
+                            while let Some(&ch) = chars.peek() {
+                                if ch == ']' {
+                                    chars.next();
+                                    break;
+                                }
+                                name.push(ch);
+                                chars.next();
+                            }
+                            if let Some(idx) = names
+                                .iter()
+                                .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                            {
+                                if let Some(ref mem) = mems[idx] {
+                                    result.push_str(mem);
+                                } else if let Some(reg) = regs[idx] {
+                                    result.push_str(&formatter.format_reg_sized(reg, size_mod));
+                                }
+                            } else {
+                                result.push('%');
+                                result.push(size_mod);
+                                result.push('[');
+                                result.push_str(&name);
+                                result.push(']');
+                            }
+                        } else if next_ch.is_ascii_digit() {
+                            chars.next();
+                            let mut num_str = String::new();
+                            num_str.push(next_ch);
+                            while let Some(&digit) = chars.peek() {
+                                if digit.is_ascii_digit() {
+                                    num_str.push(digit);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let idx: usize = num_str.parse().unwrap_or(0);
+                            if idx < regs.len() {
+                                if let Some(ref mem) = mems[idx] {
+                                    result.push_str(mem);
+                                } else if let Some(reg) = regs[idx] {
+                                    result.push_str(&formatter.format_reg_sized(reg, size_mod));
+                                }
+                            } else {
+                                result.push('%');
+                                result.push(size_mod);
+                                result.push_str(&num_str);
+                            }
+                        } else {
+                            result.push('%');
+                            result.push(size_mod);
+                        }
+                    } else {
+                        result.push('%');
+                        result.push(size_mod);
+                    }
+                }
+                _ => {
+                    result.push('%');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+// ============================================================================
+// CodeGenerator Trait
+// ============================================================================
 
 /// Trait for architecture-specific code generators
 pub trait CodeGenerator {

@@ -122,6 +122,102 @@ impl fmt::Display for FpSize {
 }
 
 // ============================================================================
+// Condition Codes (Architecture-Independent)
+// ============================================================================
+
+/// Unified condition code for comparisons (architecture-independent semantics).
+/// Each architecture translates these to its specific condition suffixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CondCode {
+    /// Equal (ZF=1)
+    Eq,
+    /// Not Equal (ZF=0)
+    Ne,
+    /// Signed Less Than
+    Slt,
+    /// Signed Less or Equal
+    Sle,
+    /// Signed Greater Than
+    Sgt,
+    /// Signed Greater or Equal
+    Sge,
+    /// Unsigned Less Than (Below)
+    Ult,
+    /// Unsigned Less or Equal (Below or Equal)
+    Ule,
+    /// Unsigned Greater Than (Above)
+    Ugt,
+    /// Unsigned Greater or Equal (Above or Equal)
+    Uge,
+}
+
+impl CondCode {
+    /// x86-64 condition suffix (e, ne, l, le, g, ge, b, be, a, ae)
+    pub fn x86_suffix(&self) -> &'static str {
+        match self {
+            CondCode::Eq => "e",
+            CondCode::Ne => "ne",
+            CondCode::Slt => "l",
+            CondCode::Sle => "le",
+            CondCode::Sgt => "g",
+            CondCode::Sge => "ge",
+            CondCode::Ult => "b",
+            CondCode::Ule => "be",
+            CondCode::Ugt => "a",
+            CondCode::Uge => "ae",
+        }
+    }
+
+    /// AArch64 condition suffix (eq, ne, lt, le, gt, ge, lo, ls, hi, hs)
+    pub fn aarch64_suffix(&self) -> &'static str {
+        match self {
+            CondCode::Eq => "eq",
+            CondCode::Ne => "ne",
+            CondCode::Slt => "lt",
+            CondCode::Sle => "le",
+            CondCode::Sgt => "gt",
+            CondCode::Sge => "ge",
+            CondCode::Ult => "lo",
+            CondCode::Ule => "ls",
+            CondCode::Ugt => "hi",
+            CondCode::Uge => "hs",
+        }
+    }
+}
+
+impl fmt::Display for CondCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            CondCode::Eq => "eq",
+            CondCode::Ne => "ne",
+            CondCode::Slt => "slt",
+            CondCode::Sle => "sle",
+            CondCode::Sgt => "sgt",
+            CondCode::Sge => "sge",
+            CondCode::Ult => "ult",
+            CondCode::Ule => "ule",
+            CondCode::Ugt => "ugt",
+            CondCode::Uge => "uge",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+// ============================================================================
+// Call Target (Architecture-Independent)
+// ============================================================================
+
+/// Call target - either direct (symbol) or indirect (register).
+/// Generic over register type R to support different architectures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallTarget<R> {
+    /// Direct call to a named symbol
+    Direct(Symbol),
+    /// Indirect call through a register
+    Indirect(R),
+}
+
+// ============================================================================
 // Complex Type Helpers
 // ============================================================================
 
@@ -245,6 +341,19 @@ impl SymbolType {
 pub trait EmitAsm {
     /// Emit assembly text for this instruction
     fn emit(&self, target: &Target, out: &mut String);
+}
+
+// ============================================================================
+// LirInst Trait (Architecture-Generic LIR Instructions)
+// ============================================================================
+
+/// Trait for architecture-specific LIR instruction types.
+/// This enables generic code generation infrastructure while preserving
+/// type safety for each architecture's instruction set.
+pub trait LirInst: Clone + std::fmt::Debug {
+    /// Wrap an assembler directive as an LIR instruction.
+    /// All architectures support directives the same way.
+    fn from_directive(dir: Directive) -> Self;
 }
 
 // ============================================================================

@@ -183,22 +183,6 @@ impl CondCode {
             CondCode::Uge => "hs",
         }
     }
-
-    /// Invert the condition (for branch inversion)
-    pub fn invert(&self) -> Self {
-        match self {
-            CondCode::Eq => CondCode::Ne,
-            CondCode::Ne => CondCode::Eq,
-            CondCode::Slt => CondCode::Sge,
-            CondCode::Sle => CondCode::Sgt,
-            CondCode::Sgt => CondCode::Sle,
-            CondCode::Sge => CondCode::Slt,
-            CondCode::Ult => CondCode::Uge,
-            CondCode::Ule => CondCode::Ugt,
-            CondCode::Ugt => CondCode::Ule,
-            CondCode::Uge => CondCode::Ult,
-        }
-    }
 }
 
 impl fmt::Display for CondCode {
@@ -370,9 +354,6 @@ pub trait LirInst: Clone + std::fmt::Debug {
     /// Wrap an assembler directive as an LIR instruction.
     /// All architectures support directives the same way.
     fn from_directive(dir: Directive) -> Self;
-
-    /// Check if this instruction is a directive (for peephole optimization)
-    fn as_directive(&self) -> Option<&Directive>;
 }
 
 // ============================================================================

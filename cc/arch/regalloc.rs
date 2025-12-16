@@ -9,83 +9,9 @@
 // Common register allocator utilities shared between architectures
 //
 
-use crate::ir::{Function, Opcode, PseudoId, PseudoKind};
-use std::collections::HashSet;
+use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-
-// ============================================================================
-// Register Traits
-// ============================================================================
-
-/// Trait for general-purpose registers.
-/// Implemented by architecture-specific register enums to enable generic algorithms.
-pub trait GpReg: Copy + Eq + Hash + std::fmt::Debug {
-    /// Register name (64-bit form)
-    fn name(&self) -> &'static str;
-
-    /// Register name for specific bit width
-    fn name_for_size(&self, bits: u32) -> &'static str;
-
-    /// Is this a callee-saved register?
-    fn is_callee_saved(&self) -> bool;
-
-    /// Argument-passing registers (in order)
-    fn arg_regs() -> &'static [Self];
-
-    /// Callee-saved registers available for allocation
-    fn callee_saved_regs() -> &'static [Self];
-
-    /// All registers available for allocation
-    fn allocatable_regs() -> &'static [Self];
-}
-
-/// Trait for floating-point registers.
-/// Implemented by architecture-specific FP register enums.
-pub trait FpReg: Copy + Eq + Hash + std::fmt::Debug {
-    /// Register name
-    fn name(&self) -> &'static str;
-
-    /// Register name for specific bit width (e.g., 32 for single, 64 for double)
-    fn name_for_size(&self, bits: u32) -> &'static str;
-
-    /// Is this a callee-saved register?
-    fn is_callee_saved(&self) -> bool;
-
-    /// Argument-passing FP registers
-    fn arg_regs() -> &'static [Self];
-
-    /// Callee-saved FP registers
-    fn callee_saved_regs() -> &'static [Self];
-
-    /// All FP registers available for allocation
-    fn allocatable_regs() -> &'static [Self];
-}
-
-/// Register constraints for an opcode.
-/// Specifies which registers are clobbered or required as inputs.
-pub struct RegConstraints<R: 'static> {
-    /// Registers clobbered by this operation
-    pub clobbers: &'static [R],
-    /// Registers required as inputs
-    pub inputs: &'static [R],
-}
-
-impl<R: 'static> RegConstraints<R> {
-    /// No constraints
-    pub const NONE: RegConstraints<R> = RegConstraints {
-        clobbers: &[],
-        inputs: &[],
-    };
-}
-
-impl<R: 'static> Default for RegConstraints<R> {
-    fn default() -> Self {
-        RegConstraints {
-            clobbers: &[],
-            inputs: &[],
-        }
-    }
-}
 
 // ============================================================================
 // Common Types
@@ -97,6 +23,21 @@ pub struct LiveInterval {
     pub pseudo: PseudoId,
     pub start: usize,
     pub end: usize,
+}
+
+/// A point in the function where register constraints apply.
+/// Used during allocation to avoid assigning pseudos to registers
+/// that would be clobbered at this point.
+/// Generic over register type R.
+#[derive(Debug, Clone)]
+pub struct ConstraintPoint<R> {
+    /// Instruction position in the function
+    pub position: usize,
+    /// Registers clobbered at this point
+    pub clobbers: Vec<R>,
+    /// Pseudos that ARE the operands of the constrained instruction
+    /// (these should NOT be evicted - they're the actual operands)
+    pub involved_pseudos: Vec<PseudoId>,
 }
 
 // ============================================================================
@@ -148,6 +89,260 @@ pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) 
     call_positions
         .iter()
         .any(|&call_pos| interval.start <= call_pos && call_pos <= interval.end)
+}
+
+/// Find registers that would conflict with this interval due to constraints.
+/// If a pseudo is live at a constraint point and is NOT an operand of that
+/// instruction, it cannot be allocated to any clobbered register.
+/// Generic over register type R.
+pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
+    interval: &LiveInterval,
+    constraint_points: &[ConstraintPoint<R>],
+) -> HashSet<R> {
+    let mut conflicts = HashSet::new();
+
+    for cp in constraint_points {
+        // If interval is live at this constraint point...
+        // Use <= for end to handle case where interval ends exactly at constraint point
+        if interval.start <= cp.position && cp.position <= interval.end {
+            // ...and this pseudo is NOT involved in the constrained instruction...
+            if !cp.involved_pseudos.contains(&interval.pseudo) {
+                // ...then it cannot be in any clobbered register
+                for &reg in &cp.clobbers {
+                    conflicts.insert(reg);
+                }
+            }
+        }
+    }
+
+    conflicts
+}
+
+/// Compute live intervals and constraint points for a function.
+///
+/// This is the shared core of live interval computation used by both x86-64 and AArch64.
+/// The `get_constraint_info` callback allows architecture-specific constraint handling.
+///
+/// # Arguments
+/// * `func` - The function to analyze
+/// * `get_constraint_info` - Callback that returns constraint info for an instruction:
+///   - Returns `Some((clobbers, involved_pseudos))` if the instruction has register constraints
+///   - Returns `None` if no constraints apply
+///
+/// The callback signature: `Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>`
+pub fn compute_live_intervals<R, F>(
+    func: &Function,
+    get_constraint_info: F,
+) -> (Vec<LiveInterval>, Vec<ConstraintPoint<R>>)
+where
+    R: Clone,
+    F: Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>,
+{
+    struct IntervalInfo {
+        pseudo: PseudoId,
+        first_def: usize,
+        last_def: usize,
+        last_use: usize,
+    }
+
+    let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
+    let mut constraint_points: Vec<ConstraintPoint<R>> = Vec::new();
+    let mut pos = 0usize;
+
+    // First pass: compute block start and end positions
+    let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
+    let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::new();
+    let mut temp_pos = 0usize;
+    for block in &func.blocks {
+        block_start_pos.insert(block.id, temp_pos);
+        temp_pos += block.insns.len();
+        block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
+    }
+
+    // Pre-initialize intervals for argument pseudos with first_def = 0
+    // because arguments are live from function entry
+    for pseudo in &func.pseudos {
+        if let PseudoKind::Arg(_) = pseudo.kind {
+            intervals.insert(
+                pseudo.id,
+                IntervalInfo {
+                    pseudo: pseudo.id,
+                    first_def: 0,
+                    last_def: 0,
+                    last_use: 0,
+                },
+            );
+        }
+    }
+
+    // Collect phi sources and targets
+    let mut phi_sources: Vec<(BasicBlockId, PseudoId)> = Vec::new();
+    let mut phi_targets: Vec<(BasicBlockId, PseudoId)> = Vec::new();
+
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if let Some(target) = insn.target {
+                intervals
+                    .entry(target)
+                    .and_modify(|info| {
+                        info.first_def = info.first_def.min(pos);
+                        info.last_def = info.last_def.max(pos);
+                    })
+                    .or_insert(IntervalInfo {
+                        pseudo: target,
+                        first_def: pos,
+                        last_def: pos,
+                        last_use: pos,
+                    });
+            }
+
+            for &src in &insn.src {
+                if let Some(info) = intervals.get_mut(&src) {
+                    info.last_use = info.last_use.max(pos);
+                } else {
+                    intervals.insert(
+                        src,
+                        IntervalInfo {
+                            pseudo: src,
+                            first_def: pos,
+                            last_def: pos,
+                            last_use: pos,
+                        },
+                    );
+                }
+            }
+
+            // For indirect calls, the indirect_target pseudo is also used
+            if let Some(indirect) = insn.indirect_target {
+                if let Some(info) = intervals.get_mut(&indirect) {
+                    info.last_use = info.last_use.max(pos);
+                } else {
+                    intervals.insert(
+                        indirect,
+                        IntervalInfo {
+                            pseudo: indirect,
+                            first_def: pos,
+                            last_def: pos,
+                            last_use: pos,
+                        },
+                    );
+                }
+            }
+
+            for (src_bb, pseudo) in &insn.phi_list {
+                phi_sources.push((*src_bb, *pseudo));
+                if let Some(target) = insn.target {
+                    phi_targets.push((*src_bb, target));
+                }
+            }
+
+            // Collect constraint points via the architecture-specific callback
+            if let Some((clobbers, involved_pseudos)) = get_constraint_info(insn) {
+                constraint_points.push(ConstraintPoint {
+                    position: pos,
+                    clobbers,
+                    involved_pseudos,
+                });
+            }
+
+            pos += 1;
+        }
+    }
+
+    // Extend phi source intervals to end of their source block
+    for (src_bb, pseudo) in phi_sources {
+        if let Some(&end_pos) = block_end_pos.get(&src_bb) {
+            if let Some(info) = intervals.get_mut(&pseudo) {
+                info.last_use = info.last_use.max(end_pos);
+            } else {
+                intervals.insert(
+                    pseudo,
+                    IntervalInfo {
+                        pseudo,
+                        first_def: end_pos,
+                        last_def: end_pos,
+                        last_use: end_pos,
+                    },
+                );
+            }
+        }
+    }
+
+    // Extend phi target intervals
+    for (src_bb, target) in phi_targets {
+        if let Some(&end_pos) = block_end_pos.get(&src_bb) {
+            if let Some(info) = intervals.get_mut(&target) {
+                info.last_def = info.last_def.max(end_pos);
+            } else {
+                intervals.insert(
+                    target,
+                    IntervalInfo {
+                        pseudo: target,
+                        first_def: end_pos,
+                        last_def: end_pos,
+                        last_use: end_pos,
+                    },
+                );
+            }
+        }
+    }
+
+    // Handle loop back edges
+    let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> = Vec::new();
+    for block in &func.blocks {
+        if let Some(last_insn) = block.insns.last() {
+            let mut targets = Vec::new();
+            if let Some(target) = last_insn.bb_true {
+                targets.push(target);
+            }
+            if let Some(target) = last_insn.bb_false {
+                targets.push(target);
+            }
+
+            let from_start = block_start_pos.get(&block.id).copied().unwrap_or(0);
+            for target_bb in targets {
+                let target_start = block_start_pos.get(&target_bb).copied().unwrap_or(0);
+                if target_start < from_start {
+                    let from_end = block_end_pos.get(&block.id).copied().unwrap_or(0);
+                    loop_back_edges.push((block.id, target_bb, from_end));
+                }
+            }
+        }
+    }
+
+    // Extend lifetimes for loop variables
+    for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
+        let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
+
+        for info in intervals.values_mut() {
+            if info.first_def < loop_start
+                && info.last_use >= loop_start
+                && info.last_use <= *back_edge_pos
+            {
+                info.last_use = info.last_use.max(*back_edge_pos);
+            }
+        }
+    }
+
+    let max_pos = pos.saturating_sub(1);
+
+    let mut result: Vec<_> = intervals
+        .into_values()
+        .map(|info| {
+            let end = if info.last_def > info.last_use {
+                max_pos
+            } else {
+                info.last_def.max(info.last_use)
+            };
+            LiveInterval {
+                pseudo: info.pseudo,
+                start: info.first_def,
+                end,
+            }
+        })
+        .collect();
+    result.sort_by_key(|i| i.start);
+    (result, constraint_points)
 }
 
 /// Identify pseudo-registers that should use floating-point registers.

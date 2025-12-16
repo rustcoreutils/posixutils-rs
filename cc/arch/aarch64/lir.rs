@@ -560,13 +560,6 @@ impl crate::arch::lir::LirInst for Aarch64Inst {
     fn from_directive(dir: Directive) -> Self {
         Aarch64Inst::Directive(dir)
     }
-
-    fn as_directive(&self) -> Option<&Directive> {
-        match self {
-            Aarch64Inst::Directive(d) => Some(d),
-            _ => None,
-        }
-    }
 }
 
 // ============================================================================

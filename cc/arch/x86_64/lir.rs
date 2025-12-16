@@ -447,13 +447,6 @@ impl crate::arch::lir::LirInst for X86Inst {
     fn from_directive(dir: Directive) -> Self {
         X86Inst::Directive(dir)
     }
-
-    fn as_directive(&self) -> Option<&Directive> {
-        match self {
-            X86Inst::Directive(d) => Some(d),
-            _ => None,
-        }
-    }
 }
 
 // ============================================================================

@@ -10,6 +10,7 @@
 //
 
 pub mod codegen;
+mod float;
 pub mod lir;
 pub mod macros;
 pub mod regalloc;

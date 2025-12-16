@@ -12,18 +12,15 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
-use crate::arch::codegen::{
-    escape_string, is_variadic_function, BswapSize, CodeGenerator, UnaryOp,
+use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
+use crate::arch::lir::{
+    complex_fp_info, CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol,
 };
-use crate::arch::lir::{complex_fp_info, Directive, FpSize, Label, OperandSize, Symbol};
-use crate::arch::x86_64::lir::{
-    CallTarget, GpOperand, IntCC, MemAddr, ShiftCount, X86Inst, XmmOperand,
-};
+use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
-use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
-use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
+use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -32,18 +29,12 @@ use std::collections::{HashMap, HashSet};
 
 /// x86-64 code generator
 pub struct X86_64CodeGen {
-    /// Target info
-    target: Target,
-    /// Output buffer
-    output: String,
-    /// LIR instruction buffer (for deferred emission and future peephole optimization)
-    lir_buffer: Vec<X86Inst>,
+    /// Common code generation infrastructure
+    base: CodeGenBase<X86Inst>,
     /// Current function's register allocation
     locations: HashMap<PseudoId, Loc>,
     /// Current function's pseudos (for looking up values)
     pseudos: Vec<Pseudo>,
-    /// Current function name (for generating unique labels)
-    current_fn: String,
     /// Callee-saved registers used in current function (for epilogue)
     callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
@@ -54,14 +45,6 @@ pub struct X86_64CodeGen {
     num_fixed_gp_params: usize,
     /// Number of fixed FP parameters (for variadic functions)
     num_fixed_fp_params: usize,
-    /// Whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
-    emit_unwind_tables: bool,
-    /// Last emitted source line (for avoiding duplicate .loc directives)
-    last_debug_line: u32,
-    /// Last emitted source file index
-    last_debug_file: u16,
-    /// Whether to emit debug info (.file/.loc directives)
-    emit_debug: bool,
     /// Counter for generating unique internal labels
     unique_label_counter: u32,
 }
@@ -69,36 +52,22 @@ pub struct X86_64CodeGen {
 impl X86_64CodeGen {
     pub fn new(target: Target) -> Self {
         Self {
-            target,
-            output: String::new(),
-            lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
+            base: CodeGenBase::new(target),
             locations: HashMap::new(),
             pseudos: Vec::new(),
-            current_fn: String::new(),
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
             reg_save_area_offset: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
-            emit_unwind_tables: true, // Default to emitting basic unwind tables
-            last_debug_line: 0,
-            last_debug_file: 0,
-            emit_debug: false,
             unique_label_counter: 0,
         }
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
+    #[inline]
     fn push_lir(&mut self, inst: X86Inst) {
-        self.lir_buffer.push(inst);
-    }
-
-    /// Emit all buffered LIR instructions to the output string
-    fn emit_all(&mut self) {
-        use crate::arch::lir::EmitAsm;
-        for inst in &self.lir_buffer {
-            inst.emit(&self.target, &mut self.output);
-        }
+        self.base.push_lir(inst);
     }
 
     /// Convert a Loc to a GpOperand for LIR
@@ -119,194 +88,33 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit .loc directive for source line tracking (if debug is enabled and line changed)
+    /// Emit .loc directive for source line tracking (delegates to base)
+    #[inline]
     fn emit_loc(&mut self, insn: &Instruction) {
-        if !self.emit_debug {
-            return;
-        }
-        if let Some(pos) = &insn.pos {
-            // Only emit if line changed (avoid duplicate .loc directives)
-            let file = pos.stream + 1; // DWARF file indices start at 1
-            let line = pos.line;
-            if line != self.last_debug_line || file != self.last_debug_file {
-                // LIR: .loc directive for debug info
-                self.push_lir(X86Inst::Directive(Directive::loc(
-                    file.into(),
-                    line,
-                    pos.col.into(),
-                )));
-                self.last_debug_line = line;
-                self.last_debug_file = file;
-            }
-        }
+        self.base.emit_loc(insn);
     }
 
+    /// Emit file header (delegates to base)
+    #[inline]
     fn emit_header(&mut self) {
-        // Header comments with compiler and target info (GCC-style)
-        for comment in crate::arch::codegen::generate_header_comments(&self.target) {
-            self.push_lir(X86Inst::Directive(Directive::Comment(comment)));
-        }
-        self.push_lir(X86Inst::Directive(Directive::Text));
+        self.base.emit_header();
     }
 
-    fn emit_global(&mut self, name: &str, typ: &TypeId, init: &Initializer, types: &TypeTable) {
-        let size = types.size_bits(*typ) / 8;
-        let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
-
-        // Check storage class - skip .globl for static
-        let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
-
-        // Get alignment from type info
-        let align = types.alignment(*typ) as u32;
-
-        // Use .comm for uninitialized external (non-static) globals
-        let use_bss = matches!(init, Initializer::None) && !is_static;
-
-        if use_bss {
-            // Use .comm for uninitialized external globals
-            self.push_lir(X86Inst::Directive(Directive::comm(name, size, align)));
-            return;
-        }
-
-        // Data section
-        self.push_lir(X86Inst::Directive(Directive::Data));
-
-        // Check if this is a local symbol (starts with '.')
-        let is_local = name.starts_with('.');
-
-        // Global visibility (if not static and not local)
-        if !is_static && !is_local {
-            self.push_lir(X86Inst::Directive(Directive::global(name)));
-        }
-
-        // ELF-only type and size (handled by Directive::emit which skips on macOS)
-        self.push_lir(X86Inst::Directive(Directive::type_object(name)));
-        self.push_lir(X86Inst::Directive(Directive::size(name, size)));
-
-        // Alignment
-        if align > 1 {
-            self.push_lir(X86Inst::Directive(Directive::Align(align.trailing_zeros())));
-        }
-
-        // Label - use local_label for names starting with '.'
-        if is_local {
-            self.push_lir(X86Inst::Directive(Directive::local_label(name)));
-        } else {
-            self.push_lir(X86Inst::Directive(Directive::global_label(name)));
-        }
-
-        // Emit initializer
-        self.emit_initializer_data(init, size as usize);
-    }
-
-    /// Emit data for an initializer, recursively handling complex types
-    fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
-        match init {
-            Initializer::None => {
-                // Zero-fill
-                self.push_lir(X86Inst::Directive(Directive::Zero(size as u32)));
-            }
-            Initializer::Int(val) => match size {
-                1 => self.push_lir(X86Inst::Directive(Directive::Byte(*val))),
-                2 => self.push_lir(X86Inst::Directive(Directive::Short(*val))),
-                4 => self.push_lir(X86Inst::Directive(Directive::Long(*val))),
-                _ => self.push_lir(X86Inst::Directive(Directive::Quad(*val))),
-            },
-            Initializer::Float(val) => {
-                if size == 4 {
-                    // float - emit as 32-bit IEEE 754
-                    let bits = (*val as f32).to_bits();
-                    self.push_lir(X86Inst::Directive(Directive::Long(bits as i64)));
-                } else {
-                    // double - emit as 64-bit IEEE 754
-                    let bits = val.to_bits();
-                    self.push_lir(X86Inst::Directive(Directive::Quad(bits as i64)));
-                }
-            }
-            Initializer::String(s) => {
-                // Emit string as .ascii (without null terminator)
-                // The array size will include space for null if needed
-                use crate::arch::codegen::escape_string;
-                self.push_lir(X86Inst::Directive(Directive::Ascii(escape_string(s))));
-                // Zero-fill remaining bytes if array is larger than string
-                let string_len = s.len() + 1; // +1 for null terminator
-                if size > string_len {
-                    self.push_lir(X86Inst::Directive(Directive::Zero(
-                        (size - string_len) as u32,
-                    )));
-                } else if size > s.len() {
-                    // Need null terminator
-                    self.push_lir(X86Inst::Directive(Directive::Byte(0)));
-                }
-            }
-            Initializer::Array {
-                elem_size,
-                total_size,
-                elements,
-            } => {
-                // Emit array elements with gaps filled by zeros
-                let mut current_offset = 0usize;
-
-                for (offset, elem_init) in elements {
-                    // Zero-fill gap before this element
-                    if *offset > current_offset {
-                        self.push_lir(X86Inst::Directive(Directive::Zero(
-                            (*offset - current_offset) as u32,
-                        )));
-                    }
-
-                    // Emit element
-                    self.emit_initializer_data(elem_init, *elem_size);
-                    current_offset = offset + elem_size;
-                }
-
-                // Zero-fill remaining space
-                if *total_size > current_offset {
-                    self.push_lir(X86Inst::Directive(Directive::Zero(
-                        (*total_size - current_offset) as u32,
-                    )));
-                }
-            }
-            Initializer::Struct { total_size, fields } => {
-                // Emit struct fields with gaps (padding) filled by zeros
-                let mut current_offset = 0usize;
-
-                for (offset, field_size, field_init) in fields {
-                    // Zero-fill gap before this field (padding)
-                    if *offset > current_offset {
-                        self.push_lir(X86Inst::Directive(Directive::Zero(
-                            (*offset - current_offset) as u32,
-                        )));
-                    }
-
-                    // Emit field with its proper size
-                    self.emit_initializer_data(field_init, *field_size);
-                    current_offset = offset + field_size;
-                }
-
-                // Zero-fill remaining space (trailing padding)
-                if *total_size > current_offset {
-                    self.push_lir(X86Inst::Directive(Directive::Zero(
-                        (*total_size - current_offset) as u32,
-                    )));
-                }
-            }
-            Initializer::SymAddr(name) => {
-                // Emit symbol address as 64-bit relocatable reference
-                use crate::arch::lir::Symbol;
-                let sym = if name.starts_with('.') {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
-                self.push_lir(X86Inst::Directive(Directive::QuadSym(sym)));
-            }
-        }
+    /// Emit a global variable (delegates to base)
+    #[inline]
+    fn emit_global(
+        &mut self,
+        name: &str,
+        typ: &TypeId,
+        init: &crate::ir::Initializer,
+        types: &TypeTable,
+    ) {
+        self.base.emit_global(name, typ, init, types);
     }
 
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Save current function name for unique label generation
-        self.current_fn = func.name.clone();
+        self.base.current_fn = func.name.clone();
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
@@ -348,7 +156,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Directive(Directive::global_label(&func.name)));
 
         // CFI: Start procedure (enables stack unwinding for this function)
-        if self.emit_unwind_tables {
+        if self.base.emit_unwind_tables {
             self.push_lir(X86Inst::Directive(Directive::CfiStartProc));
         }
 
@@ -358,7 +166,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Push {
             src: GpOperand::Reg(bp),
         });
-        if self.emit_debug {
+        if self.base.emit_debug {
             // After pushq %rbp: CFA is now at %rsp+16, and %rbp is saved at CFA-16
             self.push_lir(X86Inst::Directive(Directive::CfiDefCfaOffset(16)));
             self.push_lir(X86Inst::Directive(Directive::cfi_offset("%rbp", -16)));
@@ -368,7 +176,7 @@ impl X86_64CodeGen {
             src: GpOperand::Reg(sp),
             dst: GpOperand::Reg(bp),
         });
-        if self.emit_debug {
+        if self.base.emit_debug {
             // After movq %rsp, %rbp: CFA is now tracked by %rbp+16
             self.push_lir(X86Inst::Directive(Directive::cfi_def_cfa_register("%rbp")));
         }
@@ -379,7 +187,7 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Push {
                 src: GpOperand::Reg(*reg),
             });
-            if self.emit_debug {
+            if self.base.emit_debug {
                 self.push_lir(X86Inst::Directive(Directive::cfi_offset(
                     reg.name64(),
                     cfi_offset,
@@ -607,7 +415,7 @@ impl X86_64CodeGen {
         }
 
         // CFI: End procedure
-        if self.emit_unwind_tables {
+        if self.base.emit_unwind_tables {
             self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
         }
     }
@@ -616,7 +424,7 @@ impl X86_64CodeGen {
         // Always emit block ID label for consistency with jumps
         // (jumps reference blocks by ID, not by C label name)
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::new(
-            &self.current_fn,
+            &self.base.current_fn,
             block.id.0,
         ))));
 
@@ -758,7 +566,7 @@ impl X86_64CodeGen {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.current_fn, target.0),
+                        target: Label::new(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -787,7 +595,7 @@ impl X86_64CodeGen {
                 };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.current_fn, target.0),
+                        target: Label::new(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -796,13 +604,13 @@ impl X86_64CodeGen {
 
         if let Some(target) = insn.bb_true {
             self.push_lir(X86Inst::Jcc {
-                cc: IntCC::Ne,
-                target: Label::new(&self.current_fn, target.0),
+                cc: CondCode::Ne,
+                target: Label::new(&self.base.current_fn, target.0),
             });
         }
         if let Some(target) = insn.bb_false {
             self.push_lir(X86Inst::Jmp {
-                target: Label::new(&self.current_fn, target.0),
+                target: Label::new(&self.base.current_fn, target.0),
             });
         }
         false
@@ -824,7 +632,7 @@ impl X86_64CodeGen {
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.current_fn, target.0),
+                        target: Label::new(&self.base.current_fn, target.0),
                     });
                 }
             }
@@ -849,8 +657,8 @@ impl X86_64CodeGen {
                         });
                         // LIR: conditional jump on equal
                         self.push_lir(X86Inst::Jcc {
-                            cc: IntCC::E,
-                            target: Label::new(&self.current_fn, target_bb.0),
+                            cc: CondCode::Eq,
+                            target: Label::new(&self.base.current_fn, target_bb.0),
                         });
                     }
 
@@ -858,7 +666,7 @@ impl X86_64CodeGen {
                     if let Some(default_bb) = insn.switch_default {
                         // LIR: unconditional jump to default
                         self.push_lir(X86Inst::Jmp {
-                            target: Label::new(&self.current_fn, default_bb.0),
+                            target: Label::new(&self.base.current_fn, default_bb.0),
                         });
                     }
                 }
@@ -1504,16 +1312,16 @@ impl X86_64CodeGen {
 
         // Map opcode to condition code
         let cc = match insn.op {
-            Opcode::SetEq => IntCC::E,
-            Opcode::SetNe => IntCC::Ne,
-            Opcode::SetLt => IntCC::L,
-            Opcode::SetLe => IntCC::Le,
-            Opcode::SetGt => IntCC::G,
-            Opcode::SetGe => IntCC::Ge,
-            Opcode::SetB => IntCC::B,
-            Opcode::SetBe => IntCC::Be,
-            Opcode::SetA => IntCC::A,
-            Opcode::SetAe => IntCC::Ae,
+            Opcode::SetEq => CondCode::Eq,
+            Opcode::SetNe => CondCode::Ne,
+            Opcode::SetLt => CondCode::Slt,
+            Opcode::SetLe => CondCode::Sle,
+            Opcode::SetGt => CondCode::Sgt,
+            Opcode::SetGe => CondCode::Sge,
+            Opcode::SetB => CondCode::Ult,
+            Opcode::SetBe => CondCode::Ule,
+            Opcode::SetA => CondCode::Ugt,
+            Opcode::SetAe => CondCode::Uge,
             _ => return,
         };
 
@@ -2014,12 +1822,12 @@ impl X86_64CodeGen {
         // Use appropriate setcc instruction
         // Note: FP comparisons set flags differently - need to handle unordered (NaN) cases
         let cc = match insn.op {
-            Opcode::FCmpOEq => IntCC::E,  // Equal (ZF=1, PF=0)
-            Opcode::FCmpONe => IntCC::Ne, // Not equal
-            Opcode::FCmpOLt => IntCC::B,  // Below (CF=1) - for ordered less than
-            Opcode::FCmpOLe => IntCC::Be, // Below or equal
-            Opcode::FCmpOGt => IntCC::A,  // Above (CF=0, ZF=0)
-            Opcode::FCmpOGe => IntCC::Ae, // Above or equal
+            Opcode::FCmpOEq => CondCode::Eq,  // Equal (ZF=1, PF=0)
+            Opcode::FCmpONe => CondCode::Ne,  // Not equal
+            Opcode::FCmpOLt => CondCode::Ult, // Below (CF=1) - for ordered less than
+            Opcode::FCmpOLe => CondCode::Ule, // Below or equal
+            Opcode::FCmpOGt => CondCode::Ugt, // Above (CF=0, ZF=0)
+            Opcode::FCmpOGe => CondCode::Uge, // Above or equal
             _ => return,
         };
 
@@ -2366,7 +2174,7 @@ impl X86_64CodeGen {
                 true
             } else if types.is_plain_char(t) {
                 // Plain char: unsigned if target says char is not signed
-                !self.target.char_signed
+                !self.base.target.char_signed
             } else {
                 false
             }
@@ -3337,7 +3145,7 @@ impl X86_64CodeGen {
         self.emit_move(then_val, Reg::R10, size);
         // LIR: conditional move if not equal (non-zero)
         self.push_lir(X86Inst::CMov {
-            cc: IntCC::Ne,
+            cc: CondCode::Ne,
             size: op_size,
             src: GpOperand::Reg(Reg::R10),
             dst: dst_reg,
@@ -3465,7 +3273,7 @@ impl X86_64CodeGen {
                 true
             } else if types.is_plain_char(t) {
                 // Plain char: unsigned if target says char is not signed
-                !self.target.char_signed
+                !self.base.target.char_signed
             } else {
                 false
             }
@@ -3790,7 +3598,7 @@ impl X86_64CodeGen {
         });
         // Jump if above or equal (fp_offset >= 176 means use overflow)
         self.push_lir(X86Inst::Jcc {
-            cc: IntCC::Ae,
+            cc: CondCode::Uge,
             target: overflow_label.clone(),
         });
 
@@ -3917,7 +3725,7 @@ impl X86_64CodeGen {
             dst: GpOperand::Reg(Reg::R10),
         });
         self.push_lir(X86Inst::Jcc {
-            cc: IntCC::Ae,
+            cc: CondCode::Uge,
             target: overflow_label.clone(),
         });
 
@@ -5019,7 +4827,7 @@ impl X86_64CodeGen {
             .iter()
             .map(|(bb_id, name)| {
                 // Format label as .Lfunc_bbid (same format as Label::name())
-                let label_str = format!(".L{}_{}", self.current_fn, bb_id.0);
+                let label_str = format!(".L{}_{}", self.base.current_fn, bb_id.0);
                 (label_str, name.clone())
             })
             .collect();
@@ -5458,10 +5266,9 @@ impl X86_64CodeGen {
 
 impl CodeGenerator for X86_64CodeGen {
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String {
-        self.output.clear();
-        self.last_debug_line = 0;
-        self.last_debug_file = 0;
-        self.emit_debug = module.debug;
+        self.base.output.clear();
+        self.base.reset_debug_state();
+        self.base.emit_debug = module.debug;
 
         // Emit file header
         self.emit_header();
@@ -5469,10 +5276,8 @@ impl CodeGenerator for X86_64CodeGen {
         // Emit .file directives unconditionally (useful for diagnostics/profiling)
         for (i, path) in module.source_files.iter().enumerate() {
             // File indices in DWARF start at 1
-            self.push_lir(X86Inst::Directive(Directive::file(
-                (i + 1) as u32,
-                path.clone(),
-            )));
+            self.base
+                .push_directive(Directive::file((i + 1) as u32, path.clone()));
         }
 
         // Emit globals
@@ -5482,7 +5287,7 @@ impl CodeGenerator for X86_64CodeGen {
 
         // Emit string literals
         if !module.strings.is_empty() {
-            self.emit_strings(&module.strings);
+            self.base.emit_strings(&module.strings);
         }
 
         // Emit functions
@@ -5491,29 +5296,12 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         // Emit all buffered LIR instructions to output string
-        self.emit_all();
+        self.base.emit_all();
 
-        self.output.clone()
+        self.base.output.clone()
     }
 
     fn set_emit_unwind_tables(&mut self, emit: bool) {
-        self.emit_unwind_tables = emit;
-    }
-}
-
-impl X86_64CodeGen {
-    fn emit_strings(&mut self, strings: &[(String, String)]) {
-        // Switch to rodata section (Directive handles OS differences)
-        self.push_lir(X86Inst::Directive(Directive::Rodata));
-
-        for (label, content) in strings {
-            // String labels are local (start with .)
-            self.push_lir(X86Inst::Directive(Directive::local_label(label.clone())));
-            // Emit string with proper escaping
-            self.push_lir(X86Inst::Directive(Directive::Asciz(escape_string(content))));
-        }
-
-        // Switch back to text section for functions
-        self.push_lir(X86Inst::Directive(Directive::Text));
+        self.base.emit_unwind_tables = emit;
     }
 }

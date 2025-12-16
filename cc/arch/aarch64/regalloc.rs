@@ -36,7 +36,8 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    expire_intervals, find_call_positions, interval_crosses_call, LiveInterval,
+    expire_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call, FpReg,
+    GpReg, LiveInterval,
 };
 use crate::ir::{BasicBlockId, Function, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
@@ -304,6 +305,49 @@ impl Reg {
     /// Should not be used; this is only for documentation and completeness
     pub fn platform_reserved() -> Reg {
         Reg::X18
+    }
+
+    /// Callee-saved registers available for allocation
+    pub fn callee_saved() -> &'static [Reg] {
+        &[
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+        ]
+    }
+}
+
+// Implement the GpReg trait for AArch64 registers
+impl GpReg for Reg {
+    fn name(&self) -> &'static str {
+        self.name64()
+    }
+
+    fn name_for_size(&self, bits: u32) -> &'static str {
+        Reg::name_for_size(self, bits)
+    }
+
+    fn is_callee_saved(&self) -> bool {
+        Reg::is_callee_saved(self)
+    }
+
+    fn arg_regs() -> &'static [Self] {
+        Reg::arg_regs()
+    }
+
+    fn callee_saved_regs() -> &'static [Self] {
+        Reg::callee_saved()
+    }
+
+    fn allocatable_regs() -> &'static [Self] {
+        Reg::allocatable()
     }
 }
 
@@ -576,6 +620,48 @@ impl VReg {
             VReg::V31,
         ]
     }
+
+    /// Callee-saved FP registers (AAPCS64: V8-V15)
+    pub fn callee_saved() -> &'static [VReg] {
+        &[
+            VReg::V8,
+            VReg::V9,
+            VReg::V10,
+            VReg::V11,
+            VReg::V12,
+            VReg::V13,
+            VReg::V14,
+            VReg::V15,
+        ]
+    }
+}
+
+// Implement the FpReg trait for AArch64 VReg registers
+impl FpReg for VReg {
+    fn name(&self) -> &'static str {
+        // Use the 64-bit name as default
+        self.name_d()
+    }
+
+    fn name_for_size(&self, bits: u32) -> &'static str {
+        VReg::name_for_size(self, bits)
+    }
+
+    fn is_callee_saved(&self) -> bool {
+        VReg::is_callee_saved(self)
+    }
+
+    fn arg_regs() -> &'static [Self] {
+        VReg::arg_regs()
+    }
+
+    fn callee_saved_regs() -> &'static [Self] {
+        VReg::callee_saved()
+    }
+
+    fn allocatable_regs() -> &'static [Self] {
+        VReg::allocatable()
+    }
 }
 
 // ============================================================================
@@ -659,7 +745,8 @@ impl RegAlloc {
     /// Perform register allocation for a function
     pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
         self.reset_state();
-        self.identify_fp_pseudos(func, types);
+        // Use shared identify_fp_pseudos with type-checker closure
+        self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         self.allocate_arguments(func, types);
 
         let (intervals, constraint_points) = self.compute_live_intervals(func);
@@ -997,56 +1084,6 @@ impl RegAlloc {
                     self.locations
                         .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
                 }
-            }
-        }
-    }
-
-    /// Identify which pseudos need FP registers by scanning the IR
-    fn identify_fp_pseudos(&mut self, func: &Function, types: &TypeTable) {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                let is_fp_op = matches!(
-                    insn.op,
-                    Opcode::FAdd
-                        | Opcode::FSub
-                        | Opcode::FMul
-                        | Opcode::FDiv
-                        | Opcode::FNeg
-                        | Opcode::FCvtF
-                        | Opcode::UCvtF
-                        | Opcode::SCvtF
-                );
-
-                if is_fp_op {
-                    if let Some(target) = insn.target {
-                        self.fp_pseudos.insert(target);
-                    }
-                }
-
-                if let Some(typ) = insn.typ {
-                    if types.is_float(typ)
-                        && !matches!(
-                            insn.op,
-                            Opcode::FCmpOEq
-                                | Opcode::FCmpONe
-                                | Opcode::FCmpOLt
-                                | Opcode::FCmpOLe
-                                | Opcode::FCmpOGt
-                                | Opcode::FCmpOGe
-                        )
-                    {
-                        if let Some(target) = insn.target {
-                            self.fp_pseudos.insert(target);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also mark pseudos that are FVal constants
-        for pseudo in &func.pseudos {
-            if matches!(pseudo.kind, PseudoKind::FVal(_)) {
-                self.fp_pseudos.insert(pseudo.id);
             }
         }
     }

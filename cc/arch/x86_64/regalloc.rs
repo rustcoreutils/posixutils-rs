@@ -39,7 +39,8 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    expire_intervals, find_call_positions, interval_crosses_call, LiveInterval,
+    expire_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call, FpReg,
+    GpReg, LiveInterval,
 };
 use crate::ir::{Function, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
@@ -221,6 +222,38 @@ impl Reg {
     pub fn bp() -> Reg {
         Reg::Rbp
     }
+
+    /// Callee-saved registers available for allocation
+    pub fn callee_saved() -> &'static [Reg] {
+        &[Reg::Rbx, Reg::R12, Reg::R13, Reg::R14, Reg::R15]
+    }
+}
+
+// Implement the GpReg trait for x86-64 registers
+impl GpReg for Reg {
+    fn name(&self) -> &'static str {
+        self.name64()
+    }
+
+    fn name_for_size(&self, bits: u32) -> &'static str {
+        Reg::name_for_size(self, bits)
+    }
+
+    fn is_callee_saved(&self) -> bool {
+        Reg::is_callee_saved(self)
+    }
+
+    fn arg_regs() -> &'static [Self] {
+        Reg::arg_regs()
+    }
+
+    fn callee_saved_regs() -> &'static [Self] {
+        Reg::callee_saved()
+    }
+
+    fn allocatable_regs() -> &'static [Self] {
+        Reg::allocatable()
+    }
 }
 
 // ============================================================================
@@ -374,6 +407,41 @@ impl XmmReg {
             // XMM14 and XMM15 are reserved for scratch use in codegen
         ]
     }
+
+    /// Callee-saved FP registers (none on System V ABI)
+    pub fn callee_saved() -> &'static [XmmReg] {
+        // System V AMD64 ABI: all XMM registers are caller-saved
+        &[]
+    }
+}
+
+// Implement the FpReg trait for x86-64 XMM registers
+impl FpReg for XmmReg {
+    fn name(&self) -> &'static str {
+        XmmReg::name(self)
+    }
+
+    fn name_for_size(&self, _bits: u32) -> &'static str {
+        // XMM registers don't have size variants - always use full name
+        XmmReg::name(self)
+    }
+
+    fn is_callee_saved(&self) -> bool {
+        // System V AMD64 ABI: all XMM registers are caller-saved
+        false
+    }
+
+    fn arg_regs() -> &'static [Self] {
+        XmmReg::arg_regs()
+    }
+
+    fn callee_saved_regs() -> &'static [Self] {
+        XmmReg::callee_saved()
+    }
+
+    fn allocatable_regs() -> &'static [Self] {
+        XmmReg::allocatable()
+    }
 }
 
 // ============================================================================
@@ -452,7 +520,8 @@ impl RegAlloc {
     /// Perform register allocation for a function
     pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
         self.reset_state();
-        self.identify_fp_pseudos(func, types);
+        // Use shared identify_fp_pseudos with type-checker closure
+        self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         self.allocate_arguments(func, types);
 
         let (intervals, constraint_points) = self.compute_live_intervals(func);
@@ -739,67 +808,6 @@ impl RegAlloc {
                     self.stack_offset += 8;
                     self.locations
                         .insert(interval.pseudo, Loc::Stack(self.stack_offset));
-                }
-            }
-        }
-    }
-
-    /// Scan function to identify which pseudos need FP registers
-    fn identify_fp_pseudos(&mut self, func: &Function, types: &TypeTable) {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                let is_fp_op = matches!(
-                    insn.op,
-                    Opcode::FAdd
-                        | Opcode::FSub
-                        | Opcode::FMul
-                        | Opcode::FDiv
-                        | Opcode::FNeg
-                        | Opcode::FCmpOEq
-                        | Opcode::FCmpONe
-                        | Opcode::FCmpOLt
-                        | Opcode::FCmpOLe
-                        | Opcode::FCmpOGt
-                        | Opcode::FCmpOGe
-                        | Opcode::UCvtF
-                        | Opcode::SCvtF
-                        | Opcode::FCvtF
-                );
-
-                // Mark target as FP if this is an FP operation (except comparisons)
-                if is_fp_op
-                    && !matches!(
-                        insn.op,
-                        Opcode::FCmpOEq
-                            | Opcode::FCmpONe
-                            | Opcode::FCmpOLt
-                            | Opcode::FCmpOLe
-                            | Opcode::FCmpOGt
-                            | Opcode::FCmpOGe
-                    )
-                {
-                    if let Some(target) = insn.target {
-                        self.fp_pseudos.insert(target);
-                    }
-                }
-
-                // Also check the type if available
-                if let Some(typ) = insn.typ {
-                    if types.is_float(typ)
-                        && !matches!(
-                            insn.op,
-                            Opcode::FCmpOEq
-                                | Opcode::FCmpONe
-                                | Opcode::FCmpOLt
-                                | Opcode::FCmpOLe
-                                | Opcode::FCmpOGt
-                                | Opcode::FCmpOGe
-                        )
-                    {
-                        if let Some(target) = insn.target {
-                            self.fp_pseudos.insert(target);
-                        }
-                    }
                 }
             }
         }

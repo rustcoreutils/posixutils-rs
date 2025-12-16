@@ -91,17 +91,6 @@ Not yet implemented (features we want to add):
 - C11 Thread-Local Storage (_Thread_local) and atomics (_Atomic)
 - Other C11 features: _Static_assert, _Generic, anonymous structs
 
-## Known Issues
-
-### Preprocessor
-
-- **Chained macro expansion after token paste**: When a token paste (`##`) creates an identifier that is itself a function-like macro, the subsequent macro expansion may not work correctly. For example:
-  ```c
-  #define BAR_test(y) y
-  #define FOO(x) BAR_ ## x(1)
-  FOO(test)  // Should expand to 1, but may produce incorrect output
-  ```
-
 ## Code Quality
 
 Please run `cargo fmt` before committing code, and `cargo clippy` regularly while working. Code should build without warnings.

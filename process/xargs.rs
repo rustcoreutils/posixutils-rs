@@ -17,6 +17,9 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::BUFSZ;
 
 const FALLBACK_ARG_MAX: usize = 131072;
+// POSIX requires at least 255 bytes for -I constructed arguments
+// We use a higher limit for better usability
+const INSERT_ARG_MAX: usize = 4096;
 
 fn get_arg_max() -> usize {
     let result = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
@@ -536,6 +539,20 @@ fn exec_insert_mode(
         .map(|arg| arg.replace(replstr, input_arg))
         .collect();
 
+    // POSIX: Check that constructed arguments don't exceed the limit
+    // POSIX requires at least 255 bytes, we use INSERT_ARG_MAX (4096)
+    for arg in &util_args {
+        if arg.len() > INSERT_ARG_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "xargs: constructed argument exceeds {} byte limit in insert mode",
+                    INSERT_ARG_MAX
+                ),
+            ));
+        }
+    }
+
     exec_util(&args.util, util_args, trace, prompt)
 }
 
@@ -550,6 +567,11 @@ macro_rules! handle_exec_result {
     ($result:expr, $any_failed:expr) => {
         match $result {
             ExecResult::Exited(255) => {
+                return Ok(SpawnResult { exit_code: 1 });
+            }
+            ExecResult::Exited(code) if code >= 128 => {
+                // POSIX: utility terminated by signal - exit immediately
+                eprintln!("xargs: command terminated by signal");
                 return Ok(SpawnResult { exit_code: 1 });
             }
             ExecResult::Exited(code) if code != 0 => {
@@ -682,6 +704,11 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
                 ExecResult::Exited(255) => {
                     return Ok(SpawnResult { exit_code: 1 });
                 }
+                ExecResult::Exited(code) if code >= 128 => {
+                    // POSIX: utility terminated by signal - exit immediately
+                    eprintln!("xargs: command terminated by signal");
+                    return Ok(SpawnResult { exit_code: 1 });
+                }
                 ExecResult::Exited(code) if code != 0 => {
                     any_failed = true;
                 }
@@ -701,6 +728,11 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
 
         match exec_util(&args.util, util_args, trace, args.prompt)? {
             ExecResult::Exited(255) => {
+                return Ok(SpawnResult { exit_code: 1 });
+            }
+            ExecResult::Exited(code) if code >= 128 => {
+                // POSIX: utility terminated by signal - exit immediately
+                eprintln!("xargs: command terminated by signal");
                 return Ok(SpawnResult { exit_code: 1 });
             }
             ExecResult::Exited(code) if code != 0 => {

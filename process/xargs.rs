@@ -541,16 +541,15 @@ fn exec_insert_mode(
 
     // POSIX: Check that constructed arguments don't exceed the limit
     // POSIX requires at least 255 bytes, we use INSERT_ARG_MAX (4096)
-    for arg in &util_args {
-        if arg.len() > INSERT_ARG_MAX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "xargs: constructed argument exceeds {} byte limit in insert mode",
-                    INSERT_ARG_MAX
-                ),
-            ));
-        }
+    if let Some(arg) = util_args.iter().find(|arg| arg.len() > INSERT_ARG_MAX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "xargs: constructed argument of {} bytes exceeds {} byte limit in insert mode",
+                arg.len(),
+                INSERT_ARG_MAX
+            ),
+        ));
     }
 
     exec_util(&args.util, util_args, trace, prompt)

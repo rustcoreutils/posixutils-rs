@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 fn xargs_test(test_data: &str, expected_output: &str, args: Vec<&str>) {
     run_test(TestPlan {
@@ -310,5 +310,42 @@ fn xargs_combine_n_and_s() {
         expected_out: String::from("a b\nc d\ne\n"),
         expected_err: String::from(""),
         expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_insert_arg_size_limit() {
+    // -I mode should enforce size limit on constructed arguments
+    // Create a string that when repeated will exceed 4096 bytes
+    let long_input = "x".repeat(5000);
+    let test_plan = TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-I".to_string(),
+            "{}".to_string(),
+            "echo".to_string(),
+            "{}".to_string(),
+        ],
+        stdin_data: format!("{}\n", long_input),
+        expected_out: String::from(""),
+        expected_err: String::from(""),
+        expected_exit_code: 1,
+    };
+
+    // Run with custom checker since error format includes Rust error wrapper
+    run_test_with_checker(test_plan, |plan, output| {
+        assert_eq!(output.status.code(), Some(plan.expected_exit_code));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), plan.expected_out);
+        // Just verify stderr contains the key message parts
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("constructed argument"),
+            "Expected error about constructed argument"
+        );
+        assert!(stderr.contains("5000 bytes"), "Expected size in error");
+        assert!(
+            stderr.contains("4096 byte limit"),
+            "Expected limit in error"
+        );
     });
 }

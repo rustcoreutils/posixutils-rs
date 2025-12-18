@@ -4,7 +4,6 @@
 
 - [Technical Debt](#technical-debt)
   - [R10 reserved globally for division scratch](#r10-reserved-globally-for-division-scratch)
-  - [XMM register save area for variadic functions](#xmm-register-save-area-for-variadic-functions-x86-64)
 - [Future Features](#future-features)
   - [C11 Atomics (`_Atomic`)](#c11-atomics-_atomic-implementation)
   - [C11 Alignment Specifiers (`_Alignas`, `_Alignof`)](#c11-alignment-specifiers-_alignas-_alignof)
@@ -25,7 +24,7 @@
 
 ### R10 reserved globally for division scratch
 
-**Location**: `arch/x86_64/codegen.rs` lines 160-179
+**Location**: `arch/x86_64/regalloc.rs` lines 187-208
 
 **Issue**: R10 is permanently excluded from the allocatable register pool because x86-64 `div`/`idiv` instructions clobber RAX (quotient) and RDX (remainder). When the divisor operand happens to be in RAX or RDX, we need a scratch register to hold it during the division.
 
@@ -44,27 +43,6 @@
 4. **Spill to stack**: When divisor is in RAX/RDX, use a temporary stack slot instead of a dedicated scratch register.
 
 Production compilers (GCC, LLVM) use approaches 2-4. The current approach is simple and correct but sacrifices some optimization potential.
-
-### XMM register save area for variadic functions (x86-64)
-
-**Location**: `arch/x86_64/codegen.rs` lines 1012-1015
-
-**Issue**: On x86-64 SysV ABI, variadic functions that receive floating-point arguments via XMM0-XMM7 should save those registers in the register save area during the prologue. This allows `va_arg(ap, double)` to retrieve FP arguments passed in registers.
-
-**Current state**: The compiler correctly:
-- Passes FP arguments to variadic functions (caller side) in XMM registers
-- Sets AL to the count of XMM registers used for variadic calls
-- Saves GP registers (RDI, RSI, RDX, RCX, R8, R9) in the register save area
-
-However, XMM registers are not saved, so user-defined variadic functions cannot use `va_arg` to retrieve `double` arguments.
-
-**Impact**: Low. Most POSIX variadic functions (printf, sprintf, scanf, etc.) are provided by libc and work correctly. This only affects user-defined variadic functions that accept floating-point variadic arguments.
-
-**Solution**: In the function prologue for variadic functions:
-1. Allocate additional space in the register save area (8 XMM regs × 16 bytes = 128 bytes)
-2. Use `movaps` to save XMM0-XMM7 at their ABI-specified offsets
-3. Update `va_start` to initialize the FP register save area pointer correctly
-4. Update `va_arg` to read from XMM save area when extracting FP types
 
 ---
 

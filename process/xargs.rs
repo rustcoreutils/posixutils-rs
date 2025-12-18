@@ -17,6 +17,9 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::BUFSZ;
 
 const FALLBACK_ARG_MAX: usize = 131072;
+// POSIX requires at least 255 bytes for -I constructed arguments
+// We use a higher limit for better usability
+const INSERT_ARG_MAX: usize = 4096;
 
 fn get_arg_max() -> usize {
     let result = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
@@ -535,6 +538,19 @@ fn exec_insert_mode(
         .iter()
         .map(|arg| arg.replace(replstr, input_arg))
         .collect();
+
+    // POSIX: Check that constructed arguments don't exceed the limit
+    // POSIX requires at least 255 bytes, we use INSERT_ARG_MAX (4096)
+    if let Some(arg) = util_args.iter().find(|arg| arg.len() > INSERT_ARG_MAX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "xargs: constructed argument of {} bytes exceeds {} byte limit in insert mode",
+                arg.len(),
+                INSERT_ARG_MAX
+            ),
+        ));
+    }
 
     exec_util(&args.util, util_args, trace, prompt)
 }

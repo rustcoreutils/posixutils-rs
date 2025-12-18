@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 fn xargs_test(test_data: &str, expected_output: &str, args: Vec<&str>) {
     run_test(TestPlan {
@@ -210,4 +210,142 @@ fn xargs_quoted_args() {
 fn xargs_escaped_chars() {
     // Test escaped characters
     xargs_test("hello\\ world\n", "hello world\n", vec!["echo"]);
+}
+
+#[test]
+fn xargs_single_quotes() {
+    // Test single quote (apostrophe) handling
+    xargs_test("'hello world'\n", "hello world\n", vec!["echo"]);
+}
+
+#[test]
+fn xargs_mixed_quotes() {
+    // Test mix of single and double quotes
+    xargs_test(
+        "'single' \"double\" plain\n",
+        "single double plain\n",
+        vec!["echo"],
+    );
+}
+
+#[test]
+fn xargs_empty_input() {
+    // Empty input should not execute the utility
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["echo".to_string()],
+        stdin_data: String::from(""),
+        expected_out: String::from(""),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_line_continuation() {
+    // -L with trailing blank should continue to next line
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-L".to_string(), "1".to_string(), "echo".to_string()],
+        stdin_data: String::from("one \ntwo\nthree\n"),
+        expected_out: String::from("one two\nthree\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_insert_multiple_replstr() {
+    // -I with multiple occurrences of replstr in same argument
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-I".to_string(),
+            "{}".to_string(),
+            "echo".to_string(),
+            "{}-{}-{}".to_string(),
+        ],
+        stdin_data: String::from("test\n"),
+        expected_out: String::from("test-test-test\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_insert_five_args_with_replstr() {
+    // -I with replstr in 5 arguments (POSIX requires at least 5)
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-I".to_string(),
+            "{}".to_string(),
+            "echo".to_string(),
+            "{}".to_string(),
+            "{}".to_string(),
+            "{}".to_string(),
+            "{}".to_string(),
+            "{}".to_string(),
+        ],
+        stdin_data: String::from("x\n"),
+        expected_out: String::from("x x x x x\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_combine_n_and_s() {
+    // Combining -n and -s should work together
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-n".to_string(),
+            "2".to_string(),
+            "-s".to_string(),
+            "20".to_string(),
+            "echo".to_string(),
+        ],
+        stdin_data: String::from("a b c d e\n"),
+        expected_out: String::from("a b\nc d\ne\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_insert_arg_size_limit() {
+    // -I mode should enforce size limit on constructed arguments
+    // Create a string that when repeated will exceed 4096 bytes
+    let long_input = "x".repeat(5000);
+    let test_plan = TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-I".to_string(),
+            "{}".to_string(),
+            "echo".to_string(),
+            "{}".to_string(),
+        ],
+        stdin_data: format!("{}\n", long_input),
+        expected_out: String::from(""),
+        expected_err: String::from(""),
+        expected_exit_code: 1,
+    };
+
+    // Run with custom checker since error format includes Rust error wrapper
+    run_test_with_checker(test_plan, |plan, output| {
+        assert_eq!(output.status.code(), Some(plan.expected_exit_code));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), plan.expected_out);
+        // Just verify stderr contains the key message parts
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("constructed argument"),
+            "Expected error about constructed argument"
+        );
+        assert!(stderr.contains("5000 bytes"), "Expected size in error");
+        assert!(
+            stderr.contains("4096 byte limit"),
+            "Expected limit in error"
+        );
+    });
 }

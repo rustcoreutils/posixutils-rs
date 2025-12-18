@@ -568,11 +568,6 @@ macro_rules! handle_exec_result {
             ExecResult::Exited(255) => {
                 return Ok(SpawnResult { exit_code: 1 });
             }
-            ExecResult::Exited(code) if code >= 128 => {
-                // POSIX: utility terminated by signal - exit immediately
-                eprintln!("xargs: command terminated by signal");
-                return Ok(SpawnResult { exit_code: 1 });
-            }
             ExecResult::Exited(code) if code != 0 => {
                 $any_failed = true;
             }
@@ -703,11 +698,6 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
                 ExecResult::Exited(255) => {
                     return Ok(SpawnResult { exit_code: 1 });
                 }
-                ExecResult::Exited(code) if code >= 128 => {
-                    // POSIX: utility terminated by signal - exit immediately
-                    eprintln!("xargs: command terminated by signal");
-                    return Ok(SpawnResult { exit_code: 1 });
-                }
                 ExecResult::Exited(code) if code != 0 => {
                     any_failed = true;
                 }
@@ -727,11 +717,6 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
 
         match exec_util(&args.util, util_args, trace, args.prompt)? {
             ExecResult::Exited(255) => {
-                return Ok(SpawnResult { exit_code: 1 });
-            }
-            ExecResult::Exited(code) if code >= 128 => {
-                // POSIX: utility terminated by signal - exit immediately
-                eprintln!("xargs: command terminated by signal");
                 return Ok(SpawnResult { exit_code: 1 });
             }
             ExecResult::Exited(code) if code != 0 => {

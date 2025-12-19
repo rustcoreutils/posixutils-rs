@@ -1477,6 +1477,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-cron"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "gettext-rs",
+ "libc",
+ "plib",
+ "tempfile",
+]
+
+[[package]]
 name = "posixutils-datetime"
 version = "0.7.0"
 dependencies = [

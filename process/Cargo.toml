@@ -29,10 +29,6 @@ sysinfo = "0.31"
 path = "lib.rs"
 
 [[bin]]
-name = "batch"
-path = "./batch.rs"
-
-[[bin]]
 name = "fuser"
 path = "./fuser.rs"
 

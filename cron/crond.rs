@@ -9,12 +9,14 @@
 
 use chrono::Local;
 use cron::job::Database;
+use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::cmp::Ordering::{Greater, Less};
-use std::env;
 use std::error::Error;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -25,8 +27,9 @@ static LAST_MODIFIED: Mutex<Option<u64>> = Mutex::new(None);
 #[derive(Debug)]
 enum CronError {
     Fork,
-    NoLogname,
     NoCrontab,
+    AlreadyRunning,
+    PidFile(std::io::Error),
 }
 
 impl Error for CronError {}
@@ -34,9 +37,10 @@ impl Error for CronError {}
 impl fmt::Display for CronError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoLogname => write!(f, "Could not obtain the user's logname"),
             Self::NoCrontab => write!(f, "Could not format database"),
             Self::Fork => write!(f, "Could not create child process"),
+            Self::AlreadyRunning => write!(f, "Another crond instance is already running"),
+            Self::PidFile(e) => write!(f, "Could not create PID file: {}", e),
         }
     }
 }
@@ -60,24 +64,62 @@ fn is_file_changed(filepath: &str) -> Result<bool, Box<dyn Error>> {
     }
 }
 
-/// Update [`CRONTAB`] if logname file is changed
+/// Update [`CRONTAB`] by loading all user crontabs from spool directory
 fn sync_cronfile() -> Result<(), Box<dyn Error>> {
-    let Ok(logname) = env::var("LOGNAME") else {
-        return Err(Box::new(CronError::NoLogname));
-    };
-    #[cfg(target_os = "linux")]
-    let file = format!("/var/spool/cron/{logname}");
-    #[cfg(target_os = "macos")]
-    let file = format!("/var/at/tabs/{logname}");
-    if (*CRONTAB.lock().unwrap()).is_none() || is_file_changed(&file)? {
-        let s = fs::read_to_string(&file)?;
-        let crontab = s
-            .lines()
-            .filter_map(|x| Database::from_str(x).ok())
-            .fold(Database(vec![]), |acc, next| acc.merge(next));
-        *CRONTAB.lock().unwrap() = Some(crontab);
+    // Check if directory has changed (use directory mtime)
+    let dir_changed = is_file_changed(CRON_SPOOL_DIR).unwrap_or(true);
+
+    if (*CRONTAB.lock().unwrap()).is_none() || dir_changed {
+        let mut combined_db = Database(vec![]);
+
+        // Load all user crontabs from spool directory
+        if let Ok(entries) = fs::read_dir(CRON_SPOOL_DIR) {
+            for entry in entries.flatten() {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    let user_db = content
+                        .lines()
+                        .filter_map(|x| Database::from_str(x).ok())
+                        .fold(Database(vec![]), |acc, next| acc.merge(next));
+                    combined_db = combined_db.merge(user_db);
+                }
+            }
+        }
+
+        // Also load system crontab if exists
+        if let Ok(content) = fs::read_to_string(SYSTEM_CRONTAB) {
+            let sys_db = content
+                .lines()
+                .filter_map(|x| Database::from_str(x).ok())
+                .fold(Database(vec![]), |acc, next| acc.merge(next));
+            combined_db = combined_db.merge(sys_db);
+        }
+
+        *CRONTAB.lock().unwrap() = Some(combined_db);
     }
     Ok(())
+}
+
+/// Acquire PID file lock to prevent multiple daemon instances
+/// Returns the file handle which must be kept open for the lock to persist
+fn acquire_lock() -> Result<File, CronError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(PID_FILE)
+        .map_err(CronError::PidFile)?;
+
+    unsafe {
+        if libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
+            return Err(CronError::AlreadyRunning);
+        }
+    }
+
+    // Write our PID to the file
+    writeln!(file, "{}", std::process::id()).map_err(CronError::PidFile)?;
+    file.flush().map_err(CronError::PidFile)?;
+
+    Ok(file)
 }
 
 /// Create new daemon process of crond
@@ -101,13 +143,19 @@ fn setup() -> i32 {
     }
 }
 
-/// Handles incoming signals
-fn handle_signals(signal_code: libc::c_int) {
-    if signal_code == libc::SIGHUP {
-        if let Err(err) = sync_cronfile() {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
+/// Handles SIGHUP signal to reload crontab
+extern "C" fn handle_sighup(_: libc::c_int) {
+    if let Err(err) = sync_cronfile() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+/// Handles SIGCHLD signal to reap zombie child processes
+extern "C" fn handle_sigchld(_: libc::c_int) {
+    unsafe {
+        // Reap all zombie children without blocking
+        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
     }
 }
 
@@ -127,12 +175,12 @@ fn daemon_loop() -> Result<(), Box<dyn Error>> {
             continue;
         };
         let now = Local::now();
-        let diff = now.naive_local() - next_exec;
-        let sleep_time = diff.num_seconds();
+        let diff = next_exec - now.naive_local();
+        let sleep_time = diff.num_seconds().max(0) as u64;
 
         if sleep_time < 60 {
             sleep(sleep_time as u32);
-            x.run_job()?;
+            let _ = x.run_job(); // Errors logged in child process
         } else {
             sleep(60);
         }
@@ -152,8 +200,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => {}
     }
 
+    // Acquire PID file lock (keep handle alive for the daemon's lifetime)
+    let _pid_lock = acquire_lock()?;
+
     unsafe {
-        libc::signal(libc::SIGHUP, handle_signals as usize);
+        libc::signal(libc::SIGHUP, handle_sighup as usize);
+        libc::signal(libc::SIGCHLD, handle_sigchld as usize);
     }
 
     daemon_loop()

@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-
+use cron::{CRON_ALLOW, CRON_DENY, CRON_SPOOL_DIR};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::env;
 use std::fs;
@@ -36,6 +36,23 @@ fn print_usage(err: &str) {
     eprintln!("\t-e\t- edit user's crontab");
     eprintln!("\t-l\t- list user's crontab");
     eprintln!("\t-r\t- delete user's crontab");
+}
+
+/// Check if a user is allowed to use crontab based on cron.allow/cron.deny files
+/// Returns true if allowed, false if denied
+fn is_user_allowed(username: &str) -> bool {
+    // If cron.allow exists, only listed users are allowed
+    if let Ok(content) = fs::read_to_string(CRON_ALLOW) {
+        return content.lines().any(|line| line.trim() == username);
+    }
+
+    // If cron.deny exists, listed users are denied
+    if let Ok(content) = fs::read_to_string(CRON_DENY) {
+        return !content.lines().any(|line| line.trim() == username);
+    }
+
+    // Default: allow all users
+    true
 }
 
 fn list_crontab(path: &str) -> Result<String> {
@@ -72,13 +89,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let args = CronArgs::parse();
     let Ok(logname) = env::var("LOGNAME") else {
-        println!("Could not obtain the user's logname.");
+        eprintln!("Could not obtain the user's logname.");
         exit(1);
     };
-    #[cfg(target_os = "linux")]
-    let path = format!("/var/spool/cron/{logname}");
-    #[cfg(target_os = "macos")]
-    let path = format!("/var/spool/cron/{logname}");
+
+    // Check if user is allowed to use crontab
+    if !is_user_allowed(&logname) {
+        eprintln!("You ({logname}) are not allowed to use this program.");
+        exit(1);
+    }
+
+    let path = format!("{}/{}", CRON_SPOOL_DIR, logname);
 
     let opt_count = [args.edit, args.list, args.remove, args.file.is_some()]
         .into_iter()

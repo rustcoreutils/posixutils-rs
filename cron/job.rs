@@ -7,13 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use std::collections::BTreeSet;
 use std::iter::Peekable;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::str::FromStr;
-
-trait TimeUnit {}
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Copy, Clone, Debug)]
 enum Value {
@@ -52,21 +51,24 @@ macro_rules! time_unit {
                 }
             }
 
-            fn merge(self, other: Self) -> Self {
-                let mut a = self.to_vec();
-                let b = other.to_vec();
-                a.extend(b);
-                a.sort();
-                a.dedup();
-                Self(Some(a.into_iter().map(|x| Value::Number(x)).collect()))
-            }
-
             fn parse(s: impl AsRef<str>) -> Result<Self, ()> {
                 let s = s.as_ref();
                 let mut v = Vec::new();
                 let mut src = s.chars().peekable();
 
+                // Handle wildcard: * or */step
                 if expect(&mut src, '*') {
+                    if expect(&mut src, '/') {
+                        let Some(step) = get_number(&mut src) else {
+                            return Err(());
+                        };
+                        let range = Self::range();
+                        return Ok(Self(Some(vec![Value::Range {
+                            min: *range.start(),
+                            max: *range.end(),
+                            step,
+                        }])));
+                    }
                     return Ok(Self(None));
                 }
 
@@ -80,25 +82,33 @@ macro_rules! time_unit {
                     };
 
                     if expect(&mut src, '-') {
+                        // Range: min-max or min-max/step
                         let Some(max) = get_number(&mut src) else {
                             return Err(());
                         };
-                        if expect(&mut src, '/') {
+                        let step = if expect(&mut src, '/') {
                             let Some(step) = get_number(&mut src) else {
                                 return Err(());
                             };
-                            v.push(Value::Range { min, max, step });
-                        }
-                        v.push(Value::Range { min, max, step: 1 });
+                            step
+                        } else {
+                            1
+                        };
+                        v.push(Value::Range { min, max, step });
+                    } else {
+                        // Single number
+                        v.push(Value::Number(min));
                     }
-                    v.push(Value::Number(min));
+
+                    // Handle comma-separated values
+                    if !expect(&mut src, ',') {
+                        break;
+                    }
                 }
 
                 Ok(Self(Some(v)))
             }
         }
-
-        impl TimeUnit for $name {}
     };
 }
 
@@ -107,6 +117,17 @@ time_unit!(Hour from 0 to 23);
 time_unit!(MonthDay from 1 to 31);
 time_unit!(Month from 1 to 12);
 time_unit!(WeekDay from 0 to 6);
+
+impl MonthDay {
+    fn merge(self, other: Self) -> Self {
+        let mut a = self.to_vec();
+        let b = other.to_vec();
+        a.extend(b);
+        a.sort();
+        a.dedup();
+        Self(Some(a.into_iter().map(Value::Number).collect()))
+    }
+}
 
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub struct CronJob {
@@ -144,26 +165,36 @@ impl FromStr for Database {
         let mut result = vec![];
 
         for line in s.lines() {
+            let line = line.trim();
+
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
             let mut fields = line.split_ascii_whitespace();
 
             let Some(minutes_field) = fields.next() else {
-                return Err(());
+                continue;
             };
             let Some(hours_field) = fields.next() else {
-                return Err(());
+                continue;
             };
             let Some(monthdays_field) = fields.next() else {
-                return Err(());
+                continue;
             };
             let Some(months_field) = fields.next() else {
-                return Err(());
+                continue;
             };
             let Some(weekdays_field) = fields.next() else {
-                return Err(());
+                continue;
             };
-            let Some(command) = fields.next() else {
-                return Err(());
-            };
+
+            // Collect all remaining fields as the command
+            let command: String = fields.collect::<Vec<_>>().join(" ");
+            if command.is_empty() {
+                continue;
+            }
 
             let Ok(minute) = Minute::parse(minutes_field) else {
                 return Err(());
@@ -206,55 +237,79 @@ impl CronJob {
             command: _,
         } = self;
 
-        let monthdays = monthdays.clone();
-        let weekdays = weekdays.clone();
+        let months_vec = months.to_vec();
+        let hours_vec = hours.to_vec();
+        let minutes_vec = minutes.to_vec();
 
-        let monthdays = match (monthdays.clone().0, weekdays.clone().0) {
-            (Some(_), Some(_)) => {
-                monthdays.merge(convert_weekdays_to_monthdays(now.date(), weekdays))
-            }
-            (None, Some(_)) => convert_weekdays_to_monthdays(now.date(), weekdays),
-            (Some(_), None) => monthdays,
-            (None, None) => MonthDay(None),
-        };
+        let mut candidates = Vec::new();
 
-        println!("{:?}", monthdays.to_vec());
+        // Try current year and next year for year rollover
+        for year_offset in 0..=1 {
+            let check_year = now.year() + year_offset;
 
-        for month in &months.to_vec() {
-            for monthday in &monthdays.to_vec() {
-                for hour in &hours.to_vec() {
-                    for minute in &minutes.to_vec() {
-                        let mut next_exec = *now;
-                        let Some(date) = next_exec.with_minute(*minute as u32) else {
-                            continue;
-                        };
-                        next_exec = date;
-                        let Some(date) = next_exec.with_hour(*hour as u32) else {
-                            continue;
-                        };
-                        next_exec = date;
-                        let Some(date) = next_exec.with_day(*monthday as u32) else {
-                            continue;
-                        };
-                        next_exec = date;
-                        let Some(date) = next_exec.with_month(*month as u32) else {
-                            continue;
-                        };
-                        next_exec = date;
+            for month in &months_vec {
+                // Convert weekdays to monthdays for this specific month/year
+                let date_for_conversion = NaiveDate::from_ymd_opt(check_year, *month as u32, 1)?;
+                let monthdays_for_month = match (monthdays.clone().0, weekdays.clone().0) {
+                    (Some(_), Some(_)) => monthdays.clone().merge(convert_weekdays_to_monthdays(
+                        date_for_conversion,
+                        weekdays.clone(),
+                    )),
+                    (None, Some(_)) => {
+                        convert_weekdays_to_monthdays(date_for_conversion, weekdays.clone())
+                    }
+                    (Some(_), None) => monthdays.clone(),
+                    (None, None) => MonthDay(None),
+                };
 
-                        if next_exec > *now {
-                            return Some(next_exec);
+                for monthday in &monthdays_for_month.to_vec() {
+                    for hour in &hours_vec {
+                        for minute in &minutes_vec {
+                            // Try to construct a valid date
+                            let Some(date) = NaiveDate::from_ymd_opt(
+                                check_year,
+                                *month as u32,
+                                *monthday as u32,
+                            ) else {
+                                continue; // Invalid date (e.g., Feb 30)
+                            };
+                            let Some(time) =
+                                chrono::NaiveTime::from_hms_opt(*hour as u32, *minute as u32, 0)
+                            else {
+                                continue;
+                            };
+                            let next_exec = NaiveDateTime::new(date, time);
+
+                            if next_exec > *now {
+                                candidates.push(next_exec);
+                            }
                         }
                     }
                 }
             }
         }
 
-        None
+        // Return the earliest candidate
+        candidates.into_iter().min()
     }
 
-    pub fn run_job(&self) -> std::io::Result<std::process::Output> {
-        Command::new("sh").args(["-c", &self.command]).output()
+    pub fn run_job(&self) -> std::io::Result<()> {
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if pid == 0 {
+                // Child process - execute the command
+                // This replaces the child process with sh -c "command"
+                let err = Command::new("sh").args(["-c", &self.command]).exec();
+                // exec() only returns on error
+                eprintln!("Failed to exec job: {}", err);
+                std::process::exit(1);
+            }
+            // Parent returns immediately
+            Ok(())
+        }
     }
 }
 

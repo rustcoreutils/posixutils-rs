@@ -60,6 +60,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] admin (SCCS)
  - [x] ar (Development)
  - [x] asa
+ - [x] at (cron cat.)
  - [x] awk
  - [x] basename
  - [x] bc
@@ -69,6 +70,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] comm
  - [x] compress (compress cat.)
  - [x] cp
+ - [x] crontab (cron cat.)
  - [x] csplit
  - [x] cut
  - [x] delta (SCCS)
@@ -192,10 +194,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] xgettext (i18n)
 
 ## Stage 0 - Not started
-
-### Cron category
- - [ ] at (cron cat.)
- - [ ] crontab (cron cat.)
 
 ### Development category
  - [ ] cflow (Development)

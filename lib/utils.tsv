@@ -2,6 +2,7 @@
 admin	sccs/admin.rs
 ar	dev/ar.rs
 asa	text/asa.rs
+at	cron/at.rs
 awk	awk/
 basename	pathnames/basename.rs
 batch	process/batch.rs
@@ -16,6 +17,7 @@ cmp	file/cmp.rs
 comm	text/comm.rs
 compress	xform/compress.rs
 cp	tree/cp.rs
+crontab	cron/crontab.rs
 csplit	text/csplit.rs
 cut	text/cut.rs
 date	datetime/date.rs

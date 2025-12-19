@@ -2079,8 +2079,6 @@ mod tokens {
 
     #[derive(Debug, PartialEq)]
     pub enum TokenParsingError {
-        TimeOperand(String),
-        DateOperant(String),
         H24HourParsing {
             err: std::num::ParseIntError,
             input: String,
@@ -2117,12 +2115,6 @@ mod tokens {
     impl std::fmt::Display for TokenParsingError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                TokenParsingError::TimeOperand(input) => {
-                    writeln!(f, "Failed to parse `time` operand in {input}")
-                }
-                TokenParsingError::DateOperant(input) => {
-                    writeln!(f, "Failed to parse `date` operand in {input}")
-                }
                 TokenParsingError::H24HourParsing { err: _, input } => {
                     writeln!(f, "Failed to parse `hr24clock_hour` token in `{input}`")
                 }
@@ -2175,53 +2167,6 @@ mod tokens {
                     writeln!(f, "Failed to find `am_pm` token in `{input}`")
                 }
             }
-        }
-    }
-
-    /// Specific operands in timespec for time
-    pub enum TimespecTimeOperands {
-        /// Indicates the time 12:00 am (00:00).
-        Midnight,
-        /// Indicates the time 12:00 pm.
-        Noon,
-        /// Indicates the current day and time.
-        Now,
-    }
-
-    impl FromStr for TimespecTimeOperands {
-        type Err = TokenParsingError;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let result = match s {
-                "midnight" => Self::Midnight,
-                "noon" => Self::Noon,
-                "now" => Self::Now,
-                _ => Err(TokenParsingError::TimeOperand(s.to_string()))?,
-            };
-
-            Ok(result)
-        }
-    }
-
-    /// Specific operands in timespec for date
-    pub enum TimespecDateOperands {
-        /// Indicates the current day.
-        Today,
-        /// Indicates the day following the current day.
-        Tomorrow,
-    }
-
-    impl FromStr for TimespecDateOperands {
-        type Err = TokenParsingError;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let result = match s {
-                "today" => Self::Today,
-                "tomorrow" => Self::Tomorrow,
-                _ => Err(TokenParsingError::DateOperant(s.to_owned()))?,
-            };
-
-            Ok(result)
         }
     }
 

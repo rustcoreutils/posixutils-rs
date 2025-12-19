@@ -8,6 +8,8 @@
 //
 
 use std::ffi::CString;
+use std::io::IsTerminal;
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
@@ -156,17 +158,15 @@ fn eval_unary_path(op: &UnaryOp, s: &str) -> bool {
 }
 
 fn eval_terminal(s: &str) -> bool {
-    let fd = match s.parse::<u32>() {
+    let fd = match s.parse::<i32>() {
         Ok(f) => f,
         Err(_) => {
             return false;
         }
     };
 
-    // Normally, posixutils would use the atty crate.
-    // Passing an arbitrary fd requires unsafe isatty in this case.
-
-    unsafe { libc::isatty(fd as i32) == 1 }
+    // Use safe Rust IsTerminal trait with BorrowedFd
+    unsafe { BorrowedFd::borrow_raw(fd).is_terminal() }
 }
 
 fn eval_unary(op_str: &str, s: &str) -> bool {

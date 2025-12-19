@@ -34,7 +34,6 @@ members = [
 	"uucp",
 	"xform",
 	"i18n",
-	"cron",
 ]
 
 [workspace.package]

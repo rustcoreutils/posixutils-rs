@@ -109,6 +109,10 @@ fn acquire_lock() -> Result<File, CronError> {
         .open(PID_FILE)
         .map_err(CronError::PidFile)?;
 
+    // SAFETY: flock() is safe to call here because:
+    // 1. file.as_raw_fd() returns a valid file descriptor from an open File
+    // 2. LOCK_EX | LOCK_NB are valid flags for exclusive non-blocking lock
+    // 3. We check the return value and handle errors appropriately
     unsafe {
         if libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
             return Err(CronError::AlreadyRunning);
@@ -124,6 +128,12 @@ fn acquire_lock() -> Result<File, CronError> {
 
 /// Create new daemon process of crond
 fn setup() -> i32 {
+    // SAFETY: These libc calls implement the standard Unix daemon pattern:
+    // 1. fork() creates child process; parent exits, child continues
+    // 2. setsid() creates new session, detaches from controlling terminal
+    // 3. chdir("/") prevents holding directory mounts open
+    // 4. close(STD*_FILENO) closes inherited file descriptors
+    // All calls have defined behavior and we check fork() return value.
     unsafe {
         use libc::*;
 
@@ -153,10 +163,11 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 
 /// Handles SIGCHLD signal to reap zombie child processes
 extern "C" fn handle_sigchld(_: libc::c_int) {
-    unsafe {
-        // Reap all zombie children without blocking
-        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
-    }
+    // SAFETY: waitpid() is async-signal-safe per POSIX.
+    // -1 means wait for any child, WNOHANG returns immediately if no zombie.
+    // null status pointer is valid when we don't need exit status.
+    // Loop reaps all available zombies without blocking.
+    unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
 }
 
 /// Daemon loop
@@ -203,6 +214,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Acquire PID file lock (keep handle alive for the daemon's lifetime)
     let _pid_lock = acquire_lock()?;
 
+    // SAFETY: signal() is safe to call with valid signal numbers and
+    // extern "C" function handlers. SIGHUP and SIGCHLD are standard signals.
+    // The handlers are async-signal-safe (only call async-signal-safe functions).
     unsafe {
         libc::signal(libc::SIGHUP, handle_sighup as usize);
         libc::signal(libc::SIGCHLD, handle_sigchld as usize);
@@ -212,5 +226,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn sleep(target: u32) {
+    // SAFETY: libc::sleep() is safe with any u32 value; it simply
+    // suspends execution for the specified number of seconds.
     unsafe { libc::sleep(target) };
 }

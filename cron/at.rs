@@ -1347,7 +1347,7 @@ mod timespec {
         TimeDateIncrement {
             time: Time,
             date: Date,
-            inrement: Increment,
+            increment: Increment,
         },
         Nowspec(Nowspec),
     }
@@ -1397,12 +1397,12 @@ mod timespec {
             let date = Date::from_str(&s[time_index..date_index])?;
 
             if date_index != string_length {
-                let inrement = Increment::from_str(&s[date_index..])?;
+                let increment = Increment::from_str(&s[date_index..])?;
 
                 return Ok(Self::TimeDateIncrement {
                     time,
                     date,
-                    inrement,
+                    increment,
                 });
             }
 
@@ -1439,7 +1439,7 @@ mod timespec {
                 Timespec::TimeDateIncrement {
                     time,
                     date,
-                    inrement,
+                    increment,
                 } => {
                     let time = time.to_naive_time()?;
                     let date = date.to_naive_date()?;
@@ -1447,7 +1447,7 @@ mod timespec {
                     let date_time = NaiveDateTime::new(date, time)
                         .and_utc()
                         .checked_add_signed(
-                            chrono::TimeDelta::from_std(inrement.to_duration()).ok()?,
+                            chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
                         )?;
 
                     match date_time < Utc::now() {
@@ -1889,7 +1889,7 @@ mod timespec {
                         day_number: DayNumber(NonZero::new(4).expect("valid")),
                         year_number: YearNumber(2024)
                     },
-                    inrement: Increment::Plus {
+                    increment: Increment::Plus {
                         number: 1,
                         period: IncPeriod::Day
                     }
@@ -1933,7 +1933,7 @@ mod timespec {
                     day_number: DayNumber(NonZero::new(4).expect("valid")),
                     year_number: YearNumber(3000),
                 },
-                inrement: Increment::Plus {
+                increment: Increment::Plus {
                     number: 1,
                     period: IncPeriod::Day,
                 },

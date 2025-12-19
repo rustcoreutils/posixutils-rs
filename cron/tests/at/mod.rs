@@ -136,7 +136,7 @@ fn test4() {
 }
 
 #[test]
-fn test6() {
+fn test5() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -159,7 +159,7 @@ fn test6() {
 }
 
 #[test]
-fn test7() {
+fn test6() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -182,7 +182,7 @@ fn test7() {
 }
 
 #[test]
-fn test8() {
+fn test7() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -205,7 +205,7 @@ fn test8() {
 }
 
 #[test]
-fn test9() {
+fn test8() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -228,7 +228,7 @@ fn test9() {
 }
 
 #[test]
-fn test10() {
+fn test9() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -250,7 +250,7 @@ fn test10() {
 }
 
 #[test]
-fn test11() {
+fn test10() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -279,7 +279,7 @@ fn test11() {
 }
 
 #[test]
-fn test12() {
+fn test11() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
@@ -309,7 +309,7 @@ fn test12() {
 }
 
 #[test]
-fn test13() {
+fn test12() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");

@@ -294,6 +294,11 @@ impl CronJob {
     }
 
     pub fn run_job(&self) -> std::io::Result<()> {
+        // SAFETY: fork() is safe to call here because:
+        // 1. We immediately check the return value for errors (pid < 0)
+        // 2. The child process (pid == 0) immediately exec()s a new process
+        // 3. The parent process returns immediately without shared state issues
+        // 4. We use Command::exec() which replaces the child process entirely
         unsafe {
             let pid = libc::fork();
             if pid < 0 {

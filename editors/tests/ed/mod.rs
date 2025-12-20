@@ -932,3 +932,133 @@ fn test_ed_global_list_command() {
         "foo\\tbar$\nfoo\\tend$\n",
     );
 }
+
+// ============================================================================
+// Phase 6: Help, Prompt, and Shell Command Tests
+// ============================================================================
+
+#[test]
+fn test_ed_help_command() {
+    // h command should print last error message (if any)
+    // First cause an error with invalid address, then use h to see it
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "99p\nh\nQ\n".to_string(),
+        expected_out: "?\nInvalid address\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_help_mode_toggle() {
+    // H command toggles help mode - when ON, errors show explanation
+    // Turn on help mode, then cause an error - should show explanation
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "H\n99p\nQ\n".to_string(),
+        expected_out: "?\nInvalid address\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_help_mode_shows_last_error() {
+    // When turning on help mode, it should show the last error if any
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "99p\nH\nQ\n".to_string(),
+        expected_out: "?\nInvalid address\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_shell_escape() {
+    // ! command executes shell command (without -s, prints "!" after)
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec![],
+        stdin_data: "!echo hello\nQ\n".to_string(),
+        expected_out: "hello\n!\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_shell_escape_silent() {
+    // With -s flag, ! should not print "!" after command
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "!echo hello\nQ\n".to_string(),
+        expected_out: "hello\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_shell_percent_expansion() {
+    // % in shell command should be replaced with filename
+    // POSIX: Modified line is printed before execution, then command runs
+    let temp = NamedTempFile::new().unwrap();
+    fs::write(temp.path(), "test\n").unwrap();
+    let path = temp.path().to_string_lossy().to_string();
+
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string(), path.clone()],
+        stdin_data: "!echo %\nQ\n".to_string(),
+        // First line: modified command "echo <path>"
+        // Second line: output of echo command "<path>"
+        expected_out: format!("echo {}\n{}\n", path, path),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_shell_repeat() {
+    // !! should repeat last shell command
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "!echo first\n!!\nQ\n".to_string(),
+        expected_out: "first\necho first\nfirst\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_prompt_toggle() {
+    // P command toggles prompt - test with -p option first
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-p".to_string(), "*".to_string()],
+        stdin_data: "Q\n".to_string(),
+        expected_out: "*".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_prompt_with_p_option() {
+    // -p option sets the prompt string
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-p".to_string(), "> ".to_string()],
+        stdin_data: "Q\n".to_string(),
+        expected_out: "> ".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}

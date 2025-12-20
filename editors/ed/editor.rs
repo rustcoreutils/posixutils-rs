@@ -41,6 +41,8 @@ pub struct Editor<R: BufRead, W: Write> {
     pub last_sub_replacement: Option<String>,
     /// Last substitute flags
     pub last_sub_flags: Option<String>,
+    /// Last shell command (for !! repetition)
+    last_shell_command: Option<String>,
     /// Lines being collected for input mode
     input_lines: Vec<String>,
     /// Whether we're in input mode
@@ -69,6 +71,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             last_sub_pattern: None,
             last_sub_replacement: None,
             last_sub_flags: None,
+            last_shell_command: None,
             input_lines: Vec::new(),
             in_input_mode: false,
             pending_command: None,
@@ -385,6 +388,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
             Command::HelpMode => {
                 self.help_mode = !self.help_mode;
+                // POSIX: If help mode is being turned on, also explain the previous '?' if any
+                if self.help_mode {
+                    if let Some(ref err) = self.last_error {
+                        writeln!(self.writer, "{}", err)?;
+                    }
+                }
                 Ok(())
             }
             Command::Join(addr1, addr2) => {
@@ -494,14 +503,69 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 Ok(())
             }
             Command::Shell(cmd) => {
+                // POSIX: Process special characters in shell command
+                let mut final_cmd = cmd.clone();
+                let mut modified = false;
+
+                // POSIX: If '!' appears as first character, replace with previous shell command
+                if final_cmd.starts_with('!') {
+                    if let Some(ref prev) = self.last_shell_command {
+                        final_cmd = format!("{}{}", prev, &final_cmd[1..]);
+                        modified = true;
+                    } else {
+                        return Err(EdError::Generic("no previous command".to_string()));
+                    }
+                }
+
+                // POSIX: Replace unescaped '%' with remembered pathname
+                if final_cmd.contains('%') {
+                    if self.buf.pathname.is_empty() {
+                        return Err(EdError::NoFilename);
+                    }
+                    let mut result = String::new();
+                    let mut chars = final_cmd.chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\\' {
+                            if let Some(&next) = chars.peek() {
+                                if next == '%' {
+                                    result.push('%');
+                                    chars.next();
+                                } else {
+                                    result.push('\\');
+                                }
+                            } else {
+                                result.push('\\');
+                            }
+                        } else if ch == '%' {
+                            result.push_str(&self.buf.pathname);
+                            modified = true;
+                        } else {
+                            result.push(ch);
+                        }
+                    }
+                    final_cmd = result;
+                }
+
+                // POSIX: If any replacements were performed, write modified line before execution
+                if modified {
+                    writeln!(self.writer, "{}", final_cmd)?;
+                }
+
+                // Save for !! repetition
+                self.last_shell_command = Some(final_cmd.clone());
+
                 // Execute shell command
                 let output = std::process::Command::new("sh")
                     .arg("-c")
-                    .arg(&cmd)
+                    .arg(&final_cmd)
                     .output()?;
                 self.writer.write_all(&output.stdout)?;
                 self.writer.write_all(&output.stderr)?;
-                writeln!(self.writer, "!")?;
+
+                // POSIX: Write "!" on completion unless -s option
+                if !self.silent {
+                    writeln!(self.writer, "!")?;
+                }
                 Ok(())
             }
             Command::Scroll(addr, count) => {

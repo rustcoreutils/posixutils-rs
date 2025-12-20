@@ -33,8 +33,26 @@ struct Args {
     file: Option<String>,
 }
 
+/// Set up signal handlers per POSIX requirements for ed.
+fn setup_signals() {
+    unsafe {
+        // SIGQUIT: Ignore (POSIX requirement)
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+
+        // Note: SIGINT and SIGHUP handling would require more complex
+        // integration with the editor loop. For now, we let the default
+        // behavior apply (SIGINT terminates, SIGHUP terminates).
+        // A full implementation would need to:
+        // - SIGINT: Set a flag, check in main loop, print "?" and continue
+        // - SIGHUP: Save buffer to ed.hup, then exit
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Set up signal handlers
+    setup_signals();
 
     let stdin = io::stdin();
     let stdout = io::stdout();

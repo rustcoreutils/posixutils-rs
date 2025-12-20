@@ -394,3 +394,220 @@ fn test_ed_multiple_offsets() {
     // 1+1+1 should be line 3
     ed_test("a\nline 1\nline 2\nline 3\n.\n1+1+1p\nQ\n", "line 3\n");
 }
+
+// ============================================================================
+// Phase 3: Comprehensive Line Operation Tests
+// ============================================================================
+
+// --- Delete Command Tests ---
+
+#[test]
+fn test_ed_delete_range() {
+    // Delete lines 2-3, current line becomes 2 (the old line 4)
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\n.\n2,3d\n.p\nQ\n",
+        "line 4\n",
+    );
+}
+
+#[test]
+fn test_ed_delete_at_end() {
+    // Delete at end, current line becomes new last line
+    ed_test("a\nline 1\nline 2\nline 3\n.\n3d\n.p\nQ\n", "line 2\n");
+}
+
+#[test]
+fn test_ed_delete_all() {
+    // Delete all lines, current line becomes 0
+    ed_test("a\nline 1\nline 2\n.\n1,2d\n=\nQ\n", "0\n");
+}
+
+// --- Change Command Tests ---
+
+#[test]
+fn test_ed_change_with_text() {
+    // Change line 2 with new text
+    ed_test(
+        "a\nline 1\nold line\nline 3\n.\n2c\nnew line\n.\n1,$p\nQ\n",
+        "line 1\nnew line\nline 3\n",
+    );
+}
+
+#[test]
+fn test_ed_change_no_text() {
+    // Change command with no text (effectively delete)
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n2c\n.\n1,$p\nQ\n",
+        "line 1\nline 3\n",
+    );
+}
+
+#[test]
+fn test_ed_change_range() {
+    // Change multiple lines
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\n.\n2,3c\nreplacement\n.\n1,$p\nQ\n",
+        "line 1\nreplacement\nline 4\n",
+    );
+}
+
+// --- Join Command Tests ---
+
+#[test]
+fn test_ed_join_single_address() {
+    // Join with single address should do nothing per POSIX
+    ed_test("a\nline 1\nline 2\n.\n1j\n1,$p\nQ\n", "line 1\nline 2\n");
+}
+
+#[test]
+fn test_ed_join_default_range() {
+    // Default range for j is .,.+1
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n1\nj\n1,$p\nQ\n",
+        "line 1\nline 1line 2\nline 3\n",
+    );
+}
+
+#[test]
+fn test_ed_join_multiple() {
+    // Join three lines
+    ed_test("a\nA\nB\nC\nD\n.\n1,3j\n1,$p\nQ\n", "ABC\nD\n");
+}
+
+// --- Move Command Tests ---
+
+#[test]
+fn test_ed_move_to_start() {
+    // Move line 3 to start (address 0)
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n3m0\n1,$p\nQ\n",
+        "line 3\nline 1\nline 2\n",
+    );
+}
+
+#[test]
+fn test_ed_move_to_end() {
+    // Move line 1 to end
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n1m$\n1,$p\nQ\n",
+        "line 2\nline 3\nline 1\n",
+    );
+}
+
+#[test]
+fn test_ed_move_range() {
+    // Move lines 1-2 to after line 3
+    ed_test("a\nA\nB\nC\nD\n.\n1,2m3\n1,$p\nQ\n", "C\nA\nB\nD\n");
+}
+
+// --- Copy Command Tests ---
+
+#[test]
+fn test_ed_copy_to_start() {
+    // Copy line 3 to start
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n3t0\n1,$p\nQ\n",
+        "line 3\nline 1\nline 2\nline 3\n",
+    );
+}
+
+#[test]
+fn test_ed_copy_range() {
+    // Copy lines 1-2 to after line 3
+    ed_test("a\nA\nB\nC\n.\n1,2t3\n1,$p\nQ\n", "A\nB\nC\nA\nB\n");
+}
+
+// --- Mark Command Tests ---
+
+#[test]
+fn test_ed_mark_and_address() {
+    // Set mark and use it in address
+    ed_test(
+        "a\nfirst\nsecond\nthird\n.\n2kb\n1\n'bp\nQ\n",
+        "first\nsecond\n",
+    );
+}
+
+#[test]
+fn test_ed_mark_in_range() {
+    // Use mark in a range
+    ed_test("a\nA\nB\nC\nD\nE\n.\n2ka\n4kb\n'a,'bp\nQ\n", "B\nC\nD\n");
+}
+
+// --- Number Command Tests ---
+
+#[test]
+fn test_ed_number_range() {
+    // Number command on range
+    ed_test(
+        "a\nfirst\nsecond\nthird\n.\n1,3n\nQ\n",
+        "     1\tfirst\n     2\tsecond\n     3\tthird\n",
+    );
+}
+
+// --- List Command Tests ---
+
+#[test]
+fn test_ed_list_tab() {
+    // List shows \t for tab
+    ed_test("a\nhello\tworld\n.\n1l\nQ\n", "hello\\tworld$\n");
+}
+
+#[test]
+fn test_ed_list_dollar() {
+    // List escapes $ in text
+    ed_test("a\nprice: $100\n.\n1l\nQ\n", "price: \\$100$\n");
+}
+
+#[test]
+fn test_ed_list_backslash() {
+    // List escapes backslash
+    ed_test("a\npath\\name\n.\n1l\nQ\n", "path\\\\name$\n");
+}
+
+// --- Line Number Command Tests ---
+
+#[test]
+fn test_ed_line_number_current_unchanged() {
+    // = command should not change current line
+    // Go to line 2, use .= to print line number of current line, then verify current line unchanged
+    ed_test(
+        "a\nfirst\nsecond\nthird\n.\n2\n.=\n.p\nQ\n",
+        "second\n2\nsecond\n",
+    );
+}
+
+#[test]
+fn test_ed_line_number_default() {
+    // Default address for = is $ (last line)
+    ed_test("a\nline 1\nline 2\nline 3\n.\n=\nQ\n", "3\n");
+}
+
+// --- Search Address Tests ---
+
+#[test]
+fn test_ed_search_forward_in_range() {
+    // Use forward search as address
+    ed_test(
+        "a\napple\nbanana\ncherry\napricot\n.\n/cherry/p\nQ\n",
+        "cherry\n",
+    );
+}
+
+#[test]
+fn test_ed_search_backward_in_range() {
+    // Use backward search as address
+    ed_test(
+        "a\napple\nbanana\ncherry\n.\n$\n?banana?p\nQ\n",
+        "cherry\nbanana\n",
+    );
+}
+
+#[test]
+fn test_ed_search_wrap_forward() {
+    // Forward search wraps around
+    ed_test(
+        "a\napple\nbanana\ncherry\n.\n3\n/apple/p\nQ\n",
+        "cherry\napple\n",
+    );
+}

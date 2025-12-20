@@ -544,14 +544,28 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                         writeln!(self.writer, "{:6}\t{}", i, content)?;
                     }
                     PrintMode::List => {
-                        // Show non-printable characters and end with $
+                        // POSIX: Show non-printable characters in unambiguous form
+                        // Escape sequences: \\, \a, \b, \f, \r, \t, \v
+                        // Non-printable: three-digit octal with backslash
+                        // $ within text: escaped with backslash
+                        // End of line: marked with $
                         let content = line.trim_end_matches('\n');
                         for ch in content.chars() {
                             match ch {
-                                '\t' => write!(self.writer, "\\t")?,
-                                '\x08' => write!(self.writer, "\\b")?,
                                 '\\' => write!(self.writer, "\\\\")?,
-                                c if c.is_control() => write!(self.writer, "\\x{:02x}", c as u8)?,
+                                '\x07' => write!(self.writer, "\\a")?, // bell
+                                '\x08' => write!(self.writer, "\\b")?, // backspace
+                                '\x0c' => write!(self.writer, "\\f")?, // form feed
+                                '\r' => write!(self.writer, "\\r")?,   // carriage return
+                                '\t' => write!(self.writer, "\\t")?,   // tab
+                                '\x0b' => write!(self.writer, "\\v")?, // vertical tab
+                                '$' => write!(self.writer, "\\$")?,    // escape $ in text
+                                c if c.is_control() || !c.is_ascii() => {
+                                    // Non-printable as three-digit octal per byte
+                                    for byte in c.to_string().as_bytes() {
+                                        write!(self.writer, "\\{:03o}", byte)?;
+                                    }
+                                }
                                 c => write!(self.writer, "{}", c)?,
                             }
                         }

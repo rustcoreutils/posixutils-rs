@@ -388,13 +388,19 @@ impl Buffer {
         }
 
         if new_lines.is_empty() {
-            self.cur_line = if start > 1 {
-                start - 1
-            } else if !self.lines.is_empty() {
-                1
+            // POSIX: if no lines input, current line is:
+            // - the line after the last deleted (now at position start-1)
+            // - if deleted at end, the new last line
+            // - if buffer empty, 0
+            if self.lines.is_empty() {
+                self.cur_line = 0;
+            } else if start <= self.lines.len() {
+                // Line after deleted is at position start
+                self.cur_line = start;
             } else {
-                0
-            };
+                // Deleted at end, current is new last line
+                self.cur_line = self.lines.len();
+            }
         } else {
             self.cur_line = start - 1 + new_lines.len();
         }

@@ -22,9 +22,9 @@ use num_traits::ToPrimitive;
 #[derive(Parser)]
 #[command(version, about = gettext("lp - send files to a printer"))]
 struct Args {
-    /// Exit only after file access is no longer required (copy mode)
+    /// Exit only after file access is no longer required (effectively always-on)
     #[arg(short = 'c')]
-    copy: bool,
+    _copy: bool,
 
     /// Printer destination (IPP URI, e.g., ipp://host:631/ipp/print)
     #[arg(short = 'd')]
@@ -34,17 +34,17 @@ struct Args {
     #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
     copies: u32,
 
-    /// Send mail after printing (not implemented)
+    /// Send mail after printing (stub: accepted but not implemented)
     #[arg(short = 'm')]
-    mail: bool,
+    _mail: bool,
 
     /// Suppress messages (no request ID output)
     #[arg(short = 's')]
     silent: bool,
 
-    /// Write to terminal after printing (not implemented)
+    /// Write to terminal after printing (stub: accepted but not implemented)
     #[arg(short = 'w')]
-    write: bool,
+    _write: bool,
 
     /// Printer-dependent options (can be specified multiple times)
     #[arg(short = 'o', action = clap::ArgAction::Append)]
@@ -92,24 +92,15 @@ fn validate_uri(dest: &str) -> Result<Uri, String> {
         .map_err(|_| gettext("invalid destination URI"))
 }
 
-/// Read input data from a file or stdin
-fn read_input(path: &PathBuf, copy_mode: bool) -> Result<Vec<u8>, io::Error> {
+/// Read input data from a file or stdin.
+/// Note: Copy mode (-c) is effectively always-on since IPP requires full data upload.
+fn read_input(path: &PathBuf) -> Result<Vec<u8>, io::Error> {
     let path_str = path.to_string_lossy();
     if path_str == "-" {
-        // Read from stdin
         let mut data = Vec::new();
         io::stdin().read_to_end(&mut data)?;
         Ok(data)
-    } else if copy_mode {
-        // Copy mode: read entire file into memory
-        let mut file = File::open(path)?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        Ok(data)
     } else {
-        // Non-copy mode: still read the file, but we could potentially
-        // stream it. For simplicity, we'll read it all since IPP needs
-        // the data to be available for the request.
         let mut file = File::open(path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
@@ -209,14 +200,6 @@ fn send_print_job(
 }
 
 fn do_lp(args: Args) -> Result<(), String> {
-    // Check for unsupported options first
-    if args.mail {
-        return Err(gettext("-m option not supported"));
-    }
-    if args.write {
-        return Err(gettext("-w option not supported"));
-    }
-
     // Get and validate destination
     let dest = get_destination(&args)?;
     let uri = validate_uri(&dest)?;
@@ -237,7 +220,7 @@ fn do_lp(args: Args) -> Result<(), String> {
         };
 
         // Read input data
-        let data = read_input(file, args.copy)
+        let data = read_input(file)
             .map_err(|e| format!("{} '{}': {}", gettext("cannot open"), file.display(), e))?;
 
         // Send print job

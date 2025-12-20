@@ -51,10 +51,10 @@ fn lp_invalid_uri_error() {
     );
 }
 
-/// Test that -m option returns error
+/// Test that -m option is accepted (stub implementation)
 #[test]
-fn lp_m_option_error() {
-    run_test_with_env(
+fn lp_m_option_accepted() {
+    run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("lp"),
             args: vec![
@@ -64,17 +64,31 @@ fn lp_m_option_error() {
             ],
             stdin_data: String::from("test data"),
             expected_out: String::from(""),
-            expected_err: String::from("lp: -m option not supported\n"),
+            expected_err: String::from(""),
             expected_exit_code: 1,
         },
         &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // -m should be accepted; any failure should be printer error, not option error
+            assert!(
+                !stderr.contains("-m option not supported"),
+                "Expected -m to be accepted, but got: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("printer error"),
+                "Expected printer error (no printer available), got: {}",
+                stderr
+            );
+        },
     );
 }
 
-/// Test that -w option returns error
+/// Test that -w option is accepted (stub implementation)
 #[test]
-fn lp_w_option_error() {
-    run_test_with_env(
+fn lp_w_option_accepted() {
+    run_test_with_checker_and_env(
         TestPlan {
             cmd: String::from("lp"),
             args: vec![
@@ -84,10 +98,24 @@ fn lp_w_option_error() {
             ],
             stdin_data: String::from("test data"),
             expected_out: String::from(""),
-            expected_err: String::from("lp: -w option not supported\n"),
+            expected_err: String::from(""),
             expected_exit_code: 1,
         },
         &[("LPDEST", ""), ("PRINTER", "")],
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // -w should be accepted; any failure should be printer error, not option error
+            assert!(
+                !stderr.contains("-w option not supported"),
+                "Expected -w to be accepted, but got: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("printer error"),
+                "Expected printer error (no printer available), got: {}",
+                stderr
+            );
+        },
     );
 }
 

@@ -108,16 +108,19 @@ fn du_impl(args: &Args, filename: &str) -> bool {
             };
 
             let mut stack = stack.borrow_mut();
-            if let Some(back) = stack.back_mut() {
-                back.total_blocks += size;
-            }
 
             // Check if this is the original file operand (root of traversal)
             let is_root = entry.path().as_inner() == path;
 
             if is_dir {
+                // For directories, push onto stack. Don't add to parent here -
+                // the directory's total will be added when we exit the directory.
                 stack.push_back(Node { total_blocks: size });
             } else {
+                // For files, add size to parent directory's total
+                if let Some(back) = stack.back_mut() {
+                    back.total_blocks += size;
+                }
                 // For non-directories:
                 // - Always print if it's the original file operand (POSIX BSD behavior)
                 // - Print if -a is specified

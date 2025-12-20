@@ -320,7 +320,7 @@ fn test_du_symlink_l() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         // The link should report target file's size
         for line in stdout.lines() {
-            if line.contains("link") {
+            if line.ends_with("/link") {
                 let reported_size: u64 = line.split('\t').next().unwrap().trim().parse().unwrap();
                 assert_eq!(
                     reported_size, target_size,
@@ -334,7 +334,7 @@ fn test_du_symlink_l() {
     du_test_with_checker(&["-a", subdir], |_, output| {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         for line in stdout.lines() {
-            if line.contains("link") {
+            if line.ends_with("/link") {
                 let reported_size: u64 = line.split('\t').next().unwrap().trim().parse().unwrap();
                 assert_eq!(
                     reported_size, link_size,

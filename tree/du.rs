@@ -76,7 +76,9 @@ fn du_impl(args: &Args, filename: &str) -> bool {
                 return Ok(false);
             }
 
-            let md = entry.metadata().unwrap();
+            let md = entry
+                .metadata()
+                .expect("ftw::traverse_directory yielded an entry without metadata");
 
             // -x: skip files on different filesystems
             if args.one_fs {
@@ -125,7 +127,7 @@ fn du_impl(args: &Args, filename: &str) -> bool {
                 // - Always print if it's the original file operand (POSIX BSD behavior)
                 // - Print if -a is specified
                 // - Don't print with -s (handled separately)
-                let display_size = calc_size(args.kilo, md.blocks());
+                let display_size = size;
                 if is_root {
                     // File operands are always listed
                     println!("{}\t{}", display_size, entry.path());

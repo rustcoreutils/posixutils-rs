@@ -28,6 +28,7 @@ diff	text/diff.rs
 dirname	pathnames/dirname.rs
 du	tree/du.rs
 echo	display/echo.rs
+ed	editors/ed_main.rs
 env	process/env.rs
 ex	editors/ex_main.rs
 expand	text/expand.rs

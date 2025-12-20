@@ -6,15 +6,14 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - implement -H, -L, -x
-//
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::{fs, io};
+use std::{
+    cell::RefCell,
+    collections::{HashSet, LinkedList},
+    os::unix::fs::MetadataExt,
+};
 
 /// du - estimate file space usage
 #[derive(Parser)]
@@ -56,50 +55,125 @@ fn calc_size(kilo: bool, size: u64) -> u64 {
     }
 }
 
-fn print_pathinfo(args: &Args, filename: &str, size: u64, toplevel: bool) {
-    if args.sum && !toplevel {
-        return;
-    }
-
-    // print the file size
-    println!("{}\t{}", size, filename);
+struct Node {
+    total_blocks: u64,
 }
 
-fn du_cli_arg(
-    args: &Args,
-    filename: &str,
-    total: &mut u64,
-    toplevel: bool,
-) -> Result<(), io::Error> {
-    let path = Path::new(filename);
-    let metadata = fs::metadata(path)?;
+fn du_impl(args: &Args, filename: &str) -> bool {
+    let terminate = RefCell::new(false);
+    let stack: RefCell<LinkedList<Node>> = RefCell::new(LinkedList::new());
+    // Track seen (dev, ino) pairs for hard link deduplication
+    let seen: RefCell<HashSet<(u64, u64)>> = RefCell::new(HashSet::new());
+    // Track initial device for -x option
+    let initial_dev: RefCell<Option<u64>> = RefCell::new(None);
 
-    // recursively process directories
-    if metadata.is_dir() {
-        let mut sub_total = 0;
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            let filename = path.to_str().unwrap();
-            if let Err(e) = du_cli_arg(args, filename, &mut sub_total, false) {
-                eprintln!("{}: {}", filename, e);
+    let path = std::path::Path::new(filename);
+
+    ftw::traverse_directory(
+        path,
+        |entry| {
+            if *terminate.borrow() {
+                return Ok(false);
             }
-        }
-        print_pathinfo(args, filename, sub_total, toplevel);
 
-        *total += sub_total;
-        return Ok(());
-    }
+            let md = entry
+                .metadata()
+                .expect("ftw::traverse_directory yielded an entry without metadata");
 
-    // print the file size
-    let size = calc_size(args.kilo, metadata.blocks());
-    *total += size;
+            // -x: skip files on different filesystems
+            if args.one_fs {
+                let dev = md.dev();
+                let mut init_dev = initial_dev.borrow_mut();
+                if init_dev.is_none() {
+                    *init_dev = Some(dev);
+                } else if Some(dev) != *init_dev {
+                    // Different filesystem, skip this entry
+                    return Ok(false);
+                }
+            }
 
-    if args.all {
-        print_pathinfo(args, filename, size, toplevel);
-    }
+            let is_dir = md.is_dir();
 
-    Ok(())
+            // Handle hard link deduplication: files with nlink > 1 should only be counted once
+            let size = if !is_dir && md.nlink() > 1 {
+                let key = (md.dev(), md.ino());
+                let mut seen_set = seen.borrow_mut();
+                if seen_set.contains(&key) {
+                    // Already counted this file, use size 0
+                    0
+                } else {
+                    seen_set.insert(key);
+                    calc_size(args.kilo, md.blocks())
+                }
+            } else {
+                calc_size(args.kilo, md.blocks())
+            };
+
+            let mut stack = stack.borrow_mut();
+
+            // Check if this is the original file operand (root of traversal)
+            let is_root = entry.path().as_inner() == path;
+
+            if is_dir {
+                // For directories, push onto stack. Don't add to parent here -
+                // the directory's total will be added when we exit the directory.
+                stack.push_back(Node { total_blocks: size });
+            } else {
+                // For files, add size to parent directory's total
+                if let Some(back) = stack.back_mut() {
+                    back.total_blocks += size;
+                }
+                // For non-directories:
+                // - Always print if it's the original file operand (POSIX BSD behavior)
+                // - Print if -a is specified
+                // - Don't print with -s (handled separately)
+                let display_size = size;
+                if is_root {
+                    // File operands are always listed
+                    println!("{}\t{}", display_size, entry.path());
+                } else if args.all && !args.sum {
+                    // -a: report all files within directories
+                    println!("{}\t{}", display_size, entry.path());
+                }
+            }
+
+            Ok(is_dir)
+        },
+        |entry| {
+            let mut stack = stack.borrow_mut();
+            if let Some(node) = stack.pop_back() {
+                let size = node.total_blocks;
+
+                // Recursively sum the block size
+                if let Some(back) = stack.back_mut() {
+                    back.total_blocks += size;
+                }
+
+                if args.sum {
+                    // -s: report only the total sum for the file operand
+                    let entry_path = entry.path();
+                    if entry_path.as_inner() == path {
+                        println!("{}\t{}", size, entry_path);
+                    }
+                } else {
+                    println!("{}\t{}", size, entry.path());
+                }
+            }
+            Ok(())
+        },
+        |_entry, error| {
+            *terminate.borrow_mut() = true;
+            eprintln!("du: {}", error.inner());
+        },
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args: args.follow_cli,
+            follow_symlinks: args.dereference,
+            ..Default::default()
+        },
+    );
+
+    let failed = *terminate.borrow();
+    !failed
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -114,13 +188,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(".".to_string());
     }
     let mut exit_code = 0;
-    let mut total = 0;
 
     // apply the group to each file
     for filename in &args.files {
-        if let Err(e) = du_cli_arg(&args, filename, &mut total, true) {
+        if !du_impl(&args, filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
         }
     }
 

@@ -40,6 +40,9 @@ pub struct Buffer {
     marks: HashMap<char, usize>,
     /// Single-level undo (POSIX requirement)
     undo_record: Option<UndoRecord>,
+    /// Flag to suppress individual undo saves during global commands.
+    /// When true, buffer operations don't save undo records.
+    in_global: bool,
 }
 
 impl Buffer {
@@ -52,6 +55,7 @@ impl Buffer {
             modified: false,
             marks: HashMap::new(),
             undo_record: None,
+            in_global: false,
         }
     }
 
@@ -84,12 +88,32 @@ impl Buffer {
     }
 
     /// Save the current state for undo.
+    /// When in_global is true, individual operations don't save undo
+    /// (the global command saves once for the entire operation).
     fn save_undo(&mut self) {
+        if self.in_global {
+            return; // Skip - global command already saved undo
+        }
         self.undo_record = Some(UndoRecord {
             lines: self.lines.clone(),
             cur_line: self.cur_line,
             modified: self.modified,
         });
+    }
+
+    /// Begin a global command. Saves undo once and suppresses individual saves.
+    pub fn begin_global(&mut self) {
+        self.undo_record = Some(UndoRecord {
+            lines: self.lines.clone(),
+            cur_line: self.cur_line,
+            modified: self.modified,
+        });
+        self.in_global = true;
+    }
+
+    /// End a global command. Re-enables individual undo saves.
+    pub fn end_global(&mut self) {
+        self.in_global = false;
     }
 
     /// Undo the last change. Returns true if undo was performed.
@@ -149,20 +173,19 @@ impl Buffer {
         self.save_undo();
         self.lines.drain(start - 1..end);
 
-        // Update current line
+        // POSIX: "The address of the line after the last line deleted shall
+        // become the current line number; if the lines deleted were originally
+        // at the end of the buffer, the current line number shall be set to
+        // the address of the new last line; if no lines remain in the buffer,
+        // the current line number shall be set to zero."
         if self.lines.is_empty() {
             self.cur_line = 0;
-        } else if self.cur_line > self.lines.len() {
+        } else if start <= self.lines.len() {
+            // Line after deleted exists at position 'start'
+            self.cur_line = start;
+        } else {
+            // Deleted at end, current is new last line
             self.cur_line = self.lines.len();
-        } else if self.cur_line >= start {
-            self.cur_line = if start > self.lines.len() {
-                self.lines.len()
-            } else {
-                start
-            };
-            if self.cur_line > self.lines.len() {
-                self.cur_line = self.lines.len();
-            }
         }
 
         self.modified = true;

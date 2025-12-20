@@ -105,22 +105,36 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Resolve an address to a line number.
-    fn resolve_address(&self, addr: &Address) -> EdResult<usize> {
+    fn resolve_address(&mut self, addr: &Address) -> EdResult<usize> {
         self.resolve_address_with_base(addr, self.buf.cur_line)
     }
 
     /// Resolve an address to a line number, using a specific base for current line.
     /// This is needed for semicolon separator semantics where the second address
     /// should be resolved relative to the first address.
-    fn resolve_address_with_base(&self, addr: &Address, base_line: usize) -> EdResult<usize> {
+    fn resolve_address_with_base(&mut self, addr: &Address, base_line: usize) -> EdResult<usize> {
         let mut line = match &addr.info {
             AddressInfo::Null => base_line,
             AddressInfo::Current => base_line,
             AddressInfo::Last => self.buf.last_line(),
             AddressInfo::Line(n) => *n,
             AddressInfo::Mark(c) => self.buf.get_mark(*c).ok_or(EdError::InvalidAddress)?,
-            AddressInfo::RegexForward(pat) => self.search_forward_from(pat, base_line)?,
-            AddressInfo::RegexBack(pat) => self.search_backward_from(pat, base_line)?,
+            AddressInfo::RegexForward(pat) => {
+                let result = self.search_forward_from(pat, base_line)?;
+                // POSIX: Save pattern for subsequent null RE references
+                if !pat.is_empty() {
+                    self.last_pattern = Some(pat.clone());
+                }
+                result
+            }
+            AddressInfo::RegexBack(pat) => {
+                let result = self.search_backward_from(pat, base_line)?;
+                // POSIX: Save pattern for subsequent null RE references
+                if !pat.is_empty() {
+                    self.last_pattern = Some(pat.clone());
+                }
+                result
+            }
             AddressInfo::Offset(off) => {
                 let new_line = base_line as isize + off;
                 if new_line < 0 {
@@ -150,7 +164,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// Resolve an address range, handling semicolon separator semantics.
     /// When addr2.relative_to_first is true (semicolon separator), addr2 is
     /// resolved using addr1's value as the current line.
-    fn resolve_range(&self, addr1: &Address, addr2: &Address) -> EdResult<(usize, usize)> {
+    fn resolve_range(&mut self, addr1: &Address, addr2: &Address) -> EdResult<(usize, usize)> {
         let start = self.resolve_address(addr1)?;
         let end = if addr2.relative_to_first {
             // Semicolon separator: resolve second address relative to first
@@ -579,6 +593,54 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok(())
     }
 
+    /// Convert POSIX ed replacement string to regex crate format.
+    /// POSIX: & -> matched string, \1-\9 -> back-references, \& -> literal &
+    /// Regex crate: $0 -> matched string, $1-$9 -> back-references, $$ -> literal $
+    fn convert_replacement(&self, repl: &str) -> String {
+        let mut result = String::new();
+        let mut chars = repl.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(&next) = chars.peek() {
+                        match next {
+                            '&' => {
+                                result.push('&');
+                                chars.next();
+                            }
+                            '1'..='9' => {
+                                result.push('$');
+                                result.push(chars.next().unwrap());
+                            }
+                            '\\' => {
+                                result.push('\\');
+                                chars.next();
+                            }
+                            _ => {
+                                result.push('\\');
+                            }
+                        }
+                    } else {
+                        result.push('\\');
+                    }
+                }
+                '&' => {
+                    result.push_str("$0");
+                }
+                '$' => {
+                    // Escape $ for regex crate
+                    result.push_str("$$");
+                }
+                _ => {
+                    result.push(ch);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Execute a substitute command.
     fn execute_substitute(
         &mut self,
@@ -600,11 +662,24 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             pattern.to_string()
         };
 
+        // Handle % as sole replacement character (use previous replacement)
+        let repl = if replacement == "%" {
+            self.last_sub_replacement
+                .as_ref()
+                .ok_or(EdError::Generic("no previous substitution".to_string()))?
+                .clone()
+        } else {
+            replacement.to_string()
+        };
+
         // Save for repeat
         self.last_sub_pattern = Some(pat.clone());
-        self.last_sub_replacement = Some(replacement.to_string());
+        self.last_sub_replacement = Some(repl.clone());
         self.last_sub_flags = Some(flags.to_string());
         self.last_pattern = Some(pat.clone());
+
+        // Convert POSIX replacement to regex crate format
+        let regex_repl = self.convert_replacement(&repl);
 
         let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
 
@@ -624,27 +699,25 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let mut any_match = false;
         let mut last_matched_line = start;
 
-        // Save undo state before any changes
-        if start <= end && start > 0 {
-            // We need to save undo state - but buffer methods do this internally
-        }
-
         for i in start..=end {
             if let Some(line) = self.buf.get_line(i) {
                 let line_content = line.clone();
                 let new_line = if global {
-                    re.replace_all(&line_content, replacement).to_string()
+                    re.replace_all(&line_content, regex_repl.as_str())
+                        .to_string()
                 } else if let Some(n) = count {
                     // Replace nth occurrence
                     let mut result = line_content.clone();
                     if let Some(m) = re.find_iter(&line_content).nth(n - 1) {
                         let before = &line_content[..m.start()];
                         let after = &line_content[m.end()..];
-                        result = format!("{}{}{}", before, replacement, after);
+                        // For nth occurrence, we need to expand the replacement manually
+                        let expanded = re.replace(m.as_str(), regex_repl.as_str());
+                        result = format!("{}{}{}", before, expanded, after);
                     }
                     result
                 } else {
-                    re.replace(&line_content, replacement).to_string()
+                    re.replace(&line_content, regex_repl.as_str()).to_string()
                 };
 
                 if new_line != line_content {
@@ -669,31 +742,33 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         // Print if requested
         if print || numbered || list {
-            let mode = if numbered {
-                PrintMode::Numbered
-            } else if list {
-                PrintMode::List
-            } else {
-                PrintMode::Normal
-            };
             if let Some(line) = self.buf.get_line(last_matched_line) {
-                match mode {
-                    PrintMode::Normal => write!(self.writer, "{}", line)?,
-                    PrintMode::Numbered => {
-                        let content = line.trim_end_matches('\n');
-                        writeln!(self.writer, "{:6}\t{}", last_matched_line, content)?;
-                    }
-                    PrintMode::List => {
-                        let content = line.trim_end_matches('\n');
-                        for ch in content.chars() {
-                            match ch {
-                                '\t' => write!(self.writer, "\\t")?,
-                                c if c.is_control() => write!(self.writer, "\\x{:02x}", c as u8)?,
-                                c => write!(self.writer, "{}", c)?,
+                let content = line.trim_end_matches('\n');
+                if numbered {
+                    writeln!(self.writer, "{:6}\t{}", last_matched_line, content)?;
+                } else if list {
+                    // Use POSIX-compliant list format
+                    for ch in content.chars() {
+                        match ch {
+                            '\\' => write!(self.writer, "\\\\")?,
+                            '\x07' => write!(self.writer, "\\a")?,
+                            '\x08' => write!(self.writer, "\\b")?,
+                            '\x0c' => write!(self.writer, "\\f")?,
+                            '\r' => write!(self.writer, "\\r")?,
+                            '\t' => write!(self.writer, "\\t")?,
+                            '\x0b' => write!(self.writer, "\\v")?,
+                            '$' => write!(self.writer, "\\$")?,
+                            c if c.is_control() || !c.is_ascii() => {
+                                for byte in c.to_string().as_bytes() {
+                                    write!(self.writer, "\\{:03o}", byte)?;
+                                }
                             }
+                            c => write!(self.writer, "{}", c)?,
                         }
-                        writeln!(self.writer, "$")?;
                     }
+                    writeln!(self.writer, "$")?;
+                } else {
+                    write!(self.writer, "{}", line)?;
                 }
             }
         }
@@ -726,7 +801,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
 
-        // Collect matching lines first
+        // Collect matching lines first (POSIX: mark every line that matches)
         let mut matching_lines = Vec::new();
         for i in start..=end {
             if let Some(line) = self.buf.get_line(i) {
@@ -737,6 +812,18 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
         }
 
+        // POSIX: If there were no matching lines, the current line number shall not be changed
+        if matching_lines.is_empty() {
+            return Ok(());
+        }
+
+        // POSIX: Save one undo record for the entire global operation
+        self.buf.begin_global();
+
+        // Track the current line set by the last successfully executed command
+        let original_cur_line = self.buf.cur_line;
+        let mut last_successful_line = original_cur_line;
+
         // For delete commands, process in reverse order to avoid line number shifts
         let is_delete = commands.trim() == "d";
         if is_delete {
@@ -745,33 +832,86 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         // Execute commands on each matching line
         for line_num in matching_lines {
-            // Set current line - for delete commands, line_num is still valid
-            // because we're processing in reverse order
-            if self.buf.set_cur_line(line_num).is_err() {
+            // Adjust line_num for lines that may have been deleted
+            // For non-delete commands, we need to track line number changes
+            let adjusted_line = if is_delete {
+                line_num
+            } else {
+                // For other commands, check if line still exists
+                if line_num > self.buf.line_count() {
+                    continue;
+                }
+                line_num
+            };
+
+            // Set current line
+            if self.buf.set_cur_line(adjusted_line).is_err() {
                 continue; // Line may have been deleted
             }
 
             // Parse and execute the command
-            // For simplicity, we just handle 'p' and 'd' for now
             match commands.trim() {
                 "p" => {
                     if let Some(line) = self.buf.get_line(self.buf.cur_line) {
                         write!(self.writer, "{}", line)?;
                     }
+                    last_successful_line = self.buf.cur_line;
                 }
                 "d" => {
                     let cur = self.buf.cur_line;
-                    self.buf.delete(cur, cur)?;
+                    if self.buf.delete(cur, cur).is_ok() {
+                        last_successful_line = self.buf.cur_line;
+                    }
+                }
+                "n" => {
+                    if let Some(line) = self.buf.get_line(self.buf.cur_line) {
+                        let content = line.trim_end_matches('\n');
+                        writeln!(self.writer, "{:6}\t{}", self.buf.cur_line, content)?;
+                    }
+                    last_successful_line = self.buf.cur_line;
+                }
+                "l" => {
+                    if let Some(line) = self.buf.get_line(self.buf.cur_line) {
+                        let content = line.trim_end_matches('\n');
+                        for ch in content.chars() {
+                            match ch {
+                                '\\' => write!(self.writer, "\\\\")?,
+                                '\x07' => write!(self.writer, "\\a")?,
+                                '\x08' => write!(self.writer, "\\b")?,
+                                '\x0c' => write!(self.writer, "\\f")?,
+                                '\r' => write!(self.writer, "\\r")?,
+                                '\t' => write!(self.writer, "\\t")?,
+                                '\x0b' => write!(self.writer, "\\v")?,
+                                '$' => write!(self.writer, "\\$")?,
+                                c if c.is_control() || !c.is_ascii() => {
+                                    for byte in c.to_string().as_bytes() {
+                                        write!(self.writer, "\\{:03o}", byte)?;
+                                    }
+                                }
+                                c => write!(self.writer, "{}", c)?,
+                            }
+                        }
+                        writeln!(self.writer, "$")?;
+                    }
+                    last_successful_line = self.buf.cur_line;
                 }
                 cmd if !cmd.is_empty() => {
                     // Try to parse and execute other commands
                     if let Ok(parsed_cmd) = parse(cmd) {
-                        let _ = self.execute_command(parsed_cmd);
+                        if self.execute_command(parsed_cmd).is_ok() {
+                            last_successful_line = self.buf.cur_line;
+                        }
                     }
                 }
                 _ => {}
             }
         }
+
+        // End global command (re-enable individual undo saves)
+        self.buf.end_global();
+
+        // POSIX: When g command completes, current line is value assigned by last command
+        let _ = self.buf.set_cur_line(last_successful_line);
 
         Ok(())
     }

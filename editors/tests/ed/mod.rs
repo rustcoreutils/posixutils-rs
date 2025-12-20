@@ -611,3 +611,324 @@ fn test_ed_search_wrap_forward() {
         "cherry\napple\n",
     );
 }
+
+// ============================================================================
+// Phase 4: Substitute Command Tests
+// ============================================================================
+
+#[test]
+fn test_ed_substitute_ampersand() {
+    // & in replacement is replaced by matched string
+    ed_test(
+        "a\nhello world\n.\n1s/world/& &/\n1p\nQ\n",
+        "hello world world\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_escaped_ampersand() {
+    // \& in replacement is literal &
+    ed_test("a\nhello world\n.\n1s/world/\\&/\n1p\nQ\n", "hello &\n");
+}
+
+#[test]
+fn test_ed_substitute_percent_repeat() {
+    // % as sole replacement uses previous replacement
+    ed_test(
+        "a\nfoo bar\nfoo baz\n.\n1s/foo/XXX/\n2s/foo/%/\n1,$p\nQ\n",
+        "XXX bar\nXXX baz\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_nth_occurrence() {
+    // Replace nth occurrence with count flag
+    ed_test(
+        "a\naaa bbb aaa ccc aaa\n.\n1s/aaa/XXX/2\n1p\nQ\n",
+        "aaa bbb XXX ccc aaa\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_with_print() {
+    // s command with p flag prints result
+    ed_test(
+        "a\nhello world\n.\n1s/world/everyone/p\nQ\n",
+        "hello everyone\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_with_number() {
+    // s command with n flag prints with line number
+    ed_test(
+        "a\nhello world\n.\n1s/world/everyone/n\nQ\n",
+        "     1\thello everyone\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_global_on_line() {
+    // s command with g flag replaces all occurrences on line
+    ed_test(
+        "a\naaa bbb aaa ccc aaa\n.\n1s/aaa/X/g\n1p\nQ\n",
+        "X bbb X ccc X\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_range() {
+    // Substitute on multiple lines
+    ed_test(
+        "a\nfoo one\nbar two\nfoo three\n.\n1,3s/foo/baz/\n1,$p\nQ\n",
+        "baz one\nbar two\nbaz three\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_repeat_pattern() {
+    // Empty pattern uses previous pattern
+    ed_test(
+        "a\nhello world\nhello there\n.\n1s/hello/hi/\n2s//hi/\n1,$p\nQ\n",
+        "hi world\nhi there\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_different_delimiter() {
+    // Can use different delimiter character
+    ed_test("a\npath/to/file\n.\n1s#path#dir#\n1p\nQ\n", "dir/to/file\n");
+}
+
+// ============================================================================
+// Phase 4: Undo Command Tests
+// ============================================================================
+
+#[test]
+fn test_ed_undo_substitute() {
+    // Undo a substitute command
+    ed_test(
+        "a\nhello world\n.\n1s/world/everyone/\nu\n1p\nQ\n",
+        "hello world\n",
+    );
+}
+
+#[test]
+fn test_ed_undo_delete() {
+    // Undo a delete command
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n2d\nu\n1,$p\nQ\n",
+        "line 1\nline 2\nline 3\n",
+    );
+}
+
+#[test]
+fn test_ed_undo_append() {
+    // Undo an append command
+    ed_test("a\nline 1\n.\na\nline 2\n.\nu\n1,$p\nQ\n", "line 1\n");
+}
+
+#[test]
+fn test_ed_undo_insert() {
+    // Undo an insert command
+    ed_test("a\nline 2\n.\n1i\nline 1\n.\nu\n1,$p\nQ\n", "line 2\n");
+}
+
+#[test]
+fn test_ed_undo_change() {
+    // Undo a change command
+    ed_test(
+        "a\noriginal\n.\n1c\nreplacement\n.\nu\n1p\nQ\n",
+        "original\n",
+    );
+}
+
+#[test]
+fn test_ed_undo_join() {
+    // Undo a join command
+    ed_test(
+        "a\nline 1\nline 2\n.\n1,2j\nu\n1,$p\nQ\n",
+        "line 1\nline 2\n",
+    );
+}
+
+#[test]
+fn test_ed_undo_move() {
+    // Undo a move command
+    ed_test("a\nA\nB\nC\n.\n1m2\nu\n1,$p\nQ\n", "A\nB\nC\n");
+}
+
+#[test]
+fn test_ed_undo_copy() {
+    // Undo a copy command
+    ed_test("a\nA\nB\n.\n1t2\nu\n1,$p\nQ\n", "A\nB\n");
+}
+
+#[test]
+fn test_ed_undo_redo() {
+    // Undo then redo (undo of undo)
+    ed_test("a\nhello\n.\n1s/hello/goodbye/\nu\nu\n1p\nQ\n", "goodbye\n");
+}
+
+#[test]
+fn test_ed_undo_restores_current_line() {
+    // Undo should restore current line position
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n1\n3d\n.=\nu\n.=\nQ\n",
+        "line 1\n2\n1\n",
+    );
+}
+
+// ============================================================================
+// Phase 5: Comprehensive Global Command Tests
+// ============================================================================
+
+#[test]
+fn test_ed_global_print_all_matches() {
+    // g/pattern/p should print all matching lines
+    ed_test(
+        "a\nfoo one\nbar two\nfoo three\nbar four\nfoo five\n.\ng/foo/p\nQ\n",
+        "foo one\nfoo three\nfoo five\n",
+    );
+}
+
+#[test]
+fn test_ed_global_delete_all_matches() {
+    // g/pattern/d should delete all matching lines
+    ed_test(
+        "a\nkeep 1\nremove this\nkeep 2\nremove that\nkeep 3\n.\ng/remove/d\n1,$p\nQ\n",
+        "keep 1\nkeep 2\nkeep 3\n",
+    );
+}
+
+#[test]
+fn test_ed_global_number_matches() {
+    // g/pattern/n should print matching lines with numbers
+    ed_test(
+        "a\nfoo\nbar\nfoo\n.\ng/foo/n\nQ\n",
+        "     1\tfoo\n     3\tfoo\n",
+    );
+}
+
+#[test]
+fn test_ed_global_substitute() {
+    // g/pattern/s should substitute on matching lines
+    ed_test(
+        "a\nfoo one\nbar two\nfoo three\n.\ng/foo/s/foo/baz/\n1,$p\nQ\n",
+        "baz one\nbar two\nbaz three\n",
+    );
+}
+
+#[test]
+fn test_ed_global_invert_print() {
+    // v/pattern/p should print non-matching lines
+    ed_test(
+        "a\napple\nbanana\napricot\ncherry\n.\nv/^a/p\nQ\n",
+        "banana\ncherry\n",
+    );
+}
+
+#[test]
+fn test_ed_global_invert_delete() {
+    // v/pattern/d should delete non-matching lines
+    ed_test(
+        "a\napple\nbanana\napricot\ncherry\n.\nv/^a/d\n1,$p\nQ\n",
+        "apple\napricot\n",
+    );
+}
+
+#[test]
+fn test_ed_global_undo_entire_operation() {
+    // Undo should restore buffer to state before g command
+    ed_test(
+        "a\nfoo 1\nbar 2\nfoo 3\nbar 4\n.\ng/foo/d\nu\n1,$p\nQ\n",
+        "foo 1\nbar 2\nfoo 3\nbar 4\n",
+    );
+}
+
+#[test]
+fn test_ed_global_empty_command_defaults_to_print() {
+    // g/pattern/ with no command should default to print
+    ed_test(
+        "a\napple\nbanana\napricot\n.\ng/^a/\nQ\n",
+        "apple\napricot\n",
+    );
+}
+
+#[test]
+fn test_ed_global_with_range() {
+    // Global command with address range
+    ed_test(
+        "a\napple 1\nbanana 2\napple 3\nbanana 4\napple 5\n.\n2,4g/apple/p\nQ\n",
+        "apple 3\n",
+    );
+}
+
+#[test]
+fn test_ed_global_no_match_unchanged() {
+    // If no lines match, current line should not change
+    ed_test(
+        "a\napple\nbanana\ncherry\n.\n2\ng/xyz/p\n.p\nQ\n",
+        "banana\nbanana\n",
+    );
+}
+
+#[test]
+fn test_ed_global_current_line_after() {
+    // After g command, current line should be set by last command
+    ed_test(
+        "a\nfoo 1\nbar 2\nfoo 3\nbar 4\nfoo 5\n.\ng/foo/p\n.=\nQ\n",
+        "foo 1\nfoo 3\nfoo 5\n5\n",
+    );
+}
+
+#[test]
+fn test_ed_global_different_delimiter() {
+    // Global command with different delimiter
+    ed_test(
+        "a\npath/to/file\npath/to/dir\nother\n.\ng#path#p\nQ\n",
+        "path/to/file\npath/to/dir\n",
+    );
+}
+
+#[test]
+fn test_ed_global_with_previous_pattern() {
+    // Empty pattern should use previous pattern (set by search address)
+    ed_test("a\nfoo\nbar\nfoo\n.\n/foo/\ng//p\nQ\n", "foo\nfoo\nfoo\n");
+}
+
+#[test]
+fn test_ed_invert_global_with_range() {
+    // v command with address range
+    ed_test(
+        "a\napple 1\nbanana 2\napple 3\nbanana 4\napple 5\n.\n2,4v/apple/p\nQ\n",
+        "banana 2\nbanana 4\n",
+    );
+}
+
+#[test]
+fn test_ed_global_substitute_with_flags() {
+    // g with substitute and flags
+    ed_test(
+        "a\nfoo foo foo\nbar bar\nfoo baz foo\n.\ng/foo/s/foo/X/g\n1,$p\nQ\n",
+        "X X X\nbar bar\nX baz X\n",
+    );
+}
+
+#[test]
+fn test_ed_global_undo_substitute() {
+    // Undo global substitute
+    ed_test(
+        "a\nfoo one\nbar two\nfoo three\n.\ng/foo/s/foo/baz/\nu\n1,$p\nQ\n",
+        "foo one\nbar two\nfoo three\n",
+    );
+}
+
+#[test]
+fn test_ed_global_list_command() {
+    // g with list command
+    ed_test(
+        "a\nfoo\tbar\nbaz\nfoo\tend\n.\ng/foo/l\nQ\n",
+        "foo\\tbar$\nfoo\\tend$\n",
+    );
+}

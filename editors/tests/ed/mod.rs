@@ -1332,3 +1332,63 @@ fn test_ed_list_long_line_folding() {
     let expected = format!("{}\\\n{}$\n", "a".repeat(72), "a".repeat(8));
     ed_test(&stdin, &expected);
 }
+
+// ============================================================================
+// POSIX Compliance: a/i/c with Input in Global Command Lists (Phase 3.5)
+// ============================================================================
+
+#[test]
+fn test_ed_global_append_with_input() {
+    // g/pattern/a with embedded input should append text after each match
+    // Input: g/foo/a\<newline>appended line\<newline>.
+    // This becomes: "a\nappended line\n." after line continuation processing
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\ng/foo/a\\\nappended line\\\n.\n1,$p\nQ\n",
+        "foo\nappended line\nbar\nfoo2\nappended line\n",
+    );
+}
+
+#[test]
+fn test_ed_global_insert_with_input() {
+    // g/pattern/i with embedded input should insert before each match
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\ng/foo/i\\\ninserted line\\\n.\n1,$p\nQ\n",
+        "inserted line\nfoo\nbar\ninserted line\nfoo2\n",
+    );
+}
+
+#[test]
+fn test_ed_global_change_with_input() {
+    // g/pattern/c with embedded input should replace each match
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\ng/foo/c\\\nreplacement\\\n.\n1,$p\nQ\n",
+        "replacement\nbar\nreplacement\n",
+    );
+}
+
+#[test]
+fn test_ed_global_append_no_terminator() {
+    // POSIX: Last command can omit the '.' terminator
+    ed_test(
+        "a\nfoo\nbar\n.\ng/foo/a\\\nappended line\n1,$p\nQ\n",
+        "foo\nappended line\nbar\n",
+    );
+}
+
+#[test]
+fn test_ed_global_append_multiple_lines() {
+    // Multiple input lines for a single append
+    ed_test(
+        "a\nfoo\n.\ng/foo/a\\\nline1\\\nline2\\\nline3\\\n.\n1,$p\nQ\n",
+        "foo\nline1\nline2\nline3\n",
+    );
+}
+
+#[test]
+fn test_ed_global_mixed_commands_with_append() {
+    // Mix of regular command and append with input
+    ed_test(
+        "a\nfoo\nbar\n.\ng/foo/s/foo/baz/\\\na\\\nappended\\\n.\n1,$p\nQ\n",
+        "baz\nappended\nbar\n",
+    );
+}

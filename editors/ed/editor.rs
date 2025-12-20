@@ -16,6 +16,89 @@ use regex::Regex;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::Ordering;
 
+/// Parsed command with optional embedded input for a/i/c in global commands.
+struct GlobalCommand {
+    /// The command text (e.g., "a", "s/foo/bar/", "d")
+    command: String,
+    /// For a/i/c: the input text lines
+    input_lines: Vec<String>,
+}
+
+/// Find the command character in a line (skipping address prefix).
+fn find_command_char(line: &str) -> Option<char> {
+    // Skip leading whitespace and address components
+    // Look for first command letter
+    for ch in line.chars() {
+        if ch.is_ascii_alphabetic() {
+            return Some(ch);
+        }
+        // Continue past address components
+        if ch.is_ascii_digit()
+            || ch == '.'
+            || ch == '$'
+            || ch == '\''
+            || ch == '/'
+            || ch == '?'
+            || ch == '+'
+            || ch == '-'
+            || ch == ','
+            || ch == ';'
+            || ch.is_whitespace()
+        {
+            continue;
+        }
+        // Stop at other characters
+        break;
+    }
+    None
+}
+
+/// Parse a global command list string into individual commands.
+/// Handles a/i/c commands with embedded input.
+fn parse_global_command_list(commands: &str) -> Vec<GlobalCommand> {
+    let lines: Vec<&str> = commands.split('\n').collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Check if this is an a, i, or c command (possibly with address prefix)
+        let cmd_char = find_command_char(line);
+
+        if matches!(cmd_char, Some('a') | Some('i') | Some('c')) {
+            // Collect input lines until '.' or end of list
+            let mut input_lines = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let input_line = lines[i];
+                if input_line == "." {
+                    i += 1;
+                    break;
+                }
+                input_lines.push(format!("{}\n", input_line));
+                i += 1;
+            }
+            result.push(GlobalCommand {
+                command: line.to_string(),
+                input_lines,
+            });
+        } else {
+            result.push(GlobalCommand {
+                command: line.to_string(),
+                input_lines: Vec::new(),
+            });
+            i += 1;
+        }
+    }
+
+    result
+}
+
 /// The ed editor state.
 pub struct Editor<R: BufRead, W: Write> {
     /// The text buffer
@@ -1065,6 +1148,34 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok(())
     }
 
+    /// Execute an a/i/c command with pre-supplied input lines (for global commands).
+    /// This is used when a/i/c commands appear in g/v command lists with embedded input.
+    fn execute_input_command_with_lines(
+        &mut self,
+        command: &str,
+        input_lines: &[String],
+    ) -> EdResult<()> {
+        // Parse the command to get the address and command type
+        match parse(command) {
+            Ok(Command::Append(addr)) => {
+                let line_num = self.resolve_address(&addr)?;
+                self.buf.append(line_num, input_lines);
+                Ok(())
+            }
+            Ok(Command::Insert(addr)) => {
+                let line_num = self.resolve_address(&addr)?;
+                self.buf.insert(line_num, input_lines);
+                Ok(())
+            }
+            Ok(Command::Change(addr1, addr2)) => {
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
+                self.buf.change(start, end, input_lines)?;
+                Ok(())
+            }
+            _ => Err(EdError::Generic("invalid command".to_string())),
+        }
+    }
+
     /// Execute a global command.
     fn execute_global(
         &mut self,
@@ -1116,24 +1227,32 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let original_cur_line = self.buf.cur_line;
         let mut last_successful_line = original_cur_line;
 
+        // Parse the command list into individual commands (handles a/i/c with embedded input)
+        let global_commands = parse_global_command_list(commands);
+
         // For delete commands, process in reverse order to avoid line number shifts
-        let is_delete = commands.trim() == "d";
-        if is_delete {
+        let is_delete_only = global_commands.len() == 1 && global_commands[0].command.trim() == "d";
+        if is_delete_only {
             matching_lines.reverse();
         }
 
+        // Track line offset for insert/append operations
+        // When we insert N lines, subsequent matching line numbers shift by N
+        let mut line_offset: isize = 0;
+
         // Execute commands on each matching line
         for line_num in matching_lines {
-            // Adjust line_num for lines that may have been deleted
-            // For non-delete commands, we need to track line number changes
-            let adjusted_line = if is_delete {
+            // Adjust line_num for lines that may have been deleted or shifted
+            let adjusted_line = if is_delete_only {
                 line_num
             } else {
-                // For other commands, check if line still exists
-                if line_num > self.buf.line_count() {
+                // Apply offset for lines that shifted due to insertions
+                let shifted = (line_num as isize + line_offset) as usize;
+                // Check if line still exists
+                if shifted > self.buf.line_count() || shifted == 0 {
                     continue;
                 }
-                line_num
+                shifted
             };
 
             // Set current line
@@ -1141,71 +1260,102 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 continue; // Line may have been deleted
             }
 
-            // Parse and execute the command
-            match commands.trim() {
-                "p" => {
-                    if let Some(line) = self.buf.get_line(self.buf.cur_line) {
-                        write!(self.writer, "{}", line)?;
+            // Track line count before command to detect insertions
+            let line_count_before = self.buf.line_count();
+
+            // Execute each command in the command list
+            for gc in &global_commands {
+                if gc.command.is_empty() {
+                    continue;
+                }
+
+                let cmd = gc.command.trim();
+
+                // Check if this is a/i/c with embedded input
+                let cmd_char = find_command_char(cmd);
+                if matches!(cmd_char, Some('a') | Some('i') | Some('c'))
+                    && !gc.input_lines.is_empty()
+                {
+                    // Execute a/i/c with embedded input directly
+                    if let Err(e) = self.execute_input_command_with_lines(cmd, &gc.input_lines) {
+                        self.buf.end_global();
+                        return Err(e);
                     }
                     last_successful_line = self.buf.cur_line;
+                    continue;
                 }
-                "d" => {
-                    let cur = self.buf.cur_line;
-                    if self.buf.delete(cur, cur).is_ok() {
+
+                // Handle common simple commands inline for performance
+                match cmd {
+                    "p" => {
+                        if let Some(line) = self.buf.get_line(self.buf.cur_line) {
+                            write!(self.writer, "{}", line)?;
+                        }
                         last_successful_line = self.buf.cur_line;
                     }
-                }
-                "n" => {
-                    if let Some(line) = self.buf.get_line(self.buf.cur_line) {
-                        let content = line.trim_end_matches('\n');
-                        writeln!(self.writer, "{:6}\t{}", self.buf.cur_line, content)?;
-                    }
-                    last_successful_line = self.buf.cur_line;
-                }
-                "l" => {
-                    if let Some(line) = self.buf.get_line(self.buf.cur_line) {
-                        let content = line.trim_end_matches('\n');
-                        for ch in content.chars() {
-                            match ch {
-                                '\\' => write!(self.writer, "\\\\")?,
-                                '\x07' => write!(self.writer, "\\a")?,
-                                '\x08' => write!(self.writer, "\\b")?,
-                                '\x0c' => write!(self.writer, "\\f")?,
-                                '\r' => write!(self.writer, "\\r")?,
-                                '\t' => write!(self.writer, "\\t")?,
-                                '\x0b' => write!(self.writer, "\\v")?,
-                                '$' => write!(self.writer, "\\$")?,
-                                c if c.is_control() || !c.is_ascii() => {
-                                    for byte in c.to_string().as_bytes() {
-                                        write!(self.writer, "\\{:03o}", byte)?;
-                                    }
-                                }
-                                c => write!(self.writer, "{}", c)?,
-                            }
+                    "d" => {
+                        let cur = self.buf.cur_line;
+                        if self.buf.delete(cur, cur).is_ok() {
+                            last_successful_line = self.buf.cur_line;
                         }
-                        writeln!(self.writer, "$")?;
                     }
-                    last_successful_line = self.buf.cur_line;
-                }
-                cmd if !cmd.is_empty() => {
-                    // Try to parse and execute other commands
-                    match parse(cmd) {
-                        Ok(parsed_cmd) => {
-                            if let Err(e) = self.execute_command(parsed_cmd) {
-                                // Abort global on error and propagate
+                    "n" => {
+                        if let Some(line) = self.buf.get_line(self.buf.cur_line) {
+                            let content = line.trim_end_matches('\n');
+                            writeln!(self.writer, "{:6}\t{}", self.buf.cur_line, content)?;
+                        }
+                        last_successful_line = self.buf.cur_line;
+                    }
+                    "l" => {
+                        if let Some(line) = self.buf.get_line(self.buf.cur_line) {
+                            let content = line.trim_end_matches('\n');
+                            for ch in content.chars() {
+                                match ch {
+                                    '\\' => write!(self.writer, "\\\\")?,
+                                    '\x07' => write!(self.writer, "\\a")?,
+                                    '\x08' => write!(self.writer, "\\b")?,
+                                    '\x0c' => write!(self.writer, "\\f")?,
+                                    '\r' => write!(self.writer, "\\r")?,
+                                    '\t' => write!(self.writer, "\\t")?,
+                                    '\x0b' => write!(self.writer, "\\v")?,
+                                    '$' => write!(self.writer, "\\$")?,
+                                    c if c.is_control() || !c.is_ascii() => {
+                                        for byte in c.to_string().as_bytes() {
+                                            write!(self.writer, "\\{:03o}", byte)?;
+                                        }
+                                    }
+                                    c => write!(self.writer, "{}", c)?,
+                                }
+                            }
+                            writeln!(self.writer, "$")?;
+                        }
+                        last_successful_line = self.buf.cur_line;
+                    }
+                    _ => {
+                        // Try to parse and execute other commands
+                        match parse(cmd) {
+                            Ok(parsed_cmd) => {
+                                if let Err(e) = self.execute_command(parsed_cmd) {
+                                    // Abort global on error and propagate
+                                    self.buf.end_global();
+                                    return Err(e);
+                                }
+                                last_successful_line = self.buf.cur_line;
+                            }
+                            Err(e) => {
+                                // Abort global on parse error
                                 self.buf.end_global();
                                 return Err(e);
                             }
-                            last_successful_line = self.buf.cur_line;
-                        }
-                        Err(e) => {
-                            // Abort global on parse error
-                            self.buf.end_global();
-                            return Err(e);
                         }
                     }
                 }
-                _ => {}
+            }
+
+            // Update line offset based on how many lines were added/removed
+            if !is_delete_only {
+                let line_count_after = self.buf.line_count();
+                line_offset += line_count_after as isize - line_count_before as isize;
             }
         }
 

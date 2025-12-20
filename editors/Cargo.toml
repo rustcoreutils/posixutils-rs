@@ -8,6 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clap.workspace = true
 termios = "0.3"
 libc.workspace = true
 regex.workspace = true
@@ -27,4 +28,8 @@ path = "vi_main.rs"
 [[bin]]
 name = "ex"
 path = "ex_main.rs"
+
+[[bin]]
+name = "ed"
+path = "ed_main.rs"
 

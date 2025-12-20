@@ -1531,6 +1531,7 @@ dependencies = [
 name = "posixutils-editors"
 version = "0.7.0"
 dependencies = [
+ "clap",
  "libc",
  "plib",
  "regex",

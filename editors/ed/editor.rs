@@ -1,0 +1,818 @@
+//
+// Copyright (c) 2024 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+//! Main editor logic for ed.
+
+use crate::ed::buffer::Buffer;
+use crate::ed::error::{EdError, EdResult};
+use crate::ed::parser::{parse, Address, AddressInfo, Command, PrintMode};
+use regex::Regex;
+use std::io::{self, BufRead, Write};
+
+/// The ed editor state.
+pub struct Editor<R: BufRead, W: Write> {
+    /// The text buffer
+    pub buf: Buffer,
+    /// Input reader
+    reader: R,
+    /// Output writer
+    writer: W,
+    /// Whether to show the prompt
+    pub show_prompt: bool,
+    /// The prompt string
+    pub prompt: String,
+    /// Suppress byte count output
+    pub silent: bool,
+    /// Show verbose error messages
+    pub help_mode: bool,
+    /// Last error message
+    pub last_error: Option<String>,
+    /// Last search pattern
+    pub last_pattern: Option<String>,
+    /// Last substitute pattern
+    pub last_sub_pattern: Option<String>,
+    /// Last substitute replacement
+    pub last_sub_replacement: Option<String>,
+    /// Last substitute flags
+    pub last_sub_flags: Option<String>,
+    /// Lines being collected for input mode
+    input_lines: Vec<String>,
+    /// Whether we're in input mode
+    in_input_mode: bool,
+    /// The command that initiated input mode
+    pending_command: Option<Command>,
+    /// Whether the editor should quit
+    pub should_quit: bool,
+    /// Quit warning given (for modified buffer)
+    quit_warning_given: bool,
+}
+
+impl<R: BufRead, W: Write> Editor<R, W> {
+    /// Create a new editor with custom reader/writer.
+    pub fn new(reader: R, writer: W) -> Self {
+        Editor {
+            buf: Buffer::new(),
+            reader,
+            writer,
+            show_prompt: false,
+            prompt: String::new(),
+            silent: false,
+            help_mode: false,
+            last_error: None,
+            last_pattern: None,
+            last_sub_pattern: None,
+            last_sub_replacement: None,
+            last_sub_flags: None,
+            input_lines: Vec::new(),
+            in_input_mode: false,
+            pending_command: None,
+            should_quit: false,
+            quit_warning_given: false,
+        }
+    }
+
+    /// Print the prompt if enabled.
+    fn print_prompt(&mut self) -> io::Result<()> {
+        if self.show_prompt && !self.prompt.is_empty() {
+            write!(self.writer, "{}", self.prompt)?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Print an error.
+    fn print_error(&mut self, err: &EdError) -> io::Result<()> {
+        writeln!(self.writer, "?")?;
+        if self.help_mode {
+            writeln!(self.writer, "{}", err)?;
+        }
+        self.last_error = Some(err.to_string());
+        Ok(())
+    }
+
+    /// Print bytes written (if not silent).
+    fn print_bytes(&mut self, bytes: usize) -> io::Result<()> {
+        if !self.silent {
+            writeln!(self.writer, "{}", bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve an address to a line number.
+    fn resolve_address(&self, addr: &Address) -> EdResult<usize> {
+        let mut line = match &addr.info {
+            AddressInfo::Null => self.buf.cur_line,
+            AddressInfo::Current => self.buf.cur_line,
+            AddressInfo::Last => self.buf.last_line(),
+            AddressInfo::Line(n) => *n,
+            AddressInfo::Mark(c) => self.buf.get_mark(*c).ok_or(EdError::InvalidAddress)?,
+            AddressInfo::RegexForward(pat) => self.search_forward(pat)?,
+            AddressInfo::RegexBack(pat) => self.search_backward(pat)?,
+            AddressInfo::Offset(off) => {
+                let new_line = self.buf.cur_line as isize + off;
+                if new_line < 0 {
+                    return Err(EdError::AddressOutOfRange);
+                }
+                new_line as usize
+            }
+        };
+
+        // Apply offsets
+        for off in &addr.offsets {
+            let new_line = line as isize + off;
+            if new_line < 0 {
+                return Err(EdError::AddressOutOfRange);
+            }
+            line = new_line as usize;
+        }
+
+        // Validate range
+        if line > self.buf.last_line() {
+            return Err(EdError::AddressOutOfRange);
+        }
+
+        Ok(line)
+    }
+
+    /// Search forward for a pattern.
+    fn search_forward(&self, pattern: &str) -> EdResult<usize> {
+        let pat = if pattern.is_empty() {
+            self.last_pattern
+                .as_ref()
+                .ok_or(EdError::NoPreviousPattern)?
+                .clone()
+        } else {
+            pattern.to_string()
+        };
+
+        let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
+
+        // Search from current line + 1 to end, then wrap to start
+        let start = self.buf.cur_line;
+        let total = self.buf.line_count();
+
+        if total == 0 {
+            return Err(EdError::NoMatch);
+        }
+
+        for i in 1..=total {
+            let line_num = ((start + i - 1) % total) + 1;
+            if let Some(line) = self.buf.get_line(line_num) {
+                if re.is_match(line) {
+                    return Ok(line_num);
+                }
+            }
+        }
+
+        Err(EdError::NoMatch)
+    }
+
+    /// Search backward for a pattern.
+    fn search_backward(&self, pattern: &str) -> EdResult<usize> {
+        let pat = if pattern.is_empty() {
+            self.last_pattern
+                .as_ref()
+                .ok_or(EdError::NoPreviousPattern)?
+                .clone()
+        } else {
+            pattern.to_string()
+        };
+
+        let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
+
+        let start = self.buf.cur_line;
+        let total = self.buf.line_count();
+
+        if total == 0 {
+            return Err(EdError::NoMatch);
+        }
+
+        for i in 1..=total {
+            let line_num = if start >= i {
+                start - i + 1
+            } else {
+                total - (i - start) + 1
+            };
+            if line_num == 0 || line_num > total {
+                continue;
+            }
+            if let Some(line) = self.buf.get_line(line_num) {
+                if re.is_match(line) {
+                    return Ok(line_num);
+                }
+            }
+        }
+
+        Err(EdError::NoMatch)
+    }
+
+    /// Read a line from input.
+    pub fn read_line(&mut self) -> io::Result<Option<String>> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Process a line of input.
+    pub fn process_line(&mut self, line: &str) -> io::Result<bool> {
+        if self.in_input_mode {
+            return self.process_input_line(line);
+        }
+
+        let trimmed = line.trim_end();
+        match parse(trimmed) {
+            Ok(cmd) => {
+                if let Err(e) = self.execute_command(cmd) {
+                    self.print_error(&e)?;
+                }
+            }
+            Err(e) => {
+                self.print_error(&e)?;
+            }
+        }
+
+        Ok(!self.should_quit)
+    }
+
+    /// Process a line during input mode.
+    fn process_input_line(&mut self, line: &str) -> io::Result<bool> {
+        // Check for end of input marker
+        if line == ".\n" || line == "." {
+            self.in_input_mode = false;
+            if let Some(cmd) = self.pending_command.take() {
+                let lines = std::mem::take(&mut self.input_lines);
+                if let Err(e) = self.finish_input_command(cmd, lines) {
+                    self.print_error(&e)?;
+                }
+            }
+        } else {
+            // Ensure line ends with newline
+            let mut l = line.to_string();
+            if !l.ends_with('\n') {
+                l.push('\n');
+            }
+            self.input_lines.push(l);
+        }
+        Ok(true)
+    }
+
+    /// Finish executing a command that required input.
+    fn finish_input_command(&mut self, cmd: Command, lines: Vec<String>) -> EdResult<()> {
+        match cmd {
+            Command::Append(addr) => {
+                let line_num = self.resolve_address(&addr)?;
+                self.buf.append(line_num, &lines);
+            }
+            Command::Insert(addr) => {
+                let line_num = self.resolve_address(&addr)?;
+                let insert_at = if line_num == 0 { 1 } else { line_num };
+                self.buf.insert(insert_at, &lines);
+            }
+            Command::Change(addr1, addr2) => {
+                let start = self.resolve_address(&addr1)?;
+                let end = self.resolve_address(&addr2)?;
+                self.buf.change(start, end, &lines)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Execute a parsed command.
+    fn execute_command(&mut self, cmd: Command) -> EdResult<()> {
+        match cmd {
+            Command::Append(ref addr)
+            | Command::Insert(ref addr)
+            | Command::Change(ref addr, _) => {
+                // Validate address before entering input mode
+                self.resolve_address(addr)?;
+                if let Command::Change(_, ref addr2) = cmd {
+                    self.resolve_address(addr2)?;
+                }
+                self.in_input_mode = true;
+                self.pending_command = Some(cmd);
+                self.input_lines.clear();
+                Ok(())
+            }
+            Command::Delete(ref addr1, ref addr2) => {
+                let start = self.resolve_address(addr1)?;
+                let end = self.resolve_address(addr2)?;
+                self.buf.delete(start, end)?;
+                Ok(())
+            }
+            Command::Edit(filename, force) => {
+                if !force && self.buf.modified && !self.quit_warning_given {
+                    self.quit_warning_given = true;
+                    return Err(EdError::BufferModified);
+                }
+                let path = filename.as_ref().unwrap_or(&self.buf.pathname);
+                if path.is_empty() {
+                    return Err(EdError::NoFilename);
+                }
+                let path = path.clone();
+                let bytes = self.buf.read_file(&path)?;
+                self.print_bytes(bytes)?;
+                self.quit_warning_given = false;
+                Ok(())
+            }
+            Command::Filename(filename) => {
+                if let Some(f) = filename {
+                    self.buf.pathname = f;
+                }
+                writeln!(self.writer, "{}", self.buf.pathname)?;
+                Ok(())
+            }
+            Command::Global(addr1, addr2, pattern, commands, _interactive) => {
+                self.execute_global(addr1, addr2, &pattern, &commands, false)
+            }
+            Command::GlobalNot(addr1, addr2, pattern, commands, _interactive) => {
+                self.execute_global(addr1, addr2, &pattern, &commands, true)
+            }
+            Command::GlobalInteractive(addr1, addr2, pattern) => {
+                // For now, treat as non-interactive with 'p' command
+                self.execute_global(addr1, addr2, &pattern, "p", false)
+            }
+            Command::GlobalNotInteractive(addr1, addr2, pattern) => {
+                self.execute_global(addr1, addr2, &pattern, "p", true)
+            }
+            Command::Help => {
+                if let Some(ref err) = self.last_error {
+                    writeln!(self.writer, "{}", err)?;
+                }
+                Ok(())
+            }
+            Command::HelpMode => {
+                self.help_mode = !self.help_mode;
+                Ok(())
+            }
+            Command::Join(addr1, addr2) => {
+                let start = self.resolve_address(&addr1)?;
+                let end = self.resolve_address(&addr2)?;
+                self.buf.join(start, end)?;
+                Ok(())
+            }
+            Command::Mark(addr, mark) => {
+                let line = self.resolve_address(&addr)?;
+                self.buf.set_mark(mark, line)?;
+                Ok(())
+            }
+            Command::ListLines(addr1, addr2) => self.print_lines(&addr1, &addr2, PrintMode::List),
+            Command::Move(addr1, addr2, dest) => {
+                let start = self.resolve_address(&addr1)?;
+                let end = self.resolve_address(&addr2)?;
+                let dest_line = self.resolve_address(&dest)?;
+                self.buf.move_lines(start, end, dest_line)?;
+                Ok(())
+            }
+            Command::Number(addr1, addr2) => self.print_lines(&addr1, &addr2, PrintMode::Numbered),
+            Command::Print(addr1, addr2, mode) => self.print_lines(&addr1, &addr2, mode),
+            Command::PromptToggle => {
+                self.show_prompt = !self.show_prompt;
+                Ok(())
+            }
+            Command::Quit(force) => {
+                if !force && self.buf.modified && !self.quit_warning_given {
+                    self.quit_warning_given = true;
+                    return Err(EdError::BufferModified);
+                }
+                self.should_quit = true;
+                Ok(())
+            }
+            Command::Read(addr, filename) => {
+                let after_line = self.resolve_address(&addr)?;
+                let path = filename.as_ref().unwrap_or(&self.buf.pathname);
+                if path.is_empty() {
+                    return Err(EdError::NoFilename);
+                }
+                let path = path.clone();
+                let bytes = self.buf.read_file_at(&path, after_line)?;
+                self.print_bytes(bytes)?;
+                Ok(())
+            }
+            Command::Substitute(addr1, addr2, pattern, replacement, flags) => {
+                self.execute_substitute(&addr1, &addr2, &pattern, &replacement, &flags)
+            }
+            Command::RepeatSubstitute(addr1, addr2) => {
+                let pattern = self.last_sub_pattern.clone().unwrap_or_default();
+                let replacement = self.last_sub_replacement.clone().unwrap_or_default();
+                let flags = self.last_sub_flags.clone().unwrap_or_default();
+                self.execute_substitute(&addr1, &addr2, &pattern, &replacement, &flags)
+            }
+            Command::Copy(addr1, addr2, dest) => {
+                let start = self.resolve_address(&addr1)?;
+                let end = self.resolve_address(&addr2)?;
+                let dest_line = self.resolve_address(&dest)?;
+                self.buf.copy_lines(start, end, dest_line)?;
+                Ok(())
+            }
+            Command::Undo => {
+                if self.buf.undo() {
+                    Ok(())
+                } else {
+                    Err(EdError::Generic("nothing to undo".to_string()))
+                }
+            }
+            Command::Write(addr1, addr2, filename, append) => {
+                let start = self.resolve_address(&addr1)?;
+                let end = self.resolve_address(&addr2)?;
+                let path = filename.as_ref().unwrap_or(&self.buf.pathname);
+                if path.is_empty() {
+                    return Err(EdError::NoFilename);
+                }
+                let path = path.clone();
+                if append {
+                    // Append mode - open file for appending
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)?;
+                    let bytes = self.buf.write_lines(start, end, &mut file)?;
+                    self.print_bytes(bytes)?;
+                } else {
+                    let bytes = self.buf.write_to_file(start, end, &path)?;
+                    if self.buf.pathname.is_empty() {
+                        self.buf.pathname = path;
+                    }
+                    self.print_bytes(bytes)?;
+                }
+                self.quit_warning_given = false;
+                Ok(())
+            }
+            Command::WriteQuit(addr1, addr2, filename) => {
+                let start = self.resolve_address(&addr1)?;
+                let end = self.resolve_address(&addr2)?;
+                let path = filename.as_ref().unwrap_or(&self.buf.pathname);
+                if path.is_empty() {
+                    return Err(EdError::NoFilename);
+                }
+                let path = path.clone();
+                let bytes = self.buf.write_to_file(start, end, &path)?;
+                self.print_bytes(bytes)?;
+                self.should_quit = true;
+                Ok(())
+            }
+            Command::LineNumber(addr) => {
+                let line = self.resolve_address(&addr)?;
+                writeln!(self.writer, "{}", line)?;
+                Ok(())
+            }
+            Command::Shell(cmd) => {
+                // Execute shell command
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()?;
+                self.writer.write_all(&output.stdout)?;
+                self.writer.write_all(&output.stderr)?;
+                writeln!(self.writer, "!")?;
+                Ok(())
+            }
+            Command::Scroll(addr, count) => {
+                let start = self.resolve_address(&addr)?;
+                let count = count.unwrap_or(22); // Default page size
+                let end = std::cmp::min(start + count - 1, self.buf.last_line());
+                if start > 0 && start <= self.buf.last_line() {
+                    for i in start..=end {
+                        if let Some(line) = self.buf.get_line(i) {
+                            write!(self.writer, "{}", line)?;
+                        }
+                    }
+                    self.buf.set_cur_line(end)?;
+                }
+                Ok(())
+            }
+            Command::Null(addr) => {
+                let line = self.resolve_address(&addr)?;
+                self.buf.set_cur_line(line)?;
+                Ok(())
+            }
+            Command::Goto(addr) => {
+                let line = self.resolve_address(&addr)?;
+                if line == 0 && self.buf.line_count() > 0 {
+                    return Err(EdError::AddressOutOfRange);
+                }
+                self.buf.set_cur_line(line)?;
+                // Print the line
+                if let Some(content) = self.buf.get_line(line) {
+                    write!(self.writer, "{}", content)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Print lines with the specified mode.
+    fn print_lines(&mut self, addr1: &Address, addr2: &Address, mode: PrintMode) -> EdResult<()> {
+        let start = self.resolve_address(addr1)?;
+        let end = self.resolve_address(addr2)?;
+
+        if start == 0 || end == 0 {
+            return Err(EdError::AddressOutOfRange);
+        }
+
+        for i in start..=end {
+            if let Some(line) = self.buf.get_line(i) {
+                match mode {
+                    PrintMode::Normal => {
+                        write!(self.writer, "{}", line)?;
+                    }
+                    PrintMode::Numbered => {
+                        // Remove trailing newline for formatting, then add it back
+                        let content = line.trim_end_matches('\n');
+                        writeln!(self.writer, "{:6}\t{}", i, content)?;
+                    }
+                    PrintMode::List => {
+                        // Show non-printable characters and end with $
+                        let content = line.trim_end_matches('\n');
+                        for ch in content.chars() {
+                            match ch {
+                                '\t' => write!(self.writer, "\\t")?,
+                                '\x08' => write!(self.writer, "\\b")?,
+                                '\\' => write!(self.writer, "\\\\")?,
+                                c if c.is_control() => write!(self.writer, "\\x{:02x}", c as u8)?,
+                                c => write!(self.writer, "{}", c)?,
+                            }
+                        }
+                        writeln!(self.writer, "$")?;
+                    }
+                }
+            }
+        }
+
+        self.buf.set_cur_line(end)?;
+        Ok(())
+    }
+
+    /// Execute a substitute command.
+    fn execute_substitute(
+        &mut self,
+        addr1: &Address,
+        addr2: &Address,
+        pattern: &str,
+        replacement: &str,
+        flags: &str,
+    ) -> EdResult<()> {
+        let start = self.resolve_address(addr1)?;
+        let end = self.resolve_address(addr2)?;
+
+        // Use previous pattern if empty
+        let pat = if pattern.is_empty() {
+            self.last_sub_pattern
+                .as_ref()
+                .ok_or(EdError::NoPreviousPattern)?
+                .clone()
+        } else {
+            pattern.to_string()
+        };
+
+        // Save for repeat
+        self.last_sub_pattern = Some(pat.clone());
+        self.last_sub_replacement = Some(replacement.to_string());
+        self.last_sub_flags = Some(flags.to_string());
+        self.last_pattern = Some(pat.clone());
+
+        let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
+
+        let global = flags.contains('g');
+        let print = flags.contains('p');
+        let numbered = flags.contains('n');
+        let list = flags.contains('l');
+
+        // Parse count from flags
+        let count: Option<usize> = flags
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok();
+
+        let mut any_match = false;
+        let mut last_matched_line = start;
+
+        // Save undo state before any changes
+        if start <= end && start > 0 {
+            // We need to save undo state - but buffer methods do this internally
+        }
+
+        for i in start..=end {
+            if let Some(line) = self.buf.get_line(i) {
+                let line_content = line.clone();
+                let new_line = if global {
+                    re.replace_all(&line_content, replacement).to_string()
+                } else if let Some(n) = count {
+                    // Replace nth occurrence
+                    let mut result = line_content.clone();
+                    if let Some(m) = re.find_iter(&line_content).nth(n - 1) {
+                        let before = &line_content[..m.start()];
+                        let after = &line_content[m.end()..];
+                        result = format!("{}{}{}", before, replacement, after);
+                    }
+                    result
+                } else {
+                    re.replace(&line_content, replacement).to_string()
+                };
+
+                if new_line != line_content {
+                    any_match = true;
+                    last_matched_line = i;
+                    // Ensure line ends with newline
+                    let final_line = if new_line.ends_with('\n') {
+                        new_line
+                    } else {
+                        format!("{}\n", new_line)
+                    };
+                    self.buf.change(i, i, &[final_line])?;
+                }
+            }
+        }
+
+        if !any_match {
+            return Err(EdError::NoMatch);
+        }
+
+        self.buf.set_cur_line(last_matched_line)?;
+
+        // Print if requested
+        if print || numbered || list {
+            let mode = if numbered {
+                PrintMode::Numbered
+            } else if list {
+                PrintMode::List
+            } else {
+                PrintMode::Normal
+            };
+            if let Some(line) = self.buf.get_line(last_matched_line) {
+                match mode {
+                    PrintMode::Normal => write!(self.writer, "{}", line)?,
+                    PrintMode::Numbered => {
+                        let content = line.trim_end_matches('\n');
+                        writeln!(self.writer, "{:6}\t{}", last_matched_line, content)?;
+                    }
+                    PrintMode::List => {
+                        let content = line.trim_end_matches('\n');
+                        for ch in content.chars() {
+                            match ch {
+                                '\t' => write!(self.writer, "\\t")?,
+                                c if c.is_control() => write!(self.writer, "\\x{:02x}", c as u8)?,
+                                c => write!(self.writer, "{}", c)?,
+                            }
+                        }
+                        writeln!(self.writer, "$")?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute a global command.
+    fn execute_global(
+        &mut self,
+        addr1: Address,
+        addr2: Address,
+        pattern: &str,
+        commands: &str,
+        invert: bool,
+    ) -> EdResult<()> {
+        let start = self.resolve_address(&addr1)?;
+        let end = self.resolve_address(&addr2)?;
+
+        // Use previous pattern if empty
+        let pat = if pattern.is_empty() {
+            self.last_pattern
+                .as_ref()
+                .ok_or(EdError::NoPreviousPattern)?
+                .clone()
+        } else {
+            pattern.to_string()
+        };
+
+        self.last_pattern = Some(pat.clone());
+
+        let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
+
+        // Collect matching lines first
+        let mut matching_lines = Vec::new();
+        for i in start..=end {
+            if let Some(line) = self.buf.get_line(i) {
+                let matches = re.is_match(line);
+                if matches != invert {
+                    matching_lines.push(i);
+                }
+            }
+        }
+
+        // For delete commands, process in reverse order to avoid line number shifts
+        let is_delete = commands.trim() == "d";
+        if is_delete {
+            matching_lines.reverse();
+        }
+
+        // Execute commands on each matching line
+        for line_num in matching_lines {
+            // Set current line - for delete commands, line_num is still valid
+            // because we're processing in reverse order
+            if self.buf.set_cur_line(line_num).is_err() {
+                continue; // Line may have been deleted
+            }
+
+            // Parse and execute the command
+            // For simplicity, we just handle 'p' and 'd' for now
+            match commands.trim() {
+                "p" => {
+                    if let Some(line) = self.buf.get_line(self.buf.cur_line) {
+                        write!(self.writer, "{}", line)?;
+                    }
+                }
+                "d" => {
+                    let cur = self.buf.cur_line;
+                    self.buf.delete(cur, cur)?;
+                }
+                cmd if !cmd.is_empty() => {
+                    // Try to parse and execute other commands
+                    if let Ok(parsed_cmd) = parse(cmd) {
+                        let _ = self.execute_command(parsed_cmd);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run the main editor loop.
+    pub fn run(&mut self) -> io::Result<()> {
+        loop {
+            self.print_prompt()?;
+
+            let line = match self.read_line()? {
+                Some(l) => l,
+                None => break,
+            };
+
+            if !self.process_line(&line)? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load a file into the buffer.
+    pub fn load_file(&mut self, path: &str) -> EdResult<usize> {
+        let bytes = self.buf.read_file(path)?;
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn create_test_editor(input: &str) -> Editor<Cursor<&[u8]>, Vec<u8>> {
+        let reader = Cursor::new(input.as_bytes());
+        let writer = Vec::new();
+        Editor::new(reader, writer)
+    }
+
+    #[test]
+    fn test_append_and_print() {
+        let mut editor = create_test_editor("");
+        editor
+            .buf
+            .append(0, &["hello\n".to_string(), "world\n".to_string()]);
+        assert_eq!(editor.buf.line_count(), 2);
+    }
+
+    #[test]
+    fn test_delete() {
+        let mut editor = create_test_editor("");
+        editor.buf.append(
+            0,
+            &["a\n".to_string(), "b\n".to_string(), "c\n".to_string()],
+        );
+        editor.process_line("2d\n").unwrap();
+        assert_eq!(editor.buf.line_count(), 2);
+        assert_eq!(editor.buf.get_line(1), Some(&"a\n".to_string()));
+        assert_eq!(editor.buf.get_line(2), Some(&"c\n".to_string()));
+    }
+
+    #[test]
+    fn test_quit() {
+        let mut editor = create_test_editor("");
+        editor.process_line("q\n").unwrap();
+        assert!(editor.should_quit);
+    }
+}

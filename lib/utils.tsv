@@ -69,6 +69,7 @@ nm	dev/nm.rs
 nohup	process/nohup.rs
 od	file/od.rs
 paste	text/paste.rs
+patch	text/patch.rs
 pathchk	pathnames/pathchk.rs
 pax	pax/
 pcc	cc/

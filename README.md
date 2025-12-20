@@ -76,6 +76,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] delta (SCCS)
  - [x] diff
  - [x] dirname
+ - [x] du
  - [x] echo
  - [x] ex (Editors)
  - [x] expand
@@ -177,13 +178,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] cal
  - [x] df
- - [x] du
  - [x] dd
  - [x] getconf
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
  - [x] logger
+ - [x] patch
  - [x] ps
  - [x] stty
  - [x] tabs
@@ -212,7 +213,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Misc. category
  - [ ] lp
- - [ ] patch
 
 ## Installation
 

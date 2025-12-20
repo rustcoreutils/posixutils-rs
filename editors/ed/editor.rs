@@ -54,6 +54,8 @@ pub struct Editor<R: BufRead, W: Write> {
     pub should_quit: bool,
     /// Quit warning given (for modified buffer)
     quit_warning_given: bool,
+    /// Previous command for & in interactive global (G/V)
+    last_interactive_cmd: Option<String>,
 }
 
 impl<R: BufRead, W: Write> Editor<R, W> {
@@ -78,6 +80,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             pending_command: None,
             should_quit: false,
             quit_warning_given: false,
+            last_interactive_cmd: None,
         }
     }
 
@@ -308,14 +311,57 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         }
     }
 
+    /// Check if a line has a continuation (ends with unescaped backslash).
+    /// Returns (trimmed_line_without_backslash, needs_continuation).
+    fn check_line_continuation(line: &str) -> (String, bool) {
+        let trimmed = line.trim_end_matches('\n');
+
+        // Count trailing backslashes
+        let mut backslash_count = 0;
+        for ch in trimmed.chars().rev() {
+            if ch == '\\' {
+                backslash_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Odd number of trailing backslashes = continuation
+        if backslash_count > 0 && backslash_count % 2 == 1 {
+            // Remove the trailing backslash and indicate continuation needed
+            let without_backslash = &trimmed[..trimmed.len() - 1];
+            (without_backslash.to_string(), true)
+        } else {
+            (trimmed.to_string(), false)
+        }
+    }
+
     /// Process a line of input.
     pub fn process_line(&mut self, line: &str) -> io::Result<bool> {
         if self.in_input_mode {
             return self.process_input_line(line);
         }
 
-        let trimmed = line.trim_end();
-        match parse(trimmed) {
+        // Handle line continuation (backslash-newline)
+        let (first_part, needs_continuation) = Self::check_line_continuation(line);
+        let full_line = if needs_continuation {
+            let mut accumulated = first_part;
+            // Keep reading lines until we get one without continuation
+            while let Some(next_line) = self.read_line()? {
+                let (part, more) = Self::check_line_continuation(&next_line);
+                // Join with embedded newline (the backslash-newline becomes \n in content)
+                accumulated.push('\n');
+                accumulated.push_str(&part);
+                if !more {
+                    break;
+                }
+            }
+            accumulated
+        } else {
+            first_part
+        };
+
+        match parse(&full_line) {
             Ok(cmd) => {
                 if let Err(e) = self.execute_command(cmd) {
                     self.print_error(&e)?;
@@ -432,11 +478,10 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 self.execute_global(addr1, addr2, &pattern, &commands, true)
             }
             Command::GlobalInteractive(addr1, addr2, pattern) => {
-                // For now, treat as non-interactive with 'p' command
-                self.execute_global(addr1, addr2, &pattern, "p", false)
+                self.execute_global_interactive(addr1, addr2, &pattern, false)
             }
             Command::GlobalNotInteractive(addr1, addr2, pattern) => {
-                self.execute_global(addr1, addr2, &pattern, "p", true)
+                self.execute_global_interactive(addr1, addr2, &pattern, true)
             }
             Command::Help => {
                 if let Some(ref err) = self.last_error {
@@ -747,6 +792,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
     /// Convert POSIX ed replacement string to regex crate format.
     /// POSIX: & -> matched string, \1-\9 -> back-references, \& -> literal &
+    /// POSIX: \<newline> -> split line at this point
     /// Regex crate: $0 -> matched string, $1-$9 -> back-references, $$ -> literal $
     fn convert_replacement(&self, repl: &str) -> String {
         let mut result = String::new();
@@ -767,6 +813,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                             }
                             '\\' => {
                                 result.push('\\');
+                                chars.next();
+                            }
+                            '\n' => {
+                                // POSIX: \<newline> causes line split
+                                // Preserve the newline in replacement
+                                result.push('\n');
                                 chars.next();
                             }
                             _ => {
@@ -850,9 +902,14 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         let mut any_match = false;
         let mut last_matched_line = start;
+        // Track offset when lines are split (inserted lines shift subsequent line numbers)
+        let mut offset: usize = 0;
 
         for i in start..=end {
-            if let Some(line) = self.buf.get_line(i) {
+            // Compute actual buffer position accounting for previously inserted lines
+            let actual_line = i + offset;
+
+            if let Some(line) = self.buf.get_line(actual_line) {
                 let line_content = line.clone();
                 let new_line = if global {
                     re.replace_all(&line_content, regex_repl.as_str())
@@ -874,14 +931,38 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
                 if new_line != line_content {
                     any_match = true;
-                    last_matched_line = i;
-                    // Ensure line ends with newline
-                    let final_line = if new_line.ends_with('\n') {
-                        new_line
+
+                    // Check for internal newlines (line splitting)
+                    // Strip trailing newline first, then check for remaining newlines
+                    let content = new_line.trim_end_matches('\n');
+                    if content.contains('\n') {
+                        // POSIX: Line splitting via \<newline> is not allowed in g/v commands
+                        if self.buf.is_in_global() {
+                            return Err(EdError::Generic(
+                                "cannot split lines in global command".to_string(),
+                            ));
+                        }
+
+                        // Split into multiple lines, each ending with newline
+                        let lines: Vec<String> =
+                            content.split('\n').map(|s| format!("{}\n", s)).collect();
+
+                        let num_new_lines = lines.len();
+                        self.buf.change(actual_line, actual_line, &lines)?;
+                        // Update last_matched_line to point to the last inserted line
+                        last_matched_line = actual_line + num_new_lines - 1;
+                        // Track extra lines inserted (we replaced 1 line with num_new_lines)
+                        offset += num_new_lines - 1;
                     } else {
-                        format!("{}\n", new_line)
-                    };
-                    self.buf.change(i, i, &[final_line])?;
+                        // No line splitting, just replace the single line
+                        let final_line = if new_line.ends_with('\n') {
+                            new_line
+                        } else {
+                            format!("{}\n", new_line)
+                        };
+                        self.buf.change(actual_line, actual_line, &[final_line])?;
+                        last_matched_line = actual_line;
+                    }
                 }
             }
         }
@@ -1108,9 +1189,19 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 }
                 cmd if !cmd.is_empty() => {
                     // Try to parse and execute other commands
-                    if let Ok(parsed_cmd) = parse(cmd) {
-                        if self.execute_command(parsed_cmd).is_ok() {
+                    match parse(cmd) {
+                        Ok(parsed_cmd) => {
+                            if let Err(e) = self.execute_command(parsed_cmd) {
+                                // Abort global on error and propagate
+                                self.buf.end_global();
+                                return Err(e);
+                            }
                             last_successful_line = self.buf.cur_line;
+                        }
+                        Err(e) => {
+                            // Abort global on parse error
+                            self.buf.end_global();
+                            return Err(e);
                         }
                     }
                 }
@@ -1124,6 +1215,152 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // POSIX: When g command completes, current line is value assigned by last command
         let _ = self.buf.set_cur_line(last_successful_line);
 
+        Ok(())
+    }
+
+    /// Execute an interactive global command (G or V).
+    /// For each matching line: print it, read a command from user, execute.
+    fn execute_global_interactive(
+        &mut self,
+        addr1: Address,
+        addr2: Address,
+        pattern: &str,
+        invert: bool,
+    ) -> EdResult<()> {
+        let (start, end) = self.resolve_range(&addr1, &addr2)?;
+
+        // Use previous pattern if empty
+        let pat = if pattern.is_empty() {
+            self.last_pattern
+                .as_ref()
+                .ok_or(EdError::NoPreviousPattern)?
+                .clone()
+        } else {
+            pattern.to_string()
+        };
+
+        self.last_pattern = Some(pat.clone());
+
+        let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
+
+        // Collect matching lines first
+        let mut matching_lines = Vec::new();
+        for i in start..=end {
+            if let Some(line) = self.buf.get_line(i) {
+                let matches = re.is_match(line);
+                if matches != invert {
+                    matching_lines.push(i);
+                }
+            }
+        }
+
+        if matching_lines.is_empty() {
+            return Ok(());
+        }
+
+        // Save one undo record for the entire operation
+        self.buf.begin_global();
+
+        let mut idx = 0;
+        while idx < matching_lines.len() {
+            // Check for SIGINT
+            if crate::SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
+                self.buf.end_global();
+                writeln!(self.writer, "?")?;
+                self.last_error = Some("Interrupt".to_string());
+                return Ok(());
+            }
+
+            let line_num = matching_lines[idx];
+
+            // Check if line still exists (may have been deleted by previous commands)
+            if line_num == 0 || line_num > self.buf.line_count() {
+                idx += 1;
+                continue;
+            }
+
+            // Print the line
+            if let Some(line) = self.buf.get_line(line_num) {
+                write!(self.writer, "{}", line)?;
+            }
+            self.writer.flush()?;
+
+            // Read command from user
+            let cmd_line = match self.read_line()? {
+                Some(l) => l,
+                None => break, // EOF
+            };
+
+            let trimmed = cmd_line.trim_end_matches('\n');
+
+            // Empty line = skip, no action
+            if trimmed.is_empty() {
+                idx += 1;
+                continue;
+            }
+
+            // & = repeat previous command
+            let cmd_str = if trimmed == "&" {
+                match &self.last_interactive_cmd {
+                    Some(prev) => prev.clone(),
+                    None => {
+                        // No previous command
+                        idx += 1;
+                        continue;
+                    }
+                }
+            } else {
+                self.last_interactive_cmd = Some(trimmed.to_string());
+                trimmed.to_string()
+            };
+
+            // Set current line and execute
+            if self.buf.set_cur_line(line_num).is_err() {
+                idx += 1;
+                continue;
+            }
+
+            // Track line count before and after to adjust remaining line numbers
+            let lines_before = self.buf.line_count();
+
+            match parse(&cmd_str) {
+                Ok(cmd) => {
+                    // Check for forbidden commands
+                    if matches!(
+                        cmd,
+                        Command::Global(..)
+                            | Command::GlobalNot(..)
+                            | Command::GlobalInteractive(..)
+                            | Command::GlobalNotInteractive(..)
+                            | Command::Shell(..)
+                    ) {
+                        writeln!(self.writer, "?")?;
+                        self.last_error = Some("invalid command".to_string());
+                    } else if let Err(e) = self.execute_command(cmd) {
+                        self.print_error(&e)?;
+                    }
+                }
+                Err(e) => {
+                    self.print_error(&e)?;
+                }
+            }
+
+            // Adjust remaining line numbers if lines were deleted or added
+            let lines_after = self.buf.line_count();
+            if lines_after != lines_before {
+                let diff = lines_after as isize - lines_before as isize;
+                // Adjust all remaining line numbers (those after current position)
+                for remaining_line in &mut matching_lines[(idx + 1)..] {
+                    if *remaining_line > line_num {
+                        *remaining_line = (*remaining_line as isize + diff) as usize;
+                    }
+                }
+            }
+
+            idx += 1;
+        }
+
+        self.buf.end_global();
         Ok(())
     }
 

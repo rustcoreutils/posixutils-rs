@@ -116,6 +116,11 @@ impl Buffer {
         self.in_global = false;
     }
 
+    /// Check if currently in a global command context.
+    pub fn is_in_global(&self) -> bool {
+        self.in_global
+    }
+
     /// Undo the last change. Returns true if undo was performed.
     pub fn undo(&mut self) -> bool {
         if let Some(record) = self.undo_record.take() {

@@ -701,6 +701,60 @@ fn test_ed_substitute_different_delimiter() {
 }
 
 // ============================================================================
+// POSIX Compliance: Line Splitting in Substitute
+// ============================================================================
+
+#[test]
+fn test_ed_substitute_split_line() {
+    // POSIX: A line can be split by substituting a \<newline> into it.
+    // The replacement contains a backslash followed by a literal newline.
+    // Input: "hello world"
+    // Command: s/world/one\<newline>two/ (where \<newline> is actual newline)
+    // Result: two lines: "hello one" and "two"
+    ed_test(
+        "a\nhello world\n.\ns/world/one\\\ntwo/\n1,$p\nQ\n",
+        "hello one\ntwo\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_split_line_multiple() {
+    // Split a line into three parts
+    ed_test(
+        "a\nthe quick brown fox\n.\ns/quick/A\\\nB\\\nC/\n1,$p\nQ\n",
+        "the A\nB\nC brown fox\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_split_line_sets_current() {
+    // After line splitting, current line should be the last resulting line
+    ed_test("a\nhello world\n.\ns/world/one\\\ntwo/\n.p\nQ\n", "two\n");
+}
+
+#[test]
+fn test_ed_substitute_split_line_in_range() {
+    // Line splitting within a range - should work correctly
+    ed_test(
+        "a\nline one\nfoo bar\nline three\n.\n2s/bar/X\\\nY/\n1,$p\nQ\n",
+        "line one\nfoo X\nY\nline three\n",
+    );
+}
+
+#[test]
+fn test_ed_substitute_split_in_global_error() {
+    // POSIX: Line splitting cannot be done as part of a g or v command list.
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "a\nhello world\n.\ng/hello/s/world/one\\\ntwo/\nQ\n".to_string(),
+        expected_out: "?\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// ============================================================================
 // Phase 4: Undo Command Tests
 // ============================================================================
 
@@ -1170,6 +1224,98 @@ fn test_ed_global_shell_error() {
         expected_err: String::new(),
         expected_exit_code: 0,
     });
+}
+
+// ============================================================================
+// POSIX Compliance: Multi-line Command Lists for g/v
+// ============================================================================
+
+#[test]
+fn test_ed_global_multiline_command_list() {
+    // g/pattern/cmd1\<newline>cmd2 should execute both commands
+    // The backslash-newline is line continuation for the command list
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\ng/foo/s/foo/baz/\\\np\n1,$p\nQ\n",
+        "baz\nbaz2\nbaz\nbar\nbaz2\n",
+    );
+}
+
+#[test]
+fn test_ed_global_multiline_substitute_then_print() {
+    // Multi-line: substitute then print each matching line
+    ed_test(
+        "a\nhello world\ngoodbye world\n.\ng/world/s/world/planet/\\\np\n1,$p\nQ\n",
+        "hello planet\ngoodbye planet\nhello planet\ngoodbye planet\n",
+    );
+}
+
+#[test]
+fn test_ed_v_multiline_command_list() {
+    // v command (invert) with multi-line command list
+    ed_test(
+        "a\nfoo\nbar\nbaz\n.\nv/foo/s/a/A/\\\np\n1,$p\nQ\n",
+        "bAr\nbAz\nfoo\nbAr\nbAz\n",
+    );
+}
+
+// ============================================================================
+// POSIX Compliance: Interactive G/V Commands
+// ============================================================================
+
+#[test]
+fn test_ed_interactive_g_skip() {
+    // G with empty response (just newline) should skip to next matching line
+    // For each matching line, G prints it and waits for a command
+    // Empty command = skip (no action)
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\nG/foo/\n\n\n1,$p\nQ\n",
+        "foo\nfoo2\nfoo\nbar\nfoo2\n",
+    );
+}
+
+#[test]
+fn test_ed_interactive_g_delete() {
+    // G with d command should delete matching lines interactively
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\nG/foo/\nd\nd\n1,$p\nQ\n",
+        "foo\nfoo2\nbar\n",
+    );
+}
+
+#[test]
+fn test_ed_interactive_g_substitute() {
+    // G with substitute command
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\nG/foo/\ns/foo/baz/\ns/foo/qux/\n1,$p\nQ\n",
+        "foo\nfoo2\nbaz\nbar\nqux2\n",
+    );
+}
+
+#[test]
+fn test_ed_interactive_g_repeat() {
+    // & should repeat the previous command
+    ed_test(
+        "a\nfoo\nbar\nfoo2\n.\nG/foo/\ns/foo/baz/\n&\n1,$p\nQ\n",
+        "foo\nfoo2\nbaz\nbar\nbaz2\n",
+    );
+}
+
+#[test]
+fn test_ed_interactive_v_skip() {
+    // V with empty response should skip non-matching lines
+    ed_test(
+        "a\nfoo\nbar\nbaz\n.\nV/foo/\n\n\n1,$p\nQ\n",
+        "bar\nbaz\nfoo\nbar\nbaz\n",
+    );
+}
+
+#[test]
+fn test_ed_interactive_v_delete() {
+    // V with d command should delete non-matching lines
+    ed_test(
+        "a\nfoo\nbar\nbaz\n.\nV/foo/\nd\nd\n1,$p\nQ\n",
+        "bar\nbaz\nfoo\n",
+    );
 }
 
 // ============================================================================

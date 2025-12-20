@@ -1062,3 +1062,127 @@ fn test_ed_prompt_with_p_option() {
         expected_exit_code: 0,
     });
 }
+
+// ============================================================================
+// POSIX Compliance: Bare Newline Tests
+// ============================================================================
+
+#[test]
+fn test_ed_bare_newline_prints_next_line() {
+    // POSIX: A bare newline is equivalent to .+1p (print next line)
+    ed_test("a\nline 1\nline 2\nline 3\n.\n1\n\nQ\n", "line 1\nline 2\n");
+}
+
+#[test]
+fn test_ed_bare_newline_multiple() {
+    // Multiple bare newlines should advance through buffer
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\n.\n1\n\n\nQ\n",
+        "line 1\nline 2\nline 3\n",
+    );
+}
+
+// ============================================================================
+// POSIX Compliance: Shell Command Tests (e/r/w !command)
+// ============================================================================
+
+#[test]
+fn test_ed_edit_shell_command() {
+    // e !command should read shell command output into buffer
+    ed_test("e !echo hello\n1p\nQ\n", "hello\n");
+}
+
+#[test]
+fn test_ed_edit_shell_command_multiline() {
+    // Shell command output with multiple lines
+    ed_test("e !printf 'line1\\nline2\\n'\n1,$p\nQ\n", "line1\nline2\n");
+}
+
+#[test]
+fn test_ed_read_shell_command() {
+    // r !command should append shell command output after current line
+    ed_test("a\nfirst\n.\nr !echo second\n1,$p\nQ\n", "first\nsecond\n");
+}
+
+#[test]
+fn test_ed_read_shell_command_at_address() {
+    // r with address should append after that line
+    ed_test(
+        "a\nline1\nline3\n.\n1r !echo line2\n1,$p\nQ\n",
+        "line1\nline2\nline3\n",
+    );
+}
+
+#[test]
+fn test_ed_write_shell_command() {
+    // w !command should pipe buffer to shell command stdin
+    // Use cat to verify the content is piped correctly
+    ed_test("a\nhello world\n.\nw !cat\nQ\n", "hello world\n");
+}
+
+#[test]
+fn test_ed_write_shell_command_range() {
+    // Write range to shell command
+    ed_test(
+        "a\nline1\nline2\nline3\n.\n1,2w !cat\nQ\n",
+        "line1\nline2\n",
+    );
+}
+
+// ============================================================================
+// POSIX Compliance: Nested Global Command Check
+// ============================================================================
+
+#[test]
+fn test_ed_global_nested_g_error() {
+    // g/pattern/g should error - nested g not allowed
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "a\nfoo\nbar\n.\ng/foo/g/bar/p\nQ\n".to_string(),
+        expected_out: "?\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_global_nested_v_error() {
+    // g/pattern/v should error - nested v not allowed
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "a\nfoo\nbar\n.\ng/foo/v/bar/p\nQ\n".to_string(),
+        expected_out: "?\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_global_shell_error() {
+    // g/pattern/! should error - ! not allowed in global
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: "a\nfoo\n.\ng/foo/!echo test\nQ\n".to_string(),
+        expected_out: "?\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// ============================================================================
+// POSIX Compliance: Long Line Folding in List Command
+// ============================================================================
+
+#[test]
+fn test_ed_list_long_line_folding() {
+    // Lines longer than 72 characters should be folded with \ before newline
+    // Create a line with 80 'a' characters
+    let long_line = "a".repeat(80);
+    let stdin = format!("a\n{}\n.\n1l\nQ\n", long_line);
+    // First 72 'a's, then \<newline>, then remaining 8 'a's, then $
+    let expected = format!("{}\\\n{}$\n", "a".repeat(72), "a".repeat(8));
+    ed_test(&stdin, &expected);
+}

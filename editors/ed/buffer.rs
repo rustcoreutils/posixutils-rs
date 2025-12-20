@@ -269,6 +269,39 @@ impl Buffer {
         Ok(byte_count)
     }
 
+    /// Load buffer from a string (for shell command output).
+    /// Does not set pathname.
+    pub fn load_from_string(&mut self, content: &str) {
+        let mut lines = Vec::new();
+        for line in content.lines() {
+            lines.push(format!("{}\n", line));
+        }
+        // Handle case where content doesn't end with newline
+        if !content.is_empty() && !content.ends_with('\n') {
+            // Last line already has \n from the loop above
+        }
+        self.lines = lines;
+        self.cur_line = if self.lines.is_empty() {
+            0
+        } else {
+            self.lines.len()
+        };
+        self.modified = false;
+        self.marks.clear();
+        self.undo_record = None;
+    }
+
+    /// Append content from a string after a line (for shell command output).
+    pub fn append_from_string(&mut self, after_line: usize, content: &str) {
+        let mut lines = Vec::new();
+        for line in content.lines() {
+            lines.push(format!("{}\n", line));
+        }
+        if !lines.is_empty() {
+            self.append(after_line, &lines);
+        }
+    }
+
     /// Read a file and append after a line.
     pub fn read_file_at(&mut self, pathname: &str, after_line: usize) -> io::Result<usize> {
         let file = fs::File::open(pathname)?;

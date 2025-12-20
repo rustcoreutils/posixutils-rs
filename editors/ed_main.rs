@@ -15,6 +15,13 @@ mod ed;
 
 use clap::Parser;
 use std::io::{self, BufReader, BufWriter};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag for SIGINT received
+pub static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// Global flag for SIGHUP received
+pub static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// ed - edit text
 #[derive(Parser, Debug)]
@@ -33,18 +40,27 @@ struct Args {
     file: Option<String>,
 }
 
+/// SIGINT signal handler - sets the SIGINT_RECEIVED flag
+extern "C" fn sigint_handler(_signum: libc::c_int) {
+    SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+/// SIGHUP signal handler - sets the SIGHUP_RECEIVED flag
+extern "C" fn sighup_handler(_signum: libc::c_int) {
+    SIGHUP_RECEIVED.store(true, Ordering::SeqCst);
+}
+
 /// Set up signal handlers per POSIX requirements for ed.
 fn setup_signals() {
     unsafe {
         // SIGQUIT: Ignore (POSIX requirement)
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
 
-        // Note: SIGINT and SIGHUP handling would require more complex
-        // integration with the editor loop. For now, we let the default
-        // behavior apply (SIGINT terminates, SIGHUP terminates).
-        // A full implementation would need to:
-        // - SIGINT: Set a flag, check in main loop, print "?" and continue
-        // - SIGHUP: Save buffer to ed.hup, then exit
+        // SIGINT: Set flag to be checked in main loop
+        libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+
+        // SIGHUP: Set flag to save buffer and exit
+        libc::signal(libc::SIGHUP, sighup_handler as libc::sighandler_t);
     }
 }
 

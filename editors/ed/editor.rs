@@ -14,6 +14,7 @@ use crate::ed::error::{EdError, EdResult};
 use crate::ed::parser::{parse, Address, AddressInfo, Command, PrintMode};
 use regex::Regex;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::Ordering;
 
 /// The ed editor state.
 pub struct Editor<R: BufRead, W: Write> {
@@ -105,6 +106,53 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             writeln!(self.writer, "{}", bytes)?;
         }
         Ok(())
+    }
+
+    /// Execute a shell command and return its stdout as a string.
+    /// Used for `e !command` and `r !command`.
+    fn shell_read(&self, command: &str) -> io::Result<(String, usize)> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+        let bytes = content.len();
+        Ok((content, bytes))
+    }
+
+    /// Execute a shell command with input piped to its stdin.
+    /// Used for `w !command`. Returns bytes written.
+    fn shell_write(&self, command: &str, start: usize, end: usize) -> io::Result<usize> {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let mut bytes = 0;
+        if let Some(ref mut stdin) = child.stdin {
+            for i in start..=end {
+                if let Some(line) = self.buf.get_line(i) {
+                    stdin.write_all(line.as_bytes())?;
+                    bytes += line.len();
+                }
+            }
+        }
+
+        child.wait()?;
+        Ok(bytes)
     }
 
     /// Resolve an address to a line number.
@@ -355,8 +403,18 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     return Err(EdError::NoFilename);
                 }
                 let path = path.clone();
-                let bytes = self.buf.read_file(&path)?;
-                self.print_bytes(bytes)?;
+
+                // POSIX: If path starts with !, execute as shell command
+                if let Some(command) = path.strip_prefix('!') {
+                    let (content, bytes) = self.shell_read(command)?;
+                    // Load content into buffer
+                    self.buf.load_from_string(&content);
+                    // Don't set pathname for shell commands
+                    self.print_bytes(bytes)?;
+                } else {
+                    let bytes = self.buf.read_file(&path)?;
+                    self.print_bytes(bytes)?;
+                }
                 self.quit_warning_given = false;
                 Ok(())
             }
@@ -434,8 +492,16 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     return Err(EdError::NoFilename);
                 }
                 let path = path.clone();
-                let bytes = self.buf.read_file_at(&path, after_line)?;
-                self.print_bytes(bytes)?;
+
+                // POSIX: If path starts with !, execute as shell command
+                if let Some(command) = path.strip_prefix('!') {
+                    let (content, bytes) = self.shell_read(command)?;
+                    self.buf.append_from_string(after_line, &content);
+                    self.print_bytes(bytes)?;
+                } else {
+                    let bytes = self.buf.read_file_at(&path, after_line)?;
+                    self.print_bytes(bytes)?;
+                }
                 Ok(())
             }
             Command::Substitute(addr1, addr2, pattern, replacement, flags) => {
@@ -467,7 +533,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     return Err(EdError::NoFilename);
                 }
                 let path = path.clone();
-                if append {
+
+                // POSIX: If path starts with !, execute as shell command
+                if let Some(command) = path.strip_prefix('!') {
+                    let bytes = self.shell_write(command, start, end)?;
+                    self.print_bytes(bytes)?;
+                } else if append {
                     // Append mode - open file for appending
                     let mut file = std::fs::OpenOptions::new()
                         .create(true)
@@ -627,25 +698,42 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                         // Non-printable: three-digit octal with backslash
                         // $ within text: escaped with backslash
                         // End of line: marked with $
+                        // Long lines: folded with \ before newline
+                        const FOLD_WIDTH: usize = 72;
                         let content = line.trim_end_matches('\n');
+                        let mut col = 0;
+
                         for ch in content.chars() {
-                            match ch {
-                                '\\' => write!(self.writer, "\\\\")?,
-                                '\x07' => write!(self.writer, "\\a")?, // bell
-                                '\x08' => write!(self.writer, "\\b")?, // backspace
-                                '\x0c' => write!(self.writer, "\\f")?, // form feed
-                                '\r' => write!(self.writer, "\\r")?,   // carriage return
-                                '\t' => write!(self.writer, "\\t")?,   // tab
-                                '\x0b' => write!(self.writer, "\\v")?, // vertical tab
-                                '$' => write!(self.writer, "\\$")?,    // escape $ in text
+                            // Get the escaped representation and its width
+                            let (escaped, width) = match ch {
+                                '\\' => ("\\\\".to_string(), 2),
+                                '\x07' => ("\\a".to_string(), 2),
+                                '\x08' => ("\\b".to_string(), 2),
+                                '\x0c' => ("\\f".to_string(), 2),
+                                '\r' => ("\\r".to_string(), 2),
+                                '\t' => ("\\t".to_string(), 2),
+                                '\x0b' => ("\\v".to_string(), 2),
+                                '$' => ("\\$".to_string(), 2),
                                 c if c.is_control() || !c.is_ascii() => {
-                                    // Non-printable as three-digit octal per byte
-                                    for byte in c.to_string().as_bytes() {
-                                        write!(self.writer, "\\{:03o}", byte)?;
+                                    let bytes = c.to_string().into_bytes();
+                                    let mut s = String::new();
+                                    for byte in &bytes {
+                                        s.push_str(&format!("\\{:03o}", byte));
                                     }
+                                    let w = bytes.len() * 4;
+                                    (s, w)
                                 }
-                                c => write!(self.writer, "{}", c)?,
+                                c => (c.to_string(), 1),
+                            };
+
+                            // Check if we need to fold (leave room for the char + potential $)
+                            if col + width > FOLD_WIDTH {
+                                writeln!(self.writer, "\\")?;
+                                col = 0;
                             }
+
+                            write!(self.writer, "{}", escaped)?;
+                            col += width;
                         }
                         writeln!(self.writer, "$")?;
                     }
@@ -840,6 +928,62 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok(())
     }
 
+    /// Check if a command string contains forbidden commands for global.
+    /// POSIX: The commands g, G, v, V, and ! cannot be used in the command-list.
+    fn check_global_commands(&self, commands: &str) -> EdResult<()> {
+        let cmd_str = commands.trim();
+        if cmd_str.is_empty() {
+            return Ok(());
+        }
+
+        // Get the command character (skip any leading address)
+        let cmd_chars: Vec<char> = cmd_str.chars().collect();
+        for (i, &ch) in cmd_chars.iter().enumerate() {
+            // Skip digits, dots, dollars, and address characters
+            if ch.is_ascii_digit()
+                || ch == '.'
+                || ch == '$'
+                || ch == '+'
+                || ch == '-'
+                || ch == ','
+                || ch == ';'
+                || ch == '\''
+                || ch == '/'
+                || ch == '?'
+            {
+                continue;
+            }
+            // Found a potential command character
+            match ch {
+                'g' | 'G' | 'v' | 'V' => {
+                    // Check if this is actually the command (not part of pattern)
+                    // For g/v, they'd be followed by a delimiter
+                    if i + 1 < cmd_chars.len() {
+                        let next = cmd_chars[i + 1];
+                        if !next.is_alphanumeric() && next != ' ' {
+                            return Err(EdError::Generic(
+                                "cannot nest g, G, v, or V commands".to_string(),
+                            ));
+                        }
+                    }
+                    // Single g/G/v/V at end is also forbidden
+                    if i + 1 >= cmd_chars.len() {
+                        return Err(EdError::Generic(
+                            "cannot nest g, G, v, or V commands".to_string(),
+                        ));
+                    }
+                }
+                '!' => {
+                    return Err(EdError::Generic(
+                        "cannot use ! command within global".to_string(),
+                    ));
+                }
+                _ => break, // Found a different command, stop checking
+            }
+        }
+        Ok(())
+    }
+
     /// Execute a global command.
     fn execute_global(
         &mut self,
@@ -849,6 +993,9 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         commands: &str,
         invert: bool,
     ) -> EdResult<()> {
+        // POSIX: Check for forbidden commands
+        self.check_global_commands(commands)?;
+
         let (start, end) = self.resolve_range(&addr1, &addr2)?;
 
         // Use previous pattern if empty
@@ -980,15 +1127,83 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok(())
     }
 
+    /// Check for and handle SIGINT signal.
+    /// Returns true if SIGINT was received and handled.
+    fn check_sigint(&mut self) -> io::Result<bool> {
+        if crate::SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
+            // POSIX: Print "?" and continue
+            writeln!(self.writer, "?")?;
+            self.last_error = Some("Interrupt".to_string());
+            // If in input mode, exit input mode without completing the command
+            if self.in_input_mode {
+                self.in_input_mode = false;
+                self.pending_command = None;
+                self.input_lines.clear();
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Check for and handle SIGHUP signal.
+    /// Returns true if SIGHUP was received (caller should exit).
+    fn check_sighup(&mut self) -> bool {
+        if crate::SIGHUP_RECEIVED.swap(false, Ordering::SeqCst) {
+            // POSIX: If buffer is modified, attempt to save to ed.hup
+            if self.buf.modified && self.buf.line_count() > 0 {
+                self.save_hup_file();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Save buffer to ed.hup file per POSIX requirements.
+    /// Tries current directory first, then $HOME.
+    fn save_hup_file(&mut self) {
+        let paths_to_try = [
+            Some("ed.hup".to_string()),
+            std::env::var("HOME").ok().map(|h| format!("{}/ed.hup", h)),
+        ];
+
+        for path_opt in paths_to_try.iter().flatten() {
+            if self
+                .buf
+                .write_to_file(1, self.buf.line_count(), path_opt)
+                .is_ok()
+            {
+                // Successfully saved
+                return;
+            }
+        }
+        // If we couldn't save anywhere, nothing more we can do
+    }
+
     /// Run the main editor loop.
     pub fn run(&mut self) -> io::Result<()> {
         loop {
+            // Check for SIGHUP - exit if received
+            if self.check_sighup() {
+                break;
+            }
+
+            // Check for SIGINT - print "?" and continue
+            self.check_sigint()?;
+
             self.print_prompt()?;
 
             let line = match self.read_line()? {
                 Some(l) => l,
                 None => break,
             };
+
+            // Check signals again after potentially blocking on input
+            if self.check_sighup() {
+                break;
+            }
+            if self.check_sigint()? {
+                continue; // SIGINT during input - restart loop
+            }
 
             if !self.process_line(&line)? {
                 break;

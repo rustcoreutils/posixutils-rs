@@ -106,16 +106,23 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
     /// Resolve an address to a line number.
     fn resolve_address(&self, addr: &Address) -> EdResult<usize> {
+        self.resolve_address_with_base(addr, self.buf.cur_line)
+    }
+
+    /// Resolve an address to a line number, using a specific base for current line.
+    /// This is needed for semicolon separator semantics where the second address
+    /// should be resolved relative to the first address.
+    fn resolve_address_with_base(&self, addr: &Address, base_line: usize) -> EdResult<usize> {
         let mut line = match &addr.info {
-            AddressInfo::Null => self.buf.cur_line,
-            AddressInfo::Current => self.buf.cur_line,
+            AddressInfo::Null => base_line,
+            AddressInfo::Current => base_line,
             AddressInfo::Last => self.buf.last_line(),
             AddressInfo::Line(n) => *n,
             AddressInfo::Mark(c) => self.buf.get_mark(*c).ok_or(EdError::InvalidAddress)?,
-            AddressInfo::RegexForward(pat) => self.search_forward(pat)?,
-            AddressInfo::RegexBack(pat) => self.search_backward(pat)?,
+            AddressInfo::RegexForward(pat) => self.search_forward_from(pat, base_line)?,
+            AddressInfo::RegexBack(pat) => self.search_backward_from(pat, base_line)?,
             AddressInfo::Offset(off) => {
-                let new_line = self.buf.cur_line as isize + off;
+                let new_line = base_line as isize + off;
                 if new_line < 0 {
                     return Err(EdError::AddressOutOfRange);
                 }
@@ -140,8 +147,22 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok(line)
     }
 
-    /// Search forward for a pattern.
-    fn search_forward(&self, pattern: &str) -> EdResult<usize> {
+    /// Resolve an address range, handling semicolon separator semantics.
+    /// When addr2.relative_to_first is true (semicolon separator), addr2 is
+    /// resolved using addr1's value as the current line.
+    fn resolve_range(&self, addr1: &Address, addr2: &Address) -> EdResult<(usize, usize)> {
+        let start = self.resolve_address(addr1)?;
+        let end = if addr2.relative_to_first {
+            // Semicolon separator: resolve second address relative to first
+            self.resolve_address_with_base(addr2, start)?
+        } else {
+            self.resolve_address(addr2)?
+        };
+        Ok((start, end))
+    }
+
+    /// Search forward for a pattern from a specific starting line.
+    fn search_forward_from(&self, pattern: &str, from_line: usize) -> EdResult<usize> {
         let pat = if pattern.is_empty() {
             self.last_pattern
                 .as_ref()
@@ -153,8 +174,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
 
-        // Search from current line + 1 to end, then wrap to start
-        let start = self.buf.cur_line;
+        // Search from starting line + 1 to end, then wrap to start
+        let start = from_line;
         let total = self.buf.line_count();
 
         if total == 0 {
@@ -173,8 +194,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Err(EdError::NoMatch)
     }
 
-    /// Search backward for a pattern.
-    fn search_backward(&self, pattern: &str) -> EdResult<usize> {
+    /// Search backward for a pattern from a specific starting line.
+    fn search_backward_from(&self, pattern: &str, from_line: usize) -> EdResult<usize> {
         let pat = if pattern.is_empty() {
             self.last_pattern
                 .as_ref()
@@ -186,7 +207,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         let re = Regex::new(&pat).map_err(|e| EdError::Syntax(e.to_string()))?;
 
-        let start = self.buf.cur_line;
+        let start = from_line;
         let total = self.buf.line_count();
 
         if total == 0 {
@@ -278,8 +299,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 self.buf.insert(insert_at, &lines);
             }
             Command::Change(addr1, addr2) => {
-                let start = self.resolve_address(&addr1)?;
-                let end = self.resolve_address(&addr2)?;
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 self.buf.change(start, end, &lines)?;
             }
             _ => {}
@@ -304,8 +324,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 Ok(())
             }
             Command::Delete(ref addr1, ref addr2) => {
-                let start = self.resolve_address(addr1)?;
-                let end = self.resolve_address(addr2)?;
+                let (start, end) = self.resolve_range(addr1, addr2)?;
                 self.buf.delete(start, end)?;
                 Ok(())
             }
@@ -355,8 +374,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 Ok(())
             }
             Command::Join(addr1, addr2) => {
-                let start = self.resolve_address(&addr1)?;
-                let end = self.resolve_address(&addr2)?;
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 self.buf.join(start, end)?;
                 Ok(())
             }
@@ -367,8 +385,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
             Command::ListLines(addr1, addr2) => self.print_lines(&addr1, &addr2, PrintMode::List),
             Command::Move(addr1, addr2, dest) => {
-                let start = self.resolve_address(&addr1)?;
-                let end = self.resolve_address(&addr2)?;
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 let dest_line = self.resolve_address(&dest)?;
                 self.buf.move_lines(start, end, dest_line)?;
                 Ok(())
@@ -408,8 +425,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 self.execute_substitute(&addr1, &addr2, &pattern, &replacement, &flags)
             }
             Command::Copy(addr1, addr2, dest) => {
-                let start = self.resolve_address(&addr1)?;
-                let end = self.resolve_address(&addr2)?;
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 let dest_line = self.resolve_address(&dest)?;
                 self.buf.copy_lines(start, end, dest_line)?;
                 Ok(())
@@ -422,8 +438,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 }
             }
             Command::Write(addr1, addr2, filename, append) => {
-                let start = self.resolve_address(&addr1)?;
-                let end = self.resolve_address(&addr2)?;
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 let path = filename.as_ref().unwrap_or(&self.buf.pathname);
                 if path.is_empty() {
                     return Err(EdError::NoFilename);
@@ -448,8 +463,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 Ok(())
             }
             Command::WriteQuit(addr1, addr2, filename) => {
-                let start = self.resolve_address(&addr1)?;
-                let end = self.resolve_address(&addr2)?;
+                let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 let path = filename.as_ref().unwrap_or(&self.buf.pathname);
                 if path.is_empty() {
                     return Err(EdError::NoFilename);
@@ -512,8 +526,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
     /// Print lines with the specified mode.
     fn print_lines(&mut self, addr1: &Address, addr2: &Address, mode: PrintMode) -> EdResult<()> {
-        let start = self.resolve_address(addr1)?;
-        let end = self.resolve_address(addr2)?;
+        let (start, end) = self.resolve_range(addr1, addr2)?;
 
         if start == 0 || end == 0 {
             return Err(EdError::AddressOutOfRange);
@@ -561,8 +574,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         replacement: &str,
         flags: &str,
     ) -> EdResult<()> {
-        let start = self.resolve_address(addr1)?;
-        let end = self.resolve_address(addr2)?;
+        let (start, end) = self.resolve_range(addr1, addr2)?;
 
         // Use previous pattern if empty
         let pat = if pattern.is_empty() {
@@ -684,8 +696,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         commands: &str,
         invert: bool,
     ) -> EdResult<()> {
-        let start = self.resolve_address(&addr1)?;
-        let end = self.resolve_address(&addr2)?;
+        let (start, end) = self.resolve_range(&addr1, &addr2)?;
 
         // Use previous pattern if empty
         let pat = if pattern.is_empty() {

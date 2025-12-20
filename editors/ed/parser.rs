@@ -173,6 +173,10 @@ pub enum AddressInfo {
 pub struct Address {
     pub info: AddressInfo,
     pub offsets: Vec<isize>,
+    /// If true, this address was preceded by a semicolon separator,
+    /// meaning it should be resolved relative to the first address
+    /// (POSIX requirement for `;` separator)
+    pub relative_to_first: bool,
 }
 
 impl Address {
@@ -180,6 +184,7 @@ impl Address {
         Address {
             info: AddressInfo::Null,
             offsets: Vec::new(),
+            relative_to_first: false,
         }
     }
 
@@ -187,6 +192,7 @@ impl Address {
         Address {
             info: AddressInfo::Current,
             offsets: Vec::new(),
+            relative_to_first: false,
         }
     }
 }
@@ -389,6 +395,9 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
                     Token::AddressSeparator(ch) => {
                         addrvec.push(addr);
                         addr = Address::new();
+                        // Mark this address as relative to first if preceded by semicolon
+                        // (POSIX: semicolon sets current line to first address before evaluating second)
+                        addr.relative_to_first = ch == ';';
                         state = ParseState::Address;
                         separator = Some(ch);
                     }
@@ -414,18 +423,27 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
                     Token::AddressSeparator(ch) => {
                         state = ParseState::Address;
                         separator = Some(ch);
+                        // When we push the current address and create a new one,
+                        // the new address needs to know if it should be relative to first
+                        if addr_dirty {
+                            addrvec.push(addr);
+                            addr = Address::new();
+                            addr.relative_to_first = ch == ';';
+                            addr_dirty = false;
+                        }
                     }
                     Token::Offset(i) => addr.offsets.push(i),
                     Token::Command(_) | Token::Rest(_) => {
                         tokens.insert(0, token);
                         state = ParseState::Command;
+                        // Push current address before transitioning to command state
+                        if addr_dirty {
+                            addrvec.push(addr);
+                            addr = Address::new();
+                            addr_dirty = false;
+                        }
                     }
                     _ => return Err(EdError::Syntax("unexpected token".to_string())),
-                }
-                if addr_dirty {
-                    addrvec.push(addr);
-                    addr = Address::new();
-                    addr_dirty = false;
                 }
             }
             ParseState::Command => match token {
@@ -462,6 +480,7 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
     Ok(Command::Goto(Address {
         info: AddressInfo::Offset(1),
         offsets: Vec::new(),
+        relative_to_first: false,
     }))
 }
 

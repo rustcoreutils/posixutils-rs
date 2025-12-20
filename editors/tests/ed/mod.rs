@@ -287,3 +287,110 @@ fn test_ed_help_mode() {
     // H toggles help mode, then an invalid command should show the error message
     ed_test("H\nQ\n", "");
 }
+
+// ============================================================================
+// Address Separator Tests (POSIX compliance)
+// ============================================================================
+
+#[test]
+fn test_ed_semicolon_separator() {
+    // Semicolon separator: second address is relative to first
+    // 2;+1p should print lines 2 and 3 (2 and 2+1)
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\nline 5\n.\n2;+1p\nQ\n",
+        "line 2\nline 3\n",
+    );
+}
+
+#[test]
+fn test_ed_comma_separator() {
+    // Comma separator: second address is relative to current line (which is 5 at end)
+    // After adding 5 lines, current line is 5
+    // 2,4p should print lines 2 to 4
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\nline 5\n.\n2,4p\nQ\n",
+        "line 2\nline 3\nline 4\n",
+    );
+}
+
+#[test]
+fn test_ed_semicolon_with_offset() {
+    // 3;+2p should print lines 3, 4, 5 (3 to 3+2)
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\nline 5\n.\n3;+2p\nQ\n",
+        "line 3\nline 4\nline 5\n",
+    );
+}
+
+#[test]
+fn test_ed_semicolon_current_line() {
+    // Go to line 2, then ;+2p should print from current line (2) to 2+2=4
+    ed_test(
+        "a\nline 1\nline 2\nline 3\nline 4\nline 5\n.\n2\n;+2p\nQ\n",
+        "line 2\nline 2\nline 3\nline 4\n",
+    );
+}
+
+// ============================================================================
+// Additional File Operation Tests
+// ============================================================================
+
+#[test]
+fn test_ed_edit_command() {
+    // Test edit command with a file
+    let temp = NamedTempFile::new().unwrap();
+    fs::write(temp.path(), "test content\n").unwrap();
+
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: format!("e {}\n1p\nq\n", temp.path().to_string_lossy()),
+        expected_out: "test content\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_ed_filename_command() {
+    // Test f command - sets filename then prints it
+    // The output will be the temp file path, which we verify by checking it's printed
+    let temp = NamedTempFile::new().unwrap();
+    fs::write(temp.path(), "content\n").unwrap();
+    let path = temp.path().to_string_lossy().to_string();
+
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string(), path.clone()],
+        stdin_data: "f\nq\n".to_string(),
+        expected_out: format!("{}\n", path),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// ============================================================================
+// Address Offset Tests
+// ============================================================================
+
+#[test]
+fn test_ed_positive_offset() {
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n1\n+1p\nQ\n",
+        "line 1\nline 2\n",
+    );
+}
+
+#[test]
+fn test_ed_negative_offset() {
+    ed_test(
+        "a\nline 1\nline 2\nline 3\n.\n3\n-1p\nQ\n",
+        "line 3\nline 2\n",
+    );
+}
+
+#[test]
+fn test_ed_multiple_offsets() {
+    // 1+1+1 should be line 3
+    ed_test("a\nline 1\nline 2\nline 3\n.\n1+1+1p\nQ\n", "line 3\n");
+}

@@ -184,6 +184,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcs (IPC)
  - [x] kill
  - [x] logger
+ - [x] patch
  - [x] ps
  - [x] stty
  - [x] tabs
@@ -212,7 +213,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Misc. category
  - [ ] lp
- - [ ] patch
 
 ## Installation
 

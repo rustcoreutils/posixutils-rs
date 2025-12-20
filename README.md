@@ -78,6 +78,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] dirname
  - [x] du
  - [x] echo
+ - [x] ed (Editors)
  - [x] ex (Editors)
  - [x] expand
  - [x] expr
@@ -207,9 +208,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
  - [ ] ngettext (i18n)
-
-### Editors category
- - [ ] ed (Editors)
 
 ### Misc. category
  - [ ] lp

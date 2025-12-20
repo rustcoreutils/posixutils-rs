@@ -1333,7 +1333,7 @@ fn print_multiline_binary(line: &str) {
 
 /// Find first label in [`Script`] that has duplicates
 fn find_first_repeated_label(vec: Vec<String>) -> Option<String> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::with_capacity(vec.len());
     for item in &vec {
         *counts.entry(item).or_insert(0) += 1;
     }

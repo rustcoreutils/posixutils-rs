@@ -26,6 +26,11 @@ use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
+/// Default capacity for variable mapping HashMaps during IR linearization
+const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
+/// Default capacity for label/static HashMaps (typically smaller)
+const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
+
 /// Information about a local variable
 #[derive(Clone)]
 struct LocalVarInfo {
@@ -127,9 +132,9 @@ impl<'a> Linearizer<'a> {
             current_bb: None,
             next_pseudo: 0,
             next_bb: 0,
-            var_map: HashMap::new(),
-            locals: HashMap::new(),
-            label_map: HashMap::new(),
+            var_map: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
+            locals: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
+            label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::new(),
             continue_targets: Vec::new(),
             run_ssa: true, // Enable SSA conversion by default
@@ -142,7 +147,7 @@ impl<'a> Linearizer<'a> {
             current_func_name: String::new(),
             static_local_counter: 0,
             compound_literal_counter: 0,
-            static_locals: HashMap::new(),
+            static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             current_pos: None,
             target,
             current_func_is_non_static_inline: false,

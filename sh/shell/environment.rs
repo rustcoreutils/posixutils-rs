@@ -174,7 +174,7 @@ impl Environment {
     }
 
     pub fn exported(&self) -> impl Iterator<Item = (&String, &String)> {
-        let mut exported = HashMap::new();
+        let mut exported = HashMap::with_capacity(self.global_scope.len());
         for (name, var) in &self.global_scope {
             if var.export {
                 if let Some(value) = &var.value {

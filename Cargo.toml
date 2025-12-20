@@ -23,6 +23,7 @@ members = [
 	"pathnames",
 	"pax",
 	"plib",
+	"print",
 	"process",
 	"sccs",
 	"screen",

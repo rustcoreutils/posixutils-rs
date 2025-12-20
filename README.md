@@ -185,6 +185,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcs (IPC)
  - [x] kill
  - [x] logger
+ - [x] lp
  - [x] patch
  - [x] ps
  - [x] stty
@@ -208,9 +209,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
  - [ ] ngettext (i18n)
-
-### Misc. category
- - [ ] lp
 
 ## Installation
 

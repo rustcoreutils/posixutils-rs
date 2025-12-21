@@ -23,6 +23,9 @@ use crate::diag;
 use crate::os;
 use crate::target::Target;
 
+/// Default capacity for macro HashMap (covers predefined macros + typical program macros)
+const DEFAULT_MACRO_CAPACITY: usize = 32;
+
 // ============================================================================
 // Macro Definition
 // ============================================================================
@@ -390,7 +393,7 @@ impl<'a> Preprocessor<'a> {
 
         let mut pp = Self {
             target,
-            macros: HashMap::new(),
+            macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
             cond_stack: Vec::new(),
             system_include_paths: Vec::new(),
             quote_include_paths: Vec::new(),

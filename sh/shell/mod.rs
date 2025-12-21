@@ -44,6 +44,9 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::{env, io};
 
+/// Default capacity for cached command locations HashMap
+const DEFAULT_COMMAND_CACHE_CAPACITY: usize = 64;
+
 pub mod environment;
 pub mod history;
 pub mod opened_files;
@@ -1058,7 +1061,7 @@ impl Default for Shell {
             background_jobs: JobManager::default(),
             history: History::new(32767),
             umask: !0o022 & 0o777,
-            saved_command_locations: HashMap::new(),
+            saved_command_locations: HashMap::with_capacity(DEFAULT_COMMAND_CACHE_CAPACITY),
             is_subshell: false,
             last_pipeline_command: String::new(),
             terminal: Terminal::default(),

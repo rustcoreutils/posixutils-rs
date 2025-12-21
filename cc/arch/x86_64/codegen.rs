@@ -1898,7 +1898,7 @@ impl X86_64CodeGen {
         // First pass: determine which args go on stack
         // For variadic calls: variadic INTEGER args go on stack, variadic FLOAT args use XMM
         // For non-variadic calls: overflow args go on stack
-        let mut stack_arg_indices = Vec::new();
+        let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
         let mut temp_int_idx = 0;
         let mut temp_fp_idx = 0;
 
@@ -3734,22 +3734,23 @@ impl X86_64CodeGen {
         // Build operand strings for asm substitution
         // For constraints requiring specific registers (a,b,c,d,S,D), we use those registers
         // and emit mov instructions to/from the actual locations.
-        let mut operand_regs: Vec<Option<Reg>> = Vec::new();
-        let mut operand_mem: Vec<Option<String>> = Vec::new();
-        let mut operand_names: Vec<Option<String>> = Vec::new();
+        let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
+        let mut operand_regs: Vec<Option<Reg>> = Vec::with_capacity(operand_count);
+        let mut operand_mem: Vec<Option<String>> = Vec::with_capacity(operand_count);
+        let mut operand_names: Vec<Option<String>> = Vec::with_capacity(operand_count);
 
         // Track which outputs need to be moved from specific registers after asm
         // (output_idx, specific_reg, actual_loc)
-        let mut output_moves: Vec<(usize, Reg, Loc)> = Vec::new();
+        let mut output_moves: Vec<(usize, Reg, Loc)> = Vec::with_capacity(asm_data.outputs.len());
 
         // Track which inputs need to be moved to specific registers before asm
         // (specific_reg, actual_loc)
-        let mut input_moves: Vec<(Reg, Loc)> = Vec::new();
+        let mut input_moves: Vec<(Reg, Loc)> = Vec::with_capacity(asm_data.inputs.len());
 
         // Track register remaps: if an allocated reg conflicts with reserved, use temp
         // (original_reg, temp_reg, actual_loc for restore)
-        let mut remap_setup: Vec<(Reg, Reg, Loc)> = Vec::new();
-        let mut remap_restore: Vec<(Reg, Reg, Loc)> = Vec::new();
+        let mut remap_setup: Vec<(Reg, Reg, Loc)> = Vec::with_capacity(operand_count);
+        let mut remap_restore: Vec<(Reg, Reg, Loc)> = Vec::with_capacity(operand_count);
 
         // Track which pseudos have been assigned temp registers (for +r where input/output share pseudo)
         let mut pseudo_to_temp: std::collections::HashMap<PseudoId, Reg> =

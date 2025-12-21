@@ -14,6 +14,9 @@ use crate::strings::StringId;
 use crate::types::TypeId;
 use std::collections::HashMap;
 
+/// Default capacity for symbol table name lookup HashMap
+const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 256;
+
 // ============================================================================
 // Symbol ID
 // ============================================================================
@@ -234,7 +237,7 @@ impl SymbolTable {
             scopes: Vec::new(),
             current_scope: 0,
             scope_depth: 0,
-            name_map: HashMap::new(),
+            name_map: HashMap::with_capacity(DEFAULT_SYMBOL_MAP_CAPACITY),
         };
         // Create the global scope
         table.scopes.push(Scope::new(None));

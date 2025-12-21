@@ -302,7 +302,7 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
     let mut created_files = HashSet::new();
 
     // inode of source -> target path
-    let mut inode_map = HashMap::new();
+    let mut inode_map = HashMap::with_capacity(sources.len());
 
     // Postpone deletion when moving across filesystems because it would
     // otherwise error when copying dangling hard links

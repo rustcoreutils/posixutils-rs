@@ -61,7 +61,7 @@ fn strtod(s: &str) -> f64 {
 }
 
 fn gather_values(stack: &mut Stack, count: u16) -> Result<Vec<AwkValue>, String> {
-    let mut values = Vec::new();
+    let mut values = Vec::with_capacity(count as usize);
     for _ in 0..count {
         values.push(stack.pop_scalar_value()?);
     }
@@ -73,7 +73,7 @@ fn print_to_string(
     argc: u16,
     global_env: &GlobalEnv,
 ) -> Result<AwkString, String> {
-    let mut values = Vec::new();
+    let mut values = Vec::with_capacity(argc as usize);
     for _ in 0..argc {
         values.push(
             stack

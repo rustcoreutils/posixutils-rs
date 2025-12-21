@@ -10,7 +10,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -94,7 +94,7 @@ fn validate_uri(dest: &str) -> Result<Uri, String> {
 
 /// Read input data from a file or stdin.
 /// Note: Copy mode (-c) is effectively always-on since IPP requires full data upload.
-fn read_input(path: &PathBuf) -> Result<Vec<u8>, io::Error> {
+fn read_input(path: &Path) -> Result<Vec<u8>, io::Error> {
     let path_str = path.to_string_lossy();
     if path_str == "-" {
         let mut data = Vec::new();
@@ -199,7 +199,7 @@ fn send_print_job(
     Ok(job_id)
 }
 
-fn do_lp(args: Args) -> Result<(), String> {
+fn do_lp(mut args: Args) -> Result<(), String> {
     // Get and validate destination
     let dest = get_destination(&args)?;
     let uri = validate_uri(&dest)?;
@@ -208,7 +208,7 @@ fn do_lp(args: Args) -> Result<(), String> {
     let files: Vec<PathBuf> = if args.files.is_empty() {
         vec![PathBuf::from("-")]
     } else {
-        args.files.clone()
+        std::mem::take(&mut args.files)
     };
 
     // Process each file

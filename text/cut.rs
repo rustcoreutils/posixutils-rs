@@ -126,7 +126,7 @@ fn is_character_boundary(bytes: &[u8]) -> bool {
 /// A vector containing the selected bytes from the input line based on the specified ranges.
 ///
 fn cut_bytes(line: &[u8], delim: Option<char>, ranges: &Vec<(i32, i32)>, n: bool) -> Vec<u8> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(line.len());
 
     for (start, end) in ranges {
         let mut start = *start as usize;

@@ -838,9 +838,11 @@ impl<'a> Linearizer<'a> {
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
         // so member access works properly
-        let mut struct_params: Vec<(String, TypeId, PseudoId)> = Vec::new();
+        let mut struct_params: Vec<(String, TypeId, PseudoId)> =
+            Vec::with_capacity(func.params.len());
         // Complex parameters also need local storage for real/imag access
-        let mut complex_params: Vec<(String, TypeId, PseudoId)> = Vec::new();
+        let mut complex_params: Vec<(String, TypeId, PseudoId)> =
+            Vec::with_capacity(func.params.len());
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param

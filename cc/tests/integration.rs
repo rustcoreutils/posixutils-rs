@@ -9,7 +9,10 @@
 // Integration test harness for pcc
 //
 
+mod cflow;
 mod common;
+mod ctags;
+mod cxref;
 mod datatypes;
 mod features;
 mod globals;

@@ -1,0 +1,560 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// cxref - generate a C-language program cross-reference table
+//
+// POSIX cxref utility: analyzes C source files and builds a cross-reference
+// table of all symbols, showing where they are defined and used.
+//
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Stmt};
+use posixutils_cc::parse::Parser as CParser;
+use posixutils_cc::strings::StringTable;
+use posixutils_cc::symbol::SymbolTable;
+use posixutils_cc::target::Target;
+use posixutils_cc::token::{preprocess_with_defines, StreamTable, Tokenizer};
+use posixutils_cc::types::TypeTable;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+use std::path::Path;
+use std::process::ExitCode;
+
+// ============================================================================
+// CLI
+// ============================================================================
+
+#[derive(Parser)]
+#[command(version, about = gettext("cxref - generate a C-language program cross-reference table"))]
+struct Args {
+    /// Write combined cross-reference of all input files
+    #[arg(short = 'c', long, help = gettext("Combine all input files"))]
+    combined: bool,
+
+    /// Operate silently (do not print input filenames)
+    #[arg(short = 's', long, help = gettext("Silent mode, suppress filenames"))]
+    silent: bool,
+
+    /// Direct output to named file
+    #[arg(short = 'o', long, help = gettext("Write output to file"))]
+    output: Option<String>,
+
+    /// Format output no wider than num columns
+    #[arg(short = 'w', long, default_value = "80", help = gettext("Maximum output width"))]
+    width: usize,
+
+    /// Preprocessor defines
+    #[arg(short = 'D', action = clap::ArgAction::Append)]
+    defines: Vec<String>,
+
+    /// Include paths
+    #[arg(short = 'I', action = clap::ArgAction::Append)]
+    include_paths: Vec<String>,
+
+    /// Undefine macros
+    #[arg(short = 'U', action = clap::ArgAction::Append)]
+    undefines: Vec<String>,
+
+    /// Input files
+    #[arg(required = true)]
+    files: Vec<String>,
+}
+
+// ============================================================================
+// Symbol Reference
+// ============================================================================
+
+/// A reference to a symbol
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SymbolRef {
+    /// Line number
+    line: u32,
+    /// Is this the declaring/defining reference?
+    is_definition: bool,
+}
+
+/// Information about a symbol across files
+#[derive(Debug, Clone)]
+struct SymbolInfo {
+    /// References organized by file, then by function scope
+    /// Map: file -> Map: function (or empty for global) -> refs
+    refs: BTreeMap<String, BTreeMap<String, BTreeSet<SymbolRef>>>,
+}
+
+impl SymbolInfo {
+    fn new() -> Self {
+        Self {
+            refs: BTreeMap::new(),
+        }
+    }
+
+    fn add_ref(&mut self, file: &str, function: &str, line: u32, is_definition: bool) {
+        self.refs
+            .entry(file.to_string())
+            .or_default()
+            .entry(function.to_string())
+            .or_default()
+            .insert(SymbolRef {
+                line,
+                is_definition,
+            });
+    }
+}
+
+/// Cross-reference table
+struct CrossRef {
+    /// All symbols: name -> info
+    symbols: BTreeMap<String, SymbolInfo>,
+    /// Current file being processed
+    current_file: String,
+    /// Current function scope (empty string for global)
+    current_function: String,
+}
+
+impl CrossRef {
+    fn new() -> Self {
+        Self {
+            symbols: BTreeMap::new(),
+            current_file: String::new(),
+            current_function: String::new(),
+        }
+    }
+
+    fn set_file(&mut self, file: &str) {
+        self.current_file = file.to_string();
+    }
+
+    fn set_function(&mut self, func: &str) {
+        self.current_function = func.to_string();
+    }
+
+    fn add_definition(&mut self, name: &str, line: u32) {
+        self.symbols
+            .entry(name.to_string())
+            .or_insert_with(SymbolInfo::new)
+            .add_ref(&self.current_file, &self.current_function, line, true);
+    }
+
+    fn add_reference(&mut self, name: &str, line: u32) {
+        self.symbols
+            .entry(name.to_string())
+            .or_insert_with(SymbolInfo::new)
+            .add_ref(&self.current_file, &self.current_function, line, false);
+    }
+}
+
+// ============================================================================
+// AST Walking
+// ============================================================================
+
+/// Walk an expression to find symbol references
+fn extract_refs_from_expr(
+    expr: &posixutils_cc::parse::ast::Expr,
+    strings: &StringTable,
+    xref: &mut CrossRef,
+) {
+    match &expr.kind {
+        ExprKind::Ident { name } => {
+            let sym_name = strings.get(*name).to_string();
+            xref.add_reference(&sym_name, expr.pos.line);
+        }
+        ExprKind::Call { func, args } => {
+            extract_refs_from_expr(func, strings, xref);
+            for arg in args {
+                extract_refs_from_expr(arg, strings, xref);
+            }
+        }
+        ExprKind::Unary { operand, .. } => {
+            extract_refs_from_expr(operand, strings, xref);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            extract_refs_from_expr(left, strings, xref);
+            extract_refs_from_expr(right, strings, xref);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            extract_refs_from_expr(target, strings, xref);
+            extract_refs_from_expr(value, strings, xref);
+        }
+        ExprKind::PostInc(e) | ExprKind::PostDec(e) => {
+            extract_refs_from_expr(e, strings, xref);
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            extract_refs_from_expr(cond, strings, xref);
+            extract_refs_from_expr(then_expr, strings, xref);
+            extract_refs_from_expr(else_expr, strings, xref);
+        }
+        ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
+            extract_refs_from_expr(expr, strings, xref);
+        }
+        ExprKind::Index { array, index } => {
+            extract_refs_from_expr(array, strings, xref);
+            extract_refs_from_expr(index, strings, xref);
+        }
+        ExprKind::Cast { expr, .. } => {
+            extract_refs_from_expr(expr, strings, xref);
+        }
+        ExprKind::SizeofExpr(e) => {
+            extract_refs_from_expr(e, strings, xref);
+        }
+        ExprKind::Comma(exprs) => {
+            for e in exprs {
+                extract_refs_from_expr(e, strings, xref);
+            }
+        }
+        ExprKind::InitList { elements } | ExprKind::CompoundLiteral { elements, .. } => {
+            for elem in elements {
+                extract_refs_from_expr(&elem.value, strings, xref);
+            }
+        }
+        ExprKind::VaStart { ap, .. } => {
+            extract_refs_from_expr(ap, strings, xref);
+        }
+        ExprKind::VaArg { ap, .. } => {
+            extract_refs_from_expr(ap, strings, xref);
+        }
+        ExprKind::VaEnd { ap } => {
+            extract_refs_from_expr(ap, strings, xref);
+        }
+        ExprKind::VaCopy { dest, src } => {
+            extract_refs_from_expr(dest, strings, xref);
+            extract_refs_from_expr(src, strings, xref);
+        }
+        ExprKind::Bswap16 { arg }
+        | ExprKind::Bswap32 { arg }
+        | ExprKind::Bswap64 { arg }
+        | ExprKind::Ctz { arg }
+        | ExprKind::Ctzl { arg }
+        | ExprKind::Ctzll { arg }
+        | ExprKind::Clz { arg }
+        | ExprKind::Clzl { arg }
+        | ExprKind::Clzll { arg }
+        | ExprKind::Popcount { arg }
+        | ExprKind::Popcountl { arg }
+        | ExprKind::Popcountll { arg }
+        | ExprKind::Alloca { size: arg } => {
+            extract_refs_from_expr(arg, strings, xref);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a statement to find symbol references
+fn extract_refs_from_stmt(stmt: &Stmt, strings: &StringTable, xref: &mut CrossRef) {
+    match stmt {
+        Stmt::Empty => {}
+        Stmt::Expr(expr) => {
+            extract_refs_from_expr(expr, strings, xref);
+        }
+        Stmt::Block(items) => {
+            for item in items {
+                match item {
+                    posixutils_cc::parse::ast::BlockItem::Statement(s) => {
+                        extract_refs_from_stmt(s, strings, xref);
+                    }
+                    posixutils_cc::parse::ast::BlockItem::Declaration(decl) => {
+                        for d in &decl.declarators {
+                            let name = strings.get(d.name).to_string();
+                            // Local variable definition
+                            // Note: we don't have position for declarations, use 0
+                            if let Some(init) = &d.init {
+                                xref.add_definition(&name, init.pos.line);
+                                extract_refs_from_expr(init, strings, xref);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Stmt::If {
+            cond,
+            then_stmt,
+            else_stmt,
+        } => {
+            extract_refs_from_expr(cond, strings, xref);
+            extract_refs_from_stmt(then_stmt, strings, xref);
+            if let Some(else_s) = else_stmt {
+                extract_refs_from_stmt(else_s, strings, xref);
+            }
+        }
+        Stmt::While { cond, body } => {
+            extract_refs_from_expr(cond, strings, xref);
+            extract_refs_from_stmt(body, strings, xref);
+        }
+        Stmt::DoWhile { body, cond } => {
+            extract_refs_from_stmt(body, strings, xref);
+            extract_refs_from_expr(cond, strings, xref);
+        }
+        Stmt::For {
+            init,
+            cond,
+            post,
+            body,
+        } => {
+            if let Some(i) = init {
+                match i {
+                    posixutils_cc::parse::ast::ForInit::Expression(e) => {
+                        extract_refs_from_expr(e, strings, xref);
+                    }
+                    posixutils_cc::parse::ast::ForInit::Declaration(d) => {
+                        for decl in &d.declarators {
+                            let name = strings.get(decl.name).to_string();
+                            if let Some(init_expr) = &decl.init {
+                                xref.add_definition(&name, init_expr.pos.line);
+                                extract_refs_from_expr(init_expr, strings, xref);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(c) = cond {
+                extract_refs_from_expr(c, strings, xref);
+            }
+            if let Some(p) = post {
+                extract_refs_from_expr(p, strings, xref);
+            }
+            extract_refs_from_stmt(body, strings, xref);
+        }
+        Stmt::Return(Some(expr)) => {
+            extract_refs_from_expr(expr, strings, xref);
+        }
+        Stmt::Switch { expr, body } => {
+            extract_refs_from_expr(expr, strings, xref);
+            extract_refs_from_stmt(body, strings, xref);
+        }
+        Stmt::Case(expr) => {
+            extract_refs_from_expr(expr, strings, xref);
+        }
+        Stmt::Label { stmt, .. } => {
+            extract_refs_from_stmt(stmt, strings, xref);
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// File Processing
+// ============================================================================
+
+fn process_file(
+    path: &str,
+    streams: &mut StreamTable,
+    xref: &mut CrossRef,
+    defines: &[String],
+    undefines: &[String],
+) -> io::Result<()> {
+    // Read file content
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer)?;
+
+    xref.set_file(path);
+
+    // Create stream
+    let stream_id = streams.add(path.to_string());
+
+    // Create string table for identifier interning
+    let mut strings = StringTable::new();
+
+    // Tokenize
+    let tokens = {
+        let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
+        tokenizer.tokenize()
+    };
+
+    // Preprocess
+    let target = Target::host();
+    let preprocessed =
+        preprocess_with_defines(tokens, &target, &mut strings, path, defines, undefines);
+
+    // Create symbol table and type table
+    let mut symbols = SymbolTable::new();
+    let mut types = TypeTable::new(target.pointer_width);
+
+    // Parse
+    let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
+    let ast = match parser.parse_translation_unit() {
+        Ok(ast) => ast,
+        Err(e) => {
+            eprintln!("cxref: {}: parse error: {}", path, e);
+            return Ok(());
+        }
+    };
+
+    // Extract references from AST
+    for item in &ast.items {
+        match item {
+            ExternalDecl::FunctionDef(func) => {
+                let name = strings.get(func.name).to_string();
+                xref.set_function(&name);
+                xref.add_definition(&name, func.pos.line);
+
+                // Add parameter references
+                for param in &func.params {
+                    if let Some(param_name) = param.name {
+                        let pname = strings.get(param_name).to_string();
+                        xref.add_definition(&pname, func.pos.line);
+                    }
+                }
+
+                // Process function body
+                extract_refs_from_stmt(&func.body, &strings, xref);
+                xref.set_function("");
+            }
+            ExternalDecl::Declaration(decl) => {
+                xref.set_function("");
+                for d in &decl.declarators {
+                    let name = strings.get(d.name).to_string();
+                    // Global declaration - we don't have position, use 0
+                    xref.add_definition(&name, 0);
+                    if let Some(init) = &d.init {
+                        extract_refs_from_expr(init, &strings, xref);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Output
+// ============================================================================
+
+/// Format and print the cross-reference
+fn print_xref(
+    xref: &CrossRef,
+    _width: usize,
+    _combined: bool,
+    silent: bool,
+    output: &mut dyn Write,
+) {
+    for (name, info) in &xref.symbols {
+        let mut first_file = true;
+
+        for (file, funcs) in &info.refs {
+            let file_display = if silent {
+                String::new()
+            } else {
+                format!("{:<20}", file)
+            };
+
+            for (func, refs) in funcs {
+                let func_display = if func.is_empty() {
+                    "".to_string()
+                } else {
+                    format!("{:<15}", func)
+                };
+
+                // Format line numbers
+                let mut line_parts = Vec::new();
+                for r in refs {
+                    let line_str = if r.is_definition {
+                        format!("*{}", r.line)
+                    } else {
+                        format!("{}", r.line)
+                    };
+                    line_parts.push(line_str);
+                }
+                let lines = line_parts.join(" ");
+
+                // Print with name only on first occurrence
+                if first_file {
+                    let _ = writeln!(
+                        output,
+                        "{:<16} {} {} {}",
+                        name, file_display, func_display, lines
+                    );
+                    first_file = false;
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "{:<16} {} {} {}",
+                        "", file_display, func_display, lines
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main() -> ExitCode {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+
+    let args = Args::parse();
+
+    // Build cross-reference
+    let mut xref = CrossRef::new();
+    let mut streams = StreamTable::new();
+
+    for file in &args.files {
+        let ext = Path::new(file)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        match ext {
+            "c" | "h" => {
+                if let Err(e) = process_file(
+                    file,
+                    &mut streams,
+                    &mut xref,
+                    &args.defines,
+                    &args.undefines,
+                ) {
+                    eprintln!("cxref: {}: {}", file, e);
+                }
+            }
+            _ => {
+                eprintln!("cxref: {}: not a C source file", file);
+            }
+        }
+    }
+
+    // Determine output
+    let stdout = io::stdout();
+    let mut output_file: Box<dyn Write>;
+
+    if let Some(ref path) = args.output {
+        match File::create(path) {
+            Ok(f) => {
+                output_file = Box::new(f);
+            }
+            Err(e) => {
+                eprintln!("cxref: cannot open {}: {}", path, e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        output_file = Box::new(stdout.lock());
+    }
+
+    // Print cross-reference
+    print_xref(
+        &xref,
+        args.width,
+        args.combined,
+        args.silent,
+        &mut *output_file,
+    );
+
+    ExitCode::SUCCESS
+}

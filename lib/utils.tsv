@@ -9,6 +9,7 @@ batch	process/batch.rs
 bc	calc/bc.rs
 cal	datetime/cal.rs
 cat	file/cat.rs
+cflow	cc/cflow.rs
 chgrp	tree/chgrp.rs
 chmod	tree/chmod.rs
 chown	tree/chown.rs
@@ -19,7 +20,9 @@ compress	xform/compress.rs
 cp	tree/cp.rs
 crontab	cron/crontab.rs
 csplit	text/csplit.rs
+ctags	cc/ctags.rs
 cut	text/cut.rs
+cxref	cc/cxref.rs
 date	datetime/date.rs
 dd	file/dd.rs
 delta	sccs/delta.rs

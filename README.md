@@ -65,6 +65,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] basename
  - [x] bc
  - [x] c99 (Development)
+ - [x] cflow (Development)
  - [x] cksum
  - [x] cmp
  - [x] comm
@@ -72,7 +73,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cp
  - [x] crontab (cron cat.)
  - [x] csplit
+ - [x] ctags (Development)
  - [x] cut
+ - [x] cxref (Development)
  - [x] delta (SCCS)
  - [x] diff
  - [x] dirname
@@ -197,11 +200,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] xgettext (i18n)
 
 ## Stage 0 - Not started
-
-### Development category
- - [ ] cflow (Development)
- - [ ] ctags (Development)
- - [ ] cxref (Development)
 
 ### i18n category
  - [ ] gettext (i18n)

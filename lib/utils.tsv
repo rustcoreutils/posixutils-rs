@@ -53,6 +53,7 @@ link	tree/link.rs
 ln	tree/ln.rs
 logger	users/logger.rs
 logname	users/logname.rs
+lp	print/lp.rs
 ls	tree/ls.rs
 m4	m4/
 mailx	mailx/

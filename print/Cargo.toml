@@ -1,0 +1,24 @@
+[package]
+name = "posixutils-print"
+version = "0.1.0"
+authors = ["Jeff Garzik"]
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plib = { path = "../plib" }
+clap.workspace = true
+gettext-rs.workspace = true
+num-traits = "0.2"
+
+# IPP - blocking client only, no TLS for minimal deps
+ipp = { version = "5.3", default-features = false, features = ["client"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lp"
+path = "./lp.rs"

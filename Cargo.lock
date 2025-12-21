@@ -249,6 +249,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "bytes"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
+
+[[package]]
 name = "cc"
 version = "1.2.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,6 +569,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
+name = "enum-as-inner"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "enum-primitive-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba7795da175654fe16979af73f81f26a8ea27638d8d9823d317016888a63dc4c"
+dependencies = [
+ "num-traits",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "env_filter"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -803,6 +832,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "http"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
+dependencies = [
+ "bytes",
+ "itoa",
+]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -854,6 +899,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "ipp"
+version = "5.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ff00aa5989ec46fad3764aa77bd04b8ec357344d7eae4053a0df5f8e9660beb"
+dependencies = [
+ "base64",
+ "bytes",
+ "enum-as-inner",
+ "enum-primitive-derive",
+ "http",
+ "log",
+ "num-traits",
+ "thiserror 2.0.17",
+ "ureq",
 ]
 
 [[package]]
@@ -1303,6 +1365,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "percent-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
 name = "pest"
 version = "2.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1524,7 +1592,7 @@ dependencies = [
  "libc",
  "plib",
  "termion",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1593,7 +1661,7 @@ dependencies = [
  "regex-lite",
  "similar-asserts",
  "test-log",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1634,7 +1702,7 @@ dependencies = [
  "regex",
  "rstest",
  "terminfo 0.9.0",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1668,6 +1736,17 @@ dependencies = [
  "libc",
  "plib",
  "tempfile",
+]
+
+[[package]]
+name = "posixutils-print"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "ipp",
+ "num-traits",
+ "plib",
 ]
 
 [[package]]
@@ -1743,7 +1822,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "regex",
- "thiserror",
+ "thiserror 1.0.69",
  "topological-sort",
  "walkdir",
 ]
@@ -1775,7 +1854,7 @@ dependencies = [
  "libcrypt-rs",
  "plib",
  "syslog",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2012,7 +2091,7 @@ checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
  "getrandom 0.2.16",
  "libredox",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2460,7 +2539,16 @@ version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f63587ca0f12b72a0600bcba1d40081f830876000bb46dd2337a3051618f4fc8"
+dependencies = [
+ "thiserror-impl 2.0.17",
 ]
 
 [[package]]
@@ -2468,6 +2556,17 @@ name = "thiserror-impl"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff15c8ecd7de3849db632e14d18d2571fa09dfc5ed93479bc4485c7a517c913"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2659,6 +2758,37 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "ureq"
+version = "3.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d39cb1dbab692d82a977c0392ffac19e188bd9186a9f32806f0aaa859d75585a"
+dependencies = [
+ "base64",
+ "log",
+ "percent-encoding",
+ "ureq-proto",
+ "utf-8",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d81f9efa9df032be5934a46a068815a10a042b494b6a58cb0a1a97bb5467ed6f"
+dependencies = [
+ "base64",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8parse"

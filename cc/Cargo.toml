@@ -16,7 +16,23 @@ plib = { path = "../plib" }
 [dev-dependencies]
 tempfile = "3"
 
+[lib]
+name = "posixutils_cc"
+path = "./lib.rs"
+
 [[bin]]
 name = "pcc"
 path = "./main.rs"
+
+[[bin]]
+name = "cflow"
+path = "./cflow.rs"
+
+[[bin]]
+name = "ctags"
+path = "./ctags.rs"
+
+[[bin]]
+name = "cxref"
+path = "./cxref.rs"
 

@@ -2625,8 +2625,14 @@ pub fn preprocess_with_defines(
     filename: &str,
     defines: &[String],
     undefines: &[String],
+    include_paths: &[String],
 ) -> Vec<Token> {
     let mut pp = Preprocessor::new(target, filename);
+
+    // Add -I include paths
+    for path in include_paths {
+        pp.quote_include_paths.push(path.clone());
+    }
 
     // Process -D defines
     for def in defines {
@@ -2666,7 +2672,8 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
-        let result = preprocess_with_defines(tokens, &target, &mut strings, "<test>", &[], &[]);
+        let result =
+            preprocess_with_defines(tokens, &target, &mut strings, "<test>", &[], &[], &[]);
         (result, strings)
     }
 

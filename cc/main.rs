@@ -193,6 +193,7 @@ fn process_file(
         path,
         &args.defines,
         &args.undefines,
+        &args.include_paths,
     );
 
     if args.preprocess_only {

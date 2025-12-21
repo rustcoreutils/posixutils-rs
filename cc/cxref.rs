@@ -352,6 +352,7 @@ fn process_file(
     xref: &mut CrossRef,
     defines: &[String],
     undefines: &[String],
+    include_paths: &[String],
 ) -> io::Result<()> {
     // Read file content
     let file = File::open(path)?;
@@ -375,8 +376,15 @@ fn process_file(
 
     // Preprocess
     let target = Target::host();
-    let preprocessed =
-        preprocess_with_defines(tokens, &target, &mut strings, path, defines, undefines);
+    let preprocessed = preprocess_with_defines(
+        tokens,
+        &target,
+        &mut strings,
+        path,
+        defines,
+        undefines,
+        include_paths,
+    );
 
     // Create symbol table and type table
     let mut symbols = SymbolTable::new();
@@ -416,8 +424,10 @@ fn process_file(
                 xref.set_function("");
                 for d in &decl.declarators {
                     let name = strings.get(d.name).to_string();
-                    // Global declaration - we don't have position, use 0
-                    xref.add_definition(&name, 0);
+                    // Use initializer position if available, otherwise 0
+                    // (Declaration/InitDeclarator don't carry position info)
+                    let line = d.init.as_ref().map(|e| e.pos.line).unwrap_or(0);
+                    xref.add_definition(&name, line);
                     if let Some(init) = &d.init {
                         extract_refs_from_expr(init, &strings, xref);
                     }
@@ -434,13 +444,7 @@ fn process_file(
 // ============================================================================
 
 /// Format and print the cross-reference
-fn print_xref(
-    xref: &CrossRef,
-    _width: usize,
-    _combined: bool,
-    silent: bool,
-    output: &mut dyn Write,
-) {
+fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Write) {
     for (name, info) in &xref.symbols {
         let mut first_file = true;
 
@@ -458,7 +462,7 @@ fn print_xref(
                     format!("{:<15}", func)
                 };
 
-                // Format line numbers
+                // Format line numbers, respecting width limit
                 let mut line_parts = Vec::new();
                 for r in refs {
                     let line_str = if r.is_definition {
@@ -468,23 +472,48 @@ fn print_xref(
                     };
                     line_parts.push(line_str);
                 }
-                let lines = line_parts.join(" ");
 
-                // Print with name only on first occurrence
-                if first_file {
-                    let _ = writeln!(
-                        output,
-                        "{:<16} {} {} {}",
-                        name, file_display, func_display, lines
-                    );
-                    first_file = false;
-                } else {
-                    let _ = writeln!(
-                        output,
-                        "{:<16} {} {} {}",
-                        "", file_display, func_display, lines
-                    );
+                // Calculate prefix length for continuation lines
+                let prefix = format!(
+                    "{:<16} {} {} ",
+                    if first_file { name.as_str() } else { "" },
+                    file_display,
+                    func_display
+                );
+                let prefix_len = prefix.len();
+
+                // Build output lines respecting width
+                let mut current_line = prefix.clone();
+                let mut first_num = true;
+
+                for part in &line_parts {
+                    let needed = if first_num {
+                        part.len()
+                    } else {
+                        part.len() + 1 // space separator
+                    };
+
+                    if !first_num && current_line.len() + needed > width {
+                        // Flush current line and start continuation
+                        let _ = writeln!(output, "{}", current_line);
+                        current_line = format!("{:prefix_len$}", "");
+                        first_num = true;
+                    }
+
+                    if first_num {
+                        current_line.push_str(part);
+                        first_num = false;
+                    } else {
+                        current_line.push(' ');
+                        current_line.push_str(part);
+                    }
                 }
+
+                if !first_num {
+                    let _ = writeln!(output, "{}", current_line);
+                }
+
+                first_file = false;
             }
         }
     }
@@ -500,34 +529,6 @@ fn main() -> ExitCode {
     bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
 
     let args = Args::parse();
-
-    // Build cross-reference
-    let mut xref = CrossRef::new();
-    let mut streams = StreamTable::new();
-
-    for file in &args.files {
-        let ext = Path::new(file)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-
-        match ext {
-            "c" | "h" => {
-                if let Err(e) = process_file(
-                    file,
-                    &mut streams,
-                    &mut xref,
-                    &args.defines,
-                    &args.undefines,
-                ) {
-                    eprintln!("cxref: {}: {}", file, e);
-                }
-            }
-            _ => {
-                eprintln!("cxref: {}: not a C source file", file);
-            }
-        }
-    }
 
     // Determine output
     let stdout = io::stdout();
@@ -547,14 +548,45 @@ fn main() -> ExitCode {
         output_file = Box::new(stdout.lock());
     }
 
-    // Print cross-reference
-    print_xref(
-        &xref,
-        args.width,
-        args.combined,
-        args.silent,
-        &mut *output_file,
-    );
+    // Build cross-reference
+    let mut xref = CrossRef::new();
+    let mut streams = StreamTable::new();
+
+    for file in &args.files {
+        let ext = Path::new(file)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        match ext {
+            "c" | "h" => {
+                if let Err(e) = process_file(
+                    file,
+                    &mut streams,
+                    &mut xref,
+                    &args.defines,
+                    &args.undefines,
+                    &args.include_paths,
+                ) {
+                    eprintln!("cxref: {}: {}", file, e);
+                }
+
+                // In non-combined mode, print and reset after each file
+                if !args.combined {
+                    print_xref(&xref, args.width, args.silent, &mut *output_file);
+                    xref = CrossRef::new();
+                }
+            }
+            _ => {
+                eprintln!("cxref: {}: not a C source file", file);
+            }
+        }
+    }
+
+    // In combined mode, print all at end
+    if args.combined {
+        print_xref(&xref, args.width, args.silent, &mut *output_file);
+    }
 
     ExitCode::SUCCESS
 }

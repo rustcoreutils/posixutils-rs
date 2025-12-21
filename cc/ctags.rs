@@ -23,7 +23,7 @@ use posixutils_cc::token::{preprocess_with_defines, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -92,12 +92,6 @@ impl TagEntry {
 // Source File Processing
 // ============================================================================
 
-/// Read file contents and split into lines
-fn read_file_lines(path: &str) -> io::Result<Vec<String>> {
-    let content = fs::read_to_string(path)?;
-    Ok(content.lines().map(String::from).collect())
-}
-
 /// Get the line content for a given line number (1-based)
 fn get_line_content(lines: &[String], line_num: u32) -> String {
     if line_num == 0 || line_num as usize > lines.len() {
@@ -111,14 +105,9 @@ fn get_line_content(lines: &[String], line_num: u32) -> String {
 fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntry>> {
     let mut tags = Vec::new();
 
-    // Read file content
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
-
-    // Also read as lines for line content extraction
-    let lines = read_file_lines(path)?;
+    // Read file content once
+    let content = fs::read_to_string(path)?;
+    let lines: Vec<String> = content.lines().map(String::from).collect();
 
     // Extract macro tags first (before preprocessing removes them)
     extract_macro_tags(&lines, path, &mut tags);
@@ -131,7 +120,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
 
     // Tokenize
     let tokens = {
-        let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
+        let mut tokenizer = Tokenizer::new(content.as_bytes(), stream_id, &mut strings);
         tokenizer.tokenize()
     };
 
@@ -144,6 +133,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
         path,
         &[], // No extra defines
         &[], // No undefines
+        &[], // No include paths
     );
 
     // Create symbol table and type table
@@ -215,11 +205,46 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
     Ok(tags)
 }
 
+/// Check whether a line contains a typedef definition for the given name.
+///
+/// This is a lightweight heuristic that:
+/// - Ignores anything following `//` or `/*` on the line.
+/// - Requires `typedef` to appear as a separate token.
+/// - Requires the typedef name to appear as an identifier-like token
+///   (allowing for trailing punctuation like `;` or `,`).
+fn is_typedef_line(line: &str, name: &str) -> bool {
+    // Strip off line comments and simple block comment starts.
+    let mut code = line;
+    if let Some(idx) = code.find("//") {
+        code = &code[..idx];
+    }
+    if let Some(idx) = code.find("/*") {
+        code = &code[..idx];
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return false;
+    }
+    let mut has_typedef = false;
+    let mut has_name = false;
+    for raw_token in code.split_whitespace() {
+        if raw_token == "typedef" {
+            has_typedef = true;
+            continue;
+        }
+        // Strip trailing non-identifier characters (e.g., ';', ',', ')').
+        let cleaned = raw_token.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+        if cleaned == name {
+            has_name = true;
+        }
+    }
+    has_typedef && has_name
+}
+
 /// Find the line number where a typedef is defined
 fn find_typedef_line(lines: &[String], name: &str) -> Option<u32> {
     for (i, line) in lines.iter().enumerate() {
-        // Simple heuristic: look for "typedef ... name" or "typedef ... name;"
-        if line.contains("typedef") && line.contains(name) {
+        if is_typedef_line(line, name) {
             return Some((i + 1) as u32);
         }
     }

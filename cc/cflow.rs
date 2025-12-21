@@ -162,7 +162,6 @@ fn extract_calls_from_expr(
     expr: &posixutils_cc::parse::ast::Expr,
     strings: &StringTable,
     calls: &mut Vec<String>,
-    variables: &mut Vec<String>,
 ) {
     match &expr.kind {
         ExprKind::Call { func, args } => {
@@ -174,76 +173,70 @@ fn extract_calls_from_expr(
                 }
             }
             // Recurse into function expression and arguments
-            extract_calls_from_expr(func, strings, calls, variables);
+            extract_calls_from_expr(func, strings, calls);
             for arg in args {
-                extract_calls_from_expr(arg, strings, calls, variables);
-            }
-        }
-        ExprKind::Ident { name } => {
-            let var_name = strings.get(*name).to_string();
-            if !variables.contains(&var_name) {
-                variables.push(var_name);
+                extract_calls_from_expr(arg, strings, calls);
             }
         }
         ExprKind::Unary { operand, .. } => {
-            extract_calls_from_expr(operand, strings, calls, variables);
+            extract_calls_from_expr(operand, strings, calls);
         }
         ExprKind::Binary { left, right, .. } => {
-            extract_calls_from_expr(left, strings, calls, variables);
-            extract_calls_from_expr(right, strings, calls, variables);
+            extract_calls_from_expr(left, strings, calls);
+            extract_calls_from_expr(right, strings, calls);
         }
         ExprKind::Assign { target, value, .. } => {
-            extract_calls_from_expr(target, strings, calls, variables);
-            extract_calls_from_expr(value, strings, calls, variables);
+            extract_calls_from_expr(target, strings, calls);
+            extract_calls_from_expr(value, strings, calls);
         }
         ExprKind::PostInc(e) | ExprKind::PostDec(e) => {
-            extract_calls_from_expr(e, strings, calls, variables);
+            extract_calls_from_expr(e, strings, calls);
         }
         ExprKind::Conditional {
             cond,
             then_expr,
             else_expr,
         } => {
-            extract_calls_from_expr(cond, strings, calls, variables);
-            extract_calls_from_expr(then_expr, strings, calls, variables);
-            extract_calls_from_expr(else_expr, strings, calls, variables);
+            extract_calls_from_expr(cond, strings, calls);
+            extract_calls_from_expr(then_expr, strings, calls);
+            extract_calls_from_expr(else_expr, strings, calls);
         }
         ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
-            extract_calls_from_expr(expr, strings, calls, variables);
+            extract_calls_from_expr(expr, strings, calls);
         }
         ExprKind::Index { array, index } => {
-            extract_calls_from_expr(array, strings, calls, variables);
-            extract_calls_from_expr(index, strings, calls, variables);
+            extract_calls_from_expr(array, strings, calls);
+            extract_calls_from_expr(index, strings, calls);
         }
         ExprKind::Cast { expr, .. } => {
-            extract_calls_from_expr(expr, strings, calls, variables);
+            extract_calls_from_expr(expr, strings, calls);
         }
         ExprKind::SizeofExpr(e) => {
-            extract_calls_from_expr(e, strings, calls, variables);
+            extract_calls_from_expr(e, strings, calls);
         }
         ExprKind::Comma(exprs) => {
             for e in exprs {
-                extract_calls_from_expr(e, strings, calls, variables);
+                extract_calls_from_expr(e, strings, calls);
             }
         }
         ExprKind::InitList { elements } | ExprKind::CompoundLiteral { elements, .. } => {
             for elem in elements {
-                extract_calls_from_expr(&elem.value, strings, calls, variables);
+                extract_calls_from_expr(&elem.value, strings, calls);
             }
         }
         // Variadic builtins
         ExprKind::VaStart { ap, .. } => {
-            extract_calls_from_expr(ap, strings, calls, variables);
+            extract_calls_from_expr(ap, strings, calls);
         }
         ExprKind::VaArg { ap, .. } => {
-            extract_calls_from_expr(ap, strings, calls, variables);
+            extract_calls_from_expr(ap, strings, calls);
         }
         ExprKind::VaEnd { ap } => {
-            extract_calls_from_expr(ap, strings, calls, variables);
+            extract_calls_from_expr(ap, strings, calls);
         }
         ExprKind::VaCopy { dest, src } => {
-            extract_calls_from_expr(dest, strings, calls, variables);
-            extract_calls_from_expr(src, strings, calls, variables);
+            extract_calls_from_expr(dest, strings, calls);
+            extract_calls_from_expr(src, strings, calls);
         }
         // Other builtins with arguments
         ExprKind::Bswap16 { arg }
@@ -259,35 +252,30 @@ fn extract_calls_from_expr(
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
         | ExprKind::Alloca { size: arg } => {
-            extract_calls_from_expr(arg, strings, calls, variables);
+            extract_calls_from_expr(arg, strings, calls);
         }
-        // Literals and other terminals - no recursion needed
+        // Literals, identifiers, and other terminals - no recursion needed
         _ => {}
     }
 }
 
 /// Walk a statement to find function calls
-fn extract_calls_from_stmt(
-    stmt: &Stmt,
-    strings: &StringTable,
-    calls: &mut Vec<String>,
-    variables: &mut Vec<String>,
-) {
+fn extract_calls_from_stmt(stmt: &Stmt, strings: &StringTable, calls: &mut Vec<String>) {
     match stmt {
         Stmt::Empty => {}
         Stmt::Expr(expr) => {
-            extract_calls_from_expr(expr, strings, calls, variables);
+            extract_calls_from_expr(expr, strings, calls);
         }
         Stmt::Block(items) => {
             for item in items {
                 match item {
                     posixutils_cc::parse::ast::BlockItem::Statement(s) => {
-                        extract_calls_from_stmt(s, strings, calls, variables);
+                        extract_calls_from_stmt(s, strings, calls);
                     }
                     posixutils_cc::parse::ast::BlockItem::Declaration(decl) => {
                         for d in &decl.declarators {
                             if let Some(init) = &d.init {
-                                extract_calls_from_expr(init, strings, calls, variables);
+                                extract_calls_from_expr(init, strings, calls);
                             }
                         }
                     }
@@ -299,19 +287,19 @@ fn extract_calls_from_stmt(
             then_stmt,
             else_stmt,
         } => {
-            extract_calls_from_expr(cond, strings, calls, variables);
-            extract_calls_from_stmt(then_stmt, strings, calls, variables);
+            extract_calls_from_expr(cond, strings, calls);
+            extract_calls_from_stmt(then_stmt, strings, calls);
             if let Some(else_s) = else_stmt {
-                extract_calls_from_stmt(else_s, strings, calls, variables);
+                extract_calls_from_stmt(else_s, strings, calls);
             }
         }
         Stmt::While { cond, body } => {
-            extract_calls_from_expr(cond, strings, calls, variables);
-            extract_calls_from_stmt(body, strings, calls, variables);
+            extract_calls_from_expr(cond, strings, calls);
+            extract_calls_from_stmt(body, strings, calls);
         }
         Stmt::DoWhile { body, cond } => {
-            extract_calls_from_stmt(body, strings, calls, variables);
-            extract_calls_from_expr(cond, strings, calls, variables);
+            extract_calls_from_stmt(body, strings, calls);
+            extract_calls_from_expr(cond, strings, calls);
         }
         Stmt::For {
             init,
@@ -322,37 +310,37 @@ fn extract_calls_from_stmt(
             if let Some(i) = init {
                 match i {
                     posixutils_cc::parse::ast::ForInit::Expression(e) => {
-                        extract_calls_from_expr(e, strings, calls, variables);
+                        extract_calls_from_expr(e, strings, calls);
                     }
                     posixutils_cc::parse::ast::ForInit::Declaration(d) => {
                         for decl in &d.declarators {
                             if let Some(init_expr) = &decl.init {
-                                extract_calls_from_expr(init_expr, strings, calls, variables);
+                                extract_calls_from_expr(init_expr, strings, calls);
                             }
                         }
                     }
                 }
             }
             if let Some(c) = cond {
-                extract_calls_from_expr(c, strings, calls, variables);
+                extract_calls_from_expr(c, strings, calls);
             }
             if let Some(p) = post {
-                extract_calls_from_expr(p, strings, calls, variables);
+                extract_calls_from_expr(p, strings, calls);
             }
-            extract_calls_from_stmt(body, strings, calls, variables);
+            extract_calls_from_stmt(body, strings, calls);
         }
         Stmt::Return(Some(expr)) => {
-            extract_calls_from_expr(expr, strings, calls, variables);
+            extract_calls_from_expr(expr, strings, calls);
         }
         Stmt::Switch { expr, body } => {
-            extract_calls_from_expr(expr, strings, calls, variables);
-            extract_calls_from_stmt(body, strings, calls, variables);
+            extract_calls_from_expr(expr, strings, calls);
+            extract_calls_from_stmt(body, strings, calls);
         }
         Stmt::Case(expr) => {
-            extract_calls_from_expr(expr, strings, calls, variables);
+            extract_calls_from_expr(expr, strings, calls);
         }
         Stmt::Label { stmt, .. } => {
-            extract_calls_from_stmt(stmt, strings, calls, variables);
+            extract_calls_from_stmt(stmt, strings, calls);
         }
         _ => {}
     }
@@ -441,6 +429,7 @@ fn process_file(
     graph: &mut CallGraph,
     defines: &[String],
     undefines: &[String],
+    include_paths: &[String],
 ) -> io::Result<()> {
     // Read file content
     let file = File::open(path)?;
@@ -462,8 +451,15 @@ fn process_file(
 
     // Preprocess
     let target = Target::host();
-    let preprocessed =
-        preprocess_with_defines(tokens, &target, &mut strings, path, defines, undefines);
+    let preprocessed = preprocess_with_defines(
+        tokens,
+        &target,
+        &mut strings,
+        path,
+        defines,
+        undefines,
+        include_paths,
+    );
 
     // Create symbol table and type table
     let mut symbols = SymbolTable::new();
@@ -487,11 +483,9 @@ fn process_file(
             let line = func.pos.line;
 
             let mut calls = Vec::new();
-            let mut _variables = Vec::new();
-            extract_calls_from_stmt(&func.body, &strings, &mut calls, &mut _variables);
+            extract_calls_from_stmt(&func.body, &strings, &mut calls);
 
-            // Filter out self-recursion representation for cleaner output
-            // and filter based on include options
+            // Filter calls based on include options (e.g., underscore names)
             calls.retain(|c| graph.should_include(c));
 
             let info = FunctionInfo {
@@ -642,6 +636,7 @@ fn main() -> ExitCode {
                     &mut graph,
                     &args.defines,
                     &args.undefines,
+                    &args.include_paths,
                 ) {
                     eprintln!("cflow: {}: {}", file, e);
                 }

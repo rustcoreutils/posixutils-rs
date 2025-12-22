@@ -140,16 +140,50 @@ fn get_idle_time(line: &str) -> String {
     }
 }
 
+// Clean up the id field - take only first 4 chars or until first non-alphanumeric
+fn clean_id_field(id: &str) -> String {
+    id.chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '~' || *c == '/')
+        .take(4)
+        .collect::<String>()
+}
+
+// Get the comment field to display for an entry
+fn get_comment_field(entry: &Utmpx) -> String {
+    let clean_id = clean_id_field(&entry.id);
+    if !clean_id.is_empty() && entry.typ != platform::USER_PROCESS {
+        format!("id={}", clean_id)
+    } else if !entry.host.is_empty() && entry.typ == platform::USER_PROCESS {
+        format!("({})", entry.host)
+    } else {
+        String::new()
+    }
+}
+
 fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
     if args.idle_time {
-        println!(
-            "{:<16} {:<12} {} {} {:>5}",
-            entry.user,
-            line,
-            fmt_timestamp(entry.timestamp),
-            get_idle_time(line),
-            entry.pid
-        );
+        let comment = get_comment_field(entry);
+
+        if comment.is_empty() {
+            println!(
+                "{:<16} {:<12} {} {} {:>5}",
+                entry.user,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid
+            );
+        } else {
+            println!(
+                "{:<16} {:<12} {} {} {:>5} {}",
+                entry.user,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid,
+                comment
+            );
+        }
     } else {
         println!(
             "{:<16} {:<12} {}",
@@ -163,15 +197,30 @@ fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
 fn print_fmt_term(args: &Args, entry: &Utmpx, line: &str) {
     let term_state = get_terminal_state(line);
     if args.idle_time {
-        println!(
-            "{:<16} {} {:<12} {} {} {:>5}",
-            entry.user,
-            term_state,
-            line,
-            fmt_timestamp(entry.timestamp),
-            get_idle_time(line),
-            entry.pid
-        );
+        let comment = get_comment_field(entry);
+
+        if comment.is_empty() {
+            println!(
+                "{:<16} {} {:<12} {} {} {:>5}",
+                entry.user,
+                term_state,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid
+            );
+        } else {
+            println!(
+                "{:<16} {} {:<12} {} {} {:>5} {}",
+                entry.user,
+                term_state,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid,
+                comment
+            );
+        }
     } else {
         println!(
             "{:<16} {} {:<12} {}",
@@ -216,6 +265,8 @@ fn print_entry(args: &Args, entry: &Utmpx) {
         || (args.login && entry.typ == platform::LOGIN_PROCESS)
         || (args.runlevel && entry.typ == platform::RUN_LVL)
         || (args.process && entry.typ == platform::INIT_PROCESS)
+        || (args.last_change
+            && (entry.typ == platform::OLD_TIME || entry.typ == platform::NEW_TIME))
     {
         selected = true;
     }
@@ -238,12 +289,47 @@ fn print_entry(args: &Args, entry: &Utmpx) {
 
 fn show_utmpx_entries(args: &Args) {
     if args.heading {
-        println!(
-            "{:<16} {:<12} {}",
-            gettext("NAME"),
-            gettext("LINE"),
-            gettext("TIME")
-        );
+        if args.idle_time && args.terminals {
+            // -H -u -T format
+            println!(
+                "{:<16} {} {:<12} {:<16} {:>5} {:>5} {}",
+                gettext("NAME"),
+                "",
+                gettext("LINE"),
+                gettext("TIME"),
+                gettext("IDLE"),
+                gettext("PID"),
+                gettext("COMMENT")
+            );
+        } else if args.idle_time {
+            // -H -u format
+            println!(
+                "{:<16} {:<12} {:<16} {:>5} {:>5} {}",
+                gettext("NAME"),
+                gettext("LINE"),
+                gettext("TIME"),
+                gettext("IDLE"),
+                gettext("PID"),
+                gettext("COMMENT")
+            );
+        } else if args.terminals {
+            // -H -T format
+            println!(
+                "{:<16} {} {:<12} {}",
+                gettext("NAME"),
+                "",
+                gettext("LINE"),
+                gettext("TIME")
+            );
+        } else {
+            // -H format
+            println!(
+                "{:<16} {:<12} {}",
+                gettext("NAME"),
+                gettext("LINE"),
+                gettext("TIME")
+            );
+        }
     }
 
     let entries = utmpx::load();

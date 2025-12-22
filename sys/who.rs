@@ -289,12 +289,47 @@ fn print_entry(args: &Args, entry: &Utmpx) {
 
 fn show_utmpx_entries(args: &Args) {
     if args.heading {
-        println!(
-            "{:<16} {:<12} {}",
-            gettext("NAME"),
-            gettext("LINE"),
-            gettext("TIME")
-        );
+        if args.idle_time && args.terminals {
+            // -H -u -T format
+            println!(
+                "{:<16} {} {:<12} {:<16} {:>5} {:>5} {}",
+                gettext("NAME"),
+                "",
+                gettext("LINE"),
+                gettext("TIME"),
+                gettext("IDLE"),
+                gettext("PID"),
+                gettext("COMMENT")
+            );
+        } else if args.idle_time {
+            // -H -u format
+            println!(
+                "{:<16} {:<12} {:<16} {:>5} {:>5} {}",
+                gettext("NAME"),
+                gettext("LINE"),
+                gettext("TIME"),
+                gettext("IDLE"),
+                gettext("PID"),
+                gettext("COMMENT")
+            );
+        } else if args.terminals {
+            // -H -T format
+            println!(
+                "{:<16} {} {:<12} {}",
+                gettext("NAME"),
+                "",
+                gettext("LINE"),
+                gettext("TIME")
+            );
+        } else {
+            // -H format
+            println!(
+                "{:<16} {:<12} {}",
+                gettext("NAME"),
+                gettext("LINE"),
+                gettext("TIME")
+            );
+        }
     }
 
     let entries = utmpx::load();

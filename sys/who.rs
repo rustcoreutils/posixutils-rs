@@ -142,14 +142,42 @@ fn get_idle_time(line: &str) -> String {
 
 fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
     if args.idle_time {
-        println!(
-            "{:<16} {:<12} {} {} {:>5}",
-            entry.user,
-            line,
-            fmt_timestamp(entry.timestamp),
-            get_idle_time(line),
-            entry.pid
-        );
+        // Clean up the id field - take only first 4 chars or until first non-alphanumeric
+        let clean_id = entry
+            .id
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '~' || *c == '/')
+            .take(4)
+            .collect::<String>();
+
+        let comment = if !clean_id.is_empty() && entry.typ != platform::USER_PROCESS {
+            format!("id={}", clean_id)
+        } else if !entry.host.is_empty() && entry.typ == platform::USER_PROCESS {
+            format!("({})", entry.host)
+        } else {
+            String::new()
+        };
+
+        if comment.is_empty() {
+            println!(
+                "{:<16} {:<12} {} {} {:>5}",
+                entry.user,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid
+            );
+        } else {
+            println!(
+                "{:<16} {:<12} {} {} {:>5} {}",
+                entry.user,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid,
+                comment
+            );
+        }
     } else {
         println!(
             "{:<16} {:<12} {}",
@@ -163,15 +191,44 @@ fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
 fn print_fmt_term(args: &Args, entry: &Utmpx, line: &str) {
     let term_state = get_terminal_state(line);
     if args.idle_time {
-        println!(
-            "{:<16} {} {:<12} {} {} {:>5}",
-            entry.user,
-            term_state,
-            line,
-            fmt_timestamp(entry.timestamp),
-            get_idle_time(line),
-            entry.pid
-        );
+        // Clean up the id field - take only first 4 chars or until first non-alphanumeric
+        let clean_id = entry
+            .id
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '~' || *c == '/')
+            .take(4)
+            .collect::<String>();
+
+        let comment = if !clean_id.is_empty() && entry.typ != platform::USER_PROCESS {
+            format!("id={}", clean_id)
+        } else if !entry.host.is_empty() && entry.typ == platform::USER_PROCESS {
+            format!("({})", entry.host)
+        } else {
+            String::new()
+        };
+
+        if comment.is_empty() {
+            println!(
+                "{:<16} {} {:<12} {} {} {:>5}",
+                entry.user,
+                term_state,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid
+            );
+        } else {
+            println!(
+                "{:<16} {} {:<12} {} {} {:>5} {}",
+                entry.user,
+                term_state,
+                line,
+                fmt_timestamp(entry.timestamp),
+                get_idle_time(line),
+                entry.pid,
+                comment
+            );
+        }
     } else {
         println!(
             "{:<16} {} {:<12} {}",
@@ -216,6 +273,8 @@ fn print_entry(args: &Args, entry: &Utmpx) {
         || (args.login && entry.typ == platform::LOGIN_PROCESS)
         || (args.runlevel && entry.typ == platform::RUN_LVL)
         || (args.process && entry.typ == platform::INIT_PROCESS)
+        || (args.last_change
+            && (entry.typ == platform::OLD_TIME || entry.typ == platform::NEW_TIME))
     {
         selected = true;
     }

@@ -140,23 +140,29 @@ fn get_idle_time(line: &str) -> String {
     }
 }
 
+// Clean up the id field - take only first 4 chars or until first non-alphanumeric
+fn clean_id_field(id: &str) -> String {
+    id.chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '~' || *c == '/')
+        .take(4)
+        .collect::<String>()
+}
+
+// Get the comment field to display for an entry
+fn get_comment_field(entry: &Utmpx) -> String {
+    let clean_id = clean_id_field(&entry.id);
+    if !clean_id.is_empty() && entry.typ != platform::USER_PROCESS {
+        format!("id={}", clean_id)
+    } else if !entry.host.is_empty() && entry.typ == platform::USER_PROCESS {
+        format!("({})", entry.host)
+    } else {
+        String::new()
+    }
+}
+
 fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
     if args.idle_time {
-        // Clean up the id field - take only first 4 chars or until first non-alphanumeric
-        let clean_id = entry
-            .id
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '~' || *c == '/')
-            .take(4)
-            .collect::<String>();
-
-        let comment = if !clean_id.is_empty() && entry.typ != platform::USER_PROCESS {
-            format!("id={}", clean_id)
-        } else if !entry.host.is_empty() && entry.typ == platform::USER_PROCESS {
-            format!("({})", entry.host)
-        } else {
-            String::new()
-        };
+        let comment = get_comment_field(entry);
 
         if comment.is_empty() {
             println!(
@@ -191,21 +197,7 @@ fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
 fn print_fmt_term(args: &Args, entry: &Utmpx, line: &str) {
     let term_state = get_terminal_state(line);
     if args.idle_time {
-        // Clean up the id field - take only first 4 chars or until first non-alphanumeric
-        let clean_id = entry
-            .id
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '~' || *c == '/')
-            .take(4)
-            .collect::<String>();
-
-        let comment = if !clean_id.is_empty() && entry.typ != platform::USER_PROCESS {
-            format!("id={}", clean_id)
-        } else if !entry.host.is_empty() && entry.typ == platform::USER_PROCESS {
-            format!("({})", entry.host)
-        } else {
-            String::new()
-        };
+        let comment = get_comment_field(entry);
 
         if comment.is_empty() {
             println!(

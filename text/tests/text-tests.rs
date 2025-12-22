@@ -24,6 +24,7 @@ mod sed;
 mod sort;
 mod tail;
 mod tr;
+mod tsort;
 mod unexpand;
 mod uniq;
 mod wc;

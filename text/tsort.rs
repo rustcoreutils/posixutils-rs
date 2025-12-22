@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream_opt;
+use plib::io::input_stream;
 use topological_sort::TopologicalSort;
 
 /// tsort - topological sort
@@ -23,12 +23,17 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
-    let file = input_stream_opt(pathname)?;
+fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<i32> {
+    // Handle stdin with "-" or no argument
+    let file = match pathname {
+        Some(path) => input_stream(path, true)?,
+        None => input_stream(&PathBuf::new(), false)?,
+    };
     let mut reader = io::BufReader::new(file);
 
     let mut ts = TopologicalSort::<String>::new();
     let mut sv: Vec<String> = Vec::new();
+    let mut all_items: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         let mut buffer = String::new();
@@ -41,6 +46,9 @@ fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
             sv.push(String::from(token));
 
             if sv.len() == 2 {
+                all_items.insert(sv[0].clone());
+                all_items.insert(sv[1].clone());
+
                 if sv[0] == sv[1] {
                     ts.insert(String::from(&sv[0]));
                 } else {
@@ -51,11 +59,56 @@ fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
         }
     }
 
-    for s in ts {
+    // Check for odd number of tokens
+    if !sv.is_empty() {
+        eprintln!(
+            "{}: input contains an odd number of tokens",
+            pathname_display(pathname)
+        );
+        return Ok(1);
+    }
+
+    // Collect results and check for cycles
+    let mut sorted_items = Vec::new();
+    let mut sorted_set = std::collections::HashSet::new();
+
+    for s in &mut ts {
+        sorted_set.insert(s.clone());
+        sorted_items.push(s);
+    }
+
+    // If there are remaining items after iteration, there's a cycle
+    if ts.len() > 0 {
+        eprintln!("{}: input contains a loop:", pathname_display(pathname));
+
+        // Find items that weren't sorted (these are in the cycle)
+        let mut cycle_items: Vec<String> = all_items.difference(&sorted_set).cloned().collect();
+        cycle_items.sort(); // For consistent output
+
+        // Print cycle items
+        for item in &cycle_items {
+            eprintln!("{}: {}", pathname_display(pathname), item);
+        }
+
+        // Print the sorted items first
+        for s in sorted_items {
+            println!("{}", s);
+        }
+
+        // Then print the cycle items
+        for item in &cycle_items {
+            println!("{}", item);
+        }
+
+        return Ok(1);
+    }
+
+    // Print results
+    for s in sorted_items {
         println!("{}", s);
     }
 
-    Ok(())
+    Ok(0)
 }
 
 fn pathname_display(path: &Option<PathBuf>) -> String {
@@ -72,12 +125,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
-
-    if let Err(e) = tsort_file(&args.file) {
-        exit_code = 1;
-        eprintln!("{}: {}", pathname_display(&args.file), e);
-    }
+    let exit_code = match tsort_file(&args.file) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{}: {}", pathname_display(&args.file), e);
+            1
+        }
+    };
 
     std::process::exit(exit_code)
 }

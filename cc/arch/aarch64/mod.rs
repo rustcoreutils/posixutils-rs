@@ -10,6 +10,7 @@
 //
 
 pub mod codegen;
+mod expression;
 mod float;
 pub mod lir;
 pub mod macros;

@@ -1516,4 +1516,26 @@ mod tests {
         assert_eq!(module.globals.len(), 1);
         assert_eq!(module.functions.len(), 1);
     }
+
+    #[test]
+    fn test_module_extern_symbols() {
+        let mut module = Module::new();
+
+        // New module should have empty extern_symbols
+        assert!(module.extern_symbols.is_empty());
+
+        // Can insert extern symbols
+        module.extern_symbols.insert("printf".to_string());
+        module.extern_symbols.insert("malloc".to_string());
+
+        assert_eq!(module.extern_symbols.len(), 2);
+        assert!(module.extern_symbols.contains("printf"));
+        assert!(module.extern_symbols.contains("malloc"));
+
+        // Can remove symbols (simulates defining them after extern declaration)
+        module.extern_symbols.remove("printf");
+        assert_eq!(module.extern_symbols.len(), 1);
+        assert!(!module.extern_symbols.contains("printf"));
+        assert!(module.extern_symbols.contains("malloc"));
+    }
 }

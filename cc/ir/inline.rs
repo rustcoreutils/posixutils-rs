@@ -952,4 +952,68 @@ mod tests {
         };
         assert!(!should_inline(&candidate_no_hint, 1, 100));
     }
+
+    #[test]
+    fn test_address_taken_function_not_removed() {
+        let types = TypeTable::new(64);
+        let mut module = Module::new();
+
+        // Create a static function "handler" that would be removed if not address-taken
+        let mut handler = Function::new("handler", types.int_id);
+        handler.is_static = true;
+        handler.is_inline = false;
+
+        let mut handler_bb = BasicBlock::new(BasicBlockId(0));
+        handler_bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret = Instruction::new(Opcode::Ret);
+        ret.src = vec![PseudoId(0)];
+        handler_bb.insns.push(ret);
+        handler.blocks.push(handler_bb);
+        handler.entry = BasicBlockId(0);
+        handler.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(handler);
+
+        // Create main function that takes the address of "handler"
+        let mut main_func = Function::new("main", types.int_id);
+        main_func.is_static = false;
+
+        let mut main_bb = BasicBlock::new(BasicBlockId(0));
+        main_bb.insns.push(Instruction::new(Opcode::Entry));
+
+        // Create a symbol pseudo for "handler" function
+        let handler_sym = Pseudo::sym(PseudoId(1), "handler".to_string());
+        main_func.pseudos.push(handler_sym);
+
+        // Create SymAddr instruction to take address of handler
+        let sym_addr = Instruction::sym_addr(PseudoId(2), PseudoId(1), types.void_ptr_id);
+        main_bb.insns.push(sym_addr);
+
+        // Add a register pseudo for the result
+        main_func.pseudos.push(Pseudo::reg(PseudoId(2), 2));
+
+        let mut ret_main = Instruction::new(Opcode::Ret);
+        ret_main.src = vec![PseudoId(0)];
+        main_bb.insns.push(ret_main);
+        main_func.blocks.push(main_bb);
+        main_func.entry = BasicBlockId(0);
+        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(main_func);
+
+        // Verify both functions exist before
+        assert_eq!(module.functions.len(), 2);
+        assert!(module.functions.iter().any(|f| f.name == "handler"));
+        assert!(module.functions.iter().any(|f| f.name == "main"));
+
+        // Run remove_dead_functions
+        remove_dead_functions(&mut module);
+
+        // Handler should NOT be removed because its address is taken
+        assert_eq!(module.functions.len(), 2);
+        assert!(
+            module.functions.iter().any(|f| f.name == "handler"),
+            "handler function should be preserved because its address is taken"
+        );
+    }
 }

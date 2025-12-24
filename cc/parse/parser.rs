@@ -6466,6 +6466,57 @@ mod tests {
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::LongLong);
     }
 
+    #[test]
+    fn test_extern_pointer_modifier_propagation() {
+        // Bug fix: "extern int *p" - EXTERN should be on the pointer type, not just int
+        let (decl, types, _strings) = parse_decl("extern int *p;").unwrap();
+        let ptr_typ = decl.declarators[0].typ;
+
+        // Verify it's a pointer type
+        assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
+
+        // Verify EXTERN modifier is on the pointer type
+        assert!(
+            types.get(ptr_typ).modifiers.contains(TypeModifiers::EXTERN),
+            "EXTERN modifier should propagate to pointer type"
+        );
+    }
+
+    #[test]
+    fn test_static_pointer_modifier_propagation() {
+        // Bug fix: "static int *p" - STATIC should be on the pointer type, not just int
+        let (decl, types, _strings) = parse_decl("static int *p;").unwrap();
+        let ptr_typ = decl.declarators[0].typ;
+
+        // Verify it's a pointer type
+        assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
+
+        // Verify STATIC modifier is on the pointer type
+        assert!(
+            types.get(ptr_typ).modifiers.contains(TypeModifiers::STATIC),
+            "STATIC modifier should propagate to pointer type"
+        );
+    }
+
+    #[test]
+    fn test_typedef_array_modifier_propagation() {
+        // Bug fix: "typedef int arr[10]" - TYPEDEF should be on the array type, not just int
+        let (decl, types, _strings) = parse_decl("typedef int arr[10];").unwrap();
+        let arr_typ = decl.declarators[0].typ;
+
+        // Verify it's an array type
+        assert_eq!(types.kind(arr_typ), TypeKind::Array);
+
+        // Verify TYPEDEF modifier is on the array type
+        assert!(
+            types
+                .get(arr_typ)
+                .modifiers
+                .contains(TypeModifiers::TYPEDEF),
+            "TYPEDEF modifier should propagate to array type"
+        );
+    }
+
     // ========================================================================
     // Function parsing tests
     // ========================================================================

@@ -349,6 +349,12 @@ impl SymbolTable {
             }
         })
     }
+
+    /// Look up an enum constant symbol by name
+    pub fn lookup_enum_constant(&self, name: StringId) -> Option<&Symbol> {
+        self.lookup(name, Namespace::Ordinary)
+            .filter(|s| s.is_enum_constant())
+    }
 }
 
 impl Default for SymbolTable {

@@ -17,7 +17,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use posixutils_cc::parse::ast::ExternalDecl;
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
-use posixutils_cc::symbol::{Namespace, SymbolKind, SymbolTable};
+use posixutils_cc::symbol::{Namespace, SymbolTable};
 use posixutils_cc::target::Target;
 use posixutils_cc::token::{preprocess_with_defines, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
@@ -183,7 +183,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
 
                     // Look up in symbol table to determine if it's a typedef
                     if let Some(sym) = symbols.lookup(declarator.name, Namespace::Ordinary) {
-                        if sym.kind == SymbolKind::Typedef {
+                        if sym.is_typedef() {
                             // Get line number from type or use default
                             // Since declarations don't have position, we scan for it
                             if let Some(line_num) = find_typedef_line(&lines, &name) {

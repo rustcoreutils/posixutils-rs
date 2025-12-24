@@ -292,9 +292,8 @@ fn show_utmpx_entries(args: &Args) {
         if args.idle_time && args.terminals {
             // -H -u -T format
             println!(
-                "{:<16} {} {:<12} {:<16} {:>5} {:>5} {}",
+                "{:<16}  {:<12} {:<16} {:>5} {:>5} {}",
                 gettext("NAME"),
-                "",
                 gettext("LINE"),
                 gettext("TIME"),
                 gettext("IDLE"),
@@ -315,9 +314,8 @@ fn show_utmpx_entries(args: &Args) {
         } else if args.terminals {
             // -H -T format
             println!(
-                "{:<16} {} {:<12} {}",
+                "{:<16}  {:<12} {}",
                 gettext("NAME"),
-                "",
                 gettext("LINE"),
                 gettext("TIME")
             );

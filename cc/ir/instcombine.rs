@@ -95,22 +95,20 @@ fn try_simplify(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
         Opcode::Lsr => simplify_lsr(insn, pseudos),
         Opcode::Asr => simplify_asr(insn, pseudos),
 
-        // Bitwise
-        Opcode::And => simplify_and(insn, pseudos),
-        Opcode::Or => simplify_or(insn, pseudos),
-        Opcode::Xor => simplify_xor(insn, pseudos),
+        // Bitwise (all handled by unified simplify_bitwise)
+        Opcode::And | Opcode::Or | Opcode::Xor => simplify_bitwise(insn, pseudos),
 
-        // Comparisons
-        Opcode::SetEq => simplify_seteq(insn, pseudos),
-        Opcode::SetNe => simplify_setne(insn, pseudos),
-        Opcode::SetLt => simplify_setlt(insn, pseudos),
-        Opcode::SetLe => simplify_setle(insn, pseudos),
-        Opcode::SetGt => simplify_setgt(insn, pseudos),
-        Opcode::SetGe => simplify_setge(insn, pseudos),
-        Opcode::SetB => simplify_setb(insn, pseudos),
-        Opcode::SetBe => simplify_setbe(insn, pseudos),
-        Opcode::SetA => simplify_seta(insn, pseudos),
-        Opcode::SetAe => simplify_setae(insn, pseudos),
+        // Comparisons (all handled by unified simplify_comparison)
+        Opcode::SetEq
+        | Opcode::SetNe
+        | Opcode::SetLt
+        | Opcode::SetLe
+        | Opcode::SetGt
+        | Opcode::SetGe
+        | Opcode::SetB
+        | Opcode::SetBe
+        | Opcode::SetA
+        | Opcode::SetAe => simplify_comparison(insn, pseudos),
 
         // Unary
         Opcode::Neg => simplify_neg(insn, pseudos),
@@ -394,98 +392,88 @@ fn simplify_asr(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // And Simplification
 // ============================================================================
 
-fn simplify_and(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
+/// Result when applying x op x
+enum SelfOpResult {
+    /// x op x copies src (e.g., x & x = x, x | x = x)
+    CopySrc,
+    /// x op x folds to a constant (e.g., x ^ x = 0)
+    Const(i64),
+}
 
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+/// Bitwise operation behavior for simplification
+struct BitwiseInfo {
+    /// Result when x op x
+    self_result: SelfOpResult,
+    /// Identity element: x op identity = x (e.g., x & -1 = x, x | 0 = x, x ^ 0 = x)
+    identity: i64,
+    /// Absorbing element: x op absorbing = absorbing (e.g., x & 0 = 0, x | -1 = -1)
+    /// None for XOR (no absorbing element)
+    absorbing: Option<i64>,
+    /// Constant folding function
+    fold: fn(i64, i64) -> i64,
+}
 
-    // Identity: x & x -> x
-    if src1 == src2 {
-        return Simplification::CopyFrom(src1);
-    }
-
-    match (val1, val2) {
-        // Constant folding: a & b
-        (Some(a), Some(b)) => Simplification::FoldToConst(a & b),
-
-        // Algebraic: x & 0 -> 0
-        (None, Some(0)) => Simplification::FoldToConst(0),
-        (Some(0), None) => Simplification::FoldToConst(0),
-
-        // Algebraic: x & -1 -> x (all bits set)
-        (None, Some(-1)) => Simplification::CopyFrom(src1),
-        (Some(-1), None) => Simplification::CopyFrom(src2),
-
-        _ => Simplification::None,
+/// Get bitwise operation info for the given opcode
+fn get_bitwise_info(op: Opcode) -> Option<BitwiseInfo> {
+    match op {
+        Opcode::And => Some(BitwiseInfo {
+            self_result: SelfOpResult::CopySrc,
+            identity: -1,       // x & -1 = x (all bits set)
+            absorbing: Some(0), // x & 0 = 0
+            fold: |a, b| a & b,
+        }),
+        Opcode::Or => Some(BitwiseInfo {
+            self_result: SelfOpResult::CopySrc,
+            identity: 0,         // x | 0 = x
+            absorbing: Some(-1), // x | -1 = -1
+            fold: |a, b| a | b,
+        }),
+        Opcode::Xor => Some(BitwiseInfo {
+            self_result: SelfOpResult::Const(0), // x ^ x = 0
+            identity: 0,                         // x ^ 0 = x
+            absorbing: None,                     // no absorbing element
+            fold: |a, b| a ^ b,
+        }),
+        _ => None,
     }
 }
 
-// ============================================================================
-// Or Simplification
-// ============================================================================
+/// Unified bitwise simplification for And/Or/Xor
+fn simplify_bitwise(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+    let info = match get_bitwise_info(insn.op) {
+        Some(i) => i,
+        None => return Simplification::None,
+    };
 
-fn simplify_or(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
+
+    // x op x -> self_result
+    if src1 == src2 {
+        return match info.self_result {
+            SelfOpResult::CopySrc => Simplification::CopyFrom(src1),
+            SelfOpResult::Const(c) => Simplification::FoldToConst(c),
+        };
+    }
+
     let val1 = get_const(pseudos, src1);
     let val2 = get_const(pseudos, src2);
 
-    // Identity: x | x -> x
-    if src1 == src2 {
-        return Simplification::CopyFrom(src1);
-    }
-
     match (val1, val2) {
-        // Constant folding: a | b
-        (Some(a), Some(b)) => Simplification::FoldToConst(a | b),
+        // Constant folding: a op b
+        (Some(a), Some(b)) => Simplification::FoldToConst((info.fold)(a, b)),
 
-        // Algebraic: x | 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
-        (Some(0), None) => Simplification::CopyFrom(src2),
+        // Algebraic: x op identity -> x
+        (None, Some(v)) if v == info.identity => Simplification::CopyFrom(src1),
+        (Some(v), None) if v == info.identity => Simplification::CopyFrom(src2),
 
-        // Algebraic: x | -1 -> -1
-        (None, Some(-1)) => Simplification::FoldToConst(-1),
-        (Some(-1), None) => Simplification::FoldToConst(-1),
-
-        _ => Simplification::None,
-    }
-}
-
-// ============================================================================
-// Xor Simplification
-// ============================================================================
-
-fn simplify_xor(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    // Identity: x ^ x -> 0
-    if src1 == src2 {
-        return Simplification::FoldToConst(0);
-    }
-
-    match (val1, val2) {
-        // Constant folding: a ^ b
-        (Some(a), Some(b)) => Simplification::FoldToConst(a ^ b),
-
-        // Algebraic: x ^ 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
-        (Some(0), None) => Simplification::CopyFrom(src2),
+        // Algebraic: x op absorbing -> absorbing (if exists)
+        (None, Some(v)) if info.absorbing == Some(v) => Simplification::FoldToConst(v),
+        (Some(v), None) if info.absorbing == Some(v) => Simplification::FoldToConst(v),
 
         _ => Simplification::None,
     }
@@ -495,30 +483,68 @@ fn simplify_xor(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // Comparison Simplifications
 // ============================================================================
 
-fn simplify_seteq(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
+/// Comparison behavior for identity (x op x) and constant folding
+struct CmpInfo {
+    /// Result when comparing x to itself (e.g., x == x -> 1, x < x -> 0)
+    identity_result: i64,
+    /// Constant comparison function
+    compare: fn(i64, i64) -> bool,
+}
 
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    // Identity: x == x -> 1
-    if src1 == src2 {
-        return Simplification::FoldToConst(1);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if a == b { 1 } else { 0 })
-    } else {
-        Simplification::None
+/// Get comparison info for the given opcode
+fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
+    match op {
+        Opcode::SetEq => Some(CmpInfo {
+            identity_result: 1,
+            compare: |a, b| a == b,
+        }),
+        Opcode::SetNe => Some(CmpInfo {
+            identity_result: 0,
+            compare: |a, b| a != b,
+        }),
+        Opcode::SetLt => Some(CmpInfo {
+            identity_result: 0,
+            compare: |a, b| a < b,
+        }),
+        Opcode::SetLe => Some(CmpInfo {
+            identity_result: 1,
+            compare: |a, b| a <= b,
+        }),
+        Opcode::SetGt => Some(CmpInfo {
+            identity_result: 0,
+            compare: |a, b| a > b,
+        }),
+        Opcode::SetGe => Some(CmpInfo {
+            identity_result: 1,
+            compare: |a, b| a >= b,
+        }),
+        Opcode::SetB => Some(CmpInfo {
+            identity_result: 0,
+            compare: |a, b| (a as u64) < (b as u64),
+        }),
+        Opcode::SetBe => Some(CmpInfo {
+            identity_result: 1,
+            compare: |a, b| (a as u64) <= (b as u64),
+        }),
+        Opcode::SetA => Some(CmpInfo {
+            identity_result: 0,
+            compare: |a, b| (a as u64) > (b as u64),
+        }),
+        Opcode::SetAe => Some(CmpInfo {
+            identity_result: 1,
+            compare: |a, b| (a as u64) >= (b as u64),
+        }),
+        _ => None,
     }
 }
 
-fn simplify_setne(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+/// Unified comparison simplification for all SetXX opcodes
+fn simplify_comparison(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+    let info = match get_cmp_info(insn.op) {
+        Some(i) => i,
+        None => return Simplification::None,
+    };
+
     if insn.src.len() != 2 {
         return Simplification::None;
     }
@@ -526,197 +552,17 @@ fn simplify_setne(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
     let src1 = insn.src[0];
     let src2 = insn.src[1];
 
-    // Identity: x != x -> 0
+    // Identity: x op x -> identity_result
     if src1 == src2 {
-        return Simplification::FoldToConst(0);
+        return Simplification::FoldToConst(info.identity_result);
     }
 
+    // Constant folding
     let val1 = get_const(pseudos, src1);
     let val2 = get_const(pseudos, src2);
 
     if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if a != b { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_setlt(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    // Identity: x < x -> 0
-    if src1 == src2 {
-        return Simplification::FoldToConst(0);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if a < b { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_setle(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    // Identity: x <= x -> 1
-    if src1 == src2 {
-        return Simplification::FoldToConst(1);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if a <= b { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_setgt(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    // Identity: x > x -> 0
-    if src1 == src2 {
-        return Simplification::FoldToConst(0);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if a > b { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_setge(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    // Identity: x >= x -> 1
-    if src1 == src2 {
-        return Simplification::FoldToConst(1);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if a >= b { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-// Unsigned comparisons
-fn simplify_setb(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    if src1 == src2 {
-        return Simplification::FoldToConst(0);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if (a as u64) < (b as u64) { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_setbe(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    if src1 == src2 {
-        return Simplification::FoldToConst(1);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if (a as u64) <= (b as u64) { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_seta(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    if src1 == src2 {
-        return Simplification::FoldToConst(0);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if (a as u64) > (b as u64) { 1 } else { 0 })
-    } else {
-        Simplification::None
-    }
-}
-
-fn simplify_setae(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-
-    if src1 == src2 {
-        return Simplification::FoldToConst(1);
-    }
-
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if (a as u64) >= (b as u64) { 1 } else { 0 })
+        Simplification::FoldToConst(if (info.compare)(a, b) { 1 } else { 0 })
     } else {
         Simplification::None
     }

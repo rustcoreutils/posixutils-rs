@@ -77,7 +77,7 @@ pub enum Reg {
     X15,
     X16,
     X17,
-    X18,
+    // X18 is platform-reserved (TLS on Linux), not used by compiler
     X19,
     X20,
     X21,
@@ -118,7 +118,6 @@ impl Reg {
             Reg::X15 => "x15",
             Reg::X16 => "x16",
             Reg::X17 => "x17",
-            Reg::X18 => "x18",
             Reg::X19 => "x19",
             Reg::X20 => "x20",
             Reg::X21 => "x21",
@@ -156,7 +155,6 @@ impl Reg {
             Reg::X15 => "w15",
             Reg::X16 => "w16",
             Reg::X17 => "w17",
-            Reg::X18 => "w18",
             Reg::X19 => "w19",
             Reg::X20 => "w20",
             Reg::X21 => "w21",
@@ -267,12 +265,6 @@ impl Reg {
     /// Stack pointer register
     pub fn sp() -> Reg {
         Reg::SP
-    }
-
-    /// Platform reserved register (x18)
-    /// Should not be used; this is only for documentation and completeness
-    pub fn platform_reserved() -> Reg {
-        Reg::X18
     }
 }
 

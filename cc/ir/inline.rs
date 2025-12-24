@@ -547,6 +547,10 @@ fn inline_call_site(
         let new_bb_id = ctx.bb_map[&callee_bb.id];
         let mut new_bb = BasicBlock::new(new_bb_id);
 
+        // Copy parents and children (will be remapped later)
+        new_bb.parents = callee_bb.parents.clone();
+        new_bb.children = callee_bb.children.clone();
+
         // Clone instructions
         for insn in &callee_bb.insns {
             let cloned = clone_instruction(&mut ctx, insn, &callee.pseudos);
@@ -651,6 +655,32 @@ fn inline_call_site(
     // Add cloned pseudos to caller
     caller.pseudos.extend(inlined_pseudos);
 
+    // Add callee's local variables to caller's locals with mangled names
+    // This is necessary so that regalloc treats these as stack-allocated locals
+    // rather than global symbols
+    for (local_name, local_var) in &callee.locals {
+        // Create the mangled name (same pattern as clone_pseudo)
+        let new_name = format!("{}_inline{}_{}", callee.name, ctx.inline_id, local_name);
+
+        // Look up the remapped pseudo ID
+        if let Some(&new_sym) = ctx.pseudo_map.get(&local_var.sym) {
+            // Remap decl_block if present
+            let new_decl_block = local_var
+                .decl_block
+                .and_then(|bb| ctx.bb_map.get(&bb).copied());
+
+            caller.locals.insert(
+                new_name,
+                super::LocalVar {
+                    sym: new_sym,
+                    typ: local_var.typ,
+                    is_volatile: local_var.is_volatile,
+                    decl_block: new_decl_block,
+                },
+            );
+        }
+    }
+
     // Update old children's parent references to point to continuation
     for &child_id in &old_children {
         if let Some(child) = caller.blocks.iter_mut().find(|b| b.id == child_id) {
@@ -748,8 +778,13 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
 
 /// Remove functions that are static and have no callers
 fn remove_dead_functions(module: &mut Module) {
-    // Count calls to each function
+    // Collect all function names for lookup
+    let func_names: HashSet<String> = module.functions.iter().map(|f| f.name.clone()).collect();
+
+    // Count calls to each function and track address-taken functions
     let mut call_counts: HashMap<String, usize> = HashMap::new();
+    let mut address_taken: HashSet<String> = HashSet::new();
+
     for func in &module.functions {
         for bb in &func.blocks {
             for insn in &bb.insns {
@@ -757,14 +792,30 @@ fn remove_dead_functions(module: &mut Module) {
                     if let Some(name) = &insn.func_name {
                         *call_counts.entry(name.clone()).or_insert(0) += 1;
                     }
+                } else if insn.op == Opcode::SymAddr {
+                    // Check if this takes the address of a function
+                    if !insn.src.is_empty() {
+                        let src_id = insn.src[0];
+                        if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == src_id) {
+                            if let PseudoKind::Sym(ref name) = pseudo.kind {
+                                // Check if this symbol is a function name
+                                if func_names.contains(name) {
+                                    address_taken.insert(name.clone());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Remove static functions with no callers (except main)
+    // Remove static functions with no callers and no address taken (except main)
     module.functions.retain(|f| {
-        f.name == "main" || !f.is_static || call_counts.get(&f.name).copied().unwrap_or(0) > 0
+        f.name == "main"
+            || !f.is_static
+            || call_counts.get(&f.name).copied().unwrap_or(0) > 0
+            || address_taken.contains(&f.name)
     });
 }
 

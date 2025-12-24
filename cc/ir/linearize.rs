@@ -1242,7 +1242,7 @@ impl<'a> Linearizer<'a> {
             // Create a symbol pseudo for this local variable (its address)
             // Use unique name (name#id) to distinguish shadowed variables for SSA
             let sym_id = self.alloc_pseudo();
-            let unique_name = format!("{}#{}", declarator.name, sym_id.0);
+            let unique_name = format!("{}.{}", declarator.name, sym_id.0);
             let sym = Pseudo::sym(sym_id, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
@@ -1347,7 +1347,7 @@ impl<'a> Linearizer<'a> {
             // Create a hidden local to store this dimension's size
             // This is needed for runtime stride computation in multi-dimensional VLAs
             let dim_sym_id = self.alloc_pseudo();
-            let dim_var_name = format!("__vla_dim{}_{}#{}", dim_idx, declarator.name, dim_sym_id.0);
+            let dim_var_name = format!("__vla_dim{}_{}.{}", dim_idx, declarator.name, dim_sym_id.0);
             let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
 
             if let Some(func) = &mut self.current_func {
@@ -1387,7 +1387,7 @@ impl<'a> Linearizer<'a> {
         // Create a hidden local variable to store the total number of elements
         // This is needed for sizeof(vla) to work at runtime
         let size_sym_id = self.alloc_pseudo();
-        let size_var_name = format!("__vla_size_{}#{}", declarator.name, size_sym_id.0);
+        let size_var_name = format!("__vla_size_{}.{}", declarator.name, size_sym_id.0);
         let size_sym = Pseudo::sym(size_sym_id, size_var_name.clone());
 
         if let Some(func) = &mut self.current_func {
@@ -1426,7 +1426,7 @@ impl<'a> Linearizer<'a> {
         // Create a symbol pseudo for the VLA pointer variable
         // This symbol stores the pointer to the VLA memory (like a pointer variable)
         let sym_id = self.alloc_pseudo();
-        let unique_name = format!("{}#{}", declarator.name, sym_id.0);
+        let unique_name = format!("{}.{}", declarator.name, sym_id.0);
         let sym = Pseudo::sym(sym_id, unique_name.clone());
 
         // Create a pointer type for the VLA (pointer to element type)
@@ -2147,6 +2147,18 @@ impl<'a> Linearizer<'a> {
     // ========================================================================
 
     /// Linearize an inline assembly statement
+    /// Check if an expression is a simple identifier that's a parameter (in var_map)
+    /// Returns Some((name, pseudo)) if it is, None otherwise
+    fn get_param_if_ident(&self, expr: &Expr) -> Option<(String, PseudoId)> {
+        if let ExprKind::Ident { name, .. } = &expr.kind {
+            let name_str = self.str(*name).to_string();
+            if let Some(&pseudo) = self.var_map.get(&name_str) {
+                return Some((name_str, pseudo));
+            }
+        }
+        None
+    }
+
     fn linearize_asm(
         &mut self,
         template: &str,
@@ -2157,6 +2169,8 @@ impl<'a> Linearizer<'a> {
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
+        // Track which outputs are parameters (need var_map update instead of store)
+        let mut param_outputs: Vec<Option<String>> = Vec::new();
 
         // Process output operands
         for op in outputs {
@@ -2169,14 +2183,28 @@ impl<'a> Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
+            // Check if this output is a parameter (SSA value, not memory location)
+            let param_info = self.get_param_if_ident(&op.expr);
+
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register
             if is_readwrite {
-                let addr = self.linearize_lvalue(&op.expr);
                 let typ = self.expr_type(&op.expr);
                 let size = self.types.size_bits(typ);
-                // Load into the same pseudo that will be used for output
-                self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+
+                if let Some((_, param_pseudo)) = &param_info {
+                    // Parameter: copy value directly (no memory address)
+                    self.emit(
+                        Instruction::new(Opcode::Copy)
+                            .with_target(pseudo)
+                            .with_src(*param_pseudo)
+                            .with_size(size),
+                    );
+                } else {
+                    // Local or global: load from memory address
+                    let addr = self.linearize_lvalue(&op.expr);
+                    self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+                }
 
                 // Also add as input, using the SAME pseudo
                 ir_inputs.push(AsmConstraint {
@@ -2193,6 +2221,9 @@ impl<'a> Linearizer<'a> {
                 matching_output: None,
                 constraint: op.constraint.clone(),
             });
+
+            // Track if this is a parameter output
+            param_outputs.push(param_info.map(|(name, _)| name));
         }
 
         // Process input operands
@@ -2291,10 +2322,18 @@ impl<'a> Linearizer<'a> {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
             let out_pseudo = ir_outputs[i].pseudo;
-            let addr = self.linearize_lvalue(&op.expr);
-            let typ = self.expr_type(&op.expr);
-            let size = self.types.size_bits(typ);
-            self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+
+            // Check if this output is a parameter (update var_map instead of memory store)
+            if let Some(param_name) = &param_outputs[i] {
+                // Parameter: update var_map with the new SSA value
+                self.var_map.insert(param_name.clone(), out_pseudo);
+            } else {
+                // Local or global: store to memory address
+                let addr = self.linearize_lvalue(&op.expr);
+                let typ = self.expr_type(&op.expr);
+                let size = self.types.size_bits(typ);
+                self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+            }
         }
     }
 
@@ -2526,7 +2565,7 @@ impl<'a> Linearizer<'a> {
                 // Compound literal as lvalue: create it and return its address
                 // This is used for &(struct S){...}
                 let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal#{}", sym_id.0);
+                let unique_name = format!(".compound_literal.{}", sym_id.0);
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
@@ -3787,7 +3826,7 @@ impl<'a> Linearizer<'a> {
 
                 // Create a symbol pseudo for the compound literal (its address)
                 let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal#{}", sym_id.0);
+                let unique_name = format!(".compound_literal.{}", sym_id.0);
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);

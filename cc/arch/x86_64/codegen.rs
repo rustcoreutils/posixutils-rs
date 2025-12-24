@@ -82,7 +82,14 @@ impl X86_64CodeGen {
             Loc::Imm(v) => GpOperand::Imm(*v),
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
-            Loc::Global(name) => GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+            Loc::Global(name) => {
+                let symbol = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                GpOperand::Mem(MemAddr::RipRelative(symbol))
+            }
         }
     }
 
@@ -987,9 +994,15 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => {
                 // LIR: RIP-relative memory-to-register move
+                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                let symbol = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+                    src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
                     dst: GpOperand::Reg(dst),
                 });
             }
@@ -1224,6 +1237,13 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
+                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                let is_local_label = name.starts_with('.');
+                let symbol = if is_local_label {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
                 if mem_size <= 16 {
                     // LIR: sign/zero extending load from global
                     let src_size = OperandSize::from_bits(mem_size);
@@ -1231,14 +1251,14 @@ impl X86_64CodeGen {
                         self.push_lir(X86Inst::Movzx {
                             src_size,
                             dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+                            src: GpOperand::Mem(MemAddr::RipRelative(symbol.clone())),
                             dst: dst_reg,
                         });
                     } else {
                         self.push_lir(X86Inst::Movsx {
                             src_size,
                             dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+                            src: GpOperand::Mem(MemAddr::RipRelative(symbol.clone())),
                             dst: dst_reg,
                         });
                     }
@@ -1247,7 +1267,7 @@ impl X86_64CodeGen {
                     let op_size = OperandSize::from_bits(reg_size);
                     self.push_lir(X86Inst::Mov {
                         size: op_size,
-                        src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+                        src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
                         dst: GpOperand::Reg(dst_reg),
                     });
                 }
@@ -1395,12 +1415,19 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
+                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                let is_local_label = name.starts_with('.');
+                let symbol = if is_local_label {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
                 let op_size = OperandSize::from_bits(mem_size);
                 // LIR: store to global via RIP-relative
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
                     src: GpOperand::Reg(value_reg),
-                    dst: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+                    dst: GpOperand::Mem(MemAddr::RipRelative(symbol)),
                 });
             }
             _ => {
@@ -1455,8 +1482,13 @@ impl X86_64CodeGen {
             }
             Loc::Global(ref name) => {
                 // LIR: lea for global source address
+                let symbol = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
                 self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::RipRelative(Symbol::global(name.clone())),
+                    addr: MemAddr::RipRelative(symbol),
                     dst: Reg::R10,
                 });
             }
@@ -1497,8 +1529,13 @@ impl X86_64CodeGen {
             }
             Loc::Global(ref name) => {
                 // LIR: lea for global destination address
+                let symbol = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
                 self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::RipRelative(Symbol::global(name.clone())),
+                    addr: MemAddr::RipRelative(symbol),
                     dst: Reg::R11,
                 });
             }

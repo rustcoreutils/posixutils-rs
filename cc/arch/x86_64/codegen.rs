@@ -140,29 +140,67 @@ impl X86_64CodeGen {
             0
         };
 
-        // Function prologue
+        // Emit function header (directives, label, CFI start)
+        self.emit_function_header(func.is_static, &func.name);
+
+        // Emit prologue (push rbp, callee-saved regs, allocate stack)
+        self.emit_prologue(stack_size, reg_save_area_size);
+
+        // Store spilled arguments before any calls can clobber them
+        self.store_spilled_args(&alloc);
+
+        // For variadic functions, save argument registers to the register save area
+        if is_variadic {
+            self.emit_variadic_save_area();
+        }
+
+        // Move arguments from registers to their allocated stack locations
+        self.store_args_to_stack(func, types, &alloc);
+
+        // Save number of fixed GP and FP params for va_start
+        if is_variadic {
+            self.count_fixed_params(func, types);
+        }
+
+        // Emit basic blocks
+        for block in &func.blocks {
+            self.emit_block(block, types);
+        }
+
+        // CFI: End procedure
+        if self.base.emit_unwind_tables {
+            self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
+        }
+    }
+
+    /// Emit function header directives (text section, visibility, type, label, CFI start)
+    fn emit_function_header(&mut self, is_static: bool, name: &str) {
         self.push_lir(X86Inst::Directive(Directive::Blank));
         self.push_lir(X86Inst::Directive(Directive::Text));
 
         // Skip .globl for static functions (internal linkage)
-        if !func.is_static {
-            self.push_lir(X86Inst::Directive(Directive::global(&func.name)));
+        if !is_static {
+            self.push_lir(X86Inst::Directive(Directive::global(name)));
         }
 
         // ELF-only type (handled by Directive::emit which skips on macOS)
-        self.push_lir(X86Inst::Directive(Directive::type_func(&func.name)));
+        self.push_lir(X86Inst::Directive(Directive::type_func(name)));
 
         // Function label
-        self.push_lir(X86Inst::Directive(Directive::global_label(&func.name)));
+        self.push_lir(X86Inst::Directive(Directive::global_label(name)));
 
         // CFI: Start procedure (enables stack unwinding for this function)
         if self.base.emit_unwind_tables {
             self.push_lir(X86Inst::Directive(Directive::CfiStartProc));
         }
+    }
 
-        // Prologue: save frame pointer and allocate stack
+    /// Emit function prologue: push rbp, save callee-saved registers, allocate stack
+    fn emit_prologue(&mut self, stack_size: i32, reg_save_area_size: i32) {
         let bp = Reg::bp();
         let sp = Reg::sp();
+
+        // Push frame pointer
         self.push_lir(X86Inst::Push {
             src: GpOperand::Reg(bp),
         });
@@ -171,6 +209,8 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Directive(Directive::CfiDefCfaOffset(16)));
             self.push_lir(X86Inst::Directive(Directive::cfi_offset("%rbp", -16)));
         }
+
+        // Set up frame pointer
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(sp),
@@ -210,9 +250,10 @@ impl X86_64CodeGen {
                 dst: Reg::Rsp,
             });
         }
+    }
 
-        // Emit stores for arguments spilled from caller-saved registers to stack
-        // These must be stored early before any call can clobber them
+    /// Emit stores for arguments spilled from caller-saved registers to stack
+    fn store_spilled_args(&mut self, alloc: &RegAlloc) {
         for spilled in alloc.spilled_args() {
             let adjusted = spilled.to_stack_offset + self.callee_saved_offset;
             self.push_lir(X86Inst::Mov {
@@ -224,47 +265,48 @@ impl X86_64CodeGen {
                 }),
             });
         }
+    }
 
-        // For variadic functions, save argument registers to the register save area
-        // This must be done before any other code uses these registers
+    /// Save argument registers to the register save area for variadic functions
+    fn emit_variadic_save_area(&mut self) {
         // AMD64 ABI: rdi at offset 0, rsi at offset 8, rdx at offset 16, etc.
-        if is_variadic {
-            let int_arg_regs = Reg::arg_regs();
-            // Save all 6 GP argument registers at their ABI-specified offsets
-            for (i, reg) in int_arg_regs.iter().enumerate() {
-                // offset from rbp = reg_save_area_offset - (i * 8)
-                // reg at ABI offset i*8 relative to reg_save_area base
-                let offset = self.reg_save_area_offset - (i as i32 * 8);
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(*reg),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -offset,
-                    }),
-                });
-            }
-
-            // Save XMM0-XMM7 at offsets 48-175 from register save area base
-            // AMD64 ABI: XMM regs start at offset 48 from reg_save_area base
-            // Each XMM slot is 16 bytes (128-bit aligned)
-            let xmm_arg_regs = XmmReg::arg_regs();
-            for (i, xmm) in xmm_arg_regs.iter().enumerate() {
-                // XMM save area starts at offset 48 from reg_save_area base
-                // Each slot is 16 bytes: base_offset = reg_save_area_offset - 48 - (i * 16)
-                let offset = self.reg_save_area_offset - 48 - (i as i32 * 16);
-                self.push_lir(X86Inst::MovFp {
-                    size: FpSize::Double, // movsd - save 64-bit double
-                    src: XmmOperand::Reg(*xmm),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -offset,
-                    }),
-                });
-            }
+        let int_arg_regs = Reg::arg_regs();
+        // Save all 6 GP argument registers at their ABI-specified offsets
+        for (i, reg) in int_arg_regs.iter().enumerate() {
+            // offset from rbp = reg_save_area_offset - (i * 8)
+            // reg at ABI offset i*8 relative to reg_save_area base
+            let offset = self.reg_save_area_offset - (i as i32 * 8);
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(*reg),
+                dst: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: -offset,
+                }),
+            });
         }
 
-        // Move arguments from registers to their allocated locations if needed
+        // Save XMM0-XMM7 at offsets 48-175 from register save area base
+        // AMD64 ABI: XMM regs start at offset 48 from reg_save_area base
+        // Each XMM slot is 16 bytes (128-bit aligned)
+        let xmm_arg_regs = XmmReg::arg_regs();
+        for (i, xmm) in xmm_arg_regs.iter().enumerate() {
+            // XMM save area starts at offset 48 from reg_save_area base
+            // Each slot is 16 bytes: base_offset = reg_save_area_offset - 48 - (i * 16)
+            let offset = self.reg_save_area_offset - 48 - (i as i32 * 16);
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double, // movsd - save 64-bit double
+                src: XmmOperand::Reg(*xmm),
+                dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: -offset,
+                }),
+            });
+        }
+    }
+
+    /// Move arguments from registers to their allocated stack locations
+    fn store_args_to_stack(&mut self, func: &Function, types: &TypeTable, alloc: &RegAlloc) {
         // System V AMD64 ABI: integer args in RDI, RSI, RDX, RCX, R8, R9
         //                     FP args in XMM0-XMM7 (separate counters)
         let int_arg_regs = Reg::arg_regs();
@@ -390,34 +432,28 @@ impl X86_64CodeGen {
                 }
             }
         }
+    }
 
-        // Save number of fixed GP and FP params for va_start
-        // Count how many non-FP params and FP params we have
-        if is_variadic {
-            self.num_fixed_gp_params = func
-                .params
-                .iter()
-                .filter(|(_, typ)| !types.is_float(*typ))
-                .count();
-            if has_sret {
-                self.num_fixed_gp_params += 1; // Account for hidden sret pointer
-            }
-            self.num_fixed_fp_params = func
-                .params
-                .iter()
-                .filter(|(_, typ)| types.is_float(*typ))
-                .count();
-        }
+    /// Count and save number of fixed GP and FP params for va_start
+    fn count_fixed_params(&mut self, func: &Function, types: &TypeTable) {
+        let has_sret = func
+            .pseudos
+            .iter()
+            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
 
-        // Emit basic blocks
-        for block in &func.blocks {
-            self.emit_block(block, types);
+        self.num_fixed_gp_params = func
+            .params
+            .iter()
+            .filter(|(_, typ)| !types.is_float(*typ))
+            .count();
+        if has_sret {
+            self.num_fixed_gp_params += 1; // Account for hidden sret pointer
         }
-
-        // CFI: End procedure
-        if self.base.emit_unwind_tables {
-            self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
-        }
+        self.num_fixed_fp_params = func
+            .params
+            .iter()
+            .filter(|(_, typ)| types.is_float(*typ))
+            .count();
     }
 
     fn emit_block(&mut self, block: &crate::ir::BasicBlock, types: &TypeTable) {

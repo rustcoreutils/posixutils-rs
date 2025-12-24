@@ -162,35 +162,84 @@ impl Aarch64CodeGen {
         self.callee_saved_size = callee_saved_size;
         self.reg_save_area_size = reg_save_area_size;
 
-        // Function prologue
+        // Emit function header (directives, label, CFI start)
+        self.emit_function_header(func.is_static, &func.name);
+
+        // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
+        self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
+
+        // Detect sret and store X8 to stack if needed
+        let has_sret = func
+            .pseudos
+            .iter()
+            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
+        if has_sret {
+            self.store_sret_if_needed(func, total_frame);
+        }
+
+        // For variadic functions on Linux/FreeBSD, save argument registers
+        if is_variadic && !is_darwin {
+            self.emit_variadic_save_area();
+        }
+
+        // Count fixed GP parameters for va_start
+        if is_variadic {
+            self.num_fixed_gp_params = func
+                .params
+                .iter()
+                .filter(|(_, typ)| !types.is_float(*typ))
+                .count();
+        }
+
+        // Store spilled arguments before any calls can clobber them
+        self.store_spilled_args(&alloc, total_frame);
+
+        // Move arguments from registers to their allocated stack locations
+        self.store_args_to_stack(func, types, &alloc, total_frame);
+
+        // Store frame size for epilogue
+        let frame_info = (total_frame, callee_saved.clone(), callee_saved_fp.clone());
+
+        // Emit basic blocks
+        for block in &func.blocks {
+            self.emit_block(block, &frame_info, types);
+        }
+
+        // CFI: End procedure
+        if self.base.emit_unwind_tables {
+            self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));
+        }
+    }
+
+    /// Emit function header directives (text section, visibility, alignment, label, CFI start)
+    fn emit_function_header(&mut self, is_static: bool, name: &str) {
         self.push_lir(Aarch64Inst::Directive(Directive::Blank));
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
 
         // Skip .globl for static functions (internal linkage)
-        if !func.is_static {
-            self.push_lir(Aarch64Inst::Directive(Directive::global(&func.name)));
+        if !is_static {
+            self.push_lir(Aarch64Inst::Directive(Directive::global(name)));
         }
 
         // ELF-only type (handled by Directive::emit which skips on macOS)
-        self.push_lir(Aarch64Inst::Directive(Directive::type_func(&func.name)));
+        self.push_lir(Aarch64Inst::Directive(Directive::type_func(name)));
 
         // Alignment
         self.push_lir(Aarch64Inst::Directive(Directive::Align(2)));
 
         // Function label
-        self.push_lir(Aarch64Inst::Directive(Directive::global_label(&func.name)));
+        self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));
 
         // CFI: Start procedure (enables stack unwinding for this function)
         if self.base.emit_unwind_tables {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiStartProc));
         }
+    }
 
-        // Prologue: save frame pointer and link register, allocate stack
-        let (scratch0, _scratch1, _) = Reg::scratch_regs();
+    /// Emit prologue: save fp/lr, allocate stack, save callee-saved registers
+    fn emit_prologue(&mut self, total_frame: i32, callee_saved: &[Reg], callee_saved_fp: &[VReg]) {
         let fp = Reg::fp();
         let lr = Reg::lr();
-        // Reference platform_reserved to acknowledge its existence
-        let _ = Reg::platform_reserved();
 
         if total_frame > 0 {
             // Combined push and allocate: stp x29, x30, [sp, #-N]!
@@ -232,101 +281,12 @@ impl Aarch64CodeGen {
                 )));
             }
 
-            // Save callee-saved registers in pairs
-            let mut offset = 16; // Start after fp/lr
-            let mut i = 0;
-            while i < callee_saved.len() {
-                if i + 1 < callee_saved.len() {
-                    self.push_lir(Aarch64Inst::Stp {
-                        size: OperandSize::B64,
-                        src1: callee_saved[i],
-                        src2: callee_saved[i + 1],
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // fp
-                            offset,
-                        },
-                    });
-                    if self.base.emit_debug {
-                        let cfi_offset1 = -(total_frame - offset);
-                        let cfi_offset2 = -(total_frame - offset - 8);
-                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                            callee_saved[i].name64(),
-                            cfi_offset1,
-                        )));
-                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                            callee_saved[i + 1].name64(),
-                            cfi_offset2,
-                        )));
-                    }
-                    i += 2;
-                } else {
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: callee_saved[i],
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // fp
-                            offset,
-                        },
-                    });
-                    if self.base.emit_debug {
-                        let cfi_offset = -(total_frame - offset);
-                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                            callee_saved[i].name64(),
-                            cfi_offset,
-                        )));
-                    }
-                    i += 1;
-                }
-                offset += 16;
-            }
+            // Save callee-saved GP registers in pairs
+            self.save_callee_saved_gp_regs(total_frame, callee_saved);
 
-            // Save FP callee-saved registers (d8-d15) in pairs
-            // AAPCS64 only requires preserving the lower 64 bits
-            let mut i = 0;
-            while i < callee_saved_fp.len() {
-                if i + 1 < callee_saved_fp.len() {
-                    self.push_lir(Aarch64Inst::StpFp {
-                        size: FpSize::Double,
-                        src1: callee_saved_fp[i],
-                        src2: callee_saved_fp[i + 1],
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // fp
-                            offset,
-                        },
-                    });
-                    if self.base.emit_debug {
-                        let cfi_offset1 = -(total_frame - offset);
-                        let cfi_offset2 = -(total_frame - offset - 8);
-                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                            callee_saved_fp[i].name_d(),
-                            cfi_offset1,
-                        )));
-                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                            callee_saved_fp[i + 1].name_d(),
-                            cfi_offset2,
-                        )));
-                    }
-                    i += 2;
-                } else {
-                    self.push_lir(Aarch64Inst::StrFp {
-                        size: FpSize::Double,
-                        src: callee_saved_fp[i],
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // fp
-                            offset,
-                        },
-                    });
-                    if self.base.emit_debug {
-                        let cfi_offset = -(total_frame - offset);
-                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                            callee_saved_fp[i].name_d(),
-                            cfi_offset,
-                        )));
-                    }
-                    i += 1;
-                }
-                offset += 16;
-            }
+            // Save callee-saved FP registers in pairs
+            let gp_offset = 16 + (callee_saved.len().div_ceil(2) as i32 * 16);
+            self.save_callee_saved_fp_regs(total_frame, callee_saved_fp, gp_offset);
         } else {
             // Minimal frame: stp x29, x30, [sp, #-16]!
             self.push_lir(Aarch64Inst::Stp {
@@ -355,70 +315,156 @@ impl Aarch64CodeGen {
                 )));
             }
         }
+    }
 
-        // Store scratch register for later use in this function
-        let _ = scratch0;
-
-        // AAPCS64: Detect if there's a hidden return pointer (sret) for large struct returns.
-        // Unlike x86-64, AAPCS64 uses X8 for indirect result, which doesn't shift other args.
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
-
-        // If there's a sret, spill X8 to stack if needed
-        if has_sret {
-            if let Some(sret) = func.pseudos.iter().find(|p| {
-                matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret")
-            }) {
-                if let Some(Loc::Stack(offset)) = self.locations.get(&sret.id) {
-                    if *offset < 0 {
-                        let actual_offset = self.stack_offset(total_frame, *offset);
-                        self.push_lir(Aarch64Inst::Str {
-                            size: OperandSize::B64,
-                            src: Reg::X8,
-                            addr: MemAddr::BaseOffset {
-                                base: Reg::X29, // fp
-                                offset: actual_offset,
-                            },
-                        });
-                    }
-                }
-            }
-        }
-
-        // For variadic functions on Linux/FreeBSD, save ALL argument registers to the register save area
-        // This must be done BEFORE any code uses these registers, so va_arg can access them
-        // AAPCS64: x0-x7 are saved at reg_save_area_offset from FP
-        // On Darwin, variadic args are passed on the stack by the caller, so we skip this.
-        if is_variadic && !is_darwin {
-            let arg_regs = Reg::arg_regs();
-            for (i, reg) in arg_regs.iter().enumerate() {
-                // Each register at offset: reg_save_area_offset + (i * 8)
-                let offset = self.reg_save_area_offset + (i as i32 * 8);
-                self.push_lir(Aarch64Inst::Str {
+    /// Save callee-saved GP registers in pairs (or single if odd count)
+    fn save_callee_saved_gp_regs(&mut self, total_frame: i32, callee_saved: &[Reg]) {
+        let mut offset = 16; // Start after fp/lr
+        let mut i = 0;
+        while i < callee_saved.len() {
+            if i + 1 < callee_saved.len() {
+                self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,
-                    src: *reg,
+                    src1: callee_saved[i],
+                    src2: callee_saved[i + 1],
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29, // fp
                         offset,
                     },
                 });
+                if self.base.emit_debug {
+                    let cfi_offset1 = -(total_frame - offset);
+                    let cfi_offset2 = -(total_frame - offset - 8);
+                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                        callee_saved[i].name64(),
+                        cfi_offset1,
+                    )));
+                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                        callee_saved[i + 1].name64(),
+                        cfi_offset2,
+                    )));
+                }
+                i += 2;
+            } else {
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: callee_saved[i],
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29, // fp
+                        offset,
+                    },
+                });
+                if self.base.emit_debug {
+                    let cfi_offset = -(total_frame - offset);
+                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                        callee_saved[i].name64(),
+                        cfi_offset,
+                    )));
+                }
+                i += 1;
+            }
+            offset += 16;
+        }
+    }
+
+    /// Save callee-saved FP registers (d8-d15) in pairs
+    fn save_callee_saved_fp_regs(
+        &mut self,
+        total_frame: i32,
+        callee_saved_fp: &[VReg],
+        start_offset: i32,
+    ) {
+        let mut offset = start_offset;
+        let mut i = 0;
+        while i < callee_saved_fp.len() {
+            if i + 1 < callee_saved_fp.len() {
+                self.push_lir(Aarch64Inst::StpFp {
+                    size: FpSize::Double,
+                    src1: callee_saved_fp[i],
+                    src2: callee_saved_fp[i + 1],
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29, // fp
+                        offset,
+                    },
+                });
+                if self.base.emit_debug {
+                    let cfi_offset1 = -(total_frame - offset);
+                    let cfi_offset2 = -(total_frame - offset - 8);
+                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                        callee_saved_fp[i].name_d(),
+                        cfi_offset1,
+                    )));
+                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                        callee_saved_fp[i + 1].name_d(),
+                        cfi_offset2,
+                    )));
+                }
+                i += 2;
+            } else {
+                self.push_lir(Aarch64Inst::StrFp {
+                    size: FpSize::Double,
+                    src: callee_saved_fp[i],
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29, // fp
+                        offset,
+                    },
+                });
+                if self.base.emit_debug {
+                    let cfi_offset = -(total_frame - offset);
+                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                        callee_saved_fp[i].name_d(),
+                        cfi_offset,
+                    )));
+                }
+                i += 1;
+            }
+            offset += 16;
+        }
+    }
+
+    /// Store sret pointer to stack if needed (for large struct returns via X8)
+    fn store_sret_if_needed(&mut self, func: &Function, total_frame: i32) {
+        if let Some(sret) = func
+            .pseudos
+            .iter()
+            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
+        {
+            if let Some(Loc::Stack(offset)) = self.locations.get(&sret.id) {
+                if *offset < 0 {
+                    let actual_offset = self.stack_offset(total_frame, *offset);
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::X8,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29, // fp
+                            offset: actual_offset,
+                        },
+                    });
+                }
             }
         }
+    }
 
-        // Count fixed GP parameters for va_start
-        if is_variadic {
-            self.num_fixed_gp_params = func
-                .params
-                .iter()
-                .filter(|(_, typ)| !types.is_float(*typ))
-                .count();
+    /// Save argument registers to the register save area for variadic functions (Linux/FreeBSD)
+    fn emit_variadic_save_area(&mut self) {
+        // AAPCS64: x0-x7 are saved at reg_save_area_offset from FP
+        let arg_regs = Reg::arg_regs();
+        for (i, reg) in arg_regs.iter().enumerate() {
+            // Each register at offset: reg_save_area_offset + (i * 8)
+            let offset = self.reg_save_area_offset + (i as i32 * 8);
+            self.push_lir(Aarch64Inst::Str {
+                size: OperandSize::B64,
+                src: *reg,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X29, // fp
+                    offset,
+                },
+            });
         }
+    }
 
-        // Emit stores for arguments spilled from caller-saved registers to stack
-        // These must be stored early before any call can clobber them
+    /// Emit stores for arguments spilled from caller-saved registers to stack
+    fn store_spilled_args(&mut self, alloc: &RegAlloc, total_frame: i32) {
         for spilled in alloc.spilled_args() {
             // spilled.to_stack_offset is negative (e.g., -8, -16, etc.)
             // Convert to FP-relative offset
@@ -443,9 +489,18 @@ impl Aarch64CodeGen {
                 });
             }
         }
+    }
 
-        // Move arguments from registers to their allocated locations if needed
-        // Note: On AAPCS64, sret uses X8, so regular args still start at X0
+    /// Move arguments from registers to their allocated stack locations
+    fn store_args_to_stack(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+        alloc: &RegAlloc,
+        total_frame: i32,
+    ) {
+        // AAPCS64: integer args in X0-X7, FP args in D0-D7 (separate counters)
+        // Note: sret uses X8, so regular args still start at X0
         // Complex parameters use two consecutive FP registers (D0+D1, D2+D3, etc.)
         let arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
@@ -453,9 +508,15 @@ impl Aarch64CodeGen {
         let mut fp_arg_idx = 0;
 
         // Track which pseudos were already spilled via spill_args_across_calls
-        // to avoid double-storing them here
         let spilled_pseudos: HashSet<PseudoId> =
             alloc.spilled_args().iter().map(|s| s.pseudo).collect();
+
+        // Detect sret for arg_idx offset
+        let has_sret = func
+            .pseudos
+            .iter()
+            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
+        let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex(*typ);
@@ -480,7 +541,6 @@ impl Aarch64CodeGen {
                         }
                         if is_complex {
                             // Complex argument - uses TWO consecutive FP registers
-                            // Look up the local variable for stack location
                             if fp_arg_idx + 1 < fp_arg_regs.len() {
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
@@ -557,19 +617,6 @@ impl Aarch64CodeGen {
                     }
                 }
             }
-        }
-
-        // Store frame size for epilogue
-        let frame_info = (total_frame, callee_saved.clone(), callee_saved_fp.clone());
-
-        // Emit basic blocks
-        for block in &func.blocks {
-            self.emit_block(block, &frame_info, types);
-        }
-
-        // CFI: End procedure
-        if self.base.emit_unwind_tables {
-            self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));
         }
     }
 
@@ -2429,7 +2476,6 @@ fn asm_reg_name_64(reg: Reg) -> &'static str {
         Reg::X15 => "x15",
         Reg::X16 => "x16",
         Reg::X17 => "x17",
-        Reg::X18 => "x18",
         Reg::X19 => "x19",
         Reg::X20 => "x20",
         Reg::X21 => "x21",
@@ -2467,7 +2513,6 @@ fn asm_reg_name_32(reg: Reg) -> &'static str {
         Reg::X15 => "w15",
         Reg::X16 => "w16",
         Reg::X17 => "w17",
-        Reg::X18 => "w18",
         Reg::X19 => "w19",
         Reg::X20 => "w20",
         Reg::X21 => "w21",

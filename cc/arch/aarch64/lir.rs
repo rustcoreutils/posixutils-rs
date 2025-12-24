@@ -159,6 +159,10 @@ pub enum Aarch64Inst {
     /// ADRP - Form PC-relative address to 4KB page
     Adrp { sym: Symbol, dst: Reg },
 
+    /// ADRP for GOT access (macOS only)
+    /// Emits: adrp dst, sym@GOTPAGE
+    AdrpGotPage { sym: Symbol, dst: Reg },
+
     /// ADD with symbol page offset (used with ADRP)
     /// macOS: add dst, base, symbol@PAGEOFF
     /// Linux: add dst, base, :lo12:symbol
@@ -173,6 +177,10 @@ pub enum Aarch64Inst {
         base: Reg,
         dst: Reg,
     },
+
+    /// LDR with GOT page offset (macOS only, for external symbols)
+    /// Emits: ldr dst, [base, sym@GOTPAGEOFF]
+    LdrSymGotPageOff { sym: Symbol, base: Reg, dst: Reg },
 
     // ========================================================================
     // Integer Arithmetic
@@ -698,6 +706,12 @@ impl EmitAsm for Aarch64Inst {
                 }
             }
 
+            Aarch64Inst::AdrpGotPage { sym, dst } => {
+                let sym_name = sym.format_for_target(target);
+                // GOT page access - only used on macOS for external symbols
+                let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
+            }
+
             Aarch64Inst::AddSymOffset { sym, base, dst } => {
                 let sym_name = sym.format_for_target(target);
                 match target.os {
@@ -758,6 +772,18 @@ impl EmitAsm for Aarch64Inst {
                         );
                     }
                 }
+            }
+
+            Aarch64Inst::LdrSymGotPageOff { sym, base, dst } => {
+                let sym_name = sym.format_for_target(target);
+                // GOT page offset load - loads the address from GOT (macOS only)
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, {}@GOTPAGEOFF]",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
             }
 
             // Integer Arithmetic

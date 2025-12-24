@@ -273,6 +273,8 @@ pub struct Symbol {
     pub name: String,
     /// Is this a local symbol (starts with '.')
     pub is_local: bool,
+    /// Is this an external symbol (declared extern, needs GOT on macOS)
+    pub is_extern: bool,
 }
 
 impl Symbol {
@@ -280,6 +282,7 @@ impl Symbol {
         Self {
             name: name.into(),
             is_local: true,
+            is_extern: false,
         }
     }
 
@@ -287,6 +290,15 @@ impl Symbol {
         Self {
             name: name.into(),
             is_local: false,
+            is_extern: false,
+        }
+    }
+
+    pub fn extern_sym(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            is_local: false,
+            is_extern: true,
         }
     }
 

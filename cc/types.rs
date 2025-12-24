@@ -556,7 +556,7 @@ enum TypeKey {
     /// Pointer to interned type
     Pointer(TypeId, u32), // base_id, modifiers
     /// Array of interned type
-    Array(TypeId, Option<usize>),
+    Array(TypeId, Option<usize>, u32), // base_id, size, modifiers
     /// Function type
     Function {
         ret: TypeId,
@@ -718,7 +718,7 @@ impl TypeTable {
             }
             TypeKind::Array => {
                 let base = typ.base?;
-                Some(TypeKey::Array(base, typ.array_size))
+                Some(TypeKey::Array(base, typ.array_size, typ.modifiers.bits()))
             }
             TypeKind::Function => {
                 let ret = typ.base?;

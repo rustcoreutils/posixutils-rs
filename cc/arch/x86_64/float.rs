@@ -93,14 +93,32 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::RipRelative(Symbol {
-                        name: name.to_string(),
-                        is_local: false,
-                    })),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then load FP value
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R11,
+                            offset: insn.offset as i32,
+                        }),
+                        dst: XmmOperand::Reg(dst_xmm),
+                    });
+                } else {
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Mem(MemAddr::RipRelative(Symbol {
+                            name: name.to_string(),
+                            is_local: false,
+                            is_extern: false,
+                        })),
+                        dst: XmmOperand::Reg(dst_xmm),
+                    });
+                }
             }
             _ => {
                 // Load address into R11, then load from that address
@@ -210,14 +228,32 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::RipRelative(Symbol {
-                        name: name.to_string(),
-                        is_local: false,
-                    })),
-                });
+                if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then store FP value
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm15),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R11,
+                            offset: insn.offset as i32,
+                        }),
+                    });
+                } else {
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm15),
+                        dst: XmmOperand::Mem(MemAddr::RipRelative(Symbol {
+                            name: name.to_string(),
+                            is_local: false,
+                            is_extern: false,
+                        })),
+                    });
+                }
             }
             _ => {
                 // Load address into R11, then store
@@ -733,11 +769,28 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                    dst: XmmOperand::Reg(dst),
-                });
+                if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then load FP value
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R11,
+                            offset: 0,
+                        }),
+                        dst: XmmOperand::Reg(dst),
+                    });
+                } else {
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+                        dst: XmmOperand::Reg(dst),
+                    });
+                }
             }
         }
     }

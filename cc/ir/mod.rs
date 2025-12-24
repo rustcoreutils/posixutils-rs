@@ -24,7 +24,7 @@ pub mod ssa;
 
 use crate::diag::Position;
 use crate::types::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // ============================================================================
@@ -1294,6 +1294,9 @@ pub struct Module {
     pub debug: bool,
     /// Source file paths (stream id -> path) for .file directives
     pub source_files: Vec<String>,
+    /// External symbols (declared extern but not defined in this module)
+    /// These need GOT access on macOS
+    pub extern_symbols: HashSet<String>,
 }
 
 impl Module {
@@ -1305,6 +1308,7 @@ impl Module {
             strings: Vec::new(),
             debug: false,
             source_files: Vec::new(),
+            extern_symbols: HashSet::new(),
         }
     }
 

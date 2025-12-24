@@ -22,7 +22,7 @@ use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
-use crate::target::Target;
+use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
@@ -49,6 +49,8 @@ pub struct Aarch64CodeGen {
     pub(super) reg_save_area_size: i32,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
+    /// External symbols (need GOT access on macOS)
+    pub(super) extern_symbols: HashSet<String>,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -72,7 +74,14 @@ impl Aarch64CodeGen {
             reg_save_area_offset: 0,
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
+            extern_symbols: HashSet::new(),
         }
+    }
+
+    /// Check if a symbol needs GOT access (extern on macOS)
+    #[inline]
+    pub(super) fn needs_got_access(&self, name: &str) -> bool {
+        self.base.target.os == Os::MacOS && self.extern_symbols.contains(name)
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -119,6 +128,10 @@ impl Aarch64CodeGen {
         init: &crate::ir::Initializer,
         types: &TypeTable,
     ) {
+        // Skip extern symbols - they're defined elsewhere
+        if self.extern_symbols.contains(name) {
+            return;
+        }
         self.base.emit_global(name, typ, init, types);
     }
 
@@ -1248,16 +1261,31 @@ impl Aarch64CodeGen {
             Symbol::global(name)
         };
 
-        // ADRP + ADD sequence for PIC address loading
-        self.push_lir(Aarch64Inst::Adrp {
-            sym: sym.clone(),
-            dst,
-        });
-        self.push_lir(Aarch64Inst::AddSymOffset {
-            sym,
-            base: dst,
-            dst,
-        });
+        if self.needs_got_access(name) {
+            // External symbols on macOS: load address from GOT
+            // ADRP + LDR from GOT
+            let extern_sym = Symbol::extern_sym(name);
+            self.push_lir(Aarch64Inst::AdrpGotPage {
+                sym: extern_sym.clone(),
+                dst,
+            });
+            self.push_lir(Aarch64Inst::LdrSymGotPageOff {
+                sym: extern_sym,
+                base: dst,
+                dst,
+            });
+        } else {
+            // ADRP + ADD sequence for PIC address loading
+            self.push_lir(Aarch64Inst::Adrp {
+                sym: sym.clone(),
+                dst,
+            });
+            self.push_lir(Aarch64Inst::AddSymOffset {
+                sym,
+                base: dst,
+                dst,
+            });
+        }
     }
 
     /// Load value of a global symbol into a register with specified size
@@ -1269,17 +1297,38 @@ impl Aarch64CodeGen {
             Symbol::global(name)
         };
 
-        // ADRP + LDR sequence for PIC value loading
-        self.push_lir(Aarch64Inst::Adrp {
-            sym: sym.clone(),
-            dst,
-        });
-        self.push_lir(Aarch64Inst::LdrSymOffset {
-            size,
-            sym,
-            base: dst,
-            dst,
-        });
+        if self.needs_got_access(name) {
+            // External symbols on macOS: load address from GOT, then load value
+            // ADRP + LDR from GOT gets address, then LDR value
+            let extern_sym = Symbol::extern_sym(name);
+            self.push_lir(Aarch64Inst::AdrpGotPage {
+                sym: extern_sym.clone(),
+                dst,
+            });
+            self.push_lir(Aarch64Inst::LdrSymGotPageOff {
+                sym: extern_sym,
+                base: dst,
+                dst,
+            });
+            // Now dst contains the address, load the actual value
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                addr: MemAddr::Base(dst),
+                dst,
+            });
+        } else {
+            // ADRP + LDR sequence for PIC value loading
+            self.push_lir(Aarch64Inst::Adrp {
+                sym: sym.clone(),
+                dst,
+            });
+            self.push_lir(Aarch64Inst::LdrSymOffset {
+                size,
+                sym,
+                base: dst,
+                dst,
+            });
+        }
     }
 
     /// Move immediate value to register
@@ -2172,6 +2221,7 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.clear_lir();
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
+        self.extern_symbols = module.extern_symbols.clone();
 
         // Emit file header
         self.emit_header();

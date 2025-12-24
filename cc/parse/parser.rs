@@ -4051,6 +4051,21 @@ impl Parser<'_> {
             full_func_params
         };
 
+        // Propagate storage class modifiers from base type to derived type
+        // For "extern int *p", the EXTERN should be on the pointer type, not just int
+        let storage_class_mask = TypeModifiers::EXTERN
+            | TypeModifiers::STATIC
+            | TypeModifiers::TYPEDEF
+            | TypeModifiers::REGISTER
+            | TypeModifiers::AUTO;
+        let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
+        if !base_storage_class.is_empty() && result_type_id != base_type_id {
+            // Add storage class modifiers to the result type
+            let mut result_type = self.types.get(result_type_id).clone();
+            result_type.modifiers |= base_storage_class;
+            result_type_id = self.types.intern(result_type);
+        }
+
         Ok((name, result_type_id, vla_exprs, returned_func_params))
     }
 
@@ -4478,6 +4493,22 @@ impl Parser<'_> {
             typ_id = self.types.intern(ptr_type);
         }
 
+        // Propagate storage class modifiers from base type to derived pointer type
+        // For "extern int *p", the EXTERN should be on the pointer type, not just int
+        if typ_id != base_type_id {
+            let storage_class_mask = TypeModifiers::EXTERN
+                | TypeModifiers::STATIC
+                | TypeModifiers::TYPEDEF
+                | TypeModifiers::REGISTER
+                | TypeModifiers::AUTO;
+            let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
+            if !base_storage_class.is_empty() {
+                let mut typ = self.types.get(typ_id).clone();
+                typ.modifiers |= base_storage_class;
+                typ_id = self.types.intern(typ);
+            }
+        }
+
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
         // At this point typ_id is char*, and we see (*fp)(int)
         if self.is_special(b'(') {
@@ -4686,6 +4717,22 @@ impl Parser<'_> {
         for size in dimensions.into_iter().rev() {
             let arr_type = Type::array(var_type_id, size.unwrap_or(0));
             var_type_id = self.types.intern(arr_type);
+        }
+
+        // Propagate storage class modifiers from base type to derived array type
+        // For "typedef int arr[10]", the TYPEDEF should be on the array type, not just int
+        if var_type_id != typ_id {
+            let storage_class_mask = TypeModifiers::EXTERN
+                | TypeModifiers::STATIC
+                | TypeModifiers::TYPEDEF
+                | TypeModifiers::REGISTER
+                | TypeModifiers::AUTO;
+            let base_storage_class = self.types.modifiers(typ_id) & storage_class_mask;
+            if !base_storage_class.is_empty() {
+                let mut var_type = self.types.get(var_type_id).clone();
+                var_type.modifiers |= base_storage_class;
+                var_type_id = self.types.intern(var_type);
+            }
         }
 
         // Skip any __attribute__ after variable name/array declarator

@@ -502,6 +502,7 @@ impl<'a> Linearizer<'a> {
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
             let modifiers = self.types.modifiers(declarator.typ);
+            let name = self.str(declarator.name).to_string();
 
             // Skip typedef declarations - they don't define storage
             if modifiers.contains(TypeModifiers::TYPEDEF) {
@@ -514,7 +515,15 @@ impl<'a> Linearizer<'a> {
             }
 
             // Skip extern declarations - they don't define storage
+            // But track them so codegen can use GOT access on macOS
+            // Only add to extern_symbols if not already defined (handles both cases:
+            // extern int x; int x = 1;  - x is defined, not extern
+            // int x = 1; extern int x;  - x is defined, not extern)
             if modifiers.contains(TypeModifiers::EXTERN) {
+                // Check if this symbol is already defined in globals
+                if !self.module.globals.iter().any(|g| g.0 == name) {
+                    self.module.extern_symbols.insert(name);
+                }
                 continue;
             }
 
@@ -522,12 +531,14 @@ impl<'a> Linearizer<'a> {
                 self.ast_init_to_ir(e, declarator.typ)
             });
 
-            let name = self.str(declarator.name).to_string();
-
             // Track file-scope static variables for inline semantic checks
             if modifiers.contains(TypeModifiers::STATIC) {
                 self.file_scope_statics.insert(name.clone());
             }
+
+            // If this symbol was previously declared extern, remove it from extern_symbols
+            // (we now have the actual definition)
+            self.module.extern_symbols.remove(&name);
 
             self.module.add_global(&name, declarator.typ, init);
         }
@@ -556,9 +567,9 @@ impl<'a> Linearizer<'a> {
                     // char array - embed the string directly
                     Initializer::String(s.clone())
                 } else {
-                    // Pointer - would need to create a string constant and reference it
-                    // For now, just use SymAddr with a label we'll create
+                    // Pointer - create a string constant and reference it
                     let label = format!(".LC{}", self.module.strings.len());
+                    self.module.strings.push((label.clone(), s.clone()));
                     Initializer::SymAddr(label)
                 }
             }

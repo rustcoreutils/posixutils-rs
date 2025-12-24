@@ -11,6 +11,7 @@
 
 pub mod codegen;
 mod expression;
+mod features;
 mod float;
 pub mod lir;
 pub mod macros;

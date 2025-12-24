@@ -9,6 +9,7 @@
 // x86_64 architecture support
 //
 
+mod call;
 pub mod codegen;
 mod expression;
 mod features;

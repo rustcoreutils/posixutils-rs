@@ -2464,30 +2464,27 @@ impl<'a> Parser<'a> {
                     }
 
                     // Check if this is an enum constant - if so, return IntLit
-                    if let Some(sym) = self.symbols.lookup(name_id, Namespace::Ordinary) {
-                        if sym.is_enum_constant() {
-                            if let Some(value) = sym.enum_value {
-                                return Ok(Self::typed_expr(
-                                    ExprKind::IntLit(value),
-                                    self.types.int_id,
-                                    token_pos,
-                                ));
-                            }
+                    if let Some(sym) = self.symbols.lookup_enum_constant(name_id) {
+                        if let Some(value) = sym.enum_value {
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(value),
+                                self.types.int_id,
+                                token_pos,
+                            ));
                         }
-                        // Regular variable/function
-                        Ok(Self::typed_expr(
-                            ExprKind::Ident { name: name_id },
-                            sym.typ,
-                            token_pos,
-                        ))
-                    } else {
-                        // Unknown identifier - default to int
-                        Ok(Self::typed_expr(
-                            ExprKind::Ident { name: name_id },
-                            self.types.int_id,
-                            token_pos,
-                        ))
                     }
+
+                    // Regular variable/function or unknown identifier
+                    let typ = self
+                        .symbols
+                        .lookup(name_id, Namespace::Ordinary)
+                        .map(|s| s.typ)
+                        .unwrap_or(self.types.int_id);
+                    Ok(Self::typed_expr(
+                        ExprKind::Ident { name: name_id },
+                        typ,
+                        token_pos,
+                    ))
                 } else {
                     Err(ParseError::new("invalid identifier token", token.pos))
                 }

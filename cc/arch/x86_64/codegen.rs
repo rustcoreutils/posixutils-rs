@@ -13,9 +13,7 @@
 //
 
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{
-    complex_fp_info, CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol,
-};
+use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
@@ -1532,11 +1530,8 @@ impl X86_64CodeGen {
     }
 
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
-        // Check if this is an indirect call (through function pointer)
-        let is_indirect = insn.indirect_target.is_some();
-
-        // For direct calls, we need a function name
-        let func_name = if is_indirect {
+        // Get function name (or placeholder for indirect calls)
+        let func_name = if insn.indirect_target.is_some() {
             "<indirect>".to_string()
         } else {
             match &insn.func_name {
@@ -1545,456 +1540,36 @@ impl X86_64CodeGen {
             }
         };
 
-        // For indirect calls, load function pointer address into R11 before argument setup
-        // R11 is caller-saved and not used for arguments in System V AMD64 ABI
+        // For indirect calls, load function pointer into R11
         if let Some(func_addr) = insn.indirect_target {
             self.emit_move(func_addr, Reg::R11, 64);
         }
 
-        // System V AMD64 ABI:
-        // - Integer arguments: RDI, RSI, RDX, RCX, R8, R9 (6 registers)
-        // - Floating-point arguments: XMM0-XMM7 (8 registers)
-        // - Each class has its own counter (int and FP are independent)
-        // - For variadic functions: float args go in XMM registers (printf needs this),
-        //   but variadic integer args go on stack (our va_arg impl reads from stack)
-        // - AL must be set to the number of XMM registers used for variadic calls
-        let int_arg_regs = Reg::arg_regs();
-        let fp_arg_regs = XmmReg::arg_regs();
-        let mut int_arg_idx = 0;
-        let mut fp_arg_idx = 0;
-        let mut stack_args = 0;
+        // Classify arguments into register vs stack
+        let info = self.classify_call_args(insn, types);
 
-        let variadic_start = insn.variadic_arg_start.unwrap_or(usize::MAX);
+        // Push stack arguments
+        let stack_args = self.push_stack_args(insn, &info, types);
 
-        // First pass: determine which args go on stack
-        // For variadic calls: variadic INTEGER args go on stack, variadic FLOAT args use XMM
-        // For non-variadic calls: overflow args go on stack
-        let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
-        let mut temp_int_idx = 0;
-        let mut temp_fp_idx = 0;
+        // Save registers that would be clobbered by argument setup
+        let saved_arg_regs = self.save_clobbered_arg_regs(insn, &info, types);
 
-        for i in 0..insn.src.len() {
-            let arg_type = insn.arg_types.get(i).copied();
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
-            let is_fp = if let Some(typ) = arg_type {
-                types.is_float(typ)
-            } else {
-                let arg_loc = self.get_location(insn.src[i]);
-                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
-            };
+        // Set up register arguments
+        let fp_arg_count = self.setup_register_args(insn, &info, &saved_arg_regs, types);
 
-            // Note: We pass all args (fixed and variadic) the same way per SysV ABI
-            // Variadic args start at index variadic_start, but use same register sequence
-            let _is_variadic_arg = i >= variadic_start;
-
-            if is_complex {
-                // Complex uses TWO consecutive XMM registers
-                if temp_fp_idx + 1 >= fp_arg_regs.len() {
-                    stack_arg_indices.push(i);
-                }
-                temp_fp_idx += 2;
-            } else if is_fp {
-                // Float args go in XMM registers (all args, including variadic)
-                if temp_fp_idx >= fp_arg_regs.len() {
-                    stack_arg_indices.push(i);
-                }
-                temp_fp_idx += 1;
-            } else {
-                // Integer args go in GP registers (all args, including variadic)
-                // per x86-64 SysV ABI
-                if temp_int_idx >= int_arg_regs.len() {
-                    stack_arg_indices.push(i);
-                }
-                temp_int_idx += 1;
-            }
-        }
-
-        // Ensure 16-byte stack alignment before call
-        // If we're pushing an odd number of 8-byte args, add padding
-        let needs_padding = stack_arg_indices.len() % 2 == 1;
-        if needs_padding {
-            self.push_lir(X86Inst::Sub {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(8),
-                dst: Reg::Rsp,
-            });
-        }
-
-        // Push stack arguments in reverse order
-        for &i in stack_arg_indices.iter().rev() {
-            let arg = insn.src[i];
-            let arg_type = insn.arg_types.get(i).copied();
-            let is_fp = if let Some(typ) = arg_type {
-                types.is_float(typ)
-            } else {
-                let arg_loc = self.get_location(arg);
-                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
-            };
-
-            if is_fp {
-                let fp_size = if let Some(typ) = arg_type {
-                    types.size_bits(typ)
-                } else {
-                    64
-                };
-                self.emit_fp_move(arg, XmmReg::Xmm15, fp_size);
-                self.push_lir(X86Inst::Sub {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(8),
-                    dst: Reg::Rsp,
-                });
-                let fp_lir_size = FpSize::from_bits(fp_size);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_lir_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rsp,
-                        offset: 0,
-                    }),
-                });
-            } else {
-                let arg_size = if let Some(typ) = arg_type {
-                    types.size_bits(typ).max(32)
-                } else {
-                    64
-                };
-                self.emit_move(arg, Reg::Rax, arg_size);
-                self.push_lir(X86Inst::Push {
-                    src: GpOperand::Reg(Reg::Rax),
-                });
-            }
-            stack_args += 1;
-        }
-
-        // Pre-pass: Save argument values that are in argument registers to avoid clobbering.
-        // If arg[j]'s source is in an argument register that will be written by arg[k] where k < j,
-        // we need to save arg[j]'s value before we start setting up arguments.
-        // Use a HashMap to track saved locations: original_reg -> scratch_reg
-        let mut saved_arg_regs: std::collections::HashMap<Reg, Reg> =
-            std::collections::HashMap::new();
-        let scratch_regs = [Reg::R10, Reg::R11]; // Available scratch registers
-        let mut scratch_idx = 0;
-
-        // Collect which argument registers we'll write to (in order)
-        let mut regs_to_write: Vec<Reg> = Vec::new();
-        let mut temp_int_idx2 = 0;
-        for i in 0..insn.src.len() {
-            if stack_arg_indices.contains(&i) {
-                continue;
-            }
-            let arg_type = insn.arg_types.get(i).copied();
-            let is_fp = if let Some(typ) = arg_type {
-                types.is_float(typ)
-            } else {
-                let arg_loc = self.get_location(insn.src[i]);
-                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
-            };
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
-
-            if !is_fp && !is_complex {
-                if temp_int_idx2 < int_arg_regs.len() {
-                    regs_to_write.push(int_arg_regs[temp_int_idx2]);
-                }
-                temp_int_idx2 += 1;
-            }
-        }
-
-        // Now check which argument sources are in registers that will be clobbered
-        temp_int_idx2 = 0;
-        for i in 0..insn.src.len() {
-            if stack_arg_indices.contains(&i) {
-                continue;
-            }
-            let arg = insn.src[i];
-            let arg_type = insn.arg_types.get(i).copied();
-            let is_fp = if let Some(typ) = arg_type {
-                types.is_float(typ)
-            } else {
-                let arg_loc = self.get_location(arg);
-                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
-            };
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
-
-            if !is_fp && !is_complex && temp_int_idx2 < int_arg_regs.len() {
-                let arg_loc = self.get_location(arg);
-                if let Loc::Reg(src_reg) = arg_loc {
-                    // Check if this source register will be written by an earlier argument
-                    let my_dest_idx = temp_int_idx2;
-                    for (write_idx, &write_reg) in regs_to_write.iter().enumerate() {
-                        if write_idx < my_dest_idx && write_reg == src_reg {
-                            // This source will be clobbered! Save it if not already saved
-                            if !saved_arg_regs.contains_key(&src_reg)
-                                && scratch_idx < scratch_regs.len()
-                            {
-                                let scratch = scratch_regs[scratch_idx];
-                                scratch_idx += 1;
-                                self.push_lir(X86Inst::Mov {
-                                    size: OperandSize::B64,
-                                    src: GpOperand::Reg(src_reg),
-                                    dst: GpOperand::Reg(scratch),
-                                });
-                                saved_arg_regs.insert(src_reg, scratch);
-                            }
-                            break;
-                        }
-                    }
-                }
-                temp_int_idx2 += 1;
-            }
-        }
-
-        // Now handle register arguments (with saved values)
-        for i in 0..insn.src.len() {
-            // Skip args that went to stack
-            if stack_arg_indices.contains(&i) {
-                continue;
-            }
-            let arg = insn.src[i];
-            // Get argument type if available, otherwise fall back to location-based detection
-            let arg_type = insn.arg_types.get(i).copied();
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
-            let is_fp = if let Some(typ) = arg_type {
-                types.is_float(typ)
-            } else {
-                // Fall back to location-based detection for backwards compatibility
-                let arg_loc = self.get_location(arg);
-                matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
-            };
-
-            // Get argument size from type, with minimum 32-bit for register ops
-            let arg_size = if let Some(typ) = arg_type {
-                types.size_bits(typ).max(32)
-            } else {
-                64 // Default for backwards compatibility
-            };
-
-            if is_complex {
-                // Complex type: load both parts and put in 2 consecutive XMM registers
-                // The arg pseudo contains the ADDRESS of the complex value
-                let arg_loc = self.get_location(arg);
-                let (fp_size, imag_offset) = complex_fp_info(types, arg_type.unwrap());
-                match arg_loc {
-                    Loc::Stack(offset) => {
-                        // Stack slot contains the address of the complex value
-                        // First load the address into a temp register
-                        let adjusted = offset + self.callee_saved_offset;
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -adjusted,
-                            }),
-                            dst: GpOperand::Reg(Reg::R11),
-                        });
-                        // Load real part from the complex value
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: 0,
-                            }),
-                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                        });
-                        // Load imag part from the complex value
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: imag_offset,
-                            }),
-                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                        });
-                    }
-                    Loc::Reg(r) => {
-                        // Address in register - load through it
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
-                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                        });
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: r,
-                                offset: imag_offset,
-                            }),
-                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                        });
-                    }
-                    _ => {}
-                }
-                fp_arg_idx += 2;
-            } else if is_fp {
-                // FP size from type (32 for float, 64 for double)
-                let fp_size = if let Some(typ) = arg_type {
-                    types.size_bits(typ)
-                } else {
-                    64
-                };
-                // Float args go in XMM registers
-                self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size);
-                fp_arg_idx += 1;
-            } else {
-                // Integer args go in GP registers
-                // Check if this arg's source was saved to a scratch register
-                let arg_loc = self.get_location(arg);
-                if let Loc::Reg(src_reg) = arg_loc {
-                    if let Some(&saved_reg) = saved_arg_regs.get(&src_reg) {
-                        // Use the saved register instead of the original (which may be clobbered)
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::from_bits(arg_size),
-                            src: GpOperand::Reg(saved_reg),
-                            dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
-                        });
-                    } else {
-                        self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
-                    }
-                } else {
-                    self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
-                }
-                int_arg_idx += 1;
-            }
-        }
-
-        // For variadic function calls, set AL to the number of XMM registers used
-        // This is required by the System V AMD64 ABI for variadic functions
+        // For variadic calls, set AL to number of XMM registers used
         if insn.variadic_arg_start.is_some() {
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B8,
-                src: GpOperand::Imm(fp_arg_idx as i64),
-                dst: GpOperand::Reg(Reg::Rax),
-            });
+            self.set_variadic_fp_count(fp_arg_count);
         }
 
-        // Emit the call
-        if is_indirect {
-            // Indirect call through R11 (function pointer was loaded there earlier)
-            self.push_lir(X86Inst::Call {
-                target: CallTarget::Indirect(Reg::R11),
-            });
-        } else {
-            // Direct call to named function
-            self.push_lir(X86Inst::Call {
-                target: CallTarget::Direct(Symbol::global(func_name.clone())),
-            });
-        }
+        // Emit the call instruction
+        self.emit_call_instruction(insn, &func_name);
 
-        // Clean up stack arguments (including padding if any)
-        let stack_cleanup = stack_args * 8 + if needs_padding { 8 } else { 0 };
-        if stack_cleanup > 0 {
-            self.push_lir(X86Inst::Add {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(stack_cleanup as i64),
-                dst: Reg::Rsp,
-            });
-        }
+        // Clean up stack
+        self.cleanup_call_stack(stack_args, info.needs_padding);
 
         // Handle return value
-        if let Some(target) = insn.target {
-            let dst_loc = self.get_location(target);
-            // Check if return value is complex or floating-point
-            let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
-            let is_fp_result = if let Some(typ) = insn.typ {
-                types.is_float(typ)
-            } else {
-                matches!(dst_loc, Loc::Xmm(_) | Loc::FImm(..))
-            };
-
-            // Get return value size from type
-            let ret_size = insn.size.max(32);
-
-            if insn.is_two_reg_return {
-                // Two-register struct return: RAX has low 8 bytes, RDX has high 8 bytes
-                // Store both to the target location (which must be a stack slot)
-                match dst_loc {
-                    Loc::Stack(offset) => {
-                        let adjusted = offset + self.callee_saved_offset;
-                        // Store RAX (low 8 bytes)
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Reg(Reg::Rax),
-                            dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -adjusted,
-                            }),
-                        });
-                        // Store RDX (high 8 bytes)
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Reg(Reg::Rdx),
-                            dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -adjusted + 8,
-                            }),
-                        });
-                    }
-                    Loc::Reg(r) => {
-                        // Address in register - store through it
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Reg(Reg::Rax),
-                            dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
-                        });
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Reg(Reg::Rdx),
-                            dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
-                        });
-                    }
-                    _ => {}
-                }
-            } else if is_complex_result {
-                // Complex return value is in XMM0 (real) + XMM1 (imag)
-                // Store both parts to the target location
-                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
-                match dst_loc {
-                    Loc::Stack(offset) => {
-                        let adjusted = offset + self.callee_saved_offset;
-                        // Store real part from XMM0
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Reg(XmmReg::Xmm0),
-                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -adjusted,
-                            }),
-                        });
-                        // Store imag part from XMM1
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Reg(XmmReg::Xmm1),
-                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -adjusted + imag_offset,
-                            }),
-                        });
-                    }
-                    Loc::Reg(r) => {
-                        // Address in register - store through it
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Reg(XmmReg::Xmm0),
-                            dst: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
-                        });
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Reg(XmmReg::Xmm1),
-                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: r,
-                                offset: imag_offset,
-                            }),
-                        });
-                    }
-                    _ => {}
-                }
-            } else if is_fp_result {
-                // FP return value is in XMM0
-                self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_size);
-            } else {
-                // Integer return value is in RAX
-                self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
-            }
-        }
+        self.handle_call_return_value(insn, types);
     }
 
     fn emit_select(&mut self, insn: &Instruction) {

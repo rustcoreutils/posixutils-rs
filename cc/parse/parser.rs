@@ -1423,6 +1423,9 @@ impl<'a> Parser<'a> {
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
         let mut parsed_something = false;
+        // Track typedef type separately - we continue parsing after a typedef
+        // to collect trailing qualifiers like "z_word_t const"
+        let mut typedef_base: Option<TypeId> = None;
 
         loop {
             if self.peek() != TokenType::Ident {
@@ -1701,32 +1704,15 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // Check if it's a typedef name
-                    if base_kind.is_none() {
+                    // Only consume if we haven't already seen a base type or typedef
+                    if base_kind.is_none() && typedef_base.is_none() {
                         if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
                             self.advance();
-                            // For typedef, we already have a TypeId - just apply pointer/array modifiers
-                            let mut result_id = typedef_type_id;
-                            // Handle pointer declarators
-                            while self.is_special(b'*') {
-                                self.advance();
-                                result_id = self.types.intern(Type::pointer(result_id));
-                            }
-                            // Handle array declarators
-                            while self.is_special(b'[') {
-                                self.advance();
-                                if let Ok(size_expr) = self.parse_conditional_expr() {
-                                    if let Some(size) = self.eval_const_expr(&size_expr) {
-                                        result_id = self
-                                            .types
-                                            .intern(Type::array(result_id, size as usize));
-                                    }
-                                }
-                                if !self.is_special(b']') {
-                                    return None;
-                                }
-                                self.advance();
-                            }
-                            return Some(result_id);
+                            // Save the typedef type and continue looping to collect trailing
+                            // qualifiers (e.g., "z_word_t const" where const comes after typedef)
+                            typedef_base = Some(typedef_type_id);
+                            parsed_something = true;
+                            continue;
                         }
                     }
                     break;
@@ -1738,10 +1724,24 @@ impl<'a> Parser<'a> {
             return None;
         }
 
-        // If we only have modifiers like `unsigned` without a base type, default to int
-        let kind = base_kind.unwrap_or(TypeKind::Int);
-        let typ = Type::with_modifiers(kind, modifiers);
-        let mut result_id = self.types.intern(typ);
+        // Get the base type - either from typedef or from built-in type specifiers
+        let mut result_id = if let Some(typedef_type_id) = typedef_base {
+            // Apply trailing modifiers to the typedef type
+            if !modifiers.is_empty() {
+                let typedef_type = self.types.get(typedef_type_id);
+                let mut result = typedef_type.clone();
+                result.modifiers &= !TypeModifiers::TYPEDEF;
+                result.modifiers |= modifiers;
+                self.types.intern(result)
+            } else {
+                typedef_type_id
+            }
+        } else {
+            // If we only have modifiers like `unsigned` without a base type, default to int
+            let kind = base_kind.unwrap_or(TypeKind::Int);
+            let typ = Type::with_modifiers(kind, modifiers);
+            self.types.intern(typ)
+        };
 
         // Handle pointer declarators
         while self.is_special(b'*') {
@@ -3331,6 +3331,9 @@ impl Parser<'_> {
     fn parse_type_specifier(&mut self) -> ParseResult<Type> {
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
+        // Track typedef type separately - we continue parsing after a typedef
+        // to collect trailing qualifiers like "z_word_t const"
+        let mut typedef_base: Option<TypeId> = None;
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -3478,22 +3481,29 @@ impl Parser<'_> {
                 }
                 _ => {
                     // Check if it's a typedef name
-                    // Only consume the typedef if we haven't already seen a base type
-                    if base_kind.is_none() {
+                    // Only consume the typedef if we haven't already seen a base type or typedef
+                    if base_kind.is_none() && typedef_base.is_none() {
                         if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
                             self.advance();
-                            // Get the underlying type and merge in any modifiers we collected
-                            let typedef_type = self.types.get(typedef_type_id);
-                            let mut result = typedef_type.clone();
-                            // Strip TYPEDEF modifier - we're using the typedef, not defining one
-                            result.modifiers &= !TypeModifiers::TYPEDEF;
-                            result.modifiers |= modifiers;
-                            return Ok(result);
+                            // Save the typedef type and continue looping to collect trailing
+                            // qualifiers (e.g., "z_word_t const" where const comes after typedef)
+                            typedef_base = Some(typedef_type_id);
+                            continue;
                         }
                     }
                     break;
                 }
             }
+        }
+
+        // If we parsed a typedef, return that with any trailing modifiers applied
+        if let Some(typedef_type_id) = typedef_base {
+            let typedef_type = self.types.get(typedef_type_id);
+            let mut result = typedef_type.clone();
+            // Strip TYPEDEF modifier - we're using the typedef, not defining one
+            result.modifiers &= !TypeModifiers::TYPEDEF;
+            result.modifiers |= modifiers;
+            return Ok(result);
         }
 
         let kind = base_kind.unwrap_or(TypeKind::Int);
@@ -7815,6 +7825,109 @@ mod tests {
                 if let Some(composite) = types.composite(decl.declarators[0].typ) {
                     // Three 1-bit fields should fit in one 4-byte int
                     assert_eq!(composite.size, 4);
+                }
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    // ========================================================================
+    // Typedef with trailing qualifiers tests (C99)
+    // Tests for "typedef_name const" and "typedef_name volatile" syntax
+    // ========================================================================
+
+    #[test]
+    fn test_typedef_trailing_const() {
+        // Test that "typedef_name const" is parsed correctly
+        // This pattern is used in real code like: z_word_t const *ptr
+        let (tu, types, _strings) =
+            parse_tu("typedef unsigned long mytype; mytype const x;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        // Second item should be the declaration of x
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                // The type should have CONST modifier
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::CONST),
+                    "Type should have CONST modifier"
+                );
+                // Base type should still be unsigned long
+                assert_eq!(types.kind(typ), TypeKind::Long);
+                assert!(types.modifiers(typ).contains(TypeModifiers::UNSIGNED));
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_typedef_trailing_volatile() {
+        // Test that "typedef_name volatile" is parsed correctly
+        let (tu, types, _strings) =
+            parse_tu("typedef int myint; myint volatile v;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::VOLATILE),
+                    "Type should have VOLATILE modifier"
+                );
+                assert_eq!(types.kind(typ), TypeKind::Int);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_typedef_trailing_const_volatile() {
+        // Test both const and volatile after typedef name
+        let (tu, types, _strings) =
+            parse_tu("typedef int myint; myint const volatile cv;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::CONST),
+                    "Type should have CONST modifier"
+                );
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::VOLATILE),
+                    "Type should have VOLATILE modifier"
+                );
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_typedef_trailing_const_pointer() {
+        // Test "typedef_name const *ptr" pattern
+        // This is common in real code: z_word_t const *ptr
+        let (tu, types, _strings) =
+            parse_tu("typedef unsigned long word_t; word_t const *ptr;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let ptr_typ = decl.declarators[0].typ;
+                // Should be a pointer
+                assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
+                // The base type (what pointer points to) should be const
+                if let Some(base) = types.base_type(ptr_typ) {
+                    assert!(
+                        types.modifiers(base).contains(TypeModifiers::CONST),
+                        "Pointee type should have CONST modifier"
+                    );
+                    assert!(types.modifiers(base).contains(TypeModifiers::UNSIGNED));
                 }
             }
             _ => panic!("Expected Declaration"),

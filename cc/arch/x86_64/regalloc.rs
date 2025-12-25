@@ -404,6 +404,9 @@ pub enum Loc {
     Xmm(XmmReg),
     /// On the stack at [rbp - offset]
     Stack(i32),
+    /// Incoming stack argument at [rbp + offset] (positive offset, above return address)
+    /// Used for function parameters 7+ that are passed on the stack by the caller
+    IncomingArg(i32),
     /// Immediate integer constant
     Imm(i64),
     /// Immediate float constant (value, size in bits)
@@ -527,9 +530,11 @@ impl RegAlloc {
                                 self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                                 self.fp_pseudos.insert(pseudo.id);
                             } else {
+                                // Stack-passed FP argument: at [rbp + offset]
+                                // 16 = saved rbp (8) + return address (8)
                                 let offset =
                                     16 + (i - int_arg_regs.len() - fp_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::Stack(-offset));
+                                self.locations.insert(pseudo.id, Loc::IncomingArg(offset));
                             }
                             fp_arg_idx += 1;
                         } else {
@@ -538,8 +543,10 @@ impl RegAlloc {
                                     .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
                                 self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                             } else {
-                                let offset = 16 + (i - int_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::Stack(-offset));
+                                // Stack-passed integer argument: at [rbp + offset]
+                                // 16 = saved rbp (8) + return address (8)
+                                let offset = 16 + (int_arg_idx - int_arg_regs.len()) as i32 * 8;
+                                self.locations.insert(pseudo.id, Loc::IncomingArg(offset));
                             }
                             int_arg_idx += 1;
                         }

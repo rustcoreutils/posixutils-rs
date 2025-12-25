@@ -86,6 +86,11 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
         }
     }
 
+    // Indirect call target (function pointer)
+    if let Some(indirect) = insn.indirect_target {
+        uses.push(indirect);
+    }
+
     uses
 }
 
@@ -506,5 +511,75 @@ mod tests {
         assert!(!changed); // Store is a root, not dead
 
         assert_eq!(func.blocks[0].insns[1].op, Opcode::Store);
+    }
+
+    #[test]
+    fn test_indirect_call_target_is_use() {
+        // Test that get_uses() includes indirect_target for function pointer calls.
+        // This prevents DCE from eliminating the instruction that computes
+        // the function pointer before an indirect call.
+        let types = TypeTable::new(64);
+        let call_insn = Instruction::call_indirect(
+            Some(PseudoId(0)), // return value target
+            PseudoId(5),       // func_addr (the function pointer)
+            vec![PseudoId(1), PseudoId(2)], // args
+            vec![types.int_id, types.int_id], // arg_types
+            types.int_id,
+            32,
+        );
+
+        let uses = get_uses(&call_insn);
+
+        // Verify indirect_target is in the uses list
+        assert!(
+            uses.contains(&PseudoId(5)),
+            "get_uses should include indirect_target"
+        );
+        // Also verify call arguments are in uses
+        assert!(uses.contains(&PseudoId(1)));
+        assert!(uses.contains(&PseudoId(2)));
+    }
+
+    #[test]
+    fn test_indirect_call_keeps_func_ptr_live() {
+        // Full DCE test: verify an indirect call keeps its function pointer live.
+        let types = TypeTable::new(64);
+        let mut func = Function::new("test", types.int_id);
+
+        func.add_pseudo(Pseudo::reg(PseudoId(0), 0)); // result
+        func.add_pseudo(Pseudo::reg(PseudoId(1), 1)); // func pointer
+        func.add_pseudo(Pseudo::val(PseudoId(2), 42)); // arg
+
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+
+        // %1 = load the function pointer (this should stay live)
+        let mut load = Instruction::new(Opcode::Load);
+        load.target = Some(PseudoId(1));
+        load.src = vec![PseudoId(2)]; // load from some address
+        load.typ = Some(types.pointer_to(types.int_id));
+        load.size = 64;
+        bb.add_insn(load);
+
+        // %0 = call_indirect %1(%2)
+        let call = Instruction::call_indirect(
+            Some(PseudoId(0)),
+            PseudoId(1), // indirect through %1
+            vec![PseudoId(2)], // args
+            vec![types.int_id], // arg_types
+            types.int_id,
+            32,
+        );
+        bb.add_insn(call);
+
+        bb.add_insn(Instruction::ret(Some(PseudoId(0))));
+        func.add_block(bb);
+        func.entry = BasicBlockId(0);
+
+        let changed = run(&mut func);
+
+        // The load instruction that defines %1 (func pointer) should NOT be
+        // eliminated because %1 is used as indirect_target in the call
+        assert!(!changed || func.blocks[0].insns[1].op == Opcode::Load);
     }
 }

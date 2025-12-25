@@ -776,6 +776,38 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
     any_changed
 }
 
+/// Collect all function address references from an initializer (recursive)
+fn collect_func_refs_from_initializer(
+    init: &super::Initializer,
+    func_names: &HashSet<String>,
+    address_taken: &mut HashSet<String>,
+) {
+    use super::Initializer;
+    match init {
+        Initializer::SymAddr(name) => {
+            // Check if this symbol is a function name
+            if func_names.contains(name) {
+                address_taken.insert(name.clone());
+            }
+        }
+        Initializer::Array { elements, .. } => {
+            for (_, elem_init) in elements {
+                collect_func_refs_from_initializer(elem_init, func_names, address_taken);
+            }
+        }
+        Initializer::Struct { fields, .. } => {
+            for (_, _, field_init) in fields {
+                collect_func_refs_from_initializer(field_init, func_names, address_taken);
+            }
+        }
+        // Other initializer types don't contain function references
+        Initializer::None
+        | Initializer::Int(_)
+        | Initializer::Float(_)
+        | Initializer::String(_) => {}
+    }
+}
+
 /// Remove functions that are static and have no callers
 fn remove_dead_functions(module: &mut Module) {
     // Collect all function names for lookup
@@ -785,6 +817,7 @@ fn remove_dead_functions(module: &mut Module) {
     let mut call_counts: HashMap<String, usize> = HashMap::new();
     let mut address_taken: HashSet<String> = HashSet::new();
 
+    // Check function code for calls and address-taken via SymAddr instructions
     for func in &module.functions {
         for bb in &func.blocks {
             for insn in &bb.insns {
@@ -810,6 +843,12 @@ fn remove_dead_functions(module: &mut Module) {
         }
     }
 
+    // Check global variable initializers for function pointer references
+    // (e.g., static const struct { func_ptr fn; } table[] = { {my_func}, ... })
+    for (_, _, init) in &module.globals {
+        collect_func_refs_from_initializer(init, &func_names, &mut address_taken);
+    }
+
     // Remove static functions with no callers and no address taken (except main)
     module.functions.retain(|f| {
         f.name == "main"
@@ -826,6 +865,7 @@ fn remove_dead_functions(module: &mut Module) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::Initializer;
     use crate::types::TypeTable;
 
     fn make_simple_func(name: &str, is_inline: bool) -> Function {
@@ -1014,6 +1054,174 @@ mod tests {
         assert!(
             module.functions.iter().any(|f| f.name == "handler"),
             "handler function should be preserved because its address is taken"
+        );
+    }
+
+    #[test]
+    fn test_global_initializer_func_ref_preserved() {
+        // Test that static functions referenced in global struct/array initializers
+        // are NOT removed by dead function elimination.
+        // This tests the fix for: static const struct { func_ptr fn; } = { my_func };
+        let types = TypeTable::new(64);
+        let mut module = Module::new();
+
+        // Create a static function "callback" with no direct callers
+        let mut callback = Function::new("callback", types.int_id);
+        callback.is_static = true;
+        callback.is_inline = false;
+
+        let mut callback_bb = BasicBlock::new(BasicBlockId(0));
+        callback_bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret = Instruction::new(Opcode::Ret);
+        ret.src = vec![PseudoId(0)];
+        callback_bb.insns.push(ret);
+        callback.blocks.push(callback_bb);
+        callback.entry = BasicBlockId(0);
+        callback.pseudos.push(Pseudo::val(PseudoId(0), 42));
+
+        module.functions.push(callback);
+
+        // Create main function (just returns 0)
+        let mut main_func = Function::new("main", types.int_id);
+        main_func.is_static = false;
+
+        let mut main_bb = BasicBlock::new(BasicBlockId(0));
+        main_bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret_main = Instruction::new(Opcode::Ret);
+        ret_main.src = vec![PseudoId(0)];
+        main_bb.insns.push(ret_main);
+        main_func.blocks.push(main_bb);
+        main_func.entry = BasicBlockId(0);
+        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(main_func);
+
+        // Add a global variable with a SymAddr initializer referencing "callback"
+        // This simulates: static void (*handler)(void) = callback;
+        module.globals.push((
+            "handler".to_string(),
+            types.void_ptr_id,
+            Initializer::SymAddr("callback".to_string()),
+        ));
+
+        // Verify both functions exist before
+        assert_eq!(module.functions.len(), 2);
+        assert!(module.functions.iter().any(|f| f.name == "callback"));
+
+        // Run remove_dead_functions
+        remove_dead_functions(&mut module);
+
+        // callback should NOT be removed because it's referenced in global initializer
+        assert!(
+            module.functions.iter().any(|f| f.name == "callback"),
+            "callback function should be preserved because it's referenced in global initializer"
+        );
+    }
+
+    #[test]
+    fn test_global_struct_initializer_func_ref_preserved() {
+        // Test function refs inside struct initializers in globals
+        let types = TypeTable::new(64);
+        let mut module = Module::new();
+
+        // Create static function "my_handler"
+        let mut handler = Function::new("my_handler", types.int_id);
+        handler.is_static = true;
+
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret = Instruction::new(Opcode::Ret);
+        ret.src = vec![PseudoId(0)];
+        bb.insns.push(ret);
+        handler.blocks.push(bb);
+        handler.entry = BasicBlockId(0);
+        handler.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(handler);
+
+        // Create main
+        let mut main_func = Function::new("main", types.int_id);
+        let mut main_bb = BasicBlock::new(BasicBlockId(0));
+        main_bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret_main = Instruction::new(Opcode::Ret);
+        ret_main.src = vec![PseudoId(0)];
+        main_bb.insns.push(ret_main);
+        main_func.blocks.push(main_bb);
+        main_func.entry = BasicBlockId(0);
+        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(main_func);
+
+        // Add global with struct initializer containing function reference
+        // Simulates: struct { void (*fn)(void); } table = { my_handler };
+        module.globals.push((
+            "table".to_string(),
+            types.void_ptr_id,
+            Initializer::Struct {
+                total_size: 8,
+                fields: vec![(0, 8, Initializer::SymAddr("my_handler".to_string()))],
+            },
+        ));
+
+        remove_dead_functions(&mut module);
+
+        assert!(
+            module.functions.iter().any(|f| f.name == "my_handler"),
+            "my_handler should be preserved - referenced in global struct initializer"
+        );
+    }
+
+    #[test]
+    fn test_global_array_initializer_func_ref_preserved() {
+        // Test function refs inside array initializers in globals
+        let types = TypeTable::new(64);
+        let mut module = Module::new();
+
+        // Create static function "arr_func"
+        let mut func = Function::new("arr_func", types.int_id);
+        func.is_static = true;
+
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret = Instruction::new(Opcode::Ret);
+        ret.src = vec![PseudoId(0)];
+        bb.insns.push(ret);
+        func.blocks.push(bb);
+        func.entry = BasicBlockId(0);
+        func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(func);
+
+        // Create main
+        let mut main_func = Function::new("main", types.int_id);
+        let mut main_bb = BasicBlock::new(BasicBlockId(0));
+        main_bb.insns.push(Instruction::new(Opcode::Entry));
+        let mut ret_main = Instruction::new(Opcode::Ret);
+        ret_main.src = vec![PseudoId(0)];
+        main_bb.insns.push(ret_main);
+        main_func.blocks.push(main_bb);
+        main_func.entry = BasicBlockId(0);
+        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+
+        module.functions.push(main_func);
+
+        // Add global with array initializer containing function reference
+        // Simulates: void (*handlers[])(void) = { arr_func };
+        module.globals.push((
+            "handlers".to_string(),
+            types.void_ptr_id,
+            Initializer::Array {
+                elem_size: 8,
+                total_size: 8,
+                elements: vec![(0, Initializer::SymAddr("arr_func".to_string()))],
+            },
+        ));
+
+        remove_dead_functions(&mut module);
+
+        assert!(
+            module.functions.iter().any(|f| f.name == "arr_func"),
+            "arr_func should be preserved - referenced in global array initializer"
         );
     }
 }

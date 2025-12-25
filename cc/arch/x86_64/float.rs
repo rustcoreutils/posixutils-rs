@@ -730,6 +730,16 @@ impl X86_64CodeGen {
                     dst: XmmOperand::Reg(dst),
                 });
             }
+            Loc::IncomingArg(offset) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset,
+                    }),
+                    dst: XmmOperand::Reg(dst),
+                });
+            }
             Loc::FImm(v, imm_size) => {
                 // Use the size from the FImm, not the passed-in size
                 // This ensures float constants are loaded as float, not double

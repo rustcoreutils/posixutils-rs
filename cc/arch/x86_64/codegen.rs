@@ -82,6 +82,14 @@ impl X86_64CodeGen {
                     offset: -adjusted,
                 })
             }
+            Loc::IncomingArg(offset) => {
+                // Incoming stack argument: at [rbp + offset] (positive offset)
+                // No callee_saved_offset adjustment needed - these are above the return address
+                GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: *offset,
+                })
+            }
             Loc::Imm(v) => GpOperand::Imm(*v),
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
@@ -616,6 +624,16 @@ impl X86_64CodeGen {
                     }),
                 });
             }
+            Loc::IncomingArg(offset) => {
+                self.push_lir(X86Inst::Cmp {
+                    size: op_size,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *offset,
+                    }),
+                });
+            }
             Loc::Imm(v) => {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
@@ -998,6 +1016,17 @@ impl X86_64CodeGen {
                     src: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: -adjusted,
+                    }),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
+            Loc::IncomingArg(offset) => {
+                // LIR: memory-to-register move from incoming stack arg
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset,
                     }),
                     dst: GpOperand::Reg(dst),
                 });
@@ -2273,6 +2302,9 @@ impl X86_64CodeGen {
             Loc::Stack(offset) => {
                 let adjusted = offset + self.callee_saved_offset;
                 format!("-{}(%rbp)", adjusted)
+            }
+            Loc::IncomingArg(offset) => {
+                format!("{}(%rbp)", offset)
             }
             Loc::Imm(v) => format!("${}", v),
             Loc::Xmm(xmm) => xmm.name().to_string(),

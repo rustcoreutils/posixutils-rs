@@ -94,6 +94,8 @@ pub enum Reg {
     X30,
     // Stack pointer (special, shares encoding with XZR in some contexts)
     SP,
+    // Zero register (always reads as zero, discards writes)
+    Xzr,
 }
 
 impl Reg {
@@ -131,6 +133,7 @@ impl Reg {
             Reg::X29 => "x29",
             Reg::X30 => "x30",
             Reg::SP => "sp",
+            Reg::Xzr => "xzr",
         }
     }
 
@@ -168,6 +171,7 @@ impl Reg {
             Reg::X29 => "w29",
             Reg::X30 => "w30",
             Reg::SP => "sp", // SP doesn't have a 32-bit form in normal use
+            Reg::Xzr => "wzr",
         }
     }
 

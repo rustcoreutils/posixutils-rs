@@ -31,7 +31,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let work_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         // Load first operand
@@ -120,7 +120,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let work_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         self.emit_move(src, work_reg, size, frame_size);
@@ -156,7 +156,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         self.emit_move(src1, Reg::X10, size, frame_size);
@@ -192,7 +192,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         // Division instruction
@@ -263,7 +263,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         // Use cset to set register based on condition
@@ -300,7 +300,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         match insn.op {

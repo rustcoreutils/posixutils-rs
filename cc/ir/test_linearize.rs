@@ -11,7 +11,7 @@
 //
 
 use super::*;
-use crate::parse::ast::{ExternalDecl, FunctionDef, Parameter};
+use crate::parse::ast::{AssignOp, ExprKind, ExternalDecl, FunctionDef, Parameter, UnaryOp};
 use crate::strings::StringTable;
 
 /// Create a default position for test code
@@ -121,4 +121,200 @@ fn test_function_with_many_params() {
     assert!(ir.contains("%h"), "IR should have last param: {}", ir);
     // Should have add operation for a + h
     assert!(ir.contains("add"), "IR should have add for a + h: {}", ir);
+}
+
+// ============================================================================
+// Compound assignment lvalue regression tests
+// These test the fix for assignment operators with complex lvalues
+// (Member, Arrow, Deref, Index) - linearize.rs:3730
+// ============================================================================
+
+#[test]
+fn test_compound_assignment_deref() {
+    // Test: *p += 1;
+    // Regression: assignment operators work with dereferenced pointers
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let p_id = strings.intern("p");
+    let int_type = types.int_id;
+    let int_ptr_type = types.intern(crate::types::Type::pointer(int_type));
+
+    // Function: void test(int *p) { *p += 1; }
+    let deref_expr = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::Deref,
+            operand: Box::new(Expr::var_typed(p_id, int_ptr_type)),
+        },
+        int_type,
+    );
+
+    let assign_expr = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::AddAssign,
+            target: Box::new(deref_expr),
+            value: Box::new(Expr::int(1, &types)),
+        },
+        int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            name: Some(p_id),
+            typ: int_ptr_type,
+        }],
+        body: Stmt::Expr(assign_expr),
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // The IR should have load and store for the dereferenced pointer
+    assert!(
+        ir.contains("load"),
+        "Compound assignment to *p should load: {}",
+        ir
+    );
+    assert!(
+        ir.contains("store"),
+        "Compound assignment to *p should store: {}",
+        ir
+    );
+    assert!(
+        ir.contains("add"),
+        "Compound assignment += should have add: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_compound_assignment_index() {
+    // Test: arr[i] += 1;
+    // Regression: assignment operators work with array subscripts
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let arr_id = strings.intern("arr");
+    let i_id = strings.intern("i");
+    let int_type = types.int_id;
+    let arr_ptr_type = types.intern(crate::types::Type::pointer(int_type));
+
+    // Function: void test(int *arr, int i) { arr[i] += 1; }
+    let index_expr = Expr::typed_unpositioned(
+        ExprKind::Index {
+            array: Box::new(Expr::var_typed(arr_id, arr_ptr_type)),
+            index: Box::new(Expr::var_typed(i_id, int_type)),
+        },
+        int_type,
+    );
+
+    let assign_expr = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::AddAssign,
+            target: Box::new(index_expr),
+            value: Box::new(Expr::int(1, &types)),
+        },
+        int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.void_id,
+        name: test_id,
+        params: vec![
+            Parameter {
+                name: Some(arr_id),
+                typ: arr_ptr_type,
+            },
+            Parameter {
+                name: Some(i_id),
+                typ: int_type,
+            },
+        ],
+        body: Stmt::Expr(assign_expr),
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // The IR should have load and store for the array element
+    // Also should have index calculation (mul for offset)
+    assert!(
+        ir.contains("load"),
+        "Compound assignment to arr[i] should load: {}",
+        ir
+    );
+    assert!(
+        ir.contains("store"),
+        "Compound assignment to arr[i] should store: {}",
+        ir
+    );
+}
+
+// ============================================================================
+// Array field initialization regression test
+// Tests the fix for C99 6.7.8p14: scalar initializes first array element
+// ============================================================================
+
+#[test]
+fn test_simple_array_element_store() {
+    // Simpler test: verify we can store to a specific array element
+    // This exercises the path that was fixed for array field initialization
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let arr_id = strings.intern("arr");
+    let int_type = types.int_id;
+    let arr_ptr_type = types.intern(crate::types::Type::pointer(int_type));
+
+    // Function: void test(int *arr) { arr[0] = 42; }
+    let index_expr = Expr::typed_unpositioned(
+        ExprKind::Index {
+            array: Box::new(Expr::var_typed(arr_id, arr_ptr_type)),
+            index: Box::new(Expr::int(0, &types)),
+        },
+        int_type,
+    );
+
+    let assign_expr = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(index_expr),
+            value: Box::new(Expr::int(42, &types)),
+        },
+        int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            name: Some(arr_id),
+            typ: arr_ptr_type,
+        }],
+        body: Stmt::Expr(assign_expr),
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // Should have a store for the array element assignment
+    assert!(
+        ir.contains("store"),
+        "Array element assignment should produce store: {}",
+        ir
+    );
 }

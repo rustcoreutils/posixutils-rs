@@ -490,9 +490,10 @@ impl X86_64CodeGen {
 
         // Set result based on comparison type
         let dst_loc = self.get_location(target);
+        // Use R10 as scratch to avoid clobbering live values in Rax
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10,
         };
 
         // Use appropriate setcc instruction

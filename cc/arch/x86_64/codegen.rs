@@ -864,9 +864,10 @@ impl X86_64CodeGen {
             Opcode::SymAddr => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     let dst_loc = self.get_location(target);
+                    // Use R10 as scratch to avoid clobbering live values in Rax
                     let dst_reg = match &dst_loc {
                         Loc::Reg(r) => *r,
-                        _ => Reg::Rax,
+                        _ => Reg::R10,
                     };
                     let src_loc = self.get_location(src);
                     match src_loc {
@@ -1590,6 +1591,12 @@ impl X86_64CodeGen {
         // Get destination address
         let addr_loc = self.get_location(addr);
 
+        // Special case: if value is immediate 0, zero the struct instead of copying
+        if let Loc::Imm(0) = value_loc {
+            self.emit_struct_zero(insn, addr, num_qwords);
+            return;
+        }
+
         // Load source address into R10
         match value_loc {
             Loc::Stack(offset) => {
@@ -1717,6 +1724,89 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Emit code to zero a struct (for struct = {0} initialization)
+    fn emit_struct_zero(&mut self, insn: &Instruction, addr: PseudoId, num_qwords: u32) {
+        let addr_loc = self.get_location(addr);
+
+        // Load destination address into R11
+        match addr_loc {
+            Loc::Stack(offset) => {
+                let adjusted = offset - insn.offset as i32 + self.callee_saved_offset;
+                self.push_lir(X86Inst::Lea {
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -adjusted,
+                    },
+                    dst: Reg::R11,
+                });
+            }
+            Loc::Reg(r) => {
+                if insn.offset != 0 {
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::BaseOffset {
+                            base: r,
+                            offset: insn.offset as i32,
+                        },
+                        dst: Reg::R11,
+                    });
+                } else if r != Reg::R11 {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(r),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                }
+            }
+            Loc::Global(ref name) => {
+                if self.needs_got_access(name) {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                } else {
+                    let symbol = if name.starts_with('.') {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::RipRelative(symbol),
+                        dst: Reg::R11,
+                    });
+                }
+                if insn.offset != 0 {
+                    self.push_lir(X86Inst::Add {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(insn.offset),
+                        dst: Reg::R11,
+                    });
+                }
+            }
+            _ => return,
+        }
+
+        // Load 0 into R10 once
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(0),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+
+        // Store zeros to each qword
+        for i in 0..num_qwords {
+            let byte_offset = (i * 8) as i32;
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::R11,
+                    offset: byte_offset,
+                }),
+            });
+        }
+    }
+
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
         // Get function name (or placeholder for indirect calls)
         let func_name = if insn.indirect_target.is_some() {
@@ -1811,12 +1901,18 @@ impl X86_64CodeGen {
                 });
             }
         }
-        self.emit_move(then_val, Reg::R10, size);
+        // Use R11 for then_val when dst_reg is R10 to avoid clobbering else value
+        let then_reg = if dst_reg == Reg::R10 {
+            Reg::R11
+        } else {
+            Reg::R10
+        };
+        self.emit_move(then_val, then_reg, size);
         // LIR: conditional move if not equal (non-zero)
         self.push_lir(X86Inst::CMov {
             cc: CondCode::Ne,
             size: op_size,
-            src: GpOperand::Reg(Reg::R10),
+            src: GpOperand::Reg(then_reg),
             dst: dst_reg,
         });
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {

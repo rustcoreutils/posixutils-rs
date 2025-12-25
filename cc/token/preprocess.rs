@@ -2701,6 +2701,22 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 // ============================================================================
 // Public API
 // ============================================================================
+
+/// Configuration for preprocessing command-line options
+#[derive(Default)]
+pub struct PreprocessConfig<'a> {
+    /// Command-line -D defines
+    pub defines: &'a [String],
+    /// Command-line -U undefines
+    pub undefines: &'a [String],
+    /// Command-line -I include paths
+    pub include_paths: &'a [String],
+    /// If true, disable system include paths (-nostdinc)
+    pub no_std_inc: bool,
+    /// If true, disable builtin headers (-nobuiltininc)
+    pub no_builtin_inc: bool,
+}
+
 /// Preprocess tokens with command-line defines and undefines
 ///
 /// This is the main entry point for preprocessing.
@@ -2711,40 +2727,32 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 /// * `target` - Target platform configuration
 /// * `idents` - Identifier table for string interning
 /// * `filename` - Name of the source file
-/// * `defines` - Command-line -D defines
-/// * `undefines` - Command-line -U undefines
-/// * `include_paths` - Command-line -I include paths
-/// * `no_std_inc` - If true, disable system include paths (-nostdinc)
-/// * `no_builtin_inc` - If true, disable builtin headers (-nobuiltininc)
+/// * `config` - Preprocessing configuration (defines, undefines, include paths, flags)
 pub fn preprocess_with_defines(
     tokens: Vec<Token>,
     target: &Target,
     idents: &mut IdentTable,
     filename: &str,
-    defines: &[String],
-    undefines: &[String],
-    include_paths: &[String],
-    no_std_inc: bool,
-    no_builtin_inc: bool,
+    config: &PreprocessConfig<'_>,
 ) -> Vec<Token> {
     let mut pp = Preprocessor::new(target, filename);
 
     // Handle -nostdinc and -nobuiltininc flags
-    if no_std_inc {
+    if config.no_std_inc {
         pp.use_system_headers = false;
         pp.use_builtin_headers = false;
     }
-    if no_builtin_inc {
+    if config.no_builtin_inc {
         pp.use_builtin_headers = false;
     }
 
     // Add -I include paths
-    for path in include_paths {
+    for path in config.include_paths {
         pp.quote_include_paths.push(path.clone());
     }
 
     // Process -D defines
-    for def in defines {
+    for def in config.defines {
         if let Some(eq_pos) = def.find('=') {
             // -DNAME=VALUE - tokenize the value properly
             let name = &def[..eq_pos];
@@ -2759,7 +2767,7 @@ pub fn preprocess_with_defines(
     }
 
     // Process -U undefines
-    for undef in undefines {
+    for undef in config.undefines {
         pp.undef_macro(undef);
     }
 
@@ -2786,11 +2794,7 @@ mod tests {
             &target,
             &mut strings,
             "<test>",
-            &[],
-            &[],
-            &[],
-            false,
-            false,
+            &PreprocessConfig::default(),
         );
         (result, strings)
     }

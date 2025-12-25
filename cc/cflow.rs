@@ -19,7 +19,7 @@ use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, StreamTable, Tokenizer};
+use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -456,11 +456,13 @@ fn process_file(
         &target,
         &mut strings,
         path,
-        defines,
-        undefines,
-        include_paths,
-        false, // no_std_inc
-        false, // no_builtin_inc
+        &PreprocessConfig {
+            defines,
+            undefines,
+            include_paths,
+            no_std_inc: false,
+            no_builtin_inc: false,
+        },
     );
 
     // Create symbol table and type table

@@ -1679,12 +1679,25 @@ impl<'a> Linearizer<'a> {
                             );
                         } else {
                             // Scalar value
+                            // If the field is an array and we're initializing with a scalar,
+                            // initialize only the first element of the array (C99 6.7.8p14)
+                            let (actual_type, actual_size) =
+                                if self.types.kind(field_type) == TypeKind::Array {
+                                    let elem_type =
+                                        self.types.base_type(field_type).unwrap_or(field_type);
+                                    (elem_type, self.types.size_bits(elem_type))
+                                } else {
+                                    (field_type, self.types.size_bits(field_type))
+                                };
                             let val = self.linearize_expr(&element.value);
                             let val_type = self.expr_type(&element.value);
-                            let converted = self.emit_convert(val, val_type, field_type);
-                            let field_size = self.types.size_bits(field_type);
+                            let converted = self.emit_convert(val, val_type, actual_type);
                             self.emit(Instruction::store(
-                                converted, base_sym, offset, field_type, field_size,
+                                converted,
+                                base_sym,
+                                offset,
+                                actual_type,
+                                actual_size,
                             ));
                         }
                     }
@@ -3447,6 +3460,78 @@ impl<'a> Linearizer<'a> {
                 let addr = self.linearize_expr(ptr_expr);
                 self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
             }
+            ExprKind::Member { expr, member } => {
+                // Struct member: get address and store with offset
+                let base = self.linearize_lvalue(expr);
+                let base_struct_type = self.expr_type(expr);
+                let struct_type = self.resolve_struct_type(base_struct_type);
+                if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                    self.emit(Instruction::store(
+                        final_result,
+                        base,
+                        member_info.offset as i64,
+                        typ,
+                        store_size,
+                    ));
+                }
+            }
+            ExprKind::Arrow { expr, member } => {
+                // Pointer member: pointer value is the base address
+                let ptr = self.linearize_expr(expr);
+                let ptr_type = self.expr_type(expr);
+                let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
+                let struct_type = self.resolve_struct_type(base_struct_type);
+                if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                    self.emit(Instruction::store(
+                        final_result,
+                        ptr,
+                        member_info.offset as i64,
+                        typ,
+                        store_size,
+                    ));
+                }
+            }
+            ExprKind::Index { array, index } => {
+                // Array subscript: compute address and store
+                let array_type = self.expr_type(array);
+                let index_type = self.expr_type(index);
+                let array_kind = self.types.kind(array_type);
+                let (ptr_expr, idx_expr, idx_type) =
+                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
+                        (array.as_ref(), index.as_ref(), index_type)
+                    } else {
+                        (index.as_ref(), array.as_ref(), array_type)
+                    };
+                let arr = self.linearize_expr(ptr_expr);
+                let idx = self.linearize_expr(idx_expr);
+                let elem_size = store_size / 8;
+                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
+                let offset = self.alloc_pseudo();
+                let ptr_typ = self.types.long_id;
+                self.emit(Instruction::binop(
+                    Opcode::Mul,
+                    offset,
+                    idx_extended,
+                    elem_size_val,
+                    ptr_typ,
+                    64,
+                ));
+                let addr = self.alloc_pseudo();
+                let pseudo = Pseudo::reg(addr, addr.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    addr,
+                    arr,
+                    offset,
+                    ptr_typ,
+                    64,
+                ));
+                self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
+            }
             _ => {}
         }
 
@@ -3645,29 +3730,113 @@ impl<'a> Linearizer<'a> {
                 result
             };
 
-            // Store back to the variable
-            if let ExprKind::Ident { name, .. } = &operand.kind {
-                let name_str = self.str(*name).to_string();
-                if let Some(local) = self.locals.get(&name_str).cloned() {
-                    let store_size = self.types.size_bits(typ);
-                    self.emit(Instruction::store(
-                        final_result,
-                        local.sym,
-                        0,
-                        typ,
-                        store_size,
+            // Store back to the lvalue
+            let store_size = self.types.size_bits(typ);
+            match &operand.kind {
+                ExprKind::Ident { name, .. } => {
+                    let name_str = self.str(*name).to_string();
+                    if let Some(local) = self.locals.get(&name_str).cloned() {
+                        self.emit(Instruction::store(
+                            final_result,
+                            local.sym,
+                            0,
+                            typ,
+                            store_size,
+                        ));
+                    } else if self.var_map.contains_key(&name_str) {
+                        self.var_map.insert(name_str.clone(), final_result);
+                    } else {
+                        // Global variable - emit store
+                        let sym_id = self.alloc_pseudo();
+                        let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                        if let Some(func) = &mut self.current_func {
+                            func.add_pseudo(pseudo);
+                        }
+                        self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                    }
+                }
+                ExprKind::Member { expr, member } => {
+                    // Struct member: get address and store with offset
+                    let base = self.linearize_lvalue(expr);
+                    let base_struct_type = self.expr_type(expr);
+                    let struct_type = self.resolve_struct_type(base_struct_type);
+                    if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                        self.emit(Instruction::store(
+                            final_result,
+                            base,
+                            member_info.offset as i64,
+                            typ,
+                            store_size,
+                        ));
+                    }
+                }
+                ExprKind::Arrow { expr, member } => {
+                    // Pointer member: pointer value is the base address
+                    let ptr = self.linearize_expr(expr);
+                    let ptr_type = self.expr_type(expr);
+                    let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
+                    let struct_type = self.resolve_struct_type(base_struct_type);
+                    if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                        self.emit(Instruction::store(
+                            final_result,
+                            ptr,
+                            member_info.offset as i64,
+                            typ,
+                            store_size,
+                        ));
+                    }
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand: deref_operand,
+                } => {
+                    // Dereference: store to the pointer address
+                    let ptr = self.linearize_expr(deref_operand);
+                    self.emit(Instruction::store(final_result, ptr, 0, typ, store_size));
+                }
+                ExprKind::Index { array, index } => {
+                    // Array subscript: compute address and store
+                    let array_type = self.expr_type(array);
+                    let index_type = self.expr_type(index);
+                    let array_kind = self.types.kind(array_type);
+                    let (ptr_expr, idx_expr, idx_type) =
+                        if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
+                            (array.as_ref(), index.as_ref(), index_type)
+                        } else {
+                            (index.as_ref(), array.as_ref(), array_type)
+                        };
+                    let arr = self.linearize_expr(ptr_expr);
+                    let idx = self.linearize_expr(idx_expr);
+                    let elem_size = store_size / 8;
+                    let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                    let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
+                    let offset = self.alloc_pseudo();
+                    let ptr_typ = self.types.long_id;
+                    self.emit(Instruction::binop(
+                        Opcode::Mul,
+                        offset,
+                        idx_extended,
+                        elem_size_val,
+                        ptr_typ,
+                        64,
                     ));
-                } else if self.var_map.contains_key(&name_str) {
-                    self.var_map.insert(name_str.clone(), final_result);
-                } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                    let addr = self.alloc_pseudo();
+                    let pseudo = Pseudo::reg(addr, addr.0);
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(pseudo);
                     }
-                    let store_size = self.types.size_bits(typ);
-                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                    self.emit(Instruction::binop(
+                        Opcode::Add,
+                        addr,
+                        arr,
+                        offset,
+                        ptr_typ,
+                        64,
+                    ));
+                    self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
+                }
+                _ => {
+                    // Fallback: shouldn't happen for valid lvalues
                 }
             }
 

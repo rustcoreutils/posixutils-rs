@@ -520,9 +520,9 @@ mod tests {
         // the function pointer before an indirect call.
         let types = TypeTable::new(64);
         let call_insn = Instruction::call_indirect(
-            Some(PseudoId(0)), // return value target
-            PseudoId(5),       // func_addr (the function pointer)
-            vec![PseudoId(1), PseudoId(2)], // args
+            Some(PseudoId(0)),                // return value target
+            PseudoId(5),                      // func_addr (the function pointer)
+            vec![PseudoId(1), PseudoId(2)],   // args
             vec![types.int_id, types.int_id], // arg_types
             types.int_id,
             32,
@@ -564,8 +564,8 @@ mod tests {
         // %0 = call_indirect %1(%2)
         let call = Instruction::call_indirect(
             Some(PseudoId(0)),
-            PseudoId(1), // indirect through %1
-            vec![PseudoId(2)], // args
+            PseudoId(1),        // indirect through %1
+            vec![PseudoId(2)],  // args
             vec![types.int_id], // arg_types
             types.int_id,
             32,

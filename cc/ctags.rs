@@ -19,7 +19,7 @@ use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::{Namespace, SymbolTable};
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, StreamTable, Tokenizer};
+use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -131,11 +131,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
         &target,
         &mut strings,
         path,
-        &[],   // No extra defines
-        &[],   // No undefines
-        &[],   // No include paths
-        false, // no_std_inc
-        false, // no_builtin_inc
+        &PreprocessConfig::default(),
     );
 
     // Create symbol table and type table

@@ -1106,9 +1106,11 @@ impl Aarch64CodeGen {
             Opcode::SymAddr => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     let dst_loc = self.get_location(target);
+                    // Use X16 as scratch to avoid clobbering live values
+                    // X16 is the intra-procedure-call scratch register (IP0)
                     let dst_reg = match &dst_loc {
                         Loc::Reg(r) => *r,
-                        _ => Reg::X9,
+                        _ => Reg::X16,
                     };
                     let src_loc = self.get_location(src);
                     match src_loc {
@@ -1693,6 +1695,13 @@ impl Aarch64CodeGen {
 
         // Get source address (where the struct data is)
         let value_loc = self.get_location(value);
+
+        // Special case: if value is immediate 0, zero the struct instead of copying
+        if let Loc::Imm(0) = value_loc {
+            self.emit_struct_zero(insn, addr, num_qwords, frame_size);
+            return;
+        }
+
         // Get destination address
         let addr_loc = self.get_location(addr);
 
@@ -1777,6 +1786,71 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Emit code to zero a struct (for struct = {0} initialization)
+    fn emit_struct_zero(
+        &mut self,
+        insn: &Instruction,
+        addr: PseudoId,
+        num_qwords: u32,
+        frame_size: i32,
+    ) {
+        let addr_loc = self.get_location(addr);
+
+        // Load destination address into X17
+        match addr_loc {
+            Loc::Stack(offset) => {
+                let total_offset = self.stack_offset(frame_size, offset) + insn.offset as i32;
+                self.push_lir(Aarch64Inst::Add {
+                    size: OperandSize::B64,
+                    src1: Reg::X29,
+                    src2: GpOperand::Imm(total_offset as i64),
+                    dst: Reg::X17,
+                });
+            }
+            Loc::Reg(r) => {
+                if insn.offset != 0 {
+                    self.push_lir(Aarch64Inst::Add {
+                        size: OperandSize::B64,
+                        src1: r,
+                        src2: GpOperand::Imm(insn.offset),
+                        dst: Reg::X17,
+                    });
+                } else if r != Reg::X17 {
+                    self.push_lir(Aarch64Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(r),
+                        dst: Reg::X17,
+                    });
+                }
+            }
+            Loc::Global(ref name) => {
+                self.emit_load_addr(name, Reg::X17);
+                if insn.offset != 0 {
+                    self.push_lir(Aarch64Inst::Add {
+                        size: OperandSize::B64,
+                        src1: Reg::X17,
+                        src2: GpOperand::Imm(insn.offset),
+                        dst: Reg::X17,
+                    });
+                }
+            }
+            _ => return,
+        }
+
+        // Store zeros using XZR (zero register) - aarch64 has hardware zero reg!
+        for i in 0..num_qwords {
+            let byte_offset = (i * 8) as i32;
+            self.push_lir(Aarch64Inst::Str {
+                size: OperandSize::B64,
+                src: Reg::Xzr,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X17,
+                    offset: byte_offset,
+                },
+            });
+        }
+    }
+
     fn emit_call(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
         // Get function name (or placeholder for indirect calls)
         let func_name = if insn.indirect_target.is_some() {
@@ -1830,20 +1904,33 @@ impl Aarch64CodeGen {
         let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
+        // Use X16 as default scratch to avoid clobbering live values
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
+        };
+
+        // Pick non-conflicting temp registers for cond/then/else values
+        // If dst_reg is one of our default temps, shift allocation to avoid conflicts
+        let (cond_reg, then_reg, else_reg) = if dst_reg == Reg::X10 {
+            (Reg::X11, Reg::X12, Reg::X13)
+        } else if dst_reg == Reg::X11 {
+            (Reg::X10, Reg::X12, Reg::X13)
+        } else if dst_reg == Reg::X12 {
+            (Reg::X10, Reg::X11, Reg::X13)
+        } else {
+            (Reg::X10, Reg::X11, Reg::X12) // Original allocation
         };
 
         // Load condition, then and else values
-        self.emit_move(cond, Reg::X10, 64, frame_size);
-        self.emit_move(then_val, Reg::X11, size, frame_size);
-        self.emit_move(else_val, Reg::X12, size, frame_size);
+        self.emit_move(cond, cond_reg, 64, frame_size);
+        self.emit_move(then_val, then_reg, size, frame_size);
+        self.emit_move(else_val, else_reg, size, frame_size);
 
         // LIR: compare condition with zero
         self.push_lir(Aarch64Inst::Cmp {
             size: OperandSize::B64,
-            src1: Reg::X10,
+            src1: cond_reg,
             src2: GpOperand::Imm(0),
         });
 
@@ -1851,8 +1938,8 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Csel {
             size: op_size,
             cond: CondCode::Ne,
-            src_true: Reg::X11,
-            src_false: Reg::X12,
+            src_true: then_reg,
+            src_false: else_reg,
             dst: dst_reg,
         });
 
@@ -2146,6 +2233,7 @@ fn asm_reg_name_64(reg: Reg) -> &'static str {
         Reg::X29 => "x29",
         Reg::X30 => "x30",
         Reg::SP => "sp",
+        Reg::Xzr => "xzr",
     }
 }
 
@@ -2183,6 +2271,7 @@ fn asm_reg_name_32(reg: Reg) -> &'static str {
         Reg::X29 => "w29",
         Reg::X30 => "w30",
         Reg::SP => "wsp",
+        Reg::Xzr => "wzr",
     }
 }
 

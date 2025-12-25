@@ -33,7 +33,9 @@ use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
 use target::Target;
-use token::{preprocess_with_defines, show_token, token_type_name, StreamTable, Tokenizer};
+use token::{
+    preprocess_with_defines, show_token, token_type_name, PreprocessConfig, StreamTable, Tokenizer,
+};
 
 // ============================================================================
 // CLI
@@ -208,11 +210,13 @@ fn process_file(
         target,
         &mut strings,
         path,
-        &args.defines,
-        &args.undefines,
-        &args.include_paths,
-        args.no_std_inc,
-        args.no_builtin_inc,
+        &PreprocessConfig {
+            defines: &args.defines,
+            undefines: &args.undefines,
+            include_paths: &args.include_paths,
+            no_std_inc: args.no_std_inc,
+            no_builtin_inc: args.no_builtin_inc,
+        },
     );
 
     if args.preprocess_only {

@@ -308,6 +308,42 @@ impl<'a> Parser<'a> {
         self.idents.get(id)
     }
 
+    /// Resolve an incomplete struct/union type to its complete definition.
+    ///
+    /// When a struct is forward-declared (e.g., `struct foo;`) and later
+    /// defined, the forward declaration creates an incomplete TypeId.
+    /// Pointers to the forward-declared type still reference this incomplete
+    /// TypeId even after the struct is fully defined with a new TypeId.
+    ///
+    /// This method looks up the complete definition in the symbol table
+    /// using the struct's tag name, returning the complete TypeId if found.
+    fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
+        let typ = self.types.get(type_id);
+
+        // Only try to resolve struct/union types
+        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
+            return type_id;
+        }
+
+        // Check if this is an incomplete type with a tag
+        if let Some(ref composite) = typ.composite {
+            if composite.is_complete {
+                // Already complete, no resolution needed
+                return type_id;
+            }
+            if let Some(tag) = composite.tag {
+                // Look up the tag in the symbol table to find the complete type
+                if let Some(symbol) = self.symbols.lookup_tag(tag) {
+                    // Return the complete type from the symbol table
+                    return symbol.typ;
+                }
+            }
+        }
+
+        // Couldn't resolve, return original
+        type_id
+    }
+
     /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
     pub fn skip_stream_tokens(&mut self) {
         while self.peek() == TokenType::StreamBegin {
@@ -1853,9 +1889,10 @@ impl<'a> Parser<'a> {
                 // Member access
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type from struct type
+                // Get member type from struct type, resolving incomplete types first
                 let member_type = expr
                     .typ
+                    .map(|t| self.resolve_struct_type(t))
                     .and_then(|t| self.types.find_member(t, member))
                     .map(|info| info.typ)
                     .unwrap_or(self.types.int_id);
@@ -1871,10 +1908,11 @@ impl<'a> Parser<'a> {
                 // Pointer member access
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type: dereference pointer to get struct, then find member
+                // Get member type: dereference pointer to get struct, resolve if incomplete, then find member
                 let member_type = expr
                     .typ
                     .and_then(|t| self.types.base_type(t))
+                    .map(|struct_type| self.resolve_struct_type(struct_type))
                     .and_then(|struct_type| self.types.find_member(struct_type, member))
                     .map(|info| info.typ)
                     .unwrap_or(self.types.int_id);
@@ -1894,12 +1932,26 @@ impl<'a> Parser<'a> {
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
-                // and the return type is stored in base
+                // and the return type is stored in base.
+                // For function pointers (TypeKind::Pointer to Function),
+                // we need to dereference first to get the function type.
                 let return_type = expr
                     .typ
                     .and_then(|t| {
-                        if self.types.kind(t) == TypeKind::Function {
+                        let kind = self.types.kind(t);
+                        if kind == TypeKind::Function {
+                            // Direct function call
                             self.types.base_type(t)
+                        } else if kind == TypeKind::Pointer {
+                            // Function pointer call - get the pointee (function type)
+                            self.types.base_type(t).and_then(|func_type| {
+                                if self.types.kind(func_type) == TypeKind::Function {
+                                    // Get return type from function type
+                                    self.types.base_type(func_type)
+                                } else {
+                                    None
+                                }
+                            })
                         } else {
                             None
                         }
@@ -7865,8 +7917,7 @@ mod tests {
     #[test]
     fn test_typedef_trailing_volatile() {
         // Test that "typedef_name volatile" is parsed correctly
-        let (tu, types, _strings) =
-            parse_tu("typedef int myint; myint volatile v;").unwrap();
+        let (tu, types, _strings) = parse_tu("typedef int myint; myint volatile v;").unwrap();
         assert_eq!(tu.items.len(), 2);
 
         match &tu.items[1] {
@@ -7932,5 +7983,86 @@ mod tests {
             }
             _ => panic!("Expected Declaration"),
         }
+    }
+
+    // ========================================================================
+    // Bug fix regression tests
+    // ========================================================================
+
+    #[test]
+    fn test_forward_declared_struct_member_access() {
+        // Regression test: forward-declared struct pointer member access
+        // The incomplete struct type should be resolved to the complete type
+        // when the member access is performed.
+        let (tu, types, _strings) =
+            parse_tu("struct S { int x; }; void f(struct S *p) { p->x; }").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        // Verify the function body parsed correctly
+        match &tu.items[1] {
+            ExternalDecl::FunctionDef(func) => {
+                // The function should have parsed successfully
+                assert_eq!(types.kind(func.return_type), TypeKind::Void);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_forward_declared_struct_via_pointer_param() {
+        // More complex case: struct declared after function, used via pointer
+        // This tests that resolve_struct_type works for arrow operator
+        let (tu, _types, _strings) = parse_tu(
+            "struct Node; \
+             int get_val(struct Node *n); \
+             struct Node { int val; struct Node *next; }; \
+             int get_val(struct Node *n) { return n->val; }",
+        )
+        .unwrap();
+        // 4 items: forward decl, prototype, struct def, function def
+        assert_eq!(tu.items.len(), 4);
+    }
+
+    #[test]
+    fn test_function_pointer_call() {
+        // Regression test: function pointer calls should return the correct type
+        // Previously, the parser only handled TypeKind::Function, not pointers to functions
+        let (tu, types, _strings) = parse_tu(
+            "int (*fp)(int); \
+             int test(void) { return fp(42); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        // Verify the function return type is int (from fp(42) call)
+        match &tu.items[1] {
+            ExternalDecl::FunctionDef(func) => {
+                assert_eq!(types.kind(func.return_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_function_pointer_in_struct_call() {
+        // Test calling function pointer stored in struct member
+        let (tu, _types, _strings) = parse_tu(
+            "struct Ops { int (*handler)(int); }; \
+             int call_handler(struct Ops *ops, int x) { return ops->handler(x); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 2);
+    }
+
+    #[test]
+    fn test_typedef_function_pointer_call() {
+        // Test typedef'd function pointer call
+        let (tu, _types, _strings) = parse_tu(
+            "typedef int (*callback_t)(int); \
+             callback_t cb; \
+             int test(void) { return cb(10); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 3);
     }
 }

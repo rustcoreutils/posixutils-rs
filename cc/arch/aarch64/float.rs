@@ -388,7 +388,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         // Set result based on condition
@@ -481,7 +481,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::X9,
+            _ => Reg::X16,
         };
 
         // Load source to FP register

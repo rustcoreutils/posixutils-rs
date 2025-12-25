@@ -45,7 +45,27 @@ struct SsaConverter<'a> {
 impl<'a> SsaConverter<'a> {
     fn new(func: &'a mut Function) -> Self {
         // Find the maximum pseudo ID and reg number currently in use
-        let max_pseudo_id = func.pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
+        // Must scan BOTH func.pseudos AND all instruction targets/sources,
+        // since alloc_pseudo() in the linearizer doesn't add to func.pseudos
+        let mut max_pseudo_id = func.pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
+
+        // Also scan all instruction targets and sources
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                if let Some(target) = insn.target {
+                    max_pseudo_id = max_pseudo_id.max(target.0);
+                }
+                for src in &insn.src {
+                    max_pseudo_id = max_pseudo_id.max(src.0);
+                }
+                if let Some(indirect) = insn.indirect_target {
+                    max_pseudo_id = max_pseudo_id.max(indirect.0);
+                }
+                for (_, phi_src) in &insn.phi_list {
+                    max_pseudo_id = max_pseudo_id.max(phi_src.0);
+                }
+            }
+        }
 
         let max_reg_nr = func
             .pseudos
@@ -774,5 +794,49 @@ mod tests {
 
         let merge = func.get_block(BasicBlockId(3)).unwrap();
         assert_eq!(merge.idom, Some(BasicBlockId(0)));
+    }
+
+    // ========================================================================
+    // Bug fix regression test: pseudo ID tracking from instructions
+    // Verifies that SSA conversion correctly finds max pseudo ID from
+    // instruction operands, not just func.pseudos
+    // ========================================================================
+
+    #[test]
+    fn test_max_pseudo_id_from_instructions() {
+        // Regression test: pseudo IDs allocated but not in func.pseudos are tracked
+        // This tests the fix in SsaConverter::new() that scans instruction operands
+        let types = TypeTable::new(64);
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
+
+        // Only add ONE pseudo to func.pseudos with ID 0
+        let x_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
+        func.add_local("x", x_sym, int_id, false, Some(BasicBlockId(0)));
+
+        // Create an instruction that uses a HIGHER pseudo ID (say, 100)
+        // that is NOT in func.pseudos. This simulates what the linearizer does
+        // when it allocates pseudos via alloc_pseudo() without adding to func.pseudos
+        let high_id = PseudoId(100);
+        // Note: we intentionally DON'T add this to func.pseudos
+
+        // Build minimal CFG
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        // Store using the high pseudo ID as source (simulating linearizer output)
+        entry.add_insn(Instruction::store(high_id, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::ret(None));
+
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+
+        // This should NOT panic - the SSA converter should find max ID from instructions
+        ssa_convert(&mut func, &types);
+
+        // The converter should have found PseudoId(100) from scanning instructions
+        // and used next_pseudo_id >= 101 for any new IDs
+        // (We can't easily verify the internal counter, but the lack of panic
+        // indicates the fix is working)
     }
 }

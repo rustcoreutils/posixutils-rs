@@ -96,8 +96,11 @@ impl Aarch64CodeGen {
             // Locals are at offsets from (frame_size - reg_save_area_size)
             (frame_size - self.reg_save_area_size) + offset
         } else {
-            // Positive offset (arguments passed on stack) - use as-is
-            offset
+            // Positive offset = stack args (passed by caller)
+            // regalloc uses 16 as base (x86_64 convention: saved rbp + return addr)
+            // but aarch64 places stack args at [x29 + frame_size + slot_offset]
+            // where slot_offset = offset - 16
+            frame_size + offset - 16
         }
     }
 

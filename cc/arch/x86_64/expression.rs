@@ -29,8 +29,7 @@ impl X86_64CodeGen {
             None => return,
         };
         let dst_loc = self.get_location(target);
-        // Use R10 as scratch register when dst is on stack, to avoid clobbering
-        // live values in caller-saved registers (Rax may hold phi values)
+        // Use R10 (reserved scratch register, never allocated) when dst is on stack
         let work_reg = match &dst_loc {
             Loc::Reg(r) => *r,
             _ => Reg::R10,

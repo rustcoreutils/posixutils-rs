@@ -4011,34 +4011,14 @@ impl Parser<'_> {
         let mut result_type_id = base_type_id;
 
         if let Some(inner_tid) = inner_type_id {
-            // Grouped declarator: int (*p)[3] or void (*fp)(int)
-            // Arrays/functions in suffix apply to the base type first
-            // Then we substitute into the inner declarator
+            // Grouped declarator: int (*p)[3] or void (*fp)(int) or int *(*q)[3]
+            // Outer pointers (before parens) apply to the base type first
+            // Then arrays/functions in suffix are applied
+            // Finally we substitute into the inner declarator
 
-            // Apply function parameters to base type first (if present)
-            // For void (*fp)(int): base is void, suffix (int) -> Function(void, [int])
-            if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic);
-                result_type_id = self.types.intern(func_type);
-            }
-
-            // Apply array dimensions to base type
-            // For int (*p)[3]: base is int, suffix [3] -> Array(3, int)
-            for size in dimensions.into_iter().rev() {
-                let arr_type = Type {
-                    kind: TypeKind::Array,
-                    modifiers: TypeModifiers::empty(),
-                    base: Some(result_type_id),
-                    array_size: size,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
-                };
-                result_type_id = self.types.intern(arr_type);
-            }
-
-            // Apply any outer pointers (before the parens)
+            // Apply any outer pointers (before the parens) to base type FIRST
+            // For struct node *(*fp)(int): base is struct node, outer * -> Pointer(struct node)
+            // For int *(*q)[3]: base is int, outer * -> Pointer(int)
             for modifiers in pointer_modifiers.into_iter().rev() {
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
@@ -4053,11 +4033,36 @@ impl Parser<'_> {
                 result_type_id = self.types.intern(ptr_type);
             }
 
+            // Apply function parameters to (possibly pointer-modified) base type
+            // For struct node *(*fp)(int): result is Pointer(struct node)
+            //   -> Function(Pointer(struct node), [int])
+            if let Some((param_type_ids, variadic)) = func_params {
+                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                result_type_id = self.types.intern(func_type);
+            }
+
+            // Apply array dimensions to result type
+            // For int *(*q)[3]: result is Pointer(int) -> Array(3, Pointer(int))
+            for size in dimensions.into_iter().rev() {
+                let arr_type = Type {
+                    kind: TypeKind::Array,
+                    modifiers: TypeModifiers::empty(),
+                    base: Some(result_type_id),
+                    array_size: size,
+                    params: None,
+                    variadic: false,
+                    noreturn: false,
+                    composite: None,
+                };
+                result_type_id = self.types.intern(arr_type);
+            }
+
             // Substitute into inner declarator
             // For int (*p)[3]: inner_decl is Pointer(Void), result_type is Array(3, int)
             // -> Pointer(Array(3, int))
-            // For void (*fp)(int): inner_decl is Pointer(Void), result_type is Function(void, [int])
-            // -> Pointer(Function(void, [int]))
+            // For struct node *(*fp)(int): inner_decl is Pointer(Void),
+            //   result_type is Function(Pointer(struct node), [int])
+            // -> Pointer(Function(Pointer(struct node), [int]))
             result_type_id = self.substitute_base_type(inner_tid, result_type_id);
         } else {
             // Simple declarator: char *arr[3]
@@ -7748,6 +7753,96 @@ mod tests {
                 } else {
                     panic!("Expected return type");
                 }
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_pointer_returning_struct_pointer() {
+        // Function pointer returning a struct pointer: struct node *(*fp)(int)
+        // This declares fp as a pointer to a function (int) -> struct node*
+        // Regression test for issue where outer pointers in grouped declarators
+        // were applied after the function type instead of before (to the return type)
+        let (tu, types, _strings) =
+            parse_tu("struct node { int value; }; struct node *(*fp)(int);").unwrap();
+        assert_eq!(tu.items.len(), 2);
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                // fp should be Pointer -> Function -> Pointer -> struct node
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+
+                // Base type of fp should be Function (not Pointer!)
+                let func_id = types.base_type(decl.declarators[0].typ).unwrap();
+                assert_eq!(
+                    types.kind(func_id),
+                    TypeKind::Function,
+                    "Function pointer base type should be Function, not Pointer"
+                );
+
+                // Function return type should be Pointer
+                let ret_id = types.base_type(func_id).unwrap();
+                assert_eq!(
+                    types.kind(ret_id),
+                    TypeKind::Pointer,
+                    "Function return type should be Pointer"
+                );
+
+                // Pointer base type should be Struct
+                let struct_id = types.base_type(ret_id).unwrap();
+                assert_eq!(
+                    types.kind(struct_id),
+                    TypeKind::Struct,
+                    "Pointer base type should be Struct"
+                );
+
+                // Function should take one int parameter
+                if let Some(params) = types.params(func_id) {
+                    assert_eq!(params.len(), 1);
+                    assert_eq!(types.kind(params[0]), TypeKind::Int);
+                }
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_pointer_to_array_of_pointers() {
+        // Pointer to array of pointers: int *(*p)[3]
+        // This declares p as a pointer to an array of 3 int pointers
+        // Regression test for issue where type chain was incorrectly built
+        let (tu, types, _strings) = parse_tu("int *(*p)[3];").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                // p should be Pointer -> Array -> Pointer -> int
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+
+                // Base type of p should be Array
+                let array_id = types.base_type(decl.declarators[0].typ).unwrap();
+                assert_eq!(
+                    types.kind(array_id),
+                    TypeKind::Array,
+                    "Pointer base type should be Array"
+                );
+
+                // Array element type should be Pointer
+                let elem_id = types.base_type(array_id).unwrap();
+                assert_eq!(
+                    types.kind(elem_id),
+                    TypeKind::Pointer,
+                    "Array element type should be Pointer"
+                );
+
+                // Pointer base type should be Int
+                let int_id = types.base_type(elem_id).unwrap();
+                assert_eq!(
+                    types.kind(int_id),
+                    TypeKind::Int,
+                    "Pointer base type should be Int"
+                );
             }
             _ => panic!("Expected Declaration"),
         }

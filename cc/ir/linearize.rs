@@ -1287,7 +1287,7 @@ impl<'a> Linearizer<'a> {
             }
 
             // Create a symbol pseudo for this local variable (its address)
-            // Use unique name (name#id) to distinguish shadowed variables for SSA
+            // Use unique name (name.id) to distinguish shadowed variables
             let sym_id = self.alloc_pseudo();
             let unique_name = format!("{}.{}", declarator.name, sym_id.0);
             let sym = Pseudo::sym(sym_id, unique_name.clone());

@@ -14,7 +14,7 @@
 #   -L <dir> : Library directory
 # Extra args after file are passed to compiler (e.g., libz.a)
 
-PCC=/Users/jgarzik/repo/posixutils-rs/target/release/pcc
+PCC="${PCC:-pcc}"
 WORKDIR=/tmp/pcc_debug_$$
 mkdir -p $WORKDIR
 

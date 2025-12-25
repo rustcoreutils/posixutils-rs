@@ -341,7 +341,10 @@ where
             }
         })
         .collect();
-    result.sort_by_key(|i| i.start);
+    // Sort by (start, pseudo) to ensure deterministic ordering
+    // This is critical when multiple intervals have the same start position
+    // (e.g., all arguments start at 0), as HashMap iteration is non-deterministic
+    result.sort_by_key(|i| (i.start, i.pseudo.0));
     (result, constraint_points)
 }
 

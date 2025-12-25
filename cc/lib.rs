@@ -13,6 +13,7 @@
 //
 
 pub mod arch;
+pub mod builtin_headers;
 pub mod diag;
 pub mod ir;
 pub mod opt;

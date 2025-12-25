@@ -94,6 +94,8 @@ pub enum Reg {
     X30,
     // Stack pointer (special, shares encoding with XZR in some contexts)
     SP,
+    // Zero register (always reads as zero, discards writes)
+    Xzr,
 }
 
 impl Reg {
@@ -131,6 +133,7 @@ impl Reg {
             Reg::X29 => "x29",
             Reg::X30 => "x30",
             Reg::SP => "sp",
+            Reg::Xzr => "xzr",
         }
     }
 
@@ -168,6 +171,7 @@ impl Reg {
             Reg::X29 => "w29",
             Reg::X30 => "w30",
             Reg::SP => "sp", // SP doesn't have a 32-bit form in normal use
+            Reg::Xzr => "wzr",
         }
     }
 
@@ -649,11 +653,19 @@ impl RegAlloc {
     }
 
     /// Pre-allocate argument registers per AAPCS64
+    ///
+    /// AAPCS64 passes arguments as follows:
+    /// - First 8 integer/pointer args in X0-X7
+    /// - First 8 FP args in V0-V7 (D0-D7 for doubles, S0-S7 for floats)
+    /// - Remaining args go on the stack in parameter order (not separated by type)
     fn allocate_arguments(&mut self, func: &Function, types: &TypeTable) {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
         let mut int_arg_idx = 0usize;
         let mut fp_arg_idx = 0usize;
+        // Stack offset for overflow args - must be shared across all types
+        // because AAPCS64 places stack args in parameter order
+        let mut stack_arg_offset = 16i32;
 
         // Detect hidden return pointer for large struct returns
         let sret_pseudo = func
@@ -680,9 +692,11 @@ impl RegAlloc {
                                 self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                                 self.fp_pseudos.insert(pseudo.id);
                             } else {
-                                let offset = 16 + (fp_arg_idx - fp_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::Stack(offset));
+                                // Stack args are placed in parameter order per AAPCS64
+                                self.locations
+                                    .insert(pseudo.id, Loc::Stack(stack_arg_offset));
                                 self.fp_pseudos.insert(pseudo.id);
+                                stack_arg_offset += 8;
                             }
                             fp_arg_idx += 1;
                         } else {
@@ -691,8 +705,10 @@ impl RegAlloc {
                                     .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
                                 self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                             } else {
-                                let offset = 16 + (int_arg_idx - int_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::Stack(offset));
+                                // Stack args are placed in parameter order per AAPCS64
+                                self.locations
+                                    .insert(pseudo.id, Loc::Stack(stack_arg_offset));
+                                stack_arg_offset += 8;
                             }
                             int_arg_idx += 1;
                         }

@@ -308,6 +308,42 @@ impl<'a> Parser<'a> {
         self.idents.get(id)
     }
 
+    /// Resolve an incomplete struct/union type to its complete definition.
+    ///
+    /// When a struct is forward-declared (e.g., `struct foo;`) and later
+    /// defined, the forward declaration creates an incomplete TypeId.
+    /// Pointers to the forward-declared type still reference this incomplete
+    /// TypeId even after the struct is fully defined with a new TypeId.
+    ///
+    /// This method looks up the complete definition in the symbol table
+    /// using the struct's tag name, returning the complete TypeId if found.
+    fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
+        let typ = self.types.get(type_id);
+
+        // Only try to resolve struct/union types
+        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
+            return type_id;
+        }
+
+        // Check if this is an incomplete type with a tag
+        if let Some(ref composite) = typ.composite {
+            if composite.is_complete {
+                // Already complete, no resolution needed
+                return type_id;
+            }
+            if let Some(tag) = composite.tag {
+                // Look up the tag in the symbol table to find the complete type
+                if let Some(symbol) = self.symbols.lookup_tag(tag) {
+                    // Return the complete type from the symbol table
+                    return symbol.typ;
+                }
+            }
+        }
+
+        // Couldn't resolve, return original
+        type_id
+    }
+
     /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
     pub fn skip_stream_tokens(&mut self) {
         while self.peek() == TokenType::StreamBegin {
@@ -1423,6 +1459,9 @@ impl<'a> Parser<'a> {
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
         let mut parsed_something = false;
+        // Track typedef type separately - we continue parsing after a typedef
+        // to collect trailing qualifiers like "z_word_t const"
+        let mut typedef_base: Option<TypeId> = None;
 
         loop {
             if self.peek() != TokenType::Ident {
@@ -1701,32 +1740,15 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // Check if it's a typedef name
-                    if base_kind.is_none() {
+                    // Only consume if we haven't already seen a base type or typedef
+                    if base_kind.is_none() && typedef_base.is_none() {
                         if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
                             self.advance();
-                            // For typedef, we already have a TypeId - just apply pointer/array modifiers
-                            let mut result_id = typedef_type_id;
-                            // Handle pointer declarators
-                            while self.is_special(b'*') {
-                                self.advance();
-                                result_id = self.types.intern(Type::pointer(result_id));
-                            }
-                            // Handle array declarators
-                            while self.is_special(b'[') {
-                                self.advance();
-                                if let Ok(size_expr) = self.parse_conditional_expr() {
-                                    if let Some(size) = self.eval_const_expr(&size_expr) {
-                                        result_id = self
-                                            .types
-                                            .intern(Type::array(result_id, size as usize));
-                                    }
-                                }
-                                if !self.is_special(b']') {
-                                    return None;
-                                }
-                                self.advance();
-                            }
-                            return Some(result_id);
+                            // Save the typedef type and continue looping to collect trailing
+                            // qualifiers (e.g., "z_word_t const" where const comes after typedef)
+                            typedef_base = Some(typedef_type_id);
+                            parsed_something = true;
+                            continue;
                         }
                     }
                     break;
@@ -1738,10 +1760,24 @@ impl<'a> Parser<'a> {
             return None;
         }
 
-        // If we only have modifiers like `unsigned` without a base type, default to int
-        let kind = base_kind.unwrap_or(TypeKind::Int);
-        let typ = Type::with_modifiers(kind, modifiers);
-        let mut result_id = self.types.intern(typ);
+        // Get the base type - either from typedef or from built-in type specifiers
+        let mut result_id = if let Some(typedef_type_id) = typedef_base {
+            // Apply trailing modifiers to the typedef type
+            if !modifiers.is_empty() {
+                let typedef_type = self.types.get(typedef_type_id);
+                let mut result = typedef_type.clone();
+                result.modifiers &= !TypeModifiers::TYPEDEF;
+                result.modifiers |= modifiers;
+                self.types.intern(result)
+            } else {
+                typedef_type_id
+            }
+        } else {
+            // If we only have modifiers like `unsigned` without a base type, default to int
+            let kind = base_kind.unwrap_or(TypeKind::Int);
+            let typ = Type::with_modifiers(kind, modifiers);
+            self.types.intern(typ)
+        };
 
         // Handle pointer declarators
         while self.is_special(b'*') {
@@ -1853,9 +1889,10 @@ impl<'a> Parser<'a> {
                 // Member access
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type from struct type
+                // Get member type from struct type, resolving incomplete types first
                 let member_type = expr
                     .typ
+                    .map(|t| self.resolve_struct_type(t))
                     .and_then(|t| self.types.find_member(t, member))
                     .map(|info| info.typ)
                     .unwrap_or(self.types.int_id);
@@ -1871,10 +1908,11 @@ impl<'a> Parser<'a> {
                 // Pointer member access
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type: dereference pointer to get struct, then find member
+                // Get member type: dereference pointer to get struct, resolve if incomplete, then find member
                 let member_type = expr
                     .typ
                     .and_then(|t| self.types.base_type(t))
+                    .map(|struct_type| self.resolve_struct_type(struct_type))
                     .and_then(|struct_type| self.types.find_member(struct_type, member))
                     .map(|info| info.typ)
                     .unwrap_or(self.types.int_id);
@@ -1894,12 +1932,26 @@ impl<'a> Parser<'a> {
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
-                // and the return type is stored in base
+                // and the return type is stored in base.
+                // For function pointers (TypeKind::Pointer to Function),
+                // we need to dereference first to get the function type.
                 let return_type = expr
                     .typ
                     .and_then(|t| {
-                        if self.types.kind(t) == TypeKind::Function {
+                        let kind = self.types.kind(t);
+                        if kind == TypeKind::Function {
+                            // Direct function call
                             self.types.base_type(t)
+                        } else if kind == TypeKind::Pointer {
+                            // Function pointer call - get the pointee (function type)
+                            self.types.base_type(t).and_then(|func_type| {
+                                if self.types.kind(func_type) == TypeKind::Function {
+                                    // Get return type from function type
+                                    self.types.base_type(func_type)
+                                } else {
+                                    None
+                                }
+                            })
                         } else {
                             None
                         }
@@ -3331,6 +3383,9 @@ impl Parser<'_> {
     fn parse_type_specifier(&mut self) -> ParseResult<Type> {
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
+        // Track typedef type separately - we continue parsing after a typedef
+        // to collect trailing qualifiers like "z_word_t const"
+        let mut typedef_base: Option<TypeId> = None;
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -3478,22 +3533,29 @@ impl Parser<'_> {
                 }
                 _ => {
                     // Check if it's a typedef name
-                    // Only consume the typedef if we haven't already seen a base type
-                    if base_kind.is_none() {
+                    // Only consume the typedef if we haven't already seen a base type or typedef
+                    if base_kind.is_none() && typedef_base.is_none() {
                         if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
                             self.advance();
-                            // Get the underlying type and merge in any modifiers we collected
-                            let typedef_type = self.types.get(typedef_type_id);
-                            let mut result = typedef_type.clone();
-                            // Strip TYPEDEF modifier - we're using the typedef, not defining one
-                            result.modifiers &= !TypeModifiers::TYPEDEF;
-                            result.modifiers |= modifiers;
-                            return Ok(result);
+                            // Save the typedef type and continue looping to collect trailing
+                            // qualifiers (e.g., "z_word_t const" where const comes after typedef)
+                            typedef_base = Some(typedef_type_id);
+                            continue;
                         }
                     }
                     break;
                 }
             }
+        }
+
+        // If we parsed a typedef, return that with any trailing modifiers applied
+        if let Some(typedef_type_id) = typedef_base {
+            let typedef_type = self.types.get(typedef_type_id);
+            let mut result = typedef_type.clone();
+            // Strip TYPEDEF modifier - we're using the typedef, not defining one
+            result.modifiers &= !TypeModifiers::TYPEDEF;
+            result.modifiers |= modifiers;
+            return Ok(result);
         }
 
         let kind = base_kind.unwrap_or(TypeKind::Int);
@@ -3949,34 +4011,14 @@ impl Parser<'_> {
         let mut result_type_id = base_type_id;
 
         if let Some(inner_tid) = inner_type_id {
-            // Grouped declarator: int (*p)[3] or void (*fp)(int)
-            // Arrays/functions in suffix apply to the base type first
-            // Then we substitute into the inner declarator
+            // Grouped declarator: int (*p)[3] or void (*fp)(int) or int *(*q)[3]
+            // Outer pointers (before parens) apply to the base type first
+            // Then arrays/functions in suffix are applied
+            // Finally we substitute into the inner declarator
 
-            // Apply function parameters to base type first (if present)
-            // For void (*fp)(int): base is void, suffix (int) -> Function(void, [int])
-            if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic);
-                result_type_id = self.types.intern(func_type);
-            }
-
-            // Apply array dimensions to base type
-            // For int (*p)[3]: base is int, suffix [3] -> Array(3, int)
-            for size in dimensions.into_iter().rev() {
-                let arr_type = Type {
-                    kind: TypeKind::Array,
-                    modifiers: TypeModifiers::empty(),
-                    base: Some(result_type_id),
-                    array_size: size,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
-                };
-                result_type_id = self.types.intern(arr_type);
-            }
-
-            // Apply any outer pointers (before the parens)
+            // Apply any outer pointers (before the parens) to base type FIRST
+            // For struct node *(*fp)(int): base is struct node, outer * -> Pointer(struct node)
+            // For int *(*q)[3]: base is int, outer * -> Pointer(int)
             for modifiers in pointer_modifiers.into_iter().rev() {
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
@@ -3991,11 +4033,36 @@ impl Parser<'_> {
                 result_type_id = self.types.intern(ptr_type);
             }
 
+            // Apply function parameters to (possibly pointer-modified) base type
+            // For struct node *(*fp)(int): result is Pointer(struct node)
+            //   -> Function(Pointer(struct node), [int])
+            if let Some((param_type_ids, variadic)) = func_params {
+                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                result_type_id = self.types.intern(func_type);
+            }
+
+            // Apply array dimensions to result type
+            // For int *(*q)[3]: result is Pointer(int) -> Array(3, Pointer(int))
+            for size in dimensions.into_iter().rev() {
+                let arr_type = Type {
+                    kind: TypeKind::Array,
+                    modifiers: TypeModifiers::empty(),
+                    base: Some(result_type_id),
+                    array_size: size,
+                    params: None,
+                    variadic: false,
+                    noreturn: false,
+                    composite: None,
+                };
+                result_type_id = self.types.intern(arr_type);
+            }
+
             // Substitute into inner declarator
             // For int (*p)[3]: inner_decl is Pointer(Void), result_type is Array(3, int)
             // -> Pointer(Array(3, int))
-            // For void (*fp)(int): inner_decl is Pointer(Void), result_type is Function(void, [int])
-            // -> Pointer(Function(void, [int]))
+            // For struct node *(*fp)(int): inner_decl is Pointer(Void),
+            //   result_type is Function(Pointer(struct node), [int])
+            // -> Pointer(Function(Pointer(struct node), [int]))
             result_type_id = self.substitute_base_type(inner_tid, result_type_id);
         } else {
             // Simple declarator: char *arr[3]
@@ -4050,6 +4117,21 @@ impl Parser<'_> {
         } else {
             full_func_params
         };
+
+        // Propagate storage class modifiers from base type to derived type
+        // For "extern int *p", the EXTERN should be on the pointer type, not just int
+        let storage_class_mask = TypeModifiers::EXTERN
+            | TypeModifiers::STATIC
+            | TypeModifiers::TYPEDEF
+            | TypeModifiers::REGISTER
+            | TypeModifiers::AUTO;
+        let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
+        if !base_storage_class.is_empty() && result_type_id != base_type_id {
+            // Add storage class modifiers to the result type
+            let mut result_type = self.types.get(result_type_id).clone();
+            result_type.modifiers |= base_storage_class;
+            result_type_id = self.types.intern(result_type);
+        }
 
         Ok((name, result_type_id, vla_exprs, returned_func_params))
     }
@@ -4478,6 +4560,22 @@ impl Parser<'_> {
             typ_id = self.types.intern(ptr_type);
         }
 
+        // Propagate storage class modifiers from base type to derived pointer type
+        // For "extern int *p", the EXTERN should be on the pointer type, not just int
+        if typ_id != base_type_id {
+            let storage_class_mask = TypeModifiers::EXTERN
+                | TypeModifiers::STATIC
+                | TypeModifiers::TYPEDEF
+                | TypeModifiers::REGISTER
+                | TypeModifiers::AUTO;
+            let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
+            if !base_storage_class.is_empty() {
+                let mut typ = self.types.get(typ_id).clone();
+                typ.modifiers |= base_storage_class;
+                typ_id = self.types.intern(typ);
+            }
+        }
+
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
         // At this point typ_id is char*, and we see (*fp)(int)
         if self.is_special(b'(') {
@@ -4686,6 +4784,22 @@ impl Parser<'_> {
         for size in dimensions.into_iter().rev() {
             let arr_type = Type::array(var_type_id, size.unwrap_or(0));
             var_type_id = self.types.intern(arr_type);
+        }
+
+        // Propagate storage class modifiers from base type to derived array type
+        // For "typedef int arr[10]", the TYPEDEF should be on the array type, not just int
+        if var_type_id != typ_id {
+            let storage_class_mask = TypeModifiers::EXTERN
+                | TypeModifiers::STATIC
+                | TypeModifiers::TYPEDEF
+                | TypeModifiers::REGISTER
+                | TypeModifiers::AUTO;
+            let base_storage_class = self.types.modifiers(typ_id) & storage_class_mask;
+            if !base_storage_class.is_empty() {
+                let mut var_type = self.types.get(var_type_id).clone();
+                var_type.modifiers |= base_storage_class;
+                var_type_id = self.types.intern(var_type);
+            }
         }
 
         // Skip any __attribute__ after variable name/array declarator
@@ -6419,6 +6533,57 @@ mod tests {
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::LongLong);
     }
 
+    #[test]
+    fn test_extern_pointer_modifier_propagation() {
+        // Bug fix: "extern int *p" - EXTERN should be on the pointer type, not just int
+        let (decl, types, _strings) = parse_decl("extern int *p;").unwrap();
+        let ptr_typ = decl.declarators[0].typ;
+
+        // Verify it's a pointer type
+        assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
+
+        // Verify EXTERN modifier is on the pointer type
+        assert!(
+            types.get(ptr_typ).modifiers.contains(TypeModifiers::EXTERN),
+            "EXTERN modifier should propagate to pointer type"
+        );
+    }
+
+    #[test]
+    fn test_static_pointer_modifier_propagation() {
+        // Bug fix: "static int *p" - STATIC should be on the pointer type, not just int
+        let (decl, types, _strings) = parse_decl("static int *p;").unwrap();
+        let ptr_typ = decl.declarators[0].typ;
+
+        // Verify it's a pointer type
+        assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
+
+        // Verify STATIC modifier is on the pointer type
+        assert!(
+            types.get(ptr_typ).modifiers.contains(TypeModifiers::STATIC),
+            "STATIC modifier should propagate to pointer type"
+        );
+    }
+
+    #[test]
+    fn test_typedef_array_modifier_propagation() {
+        // Bug fix: "typedef int arr[10]" - TYPEDEF should be on the array type, not just int
+        let (decl, types, _strings) = parse_decl("typedef int arr[10];").unwrap();
+        let arr_typ = decl.declarators[0].typ;
+
+        // Verify it's an array type
+        assert_eq!(types.kind(arr_typ), TypeKind::Array);
+
+        // Verify TYPEDEF modifier is on the array type
+        assert!(
+            types
+                .get(arr_typ)
+                .modifiers
+                .contains(TypeModifiers::TYPEDEF),
+            "TYPEDEF modifier should propagate to array type"
+        );
+    }
+
     // ========================================================================
     // Function parsing tests
     // ========================================================================
@@ -7593,6 +7758,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_function_pointer_returning_struct_pointer() {
+        // Function pointer returning a struct pointer: struct node *(*fp)(int)
+        // This declares fp as a pointer to a function (int) -> struct node*
+        // Regression test for issue where outer pointers in grouped declarators
+        // were applied after the function type instead of before (to the return type)
+        let (tu, types, _strings) =
+            parse_tu("struct node { int value; }; struct node *(*fp)(int);").unwrap();
+        assert_eq!(tu.items.len(), 2);
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                // fp should be Pointer -> Function -> Pointer -> struct node
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+
+                // Base type of fp should be Function (not Pointer!)
+                let func_id = types.base_type(decl.declarators[0].typ).unwrap();
+                assert_eq!(
+                    types.kind(func_id),
+                    TypeKind::Function,
+                    "Function pointer base type should be Function, not Pointer"
+                );
+
+                // Function return type should be Pointer
+                let ret_id = types.base_type(func_id).unwrap();
+                assert_eq!(
+                    types.kind(ret_id),
+                    TypeKind::Pointer,
+                    "Function return type should be Pointer"
+                );
+
+                // Pointer base type should be Struct
+                let struct_id = types.base_type(ret_id).unwrap();
+                assert_eq!(
+                    types.kind(struct_id),
+                    TypeKind::Struct,
+                    "Pointer base type should be Struct"
+                );
+
+                // Function should take one int parameter
+                if let Some(params) = types.params(func_id) {
+                    assert_eq!(params.len(), 1);
+                    assert_eq!(types.kind(params[0]), TypeKind::Int);
+                }
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_pointer_to_array_of_pointers() {
+        // Pointer to array of pointers: int *(*p)[3]
+        // This declares p as a pointer to an array of 3 int pointers
+        // Regression test for issue where type chain was incorrectly built
+        let (tu, types, _strings) = parse_tu("int *(*p)[3];").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                // p should be Pointer -> Array -> Pointer -> int
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+
+                // Base type of p should be Array
+                let array_id = types.base_type(decl.declarators[0].typ).unwrap();
+                assert_eq!(
+                    types.kind(array_id),
+                    TypeKind::Array,
+                    "Pointer base type should be Array"
+                );
+
+                // Array element type should be Pointer
+                let elem_id = types.base_type(array_id).unwrap();
+                assert_eq!(
+                    types.kind(elem_id),
+                    TypeKind::Pointer,
+                    "Array element type should be Pointer"
+                );
+
+                // Pointer base type should be Int
+                let int_id = types.base_type(elem_id).unwrap();
+                assert_eq!(
+                    types.kind(int_id),
+                    TypeKind::Int,
+                    "Pointer base type should be Int"
+                );
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
     // ========================================================================
     // Bitfield tests
     // ========================================================================
@@ -7721,5 +7976,188 @@ mod tests {
             }
             _ => panic!("Expected Declaration"),
         }
+    }
+
+    // ========================================================================
+    // Typedef with trailing qualifiers tests (C99)
+    // Tests for "typedef_name const" and "typedef_name volatile" syntax
+    // ========================================================================
+
+    #[test]
+    fn test_typedef_trailing_const() {
+        // Test that "typedef_name const" is parsed correctly
+        // This pattern is used in real code like: z_word_t const *ptr
+        let (tu, types, _strings) =
+            parse_tu("typedef unsigned long mytype; mytype const x;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        // Second item should be the declaration of x
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                // The type should have CONST modifier
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::CONST),
+                    "Type should have CONST modifier"
+                );
+                // Base type should still be unsigned long
+                assert_eq!(types.kind(typ), TypeKind::Long);
+                assert!(types.modifiers(typ).contains(TypeModifiers::UNSIGNED));
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_typedef_trailing_volatile() {
+        // Test that "typedef_name volatile" is parsed correctly
+        let (tu, types, _strings) = parse_tu("typedef int myint; myint volatile v;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::VOLATILE),
+                    "Type should have VOLATILE modifier"
+                );
+                assert_eq!(types.kind(typ), TypeKind::Int);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_typedef_trailing_const_volatile() {
+        // Test both const and volatile after typedef name
+        let (tu, types, _strings) =
+            parse_tu("typedef int myint; myint const volatile cv;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::CONST),
+                    "Type should have CONST modifier"
+                );
+                assert!(
+                    types.modifiers(typ).contains(TypeModifiers::VOLATILE),
+                    "Type should have VOLATILE modifier"
+                );
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_typedef_trailing_const_pointer() {
+        // Test "typedef_name const *ptr" pattern
+        // This is common in real code: z_word_t const *ptr
+        let (tu, types, _strings) =
+            parse_tu("typedef unsigned long word_t; word_t const *ptr;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        match &tu.items[1] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let ptr_typ = decl.declarators[0].typ;
+                // Should be a pointer
+                assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
+                // The base type (what pointer points to) should be const
+                if let Some(base) = types.base_type(ptr_typ) {
+                    assert!(
+                        types.modifiers(base).contains(TypeModifiers::CONST),
+                        "Pointee type should have CONST modifier"
+                    );
+                    assert!(types.modifiers(base).contains(TypeModifiers::UNSIGNED));
+                }
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    // ========================================================================
+    // Bug fix regression tests
+    // ========================================================================
+
+    #[test]
+    fn test_forward_declared_struct_member_access() {
+        // Regression test: forward-declared struct pointer member access
+        // The incomplete struct type should be resolved to the complete type
+        // when the member access is performed.
+        let (tu, types, _strings) =
+            parse_tu("struct S { int x; }; void f(struct S *p) { p->x; }").unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        // Verify the function body parsed correctly
+        match &tu.items[1] {
+            ExternalDecl::FunctionDef(func) => {
+                // The function should have parsed successfully
+                assert_eq!(types.kind(func.return_type), TypeKind::Void);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_forward_declared_struct_via_pointer_param() {
+        // More complex case: struct declared after function, used via pointer
+        // This tests that resolve_struct_type works for arrow operator
+        let (tu, _types, _strings) = parse_tu(
+            "struct Node; \
+             int get_val(struct Node *n); \
+             struct Node { int val; struct Node *next; }; \
+             int get_val(struct Node *n) { return n->val; }",
+        )
+        .unwrap();
+        // 4 items: forward decl, prototype, struct def, function def
+        assert_eq!(tu.items.len(), 4);
+    }
+
+    #[test]
+    fn test_function_pointer_call() {
+        // Regression test: function pointer calls should return the correct type
+        // Previously, the parser only handled TypeKind::Function, not pointers to functions
+        let (tu, types, _strings) = parse_tu(
+            "int (*fp)(int); \
+             int test(void) { return fp(42); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 2);
+
+        // Verify the function return type is int (from fp(42) call)
+        match &tu.items[1] {
+            ExternalDecl::FunctionDef(func) => {
+                assert_eq!(types.kind(func.return_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_function_pointer_in_struct_call() {
+        // Test calling function pointer stored in struct member
+        let (tu, _types, _strings) = parse_tu(
+            "struct Ops { int (*handler)(int); }; \
+             int call_handler(struct Ops *ops, int x) { return ops->handler(x); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 2);
+    }
+
+    #[test]
+    fn test_typedef_function_pointer_call() {
+        // Test typedef'd function pointer call
+        let (tu, _types, _strings) = parse_tu(
+            "typedef int (*callback_t)(int); \
+             callback_t cb; \
+             int test(void) { return cb(10); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 3);
     }
 }

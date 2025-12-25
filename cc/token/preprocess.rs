@@ -19,12 +19,21 @@ use std::time::SystemTime;
 
 use super::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue, Tokenizer};
 use crate::arch;
+use crate::builtin_headers;
 use crate::diag;
 use crate::os;
 use crate::target::Target;
 
 /// Default capacity for macro HashMap (covers predefined macros + typical program macros)
 const DEFAULT_MACRO_CAPACITY: usize = 32;
+
+/// Source of an included file
+pub enum IncludeSource {
+    /// File on disk
+    File(PathBuf),
+    /// Builtin (embedded) header content (content only, name is for display)
+    Builtin(&'static str), // content
+}
 
 // ============================================================================
 // Macro Definition
@@ -312,6 +321,12 @@ pub struct Preprocessor<'a> {
 
     /// Preprocess call depth (0 = top level, >0 = recursive for macros/includes)
     preprocess_depth: u32,
+
+    /// Whether to use builtin headers (disabled by -nobuiltininc or -nostdinc)
+    use_builtin_headers: bool,
+
+    /// Whether to use system include paths (disabled by -nostdinc)
+    use_system_headers: bool,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -409,6 +424,8 @@ impl<'a> Preprocessor<'a> {
             compile_date,
             compile_time,
             preprocess_depth: 0,
+            use_builtin_headers: true,
+            use_system_headers: true,
         };
 
         // Initialize predefined macros
@@ -662,7 +679,12 @@ impl<'a> Preprocessor<'a> {
                                     // Pop the identifier and expand as function-like macro
                                     let last_token = output.pop().unwrap();
                                     iter.next(); // consume '('
-                                    let args = self.collect_macro_args(&mut iter, idents);
+                                    let args = self.collect_macro_args(
+                                        &mut iter,
+                                        idents,
+                                        &last_token.pos,
+                                        &macro_name,
+                                    );
                                     let mac = mac.clone();
                                     if let Some(more_expanded) = self.expand_function_macro(
                                         &mac,
@@ -1292,8 +1314,15 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Find and include the file
-        if let Some(path) = self.find_include_file(&filename, is_system, is_include_next) {
-            self.include_file(&path, output, idents, hash_token);
+        if let Some(source) = self.find_include_file(&filename, is_system, is_include_next) {
+            match source {
+                IncludeSource::File(path) => {
+                    self.include_file(&path, output, idents, hash_token);
+                }
+                IncludeSource::Builtin(content) => {
+                    self.include_builtin(&filename, content, output, idents, hash_token);
+                }
+            }
         } else {
             diag::error(hash_token.pos, &format!("'{}': file not found", filename));
         }
@@ -1360,12 +1389,20 @@ impl<'a> Preprocessor<'a> {
         filename: &str,
         is_system: bool,
         _is_include_next: bool,
-    ) -> Option<PathBuf> {
+    ) -> Option<IncludeSource> {
+        // Check builtin headers first (before any filesystem search)
+        // Builtin headers take precedence for standard names like stdarg.h
+        if self.use_builtin_headers {
+            if let Some(content) = builtin_headers::get_builtin_header(filename) {
+                return Some(IncludeSource::Builtin(content));
+            }
+        }
+
         // Absolute path
         if filename.starts_with('/') {
             let path = PathBuf::from(filename);
             if path.exists() {
-                return Some(path);
+                return Some(IncludeSource::File(path));
             }
             return None;
         }
@@ -1374,23 +1411,25 @@ impl<'a> Preprocessor<'a> {
         if !is_system {
             let relative_path = Path::new(&self.current_dir).join(filename);
             if relative_path.exists() {
-                return Some(relative_path);
+                return Some(IncludeSource::File(relative_path));
             }
 
             // Check quote include paths
             for dir in &self.quote_include_paths {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {
-                    return Some(path);
+                    return Some(IncludeSource::File(path));
                 }
             }
         }
 
-        // Check system include paths
-        for dir in &self.system_include_paths {
-            let path = Path::new(dir).join(filename);
-            if path.exists() {
-                return Some(path);
+        // Check system include paths (unless -nostdinc)
+        if self.use_system_headers {
+            for dir in &self.system_include_paths {
+                let path = Path::new(dir).join(filename);
+                if path.exists() {
+                    return Some(IncludeSource::File(path));
+                }
             }
         }
 
@@ -1489,6 +1528,61 @@ impl<'a> Preprocessor<'a> {
         // Restore state
         self.include_depth -= 1;
         self.include_stack.remove(&canonical);
+        self.current_file = saved_file;
+        self.current_dir = saved_dir;
+        self.cond_stack = saved_cond_stack;
+    }
+
+    /// Include a builtin (embedded) header
+    fn include_builtin(
+        &mut self,
+        name: &str,
+        content: &str,
+        output: &mut Vec<Token>,
+        idents: &mut IdentTable,
+        hash_token: &Token,
+    ) {
+        // Check include depth
+        if self.include_depth >= self.max_include_depth {
+            diag::error(
+                hash_token.pos,
+                &format!(
+                    "#include nested too deeply (max {})",
+                    self.max_include_depth
+                ),
+            );
+            return;
+        }
+
+        // Save current state
+        let saved_file = std::mem::replace(&mut self.current_file, format!("<builtin:{}>", name));
+        let saved_dir = std::mem::replace(&mut self.current_dir, ".".to_string());
+        let saved_cond_stack = std::mem::take(&mut self.cond_stack);
+
+        self.include_depth += 1;
+
+        // Create a stream for this builtin header
+        let stream_id = diag::init_stream(&self.current_file);
+
+        // Tokenize the builtin content
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(content.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        };
+
+        // Preprocess the included tokens
+        let preprocessed = self.preprocess(tokens, idents);
+
+        // Filter out stream markers from included content
+        for token in preprocessed {
+            match token.typ {
+                TokenType::StreamBegin | TokenType::StreamEnd => {}
+                _ => output.push(token),
+            }
+        }
+
+        // Restore state
+        self.include_depth -= 1;
         self.current_file = saved_file;
         self.current_dir = saved_dir;
         self.cond_stack = saved_cond_stack;
@@ -1626,7 +1720,7 @@ impl<'a> Preprocessor<'a> {
                 if let TokenValue::Special(code) = &next.value {
                     if *code == b'(' as u32 {
                         iter.next(); // consume '('
-                        let args = self.collect_macro_args(iter, idents);
+                        let args = self.collect_macro_args(iter, idents, pos, name);
                         return self.expand_function_macro(&mac, &args, pos, idents);
                     }
                 }
@@ -1644,37 +1738,39 @@ impl<'a> Preprocessor<'a> {
         &self,
         iter: &mut std::iter::Peekable<I>,
         _idents: &IdentTable,
+        macro_pos: &Position,
+        macro_name: &str,
     ) -> Vec<Vec<Token>>
     where
         I: Iterator<Item = Token>,
     {
         let mut args = Vec::new();
         let mut current_arg = Vec::new();
-        let mut paren_depth = 0;
+        // Start at depth 1 because the opening '(' has already been consumed
+        // by the caller. This is important for handling multiline macro calls.
+        let mut paren_depth = 1;
+        let mut found_closing_paren = false;
 
         for token in iter.by_ref() {
-            if token.pos.newline && paren_depth == 0 {
-                // Unterminated macro call
-                break;
-            }
-
             match &token.value {
                 TokenValue::Special(code) => {
                     if *code == b'(' as u32 {
                         paren_depth += 1;
                         current_arg.push(token);
                     } else if *code == b')' as u32 {
+                        paren_depth -= 1;
                         if paren_depth == 0 {
-                            // End of arguments
+                            // End of arguments - closing ')' of macro call
                             if !current_arg.is_empty() || !args.is_empty() {
                                 args.push(current_arg);
                             }
+                            found_closing_paren = true;
                             break;
                         }
-                        paren_depth -= 1;
+                        // Nested ')' - add to current argument
                         current_arg.push(token);
-                    } else if *code == b',' as u32 && paren_depth == 0 {
-                        // Argument separator
+                    } else if *code == b',' as u32 && paren_depth == 1 {
+                        // Argument separator at top level (paren_depth == 1 since we're inside the macro call)
                         args.push(current_arg);
                         current_arg = Vec::new();
                     } else {
@@ -1685,6 +1781,17 @@ impl<'a> Preprocessor<'a> {
                     current_arg.push(token);
                 }
             }
+        }
+
+        // Check for unterminated macro call (EOF before closing ')')
+        if !found_closing_paren {
+            crate::diag::error(
+                *macro_pos,
+                &format!(
+                    "unterminated argument list invoking macro \"{}\"",
+                    macro_name
+                ),
+            );
         }
 
         args
@@ -1962,7 +2069,7 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         builtin: BuiltinMacro,
         pos: &Position,
-        _mac: &Macro,
+        mac: &Macro,
         iter: &mut std::iter::Peekable<I>,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>>
@@ -2018,7 +2125,7 @@ impl<'a> Preprocessor<'a> {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
                             iter.next();
-                            let args = self.collect_macro_args(iter, idents);
+                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
                             let result = self.eval_has_builtin(builtin, &args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
@@ -2040,7 +2147,7 @@ impl<'a> Preprocessor<'a> {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
                             iter.next();
-                            let args = self.collect_macro_args(iter, idents);
+                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
                             let result = self.eval_has_include(&args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
@@ -2614,28 +2721,58 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 // ============================================================================
 // Public API
 // ============================================================================
+
+/// Configuration for preprocessing command-line options
+#[derive(Default)]
+pub struct PreprocessConfig<'a> {
+    /// Command-line -D defines
+    pub defines: &'a [String],
+    /// Command-line -U undefines
+    pub undefines: &'a [String],
+    /// Command-line -I include paths
+    pub include_paths: &'a [String],
+    /// If true, disable system include paths (-nostdinc)
+    pub no_std_inc: bool,
+    /// If true, disable builtin headers (-nobuiltininc)
+    pub no_builtin_inc: bool,
+}
+
 /// Preprocess tokens with command-line defines and undefines
 ///
 /// This is the main entry point for preprocessing.
 /// Takes lexer output and returns preprocessed tokens.
+///
+/// # Arguments
+/// * `tokens` - Lexer output tokens
+/// * `target` - Target platform configuration
+/// * `idents` - Identifier table for string interning
+/// * `filename` - Name of the source file
+/// * `config` - Preprocessing configuration (defines, undefines, include paths, flags)
 pub fn preprocess_with_defines(
     tokens: Vec<Token>,
     target: &Target,
     idents: &mut IdentTable,
     filename: &str,
-    defines: &[String],
-    undefines: &[String],
-    include_paths: &[String],
+    config: &PreprocessConfig<'_>,
 ) -> Vec<Token> {
     let mut pp = Preprocessor::new(target, filename);
 
+    // Handle -nostdinc and -nobuiltininc flags
+    if config.no_std_inc {
+        pp.use_system_headers = false;
+        pp.use_builtin_headers = false;
+    }
+    if config.no_builtin_inc {
+        pp.use_builtin_headers = false;
+    }
+
     // Add -I include paths
-    for path in include_paths {
+    for path in config.include_paths {
         pp.quote_include_paths.push(path.clone());
     }
 
     // Process -D defines
-    for def in defines {
+    for def in config.defines {
         if let Some(eq_pos) = def.find('=') {
             // -DNAME=VALUE - tokenize the value properly
             let name = &def[..eq_pos];
@@ -2650,7 +2787,7 @@ pub fn preprocess_with_defines(
     }
 
     // Process -U undefines
-    for undef in undefines {
+    for undef in config.undefines {
         pp.undef_macro(undef);
     }
 
@@ -2672,8 +2809,13 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         drop(tokenizer);
-        let result =
-            preprocess_with_defines(tokens, &target, &mut strings, "<test>", &[], &[], &[]);
+        let result = preprocess_with_defines(
+            tokens,
+            &target,
+            &mut strings,
+            "<test>",
+            &PreprocessConfig::default(),
+        );
         (result, strings)
     }
 

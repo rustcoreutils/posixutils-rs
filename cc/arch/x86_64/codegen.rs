@@ -17,7 +17,7 @@ use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, Oper
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
-use crate::target::Target;
+use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
@@ -45,6 +45,8 @@ pub struct X86_64CodeGen {
     pub(super) num_fixed_fp_params: usize,
     /// Counter for generating unique internal labels
     pub(super) unique_label_counter: u32,
+    /// External symbols (need GOT access on macOS)
+    pub(super) extern_symbols: HashSet<String>,
 }
 
 impl X86_64CodeGen {
@@ -59,6 +61,7 @@ impl X86_64CodeGen {
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
             unique_label_counter: 0,
+            extern_symbols: HashSet::new(),
         }
     }
 
@@ -79,11 +82,32 @@ impl X86_64CodeGen {
                     offset: -adjusted,
                 })
             }
+            Loc::IncomingArg(offset) => {
+                // Incoming stack argument: at [rbp + offset] (positive offset)
+                // No callee_saved_offset adjustment needed - these are above the return address
+                GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: *offset,
+                })
+            }
             Loc::Imm(v) => GpOperand::Imm(*v),
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
-            Loc::Global(name) => GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
+            Loc::Global(name) => {
+                let symbol = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                GpOperand::Mem(MemAddr::RipRelative(symbol))
+            }
         }
+    }
+
+    /// Check if a symbol needs GOT access (extern on macOS)
+    #[inline]
+    pub(super) fn needs_got_access(&self, name: &str) -> bool {
+        self.base.target.os == Os::MacOS && self.extern_symbols.contains(name)
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
@@ -107,6 +131,10 @@ impl X86_64CodeGen {
         init: &crate::ir::Initializer,
         types: &TypeTable,
     ) {
+        // Skip extern symbols - they're defined elsewhere
+        if self.extern_symbols.contains(name) {
+            return;
+        }
         self.base.emit_global(name, typ, init, types);
     }
 
@@ -596,6 +624,16 @@ impl X86_64CodeGen {
                     }),
                 });
             }
+            Loc::IncomingArg(offset) => {
+                self.push_lir(X86Inst::Cmp {
+                    size: op_size,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *offset,
+                    }),
+                });
+            }
             Loc::Imm(v) => {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
@@ -826,22 +864,35 @@ impl X86_64CodeGen {
             Opcode::SymAddr => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     let dst_loc = self.get_location(target);
+                    // Use R10 as scratch to avoid clobbering live values in Rax
                     let dst_reg = match &dst_loc {
                         Loc::Reg(r) => *r,
-                        _ => Reg::Rax,
+                        _ => Reg::R10,
                     };
                     let src_loc = self.get_location(src);
                     match src_loc {
                         Loc::Global(name) => {
                             // Check if it's a local label (starts with '.') or global symbol
                             let is_local_label = name.starts_with('.');
-                            self.push_lir(X86Inst::Lea {
-                                addr: MemAddr::RipRelative(Symbol {
-                                    name: name.clone(),
-                                    is_local: is_local_label,
-                                }),
-                                dst: dst_reg,
-                            });
+                            if self.needs_got_access(&name) {
+                                // External symbols on macOS need GOT access
+                                self.push_lir(X86Inst::Mov {
+                                    size: OperandSize::B64,
+                                    src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(
+                                        name.clone(),
+                                    ))),
+                                    dst: GpOperand::Reg(dst_reg),
+                                });
+                            } else {
+                                self.push_lir(X86Inst::Lea {
+                                    addr: MemAddr::RipRelative(Symbol {
+                                        name: name.clone(),
+                                        is_local: is_local_label,
+                                        is_extern: false,
+                                    }),
+                                    dst: dst_reg,
+                                });
+                            }
                         }
                         Loc::Stack(offset) => {
                             // Get address of stack location
@@ -970,6 +1021,17 @@ impl X86_64CodeGen {
                     dst: GpOperand::Reg(dst),
                 });
             }
+            Loc::IncomingArg(offset) => {
+                // LIR: memory-to-register move from incoming stack arg
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset,
+                    }),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
             Loc::Imm(v) => {
                 // x86-64: movl sign-extends to 64-bit, movq only works with 32-bit signed immediates
                 // For values outside 32-bit signed range, use movabsq
@@ -987,11 +1049,36 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => {
                 // LIR: RIP-relative memory-to-register move
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                    dst: GpOperand::Reg(dst),
-                });
+                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then load value
+                    // Use R11 as temp if dst is R11, otherwise use dst
+                    let temp_reg = if dst == Reg::R11 { Reg::R10 } else { Reg::R11 };
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(temp_reg),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: temp_reg,
+                            offset: 0,
+                        }),
+                        dst: GpOperand::Reg(dst),
+                    });
+                } else {
+                    let symbol = if name.starts_with('.') {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
+                        dst: GpOperand::Reg(dst),
+                    });
+                }
             }
             Loc::Xmm(x) => {
                 // Move from XMM to general-purpose register
@@ -1224,32 +1311,82 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                if mem_size <= 16 {
-                    // LIR: sign/zero extending load from global
-                    let src_size = OperandSize::from_bits(mem_size);
-                    if is_unsigned {
-                        self.push_lir(X86Inst::Movzx {
-                            src_size,
-                            dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                            dst: dst_reg,
-                        });
+                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                let is_local_label = name.starts_with('.');
+                if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then load value
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    if mem_size <= 16 {
+                        let src_size = OperandSize::from_bits(mem_size);
+                        if is_unsigned {
+                            self.push_lir(X86Inst::Movzx {
+                                src_size,
+                                dst_size: OperandSize::B32,
+                                src: GpOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::R11,
+                                    offset: insn.offset as i32,
+                                }),
+                                dst: dst_reg,
+                            });
+                        } else {
+                            self.push_lir(X86Inst::Movsx {
+                                src_size,
+                                dst_size: OperandSize::B32,
+                                src: GpOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::R11,
+                                    offset: insn.offset as i32,
+                                }),
+                                dst: dst_reg,
+                            });
+                        }
                     } else {
-                        self.push_lir(X86Inst::Movsx {
-                            src_size,
-                            dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                            dst: dst_reg,
+                        let op_size = OperandSize::from_bits(reg_size);
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::R11,
+                                offset: insn.offset as i32,
+                            }),
+                            dst: GpOperand::Reg(dst_reg),
                         });
                     }
                 } else {
-                    // LIR: regular load from global
-                    let op_size = OperandSize::from_bits(reg_size);
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                        dst: GpOperand::Reg(dst_reg),
-                    });
+                    let symbol = if is_local_label {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    if mem_size <= 16 {
+                        // LIR: sign/zero extending load from global
+                        let src_size = OperandSize::from_bits(mem_size);
+                        if is_unsigned {
+                            self.push_lir(X86Inst::Movzx {
+                                src_size,
+                                dst_size: OperandSize::B32,
+                                src: GpOperand::Mem(MemAddr::RipRelative(symbol.clone())),
+                                dst: dst_reg,
+                            });
+                        } else {
+                            self.push_lir(X86Inst::Movsx {
+                                src_size,
+                                dst_size: OperandSize::B32,
+                                src: GpOperand::Mem(MemAddr::RipRelative(symbol.clone())),
+                                dst: dst_reg,
+                            });
+                        }
+                    } else {
+                        // LIR: regular load from global
+                        let op_size = OperandSize::from_bits(reg_size);
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
+                            dst: GpOperand::Reg(dst_reg),
+                        });
+                    }
                 }
             }
             _ => {
@@ -1395,13 +1532,37 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
+                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                let is_local_label = name.starts_with('.');
                 let op_size = OperandSize::from_bits(mem_size);
-                // LIR: store to global via RIP-relative
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(value_reg),
-                    dst: GpOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                });
+                if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then store
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(value_reg),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R11,
+                            offset: insn.offset as i32,
+                        }),
+                    });
+                } else {
+                    let symbol = if is_local_label {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    // LIR: store to global via RIP-relative
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(value_reg),
+                        dst: GpOperand::Mem(MemAddr::RipRelative(symbol)),
+                    });
+                }
             }
             _ => {
                 self.emit_move(addr, Reg::R11, 64);
@@ -1430,6 +1591,12 @@ impl X86_64CodeGen {
         // Get destination address
         let addr_loc = self.get_location(addr);
 
+        // Special case: if value is immediate 0, zero the struct instead of copying
+        if let Loc::Imm(0) = value_loc {
+            self.emit_struct_zero(insn, addr, num_qwords);
+            return;
+        }
+
         // Load source address into R10
         match value_loc {
             Loc::Stack(offset) => {
@@ -1455,10 +1622,24 @@ impl X86_64CodeGen {
             }
             Loc::Global(ref name) => {
                 // LIR: lea for global source address
-                self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::RipRelative(Symbol::global(name.clone())),
-                    dst: Reg::R10,
-                });
+                if self.needs_got_access(name) {
+                    // External symbols on macOS: load address from GOT
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R10),
+                    });
+                } else {
+                    let symbol = if name.starts_with('.') {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::RipRelative(symbol),
+                        dst: Reg::R10,
+                    });
+                }
             }
             _ => return,
         }
@@ -1497,10 +1678,24 @@ impl X86_64CodeGen {
             }
             Loc::Global(ref name) => {
                 // LIR: lea for global destination address
-                self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::RipRelative(Symbol::global(name.clone())),
-                    dst: Reg::R11,
-                });
+                if self.needs_got_access(name) {
+                    // External symbols on macOS: load address from GOT
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                } else {
+                    let symbol = if name.starts_with('.') {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::RipRelative(symbol),
+                        dst: Reg::R11,
+                    });
+                }
             }
             _ => return,
         }
@@ -1521,6 +1716,89 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(Reg::Rax),
+                dst: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::R11,
+                    offset: byte_offset,
+                }),
+            });
+        }
+    }
+
+    /// Emit code to zero a struct (for struct = {0} initialization)
+    fn emit_struct_zero(&mut self, insn: &Instruction, addr: PseudoId, num_qwords: u32) {
+        let addr_loc = self.get_location(addr);
+
+        // Load destination address into R11
+        match addr_loc {
+            Loc::Stack(offset) => {
+                let adjusted = offset - insn.offset as i32 + self.callee_saved_offset;
+                self.push_lir(X86Inst::Lea {
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -adjusted,
+                    },
+                    dst: Reg::R11,
+                });
+            }
+            Loc::Reg(r) => {
+                if insn.offset != 0 {
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::BaseOffset {
+                            base: r,
+                            offset: insn.offset as i32,
+                        },
+                        dst: Reg::R11,
+                    });
+                } else if r != Reg::R11 {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(r),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                }
+            }
+            Loc::Global(ref name) => {
+                if self.needs_got_access(name) {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                } else {
+                    let symbol = if name.starts_with('.') {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::RipRelative(symbol),
+                        dst: Reg::R11,
+                    });
+                }
+                if insn.offset != 0 {
+                    self.push_lir(X86Inst::Add {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(insn.offset),
+                        dst: Reg::R11,
+                    });
+                }
+            }
+            _ => return,
+        }
+
+        // Load 0 into R10 once
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(0),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+
+        // Store zeros to each qword
+        for i in 0..num_qwords {
+            let byte_offset = (i * 8) as i32;
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
                 dst: GpOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::R11,
                     offset: byte_offset,
@@ -1623,12 +1901,18 @@ impl X86_64CodeGen {
                 });
             }
         }
-        self.emit_move(then_val, Reg::R10, size);
+        // Use R11 for then_val when dst_reg is R10 to avoid clobbering else value
+        let then_reg = if dst_reg == Reg::R10 {
+            Reg::R11
+        } else {
+            Reg::R10
+        };
+        self.emit_move(then_val, then_reg, size);
         // LIR: conditional move if not equal (non-zero)
         self.push_lir(X86Inst::CMov {
             cc: CondCode::Ne,
             size: op_size,
-            src: GpOperand::Reg(Reg::R10),
+            src: GpOperand::Reg(then_reg),
             dst: dst_reg,
         });
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
@@ -2028,11 +2312,23 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl {}(%rip), %{}",
-                    name,
-                    self.sized_reg_name(dest_reg, 'k')
-                ))));
+                if self.needs_got_access(name) {
+                    // External symbols on macOS: load address from GOT, then load value
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movq {}@GOTPCREL(%rip), %r11",
+                        self.format_symbol_name(name)
+                    ))));
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movl (%r11), %{}",
+                        self.sized_reg_name(dest_reg, 'k')
+                    ))));
+                } else {
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movl {}(%rip), %{}",
+                        self.format_symbol_name(name),
+                        self.sized_reg_name(dest_reg, 'k')
+                    ))));
+                }
             }
             _ => {
                 // Other locations - use generic string
@@ -2066,10 +2362,23 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl %{}, {}(%rip)",
-                    src_name, name
-                ))));
+                if self.needs_got_access(name) {
+                    // External symbols on macOS: load address from GOT, then store
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movq {}@GOTPCREL(%rip), %r11",
+                        self.format_symbol_name(name)
+                    ))));
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movl %{}, (%r11)",
+                        src_name
+                    ))));
+                } else {
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movl %{}, {}(%rip)",
+                        src_name,
+                        self.format_symbol_name(name)
+                    ))));
+                }
             }
             _ => {
                 // Other locations - use generic string
@@ -2090,13 +2399,27 @@ impl X86_64CodeGen {
                 let adjusted = offset + self.callee_saved_offset;
                 format!("-{}(%rbp)", adjusted)
             }
+            Loc::IncomingArg(offset) => {
+                format!("{}(%rbp)", offset)
+            }
             Loc::Imm(v) => format!("${}", v),
             Loc::Xmm(xmm) => xmm.name().to_string(),
             Loc::FImm(_, _) => {
                 // Float immediates not directly usable in inline asm
                 panic!("Float immediate not supported in inline asm operand")
             }
-            Loc::Global(name) => format!("{}(%rip)", name),
+            Loc::Global(name) => {
+                format!("{}(%rip)", self.format_symbol_name(name))
+            }
+        }
+    }
+
+    /// Format a symbol name with platform-specific prefix
+    fn format_symbol_name(&self, name: &str) -> String {
+        if self.base.target.os == Os::MacOS && !name.starts_with('.') {
+            format!("_{}", name)
+        } else {
+            name.to_string()
         }
     }
 
@@ -2239,6 +2562,7 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.output.clear();
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
+        self.extern_symbols = module.extern_symbols.clone();
 
         // Emit file header
         self.emit_header();

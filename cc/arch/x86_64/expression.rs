@@ -29,9 +29,10 @@ impl X86_64CodeGen {
             None => return,
         };
         let dst_loc = self.get_location(target);
+        // Use R10 (reserved scratch register, never allocated) when dst is on stack
         let work_reg = match &dst_loc {
             Loc::Reg(r) => *r,
-            _ => Reg::Rax,
+            _ => Reg::R10,
         };
 
         if matches!(insn.op, Opcode::Shl | Opcode::Lsr | Opcode::Asr) {

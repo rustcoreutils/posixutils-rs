@@ -24,7 +24,7 @@ pub mod ssa;
 
 use crate::diag::Position;
 use crate::types::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // ============================================================================
@@ -1294,6 +1294,9 @@ pub struct Module {
     pub debug: bool,
     /// Source file paths (stream id -> path) for .file directives
     pub source_files: Vec<String>,
+    /// External symbols (declared extern but not defined in this module)
+    /// These need GOT access on macOS
+    pub extern_symbols: HashSet<String>,
 }
 
 impl Module {
@@ -1305,6 +1308,7 @@ impl Module {
             strings: Vec::new(),
             debug: false,
             source_files: Vec::new(),
+            extern_symbols: HashSet::new(),
         }
     }
 
@@ -1511,5 +1515,27 @@ mod tests {
 
         assert_eq!(module.globals.len(), 1);
         assert_eq!(module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_module_extern_symbols() {
+        let mut module = Module::new();
+
+        // New module should have empty extern_symbols
+        assert!(module.extern_symbols.is_empty());
+
+        // Can insert extern symbols
+        module.extern_symbols.insert("printf".to_string());
+        module.extern_symbols.insert("malloc".to_string());
+
+        assert_eq!(module.extern_symbols.len(), 2);
+        assert!(module.extern_symbols.contains("printf"));
+        assert!(module.extern_symbols.contains("malloc"));
+
+        // Can remove symbols (simulates defining them after extern declaration)
+        module.extern_symbols.remove("printf");
+        assert_eq!(module.extern_symbols.len(), 1);
+        assert!(!module.extern_symbols.contains("printf"));
+        assert!(module.extern_symbols.contains("malloc"));
     }
 }

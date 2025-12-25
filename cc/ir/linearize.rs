@@ -502,6 +502,7 @@ impl<'a> Linearizer<'a> {
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
             let modifiers = self.types.modifiers(declarator.typ);
+            let name = self.str(declarator.name).to_string();
 
             // Skip typedef declarations - they don't define storage
             if modifiers.contains(TypeModifiers::TYPEDEF) {
@@ -514,7 +515,15 @@ impl<'a> Linearizer<'a> {
             }
 
             // Skip extern declarations - they don't define storage
+            // But track them so codegen can use GOT access on macOS
+            // Only add to extern_symbols if not already defined (handles both cases:
+            // extern int x; int x = 1;  - x is defined, not extern
+            // int x = 1; extern int x;  - x is defined, not extern)
             if modifiers.contains(TypeModifiers::EXTERN) {
+                // Check if this symbol is already defined in globals
+                if !self.module.globals.iter().any(|g| g.0 == name) {
+                    self.module.extern_symbols.insert(name);
+                }
                 continue;
             }
 
@@ -522,12 +531,14 @@ impl<'a> Linearizer<'a> {
                 self.ast_init_to_ir(e, declarator.typ)
             });
 
-            let name = self.str(declarator.name).to_string();
-
             // Track file-scope static variables for inline semantic checks
             if modifiers.contains(TypeModifiers::STATIC) {
                 self.file_scope_statics.insert(name.clone());
             }
+
+            // If this symbol was previously declared extern, remove it from extern_symbols
+            // (we now have the actual definition)
+            self.module.extern_symbols.remove(&name);
 
             self.module.add_global(&name, declarator.typ, init);
         }
@@ -556,9 +567,9 @@ impl<'a> Linearizer<'a> {
                     // char array - embed the string directly
                     Initializer::String(s.clone())
                 } else {
-                    // Pointer - would need to create a string constant and reference it
-                    // For now, just use SymAddr with a label we'll create
+                    // Pointer - create a string constant and reference it
                     let label = format!(".LC{}", self.module.strings.len());
+                    self.module.strings.push((label.clone(), s.clone()));
                     Initializer::SymAddr(label)
                 }
             }
@@ -843,6 +854,9 @@ impl<'a> Linearizer<'a> {
         // Complex parameters also need local storage for real/imag access
         let mut complex_params: Vec<(String, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
+        // Scalar parameters need local storage for SSA-correct reassignment handling
+        let mut scalar_params: Vec<(String, TypeId, PseudoId)> =
+            Vec::with_capacity(func.params.len());
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param
@@ -867,7 +881,10 @@ impl<'a> Linearizer<'a> {
                 // so we create local storage and the codegen handles the register split
                 complex_params.push((name, param.typ, pseudo_id));
             } else {
-                self.var_map.insert(name, pseudo_id);
+                // Store all scalar parameters to locals so SSA conversion can properly
+                // handle reassignment with phi nodes. If the parameter is never modified,
+                // SSA will optimize away the redundant load/store.
+                scalar_params.push((name, param.typ, pseudo_id));
             }
         }
 
@@ -957,6 +974,36 @@ impl<'a> Linearizer<'a> {
 
             // Don't emit a store here - the prologue codegen handles storing
             // from XMM0+XMM1/XMM2+XMM3/etc to local storage
+
+            // Register as a local variable for name lookup
+            self.locals.insert(
+                name,
+                LocalVarInfo {
+                    sym: local_sym,
+                    typ,
+                    vla_size_sym: None,
+                    vla_elem_type: None,
+                    vla_dim_syms: vec![],
+                },
+            );
+        }
+
+        // Store scalar parameters to local storage for SSA-correct reassignment handling
+        // This ensures that if a parameter is reassigned inside a branch, phi nodes
+        // are properly inserted at merge points.
+        for (name, typ, arg_pseudo) in scalar_params {
+            // Create a symbol pseudo for this local variable (its address)
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+                func.add_local(&name, local_sym, typ, is_volatile, None);
+            }
+
+            // Store the incoming argument value to the local
+            let typ_size = self.types.size_bits(typ);
+            self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
 
             // Register as a local variable for name lookup
             self.locals.insert(
@@ -1240,9 +1287,9 @@ impl<'a> Linearizer<'a> {
             }
 
             // Create a symbol pseudo for this local variable (its address)
-            // Use unique name (name#id) to distinguish shadowed variables for SSA
+            // Use unique name (name.id) to distinguish shadowed variables
             let sym_id = self.alloc_pseudo();
-            let unique_name = format!("{}#{}", declarator.name, sym_id.0);
+            let unique_name = format!("{}.{}", declarator.name, sym_id.0);
             let sym = Pseudo::sym(sym_id, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
@@ -1269,6 +1316,15 @@ impl<'a> Linearizer<'a> {
             if let Some(init) = &declarator.init {
                 if let ExprKind::InitList { elements } = &init.kind {
                     // Handle initializer list for arrays and structs
+                    // C99 6.7.8p19: uninitialized members must be zero-initialized
+                    // Zero the entire aggregate first, then apply explicit initializers
+                    let type_kind = self.types.kind(typ);
+                    if type_kind == TypeKind::Struct
+                        || type_kind == TypeKind::Union
+                        || type_kind == TypeKind::Array
+                    {
+                        self.emit_aggregate_zero(sym_id, typ);
+                    }
                     self.linearize_init_list(sym_id, typ, elements);
                 } else if self.types.is_complex(typ) {
                     // Complex type initialization - linearize_expr returns an address
@@ -1347,7 +1403,7 @@ impl<'a> Linearizer<'a> {
             // Create a hidden local to store this dimension's size
             // This is needed for runtime stride computation in multi-dimensional VLAs
             let dim_sym_id = self.alloc_pseudo();
-            let dim_var_name = format!("__vla_dim{}_{}#{}", dim_idx, declarator.name, dim_sym_id.0);
+            let dim_var_name = format!("__vla_dim{}_{}.{}", dim_idx, declarator.name, dim_sym_id.0);
             let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
 
             if let Some(func) = &mut self.current_func {
@@ -1387,7 +1443,7 @@ impl<'a> Linearizer<'a> {
         // Create a hidden local variable to store the total number of elements
         // This is needed for sizeof(vla) to work at runtime
         let size_sym_id = self.alloc_pseudo();
-        let size_var_name = format!("__vla_size_{}#{}", declarator.name, size_sym_id.0);
+        let size_var_name = format!("__vla_size_{}.{}", declarator.name, size_sym_id.0);
         let size_sym = Pseudo::sym(size_sym_id, size_var_name.clone());
 
         if let Some(func) = &mut self.current_func {
@@ -1426,7 +1482,7 @@ impl<'a> Linearizer<'a> {
         // Create a symbol pseudo for the VLA pointer variable
         // This symbol stores the pointer to the VLA memory (like a pointer variable)
         let sym_id = self.alloc_pseudo();
-        let unique_name = format!("{}#{}", declarator.name, sym_id.0);
+        let unique_name = format!("{}.{}", declarator.name, sym_id.0);
         let sym = Pseudo::sym(sym_id, unique_name.clone());
 
         // Create a pointer type for the VLA (pointer to element type)
@@ -1623,12 +1679,25 @@ impl<'a> Linearizer<'a> {
                             );
                         } else {
                             // Scalar value
+                            // If the field is an array and we're initializing with a scalar,
+                            // initialize only the first element of the array (C99 6.7.8p14)
+                            let (actual_type, actual_size) =
+                                if self.types.kind(field_type) == TypeKind::Array {
+                                    let elem_type =
+                                        self.types.base_type(field_type).unwrap_or(field_type);
+                                    (elem_type, self.types.size_bits(elem_type))
+                                } else {
+                                    (field_type, self.types.size_bits(field_type))
+                                };
                             let val = self.linearize_expr(&element.value);
                             let val_type = self.expr_type(&element.value);
-                            let converted = self.emit_convert(val, val_type, field_type);
-                            let field_size = self.types.size_bits(field_type);
+                            let converted = self.emit_convert(val, val_type, actual_type);
                             self.emit(Instruction::store(
-                                converted, base_sym, offset, field_type, field_size,
+                                converted,
+                                base_sym,
+                                offset,
+                                actual_type,
+                                actual_size,
                             ));
                         }
                     }
@@ -2147,6 +2216,18 @@ impl<'a> Linearizer<'a> {
     // ========================================================================
 
     /// Linearize an inline assembly statement
+    /// Check if an expression is a simple identifier that's a parameter (in var_map)
+    /// Returns Some((name, pseudo)) if it is, None otherwise
+    fn get_param_if_ident(&self, expr: &Expr) -> Option<(String, PseudoId)> {
+        if let ExprKind::Ident { name, .. } = &expr.kind {
+            let name_str = self.str(*name).to_string();
+            if let Some(&pseudo) = self.var_map.get(&name_str) {
+                return Some((name_str, pseudo));
+            }
+        }
+        None
+    }
+
     fn linearize_asm(
         &mut self,
         template: &str,
@@ -2157,6 +2238,8 @@ impl<'a> Linearizer<'a> {
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
+        // Track which outputs are parameters (need var_map update instead of store)
+        let mut param_outputs: Vec<Option<String>> = Vec::new();
 
         // Process output operands
         for op in outputs {
@@ -2169,14 +2252,28 @@ impl<'a> Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
+            // Check if this output is a parameter (SSA value, not memory location)
+            let param_info = self.get_param_if_ident(&op.expr);
+
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register
             if is_readwrite {
-                let addr = self.linearize_lvalue(&op.expr);
                 let typ = self.expr_type(&op.expr);
                 let size = self.types.size_bits(typ);
-                // Load into the same pseudo that will be used for output
-                self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+
+                if let Some((_, param_pseudo)) = &param_info {
+                    // Parameter: copy value directly (no memory address)
+                    self.emit(
+                        Instruction::new(Opcode::Copy)
+                            .with_target(pseudo)
+                            .with_src(*param_pseudo)
+                            .with_size(size),
+                    );
+                } else {
+                    // Local or global: load from memory address
+                    let addr = self.linearize_lvalue(&op.expr);
+                    self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+                }
 
                 // Also add as input, using the SAME pseudo
                 ir_inputs.push(AsmConstraint {
@@ -2193,6 +2290,9 @@ impl<'a> Linearizer<'a> {
                 matching_output: None,
                 constraint: op.constraint.clone(),
             });
+
+            // Track if this is a parameter output
+            param_outputs.push(param_info.map(|(name, _)| name));
         }
 
         // Process input operands
@@ -2291,10 +2391,18 @@ impl<'a> Linearizer<'a> {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
             let out_pseudo = ir_outputs[i].pseudo;
-            let addr = self.linearize_lvalue(&op.expr);
-            let typ = self.expr_type(&op.expr);
-            let size = self.types.size_bits(typ);
-            self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+
+            // Check if this output is a parameter (update var_map instead of memory store)
+            if let Some(param_name) = &param_outputs[i] {
+                // Parameter: update var_map with the new SSA value
+                self.var_map.insert(param_name.clone(), out_pseudo);
+            } else {
+                // Local or global: store to memory address
+                let addr = self.linearize_lvalue(&op.expr);
+                let typ = self.expr_type(&op.expr);
+                let size = self.types.size_bits(typ);
+                self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+            }
         }
     }
 
@@ -2348,6 +2456,42 @@ impl<'a> Linearizer<'a> {
         )
     }
 
+    /// Resolve an incomplete struct/union type to its complete definition.
+    ///
+    /// When a struct is forward-declared (e.g., `struct foo;`) and later
+    /// defined, the forward declaration creates an incomplete TypeId.
+    /// Pointers to the forward-declared type still reference this incomplete
+    /// TypeId even after the struct is fully defined with a new TypeId.
+    ///
+    /// This method looks up the complete definition in the symbol table
+    /// using the struct's tag name, returning the complete TypeId if found.
+    fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
+        let typ = self.types.get(type_id);
+
+        // Only try to resolve struct/union types
+        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
+            return type_id;
+        }
+
+        // Check if this is an incomplete type with a tag
+        if let Some(ref composite) = typ.composite {
+            if composite.is_complete {
+                // Already complete, no resolution needed
+                return type_id;
+            }
+            if let Some(tag) = composite.tag {
+                // Look up the tag in the symbol table to find the complete type
+                if let Some(symbol) = self.symbols.lookup_tag(tag) {
+                    // Return the complete type from the symbol table
+                    return symbol.typ;
+                }
+            }
+        }
+
+        // Couldn't resolve, return original
+        type_id
+    }
+
     /// Linearize an expression as an lvalue (get its address)
     fn linearize_lvalue(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
@@ -2381,6 +2525,63 @@ impl<'a> Linearizer<'a> {
                         self.types.pointer_to(local.typ),
                     ));
                     result
+                } else if let Some(&param_pseudo) = self.var_map.get(&name_str) {
+                    // Parameter whose address is taken - spill to local storage
+                    // Parameters are pass-by-value in the IR (Arg pseudos), but if
+                    // their address is taken, we need to copy to a stack slot first.
+                    let param_type = self.expr_type(expr);
+                    let size = self.types.size_bits(param_type);
+
+                    // Create a local variable to hold the parameter value
+                    let local_sym = self.alloc_pseudo();
+                    let local_pseudo = Pseudo::sym(local_sym, format!("{}_spill", name_str));
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(local_pseudo);
+                        func.locals.insert(
+                            format!("{}_spill", name_str),
+                            super::LocalVar {
+                                sym: local_sym,
+                                typ: param_type,
+                                is_volatile: false,
+                                decl_block: self.current_bb,
+                            },
+                        );
+                    }
+
+                    // Store the parameter value to the local
+                    self.emit(Instruction::store(
+                        param_pseudo,
+                        local_sym,
+                        0,
+                        param_type,
+                        size,
+                    ));
+
+                    // Update locals map so future accesses use the spilled location
+                    self.locals.insert(
+                        name_str.clone(),
+                        LocalVarInfo {
+                            sym: local_sym,
+                            typ: param_type,
+                            vla_size_sym: None,
+                            vla_elem_type: None,
+                            vla_dim_syms: vec![],
+                        },
+                    );
+
+                    // Also update var_map to point to the local for future value accesses
+                    // (so reads go through load instead of using the original Arg pseudo)
+                    // Note: We leave var_map unchanged here because reads should use
+                    // the stored value via load from the local.
+
+                    // Return address of the local
+                    let result = self.alloc_pseudo();
+                    self.emit(Instruction::sym_addr(
+                        result,
+                        local_sym,
+                        self.types.pointer_to(param_type),
+                    ));
+                    result
                 } else {
                     // Global variable - emit SymAddr to get its address
                     let sym_id = self.alloc_pseudo();
@@ -2411,7 +2612,9 @@ impl<'a> Linearizer<'a> {
             } => {
                 // s.m as lvalue = &s + offset(m)
                 let base = self.linearize_lvalue(inner);
-                let struct_type = self.expr_type(inner);
+                let base_struct_type = self.expr_type(inner);
+                // Resolve if the struct type is incomplete (forward-declared)
+                let struct_type = self.resolve_struct_type(base_struct_type);
                 let member_info =
                     self.types
                         .find_member(struct_type, *member)
@@ -2446,10 +2649,12 @@ impl<'a> Linearizer<'a> {
                 // ptr->m as lvalue = ptr + offset(m)
                 let ptr = self.linearize_expr(inner);
                 let ptr_type = self.expr_type(inner);
-                let struct_type = self
+                let base_struct_type = self
                     .types
                     .base_type(ptr_type)
                     .unwrap_or_else(|| self.expr_type(expr));
+                // Resolve if the struct type is incomplete (forward-declared)
+                let struct_type = self.resolve_struct_type(base_struct_type);
                 let member_info =
                     self.types
                         .find_member(struct_type, *member)
@@ -2526,7 +2731,7 @@ impl<'a> Linearizer<'a> {
                 // Compound literal as lvalue: create it and return its address
                 // This is used for &(struct S){...}
                 let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal#{}", sym_id.0);
+                let unique_name = format!(".compound_literal.{}", sym_id.0);
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
@@ -2632,7 +2837,9 @@ impl<'a> Linearizer<'a> {
     fn linearize_member(&mut self, expr: &Expr, inner_expr: &Expr, member: StringId) -> PseudoId {
         // Get address of the struct base
         let base = self.linearize_lvalue(inner_expr);
-        let struct_type = self.expr_type(inner_expr);
+        let base_struct_type = self.expr_type(inner_expr);
+        // Resolve if the struct type is incomplete (forward-declared)
+        let struct_type = self.resolve_struct_type(base_struct_type);
 
         // Look up member offset and type
         let member_info = self
@@ -2697,11 +2904,12 @@ impl<'a> Linearizer<'a> {
         let ptr = self.linearize_expr(inner_expr);
         let ptr_type = self.expr_type(inner_expr);
 
-        // Dereference pointer to get struct type
-        let struct_type = self
+        // Dereference pointer to get struct type, then resolve if incomplete
+        let base_struct_type = self
             .types
             .base_type(ptr_type)
             .unwrap_or_else(|| self.expr_type(expr));
+        let struct_type = self.resolve_struct_type(base_struct_type);
 
         // Look up member offset and type
         let member_info = self
@@ -3252,6 +3460,78 @@ impl<'a> Linearizer<'a> {
                 let addr = self.linearize_expr(ptr_expr);
                 self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
             }
+            ExprKind::Member { expr, member } => {
+                // Struct member: get address and store with offset
+                let base = self.linearize_lvalue(expr);
+                let base_struct_type = self.expr_type(expr);
+                let struct_type = self.resolve_struct_type(base_struct_type);
+                if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                    self.emit(Instruction::store(
+                        final_result,
+                        base,
+                        member_info.offset as i64,
+                        typ,
+                        store_size,
+                    ));
+                }
+            }
+            ExprKind::Arrow { expr, member } => {
+                // Pointer member: pointer value is the base address
+                let ptr = self.linearize_expr(expr);
+                let ptr_type = self.expr_type(expr);
+                let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
+                let struct_type = self.resolve_struct_type(base_struct_type);
+                if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                    self.emit(Instruction::store(
+                        final_result,
+                        ptr,
+                        member_info.offset as i64,
+                        typ,
+                        store_size,
+                    ));
+                }
+            }
+            ExprKind::Index { array, index } => {
+                // Array subscript: compute address and store
+                let array_type = self.expr_type(array);
+                let index_type = self.expr_type(index);
+                let array_kind = self.types.kind(array_type);
+                let (ptr_expr, idx_expr, idx_type) =
+                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
+                        (array.as_ref(), index.as_ref(), index_type)
+                    } else {
+                        (index.as_ref(), array.as_ref(), array_type)
+                    };
+                let arr = self.linearize_expr(ptr_expr);
+                let idx = self.linearize_expr(idx_expr);
+                let elem_size = store_size / 8;
+                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
+                let offset = self.alloc_pseudo();
+                let ptr_typ = self.types.long_id;
+                self.emit(Instruction::binop(
+                    Opcode::Mul,
+                    offset,
+                    idx_extended,
+                    elem_size_val,
+                    ptr_typ,
+                    64,
+                ));
+                let addr = self.alloc_pseudo();
+                let pseudo = Pseudo::reg(addr, addr.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    addr,
+                    arr,
+                    offset,
+                    ptr_typ,
+                    64,
+                ));
+                self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
+            }
             _ => {}
         }
 
@@ -3450,29 +3730,113 @@ impl<'a> Linearizer<'a> {
                 result
             };
 
-            // Store back to the variable
-            if let ExprKind::Ident { name, .. } = &operand.kind {
-                let name_str = self.str(*name).to_string();
-                if let Some(local) = self.locals.get(&name_str).cloned() {
-                    let store_size = self.types.size_bits(typ);
-                    self.emit(Instruction::store(
-                        final_result,
-                        local.sym,
-                        0,
-                        typ,
-                        store_size,
+            // Store back to the lvalue
+            let store_size = self.types.size_bits(typ);
+            match &operand.kind {
+                ExprKind::Ident { name, .. } => {
+                    let name_str = self.str(*name).to_string();
+                    if let Some(local) = self.locals.get(&name_str).cloned() {
+                        self.emit(Instruction::store(
+                            final_result,
+                            local.sym,
+                            0,
+                            typ,
+                            store_size,
+                        ));
+                    } else if self.var_map.contains_key(&name_str) {
+                        self.var_map.insert(name_str.clone(), final_result);
+                    } else {
+                        // Global variable - emit store
+                        let sym_id = self.alloc_pseudo();
+                        let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                        if let Some(func) = &mut self.current_func {
+                            func.add_pseudo(pseudo);
+                        }
+                        self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                    }
+                }
+                ExprKind::Member { expr, member } => {
+                    // Struct member: get address and store with offset
+                    let base = self.linearize_lvalue(expr);
+                    let base_struct_type = self.expr_type(expr);
+                    let struct_type = self.resolve_struct_type(base_struct_type);
+                    if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                        self.emit(Instruction::store(
+                            final_result,
+                            base,
+                            member_info.offset as i64,
+                            typ,
+                            store_size,
+                        ));
+                    }
+                }
+                ExprKind::Arrow { expr, member } => {
+                    // Pointer member: pointer value is the base address
+                    let ptr = self.linearize_expr(expr);
+                    let ptr_type = self.expr_type(expr);
+                    let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
+                    let struct_type = self.resolve_struct_type(base_struct_type);
+                    if let Some(member_info) = self.types.find_member(struct_type, *member) {
+                        self.emit(Instruction::store(
+                            final_result,
+                            ptr,
+                            member_info.offset as i64,
+                            typ,
+                            store_size,
+                        ));
+                    }
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand: deref_operand,
+                } => {
+                    // Dereference: store to the pointer address
+                    let ptr = self.linearize_expr(deref_operand);
+                    self.emit(Instruction::store(final_result, ptr, 0, typ, store_size));
+                }
+                ExprKind::Index { array, index } => {
+                    // Array subscript: compute address and store
+                    let array_type = self.expr_type(array);
+                    let index_type = self.expr_type(index);
+                    let array_kind = self.types.kind(array_type);
+                    let (ptr_expr, idx_expr, idx_type) =
+                        if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
+                            (array.as_ref(), index.as_ref(), index_type)
+                        } else {
+                            (index.as_ref(), array.as_ref(), array_type)
+                        };
+                    let arr = self.linearize_expr(ptr_expr);
+                    let idx = self.linearize_expr(idx_expr);
+                    let elem_size = store_size / 8;
+                    let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                    let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
+                    let offset = self.alloc_pseudo();
+                    let ptr_typ = self.types.long_id;
+                    self.emit(Instruction::binop(
+                        Opcode::Mul,
+                        offset,
+                        idx_extended,
+                        elem_size_val,
+                        ptr_typ,
+                        64,
                     ));
-                } else if self.var_map.contains_key(&name_str) {
-                    self.var_map.insert(name_str.clone(), final_result);
-                } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                    let addr = self.alloc_pseudo();
+                    let pseudo = Pseudo::reg(addr, addr.0);
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(pseudo);
                     }
-                    let store_size = self.types.size_bits(typ);
-                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                    self.emit(Instruction::binop(
+                        Opcode::Add,
+                        addr,
+                        arr,
+                        offset,
+                        ptr_typ,
+                        64,
+                    ));
+                    self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
+                }
+                _ => {
+                    // Fallback: shouldn't happen for valid lvalues
                 }
             }
 
@@ -3787,7 +4151,7 @@ impl<'a> Linearizer<'a> {
 
                 // Create a symbol pseudo for the compound literal (its address)
                 let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal#{}", sym_id.0);
+                let unique_name = format!(".compound_literal.{}", sym_id.0);
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
@@ -4098,6 +4462,68 @@ impl<'a> Linearizer<'a> {
         self.emit(insn);
 
         id
+    }
+
+    /// Emit stores to zero-initialize an aggregate (struct, union, or array)
+    /// This handles C99 6.7.8p19: uninitialized members must be zero-initialized
+    fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
+        let total_bytes = self.types.size_bits(typ) / 8;
+        let mut offset: i64 = 0;
+
+        // Create a zero constant for 64-bit stores
+        let zero64 = self.emit_const(0, self.types.long_id);
+
+        // Zero in 8-byte chunks
+        while offset + 8 <= total_bytes as i64 {
+            self.emit(Instruction::store(
+                zero64,
+                base_sym,
+                offset,
+                self.types.long_id,
+                64,
+            ));
+            offset += 8;
+        }
+
+        // Handle remaining bytes (if any)
+        if offset < total_bytes as i64 {
+            let remaining = total_bytes as i64 - offset;
+            if remaining >= 4 {
+                let zero32 = self.emit_const(0, self.types.int_id);
+                self.emit(Instruction::store(
+                    zero32,
+                    base_sym,
+                    offset,
+                    self.types.int_id,
+                    32,
+                ));
+                offset += 4;
+            }
+            if offset < total_bytes as i64 {
+                let remaining = total_bytes as i64 - offset;
+                if remaining >= 2 {
+                    let zero16 = self.emit_const(0, self.types.short_id);
+                    self.emit(Instruction::store(
+                        zero16,
+                        base_sym,
+                        offset,
+                        self.types.short_id,
+                        16,
+                    ));
+                    offset += 2;
+                }
+                if offset < total_bytes as i64 {
+                    let zero8 = self.emit_const(0, self.types.char_id);
+                    self.emit(Instruction::store(
+                        zero8,
+                        base_sym,
+                        offset,
+                        self.types.char_id,
+                        8,
+                    ));
+                }
+            }
+        }
     }
 
     /// Emit code to load a bitfield value
@@ -5175,7 +5601,9 @@ impl<'a> Linearizer<'a> {
             ExprKind::Member { expr, member } => {
                 // Struct member: get address and store with offset
                 let base = self.linearize_lvalue(expr);
-                let struct_type = self.expr_type(expr);
+                let base_struct_type = self.expr_type(expr);
+                // Resolve if the struct type is incomplete (forward-declared)
+                let struct_type = self.resolve_struct_type(base_struct_type);
                 let member_info =
                     self.types
                         .find_member(struct_type, *member)
@@ -5215,7 +5643,9 @@ impl<'a> Linearizer<'a> {
                 // Pointer member: pointer value is the base address
                 let ptr = self.linearize_expr(expr);
                 let ptr_type = self.expr_type(expr);
-                let struct_type = self.types.base_type(ptr_type).unwrap_or(target_typ);
+                let base_struct_type = self.types.base_type(ptr_type).unwrap_or(target_typ);
+                // Resolve if the struct type is incomplete (forward-declared)
+                let struct_type = self.resolve_struct_type(base_struct_type);
                 let member_info =
                     self.types
                         .find_member(struct_type, *member)
@@ -6012,3 +6442,8 @@ mod tests {
         );
     }
 }
+
+// Additional tests in separate file to keep this file manageable
+#[cfg(test)]
+#[path = "test_linearize.rs"]
+mod test_linearize;

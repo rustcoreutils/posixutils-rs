@@ -556,7 +556,7 @@ enum TypeKey {
     /// Pointer to interned type
     Pointer(TypeId, u32), // base_id, modifiers
     /// Array of interned type
-    Array(TypeId, Option<usize>),
+    Array(TypeId, Option<usize>, u32), // base_id, size, modifiers
     /// Function type
     Function {
         ret: TypeId,
@@ -718,7 +718,7 @@ impl TypeTable {
             }
             TypeKind::Array => {
                 let base = typ.base?;
-                Some(TypeKey::Array(base, typ.array_size))
+                Some(TypeKey::Array(base, typ.array_size, typ.modifiers.bits()))
             }
             TypeKind::Function => {
                 let ret = typ.base?;
@@ -1349,5 +1349,40 @@ mod tests {
         // And have correct kinds
         assert_eq!(types.kind(types.int_id), TypeKind::Int);
         assert_eq!(types.kind(types.void_ptr_id), TypeKind::Pointer);
+    }
+
+    #[test]
+    fn test_array_with_modifiers_deduplication() {
+        let mut types = TypeTable::new(64);
+
+        // Create a plain array type: int arr[10]
+        let plain_arr = types.intern(Type::array(types.int_id, 10));
+
+        // Create an array type with TYPEDEF modifier: typedef int arr[10]
+        let mut typedef_arr_type = Type::array(types.int_id, 10);
+        typedef_arr_type.modifiers = TypeModifiers::TYPEDEF;
+        let typedef_arr = types.intern(typedef_arr_type);
+
+        // These should be DIFFERENT TypeIds because modifiers are now part of TypeKey
+        assert_ne!(
+            plain_arr, typedef_arr,
+            "Arrays with different modifiers should have different TypeIds"
+        );
+
+        // Plain arrays should still deduplicate with each other
+        let plain_arr2 = types.intern(Type::array(types.int_id, 10));
+        assert_eq!(
+            plain_arr, plain_arr2,
+            "Same plain arrays should have same TypeId"
+        );
+
+        // Typedef arrays should still deduplicate with each other
+        let mut typedef_arr_type2 = Type::array(types.int_id, 10);
+        typedef_arr_type2.modifiers = TypeModifiers::TYPEDEF;
+        let typedef_arr2 = types.intern(typedef_arr_type2);
+        assert_eq!(
+            typedef_arr, typedef_arr2,
+            "Same typedef arrays should have same TypeId"
+        );
     }
 }

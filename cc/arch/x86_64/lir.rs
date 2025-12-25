@@ -32,6 +32,9 @@ pub enum MemAddr {
 
     /// [rip + symbol] - PC-relative addressing for position-independent code
     RipRelative(Symbol),
+
+    /// symbol@GOTPCREL(%rip) - GOT-relative addressing for external symbols on macOS
+    GotPcrel(Symbol),
 }
 
 impl MemAddr {
@@ -47,6 +50,9 @@ impl MemAddr {
             }
             MemAddr::RipRelative(sym) => {
                 format!("{}(%rip)", sym.format_for_target(target))
+            }
+            MemAddr::GotPcrel(sym) => {
+                format!("{}@GOTPCREL(%rip)", sym.format_for_target(target))
             }
         }
     }

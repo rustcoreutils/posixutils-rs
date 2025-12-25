@@ -498,11 +498,20 @@ impl RegAlloc {
     }
 
     /// Pre-allocate argument registers per System V AMD64 ABI
+    ///
+    /// System V AMD64 ABI passes arguments as follows:
+    /// - First 6 integer/pointer args in RDI, RSI, RDX, RCX, R8, R9
+    /// - First 8 FP args in XMM0-XMM7
+    /// - Remaining args go on the stack in parameter order (not separated by type)
     fn allocate_arguments(&mut self, func: &Function, types: &TypeTable) {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = XmmReg::arg_regs();
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
+        // Stack offset for overflow args - must be shared across all types
+        // because System V AMD64 ABI places stack args in parameter order
+        // 16 = saved rbp (8) + return address (8)
+        let mut stack_arg_offset = 16i32;
 
         // Detect hidden return pointer for large struct returns
         let sret_pseudo = func
@@ -530,11 +539,10 @@ impl RegAlloc {
                                 self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                                 self.fp_pseudos.insert(pseudo.id);
                             } else {
-                                // Stack-passed FP argument: at [rbp + offset]
-                                // 16 = saved rbp (8) + return address (8)
-                                let offset =
-                                    16 + (i - int_arg_regs.len() - fp_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::IncomingArg(offset));
+                                // Stack args are placed in parameter order per System V AMD64 ABI
+                                self.locations
+                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                                stack_arg_offset += 8;
                             }
                             fp_arg_idx += 1;
                         } else {
@@ -543,10 +551,10 @@ impl RegAlloc {
                                     .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
                                 self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                             } else {
-                                // Stack-passed integer argument: at [rbp + offset]
-                                // 16 = saved rbp (8) + return address (8)
-                                let offset = 16 + (int_arg_idx - int_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::IncomingArg(offset));
+                                // Stack args are placed in parameter order per System V AMD64 ABI
+                                self.locations
+                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                                stack_arg_offset += 8;
                             }
                             int_arg_idx += 1;
                         }

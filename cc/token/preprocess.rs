@@ -679,7 +679,12 @@ impl<'a> Preprocessor<'a> {
                                     // Pop the identifier and expand as function-like macro
                                     let last_token = output.pop().unwrap();
                                     iter.next(); // consume '('
-                                    let args = self.collect_macro_args(&mut iter, idents);
+                                    let args = self.collect_macro_args(
+                                        &mut iter,
+                                        idents,
+                                        &last_token.pos,
+                                        &macro_name,
+                                    );
                                     let mac = mac.clone();
                                     if let Some(more_expanded) = self.expand_function_macro(
                                         &mac,
@@ -1715,7 +1720,7 @@ impl<'a> Preprocessor<'a> {
                 if let TokenValue::Special(code) = &next.value {
                     if *code == b'(' as u32 {
                         iter.next(); // consume '('
-                        let args = self.collect_macro_args(iter, idents);
+                        let args = self.collect_macro_args(iter, idents, pos, name);
                         return self.expand_function_macro(&mac, &args, pos, idents);
                     }
                 }
@@ -1733,6 +1738,8 @@ impl<'a> Preprocessor<'a> {
         &self,
         iter: &mut std::iter::Peekable<I>,
         _idents: &IdentTable,
+        macro_pos: &Position,
+        macro_name: &str,
     ) -> Vec<Vec<Token>>
     where
         I: Iterator<Item = Token>,
@@ -1742,6 +1749,7 @@ impl<'a> Preprocessor<'a> {
         // Start at depth 1 because the opening '(' has already been consumed
         // by the caller. This is important for handling multiline macro calls.
         let mut paren_depth = 1;
+        let mut found_closing_paren = false;
 
         for token in iter.by_ref() {
             match &token.value {
@@ -1756,6 +1764,7 @@ impl<'a> Preprocessor<'a> {
                             if !current_arg.is_empty() || !args.is_empty() {
                                 args.push(current_arg);
                             }
+                            found_closing_paren = true;
                             break;
                         }
                         // Nested ')' - add to current argument
@@ -1772,6 +1781,17 @@ impl<'a> Preprocessor<'a> {
                     current_arg.push(token);
                 }
             }
+        }
+
+        // Check for unterminated macro call (EOF before closing ')')
+        if !found_closing_paren {
+            crate::diag::error(
+                *macro_pos,
+                &format!(
+                    "unterminated argument list invoking macro \"{}\"",
+                    macro_name
+                ),
+            );
         }
 
         args
@@ -2049,7 +2069,7 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         builtin: BuiltinMacro,
         pos: &Position,
-        _mac: &Macro,
+        mac: &Macro,
         iter: &mut std::iter::Peekable<I>,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>>
@@ -2105,7 +2125,7 @@ impl<'a> Preprocessor<'a> {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
                             iter.next();
-                            let args = self.collect_macro_args(iter, idents);
+                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
                             let result = self.eval_has_builtin(builtin, &args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
@@ -2127,7 +2147,7 @@ impl<'a> Preprocessor<'a> {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
                             iter.next();
-                            let args = self.collect_macro_args(iter, idents);
+                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
                             let result = self.eval_has_include(&args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,

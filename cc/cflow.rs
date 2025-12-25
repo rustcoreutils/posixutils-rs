@@ -459,6 +459,8 @@ fn process_file(
         defines,
         undefines,
         include_paths,
+        false, // no_std_inc
+        false, // no_builtin_inc
     );
 
     // Create symbol table and type table

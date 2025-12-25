@@ -131,9 +131,11 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
         &target,
         &mut strings,
         path,
-        &[], // No extra defines
-        &[], // No undefines
-        &[], // No include paths
+        &[],   // No extra defines
+        &[],   // No undefines
+        &[],   // No include paths
+        false, // no_std_inc
+        false, // no_builtin_inc
     );
 
     // Create symbol table and type table

@@ -10,6 +10,7 @@
 //
 
 mod arch;
+mod builtin_headers;
 mod diag;
 mod ir;
 mod opt;
@@ -85,6 +86,14 @@ struct Args {
     #[arg(short = 'I', action = clap::ArgAction::Append, value_name = "dir")]
     include_paths: Vec<String>,
 
+    /// Disable all standard include paths (system and builtin)
+    #[arg(long = "nostdinc", help = gettext("Disable standard system include paths"))]
+    no_std_inc: bool,
+
+    /// Disable builtin include paths only (keep system paths)
+    #[arg(long = "nobuiltininc", help = gettext("Disable builtin #include directories"))]
+    no_builtin_inc: bool,
+
     /// Compile and assemble, but do not link
     #[arg(short = 'c', help = gettext("Compile and assemble, but do not link"))]
     compile_only: bool,
@@ -124,6 +133,14 @@ struct Args {
     /// Pedantic mode (compatibility, currently no-op)
     #[arg(long = "pedantic", hide = true)]
     pedantic: bool,
+
+    /// Add library search path (passed to linker)
+    #[arg(short = 'L', action = clap::ArgAction::Append, value_name = "dir")]
+    lib_paths: Vec<String>,
+
+    /// Link library (passed to linker)
+    #[arg(short = 'l', action = clap::ArgAction::Append, value_name = "library")]
+    libraries: Vec<String>,
 }
 
 fn process_file(
@@ -194,6 +211,8 @@ fn process_file(
         &args.defines,
         &args.undefines,
         &args.include_paths,
+        args.no_std_inc,
+        args.no_builtin_inc,
     );
 
     if args.preprocess_only {
@@ -348,9 +367,17 @@ fn process_file(
     }
 
     // Link
-    let status = Command::new("cc")
-        .args(["-o", &exe_file, &temp_obj])
-        .status()?;
+    let mut link_cmd = Command::new("cc");
+    link_cmd.args(["-o", &exe_file, &temp_obj]);
+    // Add library search paths
+    for lib_path in &args.lib_paths {
+        link_cmd.arg(format!("-L{}", lib_path));
+    }
+    // Add libraries
+    for lib in &args.libraries {
+        link_cmd.arg(format!("-l{}", lib));
+    }
+    let status = link_cmd.status()?;
 
     let _ = std::fs::remove_file(&temp_obj);
 
@@ -365,19 +392,59 @@ fn process_file(
     Ok(())
 }
 
+/// Check if a string is a valid optimization level for -O
+fn is_valid_opt_level(s: &str) -> bool {
+    matches!(s, "0" | "1" | "2" | "3" | "s" | "z" | "fast" | "g")
+}
+
 /// Preprocess command-line arguments for gcc compatibility.
-/// Converts -Wall → -W all, -Wextra → -W extra, etc.
+/// - Converts -Wall → -W all, -Wextra → -W extra, etc.
+/// - Handles -O flag: standalone -O followed by non-level becomes -O1
 fn preprocess_args() -> Vec<String> {
-    std::env::args()
-        .flat_map(|arg| {
-            if arg.starts_with("-W") && arg.len() > 2 {
-                // -Wall → -W all, -Wextra → -W extra, etc.
-                vec!["-W".to_string(), arg[2..].to_string()]
-            } else {
-                vec![arg]
+    let raw_args: Vec<String> = std::env::args().collect();
+    let mut result = Vec::with_capacity(raw_args.len());
+    let mut i = 0;
+
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+
+        if arg == "-O" {
+            // Standalone -O: check if next arg is a valid optimization level
+            if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
+                // Next arg is a level like "1", "2", etc. - merge them
+                result.push(format!("-O{}", raw_args[i + 1]));
+                i += 2;
+                continue;
             }
-        })
-        .collect()
+            // Next arg is not a valid level (or no next arg) - use default -O1
+            result.push("-O1".to_string());
+            i += 1;
+        } else if arg.starts_with("-O") && arg.len() > 2 {
+            // -O0, -O1, -O2, -O3, -Os, -Oz, -Ofast, -Og - pass through
+            result.push(arg.clone());
+            i += 1;
+        } else if arg.starts_with("-W") && arg.len() > 2 {
+            // -Wall → -W all, -Wextra → -W extra, etc.
+            result.push("-W".to_string());
+            result.push(arg[2..].to_string());
+            i += 1;
+        } else if arg.starts_with("-L") && arg.len() > 2 {
+            // -L. → -L .
+            result.push("-L".to_string());
+            result.push(arg[2..].to_string());
+            i += 1;
+        } else if arg.starts_with("-l") && arg.len() > 2 {
+            // -lz → -l z
+            result.push("-l".to_string());
+            result.push(arg[2..].to_string());
+            i += 1;
+        } else {
+            result.push(arg.clone());
+            i += 1;
+        }
+    }
+
+    result
 }
 
 /// Check if a file is a C source file (by extension)
@@ -436,6 +503,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         link_cmd.args(["-o", &exe_file]);
         for obj in &object_files {
             link_cmd.arg(*obj);
+        }
+        // Add library search paths
+        for lib_path in &args.lib_paths {
+            link_cmd.arg(format!("-L{}", lib_path));
+        }
+        // Add libraries
+        for lib in &args.libraries {
+            link_cmd.arg(format!("-l{}", lib));
         }
         let status = link_cmd.status()?;
         if !status.success() {

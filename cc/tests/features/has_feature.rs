@@ -86,32 +86,40 @@ int main(void) {
     return 16;
     #endif
 
-    // Test 17-18: Unsupported/unknown builtins return 0
-    #if __has_builtin(__builtin_nonexistent_thing)
+    #if !__has_builtin(__builtin_offsetof)
     return 17;
     #endif
 
-    #if __has_builtin(__builtin_xyz_unknown)
+    #if !__has_builtin(offsetof)
     return 18;
     #endif
 
-    // Test 19-21: Complex expressions
+    // Test 19-20: Unsupported/unknown builtins return 0
+    #if __has_builtin(__builtin_nonexistent_thing)
+    return 19;
+    #endif
+
+    #if __has_builtin(__builtin_xyz_unknown)
+    return 20;
+    #endif
+
+    // Test 21-23: Complex expressions
     #if __has_builtin(__builtin_constant_p) && __has_builtin(__builtin_bswap32)
     int ok1 = 1;
     #else
-    return 19;
+    return 21;
     #endif
 
     #if __has_builtin(__builtin_nonexistent) || __has_builtin(__builtin_alloca)
     int ok2 = 1;
     #else
-    return 20;
+    return 22;
     #endif
 
     #if !__has_builtin(__builtin_nonexistent)
     int ok3 = 1;
     #else
-    return 21;
+    return 23;
     #endif
 
     return ok1 + ok2 + ok3 - 3;
@@ -146,26 +154,36 @@ int main(void) {
     return 4;
     #endif
 
-    // Test 5-7: __has_feature returns 0 (not yet implemented)
-    #if __has_feature(c_alignas)
+    // Test 5: __has_feature(statement_expressions) returns 1
+    #if !__has_feature(statement_expressions)
     return 5;
     #endif
 
-    #if __has_feature(c_static_assert)
+    // Test 6: __has_extension(statement_expressions) returns 1
+    #if !__has_extension(statement_expressions)
     return 6;
     #endif
 
-    #if __has_feature(c_generic_selections)
+    // Test 7-9: __has_feature returns 0 for C11 features (not yet implemented)
+    #if __has_feature(c_alignas)
     return 7;
     #endif
 
-    // Test 8-9: __has_extension returns 0 (not yet implemented)
-    #if __has_extension(c_alignas)
+    #if __has_feature(c_static_assert)
     return 8;
     #endif
 
-    #if __has_extension(attribute_deprecated_with_message)
+    #if __has_feature(c_generic_selections)
     return 9;
+    #endif
+
+    // Test 10-11: __has_extension returns 0 for other extensions (not yet implemented)
+    #if __has_extension(c_alignas)
+    return 10;
+    #endif
+
+    #if __has_extension(attribute_deprecated_with_message)
+    return 11;
     #endif
 
     return 0;

@@ -18,7 +18,7 @@ use super::{
 use crate::diag::{error, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
-    ExternalDecl, ForInit, FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
+    ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::SymbolTable;
@@ -468,6 +468,20 @@ impl<'a> Linearizer<'a> {
             }
         }
         false
+    }
+
+    /// Link current block to merge block if not terminated.
+    /// Used after linearizing then/else branches to connect to merge block.
+    fn link_to_merge_if_needed(&mut self, merge_bb: BasicBlockId) {
+        if self.is_terminated() {
+            return;
+        }
+        if let Some(current) = self.current_bb {
+            // If the block isn't terminated, it needs a branch to the merge block.
+            // Any unreachable blocks will be cleaned up by dead code elimination.
+            self.emit(Instruction::br(merge_bb));
+            self.link_bb(current, merge_bb);
+        }
     }
 
     /// Link two basic blocks (parent -> child)
@@ -1747,19 +1761,13 @@ impl<'a> Linearizer<'a> {
         // Then block
         self.switch_bb(then_bb);
         self.linearize_stmt(then_stmt);
-        if !self.is_terminated() {
-            self.emit(Instruction::br(merge_bb));
-            self.link_bb(then_bb, merge_bb);
-        }
+        self.link_to_merge_if_needed(merge_bb);
 
         // Else block
         if let Some(else_s) = else_stmt {
             self.switch_bb(else_bb);
             self.linearize_stmt(else_s);
-            if !self.is_terminated() {
-                self.emit(Instruction::br(merge_bb));
-                self.link_bb(else_bb, merge_bb);
-            }
+            self.link_to_merge_if_needed(merge_bb);
         }
 
         // Merge block
@@ -4428,6 +4436,54 @@ impl<'a> Linearizer<'a> {
                 insn.typ = Some(self.types.void_id);
                 self.emit(insn);
                 result
+            }
+
+            ExprKind::OffsetOf { type_id, path } => {
+                // __builtin_offsetof(type, member-designator)
+                // Compute the byte offset of the member within the struct
+                let mut offset: u64 = 0;
+                let mut current_type = *type_id;
+
+                for element in path {
+                    match element {
+                        OffsetOfPath::Field(field_id) => {
+                            // Look up the field in the current struct type
+                            let struct_type = self.resolve_struct_type(current_type);
+                            let member_info = self
+                                .types
+                                .find_member(struct_type, *field_id)
+                                .expect("offsetof: field not found in struct type");
+                            offset += member_info.offset as u64;
+                            current_type = member_info.typ;
+                        }
+                        OffsetOfPath::Index(index) => {
+                            // Array indexing: offset += index * sizeof(element)
+                            let elem_type = self
+                                .types
+                                .base_type(current_type)
+                                .expect("offsetof: array index on non-array type");
+                            let elem_size = self.types.size_bytes(elem_type);
+                            offset += (*index as u64) * (elem_size as u64);
+                            current_type = elem_type;
+                        }
+                    }
+                }
+
+                // Return the offset as a constant
+                self.emit_const(offset as i64, self.types.ulong_id)
+            }
+
+            ExprKind::StmtExpr { stmts, result } => {
+                // GNU statement expression: ({ stmt; stmt; expr; })
+                // Linearize all the statements first
+                for item in stmts {
+                    match item {
+                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
+                        BlockItem::Statement(s) => self.linearize_stmt(s),
+                    }
+                }
+                // The result is the value of the final expression
+                self.linearize_expr(result)
             }
         }
     }

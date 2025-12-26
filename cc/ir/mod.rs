@@ -129,7 +129,7 @@ pub enum Opcode {
     // Other
     SymAddr, // Get address of symbol
     Call,    // Function call
-    Select,  // Ternary select: cond ? a : b
+    Select,  // Ternary select: cond ? a : b (pure expressions only, enables cmov/csel)
     SetVal,  // Create pseudo for constant
     Nop,     // No operation
 
@@ -793,7 +793,8 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a select (ternary) instruction
+    /// Create a select (ternary) instruction for pure expressions
+    /// Enables cmov/csel codegen instead of branches
     pub fn select(
         target: PseudoId,
         cond: PseudoId,

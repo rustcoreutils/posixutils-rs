@@ -149,7 +149,11 @@ pub fn domtree_build(func: &mut Function) {
             // Find new idom as intersection of all processed predecessors
             let mut new_idom: Option<usize> = None;
             for parent_id in parents {
-                let parent_nr = postorder_nr[&parent_id];
+                // Skip predecessors that weren't reached during DFS (unreachable blocks)
+                let parent_nr = match postorder_nr.get(&parent_id) {
+                    Some(&nr) => nr,
+                    None => continue,
+                };
                 if doms[parent_nr].is_none() {
                     continue;
                 }
@@ -633,5 +637,63 @@ mod tests {
         // merge dominates exit
         assert!(func.dominates(BasicBlockId(3), BasicBlockId(4)));
         assert!(!func.dominates(BasicBlockId(3), BasicBlockId(1)));
+    }
+
+    /// Test that domtree_build handles unreachable blocks gracefully.
+    /// Unreachable blocks have predecessors that weren't visited during DFS.
+    #[test]
+    fn test_domtree_with_unreachable_block() {
+        // Create a CFG with an unreachable block:
+        //       entry(0)
+        //          |
+        //          v
+        //        bb1(1)
+        //          |
+        //          v
+        //        exit(2)
+        //
+        //    unreachable(3) <-- has edge from nowhere reachable
+        //          |
+        //          v
+        //        bb1(1) <-- unreachable points TO bb1, making bb1 have unreachable as predecessor
+
+        let types = TypeTable::new(64);
+        let mut func = Function::new("test", types.void_id);
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.children = vec![BasicBlockId(1)];
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::br(BasicBlockId(1)));
+
+        let mut bb1 = BasicBlock::new(BasicBlockId(1));
+        // bb1 has both entry AND unreachable as predecessors
+        bb1.parents = vec![BasicBlockId(0), BasicBlockId(3)];
+        bb1.children = vec![BasicBlockId(2)];
+        bb1.add_insn(Instruction::br(BasicBlockId(2)));
+
+        let mut exit = BasicBlock::new(BasicBlockId(2));
+        exit.parents = vec![BasicBlockId(1)];
+        exit.add_insn(Instruction::ret(None));
+
+        // Unreachable block - not reachable from entry
+        let mut unreachable = BasicBlock::new(BasicBlockId(3));
+        unreachable.children = vec![BasicBlockId(1)];
+        unreachable.add_insn(Instruction::br(BasicBlockId(1)));
+
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry, bb1, exit, unreachable];
+
+        // This should not panic - the fix skips predecessors not reached during DFS
+        domtree_build(&mut func);
+
+        // Verify the reachable blocks have correct dominators
+        let entry_block = func.get_block(BasicBlockId(0)).unwrap();
+        assert!(entry_block.idom.is_none());
+
+        let bb1_block = func.get_block(BasicBlockId(1)).unwrap();
+        assert_eq!(bb1_block.idom, Some(BasicBlockId(0)));
+
+        let exit_block = func.get_block(BasicBlockId(2)).unwrap();
+        assert_eq!(exit_block.idom, Some(BasicBlockId(1)));
     }
 }

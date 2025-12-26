@@ -2464,6 +2464,120 @@ impl<'a> Linearizer<'a> {
         )
     }
 
+    /// Check if an expression is "pure" (side-effect-free).
+    /// Pure expressions can be speculatively evaluated, enabling cmov/csel codegen.
+    ///
+    /// An expression is pure if it contains NO:
+    /// - Function calls
+    /// - Volatile accesses
+    /// - Pre/post increment/decrement (++, --)
+    /// - Assignments (=, +=, -=, etc.)
+    /// - Statement expressions (GNU extension with potential side effects)
+    fn is_pure_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Literals are always pure
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::CharLit(_)
+            | ExprKind::StringLit(_) => true,
+
+            // Identifiers are pure unless volatile
+            ExprKind::Ident { .. } => {
+                if let Some(typ) = expr.typ {
+                    !self.types.modifiers(typ).contains(TypeModifiers::VOLATILE)
+                } else {
+                    true
+                }
+            }
+
+            // Binary ops are pure if both operands are pure
+            ExprKind::Binary { left, right, .. } => {
+                self.is_pure_expr(left) && self.is_pure_expr(right)
+            }
+
+            // Unary ops are pure if operand is pure (no side-effect ops here)
+            ExprKind::Unary { operand, .. } => self.is_pure_expr(operand),
+
+            // Post-increment/decrement have side effects
+            ExprKind::PostInc(_) | ExprKind::PostDec(_) => false,
+
+            // Ternary is pure if all parts are pure
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.is_pure_expr(cond)
+                    && self.is_pure_expr(then_expr)
+                    && self.is_pure_expr(else_expr)
+            }
+
+            // Function calls are never pure (may have side effects)
+            ExprKind::Call { .. } => false,
+
+            // Member access is pure if the base expression is pure
+            ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => self.is_pure_expr(expr),
+
+            // Array indexing is pure if both parts are pure
+            ExprKind::Index { array, index } => {
+                self.is_pure_expr(array) && self.is_pure_expr(index)
+            }
+
+            // Casts are pure if the operand is pure
+            ExprKind::Cast { expr, .. } => self.is_pure_expr(expr),
+
+            // Assignments have side effects
+            ExprKind::Assign { .. } => false,
+
+            // Sizeof is always pure (compile-time constant)
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => true,
+
+            // Comma expressions: pure if all sub-expressions are pure
+            ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
+
+            // Compound literals may have side effects in initializers
+            ExprKind::CompoundLiteral { .. } => false,
+
+            // Init lists may have side effects
+            ExprKind::InitList { .. } => false,
+
+            // Statement expressions have side effects
+            ExprKind::StmtExpr { .. } => false,
+
+            // Variadic builtins have side effects
+            ExprKind::VaStart { .. }
+            | ExprKind::VaArg { .. }
+            | ExprKind::VaEnd { .. }
+            | ExprKind::VaCopy { .. } => false,
+
+            // Offsetof is always pure (compile-time constant)
+            ExprKind::OffsetOf { .. } => true,
+
+            // Builtins: bswap, ctz, clz, popcount are pure
+            ExprKind::Bswap16 { arg }
+            | ExprKind::Bswap32 { arg }
+            | ExprKind::Bswap64 { arg }
+            | ExprKind::Ctz { arg }
+            | ExprKind::Ctzl { arg }
+            | ExprKind::Ctzll { arg }
+            | ExprKind::Clz { arg }
+            | ExprKind::Clzl { arg }
+            | ExprKind::Clzll { arg }
+            | ExprKind::Popcount { arg }
+            | ExprKind::Popcountl { arg }
+            | ExprKind::Popcountll { arg } => self.is_pure_expr(arg),
+
+            // Alloca allocates memory - not pure
+            ExprKind::Alloca { .. } => false,
+
+            // Unreachable is pure (no side effects, just UB hint)
+            ExprKind::Unreachable => true,
+
+            // Setjmp/longjmp have control flow side effects
+            ExprKind::Setjmp { .. } | ExprKind::Longjmp { .. } => false,
+        }
+    }
+
     /// Resolve an incomplete struct/union type to its complete definition.
     ///
     /// When a struct is forward-declared (e.g., `struct foo;`) and later
@@ -4054,23 +4168,79 @@ impl<'a> Linearizer<'a> {
                 then_expr,
                 else_expr,
             } => {
-                let cond_val = self.linearize_expr(cond);
-                let then_val = self.linearize_expr(then_expr);
-                let else_val = self.linearize_expr(else_expr);
-
-                let result = self.alloc_pseudo();
-                let typ = self.expr_type(expr); // Use evaluated type
-                                                // Function types in ternary expressions decay to pointers (64-bit)
-                let size = if self.types.kind(typ) == TypeKind::Function {
+                let result_typ = self.expr_type(expr);
+                // Function types in ternary expressions decay to pointers (64-bit)
+                let size = if self.types.kind(result_typ) == TypeKind::Function {
                     64
                 } else {
-                    self.types.size_bits(typ)
+                    self.types.size_bits(result_typ)
                 };
 
-                self.emit(Instruction::select(
-                    result, cond_val, then_val, else_val, typ, size,
-                ));
-                result
+                // Check if both branches are pure (side-effect-free).
+                // If so, we can use Select instruction which enables cmov/csel codegen.
+                // Otherwise, we must use control flow for proper short-circuit evaluation.
+                if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) {
+                    // Pure: use Select instruction (enables cmov/csel)
+                    let cond_val = self.linearize_expr(cond);
+                    let cond_typ = self.expr_type(cond);
+                    let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+                    let then_val = self.linearize_expr(then_expr);
+                    let else_val = self.linearize_expr(else_expr);
+                    let result = self.alloc_pseudo();
+                    self.emit(Instruction::select(
+                        result, cond_bool, then_val, else_val, result_typ, size,
+                    ));
+                    result
+                } else {
+                    // Impure: use control flow + phi for proper short-circuit evaluation
+                    // Only evaluate the selected branch (important for side effects)
+
+                    // Create basic blocks for branches
+                    let then_bb = self.alloc_bb();
+                    let else_bb = self.alloc_bb();
+                    let merge_bb = self.alloc_bb();
+
+                    // Evaluate condition
+                    let cond_val = self.linearize_expr(cond);
+                    let cond_typ = self.expr_type(cond);
+                    let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+
+                    let cond_end_bb = self.current_bb.unwrap();
+
+                    // Branch on condition: if true go to then_bb, else go to else_bb
+                    self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+                    self.link_bb(cond_end_bb, then_bb);
+                    self.link_bb(cond_end_bb, else_bb);
+
+                    // Then branch: evaluate then_expr
+                    self.switch_bb(then_bb);
+                    let then_val = self.linearize_expr(then_expr);
+                    let then_end_bb = self.current_bb.unwrap();
+                    self.emit(Instruction::br(merge_bb));
+                    self.link_bb(then_end_bb, merge_bb);
+
+                    // Else branch: evaluate else_expr
+                    self.switch_bb(else_bb);
+                    let else_val = self.linearize_expr(else_expr);
+                    let else_end_bb = self.current_bb.unwrap();
+                    self.emit(Instruction::br(merge_bb));
+                    self.link_bb(else_end_bb, merge_bb);
+
+                    // Merge: phi node to get result
+                    self.switch_bb(merge_bb);
+                    let result = self.alloc_pseudo();
+                    // Create a phi pseudo for the target - important for register allocation
+                    let phi_pseudo = Pseudo::phi(result, result.0);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(phi_pseudo);
+                    }
+                    let mut phi_insn = Instruction::phi(result, result_typ, size);
+                    phi_insn.phi_list.push((then_end_bb, then_val));
+                    phi_insn.phi_list.push((else_end_bb, else_val));
+                    self.emit(phi_insn);
+
+                    result
+                }
             }
 
             ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
@@ -5378,6 +5548,11 @@ impl<'a> Linearizer<'a> {
         // Result is 0 if we came from lhs_end_bb (LHS was false),
         // or right_bool if we came from rhs_end_bb (LHS was true)
         let result = self.alloc_pseudo();
+        // Create a phi pseudo for the target - important for register allocation
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
         phi_insn.phi_list.push((lhs_end_bb, zero));
         phi_insn.phi_list.push((rhs_end_bb, right_bool));
@@ -5434,6 +5609,11 @@ impl<'a> Linearizer<'a> {
         // Result is 1 if we came from lhs_end_bb (LHS was true),
         // or right_bool if we came from rhs_end_bb (LHS was false)
         let result = self.alloc_pseudo();
+        // Create a phi pseudo for the target - important for register allocation
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
         phi_insn.phi_list.push((lhs_end_bb, one));
         phi_insn.phi_list.push((rhs_end_bb, right_bool));
@@ -6494,6 +6674,296 @@ mod tests {
         assert!(
             ir.contains("phi"),
             "Short-circuit OR should have phi node: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_ternary_pure_uses_select() {
+        let mut strings = StringTable::new();
+        let types = TypeTable::new(64);
+        let test_id = strings.intern("test");
+        let a_id = strings.intern("a");
+        let b_id = strings.intern("b");
+        // int test(int a, int b) {
+        //     return a > b ? a : b;  // pure ternary -> should use select
+        // }
+        let int_type = types.int_id;
+
+        // Build ternary: (a > b) ? a : b
+        let cond = Expr::binary(
+            BinaryOp::Gt,
+            Expr::var_typed(a_id, int_type),
+            Expr::var_typed(b_id, int_type),
+            &types,
+        );
+        let ternary = Expr::typed(
+            ExprKind::Conditional {
+                cond: Box::new(cond),
+                then_expr: Box::new(Expr::var_typed(a_id, int_type)),
+                else_expr: Box::new(Expr::var_typed(b_id, int_type)),
+            },
+            int_type,
+            test_pos(),
+        );
+
+        let func = FunctionDef {
+            return_type: int_type,
+            name: test_id,
+            params: vec![
+                Parameter {
+                    name: Some(a_id),
+                    typ: int_type,
+                },
+                Parameter {
+                    name: Some(b_id),
+                    typ: int_type,
+                },
+            ],
+            body: Stmt::Return(Some(ternary)),
+            pos: test_pos(),
+        };
+        let tu = TranslationUnit {
+            items: vec![ExternalDecl::FunctionDef(func)],
+        };
+
+        let module = test_linearize(&tu, &types, &strings);
+        let ir = format!("{}", module);
+
+        // Pure ternary should use select instruction (enables cmov/csel)
+        // Note: IR displays as "sel" not "select"
+        assert!(
+            ir.contains("sel."),
+            "Pure ternary should use select instruction: {}",
+            ir
+        );
+        // Should NOT have phi (that's for impure ternary)
+        assert!(
+            !ir.contains("phi"),
+            "Pure ternary should NOT use phi node: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_ternary_impure_uses_phi() {
+        let mut strings = StringTable::new();
+        let types = TypeTable::new(64);
+        let test_id = strings.intern("test");
+        let a_id = strings.intern("a");
+        let foo_id = strings.intern("foo");
+        let bar_id = strings.intern("bar");
+        // int test(int a) {
+        //     return a ? foo() : bar();  // impure ternary -> should use phi
+        // }
+        let int_type = types.int_id;
+
+        // Build ternary with function calls (impure)
+        let foo_call = Expr::typed(
+            ExprKind::Call {
+                func: Box::new(Expr::var_typed(foo_id, int_type)),
+                args: vec![],
+            },
+            int_type,
+            test_pos(),
+        );
+        let bar_call = Expr::typed(
+            ExprKind::Call {
+                func: Box::new(Expr::var_typed(bar_id, int_type)),
+                args: vec![],
+            },
+            int_type,
+            test_pos(),
+        );
+        let ternary = Expr::typed(
+            ExprKind::Conditional {
+                cond: Box::new(Expr::var_typed(a_id, int_type)),
+                then_expr: Box::new(foo_call),
+                else_expr: Box::new(bar_call),
+            },
+            int_type,
+            test_pos(),
+        );
+
+        let func = FunctionDef {
+            return_type: int_type,
+            name: test_id,
+            params: vec![Parameter {
+                name: Some(a_id),
+                typ: int_type,
+            }],
+            body: Stmt::Return(Some(ternary)),
+            pos: test_pos(),
+        };
+        let tu = TranslationUnit {
+            items: vec![ExternalDecl::FunctionDef(func)],
+        };
+
+        let module = test_linearize(&tu, &types, &strings);
+        let ir = format!("{}", module);
+
+        // Impure ternary should use phi (for proper short-circuit evaluation)
+        assert!(
+            ir.contains("phi"),
+            "Impure ternary should use phi node: {}",
+            ir
+        );
+        // Should have conditional branch
+        assert!(
+            ir.contains("cbr"),
+            "Impure ternary should use conditional branch: {}",
+            ir
+        );
+        // Should NOT use select (that's for pure ternary)
+        assert!(
+            !ir.contains("sel."),
+            "Impure ternary should NOT use select instruction: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_ternary_with_assignment_uses_phi() {
+        let mut strings = StringTable::new();
+        let types = TypeTable::new(64);
+        let test_id = strings.intern("test");
+        let a_id = strings.intern("a");
+        let b_id = strings.intern("b");
+        // int test(int a, int b) {
+        //     return a ? (b = 1) : (b = 2);  // assignment is impure
+        // }
+        let int_type = types.int_id;
+
+        // Build ternary with assignments (impure)
+        let assign1 = Expr::typed(
+            ExprKind::Assign {
+                op: crate::parse::ast::AssignOp::Assign,
+                target: Box::new(Expr::var_typed(b_id, int_type)),
+                value: Box::new(Expr::int(1, &types)),
+            },
+            int_type,
+            test_pos(),
+        );
+        let assign2 = Expr::typed(
+            ExprKind::Assign {
+                op: crate::parse::ast::AssignOp::Assign,
+                target: Box::new(Expr::var_typed(b_id, int_type)),
+                value: Box::new(Expr::int(2, &types)),
+            },
+            int_type,
+            test_pos(),
+        );
+        let ternary = Expr::typed(
+            ExprKind::Conditional {
+                cond: Box::new(Expr::var_typed(a_id, int_type)),
+                then_expr: Box::new(assign1),
+                else_expr: Box::new(assign2),
+            },
+            int_type,
+            test_pos(),
+        );
+
+        let func = FunctionDef {
+            return_type: int_type,
+            name: test_id,
+            params: vec![
+                Parameter {
+                    name: Some(a_id),
+                    typ: int_type,
+                },
+                Parameter {
+                    name: Some(b_id),
+                    typ: int_type,
+                },
+            ],
+            body: Stmt::Return(Some(ternary)),
+            pos: test_pos(),
+        };
+        let tu = TranslationUnit {
+            items: vec![ExternalDecl::FunctionDef(func)],
+        };
+
+        let module = test_linearize(&tu, &types, &strings);
+        let ir = format!("{}", module);
+
+        // Assignment is impure, so should use phi
+        assert!(
+            ir.contains("phi"),
+            "Ternary with assignment should use phi: {}",
+            ir
+        );
+        assert!(
+            !ir.contains("sel."),
+            "Ternary with assignment should NOT use select: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_ternary_with_post_increment_uses_phi() {
+        let mut strings = StringTable::new();
+        let types = TypeTable::new(64);
+        let test_id = strings.intern("test");
+        let a_id = strings.intern("a");
+        let b_id = strings.intern("b");
+        // int test(int a, int b) {
+        //     return a ? b++ : b--;  // post-inc/dec is impure
+        // }
+        let int_type = types.int_id;
+
+        // Build ternary with post-inc/dec (impure)
+        let post_inc = Expr::typed(
+            ExprKind::PostInc(Box::new(Expr::var_typed(b_id, int_type))),
+            int_type,
+            test_pos(),
+        );
+        let post_dec = Expr::typed(
+            ExprKind::PostDec(Box::new(Expr::var_typed(b_id, int_type))),
+            int_type,
+            test_pos(),
+        );
+        let ternary = Expr::typed(
+            ExprKind::Conditional {
+                cond: Box::new(Expr::var_typed(a_id, int_type)),
+                then_expr: Box::new(post_inc),
+                else_expr: Box::new(post_dec),
+            },
+            int_type,
+            test_pos(),
+        );
+
+        let func = FunctionDef {
+            return_type: int_type,
+            name: test_id,
+            params: vec![
+                Parameter {
+                    name: Some(a_id),
+                    typ: int_type,
+                },
+                Parameter {
+                    name: Some(b_id),
+                    typ: int_type,
+                },
+            ],
+            body: Stmt::Return(Some(ternary)),
+            pos: test_pos(),
+        };
+        let tu = TranslationUnit {
+            items: vec![ExternalDecl::FunctionDef(func)],
+        };
+
+        let module = test_linearize(&tu, &types, &strings);
+        let ir = format!("{}", module);
+
+        // Post-increment/decrement is impure, so should use phi
+        assert!(
+            ir.contains("phi"),
+            "Ternary with post-inc/dec should use phi: {}",
+            ir
+        );
+        assert!(
+            !ir.contains("sel."),
+            "Ternary with post-inc/dec should NOT use select: {}",
             ir
         );
     }

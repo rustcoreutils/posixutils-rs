@@ -1894,6 +1894,8 @@ impl Aarch64CodeGen {
         self.handle_call_return_value(insn, types, frame_size);
     }
 
+    /// Emit a select (ternary) instruction using CSEL
+    /// This is used for pure ternary expressions: cond ? a : b
     fn emit_select(&mut self, insn: &Instruction, frame_size: i32) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
@@ -1930,7 +1932,7 @@ impl Aarch64CodeGen {
         self.emit_move(then_val, then_reg, size, frame_size);
         self.emit_move(else_val, else_reg, size, frame_size);
 
-        // LIR: compare condition with zero
+        // Compare condition with zero
         self.push_lir(Aarch64Inst::Cmp {
             size: OperandSize::B64,
             src1: cond_reg,

@@ -1850,6 +1850,8 @@ impl X86_64CodeGen {
         self.handle_call_return_value(insn, types);
     }
 
+    /// Emit a select (ternary) instruction using CMOVcc
+    /// This is used for pure ternary expressions: cond ? a : b
     fn emit_select(&mut self, insn: &Instruction) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
@@ -1867,11 +1869,15 @@ impl X86_64CodeGen {
             Loc::Reg(r) => *r,
             _ => Reg::R10, // Use scratch register R10
         };
+
+        // Move else value into destination first (default if condition is false)
         self.emit_move(else_val, dst_reg, size);
+
+        // Test condition
         let cond_loc = self.get_location(cond);
         match &cond_loc {
             Loc::Reg(r) => {
-                // LIR: test register with itself
+                // Test register with itself
                 self.push_lir(X86Inst::Test {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(*r),
@@ -1879,6 +1885,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Imm(v) => {
+                // Constant condition - just use appropriate value
                 if *v != 0 {
                     self.emit_move(then_val, dst_reg, size);
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
@@ -1886,14 +1893,15 @@ impl X86_64CodeGen {
                     }
                     return;
                 }
+                // else_val already in dst_reg
                 if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
                     self.emit_move_to_loc(dst_reg, &dst_loc, size);
                 }
                 return;
             }
             _ => {
+                // Load condition to scratch register and test
                 self.emit_move(cond, Reg::R11, 64);
-                // LIR: test R11 with itself
                 self.push_lir(X86Inst::Test {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::R11),
@@ -1901,6 +1909,8 @@ impl X86_64CodeGen {
                 });
             }
         }
+
+        // Conditional move: if condition is non-zero (NE), use then_val
         // Use R11 for then_val when dst_reg is R10 to avoid clobbering else value
         let then_reg = if dst_reg == Reg::R10 {
             Reg::R11
@@ -1908,13 +1918,14 @@ impl X86_64CodeGen {
             Reg::R10
         };
         self.emit_move(then_val, then_reg, size);
-        // LIR: conditional move if not equal (non-zero)
         self.push_lir(X86Inst::CMov {
             cc: CondCode::Ne,
             size: op_size,
             src: GpOperand::Reg(then_reg),
             dst: dst_reg,
         });
+
+        // Move to final destination if needed
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }

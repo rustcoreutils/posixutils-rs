@@ -2512,8 +2512,8 @@ impl<'a> Parser<'a> {
 
                             self.expect_special(b',')?;
 
-                            // Parse member-designator: field, .field, [index], or chains
-                            // First component is a field name (no leading dot required)
+                            // Parse member-designator starting with field name (no dot prefix for first field)
+                            // Subsequent components use .field or [index] syntax
                             let mut path = Vec::new();
 
                             // Expect identifier for first member
@@ -2530,9 +2530,16 @@ impl<'a> Parser<'a> {
                                     self.advance();
                                     // Parse constant expression for index
                                     let index_expr = self.parse_conditional_expr()?;
+                                    let index_pos = index_expr.pos;
                                     self.expect_special(b']')?;
-                                    // Evaluate as constant
-                                    let index_val = self.eval_const_expr(&index_expr).unwrap_or(0);
+                                    // Evaluate as constant - offsetof requires compile-time constant
+                                    let index_val =
+                                        self.eval_const_expr(&index_expr).ok_or_else(|| {
+                                            ParseError::new(
+                                            "array index in offsetof must be a constant expression",
+                                            index_pos,
+                                        )
+                                        })?;
                                     path.push(OffsetOfPath::Index(index_val));
                                 } else {
                                     break;
@@ -3205,12 +3212,8 @@ impl Parser<'_> {
     /// Blocks create their own scope for local declarations. This enters a
     /// new scope, parses the block, binds any declarations, then leaves
     /// the scope.
-    fn parse_block_stmt(&mut self) -> ParseResult<Stmt> {
-        self.expect_special(b'{')?;
-
-        // Enter block scope
-        self.symbols.enter_scope();
-
+    /// Parse block items (declarations and statements) until closing brace
+    fn parse_block_items(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
             if self.is_declaration_start() {
@@ -3221,6 +3224,16 @@ impl Parser<'_> {
                 items.push(BlockItem::Statement(stmt));
             }
         }
+        Ok(items)
+    }
+
+    fn parse_block_stmt(&mut self) -> ParseResult<Stmt> {
+        self.expect_special(b'{')?;
+
+        // Enter block scope
+        self.symbols.enter_scope();
+
+        let items = self.parse_block_items()?;
 
         // Leave block scope
         self.symbols.leave_scope();
@@ -3235,18 +3248,7 @@ impl Parser<'_> {
     /// by the function parsing code (to include parameters in scope).
     fn parse_block_stmt_no_scope(&mut self) -> ParseResult<Stmt> {
         self.expect_special(b'{')?;
-
-        let mut items = Vec::new();
-        while !self.is_special(b'}') && !self.is_eof() {
-            if self.is_declaration_start() {
-                let decl = self.parse_declaration_and_bind()?;
-                items.push(BlockItem::Declaration(decl));
-            } else {
-                let stmt = self.parse_statement()?;
-                items.push(BlockItem::Statement(stmt));
-            }
-        }
-
+        let items = self.parse_block_items()?;
         self.expect_special(b'}')?;
         Ok(Stmt::Block(items))
     }
@@ -3260,16 +3262,7 @@ impl Parser<'_> {
         // Enter block scope for the statement expression
         self.symbols.enter_scope();
 
-        let mut items = Vec::new();
-        while !self.is_special(b'}') && !self.is_eof() {
-            if self.is_declaration_start() {
-                let decl = self.parse_declaration_and_bind()?;
-                items.push(BlockItem::Declaration(decl));
-            } else {
-                let stmt = self.parse_statement()?;
-                items.push(BlockItem::Statement(stmt));
-            }
-        }
+        let mut items = self.parse_block_items()?;
 
         self.expect_special(b'}')?;
         self.expect_special(b')')?;

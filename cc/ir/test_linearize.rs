@@ -327,8 +327,8 @@ fn test_simple_array_element_store() {
 #[test]
 fn test_nested_if_cfg_linking() {
     // Test: if (outer) { if (inner) { x = 1; } else { x = 2; } } else { x = 3; }
-    // After nested if-else, current_bb points to inner merge block, not outer then_bb.
-    // The fix ensures the inner merge block is correctly linked to outer merge block.
+    // Verifies that after a nested if-else in the then branch, the inner merge block
+    // is correctly linked to the outer merge block in the resulting control-flow graph.
     let mut strings = StringTable::new();
     let types = TypeTable::new(64);
     let test_id = strings.intern("test");

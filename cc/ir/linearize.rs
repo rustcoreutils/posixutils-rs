@@ -470,6 +470,20 @@ impl<'a> Linearizer<'a> {
         false
     }
 
+    /// Link current block to merge block if not terminated.
+    /// Used after linearizing then/else branches to connect to merge block.
+    fn link_to_merge_if_needed(&mut self, merge_bb: BasicBlockId) {
+        if self.is_terminated() {
+            return;
+        }
+        if let Some(current) = self.current_bb {
+            // If the block isn't terminated, it needs a branch to the merge block.
+            // Any unreachable blocks will be cleaned up by dead code elimination.
+            self.emit(Instruction::br(merge_bb));
+            self.link_bb(current, merge_bb);
+        }
+    }
+
     /// Link two basic blocks (parent -> child)
     fn link_bb(&mut self, from: BasicBlockId, to: BasicBlockId) {
         let func = self.current_func.as_mut().unwrap();
@@ -1747,50 +1761,13 @@ impl<'a> Linearizer<'a> {
         // Then block
         self.switch_bb(then_bb);
         self.linearize_stmt(then_stmt);
-        if !self.is_terminated() {
-            // After linearize_stmt, current_bb may be different from then_bb
-            // (e.g., if then_stmt contains nested control flow). Link the
-            // CURRENT block to merge_bb, but only if it's reachable.
-            if let Some(current) = self.current_bb {
-                // A block is reachable if it's the original block we switched to
-                // (which has an incoming edge from the condition), or if it has
-                // any parents from previous links.
-                let is_reachable = current == then_bb
-                    || self
-                        .current_func
-                        .as_ref()
-                        .and_then(|f| f.get_block(current))
-                        .map(|bb| !bb.parents.is_empty())
-                        .unwrap_or(false);
-                if is_reachable {
-                    self.emit(Instruction::br(merge_bb));
-                    self.link_bb(current, merge_bb);
-                }
-            }
-        }
+        self.link_to_merge_if_needed(merge_bb);
 
         // Else block
         if let Some(else_s) = else_stmt {
             self.switch_bb(else_bb);
             self.linearize_stmt(else_s);
-            if !self.is_terminated() {
-                // After linearize_stmt, current_bb may be different from else_bb
-                // (e.g., if else_stmt is a nested if-else chain). Link the
-                // CURRENT block to merge_bb, but only if it's reachable.
-                if let Some(current) = self.current_bb {
-                    let is_reachable = current == else_bb
-                        || self
-                            .current_func
-                            .as_ref()
-                            .and_then(|f| f.get_block(current))
-                            .map(|bb| !bb.parents.is_empty())
-                            .unwrap_or(false);
-                    if is_reachable {
-                        self.emit(Instruction::br(merge_bb));
-                        self.link_bb(current, merge_bb);
-                    }
-                }
-            }
+            self.link_to_merge_if_needed(merge_bb);
         }
 
         // Merge block
@@ -4472,20 +4449,22 @@ impl<'a> Linearizer<'a> {
                         OffsetOfPath::Field(field_id) => {
                             // Look up the field in the current struct type
                             let struct_type = self.resolve_struct_type(current_type);
-                            if let Some(member_info) =
-                                self.types.find_member(struct_type, *field_id)
-                            {
-                                offset += member_info.offset as u64;
-                                current_type = member_info.typ;
-                            }
+                            let member_info = self
+                                .types
+                                .find_member(struct_type, *field_id)
+                                .expect("offsetof: field not found in struct type");
+                            offset += member_info.offset as u64;
+                            current_type = member_info.typ;
                         }
                         OffsetOfPath::Index(index) => {
                             // Array indexing: offset += index * sizeof(element)
-                            if let Some(elem_type) = self.types.base_type(current_type) {
-                                let elem_size = self.types.size_bytes(elem_type);
-                                offset += (*index as u64) * (elem_size as u64);
-                                current_type = elem_type;
-                            }
+                            let elem_type = self
+                                .types
+                                .base_type(current_type)
+                                .expect("offsetof: array index on non-array type");
+                            let elem_size = self.types.size_bytes(elem_type);
+                            offset += (*index as u64) * (elem_size as u64);
+                            current_type = elem_type;
                         }
                     }
                 }

@@ -12,7 +12,7 @@
 
 use super::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
-    ExternalDecl, ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt,
+    ExternalDecl, ForInit, FunctionDef, InitDeclarator, InitElement, OffsetOfPath, Parameter, Stmt,
     TranslationUnit, UnaryOp,
 };
 use crate::diag;
@@ -2501,6 +2501,52 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        "__builtin_offsetof" | "offsetof" => {
+                            // __builtin_offsetof(type, member-designator)
+                            // Returns the byte offset of a member within a struct/union
+                            // member-designator can be .field or [index] chains
+                            self.expect_special(b'(')?;
+
+                            // Parse the type name
+                            let type_id = self.parse_type_name()?;
+
+                            self.expect_special(b',')?;
+
+                            // Parse member-designator: field, .field, [index], or chains
+                            // First component is a field name (no leading dot required)
+                            let mut path = Vec::new();
+
+                            // Expect identifier for first member
+                            let first_field = self.expect_identifier()?;
+                            path.push(OffsetOfPath::Field(first_field));
+
+                            // Parse subsequent designators
+                            loop {
+                                if self.is_special(b'.') {
+                                    self.advance();
+                                    let field = self.expect_identifier()?;
+                                    path.push(OffsetOfPath::Field(field));
+                                } else if self.is_special(b'[') {
+                                    self.advance();
+                                    // Parse constant expression for index
+                                    let index_expr = self.parse_conditional_expr()?;
+                                    self.expect_special(b']')?;
+                                    // Evaluate as constant
+                                    let index_val = self.eval_const_expr(&index_expr).unwrap_or(0);
+                                    path.push(OffsetOfPath::Index(index_val));
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            self.expect_special(b')')?;
+
+                            return Ok(Self::typed_expr(
+                                ExprKind::OffsetOf { type_id, path },
+                                self.types.ulong_id, // size_t is typically unsigned long
+                                token_pos,
+                            ));
+                        }
                         _ => {}
                     }
 
@@ -2580,6 +2626,12 @@ impl<'a> Parser<'a> {
                     // Parenthesized expression or cast
                     let paren_pos = self.current_pos();
                     self.advance();
+
+                    // Check for statement expression: ({ ... })
+                    // GNU extension allowing compound statements as expressions
+                    if self.is_special(b'{') {
+                        return self.parse_stmt_expr(paren_pos);
+                    }
 
                     // Try to detect cast (type) or compound literal (type){...}
                     if let Some(typ) = self.try_parse_type_name() {
@@ -3065,7 +3117,8 @@ impl Parser<'_> {
             None
         } else if self.is_declaration_start() {
             // C99: declaration in for-init, bind to for-scope
-            let decl = self.parse_declaration_and_bind()?;
+            // Note: storage class specifiers (static, extern) are forbidden here
+            let decl = self.parse_for_init_declaration_and_bind()?;
             // Declaration already consumed the semicolon
             Some(ForInit::Declaration(decl))
         } else {
@@ -3198,6 +3251,70 @@ impl Parser<'_> {
         Ok(Stmt::Block(items))
     }
 
+    /// Parse a statement expression: ({ stmt; stmt; expr; })
+    /// This is a GNU extension that allows a compound statement to be used as an expression.
+    /// The value is the result of the last expression in the block.
+    fn parse_stmt_expr(&mut self, paren_pos: Position) -> ParseResult<Expr> {
+        self.expect_special(b'{')?;
+
+        // Enter block scope for the statement expression
+        self.symbols.enter_scope();
+
+        let mut items = Vec::new();
+        while !self.is_special(b'}') && !self.is_eof() {
+            if self.is_declaration_start() {
+                let decl = self.parse_declaration_and_bind()?;
+                items.push(BlockItem::Declaration(decl));
+            } else {
+                let stmt = self.parse_statement()?;
+                items.push(BlockItem::Statement(stmt));
+            }
+        }
+
+        self.expect_special(b'}')?;
+        self.expect_special(b')')?;
+
+        // Leave block scope
+        self.symbols.leave_scope();
+
+        // The result of a statement expression is the last expression statement.
+        // If there are no statements or the last isn't an expression, result is void.
+        let (stmts, result, result_type) = if items.is_empty() {
+            (
+                Vec::new(),
+                Expr::new(ExprKind::IntLit(0), paren_pos),
+                self.types.void_id,
+            )
+        } else {
+            // Check if the last item is an expression statement
+            let last = items.pop().unwrap();
+            match last {
+                BlockItem::Statement(Stmt::Expr(expr)) => {
+                    let typ = expr.typ.unwrap_or(self.types.int_id);
+                    (items, expr, typ)
+                }
+                _ => {
+                    // Last item is not an expression, push it back
+                    items.push(last);
+                    (
+                        items,
+                        Expr::new(ExprKind::IntLit(0), paren_pos),
+                        self.types.void_id,
+                    )
+                }
+            }
+        };
+
+        Ok(Self::typed_expr(
+            ExprKind::StmtExpr {
+                stmts,
+                result: Box::new(result),
+            },
+            result_type,
+            paren_pos,
+        ))
+    }
+
     /// Check if current position starts a declaration
     fn is_declaration_start(&self) -> bool {
         if self.peek() != TokenType::Ident {
@@ -3296,9 +3413,45 @@ impl Parser<'_> {
     ///
     /// Binds each declared variable to the symbol table immediately during
     /// parsing, so the symbol is available for subsequent references.
+    ///
+    /// If `forbid_storage_class` is true, emits an error if the declaration
+    /// contains storage class specifiers (static, extern). This is used for
+    /// for-loop init declarations per C99 6.8.5.3.
     fn parse_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
+        self.parse_declaration_and_bind_impl(false)
+    }
+
+    /// Parse a for-init declaration and bind variables to symbol table
+    ///
+    /// Same as `parse_declaration_and_bind()` but rejects storage class specifiers.
+    fn parse_for_init_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
+        self.parse_declaration_and_bind_impl(true)
+    }
+
+    /// Implementation of declaration parsing with optional storage class check
+    fn parse_declaration_and_bind_impl(
+        &mut self,
+        forbid_storage_class: bool,
+    ) -> ParseResult<Declaration> {
         // Parse type specifiers
         let base_type = self.parse_type_specifier()?;
+
+        // Check for forbidden storage class specifiers in for-init context
+        if forbid_storage_class {
+            if base_type.modifiers.contains(TypeModifiers::STATIC) {
+                return Err(ParseError::new(
+                    "declaration of static variable in for loop initial declaration",
+                    self.current_pos(),
+                ));
+            }
+            if base_type.modifiers.contains(TypeModifiers::EXTERN) {
+                return Err(ParseError::new(
+                    "declaration of extern variable in for loop initial declaration",
+                    self.current_pos(),
+                ));
+            }
+        }
+
         // Check modifiers from the specifier before interning (storage class is not part of type)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
         // Intern the base type (without storage class specifiers for the actual type)
@@ -3614,6 +3767,14 @@ impl Parser<'_> {
                 }
             }
 
+            // Empty enum definition is a GNU extension, warn with -Wpedantic
+            if constants.is_empty() {
+                diag::warning(
+                    self.current_pos(),
+                    "empty enum definition is a GNU extension",
+                );
+            }
+
             self.expect_special(b'}')?;
 
             let composite = CompositeType {
@@ -3755,8 +3916,8 @@ impl Parser<'_> {
                     let bit_width = if self.is_special(b':') {
                         self.advance(); // consume ':'
                         let width = self.parse_bitfield_width()?;
-                        // Validate bitfield type and width
-                        self.validate_bitfield(typ, width)?;
+                        // Validate bitfield type and width (this is a named bitfield)
+                        self.validate_bitfield(typ, width, true)?;
                         Some(width)
                     } else {
                         None
@@ -4324,6 +4485,14 @@ impl Parser<'_> {
         loop {
             // Check for ellipsis
             if self.is_special_token(SpecialToken::Ellipsis) {
+                // ISO C requires at least one named parameter before '...'
+                // GCC/Clang emit a warning with -Wstrict-prototypes
+                if params.is_empty() {
+                    diag::warning(
+                        self.current_pos(),
+                        "ISO C requires a named argument before '...'",
+                    );
+                }
                 self.advance();
                 variadic = true;
                 break;
@@ -5005,7 +5174,10 @@ impl Parser<'_> {
     }
 
     /// Validate a bitfield declaration
-    fn validate_bitfield(&self, typ_id: TypeId, width: u32) -> ParseResult<()> {
+    ///
+    /// `is_named` indicates if this bitfield has a name (unnamed bitfields are
+    /// allowed to have zero width for alignment purposes).
+    fn validate_bitfield(&self, typ_id: TypeId, width: u32, is_named: bool) -> ParseResult<()> {
         // Check allowed types: _Bool, int, unsigned int (and their signed/unsigned variants)
         let kind = self.types.kind(typ_id);
         let valid_type = matches!(
@@ -5020,6 +5192,15 @@ impl Parser<'_> {
             ));
         }
 
+        // C99: Zero-width bitfield with a name is an error
+        // (zero-width unnamed bitfields are allowed for alignment)
+        if width == 0 && is_named {
+            return Err(ParseError::new(
+                "named bit-field has zero width",
+                self.current_pos(),
+            ));
+        }
+
         // Check that width doesn't exceed type size
         let max_width = self.types.size_bits(typ_id);
         if width > max_width {
@@ -5027,6 +5208,15 @@ impl Parser<'_> {
                 format!("bitfield width {} exceeds type size {}", width, max_width),
                 self.current_pos(),
             ));
+        }
+
+        // Warning: one-bit signed bitfield has dubious values
+        // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations)
+        if width == 1 && !self.types.is_unsigned(typ_id) && kind != TypeKind::Bool {
+            diag::warning(
+                self.current_pos(),
+                "single-bit signed bit-field has dubious values",
+            );
         }
 
         Ok(())
@@ -6377,6 +6567,30 @@ mod tests {
     }
 
     #[test]
+    fn test_for_stmt_static_error() {
+        // C99: storage class specifiers are not allowed in for-loop init declarations
+        let result = parse_stmt("for (static int i = 0; i < 10; i++) x++;");
+        assert!(result.is_err(), "static in for-init should be an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("static"),
+            "error message should mention static"
+        );
+    }
+
+    #[test]
+    fn test_for_stmt_extern_error() {
+        // C99: storage class specifiers are not allowed in for-loop init declarations
+        let result = parse_stmt("for (extern int i; i < 10; i++) x++;");
+        assert!(result.is_err(), "extern in for-init should be an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("extern"),
+            "error message should mention extern"
+        );
+    }
+
+    #[test]
     fn test_return_void() {
         let (stmt, _strings) = parse_stmt("return;").unwrap();
         match stmt {
@@ -7502,6 +7716,29 @@ mod tests {
     }
 
     #[test]
+    fn test_variadic_without_named_param_warning() {
+        // Variadic function without named parameter - ISO C violation
+        // This should parse successfully (warning is emitted, but parsing continues)
+        // The warning can be observed in stderr during the test
+        let (tu, types, strings) = parse_tu("void varargs_only(...);").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                check_name(&strings, decl.declarators[0].name, "varargs_only");
+                // Function should be marked as variadic
+                assert!(types.is_variadic(decl.declarators[0].typ));
+                // No named parameters
+                let params = types.params(decl.declarators[0].typ);
+                assert!(
+                    params.map_or(true, |p| p.is_empty()),
+                    "should have no named params"
+                );
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
     fn test_multiple_function_decls_mixed() {
         // Mix of variadic and non-variadic declarations
         let (tu, types, strings) = parse_tu(
@@ -7978,6 +8215,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_bitfield_zero_width_named_error() {
+        // Zero-width bitfield with a name is an error
+        let result = parse_tu("struct S { int x : 0; } s;");
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("zero width"),
+                    "error message should mention zero width, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("named zero-width bitfield should be an error"),
+        }
+    }
+
+    #[test]
+    fn test_bitfield_too_wide_error() {
+        // Bitfield width exceeding type size is an error
+        let result = parse_tu("struct S { int x : 64; } s;");
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("exceeds"),
+                    "error message should mention exceeds, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("bitfield width exceeding type should be an error"),
+        }
+    }
+
+    // ========================================================================
+    // Enum tests
+    // ========================================================================
+
+    #[test]
+    fn test_empty_enum_warning() {
+        // Empty enum is a GNU extension - should parse successfully with a warning
+        // The warning is emitted to stderr during the test
+        let (tu, types, _strings) = parse_tu("enum E {};").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                // This is a type declaration (enum only, no variable)
+                // The enum should have no constants
+                let typ = decl.declarators.first().map(|d| d.typ);
+                if let Some(typ_id) = typ {
+                    if let Some(composite) = types.composite(typ_id) {
+                        assert!(composite.enum_constants.is_empty());
+                    }
+                }
+            }
+            _ => {} // May also be valid without declarators
+        }
+    }
+
     // ========================================================================
     // Typedef with trailing qualifiers tests (C99)
     // Tests for "typedef_name const" and "typedef_name volatile" syntax
@@ -8159,5 +8455,390 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tu.items.len(), 3);
+    }
+
+    // ========================================================================
+    // Designated Initializer Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn test_nested_field_designator() {
+        // Test .x.y = 1 nested field designator
+        let code =
+            "struct Inner { int y; }; struct S { struct Inner x; }; struct S s = {.x.y = 1};";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 3);
+    }
+
+    #[test]
+    fn test_mixed_array_field_designator() {
+        // Test .arr[0].field = 2 mixed designator
+        let code = "struct T { int field; }; struct S { struct T arr[10]; }; struct S s = {.arr[0].field = 2};";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 3);
+    }
+
+    #[test]
+    fn test_out_of_order_array_designator() {
+        // Test [5] = 1, [0] = 2 out-of-order designators
+        let code = "int arr[] = {[5] = 1, [0] = 2};";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_repeated_designator() {
+        // Same index twice - last wins per C99
+        let code = "int arr[] = {[0] = 1, [0] = 2};";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    // ========================================================================
+    // Complex Declarator Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn test_function_returning_ptr_to_array() {
+        // int (*foo())[10] - function returning pointer to array
+        let code = "int (*foo())[10];";
+        let (tu, types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                // Should be a function type
+                assert_eq!(types.kind(typ), TypeKind::Function);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_array_of_function_pointers() {
+        // int (*arr[5])(int) - array of 5 function pointers
+        let code = "int (*arr[5])(int);";
+        let (tu, types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                // Should be an array type
+                assert_eq!(types.kind(typ), TypeKind::Array);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_complex_nested_declarator() {
+        // int *(*(*fp)(int))[3] - ptr to func returning ptr to array of 3 int*
+        let code = "int *(*(*fp)(int))[3];";
+        let (tu, types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                let typ = decl.declarators[0].typ;
+                // Should be a pointer type
+                assert_eq!(types.kind(typ), TypeKind::Pointer);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    // ========================================================================
+    // Array Parameter Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn test_static_array_parameter() {
+        // int a[static 10] - minimum size guarantee
+        let code = "void foo(int a[static 10]);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_qualified_array_parameter() {
+        // int a[const 10] - qualifier in array size
+        let code = "void foo(int a[const 10]);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_vla_star_parameter() {
+        // int a[*] - unspecified VLA size in prototype
+        let code = "void foo(int n, int a[*]);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    // ========================================================================
+    // Type Parsing Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn test_multiple_type_qualifiers() {
+        let code = "const volatile int x;";
+        let (tu, types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                let typ = decl.declarators[0].typ;
+                assert!(types.modifiers(typ).contains(TypeModifiers::CONST));
+                assert!(types.modifiers(typ).contains(TypeModifiers::VOLATILE));
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_restrict_pointer() {
+        let code = "int * restrict p;";
+        let (tu, types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                let typ = decl.declarators[0].typ;
+                assert_eq!(types.kind(typ), TypeKind::Pointer);
+                assert!(types.modifiers(typ).contains(TypeModifiers::RESTRICT));
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_inline_function() {
+        let code = "inline int foo(void) { return 0; }";
+        let (tu, types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                // The INLINE modifier is stored on the return type
+                assert!(types
+                    .modifiers(func.return_type)
+                    .contains(TypeModifiers::INLINE));
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    // ========================================================================
+    // Escape Sequence Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn test_octal_escape_boundary() {
+        // \377 is max valid octal for 8-bit char
+        let (expr, _types, _strings) = parse_expr("'\\377'").unwrap();
+        match expr.kind {
+            ExprKind::CharLit(ch) => {
+                assert_eq!(ch as u32, 0o377); // 255 in decimal
+            }
+            _ => panic!("Expected character constant, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_hex_escape_single_digit() {
+        let (expr, _types, _strings) = parse_expr("'\\x0'").unwrap();
+        match expr.kind {
+            ExprKind::CharLit(ch) => {
+                assert_eq!(ch as u32, 0);
+            }
+            _ => panic!("Expected character constant, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_hex_escape_max() {
+        let (expr, _types, _strings) = parse_expr("'\\xff'").unwrap();
+        match expr.kind {
+            ExprKind::CharLit(ch) => {
+                assert_eq!(ch as u32, 0xff);
+            }
+            _ => panic!("Expected character constant, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_escape_sequences_comprehensive() {
+        // Test all standard escape sequences in a string
+        let (expr, _types, _strings) = parse_expr(r#""\a\b\f\n\r\t\v\\\'\"" "#).unwrap();
+        match expr.kind {
+            ExprKind::StringLit(_) => {
+                // Successfully parsed string with all escape sequences
+            }
+            _ => panic!("Expected string constant"),
+        }
+    }
+
+    // ========================================================================
+    // Expression Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn test_comma_expression_in_parens() {
+        // Comma expression inside parentheses
+        let (expr, _types, _strings) = parse_expr("(1, 2, 3)").unwrap();
+        match &expr.kind {
+            ExprKind::Comma(exprs) => {
+                assert_eq!(exprs.len(), 3);
+            }
+            _ => panic!("Expected comma expression"),
+        }
+    }
+
+    #[test]
+    fn test_ternary_expression_nesting() {
+        // Nested ternary expressions
+        let (expr, _types, _strings) = parse_expr("a ? b ? c : d : e").unwrap();
+        match &expr.kind {
+            ExprKind::Conditional { then_expr, .. } => {
+                // The middle expression should also be ternary
+                match &then_expr.kind {
+                    ExprKind::Conditional { .. } => {}
+                    _ => panic!("Expected nested ternary"),
+                }
+            }
+            _ => panic!("Expected ternary expression"),
+        }
+    }
+
+    #[test]
+    fn test_cast_expression_chain() {
+        // Multiple cast expressions
+        let (expr, types, _strings) = parse_expr("(int)(char)(short)x").unwrap();
+        match &expr.kind {
+            ExprKind::Cast {
+                cast_type,
+                expr: inner,
+            } => {
+                assert_eq!(types.kind(*cast_type), TypeKind::Int);
+                match &inner.kind {
+                    ExprKind::Cast {
+                        cast_type: typ2,
+                        expr: inner2,
+                    } => {
+                        assert_eq!(types.kind(*typ2), TypeKind::Char);
+                        match &inner2.kind {
+                            ExprKind::Cast {
+                                cast_type: typ3, ..
+                            } => {
+                                assert_eq!(types.kind(*typ3), TypeKind::Short);
+                            }
+                            _ => panic!("Expected cast expression"),
+                        }
+                    }
+                    _ => panic!("Expected cast expression"),
+                }
+            }
+            _ => panic!("Expected cast expression"),
+        }
+    }
+
+    #[test]
+    fn test_sizeof_expression_vs_type() {
+        // sizeof applied to expression
+        let (expr1, _types, _strings) = parse_expr("sizeof x").unwrap();
+        match &expr1.kind {
+            ExprKind::SizeofExpr(_) => {}
+            _ => panic!("Expected sizeof expression"),
+        }
+
+        // sizeof applied to type in parentheses
+        let (expr2, _types, _strings) = parse_expr("sizeof(int)").unwrap();
+        match &expr2.kind {
+            ExprKind::SizeofType(_) => {}
+            _ => panic!("Expected sizeof type"),
+        }
+    }
+
+    #[test]
+    fn test_compound_literal_in_expression() {
+        // Compound literal used in expression
+        let (expr, _types, _strings) = parse_expr("(struct { int x; }){.x = 5}.x").unwrap();
+        match &expr.kind {
+            ExprKind::Member { .. } => {}
+            _ => panic!("Expected member access on compound literal"),
+        }
+    }
+
+    // ========================================================================
+    // __builtin_offsetof tests
+    // ========================================================================
+
+    #[test]
+    fn test_offsetof_basic() {
+        // Simple __builtin_offsetof(type, member)
+        let code = "struct S { int a; int b; }; unsigned long x = __builtin_offsetof(struct S, b);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 2);
+    }
+
+    #[test]
+    fn test_offsetof_nested_member() {
+        // __builtin_offsetof with nested member path
+        let code = "struct Inner { int x; }; struct Outer { struct Inner i; }; \
+             unsigned long x = __builtin_offsetof(struct Outer, i.x);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 3);
+    }
+
+    #[test]
+    fn test_offsetof_array_index() {
+        // __builtin_offsetof with array index
+        let code =
+            "struct S { int arr[10]; }; unsigned long x = __builtin_offsetof(struct S, arr[5]);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 2);
+    }
+
+    #[test]
+    fn test_offsetof_macro_style() {
+        // offsetof (macro-compatible spelling)
+        let code = "struct S { int a; int b; }; unsigned long x = offsetof(struct S, b);";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 2);
+    }
+
+    // ========================================================================
+    // Statement expression tests (GNU extension)
+    // ========================================================================
+
+    #[test]
+    fn test_stmt_expr_basic() {
+        // Basic statement expression
+        let code = "int x = ({ int a = 5; a + 3; });";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_stmt_expr_with_declarations() {
+        // Statement expression with multiple declarations
+        let code = "int result = ({ int a = 1; int b = 2; a + b; });";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_stmt_expr_nested() {
+        // Nested statement expressions
+        let code = "int x = ({ int a = ({ int inner = 10; inner * 2; }); a + 5; });";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_stmt_expr_in_function() {
+        // Statement expression inside a function
+        let code = "int foo(void) { return ({ int x = 1; x + 1; }); }";
+        let (tu, _types, _strings) = parse_tu(code).unwrap();
+        assert_eq!(tu.items.len(), 1);
     }
 }

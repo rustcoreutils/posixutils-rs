@@ -53,6 +53,15 @@ Builtin functions supported by pcc. GCC/Clang compatible.
 |---------|-------------|
 | `__builtin_unreachable()` | Mark code path as unreachable (traps if reached) |
 
+## Structure Layout
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_offsetof(type, member)` | Byte offset of member within struct/union |
+| `offsetof(type, member)` | Alias for `__builtin_offsetof` |
+
+The member can be a chain like `field.subfield` or `arr[index].field`.
+
 ## Not Yet Implemented
 
 | Builtin | Description |

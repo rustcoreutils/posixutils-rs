@@ -266,6 +266,19 @@ pub enum ExprKind {
     },
 
     // =========================================================================
+    // GNU Statement Expressions
+    // =========================================================================
+    /// Statement expression: ({ stmt; stmt; expr; })
+    /// GNU extension that allows a compound statement to be used as an expression.
+    /// The value is the result of the last expression statement.
+    StmtExpr {
+        /// The statements in the block (all but the last expression)
+        stmts: Vec<BlockItem>,
+        /// The result expression (value of the statement expression)
+        result: Box<Expr>,
+    },
+
+    // =========================================================================
     // Variadic function support (va_* builtins)
     // =========================================================================
     /// __builtin_va_start(ap, last_param)
@@ -441,6 +454,33 @@ pub enum ExprKind {
         /// The value to return from setjmp (1 if 0 is passed)
         val: Box<Expr>,
     },
+
+    // =========================================================================
+    // offsetof (structure member offset)
+    // =========================================================================
+    /// __builtin_offsetof(type, member-designator)
+    /// Returns the offset in bytes of a member within a structure.
+    /// The member-designator can be a chain like .x.y or .arr[0].field
+    OffsetOf {
+        /// The struct/union type
+        type_id: TypeId,
+        /// The member path (.field or [index] components)
+        path: Vec<OffsetOfPath>,
+    },
+}
+
+// ============================================================================
+// OffsetOf Support (__builtin_offsetof)
+// ============================================================================
+
+/// A path element in __builtin_offsetof(type, path)
+/// Supports member.path[index].field style paths
+#[derive(Debug, Clone)]
+pub enum OffsetOfPath {
+    /// Field access: .field_name
+    Field(StringId),
+    /// Array index: [constant_expr] - evaluated at parse time
+    Index(i64),
 }
 
 // ============================================================================

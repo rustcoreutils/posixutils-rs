@@ -2201,20 +2201,30 @@ impl<'a> Preprocessor<'a> {
                         | "__builtin_bswap16"
                         | "__builtin_bswap32"
                         | "__builtin_bswap64"
+                        | "__builtin_ctz"
+                        | "__builtin_ctzl"
+                        | "__builtin_ctzll"
+                        | "__builtin_clz"
+                        | "__builtin_clzl"
+                        | "__builtin_clzll"
+                        | "__builtin_popcount"
+                        | "__builtin_popcountl"
+                        | "__builtin_popcountll"
                         | "__builtin_alloca"
                         | "__builtin_constant_p"
                         | "__builtin_types_compatible_p"
+                        | "__builtin_unreachable"
+                        | "__builtin_offsetof"
+                        | "offsetof"
                 )
             }
             BuiltinMacro::HasFeature => {
-                // We don't currently implement any C11/C23 features
-                let _ = name;
-                false
+                // Return true for GNU extensions we implement
+                matches!(name.as_str(), "statement_expressions")
             }
             BuiltinMacro::HasExtension => {
-                // We don't currently implement any extensions
-                let _ = name;
-                false
+                // Return true for GNU extensions we implement
+                matches!(name.as_str(), "statement_expressions")
             }
             _ => false,
         }
@@ -2682,6 +2692,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 | "__builtin_constant_p"
                 | "__builtin_types_compatible_p"
                 | "__builtin_unreachable"
+                | "__builtin_offsetof"
+                | "offsetof"
         );
 
         if supported {
@@ -2693,14 +2705,22 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
     /// Evaluate __has_feature(X) and __has_extension(X)
     fn eval_has_feature(&mut self) -> i64 {
-        let _name = match self.get_has_arg() {
+        let name = match self.get_has_arg() {
             Some(n) => n,
             None => return 0,
         };
 
-        // We don't currently implement any C11/C23 features
-        // Return 0 for all feature queries
-        0
+        // Return 1 for GNU extensions we implement
+        let supported = matches!(
+            name.as_str(),
+            "statement_expressions" // GNU ({ }) extension
+        );
+
+        if supported {
+            1
+        } else {
+            0
+        }
     }
 
     fn parse_number(&self, s: &str) -> i64 {

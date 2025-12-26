@@ -18,7 +18,7 @@ use super::{
 use crate::diag::{error, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
-    ExternalDecl, ForInit, FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
+    ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::SymbolTable;
@@ -4459,6 +4459,52 @@ impl<'a> Linearizer<'a> {
                 insn.typ = Some(self.types.void_id);
                 self.emit(insn);
                 result
+            }
+
+            ExprKind::OffsetOf { type_id, path } => {
+                // __builtin_offsetof(type, member-designator)
+                // Compute the byte offset of the member within the struct
+                let mut offset: u64 = 0;
+                let mut current_type = *type_id;
+
+                for element in path {
+                    match element {
+                        OffsetOfPath::Field(field_id) => {
+                            // Look up the field in the current struct type
+                            let struct_type = self.resolve_struct_type(current_type);
+                            if let Some(member_info) =
+                                self.types.find_member(struct_type, *field_id)
+                            {
+                                offset += member_info.offset as u64;
+                                current_type = member_info.typ;
+                            }
+                        }
+                        OffsetOfPath::Index(index) => {
+                            // Array indexing: offset += index * sizeof(element)
+                            if let Some(elem_type) = self.types.base_type(current_type) {
+                                let elem_size = self.types.size_bytes(elem_type);
+                                offset += (*index as u64) * (elem_size as u64);
+                                current_type = elem_type;
+                            }
+                        }
+                    }
+                }
+
+                // Return the offset as a constant
+                self.emit_const(offset as i64, self.types.ulong_id)
+            }
+
+            ExprKind::StmtExpr { stmts, result } => {
+                // GNU statement expression: ({ stmt; stmt; expr; })
+                // Linearize all the statements first
+                for item in stmts {
+                    match item {
+                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
+                        BlockItem::Statement(s) => self.linearize_stmt(s),
+                    }
+                }
+                // The result is the value of the final expression
+                self.linearize_expr(result)
             }
         }
     }

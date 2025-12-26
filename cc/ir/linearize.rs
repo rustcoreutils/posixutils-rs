@@ -1748,8 +1748,25 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(then_bb);
         self.linearize_stmt(then_stmt);
         if !self.is_terminated() {
-            self.emit(Instruction::br(merge_bb));
-            self.link_bb(then_bb, merge_bb);
+            // After linearize_stmt, current_bb may be different from then_bb
+            // (e.g., if then_stmt contains nested control flow). Link the
+            // CURRENT block to merge_bb, but only if it's reachable.
+            if let Some(current) = self.current_bb {
+                // A block is reachable if it's the original block we switched to
+                // (which has an incoming edge from the condition), or if it has
+                // any parents from previous links.
+                let is_reachable = current == then_bb
+                    || self
+                        .current_func
+                        .as_ref()
+                        .and_then(|f| f.get_block(current))
+                        .map(|bb| !bb.parents.is_empty())
+                        .unwrap_or(false);
+                if is_reachable {
+                    self.emit(Instruction::br(merge_bb));
+                    self.link_bb(current, merge_bb);
+                }
+            }
         }
 
         // Else block
@@ -1757,8 +1774,22 @@ impl<'a> Linearizer<'a> {
             self.switch_bb(else_bb);
             self.linearize_stmt(else_s);
             if !self.is_terminated() {
-                self.emit(Instruction::br(merge_bb));
-                self.link_bb(else_bb, merge_bb);
+                // After linearize_stmt, current_bb may be different from else_bb
+                // (e.g., if else_stmt is a nested if-else chain). Link the
+                // CURRENT block to merge_bb, but only if it's reachable.
+                if let Some(current) = self.current_bb {
+                    let is_reachable = current == else_bb
+                        || self
+                            .current_func
+                            .as_ref()
+                            .and_then(|f| f.get_block(current))
+                            .map(|bb| !bb.parents.is_empty())
+                            .unwrap_or(false);
+                    if is_reachable {
+                        self.emit(Instruction::br(merge_bb));
+                        self.link_bb(current, merge_bb);
+                    }
+                }
             }
         }
 

@@ -318,3 +318,108 @@ fn test_simple_array_element_store() {
         ir
     );
 }
+
+// ============================================================================
+// Nested if-else CFG edge linking regression test
+// Tests the fix for current_bb changing during nested control flow
+// ============================================================================
+
+#[test]
+fn test_nested_if_cfg_linking() {
+    // Test: if (outer) { if (inner) { x = 1; } else { x = 2; } } else { x = 3; }
+    // After nested if-else, current_bb points to inner merge block, not outer then_bb.
+    // The fix ensures the inner merge block is correctly linked to outer merge block.
+    let mut strings = StringTable::new();
+    let types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let outer_id = strings.intern("outer");
+    let inner_id = strings.intern("inner");
+    let x_id = strings.intern("x");
+    let int_type = types.int_id;
+
+    // Build: if (inner) { x = 1; } else { x = 2; }
+    let inner_then = Stmt::Expr(Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Expr::var_typed(x_id, int_type)),
+            value: Box::new(Expr::int(1, &types)),
+        },
+        int_type,
+    ));
+    let inner_else = Stmt::Expr(Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Expr::var_typed(x_id, int_type)),
+            value: Box::new(Expr::int(2, &types)),
+        },
+        int_type,
+    ));
+    let inner_if = Stmt::If {
+        cond: Expr::var_typed(inner_id, int_type),
+        then_stmt: Box::new(inner_then),
+        else_stmt: Some(Box::new(inner_else)),
+    };
+
+    // Build: if (outer) { <inner_if> } else { x = 3; }
+    let outer_else = Stmt::Expr(Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Expr::var_typed(x_id, int_type)),
+            value: Box::new(Expr::int(3, &types)),
+        },
+        int_type,
+    ));
+    let outer_if = Stmt::If {
+        cond: Expr::var_typed(outer_id, int_type),
+        then_stmt: Box::new(inner_if),
+        else_stmt: Some(Box::new(outer_else)),
+    };
+
+    // Function: void test(int outer, int inner, int x) { <outer_if> }
+    let func = FunctionDef {
+        return_type: types.void_id,
+        name: test_id,
+        params: vec![
+            Parameter {
+                name: Some(outer_id),
+                typ: int_type,
+            },
+            Parameter {
+                name: Some(inner_id),
+                typ: int_type,
+            },
+            Parameter {
+                name: Some(x_id),
+                typ: int_type,
+            },
+        ],
+        body: outer_if,
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let func = &module.functions[0];
+
+    // The function should have at least 7 blocks:
+    // entry, outer_then, outer_else, inner_then, inner_else, inner_merge, outer_merge
+    assert!(
+        func.blocks.len() >= 7,
+        "Nested if-else should produce at least 7 blocks, got {}: {:?}",
+        func.blocks.len(),
+        func.blocks.iter().map(|b| b.id).collect::<Vec<_>>()
+    );
+
+    // The outer merge block (last block) should have 2 parents:
+    // one from the inner merge block (via outer then path) and one from outer else.
+    // Without the fix, the outer merge would have incorrect parents.
+    let outer_merge = func.blocks.last().unwrap();
+    assert!(
+        outer_merge.parents.len() >= 2,
+        "Outer merge block should have at least 2 parents, got {}: {:?}",
+        outer_merge.parents.len(),
+        outer_merge.parents
+    );
+}

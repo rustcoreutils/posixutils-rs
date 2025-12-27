@@ -2779,13 +2779,67 @@ impl<'a> Parser<'a> {
             // Reinterpret bits as i64 (preserves bit pattern for unsigned values)
             let value = value_u64 as i64;
 
-            let typ = match (is_longlong, is_long, is_unsigned) {
-                (true, _, false) => self.types.longlong_id,
-                (true, _, true) => self.types.ulonglong_id,
-                (false, true, false) => self.types.long_id,
-                (false, true, true) => self.types.ulong_id,
-                (false, false, false) => self.types.int_id,
-                (false, false, true) => self.types.uint_id,
+            // Determine type according to C99 6.4.4.1:
+            // - Decimal constants: int, long int, long long int (signed only)
+            // - Hex/Octal constants: int, unsigned int, long int, unsigned long int,
+            //   long long int, unsigned long long int (both signed and unsigned)
+            // The type is the first in the list that can represent the value.
+            let is_octal = !is_hex && num_str.starts_with('0') && num_str.len() > 1;
+            let typ = if is_unsigned {
+                // Explicit U suffix
+                match (is_longlong, is_long) {
+                    (true, _) => self.types.ulonglong_id,
+                    (false, true) => self.types.ulong_id,
+                    (false, false) => self.types.uint_id,
+                }
+            } else if is_hex || is_octal {
+                // Hex/octal without U suffix - use first type that fits (C99 6.4.4.1)
+                match (is_longlong, is_long) {
+                    (true, _) => {
+                        // long long or unsigned long long
+                        if value_u64 <= i64::MAX as u64 {
+                            self.types.longlong_id
+                        } else {
+                            self.types.ulonglong_id
+                        }
+                    }
+                    (false, true) => {
+                        // long or unsigned long
+                        if value_u64 <= i64::MAX as u64 {
+                            self.types.long_id
+                        } else {
+                            self.types.ulong_id
+                        }
+                    }
+                    (false, false) => {
+                        // int, unsigned int, long, unsigned long, long long, unsigned long long
+                        if value_u64 <= i32::MAX as u64 {
+                            self.types.int_id
+                        } else if value_u64 <= u32::MAX as u64 {
+                            self.types.uint_id
+                        } else if value_u64 <= i64::MAX as u64 {
+                            self.types.long_id
+                        } else {
+                            self.types.ulong_id
+                        }
+                    }
+                }
+            } else {
+                // Decimal without U suffix - signed types only
+                match (is_longlong, is_long) {
+                    (true, _) => self.types.longlong_id,
+                    (false, true) => self.types.long_id,
+                    (false, false) => {
+                        // int, long, long long
+                        if value_u64 <= i32::MAX as u64 {
+                            self.types.int_id
+                        } else if value_u64 <= i64::MAX as u64 {
+                            self.types.long_id
+                        } else {
+                            self.types.longlong_id
+                        }
+                    }
+                }
             };
             Ok(Self::typed_expr(ExprKind::IntLit(value), typ, pos))
         }
@@ -3414,6 +3468,47 @@ impl Parser<'_> {
         self.parse_declaration_and_bind_impl(false)
     }
 
+    /// Infer array size from initializer for incomplete array types.
+    ///
+    /// For declarations like `int arr[] = {1,2,3}` or `char arr[] = "hello"`,
+    /// infers the array size from the initializer and returns a complete type.
+    ///
+    /// This handles C99 6.7.8 paragraph 22: "If an array of unknown size is initialized,
+    /// its size is determined by the largest indexed element with an explicit initializer."
+    fn infer_array_size_from_init(&mut self, typ: TypeId, init: &Expr) -> TypeId {
+        if self.types.kind(typ) != TypeKind::Array {
+            return typ;
+        }
+
+        let array_size = self.types.get(typ).array_size;
+        // Check if array size is incomplete (0 or None)
+        if array_size != Some(0) && array_size.is_some() {
+            return typ;
+        }
+
+        let new_size = match &init.kind {
+            ExprKind::InitList { elements } => Some(elements.len()),
+            ExprKind::StringLit(s) => {
+                // For char array initialized with string literal,
+                // size is string length + 1 for null terminator
+                Some(s.len() + 1)
+            }
+            _ => None,
+        };
+
+        if let Some(size) = new_size {
+            // Update type with actual size from initializer
+            let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+            // Preserve modifiers (like const, static)
+            let modifiers = self.types.modifiers(typ);
+            let mut arr_type = Type::array(elem_type, size);
+            arr_type.modifiers = modifiers;
+            self.types.intern(arr_type)
+        } else {
+            typ
+        }
+    }
+
     /// Parse a for-init declaration and bind variables to symbol table
     ///
     /// Same as `parse_declaration_and_bind()` but rejects storage class specifiers.
@@ -3475,20 +3570,9 @@ impl Parser<'_> {
                     None
                 };
 
-                // For incomplete array types (int arr[] = {...}), infer size from initializer
+                // For incomplete array types, infer size from initializer
                 if let Some(ref init_expr) = init {
-                    if let ExprKind::InitList { elements } = &init_expr.kind {
-                        if self.types.kind(typ) == TypeKind::Array {
-                            let array_size = self.types.get(typ).array_size;
-                            // Check if array size is incomplete (0 or None)
-                            if array_size == Some(0) || array_size.is_none() {
-                                // Update type with actual size from initializer count
-                                let elem_type =
-                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
-                                typ = self.types.intern(Type::array(elem_type, elements.len()));
-                            }
-                        }
-                    }
+                    typ = self.infer_array_size_from_init(typ, init_expr);
                 }
 
                 // Bind to symbol table
@@ -4980,6 +5064,11 @@ impl Parser<'_> {
         } else {
             None
         };
+
+        // For incomplete array types, infer size from initializer
+        if let Some(ref init_expr) = init {
+            var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
+        }
 
         // Add to symbol table
         if is_typedef {
@@ -8833,5 +8922,109 @@ mod tests {
         let code = "int foo(void) { return ({ int x = 1; x + 1; }); }";
         let (tu, _types, _strings) = parse_tu(code).unwrap();
         assert_eq!(tu.items.len(), 1);
+    }
+
+    // ========================================================================
+    // Integer literal type promotion tests (C99 6.4.4.1)
+    // ========================================================================
+
+    #[test]
+    fn test_hex_literal_type_promotion() {
+        // 0x7FFFFFFF fits in int (signed)
+        let (expr, types, _) = parse_expr("0x7FFFFFFF").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+        assert!(!types.is_unsigned(expr.typ.unwrap()));
+
+        // 0x80000000 doesn't fit in int, should be unsigned int
+        let (expr, types, _) = parse_expr("0x80000000").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+        assert!(types.is_unsigned(expr.typ.unwrap()));
+
+        // 0xFFFFFFFF is max u32, should be unsigned int
+        let (expr, types, _) = parse_expr("0xFFFFFFFF").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+        assert!(types.is_unsigned(expr.typ.unwrap()));
+
+        // 0x100000000 doesn't fit in u32, should be long (signed)
+        let (expr, types, _) = parse_expr("0x100000000").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
+        assert!(!types.is_unsigned(expr.typ.unwrap()));
+    }
+
+    #[test]
+    fn test_octal_literal_type_promotion() {
+        // 017777777777 = 0x7FFFFFFF = 2147483647 (fits in int)
+        let (expr, types, _) = parse_expr("017777777777").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+        assert!(!types.is_unsigned(expr.typ.unwrap()));
+
+        // 020000000000 = 0x80000000 = 2147483648 (doesn't fit in int, use uint)
+        let (expr, types, _) = parse_expr("020000000000").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+        assert!(types.is_unsigned(expr.typ.unwrap()));
+    }
+
+    #[test]
+    fn test_decimal_literal_stays_signed() {
+        // 2147483647 (INT_MAX) fits in int
+        let (expr, types, _) = parse_expr("2147483647").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+        assert!(!types.is_unsigned(expr.typ.unwrap()));
+
+        // 2147483648 (INT_MAX + 1) doesn't fit in int, should be long (NOT uint)
+        let (expr, types, _) = parse_expr("2147483648").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
+        assert!(
+            !types.is_unsigned(expr.typ.unwrap()),
+            "Decimal literal should remain signed"
+        );
+
+        // 9223372036854775807 (i64::MAX) fits in long on 64-bit systems
+        // On 64-bit systems, long is 64 bits, so this fits in long (not long long)
+        let (expr, types, _) = parse_expr("9223372036854775807").unwrap();
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
+        assert!(!types.is_unsigned(expr.typ.unwrap()));
+    }
+
+    // ========================================================================
+    // Incomplete array size from string literal tests
+    // ========================================================================
+
+    #[test]
+    fn test_incomplete_array_string_literal_size() {
+        // char arr[] = "abc"; should infer size 4 (3 chars + null)
+        let (tu, types, _) = parse_tu("char arr[] = \"abc\";").unwrap();
+        assert_eq!(tu.items.len(), 1);
+
+        // Get the declarator and check its type
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Array);
+            assert_eq!(
+                types.get(typ).array_size,
+                Some(4),
+                "Array size should be 4 (3 chars + null terminator)"
+            );
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_incomplete_array_empty_string() {
+        // char arr[] = ""; should infer size 1 (just null terminator)
+        let (tu, types, _) = parse_tu("char arr[] = \"\";").unwrap();
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Array);
+            assert_eq!(
+                types.get(typ).array_size,
+                Some(1),
+                "Array size should be 1 (just null terminator)"
+            );
+        } else {
+            panic!("Expected Declaration");
+        }
     }
 }

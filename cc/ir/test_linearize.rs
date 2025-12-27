@@ -11,8 +11,12 @@
 //
 
 use super::*;
-use crate::parse::ast::{AssignOp, ExprKind, ExternalDecl, FunctionDef, Parameter, UnaryOp};
+use crate::parse::ast::{
+    AssignOp, BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator,
+    Parameter, UnaryOp,
+};
 use crate::strings::StringTable;
+use crate::types::Type;
 
 /// Create a default position for test code
 fn test_pos() -> Position {
@@ -2419,6 +2423,113 @@ fn test_ternary_with_post_increment_uses_phi() {
     assert!(
         !ir.contains("sel."),
         "Ternary with post-inc/dec should NOT use select: {}",
+        ir
+    );
+}
+
+// ============================================================================
+// String literal initialization tests
+// ============================================================================
+
+#[test]
+fn test_string_literal_char_array_init() {
+    // Test that `char arr[6] = "hello";` generates store instructions for each byte
+    // plus null terminator (6 stores total: 'h', 'e', 'l', 'l', 'o', '\0')
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let arr_id = strings.intern("arr");
+
+    // Create char[6] type
+    let char_arr_type = types.intern(Type::array(types.char_id, 6));
+
+    // Function: int test() { char arr[6] = "hello"; return 0; }
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    name: arr_id,
+                    typ: char_arr_type,
+                    init: Some(Expr::typed(
+                        ExprKind::StringLit("hello".to_string()),
+                        types.char_ptr_id,
+                        test_pos(),
+                    )),
+                    vla_sizes: vec![],
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &types)))),
+        ]),
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // Should have 6 store instructions (5 chars + null terminator)
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 6,
+        "Expected at least 6 store instructions for 'hello' + null, got {}: {}",
+        store_count,
+        ir
+    );
+}
+
+#[test]
+fn test_string_literal_char_pointer_init() {
+    // Test that `char *p = "hello";` generates a single store of the string address
+    let mut strings = StringTable::new();
+    let types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let p_id = strings.intern("p");
+
+    // Function: int test() { char *p = "hello"; return 0; }
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    name: p_id,
+                    typ: types.char_ptr_id,
+                    init: Some(Expr::typed(
+                        ExprKind::StringLit("hello".to_string()),
+                        types.char_ptr_id,
+                        test_pos(),
+                    )),
+                    vla_sizes: vec![],
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &types)))),
+        ]),
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // Should have a store instruction for the pointer (storing the string address)
+    assert!(
+        ir.contains("store"),
+        "Pointer init should have a store instruction: {}",
+        ir
+    );
+
+    // The module should contain the string literal (strings are stored in module)
+    assert!(
+        !module.strings.is_empty(),
+        "Module should contain string literal: {}",
         ir
     );
 }

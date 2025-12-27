@@ -1346,6 +1346,37 @@ impl<'a> Linearizer<'a> {
                         self.emit_aggregate_zero(sym_id, typ);
                     }
                     self.linearize_init_list(sym_id, typ, elements);
+                } else if let ExprKind::StringLit(s) = &init.kind {
+                    // String literal initialization of char array
+                    // Copy the string bytes to the local array
+                    if self.types.kind(typ) == TypeKind::Array {
+                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                        let elem_size = self.types.size_bits(elem_type);
+
+                        // Copy each byte from string literal to local array
+                        for (i, byte) in s.bytes().enumerate() {
+                            let byte_val = self.emit_const(byte as i64, elem_type);
+                            self.emit(Instruction::store(
+                                byte_val, sym_id, i as i64, elem_type, elem_size,
+                            ));
+                        }
+                        // Store null terminator
+                        let null_val = self.emit_const(0, elem_type);
+                        self.emit(Instruction::store(
+                            null_val,
+                            sym_id,
+                            s.len() as i64,
+                            elem_type,
+                            elem_size,
+                        ));
+                    } else {
+                        // Pointer initialized with string literal - store the address
+                        let val = self.linearize_expr(init);
+                        let init_type = self.expr_type(init);
+                        let converted = self.emit_convert(val, init_type, typ);
+                        let size = self.types.size_bits(typ);
+                        self.emit(Instruction::store(converted, sym_id, 0, typ, size));
+                    }
                 } else if self.types.is_complex(typ) {
                     // Complex type initialization - linearize_expr returns an address
                     // to a temp containing the complex value. Copy from temp to local.
@@ -3407,6 +3438,12 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
                 arg_types_vec.push(self.types.pointer_to(elem_type));
                 self.linearize_expr(a)
+            } else if arg_kind == TypeKind::VaList {
+                // va_list decay to pointer (C99 7.15.1)
+                // va_list is defined as __va_list_tag[1] (an array), so it decays to
+                // a pointer when passed to a function taking va_list parameter
+                arg_types_vec.push(self.types.pointer_to(arg_type));
+                self.linearize_lvalue(a)
             } else if arg_kind == TypeKind::Function {
                 // Function decay to pointer (C99 6.3.2.1)
                 // Function names passed as arguments decay to function pointers

@@ -666,6 +666,9 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     // Phase 3: Remove dead stores
     let dead_stores = std::mem::take(&mut converter.dead_stores);
     remove_dead_stores(converter.func, &dead_stores);
+
+    // Update function's next_pseudo to avoid ID collisions with later allocations
+    converter.func.next_pseudo = converter.next_pseudo_id;
 }
 
 // ============================================================================

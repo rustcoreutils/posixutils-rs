@@ -64,6 +64,7 @@ fn is_root(op: Opcode) -> bool {
             | Opcode::Alloca
             | Opcode::Setjmp  // Has side effects (saves context)
             | Opcode::Longjmp // Never returns (noreturn)
+            | Opcode::Asm // Inline assembly has side effects
     )
 }
 
@@ -91,20 +92,30 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
         uses.push(indirect);
     }
 
+    // Inline assembly inputs (the pseudos that the asm reads)
+    if let Some(ref asm_data) = insn.asm_data {
+        for input in &asm_data.inputs {
+            uses.push(input.pseudo);
+        }
+    }
+
     uses
 }
 
-/// Find the instruction that defines a pseudo.
-/// Returns (block_index, instruction_index) if found.
-fn find_def(func: &Function, id: PseudoId) -> Option<(usize, usize)> {
+/// Find all instructions that define a pseudo.
+/// Returns vec of (block_index, instruction_index) for each definition.
+/// After inlining, a pseudo may have multiple definitions from different branches
+/// (e.g., the return target is written to from multiple return paths).
+fn find_all_defs(func: &Function, id: PseudoId) -> Vec<(usize, usize)> {
+    let mut defs = Vec::new();
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
             if insn.target == Some(id) {
-                return Some((bb_idx, insn_idx));
+                defs.push((bb_idx, insn_idx));
             }
         }
     }
-    None
+    defs
 }
 
 /// Eliminate dead code using mark-sweep algorithm.
@@ -128,8 +139,9 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
 
     // Phase 2: Propagate liveness transitively
     while let Some(id) = worklist.pop_front() {
-        // Find the instruction that defines this pseudo
-        if let Some((bb_idx, insn_idx)) = find_def(func, id) {
+        // Find all instructions that define this pseudo
+        // (there may be multiple after inlining, e.g., return target written from multiple paths)
+        for (bb_idx, insn_idx) in find_all_defs(func, id) {
             let insn = &func.blocks[bb_idx].insns[insn_idx];
 
             // Mark all operands of the defining instruction as live

@@ -1050,6 +1050,12 @@ impl<'a> Linearizer<'a> {
         if self.run_ssa {
             if let Some(ref mut ir_func) = self.current_func {
                 ssa_convert(ir_func, self.types);
+                // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
+            }
+        } else {
+            // Only set next_pseudo if SSA was NOT run (SSA sets its own)
+            if let Some(ref mut ir_func) = self.current_func {
+                ir_func.next_pseudo = self.next_pseudo;
             }
         }
 

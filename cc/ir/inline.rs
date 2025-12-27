@@ -200,6 +200,9 @@ struct InlineContext {
     pseudo_map: HashMap<PseudoId, PseudoId>,
     /// Map from callee BasicBlockId to caller BasicBlockId
     bb_map: HashMap<BasicBlockId, BasicBlockId>,
+    /// Map from global symbol names to their caller pseudo IDs
+    /// Multiple callee pseudos with the same global symbol name should map to the same caller pseudo
+    global_sym_map: HashMap<String, PseudoId>,
     /// Next pseudo ID available in the caller
     next_pseudo_id: u32,
     /// Next basic block ID available in the caller
@@ -239,8 +242,8 @@ impl InlineContext {
         return_continuation_bb: BasicBlockId,
         return_target: Option<PseudoId>,
     ) -> Self {
-        // Find max pseudo ID and BB ID in caller
-        let max_pseudo = caller.pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
+        // Use caller.next_pseudo instead of scanning pseudos list
+        // (the list may not contain all pseudo IDs, e.g., phi nodes from SSA)
         let max_bb = caller.blocks.iter().map(|b| b.id.0).max().unwrap_or(0);
 
         // Collect callee's local variable names - these need to be renamed
@@ -249,7 +252,8 @@ impl InlineContext {
         Self {
             pseudo_map: HashMap::new(),
             bb_map: HashMap::new(),
-            next_pseudo_id: max_pseudo + 1,
+            global_sym_map: HashMap::new(),
+            next_pseudo_id: caller.next_pseudo,
             next_bb_id: max_bb + 1,
             call_args,
             return_continuation_bb,
@@ -307,6 +311,18 @@ impl InlineContext {
                     // Missing argument - shouldn't happen in valid code
                     self.alloc_pseudo_id()
                 }
+            }
+            // Global symbols: ensure same name maps to same ID across multiple inlinings
+            // This is critical when a function is inlined multiple times and references
+            // the same global variable - all references must point to the same pseudo
+            Some(PseudoKind::Sym(name)) if !self.callee_locals.contains(name) => {
+                if let Some(&existing_id) = self.global_sym_map.get(name) {
+                    self.pseudo_map.insert(callee_id, existing_id);
+                    return existing_id;
+                }
+                let new_id = self.alloc_pseudo_id();
+                self.global_sym_map.insert(name.clone(), new_id);
+                new_id
             }
             // For all other kinds, allocate new ID
             _ => self.alloc_pseudo_id(),
@@ -636,12 +652,14 @@ fn inline_call_site(
         }
 
         // Blocks with Ret (now Br to continuation): update children
-        if block
+        // Note: We check for ANY instruction (not just last) that branches to continuation,
+        // because the original callee block may have had unreachable instructions after ret
+        // (e.g., __builtin_unreachable() after return), which get cloned after the branch.
+        let has_branch_to_continuation = block
             .insns
-            .last()
-            .map(|i| i.op == Opcode::Br && i.bb_true == Some(continuation_bb_id))
-            .unwrap_or(false)
-        {
+            .iter()
+            .any(|i| i.op == Opcode::Br && i.bb_true == Some(continuation_bb_id));
+        if has_branch_to_continuation {
             block.children = vec![continuation_bb_id];
             continuation_bb.parents.push(block.id);
         }
@@ -681,18 +699,94 @@ fn inline_call_site(
         }
     }
 
-    // Update old children's parent references to point to continuation
+    // Update old children's parent references and phi nodes to point to continuation
     for &child_id in &old_children {
         if let Some(child) = caller.blocks.iter_mut().find(|b| b.id == child_id) {
+            // Update parent list
             for parent in &mut child.parents {
                 if *parent == call_bb_id {
                     *parent = continuation_bb_id;
                 }
             }
+
+            // Update phi nodes: replace call_bb_id with continuation_bb_id
+            for insn in &mut child.insns {
+                if insn.op == Opcode::Phi {
+                    for (pred_bb, _) in &mut insn.phi_list {
+                        if *pred_bb == call_bb_id {
+                            *pred_bb = continuation_bb_id;
+                        }
+                    }
+                }
+            }
         }
     }
 
+    // Update caller's next_pseudo to avoid ID collisions with later allocations
+    caller.next_pseudo = ctx.next_pseudo_id;
+
     true
+}
+
+// ============================================================================
+// Block Reordering (for correct liveness analysis in regalloc)
+// ============================================================================
+
+/// Reorder blocks in control flow (topological) order.
+/// This is critical for the linear scan register allocator, which assumes
+/// blocks are in execution order when computing live intervals.
+fn reorder_blocks_topologically(func: &mut Function) {
+    if func.blocks.is_empty() {
+        return;
+    }
+
+    // Build a map of block ID to block
+    let block_map: HashMap<BasicBlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    // BFS from entry to get reachable blocks in control flow order
+    let mut visited: HashSet<BasicBlockId> = HashSet::new();
+    let mut order: Vec<BasicBlockId> = Vec::new();
+    let mut queue: std::collections::VecDeque<BasicBlockId> = std::collections::VecDeque::new();
+
+    queue.push_back(func.entry);
+
+    while let Some(bb_id) = queue.pop_front() {
+        if visited.contains(&bb_id) {
+            continue;
+        }
+        visited.insert(bb_id);
+        order.push(bb_id);
+
+        // Get successors from the block's children
+        if let Some(&idx) = block_map.get(&bb_id) {
+            for &child_id in &func.blocks[idx].children {
+                if !visited.contains(&child_id) {
+                    queue.push_back(child_id);
+                }
+            }
+        }
+    }
+
+    // Include any unreachable blocks at the end (shouldn't happen, but be safe)
+    for block in &func.blocks {
+        if !visited.contains(&block.id) {
+            order.push(block.id);
+        }
+    }
+
+    // Reorder blocks according to the computed order
+    let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(func.blocks.len());
+    for bb_id in order {
+        if let Some(&idx) = block_map.get(&bb_id) {
+            new_blocks.push(func.blocks[idx].clone());
+        }
+    }
+    func.blocks = new_blocks;
 }
 
 // ============================================================================
@@ -765,6 +859,15 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
             any_changed = true;
         } else {
             break;
+        }
+    }
+
+    // Reorder blocks in all functions that were modified
+    // This ensures blocks are in control flow order for the register allocator's
+    // linear scan algorithm, which relies on position-based liveness analysis
+    if any_changed {
+        for func in &mut module.functions {
+            reorder_blocks_topologically(func);
         }
     }
 

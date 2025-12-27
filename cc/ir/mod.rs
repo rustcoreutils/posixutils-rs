@@ -129,7 +129,7 @@ pub enum Opcode {
     // Other
     SymAddr, // Get address of symbol
     Call,    // Function call
-    Select,  // Ternary select: cond ? a : b
+    Select,  // Ternary select: cond ? a : b (pure expressions only, enables cmov/csel)
     SetVal,  // Create pseudo for constant
     Nop,     // No operation
 
@@ -793,7 +793,8 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a select (ternary) instruction
+    /// Create a select (ternary) instruction for pure expressions
+    /// Enables cmov/csel codegen instead of branches
     pub fn select(
         target: PseudoId,
         cond: PseudoId,
@@ -1053,6 +1054,8 @@ pub struct Function {
     pub entry: BasicBlockId,
     /// All pseudos indexed by PseudoId
     pub pseudos: Vec<Pseudo>,
+    /// Next pseudo ID to allocate (monotonically increasing)
+    pub next_pseudo: u32,
     /// Local variables (name -> info), used for SSA conversion
     pub locals: HashMap<String, LocalVar>,
     /// Maximum dominator tree depth (computed by dominate.rs)
@@ -1074,6 +1077,7 @@ impl Default for Function {
             blocks: Vec::new(),
             entry: BasicBlockId(0),
             pseudos: Vec::new(),
+            next_pseudo: 0,
             locals: HashMap::new(),
             max_dom_level: 0,
             is_static: false,
@@ -1143,17 +1147,18 @@ impl Function {
         self.locals.get(name)
     }
 
-    /// Compute the next available pseudo ID
-    /// This scans all existing pseudos to find the maximum ID, then returns max + 1
-    pub fn next_pseudo_id(&self) -> PseudoId {
-        let max_id = self.pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
-        PseudoId(max_id + 1)
+    /// Allocate a new pseudo ID
+    /// Returns a unique ID and increments the counter
+    pub fn alloc_pseudo(&mut self) -> PseudoId {
+        let id = PseudoId(self.next_pseudo);
+        self.next_pseudo += 1;
+        id
     }
 
     /// Create a new constant integer pseudo and return its ID
     /// The pseudo is added to self.pseudos
     pub fn create_const_pseudo(&mut self, value: i64) -> PseudoId {
-        let id = self.next_pseudo_id();
+        let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, value);
         self.add_pseudo(pseudo);
         id

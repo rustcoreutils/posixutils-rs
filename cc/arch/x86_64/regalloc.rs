@@ -260,9 +260,10 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
             inputs: &[Reg::Rax],
         },
         // Variable shifts: count must be in Cl (Rcx)
-        // Note: shifts don't clobber Rcx, they just require it as input
+        // The codegen moves the shift count INTO Rcx, clobbering it.
+        // For immediate shifts, this constraint is conservative but safe.
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => RegConstraints {
-            clobbers: &[],
+            clobbers: &[Reg::Rcx],
             inputs: &[Reg::Rcx],
         },
         // VaArg: emit_va_arg_int uses Rax for reg_save_area/overflow pointer,

@@ -307,7 +307,7 @@ impl Aarch64CodeGen {
             Opcode::Zext => {
                 // Zero extend: use uxtb, uxth, or just mov for 32->64
                 self.emit_move(src, dst_reg, 64, frame_size);
-                match insn.size {
+                match insn.src_size {
                     8 => {
                         self.push_lir(Aarch64Inst::Uxtb {
                             src: dst_reg,

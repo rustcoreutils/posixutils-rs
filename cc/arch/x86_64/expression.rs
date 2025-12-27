@@ -397,7 +397,12 @@ impl X86_64CodeGen {
         };
         match insn.op {
             Opcode::Zext => {
-                self.emit_move(src, dst_reg, insn.size);
+                // Move source at its original size - this ensures we only load
+                // the valid bits from stack/memory. On x86-64, 32-bit register
+                // writes automatically zero the upper 32 bits.
+                // For 8/16-bit sources, emit_move uses movzbl/movzwl which
+                // zero-extends to 32 bits (and thus to 64 bits).
+                self.emit_move(src, dst_reg, insn.src_size.max(32));
             }
             Opcode::Sext => {
                 // Move source at its original size, then sign-extend

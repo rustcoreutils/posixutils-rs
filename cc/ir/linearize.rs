@@ -1050,6 +1050,12 @@ impl<'a> Linearizer<'a> {
         if self.run_ssa {
             if let Some(ref mut ir_func) = self.current_func {
                 ssa_convert(ir_func, self.types);
+                // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
+            }
+        } else {
+            // Only set next_pseudo if SSA was NOT run (SSA sets its own)
+            if let Some(ref mut ir_func) = self.current_func {
+                ir_func.next_pseudo = self.next_pseudo;
             }
         }
 
@@ -2462,6 +2468,123 @@ impl<'a> Linearizer<'a> {
         expr.typ.expect(
             "BUG: expression has no type. Type evaluation pass must run before linearization.",
         )
+    }
+
+    /// Check if an expression is "pure" (side-effect-free).
+    /// Pure expressions can be speculatively evaluated, enabling cmov/csel codegen.
+    ///
+    /// An expression is pure if it contains NO:
+    /// - Function calls
+    /// - Volatile accesses
+    /// - Pre/post increment/decrement (++, --)
+    /// - Assignments (=, +=, -=, etc.)
+    /// - Statement expressions (GNU extension with potential side effects)
+    fn is_pure_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Literals are always pure
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::CharLit(_)
+            | ExprKind::StringLit(_) => true,
+
+            // Identifiers are pure unless volatile
+            ExprKind::Ident { .. } => {
+                if let Some(typ) = expr.typ {
+                    !self.types.modifiers(typ).contains(TypeModifiers::VOLATILE)
+                } else {
+                    true
+                }
+            }
+
+            // Binary ops are pure if both operands are pure
+            ExprKind::Binary { left, right, .. } => {
+                self.is_pure_expr(left) && self.is_pure_expr(right)
+            }
+
+            // Unary ops are pure if operand is pure, except for pre-inc/dec
+            ExprKind::Unary { op, operand, .. } => match op {
+                UnaryOp::PreInc | UnaryOp::PreDec => false,
+                _ => self.is_pure_expr(operand),
+            },
+
+            // Post-increment/decrement have side effects
+            ExprKind::PostInc(_) | ExprKind::PostDec(_) => false,
+
+            // Ternary is pure if all parts are pure
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.is_pure_expr(cond)
+                    && self.is_pure_expr(then_expr)
+                    && self.is_pure_expr(else_expr)
+            }
+
+            // Function calls are never pure (may have side effects)
+            ExprKind::Call { .. } => false,
+
+            // Member access is pure if the base expression is pure
+            ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => self.is_pure_expr(expr),
+
+            // Array indexing is pure if both parts are pure
+            ExprKind::Index { array, index } => {
+                self.is_pure_expr(array) && self.is_pure_expr(index)
+            }
+
+            // Casts are pure if the operand is pure
+            ExprKind::Cast { expr, .. } => self.is_pure_expr(expr),
+
+            // Assignments have side effects
+            ExprKind::Assign { .. } => false,
+
+            // Sizeof is always pure (compile-time constant)
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => true,
+
+            // Comma expressions: pure if all sub-expressions are pure
+            ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
+
+            // Compound literals may have side effects in initializers
+            ExprKind::CompoundLiteral { .. } => false,
+
+            // Init lists may have side effects
+            ExprKind::InitList { .. } => false,
+
+            // Statement expressions have side effects
+            ExprKind::StmtExpr { .. } => false,
+
+            // Variadic builtins have side effects
+            ExprKind::VaStart { .. }
+            | ExprKind::VaArg { .. }
+            | ExprKind::VaEnd { .. }
+            | ExprKind::VaCopy { .. } => false,
+
+            // Offsetof is always pure (compile-time constant)
+            ExprKind::OffsetOf { .. } => true,
+
+            // Builtins: bswap, ctz, clz, popcount are pure
+            ExprKind::Bswap16 { arg }
+            | ExprKind::Bswap32 { arg }
+            | ExprKind::Bswap64 { arg }
+            | ExprKind::Ctz { arg }
+            | ExprKind::Ctzl { arg }
+            | ExprKind::Ctzll { arg }
+            | ExprKind::Clz { arg }
+            | ExprKind::Clzl { arg }
+            | ExprKind::Clzll { arg }
+            | ExprKind::Popcount { arg }
+            | ExprKind::Popcountl { arg }
+            | ExprKind::Popcountll { arg } => self.is_pure_expr(arg),
+
+            // Alloca allocates memory - not pure
+            ExprKind::Alloca { .. } => false,
+
+            // Unreachable is pure (no side effects, just UB hint)
+            ExprKind::Unreachable => true,
+
+            // Setjmp/longjmp have control flow side effects
+            ExprKind::Setjmp { .. } | ExprKind::Longjmp { .. } => false,
+        }
     }
 
     /// Resolve an incomplete struct/union type to its complete definition.
@@ -4054,23 +4177,79 @@ impl<'a> Linearizer<'a> {
                 then_expr,
                 else_expr,
             } => {
-                let cond_val = self.linearize_expr(cond);
-                let then_val = self.linearize_expr(then_expr);
-                let else_val = self.linearize_expr(else_expr);
-
-                let result = self.alloc_pseudo();
-                let typ = self.expr_type(expr); // Use evaluated type
-                                                // Function types in ternary expressions decay to pointers (64-bit)
-                let size = if self.types.kind(typ) == TypeKind::Function {
+                let result_typ = self.expr_type(expr);
+                // Function types in ternary expressions decay to pointers (64-bit)
+                let size = if self.types.kind(result_typ) == TypeKind::Function {
                     64
                 } else {
-                    self.types.size_bits(typ)
+                    self.types.size_bits(result_typ)
                 };
 
-                self.emit(Instruction::select(
-                    result, cond_val, then_val, else_val, typ, size,
-                ));
-                result
+                // Check if both branches are pure (side-effect-free).
+                // If so, we can use Select instruction which enables cmov/csel codegen.
+                // Otherwise, we must use control flow for proper short-circuit evaluation.
+                if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) {
+                    // Pure: use Select instruction (enables cmov/csel)
+                    let cond_val = self.linearize_expr(cond);
+                    let cond_typ = self.expr_type(cond);
+                    let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+                    let then_val = self.linearize_expr(then_expr);
+                    let else_val = self.linearize_expr(else_expr);
+                    let result = self.alloc_pseudo();
+                    self.emit(Instruction::select(
+                        result, cond_bool, then_val, else_val, result_typ, size,
+                    ));
+                    result
+                } else {
+                    // Impure: use control flow + phi for proper short-circuit evaluation
+                    // Only evaluate the selected branch (important for side effects)
+
+                    // Create basic blocks for branches
+                    let then_bb = self.alloc_bb();
+                    let else_bb = self.alloc_bb();
+                    let merge_bb = self.alloc_bb();
+
+                    // Evaluate condition
+                    let cond_val = self.linearize_expr(cond);
+                    let cond_typ = self.expr_type(cond);
+                    let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+
+                    let cond_end_bb = self.current_bb.unwrap();
+
+                    // Branch on condition: if true go to then_bb, else go to else_bb
+                    self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+                    self.link_bb(cond_end_bb, then_bb);
+                    self.link_bb(cond_end_bb, else_bb);
+
+                    // Then branch: evaluate then_expr
+                    self.switch_bb(then_bb);
+                    let then_val = self.linearize_expr(then_expr);
+                    let then_end_bb = self.current_bb.unwrap();
+                    self.emit(Instruction::br(merge_bb));
+                    self.link_bb(then_end_bb, merge_bb);
+
+                    // Else branch: evaluate else_expr
+                    self.switch_bb(else_bb);
+                    let else_val = self.linearize_expr(else_expr);
+                    let else_end_bb = self.current_bb.unwrap();
+                    self.emit(Instruction::br(merge_bb));
+                    self.link_bb(else_end_bb, merge_bb);
+
+                    // Merge: phi node to get result
+                    self.switch_bb(merge_bb);
+                    let result = self.alloc_pseudo();
+                    // Create a phi pseudo for the target - important for register allocation
+                    let phi_pseudo = Pseudo::phi(result, result.0);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(phi_pseudo);
+                    }
+                    let mut phi_insn = Instruction::phi(result, result_typ, size);
+                    phi_insn.phi_list.push((then_end_bb, then_val));
+                    phi_insn.phi_list.push((else_end_bb, else_val));
+                    self.emit(phi_insn);
+
+                    result
+                }
             }
 
             ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
@@ -5378,6 +5557,11 @@ impl<'a> Linearizer<'a> {
         // Result is 0 if we came from lhs_end_bb (LHS was false),
         // or right_bool if we came from rhs_end_bb (LHS was true)
         let result = self.alloc_pseudo();
+        // Create a phi pseudo for the target - important for register allocation
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
         phi_insn.phi_list.push((lhs_end_bb, zero));
         phi_insn.phi_list.push((rhs_end_bb, right_bool));
@@ -5434,6 +5618,11 @@ impl<'a> Linearizer<'a> {
         // Result is 1 if we came from lhs_end_bb (LHS was true),
         // or right_bool if we came from rhs_end_bb (LHS was false)
         let result = self.alloc_pseudo();
+        // Create a phi pseudo for the target - important for register allocation
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
         phi_insn.phi_list.push((lhs_end_bb, one));
         phi_insn.phi_list.push((rhs_end_bb, right_bool));
@@ -5845,658 +6034,6 @@ pub fn linearize_with_debug(
         module.source_files.push(path.to_string());
     }
     module
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parse::ast::{ExternalDecl, FunctionDef, Parameter};
-    use crate::strings::StringTable;
-
-    /// Create a default position for test code
-    fn test_pos() -> Position {
-        Position {
-            stream: 0,
-            line: 1,
-            col: 1,
-            newline: false,
-            whitespace: false,
-            noexpand: false,
-        }
-    }
-
-    fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
-        let symbols = SymbolTable::new();
-        let target = Target::host();
-        linearize(tu, &symbols, types, strings, &target)
-    }
-
-    fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
-        FunctionDef {
-            return_type: types.int_id,
-            name,
-            params: vec![],
-            body,
-            pos: test_pos(),
-        }
-    }
-
-    #[test]
-    fn test_linearize_empty_function() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let func = make_simple_func(test_id, Stmt::Block(vec![]), &types);
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        assert_eq!(module.functions.len(), 1);
-        assert_eq!(module.functions[0].name, "test");
-        assert!(!module.functions[0].blocks.is_empty());
-    }
-
-    #[test]
-    fn test_linearize_return() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let func = make_simple_func(test_id, Stmt::Return(Some(Expr::int(42, &types))), &types);
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(ir.contains("ret"));
-    }
-
-    #[test]
-    fn test_linearize_if() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let func = make_simple_func(
-            test_id,
-            Stmt::If {
-                cond: Expr::int(1, &types),
-                then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &types)))),
-                else_stmt: Some(Box::new(Stmt::Return(Some(Expr::int(0, &types))))),
-            },
-            &types,
-        );
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(ir.contains("cbr")); // Conditional branch
-    }
-
-    #[test]
-    fn test_linearize_while() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let func = make_simple_func(
-            test_id,
-            Stmt::While {
-                cond: Expr::int(1, &types),
-                body: Box::new(Stmt::Break),
-            },
-            &types,
-        );
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        assert!(module.functions[0].blocks.len() >= 3); // cond, body, exit
-    }
-
-    #[test]
-    fn test_linearize_for() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let i_id = strings.intern("i");
-        // for (int i = 0; i < 10; i++) { }
-        let int_type = types.int_id;
-        let i_var = Expr::var_typed(i_id, int_type);
-        let func = make_simple_func(
-            test_id,
-            Stmt::For {
-                init: Some(ForInit::Declaration(Declaration {
-                    declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: i_id,
-                        typ: int_type,
-                        init: Some(Expr::int(0, &types)),
-                        vla_sizes: vec![],
-                    }],
-                })),
-                cond: Some(Expr::binary(
-                    BinaryOp::Lt,
-                    i_var.clone(),
-                    Expr::int(10, &types),
-                    &types,
-                )),
-                post: Some(Expr::typed(
-                    ExprKind::PostInc(Box::new(i_var)),
-                    int_type,
-                    test_pos(),
-                )),
-                body: Box::new(Stmt::Empty),
-            },
-            &types,
-        );
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        assert!(module.functions[0].blocks.len() >= 4); // entry, cond, body, post, exit
-    }
-
-    #[test]
-    fn test_linearize_binary_expr() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        // return 1 + 2 * 3;
-        let func = make_simple_func(
-            test_id,
-            Stmt::Return(Some(Expr::binary(
-                BinaryOp::Add,
-                Expr::int(1, &types),
-                Expr::binary(
-                    BinaryOp::Mul,
-                    Expr::int(2, &types),
-                    Expr::int(3, &types),
-                    &types,
-                ),
-                &types,
-            ))),
-            &types,
-        );
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(ir.contains("mul"));
-        assert!(ir.contains("add"));
-    }
-
-    #[test]
-    fn test_linearize_function_with_params() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let add_id = strings.intern("add");
-        let a_id = strings.intern("a");
-        let b_id = strings.intern("b");
-        let int_type = types.int_id;
-        let func = FunctionDef {
-            return_type: int_type,
-            name: add_id,
-            params: vec![
-                Parameter {
-                    name: Some(a_id),
-                    typ: int_type,
-                },
-                Parameter {
-                    name: Some(b_id),
-                    typ: int_type,
-                },
-            ],
-            body: Stmt::Return(Some(Expr::binary(
-                BinaryOp::Add,
-                Expr::var_typed(a_id, int_type),
-                Expr::var_typed(b_id, int_type),
-                &types,
-            ))),
-            pos: test_pos(),
-        };
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(ir.contains("add"));
-        assert!(ir.contains("%a"));
-        assert!(ir.contains("%b"));
-    }
-
-    #[test]
-    fn test_linearize_call() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let foo_id = strings.intern("foo");
-        let func = make_simple_func(
-            test_id,
-            Stmt::Return(Some(Expr::call(
-                Expr::var(foo_id),
-                vec![Expr::int(1, &types), Expr::int(2, &types)],
-                &types,
-            ))),
-            &types,
-        );
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(ir.contains("call"));
-        assert!(ir.contains("foo"));
-    }
-
-    #[test]
-    fn test_linearize_comparison() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let func = make_simple_func(
-            test_id,
-            Stmt::Return(Some(Expr::binary(
-                BinaryOp::Lt,
-                Expr::int(1, &types),
-                Expr::int(2, &types),
-                &types,
-            ))),
-            &types,
-        );
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(ir.contains("setlt"));
-    }
-
-    #[test]
-    fn test_linearize_unsigned_comparison() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-
-        // Create unsigned comparison: (unsigned)1 < (unsigned)2
-        let uint_type = types.uint_id;
-        let mut left = Expr::int(1, &types);
-        left.typ = Some(uint_type);
-        let mut right = Expr::int(2, &types);
-        right.typ = Some(uint_type);
-        let mut cmp = Expr::binary(BinaryOp::Lt, left, right, &types);
-        cmp.typ = Some(types.int_id);
-
-        let func = make_simple_func(test_id, Stmt::Return(Some(cmp)), &types);
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        // Should use unsigned comparison opcode (setb = set if below)
-        assert!(
-            ir.contains("setb"),
-            "Expected 'setb' for unsigned comparison, got:\n{}",
-            ir
-        );
-    }
-
-    #[test]
-    fn test_display_module() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let main_id = strings.intern("main");
-        let func = make_simple_func(main_id, Stmt::Return(Some(Expr::int(0, &types))), &types);
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-
-        // Should have proper structure
-        assert!(ir.contains("define"));
-        assert!(ir.contains("main"));
-        assert!(ir.contains(".L0:")); // Entry block label
-        assert!(ir.contains("ret"));
-    }
-
-    #[test]
-    fn test_type_propagation_expr_type() {
-        let strings = StringTable::new();
-        let types = TypeTable::new(64);
-
-        // Create an expression with a type annotation
-        let mut expr = Expr::int(42, &types);
-        // Simulate type evaluation having set the type
-        expr.typ = Some(types.int_id);
-
-        // Create linearizer and test that expr_type reads from the expression
-        let symbols = SymbolTable::new();
-        let target = Target::host();
-        let linearizer = Linearizer::new(&symbols, &types, &strings, &target);
-        let typ = linearizer.expr_type(&expr);
-        assert_eq!(types.kind(typ), TypeKind::Int);
-
-        // Test with unsigned type
-        let mut unsigned_expr = Expr::int(42, &types);
-        unsigned_expr.typ = Some(types.uint_id);
-        let typ = linearizer.expr_type(&unsigned_expr);
-        assert!(types.is_unsigned(typ));
-    }
-
-    #[test]
-    fn test_type_propagation_double_literal() {
-        let strings = StringTable::new();
-        let types = TypeTable::new(64);
-
-        // Create a double literal
-        let mut expr = Expr::new(ExprKind::FloatLit(3.14), test_pos());
-        expr.typ = Some(types.double_id);
-
-        let symbols = SymbolTable::new();
-        let target = Target::host();
-        let linearizer = Linearizer::new(&symbols, &types, &strings, &target);
-        let typ = linearizer.expr_type(&expr);
-        assert_eq!(types.kind(typ), TypeKind::Double);
-    }
-
-    // ========================================================================
-    // SSA Conversion Tests
-    // ========================================================================
-
-    /// Helper to linearize without SSA conversion (for comparing before/after)
-    fn linearize_no_ssa(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
-        let symbols = SymbolTable::new();
-        let target = Target::host();
-        let mut linearizer = Linearizer::new_no_ssa(&symbols, types, strings, &target);
-        linearizer.linearize(tu)
-    }
-
-    #[test]
-    fn test_local_var_emits_load_store() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let x_id = strings.intern("x");
-        // int test() { int x = 1; return x; }
-        let int_type = types.int_id;
-        let func = FunctionDef {
-            return_type: int_type,
-            name: test_id,
-            params: vec![],
-            body: Stmt::Block(vec![
-                BlockItem::Declaration(Declaration {
-                    declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: x_id,
-                        typ: int_type,
-                        init: Some(Expr::int(1, &types)),
-                        vla_sizes: vec![],
-                    }],
-                }),
-                BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
-            ]),
-            pos: test_pos(),
-        };
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        // Without SSA, should have store and load
-        let module = linearize_no_ssa(&tu, &types, &strings);
-        let ir = format!("{}", module);
-        assert!(
-            ir.contains("store"),
-            "Should have store instruction before SSA: {}",
-            ir
-        );
-        assert!(
-            ir.contains("load"),
-            "Should have load instruction before SSA: {}",
-            ir
-        );
-    }
-
-    #[test]
-    fn test_ssa_converts_local_to_phi() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let cond_id = strings.intern("cond");
-        let x_id = strings.intern("x");
-        // int test(int cond) {
-        //     int x = 1;
-        //     if (cond) x = 2;
-        //     return x;
-        // }
-        let int_type = types.int_id;
-
-        let func = FunctionDef {
-            return_type: int_type,
-            name: test_id,
-            params: vec![Parameter {
-                name: Some(cond_id),
-                typ: int_type,
-            }],
-            body: Stmt::Block(vec![
-                // int x = 1;
-                BlockItem::Declaration(Declaration {
-                    declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: x_id,
-                        typ: int_type,
-                        init: Some(Expr::int(1, &types)),
-                        vla_sizes: vec![],
-                    }],
-                }),
-                // if (cond) x = 2;
-                BlockItem::Statement(Stmt::If {
-                    cond: Expr::var_typed(cond_id, int_type),
-                    then_stmt: Box::new(Stmt::Expr(Expr::assign(
-                        Expr::var_typed(x_id, int_type),
-                        Expr::int(2, &types),
-                        &types,
-                    ))),
-                    else_stmt: None,
-                }),
-                // return x;
-                BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
-            ]),
-            pos: test_pos(),
-        };
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        // With SSA, should have phi node at merge point
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-
-        // Should have a phi instruction
-        assert!(
-            ir.contains("phi"),
-            "SSA should insert phi node at merge point: {}",
-            ir
-        );
-    }
-
-    #[test]
-    fn test_ssa_loop_variable() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let i_id = strings.intern("i");
-        // int test() {
-        //     int i = 0;
-        //     while (i < 10) { i = i + 1; }
-        //     return i;
-        // }
-        let int_type = types.int_id;
-
-        let i_var = || Expr::var_typed(i_id, int_type);
-
-        let func = FunctionDef {
-            return_type: int_type,
-            name: test_id,
-            params: vec![],
-            body: Stmt::Block(vec![
-                // int i = 0;
-                BlockItem::Declaration(Declaration {
-                    declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: i_id,
-                        typ: int_type,
-                        init: Some(Expr::int(0, &types)),
-                        vla_sizes: vec![],
-                    }],
-                }),
-                // while (i < 10) { i = i + 1; }
-                BlockItem::Statement(Stmt::While {
-                    cond: Expr::binary(BinaryOp::Lt, i_var(), Expr::int(10, &types), &types),
-                    body: Box::new(Stmt::Expr(Expr::assign(
-                        i_var(),
-                        Expr::binary(BinaryOp::Add, i_var(), Expr::int(1, &types), &types),
-                        &types,
-                    ))),
-                }),
-                // return i;
-                BlockItem::Statement(Stmt::Return(Some(i_var()))),
-            ]),
-            pos: test_pos(),
-        };
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        // With SSA, should have phi node at loop header
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-
-        // Loop should have a phi at the condition block
-        assert!(ir.contains("phi"), "Loop should have phi node: {}", ir);
-    }
-
-    #[test]
-    fn test_short_circuit_and() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let a_id = strings.intern("a");
-        let b_id = strings.intern("b");
-        // int test(int a, int b) {
-        //     return a && b;
-        // }
-        // Short-circuit: if a is false, don't evaluate b
-        let int_type = types.int_id;
-
-        let func = FunctionDef {
-            return_type: int_type,
-            name: test_id,
-            params: vec![
-                Parameter {
-                    name: Some(a_id),
-                    typ: int_type,
-                },
-                Parameter {
-                    name: Some(b_id),
-                    typ: int_type,
-                },
-            ],
-            body: Stmt::Return(Some(Expr::binary(
-                BinaryOp::LogAnd,
-                Expr::var_typed(a_id, int_type),
-                Expr::var_typed(b_id, int_type),
-                &types,
-            ))),
-            pos: test_pos(),
-        };
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-
-        // Short-circuit AND should have:
-        // 1. A conditional branch (cbr) to skip evaluation of b if a is false
-        // 2. A phi node to merge the result
-        assert!(
-            ir.contains("cbr"),
-            "Short-circuit AND should have conditional branch: {}",
-            ir
-        );
-        assert!(
-            ir.contains("phi"),
-            "Short-circuit AND should have phi node: {}",
-            ir
-        );
-    }
-
-    #[test]
-    fn test_short_circuit_or() {
-        let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
-        let test_id = strings.intern("test");
-        let a_id = strings.intern("a");
-        let b_id = strings.intern("b");
-        // int test(int a, int b) {
-        //     return a || b;
-        // }
-        // Short-circuit: if a is true, don't evaluate b
-        let int_type = types.int_id;
-
-        let func = FunctionDef {
-            return_type: int_type,
-            name: test_id,
-            params: vec![
-                Parameter {
-                    name: Some(a_id),
-                    typ: int_type,
-                },
-                Parameter {
-                    name: Some(b_id),
-                    typ: int_type,
-                },
-            ],
-            body: Stmt::Return(Some(Expr::binary(
-                BinaryOp::LogOr,
-                Expr::var_typed(a_id, int_type),
-                Expr::var_typed(b_id, int_type),
-                &types,
-            ))),
-            pos: test_pos(),
-        };
-        let tu = TranslationUnit {
-            items: vec![ExternalDecl::FunctionDef(func)],
-        };
-
-        let module = test_linearize(&tu, &types, &strings);
-        let ir = format!("{}", module);
-
-        // Short-circuit OR should have:
-        // 1. A conditional branch (cbr) to skip evaluation of b if a is true
-        // 2. A phi node to merge the result
-        assert!(
-            ir.contains("cbr"),
-            "Short-circuit OR should have conditional branch: {}",
-            ir
-        );
-        assert!(
-            ir.contains("phi"),
-            "Short-circuit OR should have phi node: {}",
-            ir
-        );
-    }
 }
 
 // Additional tests in separate file to keep this file manageable

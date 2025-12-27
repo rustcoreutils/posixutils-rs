@@ -612,9 +612,13 @@ mod tests {
         let types = TypeTable::new(64);
         let mut func = Function::new("test", types.int_id);
 
-        for p in pseudos {
-            func.add_pseudo(p);
+        for p in &pseudos {
+            func.add_pseudo(p.clone());
         }
+
+        // Set next_pseudo to be after the highest pseudo ID
+        let max_id = pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
+        func.next_pseudo = max_id + 1;
 
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));

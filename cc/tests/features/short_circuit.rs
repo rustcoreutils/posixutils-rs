@@ -340,6 +340,80 @@ int main(void) {
 }
 
 // ============================================================================
+// Pre-increment/pre-decrement in ternary (impure expressions)
+// ============================================================================
+
+#[test]
+fn ternary_pre_inc_dec() {
+    let code = r#"
+int main(void) {
+    // Test 1: Pre-increment in ternary - only selected branch evaluated
+    int x = 10, y = 20;
+    int result = (1 ? ++x : ++y);
+    if (result != 11) return 1;
+    if (x != 11) return 2;     // x was incremented
+    if (y != 20) return 3;     // y was NOT incremented
+
+    // Test 2: Pre-increment in false branch
+    x = 10; y = 20;
+    result = (0 ? ++x : ++y);
+    if (result != 21) return 4;
+    if (x != 10) return 5;     // x was NOT incremented
+    if (y != 21) return 6;     // y was incremented
+
+    // Test 3: Pre-decrement in ternary
+    x = 10; y = 20;
+    result = (1 ? --x : --y);
+    if (result != 9) return 7;
+    if (x != 9) return 8;      // x was decremented
+    if (y != 20) return 9;     // y was NOT decremented
+
+    // Test 4: Pre-decrement in false branch
+    x = 10; y = 20;
+    result = (0 ? --x : --y);
+    if (result != 19) return 10;
+    if (x != 10) return 11;    // x was NOT decremented
+    if (y != 19) return 12;    // y was decremented
+
+    // Test 5: Variable condition with pre-increment
+    int cond = 5;
+    x = 100; y = 200;
+    result = (cond ? ++x : ++y);
+    if (result != 101) return 13;
+    if (x != 101) return 14;
+    if (y != 200) return 15;
+
+    // Test 6: Zero variable condition with pre-increment
+    cond = 0;
+    x = 100; y = 200;
+    result = (cond ? ++x : ++y);
+    if (result != 201) return 16;
+    if (x != 100) return 17;
+    if (y != 201) return 18;
+
+    // Test 7: Mixed pre-inc and pre-dec
+    x = 50; y = 50;
+    result = (1 ? ++x : --y);
+    if (result != 51) return 19;
+    if (x != 51) return 20;
+    if (y != 50) return 21;
+
+    // Test 8: Pre-increment in nested ternary
+    x = 0; y = 0;
+    int z = 0;
+    result = (1 ? (0 ? ++x : ++y) : ++z);
+    if (result != 1) return 22;
+    if (x != 0) return 23;     // x NOT incremented
+    if (y != 1) return 24;     // y incremented (inner false branch)
+    if (z != 0) return 25;     // z NOT incremented (outer false branch)
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ternary_pre_inc_dec", code), 0);
+}
+
+// ============================================================================
 // Edge cases and complex scenarios
 // ============================================================================
 

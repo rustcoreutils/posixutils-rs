@@ -2501,8 +2501,11 @@ impl<'a> Linearizer<'a> {
                 self.is_pure_expr(left) && self.is_pure_expr(right)
             }
 
-            // Unary ops are pure if operand is pure (no side-effect ops here)
-            ExprKind::Unary { operand, .. } => self.is_pure_expr(operand),
+            // Unary ops are pure if operand is pure, except for pre-inc/dec
+            ExprKind::Unary { op, operand, .. } => match op {
+                UnaryOp::PreInc | UnaryOp::PreDec => false,
+                _ => self.is_pure_expr(operand),
+            },
 
             // Post-increment/decrement have side effects
             ExprKind::PostInc(_) | ExprKind::PostDec(_) => false,

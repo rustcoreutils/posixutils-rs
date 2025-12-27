@@ -26,7 +26,7 @@ jobs:
           echo "=== Toolchain ==="
           rustc --version
           cargo --version
-          cl /? 2>&1 | findstr /C:"Version" || echo "MSVC not in PATH"
+          if (Get-Command cl -ErrorAction SilentlyContinue) { cl /? 2>&1 | findstr /C:"Version" } else { echo "MSVC not in PATH" }
       - name: Fetch
         run: cargo fetch
       - name: Build

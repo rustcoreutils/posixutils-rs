@@ -994,6 +994,7 @@ impl X86_64CodeGen {
     }
 
     pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32) {
+        let actual_size = size; // Keep original size for sub-32-bit handling
         let size = size.max(32);
         let op_size = OperandSize::from_bits(size);
         let loc = self.get_location(src);
@@ -1011,26 +1012,54 @@ impl X86_64CodeGen {
             }
             Loc::Stack(offset) => {
                 let adjusted = offset + self.callee_saved_offset;
-                // LIR: memory-to-register move
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
-                    dst: GpOperand::Reg(dst),
-                });
+                // For sub-32-bit values, use zero-extending load to avoid garbage in upper bits
+                if actual_size < 32 {
+                    // LIR: zero-extending memory-to-register move
+                    self.push_lir(X86Inst::Movzx {
+                        src_size: OperandSize::from_bits(actual_size),
+                        dst_size: OperandSize::B32,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst,
+                    });
+                } else {
+                    // LIR: memory-to-register move
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst: GpOperand::Reg(dst),
+                    });
+                }
             }
             Loc::IncomingArg(offset) => {
-                // LIR: memory-to-register move from incoming stack arg
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset,
-                    }),
-                    dst: GpOperand::Reg(dst),
-                });
+                // For sub-32-bit values, use zero-extending load
+                if actual_size < 32 {
+                    // LIR: zero-extending memory-to-register move from incoming stack arg
+                    self.push_lir(X86Inst::Movzx {
+                        src_size: OperandSize::from_bits(actual_size),
+                        dst_size: OperandSize::B32,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset,
+                        }),
+                        dst,
+                    });
+                } else {
+                    // LIR: memory-to-register move from incoming stack arg
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset,
+                        }),
+                        dst: GpOperand::Reg(dst),
+                    });
+                }
             }
             Loc::Imm(v) => {
                 // x86-64: movl sign-extends to 64-bit, movq only works with 32-bit signed immediates
@@ -1114,18 +1143,47 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                // Use actual size for memory stores (8, 16, 32, 64 bits)
                 let adjusted = offset + self.callee_saved_offset;
-                let op_size = OperandSize::from_bits(size);
-                // LIR: register-to-memory move
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(src),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
-                });
+                // For sub-32-bit values, first zero-extend to 32 bits then store 32 bits.
+                // This ensures that subsequent 32-bit loads get correct values.
+                if size < 32 {
+                    // Use scratch register to avoid modifying source
+                    let scratch = if src == Reg::R10 { Reg::R11 } else { Reg::R10 };
+                    // Copy to scratch
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(src),
+                        dst: GpOperand::Reg(scratch),
+                    });
+                    // Zero-extend by masking to the appropriate size
+                    let mask = (1i64 << size) - 1;
+                    self.push_lir(X86Inst::And {
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(mask),
+                        dst: scratch,
+                    });
+                    // Store 32 bits
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(scratch),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                    });
+                } else {
+                    // Store with actual size
+                    let op_size = OperandSize::from_bits(size);
+                    // LIR: register-to-memory move
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(src),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                    });
+                }
             }
             _ => {}
         }

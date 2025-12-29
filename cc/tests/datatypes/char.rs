@@ -990,3 +990,74 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("char_advanced", code), 0);
 }
+
+// ============================================================================
+// Char: Stack Spill/Reload Regression Test
+// Tests that char values passed through stack or spilled to stack preserve
+// correct values without garbage in upper register bits (regression test for
+// movzx fix in x86_64 codegen)
+// ============================================================================
+
+#[test]
+fn char_stack_spill_reload() {
+    let code = r#"
+// Force char/unsigned char values through the stack by having many parameters
+// On x86_64: first 6 integer args go to registers, rest go to stack
+// This tests that char values are properly zero-extended when reloaded
+
+char add_many_chars(char a, char b, char c, char d, char e, char f,
+                    char g, char h, char i, char j, char k, char l) {
+    // g through l should be on the stack on x86_64
+    return a + b + c + d + e + f + g + h + i + j + k + l;
+}
+
+unsigned char add_many_uchars(unsigned char a, unsigned char b, unsigned char c,
+                               unsigned char d, unsigned char e, unsigned char f,
+                               unsigned char g, unsigned char h, unsigned char i,
+                               unsigned char j, unsigned char k, unsigned char l) {
+    return a + b + c + d + e + f + g + h + i + j + k + l;
+}
+
+// Test that char local variables spilled across function calls are preserved
+char test_char_spill(char x) {
+    // Force x to be spilled by calling a function
+    char saved = x;
+    // dummy call that might clobber registers
+    char y = add_many_chars(1,2,3,4,5,6,7,8,9,10,11,12);
+    // Use saved value - if upper bits were garbage, comparison would fail
+    return saved + y;
+}
+
+int main(void) {
+    // Test 1: Many char args (sum = 1+2+...+12 = 78)
+    char result1 = add_many_chars(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    if (result1 != 78) return 1;
+
+    // Test 2: Many unsigned char args (same sum)
+    unsigned char result2 = add_many_uchars(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    if (result2 != 78) return 2;
+
+    // Test 3: Char spill across function call
+    char result3 = test_char_spill(10);
+    // 10 + 78 = 88
+    if (result3 != 88) return 3;
+
+    // Test 4: Verify specific char values from stack args
+    // Use values that would be corrupted if high bits contain garbage
+    // e.g., if loaded as 32-bit without zero-extend, upper bits might be 0xFF
+    char result4 = add_many_chars(0, 0, 0, 0, 0, 0,
+                                   1, 2, 3, 4, 5, 6);  // g-l on stack
+    // sum = 1+2+3+4+5+6 = 21
+    if (result4 != 21) return 4;
+
+    // Test 5: Large unsigned char values (test zero-extension, not sign-extension)
+    unsigned char result5 = add_many_uchars(0, 0, 0, 0, 0, 0,
+                                             200, 10, 5, 5, 0, 0);
+    // sum = 200+10+5+5 = 220
+    if (result5 != 220) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("char_stack_spill", code), 0);
+}

@@ -725,7 +725,12 @@ impl<'a> Linearizer<'a> {
             }
 
             TypeKind::Struct | TypeKind::Union => {
-                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                // Resolve incomplete struct types to their complete definitions
+                // This is needed when a typedef to an incomplete struct is used
+                // before the struct is fully defined (forward declaration pattern)
+                let resolved_typ = self.resolve_struct_type(typ);
+                let resolved_size = (self.types.size_bits(resolved_typ) / 8) as usize;
+                if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members = &composite.members;
                     let mut init_fields = Vec::new();
                     let mut current_field_idx = 0;
@@ -765,7 +770,7 @@ impl<'a> Linearizer<'a> {
                     init_fields.sort_by_key(|(offset, _, _)| *offset);
 
                     Initializer::Struct {
-                        total_size,
+                        total_size: resolved_size,
                         fields: init_fields,
                     }
                 } else {
@@ -1691,8 +1696,12 @@ impl<'a> Linearizer<'a> {
                 }
             }
             TypeKind::Struct | TypeKind::Union => {
+                // Resolve incomplete struct types to their complete definitions
+                // This is needed when a typedef to an incomplete struct is used
+                // before the struct is fully defined (forward declaration pattern)
+                let resolved_typ = self.resolve_struct_type(typ);
                 // Get struct fields from the type's composite data
-                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     // Clone members to avoid borrow issues
                     let members: Vec<_> = composite.members.clone();
 

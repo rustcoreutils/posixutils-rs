@@ -1397,6 +1397,7 @@ impl Aarch64CodeGen {
     }
 
     pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32, frame_size: i32) {
+        let actual_size = size; // Keep original size for sub-32-bit stack loads
         let size = size.max(32);
         let loc = self.get_location(src);
         let op_size = OperandSize::from_bits(size);
@@ -1413,9 +1414,12 @@ impl Aarch64CodeGen {
             }
             Loc::Stack(offset) => {
                 let actual_offset = self.stack_offset(frame_size, offset);
+                // For sub-32-bit values, use sized load (ldrb/ldrh) which zero-extends.
+                // This avoids reading garbage from adjacent stack bytes.
+                let load_size = OperandSize::from_bits(actual_size.max(8));
                 // LIR: load from stack (FP-relative for alloca safety)
                 self.push_lir(Aarch64Inst::Ldr {
-                    size: op_size,
+                    size: load_size,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: actual_offset,

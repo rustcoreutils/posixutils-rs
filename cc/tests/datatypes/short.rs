@@ -885,3 +885,80 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("short_advanced", code), 0);
 }
+
+// ============================================================================
+// Short: Stack Spill/Reload Regression Test
+// Tests that short values passed through stack or spilled to stack preserve
+// correct values without garbage in upper register bits (regression test for
+// movzx fix in x86_64 codegen)
+// ============================================================================
+
+#[test]
+fn short_stack_spill_reload() {
+    let code = r#"
+// Force short/unsigned short values through the stack by having many parameters
+// On x86_64: first 6 integer args go to registers, rest go to stack
+// This tests that short values are properly zero-extended when reloaded
+
+int add_many_shorts(short a, short b, short c, short d, short e, short f,
+                    short g, short h, short i, short j, short k, short l) {
+    // g through l should be on the stack on x86_64
+    return a + b + c + d + e + f + g + h + i + j + k + l;
+}
+
+unsigned int add_many_ushorts(unsigned short a, unsigned short b, unsigned short c,
+                               unsigned short d, unsigned short e, unsigned short f,
+                               unsigned short g, unsigned short h, unsigned short i,
+                               unsigned short j, unsigned short k, unsigned short l) {
+    return a + b + c + d + e + f + g + h + i + j + k + l;
+}
+
+// Test that short local variables spilled across function calls are preserved
+int test_short_spill(short x) {
+    // Force x to be spilled by calling a function
+    short saved = x;
+    // dummy call that might clobber registers
+    int y = add_many_shorts(100, 200, 300, 400, 500, 600,
+                            700, 800, 900, 1000, 1100, 1200);
+    // Use saved value - if upper bits were garbage, comparison would fail
+    return saved + y;
+}
+
+int main(void) {
+    // Test 1: Many short args (sum = 100+200+...+1200 = 7800)
+    int result1 = add_many_shorts(100, 200, 300, 400, 500, 600,
+                                   700, 800, 900, 1000, 1100, 1200);
+    if (result1 != 7800) return 1;
+
+    // Test 2: Many unsigned short args (same sum)
+    unsigned int result2 = add_many_ushorts(100, 200, 300, 400, 500, 600,
+                                             700, 800, 900, 1000, 1100, 1200);
+    if (result2 != 7800) return 2;
+
+    // Test 3: Short spill across function call
+    int result3 = test_short_spill(1000);
+    // 1000 + 7800 = 8800
+    if (result3 != 8800) return 3;
+
+    // Test 4: Verify stack args preserve values
+    int result4 = add_many_shorts(0, 0, 0, 0, 0, 0,
+                                   1000, 2000, 3000, 4000, 5000, 6000);  // g-l on stack
+    // sum = 1000+2000+3000+4000+5000+6000 = 21000
+    if (result4 != 21000) return 4;
+
+    // Test 5: Large unsigned short values (test zero-extension)
+    unsigned int result5 = add_many_ushorts(0, 0, 0, 0, 0, 0,
+                                             50000, 10000, 5000, 100, 0, 0);
+    // sum = 50000+10000+5000+100 = 65100
+    if (result5 != 65100) return 5;
+
+    // Test 6: Negative short values (test sign preservation when widened)
+    int result6 = add_many_shorts(-100, -200, -300, -400, -500, -600,
+                                   -700, -800, -900, -1000, -1100, -1200);
+    if (result6 != -7800) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("short_stack_spill", code), 0);
+}

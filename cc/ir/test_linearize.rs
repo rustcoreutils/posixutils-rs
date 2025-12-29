@@ -13,10 +13,11 @@
 use super::*;
 use crate::parse::ast::{
     AssignOp, BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator,
-    Parameter, UnaryOp,
+    InitElement, Parameter, UnaryOp,
 };
 use crate::strings::StringTable;
-use crate::types::Type;
+use crate::symbol::Symbol;
+use crate::types::{CompositeType, StructMember, Type};
 
 /// Create a default position for test code
 fn test_pos() -> Position {
@@ -2530,6 +2531,161 @@ fn test_string_literal_char_pointer_init() {
     assert!(
         !module.strings.is_empty(),
         "Module should contain string literal: {}",
+        ir
+    );
+}
+
+// ============================================================================
+// Incomplete struct type resolution test (regression test for forward declarations)
+// Tests the fix in resolve_struct_type() that resolves incomplete struct types
+// to their complete definitions when processing initializers.
+// ============================================================================
+
+/// Helper to linearize with a custom symbol table (for testing struct resolution)
+fn test_linearize_with_symbols(
+    tu: &TranslationUnit,
+    symbols: &SymbolTable,
+    types: &TypeTable,
+    strings: &StringTable,
+) -> Module {
+    let target = Target::host();
+    linearize(tu, symbols, types, strings, &target)
+}
+
+#[test]
+fn test_incomplete_struct_type_resolution() {
+    // This test verifies that when a typedef refers to an incomplete struct,
+    // the linearizer correctly resolves it to the complete struct definition
+    // when processing struct initializers.
+    //
+    // Pattern being tested:
+    //   typedef struct foo foo_t;  // incomplete at this point
+    //   struct foo { int x; int y; };  // complete definition
+    //   foo_t f = {1, 2};  // should use complete struct's size (8 bytes), not 0
+    //
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let mut symbols = SymbolTable::new();
+    let test_id = strings.intern("test");
+    let foo_tag = strings.intern("foo");
+    let f_id = strings.intern("f");
+    let x_id = strings.intern("x");
+    let y_id = strings.intern("y");
+    let int_type = types.int_id;
+
+    // Create the complete struct type: struct foo { int x; int y; }
+    let complete_composite = CompositeType {
+        tag: Some(foo_tag),
+        members: vec![
+            StructMember {
+                name: x_id,
+                typ: int_type,
+                offset: 0,
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+            },
+            StructMember {
+                name: y_id,
+                typ: int_type,
+                offset: 4, // Second int at offset 4 bytes
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+            },
+        ],
+        enum_constants: vec![],
+        size: 8,  // 2 ints = 8 bytes
+        align: 4, // int alignment
+        is_complete: true,
+    };
+    let complete_struct_type = types.intern(Type::struct_type(complete_composite));
+
+    // Register the complete struct in the symbol table as a tag
+    symbols
+        .declare(Symbol::tag(foo_tag, complete_struct_type, 0))
+        .expect("Failed to declare tag");
+
+    // Verify the symbol table is correctly set up
+    let looked_up = symbols.lookup_tag(foo_tag);
+    assert!(
+        looked_up.is_some(),
+        "Symbol table should contain tag for 'foo'"
+    );
+    assert_eq!(
+        looked_up.unwrap().typ,
+        complete_struct_type,
+        "Tag should point to complete struct type"
+    );
+
+    // Create an incomplete struct type with the same tag
+    // This simulates what happens with: typedef struct foo foo_t; (before struct foo is defined)
+    let incomplete_composite = CompositeType::incomplete(Some(foo_tag));
+    let incomplete_struct_type = types.intern(Type::struct_type(incomplete_composite));
+
+    // Verify the incomplete type has size 0 before resolution
+    assert_eq!(
+        types.size_bytes(incomplete_struct_type),
+        0,
+        "Incomplete struct should have size 0"
+    );
+
+    // Create an initializer list: {1, 2}
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(1, &types)),
+                },
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(2, &types)),
+                },
+            ],
+        },
+        incomplete_struct_type,
+    );
+
+    // Create function: void test() { foo_t f = {1, 2}; }
+    // Using the incomplete struct type for the declaration
+    let func = FunctionDef {
+        return_type: types.void_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![BlockItem::Declaration(Declaration {
+            declarators: vec![InitDeclarator {
+                name: f_id,
+                typ: incomplete_struct_type,
+                init: Some(init_list),
+                vla_sizes: vec![],
+            }],
+        })]),
+        pos: test_pos(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    // Linearize with the symbol table that has the complete struct registered
+    let module = test_linearize_with_symbols(&tu, &symbols, &types, &strings);
+    let ir = format!("{}", module);
+
+    // The IR should show stores to the struct fields at proper offsets
+    // Without the fix, the initializer would have total_size=0 and generate no stores
+    assert!(
+        ir.contains("store"),
+        "Struct initializer should generate store instructions. \
+         This would fail if incomplete struct type was not resolved. IR:\n{}",
+        ir
+    );
+
+    // Should have at least 2 stores (one for each field: x and y)
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 2,
+        "Should have at least 2 stores for struct fields (x, y), got {}: {}",
+        store_count,
         ir
     );
 }

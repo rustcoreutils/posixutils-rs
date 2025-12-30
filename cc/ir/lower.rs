@@ -466,7 +466,7 @@ mod tests {
                 size: 32,
             },
             CopyInfo {
-                target: PseudoId(2), // b
+                target: PseudoId(2),  // b
                 source: PseudoId(10), // x
                 size: 32,
             },
@@ -507,10 +507,7 @@ mod tests {
 
         // First copy should save one of the sources to a temp
         let temp_id = result[0].target;
-        assert!(
-            temp_id.0 >= 100,
-            "Temp should be a new pseudo (id >= 100)"
-        );
+        assert!(temp_id.0 >= 100, "Temp should be a new pseudo (id >= 100)");
 
         // Verify the cycle is broken: we can now execute sequentially
         // The exact order depends on which source was saved first

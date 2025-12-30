@@ -28,6 +28,7 @@ mod ops_struct;
 mod optimization;
 mod popcount;
 mod setjmp;
+mod shift_regalloc;
 mod short_circuit;
 mod stmt_expr;
 mod storage;

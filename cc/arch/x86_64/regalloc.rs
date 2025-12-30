@@ -479,6 +479,7 @@ impl RegAlloc {
         let call_positions = find_call_positions(func);
 
         self.spill_args_across_calls(func, &intervals, &call_positions);
+        self.spill_args_across_constraints(func, &intervals, &constraint_points);
         self.allocate_alloca_to_stack(func);
         self.run_linear_scan(func, types, intervals, &call_positions, &constraint_points);
 
@@ -601,6 +602,53 @@ impl RegAlloc {
     /// Get arguments that were spilled from caller-saved registers
     pub fn spilled_args(&self) -> &[SpilledArg] {
         &self.spilled_args
+    }
+
+    /// Spill arguments in registers that would be clobbered by constraint points (e.g., shifts)
+    ///
+    /// For example, if the 4th parameter is in Rcx and the function contains variable shifts,
+    /// Rcx will be clobbered when the shift count is loaded. We must spill such arguments
+    /// to the stack before they get clobbered.
+    fn spill_args_across_constraints(
+        &mut self,
+        _func: &Function,
+        intervals: &[LiveInterval],
+        constraint_points: &[ConstraintPoint<Reg>],
+    ) {
+        // For each argument in a register, check if its interval is live across
+        // any constraint point that clobbers that register
+        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        for interval in intervals {
+            if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
+                if int_arg_regs_set.contains(reg) {
+                    // Check if this register is clobbered by any constraint point
+                    // while the interval is live (and the pseudo is not involved)
+                    let needs_spill = constraint_points.iter().any(|cp| {
+                        interval.start <= cp.position
+                            && cp.position <= interval.end
+                            && !cp.involved_pseudos.contains(&interval.pseudo)
+                            && cp.clobbers.contains(reg)
+                    });
+
+                    if needs_spill {
+                        let from_reg = *reg;
+                        self.stack_offset += 8;
+                        let to_stack_offset = self.stack_offset;
+
+                        // Record the spill for codegen to emit stores in prologue
+                        self.spilled_args.push(SpilledArg {
+                            pseudo: interval.pseudo,
+                            from_reg,
+                            to_stack_offset,
+                        });
+
+                        self.locations
+                            .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                        self.free_regs.push(from_reg);
+                    }
+                }
+            }
+        }
     }
 
     /// Force alloca results to stack to avoid clobbering issues

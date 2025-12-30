@@ -1836,9 +1836,14 @@ impl<'a> Linearizer<'a> {
         // Condition block
         self.switch_bb(cond_bb);
         let cond_val = self.linearize_expr(cond);
-        self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-        self.link_bb(cond_bb, body_bb);
-        self.link_bb(cond_bb, exit_bb);
+        // After linearizing condition, current_bb may be different from cond_bb
+        // (e.g., if condition contains short-circuit operators like && or ||).
+        // Link the CURRENT block to body_bb and exit_bb.
+        if let Some(cond_end_bb) = self.current_bb {
+            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+            self.link_bb(cond_end_bb, body_bb);
+            self.link_bb(cond_end_bb, exit_bb);
+        }
 
         // Body block
         self.break_targets.push(exit_bb);
@@ -1895,9 +1900,14 @@ impl<'a> Linearizer<'a> {
         // Condition block
         self.switch_bb(cond_bb);
         let cond_val = self.linearize_expr(cond);
-        self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-        self.link_bb(cond_bb, body_bb);
-        self.link_bb(cond_bb, exit_bb);
+        // After linearizing condition, current_bb may be different from cond_bb
+        // (e.g., if condition contains short-circuit operators like && or ||).
+        // Link the CURRENT block to body_bb and exit_bb.
+        if let Some(cond_end_bb) = self.current_bb {
+            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+            self.link_bb(cond_end_bb, body_bb);
+            self.link_bb(cond_end_bb, exit_bb);
+        }
 
         // Exit block
         self.switch_bb(exit_bb);
@@ -1937,13 +1947,20 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(cond_bb);
         if let Some(cond_expr) = cond {
             let cond_val = self.linearize_expr(cond_expr);
-            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+            // After linearizing condition, current_bb may be different from cond_bb
+            // (e.g., if condition contains short-circuit operators like && or ||).
+            // Link the CURRENT block to body_bb and exit_bb.
+            if let Some(cond_end_bb) = self.current_bb {
+                self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+                self.link_bb(cond_end_bb, body_bb);
+                self.link_bb(cond_end_bb, exit_bb);
+            }
         } else {
             // No condition = always true
             self.emit(Instruction::br(body_bb));
+            self.link_bb(cond_bb, body_bb);
+            // No link to exit_bb since we always enter the body
         }
-        self.link_bb(cond_bb, body_bb);
-        self.link_bb(cond_bb, exit_bb);
 
         // Body block
         self.break_targets.push(exit_bb);

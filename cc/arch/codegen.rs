@@ -209,7 +209,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // Check storage class - skip .globl for static
         let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
 
-        // Get alignment from type info
+        // Get alignment from type info - use natural alignment per ABI
         let align = types.alignment(*typ) as u32;
 
         // Use .comm for uninitialized external (non-static) globals

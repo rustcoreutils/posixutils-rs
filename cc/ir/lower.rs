@@ -412,4 +412,154 @@ mod tests {
             "Copy should be before branch"
         );
     }
+
+    // ========================================================================
+    // Tests for sequentialize_copies (parallel copy sequentialization)
+    // ========================================================================
+
+    fn make_minimal_func() -> Function {
+        let types = TypeTable::new(64);
+        let int_type = types.int_id;
+        let mut func = Function::new("test", int_type);
+        func.next_pseudo = 100; // Start high to avoid conflicts
+        func
+    }
+
+    #[test]
+    fn test_sequentialize_no_overlap() {
+        // No overlapping targets/sources - should return copies unchanged
+        // a = x, b = y (completely independent)
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1),
+                source: PseudoId(10),
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2),
+                source: PseudoId(20),
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert_eq!(result.len(), 2);
+        // Order preserved, no temporaries created
+        assert_eq!(result[0].target, PseudoId(1));
+        assert_eq!(result[0].source, PseudoId(10));
+        assert_eq!(result[1].target, PseudoId(2));
+        assert_eq!(result[1].source, PseudoId(20));
+    }
+
+    #[test]
+    fn test_sequentialize_simple_reorder() {
+        // Needs reordering but no cycle: a = b, c = d, b = x
+        // b is a target and a source, but there's no cycle
+        // Safe order: a = b first (reads b), then b = x (writes b)
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2), // b
+                source: PseudoId(10), // x
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert_eq!(result.len(), 2);
+        // a = b must come before b = x
+        assert_eq!(result[0].target, PseudoId(1)); // a = b
+        assert_eq!(result[0].source, PseudoId(2));
+        assert_eq!(result[1].target, PseudoId(2)); // b = x
+        assert_eq!(result[1].source, PseudoId(10));
+    }
+
+    #[test]
+    fn test_sequentialize_simple_cycle() {
+        // Simple 2-node cycle: a = b, b = a
+        // Requires temporary: temp = a, a = b, b = temp
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2), // b
+                source: PseudoId(1), // a
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        // Should have 3 copies: temp = source, then the two original copies
+        assert_eq!(result.len(), 3, "Cycle requires temporary variable");
+
+        // First copy should save one of the sources to a temp
+        let temp_id = result[0].target;
+        assert!(
+            temp_id.0 >= 100,
+            "Temp should be a new pseudo (id >= 100)"
+        );
+
+        // Verify the cycle is broken: we can now execute sequentially
+        // The exact order depends on which source was saved first
+        let targets: Vec<_> = result.iter().map(|c| c.target).collect();
+        assert!(targets.contains(&PseudoId(1)), "Must write to a");
+        assert!(targets.contains(&PseudoId(2)), "Must write to b");
+    }
+
+    #[test]
+    fn test_sequentialize_three_node_cycle() {
+        // 3-node cycle: a = b, b = c, c = a
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2), // b
+                source: PseudoId(3), // c
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(3), // c
+                source: PseudoId(1), // a
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        // Should have 4 copies: one temp save + 3 original
+        assert_eq!(result.len(), 4, "3-node cycle requires one temporary");
+
+        // Verify all original targets are written
+        let targets: Vec<_> = result.iter().map(|c| c.target).collect();
+        assert!(targets.contains(&PseudoId(1)));
+        assert!(targets.contains(&PseudoId(2)));
+        assert!(targets.contains(&PseudoId(3)));
+    }
+
+    #[test]
+    fn test_sequentialize_empty() {
+        let mut func = make_minimal_func();
+        let copies: Vec<CopyInfo> = vec![];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert!(result.is_empty());
+    }
 }

@@ -294,22 +294,25 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
     let reachable = compute_reachable(func);
     let before = func.blocks.len();
 
+    // Compute unreachable set BEFORE removing blocks
+    let all_block_ids: HashSet<_> = func.blocks.iter().map(|bb| bb.id).collect();
+    let unreachable: HashSet<_> = all_block_ids.difference(&reachable).copied().collect();
+
     // Remove unreachable blocks
     func.blocks.retain(|bb| reachable.contains(&bb.id));
 
     // Update parent/child references to remove dead blocks
-    let unreachable: HashSet<_> = func
-        .blocks
-        .iter()
-        .map(|bb| bb.id)
-        .collect::<HashSet<_>>()
-        .difference(&reachable)
-        .copied()
-        .collect();
-
     for bb in &mut func.blocks {
         bb.parents.retain(|p| !unreachable.contains(p));
         bb.children.retain(|c| !unreachable.contains(c));
+
+        // Also clean phi_list entries that reference removed blocks
+        for insn in &mut bb.insns {
+            if insn.op == Opcode::Phi {
+                insn.phi_list
+                    .retain(|(pred, _)| !unreachable.contains(pred));
+            }
+        }
     }
 
     func.blocks.len() < before

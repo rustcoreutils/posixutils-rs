@@ -15,7 +15,7 @@
 // - Phi elimination: Converts SSA phi nodes to copy instructions
 //
 
-use super::{BasicBlockId, Function, Instruction, Module, Opcode};
+use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -50,6 +50,20 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
 
                     // For each incoming edge in the phi
                     for (pred_bb, src_pseudo) in &insn.phi_list {
+                        // Skip copies from undef sources - they represent uninitialized
+                        // values and copying from them would read garbage.
+                        // This is safe because if we reach this phi via the undef path,
+                        // the value is semantically undefined anyway.
+                        let is_undef = func
+                            .pseudos
+                            .iter()
+                            .find(|p| p.id == *src_pseudo)
+                            .is_some_and(|p| matches!(p.kind, PseudoKind::Undef));
+
+                        if is_undef {
+                            continue;
+                        }
+
                         let copy_info = CopyInfo {
                             target,
                             source: *src_pseudo,
@@ -70,13 +84,18 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
     }
 
     // Insert copy instructions at the end of predecessor blocks
+    // Use parallel copy sequentialization to handle the "lost copy" problem
+    //
+    // First sequentialize all copies (may create temporaries), then insert
+    let mut sequenced_copies: HashMap<BasicBlockId, Vec<CopyInfo>> = HashMap::new();
     for (pred_bb_id, copies) in copies_to_insert {
+        let sequenced = sequentialize_copies(&copies, func);
+        sequenced_copies.insert(pred_bb_id, sequenced);
+    }
+
+    // Now insert the sequenced copies into blocks
+    for (pred_bb_id, copies) in sequenced_copies {
         if let Some(pred_bb) = func.get_block_mut(pred_bb_id) {
-            // Insert copies before the terminator
-            // Note: If there are multiple copies, they should logically execute
-            // in parallel (this is the "lost copy" problem). For now, we insert
-            // them sequentially which works for non-overlapping cases.
-            // A proper solution would use parallel copy sequentialization.
             for copy_info in copies {
                 let copy_insn = Instruction::new(Opcode::Copy)
                     .with_target(copy_info.target)
@@ -109,6 +128,99 @@ struct CopyInfo {
     target: crate::ir::PseudoId,
     source: crate::ir::PseudoId,
     size: u32,
+}
+
+/// Sequentialize parallel copies to handle the "lost copy" problem.
+///
+/// When multiple phi nodes in the same block have overlapping targets and sources,
+/// naive sequential insertion can corrupt values. For example:
+///
+///   %a = phi [pred: %b]
+///   %b = phi [pred: %a]
+///
+/// If we naively emit:
+///   %a = copy %b
+///   %b = copy %a   // BUG: %a already overwritten!
+///
+/// The solution is to:
+/// 1. Detect when a target is used as a source in another copy
+/// 2. Order copies so targets are written before they're read as sources
+/// 3. For cycles, break them using a temporary variable
+///
+/// Algorithm (based on "Translating Out of SSA" by Sreedhar et al.):
+/// - A copy is "free" if its TARGET is not used as SOURCE by any other pending copy
+/// - Process free copies first (writing to a target that no one else needs to read)
+/// - For cycles, save one source to a temp, update all uses, then continue
+fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInfo> {
+    use std::collections::HashSet;
+
+    if copies.is_empty() {
+        return Vec::new();
+    }
+
+    // If no overlapping targets/sources, return copies as-is
+    let targets: HashSet<_> = copies.iter().map(|c| c.target).collect();
+    let sources: HashSet<_> = copies.iter().map(|c| c.source).collect();
+    let overlap: HashSet<_> = targets.intersection(&sources).copied().collect();
+
+    if overlap.is_empty() {
+        return copies.to_vec();
+    }
+
+    // There are overlapping targets and sources - need to sequentialize
+    let mut result = Vec::new();
+    let mut pending: Vec<CopyInfo> = copies.to_vec();
+
+    // Keep processing until all copies are emitted
+    while !pending.is_empty() {
+        // Find a "free" copy: its TARGET is not used as SOURCE by any OTHER pending copy
+        // This means we can safely overwrite the target without destroying a value someone needs
+        let free_idx = pending.iter().enumerate().position(|(idx, copy)| {
+            !pending
+                .iter()
+                .enumerate()
+                .any(|(other_idx, other)| other_idx != idx && other.source == copy.target)
+        });
+
+        if let Some(idx) = free_idx {
+            // Safe to emit this copy - its target isn't needed by anyone else
+            let copy = pending.remove(idx);
+            result.push(copy);
+        } else {
+            // All remaining copies form cycles - break with a temporary
+            // Every target is used as a source by someone else
+            //
+            // Pick any copy and save its SOURCE to a temp, then update all copies
+            // that use this source to use the temp instead.
+            let copy = &pending[0];
+            let original_source = copy.source;
+            let copy_size = copy.size;
+
+            // Create a temporary pseudo to hold the original source value
+            let temp_id = super::PseudoId(func.next_pseudo);
+            func.next_pseudo += 1;
+            let temp_pseudo = super::Pseudo::reg(temp_id, temp_id.0);
+            func.add_pseudo(temp_pseudo);
+
+            // Emit: temp = copy source (save the source before it gets overwritten)
+            result.push(CopyInfo {
+                target: temp_id,
+                source: original_source,
+                size: copy_size,
+            });
+
+            // Update ALL pending copies that use this source to use temp instead
+            for other in &mut pending {
+                if other.source == original_source {
+                    other.source = temp_id;
+                }
+            }
+            // Note: don't remove any copy yet - they'll be emitted in subsequent iterations
+            // Now at least one copy should be "free" because we broke a dependency
+        }
+    }
+
+    result
 }
 
 // ============================================================================
@@ -299,5 +411,152 @@ mod tests {
             Opcode::Copy,
             "Copy should be before branch"
         );
+    }
+
+    // ========================================================================
+    // Tests for sequentialize_copies (parallel copy sequentialization)
+    // ========================================================================
+
+    fn make_minimal_func() -> Function {
+        let types = TypeTable::new(64);
+        let int_type = types.int_id;
+        let mut func = Function::new("test", int_type);
+        func.next_pseudo = 100; // Start high to avoid conflicts
+        func
+    }
+
+    #[test]
+    fn test_sequentialize_no_overlap() {
+        // No overlapping targets/sources - should return copies unchanged
+        // a = x, b = y (completely independent)
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1),
+                source: PseudoId(10),
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2),
+                source: PseudoId(20),
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert_eq!(result.len(), 2);
+        // Order preserved, no temporaries created
+        assert_eq!(result[0].target, PseudoId(1));
+        assert_eq!(result[0].source, PseudoId(10));
+        assert_eq!(result[1].target, PseudoId(2));
+        assert_eq!(result[1].source, PseudoId(20));
+    }
+
+    #[test]
+    fn test_sequentialize_simple_reorder() {
+        // Needs reordering but no cycle: a = b, c = d, b = x
+        // b is a target and a source, but there's no cycle
+        // Safe order: a = b first (reads b), then b = x (writes b)
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2),  // b
+                source: PseudoId(10), // x
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert_eq!(result.len(), 2);
+        // a = b must come before b = x
+        assert_eq!(result[0].target, PseudoId(1)); // a = b
+        assert_eq!(result[0].source, PseudoId(2));
+        assert_eq!(result[1].target, PseudoId(2)); // b = x
+        assert_eq!(result[1].source, PseudoId(10));
+    }
+
+    #[test]
+    fn test_sequentialize_simple_cycle() {
+        // Simple 2-node cycle: a = b, b = a
+        // Requires temporary: temp = a, a = b, b = temp
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2), // b
+                source: PseudoId(1), // a
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        // Should have 3 copies: temp = source, then the two original copies
+        assert_eq!(result.len(), 3, "Cycle requires temporary variable");
+
+        // First copy should save one of the sources to a temp
+        let temp_id = result[0].target;
+        assert!(temp_id.0 >= 100, "Temp should be a new pseudo (id >= 100)");
+
+        // Verify the cycle is broken: we can now execute sequentially
+        // The exact order depends on which source was saved first
+        let targets: Vec<_> = result.iter().map(|c| c.target).collect();
+        assert!(targets.contains(&PseudoId(1)), "Must write to a");
+        assert!(targets.contains(&PseudoId(2)), "Must write to b");
+    }
+
+    #[test]
+    fn test_sequentialize_three_node_cycle() {
+        // 3-node cycle: a = b, b = c, c = a
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(2), // b
+                source: PseudoId(3), // c
+                size: 32,
+            },
+            CopyInfo {
+                target: PseudoId(3), // c
+                source: PseudoId(1), // a
+                size: 32,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        // Should have 4 copies: one temp save + 3 original
+        assert_eq!(result.len(), 4, "3-node cycle requires one temporary");
+
+        // Verify all original targets are written
+        let targets: Vec<_> = result.iter().map(|c| c.target).collect();
+        assert!(targets.contains(&PseudoId(1)));
+        assert!(targets.contains(&PseudoId(2)));
+        assert!(targets.contains(&PseudoId(3)));
+    }
+
+    #[test]
+    fn test_sequentialize_empty() {
+        let mut func = make_minimal_func();
+        let copies: Vec<CopyInfo> = vec![];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert!(result.is_empty());
     }
 }

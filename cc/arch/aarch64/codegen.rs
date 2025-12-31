@@ -51,6 +51,8 @@ pub struct Aarch64CodeGen {
     pub(super) num_fixed_gp_params: usize,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// Position-independent code mode (for shared libraries)
+    pic_mode: bool,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -75,13 +77,18 @@ impl Aarch64CodeGen {
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
             extern_symbols: HashSet::new(),
+            pic_mode: false,
         }
     }
 
-    /// Check if a symbol needs GOT access (extern on macOS)
+    /// Check if a symbol needs GOT access
+    /// - In PIC mode: all external symbols need GOT access
+    /// - On macOS: external symbols always need GOT access (even without PIC)
     #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        self.base.target.os == Os::MacOS && self.extern_symbols.contains(name)
+        let is_extern = self.extern_symbols.contains(name);
+        // PIC mode or macOS: external symbols need GOT
+        (self.pic_mode || self.base.target.os == Os::MacOS) && is_extern
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -2354,5 +2361,9 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_emit_unwind_tables(&mut self, emit: bool) {
         self.base.emit_unwind_tables = emit;
+    }
+
+    fn set_pic_mode(&mut self, pic: bool) {
+        self.pic_mode = pic;
     }
 }

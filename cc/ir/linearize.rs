@@ -2704,6 +2704,8 @@ impl<'a> Linearizer<'a> {
                                 self.types.pointer_to(static_info.typ),
                             ));
                             return result;
+                        } else {
+                            unreachable!("static local sentinel without static_locals entry");
                         }
                     }
                     let result = self.alloc_pseudo();
@@ -3627,13 +3629,19 @@ impl<'a> Linearizer<'a> {
             ExprKind::Ident { name, .. } => {
                 let name_str = self.str(*name).to_string();
                 if let Some(local) = self.locals.get(&name_str).cloned() {
-                    self.emit(Instruction::store(
-                        final_result,
-                        local.sym,
-                        0,
-                        typ,
-                        store_size,
-                    ));
+                    // Check if this is a static local (sentinel value)
+                    if local.sym.0 == u32::MAX {
+                        self.emit_static_local_store(&name_str, final_result, typ, store_size);
+                    } else {
+                        // Regular local variable
+                        self.emit(Instruction::store(
+                            final_result,
+                            local.sym,
+                            0,
+                            typ,
+                            store_size,
+                        ));
+                    }
                 } else if self.var_map.contains_key(&name_str) {
                     self.var_map.insert(name_str.clone(), final_result);
                 } else {
@@ -3930,13 +3938,19 @@ impl<'a> Linearizer<'a> {
                 ExprKind::Ident { name, .. } => {
                     let name_str = self.str(*name).to_string();
                     if let Some(local) = self.locals.get(&name_str).cloned() {
-                        self.emit(Instruction::store(
-                            final_result,
-                            local.sym,
-                            0,
-                            typ,
-                            store_size,
-                        ));
+                        // Check if this is a static local (sentinel value)
+                        if local.sym.0 == u32::MAX {
+                            self.emit_static_local_store(&name_str, final_result, typ, store_size);
+                        } else {
+                            // Regular local variable
+                            self.emit(Instruction::store(
+                                final_result,
+                                local.sym,
+                                0,
+                                typ,
+                                store_size,
+                            ));
+                        }
                     } else if self.var_map.contains_key(&name_str) {
                         self.var_map.insert(name_str.clone(), final_result);
                     } else {
@@ -4110,6 +4124,8 @@ impl<'a> Linearizer<'a> {
                         self.emit(Instruction::load(result, sym_id, 0, typ, size));
                         return result;
                     }
+                } else {
+                    unreachable!("static local sentinel without static_locals entry");
                 }
             }
             let result = self.alloc_pseudo();
@@ -4760,6 +4776,23 @@ impl<'a> Linearizer<'a> {
         self.emit(insn);
 
         id
+    }
+
+    /// Emit a store to a static local variable.
+    /// The caller must have already verified that `name_str` refers to a static local
+    /// (i.e., the local's sym is the sentinel value u32::MAX).
+    fn emit_static_local_store(&mut self, name_str: &str, value: PseudoId, typ: TypeId, size: u32) {
+        let key = format!("{}.{}", self.current_func_name, name_str);
+        if let Some(static_info) = self.static_locals.get(&key).cloned() {
+            let sym_id = self.alloc_pseudo();
+            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            self.emit(Instruction::store(value, sym_id, 0, typ, size));
+        } else {
+            unreachable!("static local sentinel without static_locals entry");
+        }
     }
 
     /// Emit stores to zero-initialize an aggregate (struct, union, or array)
@@ -5859,22 +5892,7 @@ impl<'a> Linearizer<'a> {
                 if let Some(local) = self.locals.get(&name_str).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
-                        // Static local - look up the global name and emit store to global
-                        let key = format!("{}.{}", self.current_func_name, &name_str);
-                        if let Some(static_info) = self.static_locals.get(&key).cloned() {
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
-                            self.emit(Instruction::store(
-                                final_val,
-                                sym_id,
-                                0,
-                                target_typ,
-                                target_size,
-                            ));
-                        }
+                        self.emit_static_local_store(&name_str, final_val, target_typ, target_size);
                     } else {
                         // Regular local variable: emit Store
                         self.emit(Instruction::store(

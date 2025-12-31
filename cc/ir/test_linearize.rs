@@ -2689,3 +2689,350 @@ fn test_incomplete_struct_type_resolution() {
         ir
     );
 }
+
+// ============================================================================
+// Static local variable increment/decrement regression tests
+// These test the fix for pre/post increment/decrement on static locals
+// Bug: was storing to sentinel value (u32::MAX) instead of looking up global name
+// ============================================================================
+
+use crate::types::TypeModifiers;
+
+#[test]
+fn test_static_local_pre_increment() {
+    // Test: static int counter = 0; return ++counter;
+    // Regression: pre-increment on static locals should store to the global symbol,
+    // not to the sentinel value (u32::MAX)
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let counter_id = strings.intern("counter");
+
+    // Create static int type
+    let static_int_type = types.intern(Type::with_modifiers(
+        crate::types::TypeKind::Int,
+        TypeModifiers::STATIC,
+    ));
+
+    // Create declaration: static int counter = 0;
+    let decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: counter_id,
+            typ: static_int_type,
+            init: Some(Expr::int(0, &types)),
+            vla_sizes: vec![],
+        }],
+    };
+
+    // Create pre-increment expression: ++counter
+    let inc_expr = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::PreInc,
+            operand: Box::new(Expr::var_typed(counter_id, static_int_type)),
+        },
+        static_int_type,
+    );
+
+    // Function: int test() { static int counter = 0; return ++counter; }
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(decl),
+            BlockItem::Statement(Stmt::Return(Some(inc_expr))),
+        ]),
+        pos: test_pos(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // The IR should NOT contain the sentinel value %4294967295
+    assert!(
+        !ir.contains("%4294967295"),
+        "Static local pre-increment should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
+        ir
+    );
+
+    // Should have a store instruction (storing back to the static variable)
+    assert!(
+        ir.contains("store"),
+        "Static local pre-increment should generate store. IR:\n{}",
+        ir
+    );
+
+    // Should have a global symbol reference (test.counter.0)
+    assert!(
+        ir.contains("test.counter"),
+        "Static local should use global name 'test.counter'. IR:\n{}",
+        ir
+    );
+}
+
+#[test]
+fn test_static_local_pre_decrement() {
+    // Test: static int counter = 10; return --counter;
+    // Regression: pre-decrement on static locals should store to the global symbol
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let counter_id = strings.intern("counter");
+
+    let static_int_type = types.intern(Type::with_modifiers(
+        crate::types::TypeKind::Int,
+        TypeModifiers::STATIC,
+    ));
+
+    let decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: counter_id,
+            typ: static_int_type,
+            init: Some(Expr::int(10, &types)),
+            vla_sizes: vec![],
+        }],
+    };
+
+    let dec_expr = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::PreDec,
+            operand: Box::new(Expr::var_typed(counter_id, static_int_type)),
+        },
+        static_int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(decl),
+            BlockItem::Statement(Stmt::Return(Some(dec_expr))),
+        ]),
+        pos: test_pos(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    assert!(
+        !ir.contains("%4294967295"),
+        "Static local pre-decrement should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("store"),
+        "Static local pre-decrement should generate store. IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("test.counter"),
+        "Static local should use global name 'test.counter'. IR:\n{}",
+        ir
+    );
+}
+
+#[test]
+fn test_static_local_post_increment() {
+    // Test: static int counter = 0; return counter++;
+    // Regression: post-increment on static locals should store to the global symbol
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let counter_id = strings.intern("counter");
+
+    let static_int_type = types.intern(Type::with_modifiers(
+        crate::types::TypeKind::Int,
+        TypeModifiers::STATIC,
+    ));
+
+    let decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: counter_id,
+            typ: static_int_type,
+            init: Some(Expr::int(0, &types)),
+            vla_sizes: vec![],
+        }],
+    };
+
+    // Post-increment is ExprKind::PostInc, not UnaryOp
+    let inc_expr = Expr::typed_unpositioned(
+        ExprKind::PostInc(Box::new(Expr::var_typed(counter_id, static_int_type))),
+        static_int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(decl),
+            BlockItem::Statement(Stmt::Return(Some(inc_expr))),
+        ]),
+        pos: test_pos(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    assert!(
+        !ir.contains("%4294967295"),
+        "Static local post-increment should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("store"),
+        "Static local post-increment should generate store. IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("test.counter"),
+        "Static local should use global name 'test.counter'. IR:\n{}",
+        ir
+    );
+}
+
+#[test]
+fn test_static_local_post_decrement() {
+    // Test: static int counter = 10; return counter--;
+    // Regression: post-decrement on static locals should store to the global symbol
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let counter_id = strings.intern("counter");
+
+    let static_int_type = types.intern(Type::with_modifiers(
+        crate::types::TypeKind::Int,
+        TypeModifiers::STATIC,
+    ));
+
+    let decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: counter_id,
+            typ: static_int_type,
+            init: Some(Expr::int(10, &types)),
+            vla_sizes: vec![],
+        }],
+    };
+
+    // Post-decrement is ExprKind::PostDec, not UnaryOp
+    let dec_expr = Expr::typed_unpositioned(
+        ExprKind::PostDec(Box::new(Expr::var_typed(counter_id, static_int_type))),
+        static_int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(decl),
+            BlockItem::Statement(Stmt::Return(Some(dec_expr))),
+        ]),
+        pos: test_pos(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    assert!(
+        !ir.contains("%4294967295"),
+        "Static local post-decrement should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("store"),
+        "Static local post-decrement should generate store. IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("test.counter"),
+        "Static local should use global name 'test.counter'. IR:\n{}",
+        ir
+    );
+}
+
+#[test]
+fn test_static_local_compound_assignment() {
+    // Test: static int sum = 0; sum += 5; return sum;
+    // Verifies compound assignment on static locals uses proper global symbol
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let sum_id = strings.intern("sum");
+
+    let static_int_type = types.intern(Type::with_modifiers(
+        crate::types::TypeKind::Int,
+        TypeModifiers::STATIC,
+    ));
+
+    let decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: sum_id,
+            typ: static_int_type,
+            init: Some(Expr::int(0, &types)),
+            vla_sizes: vec![],
+        }],
+    };
+
+    // sum += 5
+    let compound_assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::AddAssign,
+            target: Box::new(Expr::var_typed(sum_id, static_int_type)),
+            value: Box::new(Expr::int(5, &types)),
+        },
+        static_int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(decl),
+            BlockItem::Statement(Stmt::Expr(compound_assign)),
+            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(sum_id, static_int_type)))),
+        ]),
+        pos: test_pos(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    assert!(
+        !ir.contains("%4294967295"),
+        "Static local compound assignment should NOT use sentinel pseudo. IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("store"),
+        "Static local compound assignment should generate store. IR:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("test.sum"),
+        "Static local should use global name 'test.sum'. IR:\n{}",
+        ir
+    );
+}

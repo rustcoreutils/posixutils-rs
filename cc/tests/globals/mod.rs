@@ -615,3 +615,96 @@ int main(void) {
 
     cleanup_exe(&exe);
 }
+
+// ============================================================================
+// Array Alignment Tests
+// ============================================================================
+// Tests for 16-byte alignment of large arrays (>= 16 bytes)
+// This matches clang's LargeArrayMinWidth = 128 bits = 16 bytes optimization
+
+#[test]
+fn test_global_array_alignment_large() {
+    // Arrays >= 16 bytes should get 16-byte alignment
+    let c_file = create_c_file(
+        "array_align_large",
+        r#"
+// Define uintptr_t manually to avoid system header dependency
+typedef unsigned long uintptr_t;
+// 16-byte array - should be 16-byte aligned
+char big_array[16];
+// 32-byte array - should also be 16-byte aligned
+int int_array[8];
+int main(void) {
+    // Check 16-byte alignment by testing lower 4 bits are zero
+    uintptr_t addr1 = (uintptr_t)big_array;
+    uintptr_t addr2 = (uintptr_t)int_array;
+    if ((addr1 & 0xF) != 0) return 1;  // big_array not 16-byte aligned
+    if ((addr2 & 0xF) != 0) return 2;  // int_array not 16-byte aligned
+    return 0;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 0, "large arrays should be 16-byte aligned");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_array_alignment_small() {
+    // Small arrays (< 16 bytes) should use natural alignment
+    // An 8-byte char array should be 1-byte aligned (or maybe 8 due to linking)
+    // A 4-int array (16 bytes) should be 16-byte aligned
+    // An 8-byte char array is NOT required to be 16-byte aligned
+    let c_file = create_c_file(
+        "array_align_small",
+        r#"
+// Define uintptr_t manually to avoid system header dependency
+typedef unsigned long uintptr_t;
+// 8-byte array - smaller than threshold, natural alignment
+char small_array[8];
+// 15-byte array - smaller than threshold
+char almost_big[15];
+// For comparison: 16-byte array should be aligned
+char exactly_16[16];
+int main(void) {
+    // Small arrays don't require 16-byte alignment
+    // Just verify they're accessible and work correctly
+    small_array[0] = 'a';
+    small_array[7] = 'z';
+    almost_big[0] = 'b';
+    almost_big[14] = 'y';
+    exactly_16[0] = 'c';
+    exactly_16[15] = 'x';
+
+    // Verify the 16-byte array is 16-byte aligned
+    uintptr_t addr = (uintptr_t)exactly_16;
+    if ((addr & 0xF) != 0) return 1;
+
+    // Verify data was written correctly
+    if (small_array[0] != 'a') return 2;
+    if (small_array[7] != 'z') return 3;
+    if (almost_big[0] != 'b') return 4;
+    if (almost_big[14] != 'y') return 5;
+    if (exactly_16[0] != 'c') return 6;
+    if (exactly_16[15] != 'x') return 7;
+    return 0;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(
+        exit_code, 0,
+        "array alignment and access should work correctly"
+    );
+
+    cleanup_exe(&exe);
+}

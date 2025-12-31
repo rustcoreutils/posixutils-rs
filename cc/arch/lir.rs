@@ -617,12 +617,24 @@ impl EmitAsm for Directive {
                 }
             }
             Directive::Comm { sym, size, align } => {
+                // macOS uses log2(alignment) for .comm, Linux uses byte alignment
+                let align_value = match target.os {
+                    Os::MacOS => {
+                        // Convert byte alignment to log2
+                        if *align == 0 {
+                            0
+                        } else {
+                            align.trailing_zeros()
+                        }
+                    }
+                    Os::Linux | Os::FreeBSD => *align,
+                };
                 let _ = writeln!(
                     out,
                     ".comm {},{},{}",
                     sym.format_for_target(target),
                     size,
-                    align
+                    align_value
                 );
             }
 
@@ -890,13 +902,58 @@ mod tests {
     fn test_directive_comm() {
         let linux = Target::new(Arch::X86_64, Os::Linux);
         let macos = Target::new(Arch::X86_64, Os::MacOS);
+        let freebsd = Target::new(Arch::X86_64, Os::FreeBSD);
 
+        // Linux uses byte alignment directly
         let mut out = String::new();
         Directive::comm("my_var", 8, 8).emit(&linux, &mut out);
         assert_eq!(out, ".comm my_var,8,8\n");
 
+        // macOS uses log2(alignment): 8 bytes = 2^3, so log2(8) = 3
         let mut out = String::new();
         Directive::comm("my_var", 8, 8).emit(&macos, &mut out);
-        assert_eq!(out, ".comm _my_var,8,8\n");
+        assert_eq!(out, ".comm _my_var,8,3\n");
+
+        // FreeBSD uses byte alignment like Linux
+        let mut out = String::new();
+        Directive::comm("my_var", 8, 8).emit(&freebsd, &mut out);
+        assert_eq!(out, ".comm my_var,8,8\n");
+
+        // Test alignment=1: macOS log2(1)=0, Linux/FreeBSD=1
+        let mut out = String::new();
+        Directive::comm("byte_var", 1, 1).emit(&linux, &mut out);
+        assert_eq!(out, ".comm byte_var,1,1\n");
+
+        let mut out = String::new();
+        Directive::comm("byte_var", 1, 1).emit(&macos, &mut out);
+        assert_eq!(out, ".comm _byte_var,1,0\n");
+
+        // Test alignment=2: macOS log2(2)=1, Linux=2
+        let mut out = String::new();
+        Directive::comm("short_var", 2, 2).emit(&linux, &mut out);
+        assert_eq!(out, ".comm short_var,2,2\n");
+
+        let mut out = String::new();
+        Directive::comm("short_var", 2, 2).emit(&macos, &mut out);
+        assert_eq!(out, ".comm _short_var,2,1\n");
+
+        // Test alignment=4: macOS log2(4)=2, Linux=4
+        let mut out = String::new();
+        Directive::comm("int_var", 4, 4).emit(&linux, &mut out);
+        assert_eq!(out, ".comm int_var,4,4\n");
+
+        let mut out = String::new();
+        Directive::comm("int_var", 4, 4).emit(&macos, &mut out);
+        assert_eq!(out, ".comm _int_var,4,2\n");
+
+        // Test alignment=16: macOS log2(16)=4, Linux=16
+        // (used for large arrays per clang's LargeArrayMinWidth)
+        let mut out = String::new();
+        Directive::comm("big_array", 64, 16).emit(&linux, &mut out);
+        assert_eq!(out, ".comm big_array,64,16\n");
+
+        let mut out = String::new();
+        Directive::comm("big_array", 64, 16).emit(&macos, &mut out);
+        assert_eq!(out, ".comm _big_array,64,4\n");
     }
 }

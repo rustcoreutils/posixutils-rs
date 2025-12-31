@@ -23,6 +23,8 @@ pub struct LiveInterval {
     pub pseudo: PseudoId,
     pub start: usize,
     pub end: usize,
+    /// True if this interval spans a loop back edge (used within a loop)
+    pub in_loop: bool,
 }
 
 /// A point in the function where register constraints apply.
@@ -143,6 +145,7 @@ where
         first_def: usize,
         last_def: usize,
         last_use: usize,
+        in_loop: bool,
     }
 
     let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
@@ -170,6 +173,7 @@ where
                     first_def: 0,
                     last_def: 0,
                     last_use: 0,
+                    in_loop: false,
                 },
             );
         }
@@ -193,6 +197,7 @@ where
                         first_def: pos,
                         last_def: pos,
                         last_use: pos,
+                        in_loop: false,
                     });
             }
 
@@ -207,6 +212,7 @@ where
                             first_def: pos,
                             last_def: pos,
                             last_use: pos,
+                            in_loop: false,
                         },
                     );
                 }
@@ -224,6 +230,7 @@ where
                             first_def: pos,
                             last_def: pos,
                             last_use: pos,
+                            in_loop: false,
                         },
                     );
                 }
@@ -262,6 +269,7 @@ where
                         first_def: end_pos,
                         last_def: end_pos,
                         last_use: end_pos,
+                        in_loop: false,
                     },
                 );
             }
@@ -281,6 +289,7 @@ where
                         first_def: end_pos,
                         last_def: end_pos,
                         last_use: end_pos,
+                        in_loop: false,
                     },
                 );
             }
@@ -310,16 +319,22 @@ where
         }
     }
 
-    // Extend lifetimes for loop variables
+    // Extend lifetimes for loop variables and mark them as in_loop
+    // Only mark variables that need to persist across loop iterations:
+    // - Defined before the loop but used within the loop
+    // - Used at or after the back edge (survive iteration boundary)
     for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
         let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
 
         for info in intervals.values_mut() {
-            if info.first_def < loop_start
+            // This is a loop-carried value that spans iterations
+            let spans_loop_iteration = info.first_def < loop_start
                 && info.last_use >= loop_start
-                && info.last_use <= *back_edge_pos
-            {
+                && info.last_use <= *back_edge_pos;
+
+            if spans_loop_iteration {
                 info.last_use = info.last_use.max(*back_edge_pos);
+                info.in_loop = true;
             }
         }
     }
@@ -338,6 +353,7 @@ where
                 pseudo: info.pseudo,
                 start: info.first_def,
                 end,
+                in_loop: info.in_loop,
             }
         })
         .collect();

@@ -628,7 +628,8 @@ fn test_global_array_alignment_large() {
     let c_file = create_c_file(
         "array_align_large",
         r#"
-#include <stdint.h>
+// Define uintptr_t manually to avoid system header dependency
+typedef unsigned long uintptr_t;
 // 16-byte array - should be 16-byte aligned
 char big_array[16];
 // 32-byte array - should also be 16-byte aligned
@@ -662,7 +663,8 @@ fn test_global_array_alignment_small() {
     let c_file = create_c_file(
         "array_align_small",
         r#"
-#include <stdint.h>
+// Define uintptr_t manually to avoid system header dependency
+typedef unsigned long uintptr_t;
 // 8-byte array - smaller than threshold, natural alignment
 char small_array[8];
 // 15-byte array - smaller than threshold

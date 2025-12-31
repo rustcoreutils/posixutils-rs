@@ -606,12 +606,16 @@ pub trait CodeGenerator {
 
     /// Set whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
     fn set_emit_unwind_tables(&mut self, emit: bool);
+
+    /// Set position-independent code mode (for shared libraries)
+    fn set_pic_mode(&mut self, pic: bool);
 }
 
 /// Create a code generator for the given target with options
 pub fn create_codegen_with_options(
     target: Target,
     emit_unwind_tables: bool,
+    pic_mode: bool,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -620,5 +624,6 @@ pub fn create_codegen_with_options(
         Arch::Aarch64 => Box::new(super::aarch64::codegen::Aarch64CodeGen::new(target)),
     };
     codegen.set_emit_unwind_tables(emit_unwind_tables);
+    codegen.set_pic_mode(pic_mode);
     codegen
 }

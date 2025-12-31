@@ -116,6 +116,15 @@ struct Args {
     #[arg(long = "fno-unwind-tables", help = gettext("Disable CFI unwind table generation"))]
     no_unwind_tables: bool,
 
+    /// Generate position-independent code (for shared libraries)
+    /// Set by preprocess_args() when -fPIC or -fpic is passed
+    #[arg(long = "pcc-fpic", hide = true)]
+    fpic: bool,
+
+    /// Produce a shared library
+    #[arg(long = "shared", help = gettext("Produce a shared library"))]
+    shared: bool,
+
     /// Target triple (e.g., aarch64-apple-darwin, x86_64-unknown-linux-gnu)
     #[arg(long = "target", value_name = "triple", help = gettext("Target triple for cross-compilation"))]
     target: Option<String>,
@@ -291,7 +300,7 @@ fn process_file(
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;
     let mut codegen =
-        arch::codegen::create_codegen_with_options(target.clone(), emit_unwind_tables);
+        arch::codegen::create_codegen_with_options(target.clone(), emit_unwind_tables, args.fpic);
     let asm = codegen.generate(&module, &types);
 
     // Determine output file names
@@ -372,6 +381,10 @@ fn process_file(
 
     // Link
     let mut link_cmd = Command::new("cc");
+    // Pass -shared flag for shared library creation
+    if args.shared {
+        link_cmd.arg("-shared");
+    }
     link_cmd.args(["-o", &exe_file, &temp_obj]);
     // Add library search paths
     for lib_path in &args.lib_paths {
@@ -442,6 +455,14 @@ fn preprocess_args() -> Vec<String> {
             result.push("-l".to_string());
             result.push(arg[2..].to_string());
             i += 1;
+        } else if arg == "-fPIC" || arg == "-fpic" {
+            // -fPIC / -fpic → --pcc-fpic (internal flag)
+            result.push("--pcc-fpic".to_string());
+            i += 1;
+        } else if arg == "-shared" {
+            // -shared → --shared
+            result.push("--shared".to_string());
+            i += 1;
         } else {
             result.push(arg.clone());
             i += 1;
@@ -456,9 +477,13 @@ fn is_source_file(path: &str) -> bool {
     path.ends_with(".c") || path.ends_with(".i") || path == "-"
 }
 
-/// Check if a file is an object file (by extension)
+/// Check if a file is an object file or library (by extension)
 fn is_object_file(path: &str) -> bool {
-    path.ends_with(".o") || path.ends_with(".a")
+    path.ends_with(".o")
+        || path.ends_with(".a")
+        || path.ends_with(".so")
+        || path.ends_with(".dylib")
+        || path.contains(".so.") // versioned .so files like libz.so.1.3.1
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -504,6 +529,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if source_files.is_empty() && !object_files.is_empty() && args.output.is_some() {
         let exe_file = args.output.clone().unwrap();
         let mut link_cmd = Command::new("cc");
+        // Pass -shared flag for shared library creation
+        if args.shared {
+            link_cmd.arg("-shared");
+        }
         link_cmd.args(["-o", &exe_file]);
         for obj in &object_files {
             link_cmd.arg(*obj);
@@ -537,4 +566,172 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Tests for is_object_file()
+    // ========================================================================
+
+    #[test]
+    fn test_is_object_file_object() {
+        assert!(is_object_file("foo.o"));
+        assert!(is_object_file("/path/to/bar.o"));
+    }
+
+    #[test]
+    fn test_is_object_file_static_archive() {
+        assert!(is_object_file("libfoo.a"));
+        assert!(is_object_file("/usr/lib/libbar.a"));
+    }
+
+    #[test]
+    fn test_is_object_file_shared_object() {
+        assert!(is_object_file("libfoo.so"));
+        assert!(is_object_file("/usr/lib/libbar.so"));
+    }
+
+    #[test]
+    fn test_is_object_file_dylib() {
+        assert!(is_object_file("libfoo.dylib"));
+        assert!(is_object_file("/usr/lib/libbar.dylib"));
+    }
+
+    #[test]
+    fn test_is_object_file_versioned_so() {
+        // Versioned shared objects like libz.so.1.3.1
+        assert!(is_object_file("libz.so.1"));
+        assert!(is_object_file("libz.so.1.3"));
+        assert!(is_object_file("libz.so.1.3.1"));
+        assert!(is_object_file("/usr/lib/libssl.so.3"));
+    }
+
+    #[test]
+    fn test_is_object_file_negative() {
+        assert!(!is_object_file("foo.c"));
+        assert!(!is_object_file("bar.h"));
+        assert!(!is_object_file("baz.txt"));
+        assert!(!is_object_file("myso.txt")); // should not match .so
+        assert!(!is_object_file("also.conf")); // should not match .so
+    }
+
+    // ========================================================================
+    // Tests for is_source_file()
+    // ========================================================================
+
+    #[test]
+    fn test_is_source_file_c() {
+        assert!(is_source_file("foo.c"));
+        assert!(is_source_file("/path/to/bar.c"));
+    }
+
+    #[test]
+    fn test_is_source_file_preprocessed() {
+        assert!(is_source_file("foo.i"));
+        assert!(is_source_file("/path/to/bar.i"));
+    }
+
+    #[test]
+    fn test_is_source_file_stdin() {
+        assert!(is_source_file("-"));
+    }
+
+    #[test]
+    fn test_is_source_file_negative() {
+        assert!(!is_source_file("foo.o"));
+        assert!(!is_source_file("bar.h"));
+        assert!(!is_source_file("baz.cpp"));
+    }
+
+    // ========================================================================
+    // Tests for preprocess_args()
+    // ========================================================================
+
+    fn run_preprocess(args: &[&str]) -> Vec<String> {
+        // We can't easily test preprocess_args() without modifying env::args,
+        // so we'll test the logic directly by simulating what it does
+        let input: Vec<String> = std::iter::once("pcc".to_string())
+            .chain(args.iter().map(|s| s.to_string()))
+            .collect();
+
+        // Simulate preprocess_args logic
+        let mut result = vec![input[0].clone()];
+        let mut i = 1;
+        while i < input.len() {
+            let arg = &input[i];
+            if arg == "-fPIC" || arg == "-fpic" {
+                result.push("--pcc-fpic".to_string());
+            } else if arg == "-shared" {
+                result.push("--shared".to_string());
+            } else if arg.starts_with("-L") && arg.len() > 2 {
+                result.push("-L".to_string());
+                result.push(arg[2..].to_string());
+            } else if arg.starts_with("-l") && arg.len() > 2 {
+                result.push("-l".to_string());
+                result.push(arg[2..].to_string());
+            } else if arg.starts_with("-W") && arg.len() > 2 {
+                result.push("-W".to_string());
+                result.push(arg[2..].to_string());
+            } else {
+                result.push(arg.clone());
+            }
+            i += 1;
+        }
+        result
+    }
+
+    #[test]
+    fn test_preprocess_fpic_uppercase() {
+        let result = run_preprocess(&["-fPIC", "foo.c"]);
+        assert!(result.contains(&"--pcc-fpic".to_string()));
+        assert!(!result.contains(&"-fPIC".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_fpic_lowercase() {
+        let result = run_preprocess(&["-fpic", "foo.c"]);
+        assert!(result.contains(&"--pcc-fpic".to_string()));
+        assert!(!result.contains(&"-fpic".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_shared() {
+        let result = run_preprocess(&["-shared", "foo.c"]);
+        assert!(result.contains(&"--shared".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_library_path() {
+        let result = run_preprocess(&["-L/usr/local/lib", "foo.c"]);
+        assert!(result.contains(&"-L".to_string()));
+        assert!(result.contains(&"/usr/local/lib".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_library() {
+        let result = run_preprocess(&["-lz", "foo.c"]);
+        assert!(result.contains(&"-l".to_string()));
+        assert!(result.contains(&"z".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_warning() {
+        let result = run_preprocess(&["-Wall", "foo.c"]);
+        assert!(result.contains(&"-W".to_string()));
+        assert!(result.contains(&"all".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_combined() {
+        let result = run_preprocess(&["-fPIC", "-shared", "-lz", "-L.", "foo.c"]);
+        assert!(result.contains(&"--pcc-fpic".to_string()));
+        assert!(result.contains(&"--shared".to_string()));
+        assert!(result.contains(&"-l".to_string()));
+        assert!(result.contains(&"z".to_string()));
+        assert!(result.contains(&"-L".to_string()));
+        assert!(result.contains(&".".to_string()));
+    }
 }

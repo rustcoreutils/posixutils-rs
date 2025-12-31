@@ -3627,13 +3627,28 @@ impl<'a> Linearizer<'a> {
             ExprKind::Ident { name, .. } => {
                 let name_str = self.str(*name).to_string();
                 if let Some(local) = self.locals.get(&name_str).cloned() {
-                    self.emit(Instruction::store(
-                        final_result,
-                        local.sym,
-                        0,
-                        typ,
-                        store_size,
-                    ));
+                    // Check if this is a static local (sentinel value)
+                    if local.sym.0 == u32::MAX {
+                        // Static local - look up the global name and emit store to global
+                        let key = format!("{}.{}", self.current_func_name, &name_str);
+                        if let Some(static_info) = self.static_locals.get(&key).cloned() {
+                            let sym_id = self.alloc_pseudo();
+                            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
+                            if let Some(func) = &mut self.current_func {
+                                func.add_pseudo(pseudo);
+                            }
+                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                        }
+                    } else {
+                        // Regular local variable
+                        self.emit(Instruction::store(
+                            final_result,
+                            local.sym,
+                            0,
+                            typ,
+                            store_size,
+                        ));
+                    }
                 } else if self.var_map.contains_key(&name_str) {
                     self.var_map.insert(name_str.clone(), final_result);
                 } else {
@@ -3930,13 +3945,34 @@ impl<'a> Linearizer<'a> {
                 ExprKind::Ident { name, .. } => {
                     let name_str = self.str(*name).to_string();
                     if let Some(local) = self.locals.get(&name_str).cloned() {
-                        self.emit(Instruction::store(
-                            final_result,
-                            local.sym,
-                            0,
-                            typ,
-                            store_size,
-                        ));
+                        // Check if this is a static local (sentinel value)
+                        if local.sym.0 == u32::MAX {
+                            // Static local - look up the global name and emit store to global
+                            let key = format!("{}.{}", self.current_func_name, &name_str);
+                            if let Some(static_info) = self.static_locals.get(&key).cloned() {
+                                let sym_id = self.alloc_pseudo();
+                                let pseudo = Pseudo::sym(sym_id, static_info.global_name);
+                                if let Some(func) = &mut self.current_func {
+                                    func.add_pseudo(pseudo);
+                                }
+                                self.emit(Instruction::store(
+                                    final_result,
+                                    sym_id,
+                                    0,
+                                    typ,
+                                    store_size,
+                                ));
+                            }
+                        } else {
+                            // Regular local variable
+                            self.emit(Instruction::store(
+                                final_result,
+                                local.sym,
+                                0,
+                                typ,
+                                store_size,
+                            ));
+                        }
                     } else if self.var_map.contains_key(&name_str) {
                         self.var_map.insert(name_str.clone(), final_result);
                     } else {

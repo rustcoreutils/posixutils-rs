@@ -47,6 +47,8 @@ pub struct X86_64CodeGen {
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// Position-independent code mode (for shared libraries)
+    pic_mode: bool,
 }
 
 impl X86_64CodeGen {
@@ -62,6 +64,7 @@ impl X86_64CodeGen {
             num_fixed_fp_params: 0,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
+            pic_mode: false,
         }
     }
 
@@ -104,10 +107,14 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Check if a symbol needs GOT access (extern on macOS)
+    /// Check if a symbol needs GOT access
+    /// - In PIC mode: all external symbols need GOT access
+    /// - On macOS: external symbols always need GOT access (even without PIC)
     #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        self.base.target.os == Os::MacOS && self.extern_symbols.contains(name)
+        let is_extern = self.extern_symbols.contains(name);
+        // PIC mode or macOS: external symbols need GOT
+        (self.pic_mode || self.base.target.os == Os::MacOS) && is_extern
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
@@ -2666,5 +2673,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_emit_unwind_tables(&mut self, emit: bool) {
         self.base.emit_unwind_tables = emit;
+    }
+
+    fn set_pic_mode(&mut self, pic: bool) {
+        self.pic_mode = pic;
     }
 }

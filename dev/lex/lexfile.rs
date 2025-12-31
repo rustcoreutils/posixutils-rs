@@ -243,12 +243,35 @@ enum RegexType {
     Curly,
 }
 
-// find the end of the regex in a rule line, by matching [ and ( and { and }
+// find the end of the regex in a rule line, by matching [ and ( and { and } and "
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
+    let mut inside_quotes = false;
+    let mut escape_next = false;
 
     for (i, ch) in line.chars().enumerate() {
+        // Handle escape sequences
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape_next = true;
+            continue;
+        }
+
+        // Handle quoted strings - whitespace inside quotes doesn't end the pattern
+        if ch == '"' && !inside_brackets {
+            inside_quotes = !inside_quotes;
+            continue;
+        }
+
+        // Inside quotes, nothing special happens
+        if inside_quotes {
+            continue;
+        }
+
         match ch {
             '[' => {
                 if !inside_brackets {
@@ -288,6 +311,10 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 }
             }
         }
+    }
+
+    if inside_quotes {
+        return Err("unterminated quoted string in pattern".to_string());
     }
 
     Err("unterminated regular expression".to_string())
@@ -740,6 +767,13 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
 
     let action_ws = String::from(&remaining[pos..]);
     let action = action_ws.trim_start();
+
+    // POSIX: "the absence of an action shall not be valid"
+    // Only exception is "|" which means fall-through to the next rule's action
+    if action.is_empty() {
+        return Err(state.error("missing action for rule (use '|' for fall-through)"));
+    }
+
     let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
 
     Ok(ParsedRuleInfo {

@@ -15,7 +15,8 @@ mod nfa;
 use clap::Parser;
 use dfa::Dfa;
 use nfa::Nfa;
-use regex_syntax::hir::Hir;
+use regex_syntax::ast::parse::ParserBuilder;
+use regex_syntax::hir::{translate::TranslatorBuilder, Hir};
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 
@@ -89,19 +90,42 @@ pub struct ParsedRule {
     pub has_variable_trailing_context: bool,
 }
 
+/// Parse a regex pattern to HIR with POSIX-compliant settings
+/// In particular, '.' should NOT match newlines per POSIX spec
+fn parse_regex_posix(pattern: &str) -> Result<Hir, String> {
+    // Parse to AST
+    let ast = ParserBuilder::new()
+        .build()
+        .parse(pattern)
+        .map_err(|e| format!("Failed to parse regular expression '{}': {}", pattern, e))?;
+
+    // Translate to HIR with POSIX-compliant settings:
+    // - dot_matches_new_line(false): '.' should NOT match newlines per POSIX
+    let hir = TranslatorBuilder::new()
+        .dot_matches_new_line(false)
+        .build()
+        .translate(pattern, &ast)
+        .map_err(|e| {
+            format!(
+                "Failed to translate regular expression '{}': {}",
+                pattern, e
+            )
+        })?;
+
+    Ok(hir)
+}
+
 /// Parse all rule patterns and return them with their indices and start conditions
 fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
     let mut rules = Vec::new();
 
     for (idx, rule) in lexinfo.rules.iter().enumerate() {
-        let hir = regex_syntax::parse(&rule.ere)
-            .map_err(|e| format!("Failed to parse regular expression '{}': {}", rule.ere, e))?;
+        let hir = parse_regex_posix(&rule.ere)?;
 
         // Parse trailing context if present
         let (trailing_context, main_pattern_len, has_variable_tc) =
             if let Some(ref tc) = rule.trailing_context {
-                let tc_hir = regex_syntax::parse(tc)
-                    .map_err(|e| format!("Failed to parse trailing context '{}': {}", tc, e))?;
+                let tc_hir = parse_regex_posix(tc)?;
                 // Compute fixed length of MAIN pattern (for setting yyleng correctly)
                 // If main pattern has fixed length, we can set yyleng to that value
                 let main_len = compute_fixed_length(&hir);

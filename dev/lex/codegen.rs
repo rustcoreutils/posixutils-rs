@@ -94,6 +94,9 @@ fn write_includes<W: Write>(output: &mut W) -> io::Result<()> {
         r#"#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Forward declarations */
+int yywrap(void);
 "#
     )?;
     Ok(())
@@ -716,7 +719,21 @@ fn write_yylex_function<W: Write>(
         "                YY_INPUT(yy_buffer, result, YY_BUF_SIZE);"
     )?;
     writeln!(output, "                if (result == 0) {{")?;
-    writeln!(output, "                    return 0; /* EOF */")?;
+    writeln!(
+        output,
+        "                    /* EOF - call yywrap() per POSIX */"
+    )?;
+    writeln!(output, "                    if (yywrap()) {{")?;
+    writeln!(
+        output,
+        "                        return 0; /* yywrap returned non-zero, stop */"
+    )?;
+    writeln!(output, "                    }}")?;
+    writeln!(
+        output,
+        "                    /* yywrap returned 0, continue with new input */"
+    )?;
+    writeln!(output, "                    continue;")?;
     writeln!(output, "                }}")?;
     writeln!(output, "                yy_buffer_len = result;")?;
     writeln!(output, "                yy_buffer_pos = 0;")?;
@@ -1178,13 +1195,15 @@ fn write_yylex_function<W: Write>(
     writeln!(output, "}}\n")?;
 
     // Generate yywrap if not in user subroutines
-    writeln!(output, "/* Default yywrap */")?;
-    writeln!(output, "#ifndef yywrap")?;
-    writeln!(output, "int yywrap(void)")?;
-    writeln!(output, "{{")?;
-    writeln!(output, "    return 1;")?;
-    writeln!(output, "}}")?;
-    writeln!(output, "#endif\n")?;
+    let has_yywrap = lexinfo.user_subs.iter().any(|s| s.contains("yywrap"));
+    if !has_yywrap {
+        writeln!(output, "/* Default yywrap */")?;
+        writeln!(output, "int yywrap(void)")?;
+        writeln!(output, "{{")?;
+        writeln!(output, "    return 1;")?;
+        writeln!(output, "}}")?;
+        writeln!(output)?;
+    }
 
     // Generate main if not in user subroutines
     let has_main = lexinfo

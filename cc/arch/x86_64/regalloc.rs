@@ -740,8 +740,9 @@ impl RegAlloc {
                     self.locations
                         .insert(interval.pseudo, Loc::Stack(self.stack_offset));
                 }
-            } else if crosses_call {
-                // Interval crosses a call - must use callee-saved register or spill
+            } else if crosses_call || interval.in_loop {
+                // Interval crosses a call or is inside a loop - must use callee-saved register or spill
+                // For loops without calls, this prevents values from being clobbered by register pressure
                 // Also exclude registers that conflict with constraints
                 if let Some(idx) = self
                     .free_regs

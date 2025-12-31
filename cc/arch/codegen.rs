@@ -210,7 +210,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
 
         // Get alignment from type info - use natural alignment per ABI
-        let align = types.alignment(*typ) as u32;
+        let mut align = types.alignment(*typ) as u32;
+        // Use 16-byte alignment for arrays >= 16 bytes (matches clang behavior for optimization)
+        if matches!(types.get(*typ).kind, crate::types::TypeKind::Array) && size >= 16 {
+            align = align.max(16);
+        }
 
         // Use .comm for uninitialized external (non-static) globals
         let use_bss = matches!(init, Initializer::None) && !is_static;

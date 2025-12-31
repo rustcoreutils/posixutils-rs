@@ -20,6 +20,7 @@ mod function_pointers;
 mod has_feature;
 mod inline;
 mod inline_asm;
+mod loop_regalloc;
 mod macros;
 mod many_args;
 mod noreturn;

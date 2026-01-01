@@ -8,6 +8,10 @@
 //
 
 use crate::diag;
+use crate::pattern_escape::{expand_posix_bracket_constructs, translate_escape_sequences};
+use crate::pattern_validate::{
+    parse_anchoring_and_trailing_context, validate_pattern_restrictions,
+};
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -48,8 +52,7 @@ impl LexRule {
 #[derive(Debug)]
 pub struct LexInfo {
     pub external_def: Vec<String>,
-    /// Substitution definitions (used during parsing)
-    #[allow(dead_code)]
+    /// Substitution definitions (name -> pattern mapping from definitions section)
     pub subs: HashMap<String, String>,
     pub internal_defs: Vec<String>,
     /// Inclusive start conditions (%s)
@@ -61,8 +64,7 @@ pub struct LexInfo {
     pub rules: Vec<LexRule>,
     /// Table size declarations (%p, %n, %a, %e, %k, %o)
     /// Key is the single character (p, n, a, e, k, o), value is the declared size
-    /// These are preserved for POSIX compliance but ignored in modern dynamic allocation
-    #[allow(dead_code)]
+    /// Used in -v statistics output for POSIX compliance
     pub table_sizes: HashMap<char, usize>,
 }
 
@@ -409,95 +411,6 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
     Err("unterminated regular expression".to_string())
 }
 
-/// Translate POSIX escape sequences to forms that regex_syntax understands
-///
-/// This handles several POSIX compliance issues:
-/// 1. Octal escapes (\NNN): regex_syntax interprets these as backreferences,
-///    so we convert them to hex escapes (\xNN)
-/// 2. Backspace (\b): regex_syntax interprets \b as word boundary,
-///    so we convert to \x08
-/// 3. Single-digit hex escapes (\xN): regex_syntax requires two digits,
-///    so we pad to \x0N
-fn translate_escape_sequences(input: &str) -> String {
-    let mut result = String::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() {
-            let next = chars[i + 1];
-
-            // Handle \b -> \x08 (backspace, not word boundary)
-            // In POSIX lex, \b means backspace (0x08), but regex_syntax
-            // interprets \b as word boundary assertion
-            if next == 'b' {
-                result.push_str("\\x08");
-                i += 2;
-                continue;
-            }
-
-            // Handle \xN -> \x0N (pad single hex digit)
-            // POSIX says \x followed by "the longest sequence of hexadecimal-digit
-            // characters", which can be just one digit. regex_syntax requires two.
-            if next == 'x' && i + 2 < chars.len() {
-                let hex_start = i + 2;
-                let mut hex_digits = String::new();
-                let mut j = hex_start;
-
-                // Collect hex digits
-                while j < chars.len() && chars[j].is_ascii_hexdigit() {
-                    hex_digits.push(chars[j]);
-                    j += 1;
-                }
-
-                if hex_digits.len() == 1 {
-                    // Single hex digit - pad with leading zero
-                    result.push_str(&format!("\\x0{}", hex_digits));
-                    i = j;
-                    continue;
-                } else if hex_digits.len() >= 2 {
-                    // Two or more hex digits - take first two, leave rest as literal
-                    result.push_str(&format!("\\x{}", &hex_digits[..2]));
-                    // Any digits beyond the first two become literal characters
-                    result.push_str(&hex_digits[2..]);
-                    i = j;
-                    continue;
-                }
-                // No hex digits after \x - leave as-is (will error in regex_syntax)
-            }
-
-            // Handle octal escapes (\NNN) -> \xNN
-            // Check if this is an octal escape (digit 0-7)
-            if next.is_ascii_digit() && next < '8' {
-                // Consume up to 3 octal digits
-                let mut octal_str = String::new();
-                let mut j = i + 1;
-                while j < chars.len() && octal_str.len() < 3 {
-                    let c = chars[j];
-                    if c.is_ascii_digit() && c < '8' {
-                        octal_str.push(c);
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                // Convert octal to byte value
-                if let Ok(byte_val) = u8::from_str_radix(&octal_str, 8) {
-                    // Output as hex escape \xNN
-                    result.push_str(&format!("\\x{:02x}", byte_val));
-                    i = j;
-                    continue;
-                }
-            }
-        }
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    result
-}
-
 /// Check if a string looks like an interval expression: {m}, {m,}, or {m,n}
 /// Returns true if it contains only digits and at most one comma
 fn is_interval_expression(s: &str) -> bool {
@@ -535,131 +448,17 @@ fn is_interval_expression(s: &str) -> bool {
     has_digit_before_comma
 }
 
-/// Expand POSIX equivalence classes [=c=] and collating elements [.c.] within bracket expressions.
+/// Translate lex-specific regex syntax to standard ERE format.
 ///
-/// In POSIX locale:
-/// - Equivalence class [=c=] matches just the character(s) between the delimiters
-/// - Collating element [.c.] matches the character(s) literally (with escaping if needed)
+/// Handles:
+/// - Quoted strings (regex metacharacters become literals)
+/// - Substitution references {name} expanded from definitions
+/// - POSIX equivalence classes and collating elements
+/// - Escape sequence translation
 ///
-/// Examples:
-/// - `[abc[=d=]ef]` becomes `[abcdef]`
-/// - `[[=a=]]` becomes `[a]`
-/// - `[abc[.^.]def]` becomes `[abc\^def]` (^ needs escaping at start of bracket)
-fn expand_posix_bracket_constructs(pattern: &str) -> String {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut result = String::new();
-    let mut i = 0;
-    let mut in_bracket = false;
-    let mut bracket_content_start = false; // True if we just entered a bracket
-
-    while i < chars.len() {
-        let ch = chars[i];
-
-        if ch == '\\' && i + 1 < chars.len() {
-            // Escape sequence - copy both characters
-            result.push(ch);
-            result.push(chars[i + 1]);
-            i += 2;
-            bracket_content_start = false;
-            continue;
-        }
-
-        if ch == '[' && !in_bracket {
-            // Entering a bracket expression
-            in_bracket = true;
-            bracket_content_start = true;
-            result.push(ch);
-            i += 1;
-            continue;
-        }
-
-        if in_bracket && ch == '[' && i + 1 < chars.len() {
-            let next = chars[i + 1];
-            if next == '=' || next == '.' {
-                // Found [= or [. inside brackets - this is a POSIX construct
-                let close_seq = if next == '=' { "=]" } else { ".]" };
-                if let Some((content, end_idx)) =
-                    find_posix_construct_content(&chars, i + 2, close_seq)
-                {
-                    // In POSIX locale: just output the content
-                    // For collating elements with special chars, we need to escape them
-                    if next == '.' {
-                        // Collating element - escape special bracket chars
-                        for c in content.chars() {
-                            match c {
-                                '^' if bracket_content_start => result.push_str("\\^"),
-                                ']' => result.push_str("\\]"),
-                                '\\' => result.push_str("\\\\"),
-                                '-' => result.push_str("\\-"),
-                                _ => result.push(c),
-                            }
-                            bracket_content_start = false;
-                        }
-                    } else {
-                        // Equivalence class - just output the character(s)
-                        result.push_str(&content);
-                        if !content.is_empty() {
-                            bracket_content_start = false;
-                        }
-                    }
-                    i = end_idx + 1;
-                    continue;
-                }
-                // No valid closing found - pass through as-is (regex_syntax will error)
-            }
-            // Not a POSIX construct, just a literal [ inside brackets
-            bracket_content_start = false;
-        }
-
-        if ch == ']' && in_bracket {
-            in_bracket = false;
-        }
-
-        result.push(ch);
-        if in_bracket && ch != '[' {
-            bracket_content_start = false;
-        }
-        i += 1;
-    }
-
-    result
-}
-
-/// Find the content of a POSIX bracket construct and return (content, end_index)
-/// where end_index is the index of the closing bracket ']'
-fn find_posix_construct_content(
-    chars: &[char],
-    start: usize,
-    close_seq: &str,
-) -> Option<(String, usize)> {
-    let close_chars: Vec<char> = close_seq.chars().collect();
-    let mut content = String::new();
-    let mut i = start;
-
-    while i + close_chars.len() <= chars.len() {
-        // Check if we found the closing sequence
-        let mut found = true;
-        for (j, close_char) in close_chars.iter().enumerate() {
-            if chars[i + j] != *close_char {
-                found = false;
-                break;
-            }
-        }
-
-        if found {
-            // Return content and index of the closing ]
-            return Some((content, i + close_chars.len() - 1));
-        }
-
-        content.push(chars[i]);
-        i += 1;
-    }
-
-    None
-}
-
-// translate lex-specific regex syntax to regex crate syntax
-fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
+/// If `wrap_subs` is true, substitutions are wrapped in parentheses so that
+/// following quantifiers apply to the entire substitution (used for compilation).
+fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<String, String> {
     let mut re = String::new();
     let mut in_quotes = false;
     let mut in_brace = false;
@@ -686,66 +485,14 @@ fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
             } else {
                 // Substitution reference
                 match state.subs.get(&brace_content) {
-                    Some(value) => re.push_str(value),
-                    None => {
-                        return Err(
-                            state.error(&format!("undefined substitution: {{{}}}", brace_content))
-                        );
-                    }
-                }
-            }
-            in_brace = false;
-            brace_content.clear();
-        } else if in_brace {
-            brace_content.push(ch);
-        } else if ch == '"' {
-            in_quotes = true;
-        } else if ch == '{' {
-            in_brace = true;
-        } else {
-            re.push(ch);
-        }
-    }
-
-    // Expand POSIX equivalence classes [=c=] and collating elements [.c.]
-    let expanded = expand_posix_bracket_constructs(&re);
-    // Translate POSIX escape sequences to regex_syntax compatible format
-    Ok(translate_escape_sequences(&expanded))
-}
-
-// translate lex-specific regex syntax with substitutions wrapped in parens
-// This is used for compilation where quantifiers need to apply to entire substitutions
-fn translate_ere_compiled(state: &mut ParseState, ere: &str) -> Result<String, String> {
-    let mut re = String::new();
-    let mut in_quotes = false;
-    let mut in_brace = false;
-    let mut brace_content = String::new();
-
-    for ch in ere.chars() {
-        if in_quotes && ch == '"' {
-            in_quotes = false;
-        } else if in_quotes {
-            match ch {
-                '*' => re.push_str(r"\x2a"),
-                '+' => re.push_str(r"\x2b"),
-                '.' => re.push_str(r"\x2e"),
-                '{' => re.push_str(r"\x7b"),
-                _ => re.push(ch),
-            }
-        } else if in_brace && ch == '}' {
-            // Determine if this is an interval expression or a substitution
-            if is_interval_expression(&brace_content) {
-                // Interval expression: pass through as-is
-                re.push('{');
-                re.push_str(&brace_content);
-                re.push('}');
-            } else {
-                // Substitution reference - wrap in group so quantifiers apply correctly
-                match state.subs.get(&brace_content) {
                     Some(value) => {
-                        re.push('(');
-                        re.push_str(value);
-                        re.push(')');
+                        if wrap_subs {
+                            re.push('(');
+                            re.push_str(value);
+                            re.push(')');
+                        } else {
+                            re.push_str(value);
+                        }
                     }
                     None => {
                         return Err(
@@ -797,214 +544,6 @@ fn extract_start_conditions(pattern: &str) -> (Vec<String>, &str) {
     }
 }
 
-/// Parse anchoring and trailing context from a pattern
-/// Returns (bol_anchor, main_pattern, trailing_context, eol_anchor)
-fn parse_anchoring_and_trailing_context(pattern: &str) -> (bool, String, Option<String>, bool) {
-    let mut main_pattern = pattern.to_string();
-    let mut bol_anchor = false;
-    let mut eol_anchor = false;
-    let mut trailing_context = None;
-
-    // Check for ^ at the beginning (BOL anchor)
-    if main_pattern.starts_with('^') {
-        bol_anchor = true;
-        main_pattern = main_pattern[1..].to_string();
-    }
-
-    // Check for $ at the end (EOL anchor) - must be unescaped and outside brackets/quotes
-    // $ is equivalent to /\n (trailing context with newline)
-    if pattern_ends_with_unescaped_dollar(&main_pattern) {
-        eol_anchor = true;
-        main_pattern.pop(); // Remove the $
-    }
-
-    // Look for unescaped / (trailing context operator)
-    // The / must not be inside brackets, quotes, or escaped
-    if let Some(slash_pos) = find_trailing_context_slash(&main_pattern) {
-        let tc = main_pattern[slash_pos + 1..].to_string();
-        main_pattern = main_pattern[..slash_pos].to_string();
-        trailing_context = Some(tc);
-    }
-
-    // If EOL anchor ($) was found, convert to trailing context /\n
-    if eol_anchor {
-        if trailing_context.is_some() {
-            // Can't have both $ and trailing context - $ is already a form of trailing context
-            // POSIX says this is undefined, but we'll treat $ as /\n
-        }
-        trailing_context = Some("\\n".to_string());
-    }
-
-    (bol_anchor, main_pattern, trailing_context, eol_anchor)
-}
-
-/// Check if pattern ends with an unescaped $ (not inside brackets or quotes)
-fn pattern_ends_with_unescaped_dollar(pattern: &str) -> bool {
-    if !pattern.ends_with('$') {
-        return false;
-    }
-
-    let chars: Vec<char> = pattern.chars().collect();
-    let len = chars.len();
-
-    // Count consecutive backslashes before the final $
-    let mut backslash_count = 0;
-    for i in (0..len.saturating_sub(1)).rev() {
-        if chars[i] == '\\' {
-            backslash_count += 1;
-        } else {
-            break;
-        }
-    }
-
-    // $ is escaped if preceded by odd number of backslashes
-    if backslash_count % 2 == 1 {
-        return false;
-    }
-
-    // Check if $ is inside brackets (simplified check)
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    for (idx, ch) in chars.iter().enumerate() {
-        if idx == len - 1 {
-            break; // Don't count the final $
-        }
-        match ch {
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes => in_brackets = false,
-            _ => {}
-        }
-    }
-
-    !in_brackets && !in_quotes
-}
-
-/// Find the position of trailing context operator / (not inside brackets, quotes, or escaped)
-fn find_trailing_context_slash(pattern: &str) -> Option<usize> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    let mut escape_next = false;
-
-    for (idx, ch) in chars.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape_next = true,
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            '/' if !in_brackets && !in_quotes => return Some(idx),
-            _ => {}
-        }
-    }
-
-    None
-}
-
-/// Count the number of unescaped trailing context operators / in a pattern
-fn count_trailing_context_slashes(pattern: &str) -> usize {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    let mut escape_next = false;
-    let mut count = 0;
-
-    for ch in chars.iter() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape_next = true,
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            '/' if !in_brackets && !in_quotes => count += 1,
-            _ => {}
-        }
-    }
-
-    count
-}
-
-/// Validate pattern restrictions per POSIX specification
-/// Returns Ok(()) if valid, Err(message) if invalid
-fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    let mut escape_next = false;
-    let mut dollar_positions: Vec<usize> = Vec::new();
-    let mut caret_positions: Vec<usize> = Vec::new();
-
-    // First pass: find trailing context operator
-    let has_trailing_context = find_trailing_context_slash(pattern).is_some();
-
-    // Second pass: find all unescaped ^ and $ positions
-    for (idx, ch) in chars.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape_next = true,
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            '^' if !in_brackets && !in_quotes => {
-                // ^ inside [] is a negation character, which is valid anywhere
-                caret_positions.push(idx);
-            }
-            '$' if !in_brackets && !in_quotes => {
-                dollar_positions.push(idx);
-            }
-            _ => {}
-        }
-    }
-
-    // Validate ^ positions - only valid at beginning
-    for pos in &caret_positions {
-        if *pos != 0 {
-            return Err(format!(
-                "'^' operator only valid at beginning of pattern, found at position {}",
-                pos
-            ));
-        }
-    }
-
-    // Validate $ positions - only valid at end (and not with trailing context)
-    for pos in &dollar_positions {
-        // $ must be at the very end of the pattern
-        if *pos != chars.len() - 1 {
-            return Err(format!(
-                "'$' operator only valid at end of pattern, found at position {}",
-                pos
-            ));
-        }
-        // $ cannot be used with trailing context
-        if has_trailing_context {
-            return Err(
-                "'$' cannot be used with trailing context '/'; $ is equivalent to /\\n".to_string(),
-            );
-        }
-    }
-
-    // Validate only one trailing context operator
-    let tc_count = count_trailing_context_slashes(pattern);
-    if tc_count > 1 {
-        return Err(format!(
-            "Only one trailing context operator '/' allowed per pattern, found {}",
-            tc_count
-        ));
-    }
-
-    Ok(())
-}
-
 /// Parsed rule information
 struct ParsedRuleInfo {
     ere: String,
@@ -1032,18 +571,18 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     let (bol_anchor, ere_main, trailing_context_raw, _eol_anchor) =
         parse_anchoring_and_trailing_context(&ere_raw);
 
-    // Translate the main pattern (translate_ere already adds line numbers)
-    let ere = translate_ere(state, &ere_main)?;
+    // Translate the main pattern
+    let ere = translate_ere(state, &ere_main, false)?;
     // Compiled version wraps substitutions in parens for correct quantifier handling
-    let compiled_ere = translate_ere_compiled(state, &ere_main)?;
+    let compiled_ere = translate_ere(state, &ere_main, true)?;
 
-    // Translate trailing context if present (translate_ere already adds line numbers)
+    // Translate trailing context if present
     let trailing_context = match &trailing_context_raw {
-        Some(tc) => Some(translate_ere(state, tc)?),
+        Some(tc) => Some(translate_ere(state, tc, false)?),
         None => None,
     };
     let compiled_trailing_context = match &trailing_context_raw {
-        Some(tc) => Some(translate_ere_compiled(state, tc)?),
+        Some(tc) => Some(translate_ere(state, tc, true)?),
         None => None,
     };
 
@@ -1560,126 +1099,6 @@ DIGIT    [0-9]
         let result = parse(&input);
         assert!(result.is_err());
         // The error message with line number is printed to stderr by diag
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_octal_basic() {
-        // \101 = 65 decimal = 'A'
-        assert_eq!(translate_escape_sequences(r"\101"), r"\x41");
-        // \141 = 97 decimal = 'a'
-        assert_eq!(translate_escape_sequences(r"\141"), r"\x61");
-        // \0 = 0 = NUL
-        assert_eq!(translate_escape_sequences(r"\0"), r"\x00");
-        // \7 = 7 = BEL
-        assert_eq!(translate_escape_sequences(r"\7"), r"\x07");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_octal_two_digits() {
-        // \12 = 10 decimal = newline
-        assert_eq!(translate_escape_sequences(r"\12"), r"\x0a");
-        // \40 = 32 decimal = space
-        assert_eq!(translate_escape_sequences(r"\40"), r"\x20");
-        // \77 = 63 decimal = '?'
-        assert_eq!(translate_escape_sequences(r"\77"), r"\x3f");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_octal_three_digits() {
-        // \377 = 255 decimal = max byte value
-        assert_eq!(translate_escape_sequences(r"\377"), r"\xff");
-        // \000 = 0
-        assert_eq!(translate_escape_sequences(r"\000"), r"\x00");
-        // \177 = 127 decimal = DEL
-        assert_eq!(translate_escape_sequences(r"\177"), r"\x7f");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_octal_in_pattern() {
-        // Octal escape in the middle of a pattern
-        assert_eq!(translate_escape_sequences(r"a\101b"), r"a\x41b");
-        // Multiple octal escapes
-        assert_eq!(translate_escape_sequences(r"\101\102\103"), r"\x41\x42\x43");
-        // Mixed with other escapes (note: \b becomes \x08)
-        assert_eq!(translate_escape_sequences(r"\101\n\102"), r"\x41\n\x42");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_non_octal() {
-        // \8 and \9 are not valid octal - should be left alone
-        assert_eq!(translate_escape_sequences(r"\8"), r"\8");
-        assert_eq!(translate_escape_sequences(r"\9"), r"\9");
-        // \n, \t, etc. should be left alone
-        assert_eq!(translate_escape_sequences(r"\n"), r"\n");
-        assert_eq!(translate_escape_sequences(r"\t"), r"\t");
-        // \x with two hex digits - normalized format
-        assert_eq!(translate_escape_sequences(r"\x41"), r"\x41");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_octal_stops_at_three_digits() {
-        // \1234 should be \x53 (octal 123 = 83) followed by '4'
-        assert_eq!(translate_escape_sequences(r"\1234"), r"\x534");
-        // \0009 should be \x00 followed by '9'
-        assert_eq!(translate_escape_sequences(r"\0009"), r"\x009");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_octal_stops_at_non_octal() {
-        // \128 - octal 12 = 10, then '8' (not octal)
-        assert_eq!(translate_escape_sequences(r"\128"), r"\x0a8");
-        // \1a - octal 1 = 1, then 'a'
-        assert_eq!(translate_escape_sequences(r"\1a"), r"\x01a");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_backspace() {
-        // \b in POSIX lex means backspace (0x08), not word boundary
-        assert_eq!(translate_escape_sequences(r"\b"), r"\x08");
-        // \b in a pattern
-        assert_eq!(translate_escape_sequences(r"a\bc"), r"a\x08c");
-        // Multiple \b
-        assert_eq!(translate_escape_sequences(r"\b\b"), r"\x08\x08");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_hex_padding() {
-        // Single hex digit should be padded
-        assert_eq!(translate_escape_sequences(r"\x4"), r"\x04");
-        assert_eq!(translate_escape_sequences(r"\xa"), r"\x0a");
-        assert_eq!(translate_escape_sequences(r"\xF"), r"\x0F");
-        // Two hex digits - no change
-        assert_eq!(translate_escape_sequences(r"\x41"), r"\x41");
-        assert_eq!(translate_escape_sequences(r"\xff"), r"\xff");
-        // More than two hex digits - take first two, rest as literal
-        // \x412 -> \x41 (hex byte 0x41='A') + literal '2'
-        assert_eq!(translate_escape_sequences(r"\x412"), r"\x412");
-        // \xabc -> \xab (hex byte 0xAB) + literal 'c'
-        assert_eq!(translate_escape_sequences(r"\xabc"), r"\xabc");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_hex_in_pattern() {
-        // \x4b has two hex digits ('4' and 'b'), so no padding needed
-        assert_eq!(translate_escape_sequences(r"a\x4b"), r"a\x4b");
-        assert_eq!(translate_escape_sequences(r"\x4B"), r"\x4B");
-        // Single hex digit followed by non-hex character
-        assert_eq!(translate_escape_sequences(r"\x4g"), r"\x04g");
-        assert_eq!(translate_escape_sequences(r"a\x4z"), r"a\x04z");
-    }
-
-    #[test]
-    fn test_translate_escape_sequences_mixed() {
-        // Mix of octal, hex, and backspace escapes
-        assert_eq!(
-            translate_escape_sequences(r"\101\x42\b\103"),
-            r"\x41\x42\x08\x43"
-        );
-        // Complex pattern
-        assert_eq!(
-            translate_escape_sequences(r"hello\bworld\x0a"),
-            r"hello\x08world\x0a"
-        );
     }
 
     #[test]

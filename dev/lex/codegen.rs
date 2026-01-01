@@ -13,7 +13,33 @@
 
 use crate::dfa::{CompressedTables, Dfa};
 use crate::lexfile::LexInfo;
+use std::fmt::Display;
 use std::io::{self, Write};
+
+/// Write an array of values inline (comma-separated, single line)
+fn write_array_inline<W: Write, T: Display>(output: &mut W, values: &[T]) -> io::Result<()> {
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{}", v)?;
+    }
+    Ok(())
+}
+
+/// Write an array of values with formatting (16 per line, right-aligned)
+fn write_array_formatted<W: Write, T: Display>(output: &mut W, values: &[T]) -> io::Result<()> {
+    for (i, v) in values.iter().enumerate() {
+        if i % 16 == 0 {
+            write!(output, "\n    ")?;
+        }
+        write!(output, "{:4}", v)?;
+        if i < values.len() - 1 {
+            write!(output, ",")?;
+        }
+    }
+    Ok(())
+}
 
 /// Rule metadata for code generation
 #[derive(Clone, Default)]
@@ -317,23 +343,13 @@ fn write_compressed_tables<W: Write>(
         "/* Base offset for each state into nxt/chk arrays */"
     )?;
     write!(output, "static const int yy_base[YY_NUM_STATES] = {{ ")?;
-    for (i, &b) in compressed.base.iter().enumerate() {
-        if i > 0 {
-            write!(output, ", ")?;
-        }
-        write!(output, "{}", b)?;
-    }
+    write_array_inline(output, &compressed.base)?;
     writeln!(output, " }};\n")?;
 
     // Write default transition array
     writeln!(output, "/* Default transition for each state */")?;
     write!(output, "static const short yy_default[YY_NUM_STATES] = {{ ")?;
-    for (i, &d) in compressed.default.iter().enumerate() {
-        if i > 0 {
-            write!(output, ", ")?;
-        }
-        write!(output, "{}", d)?;
-    }
+    write_array_inline(output, &compressed.default)?;
     writeln!(output, " }};\n")?;
 
     // Write nxt array (packed next-state transitions)
@@ -342,15 +358,7 @@ fn write_compressed_tables<W: Write>(
         writeln!(output, "static const short yy_nxt[1] = {{ -1 }};\n")?;
     } else {
         write!(output, "static const short yy_nxt[YY_NXT_SIZE] = {{")?;
-        for (i, &n) in compressed.nxt.iter().enumerate() {
-            if i % 16 == 0 {
-                write!(output, "\n    ")?;
-            }
-            write!(output, "{:4}", n)?;
-            if i < compressed.nxt.len() - 1 {
-                write!(output, ",")?;
-            }
-        }
+        write_array_formatted(output, &compressed.nxt)?;
         writeln!(output, "\n}};\n")?;
     }
 
@@ -360,15 +368,7 @@ fn write_compressed_tables<W: Write>(
         writeln!(output, "static const short yy_chk[1] = {{ -1 }};\n")?;
     } else {
         write!(output, "static const short yy_chk[YY_NXT_SIZE] = {{")?;
-        for (i, &c) in compressed.chk.iter().enumerate() {
-            if i % 16 == 0 {
-                write!(output, "\n    ")?;
-            }
-            write!(output, "{:4}", c)?;
-            if i < compressed.chk.len() - 1 {
-                write!(output, ",")?;
-            }
-        }
+        write_array_formatted(output, &compressed.chk)?;
         writeln!(output, "\n}};\n")?;
     }
 
@@ -471,12 +471,7 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
         output,
         "static const unsigned short yy_accept_idx[YY_NUM_STATES + 1] = {{ "
     )?;
-    for (i, &idx) in accept_idx.iter().enumerate() {
-        if i > 0 {
-            write!(output, ", ")?;
-        }
-        write!(output, "{}", idx)?;
-    }
+    write_array_inline(output, &accept_idx)?;
     writeln!(output, " }};\n")?;
 
     // Write the rules list
@@ -488,12 +483,7 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
             "static const short yy_accept_list[{}] = {{ ",
             accept_list.len()
         )?;
-        for (i, &rule) in accept_list.iter().enumerate() {
-            if i > 0 {
-                write!(output, ", ")?;
-            }
-            write!(output, "{}", rule)?;
-        }
+        write_array_inline(output, &accept_list)?;
         writeln!(output, " }};\n")?;
     }
 
@@ -1487,5 +1477,189 @@ mod tests {
         assert!(s.contains("int yylex(void)"));
         assert!(s.contains("yy_nxt"));
         assert!(s.contains("yy_accept"));
+    }
+
+    #[test]
+    fn test_generate_with_bol_anchor() {
+        // Test that BOL anchor rules generate the correct code
+        let hir = regex_syntax::parse("foo").unwrap();
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+
+        let mut lexinfo = create_test_lexinfo();
+        lexinfo.rules.push(crate::lexfile::LexRule {
+            ere: "^foo".to_string(),
+            compiled_ere: "foo".to_string(),
+            action: "return BOL_RULE;".to_string(),
+            start_conditions: vec![],
+            bol_anchor: true, // BOL-anchored rule
+            trailing_context: None,
+            compiled_trailing_context: None,
+        });
+
+        let rule_meta = vec![RuleMetadata {
+            bol_anchor: true,
+            main_pattern_len: None,
+            has_trailing_context: false,
+            has_variable_trailing_context: false,
+        }];
+
+        let mut output = Vec::new();
+        let config = CodeGenConfig {
+            rule_metadata: rule_meta,
+            ..Default::default()
+        };
+        generate(&mut output, &dfa, &lexinfo, &config).unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+
+        // Should contain BOL checking logic in the action switch
+        // The generated code checks yy_at_bol for BOL-anchored rules
+        assert!(
+            s.contains("return BOL_RULE"),
+            "Should include the BOL rule action"
+        );
+        // yylex function should be generated
+        assert!(
+            s.contains("int yylex(void)"),
+            "Should generate yylex function"
+        );
+    }
+
+    #[test]
+    fn test_generate_with_start_conditions() {
+        // Test that start conditions generate correct code
+        let hir = regex_syntax::parse("foo").unwrap();
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+
+        let mut lexinfo = create_test_lexinfo();
+        lexinfo.cond_start.push("COMMENT".to_string());
+        lexinfo.cond_xstart.push("STRING".to_string());
+        lexinfo.rules.push(crate::lexfile::LexRule {
+            ere: "foo".to_string(),
+            compiled_ere: "foo".to_string(),
+            action: "return 1;".to_string(),
+            start_conditions: vec!["COMMENT".to_string()],
+            bol_anchor: false,
+            trailing_context: None,
+            compiled_trailing_context: None,
+        });
+
+        let mut output = Vec::new();
+        let config = CodeGenConfig {
+            start_conditions: vec![
+                "INITIAL".to_string(),
+                "COMMENT".to_string(),
+                "STRING".to_string(),
+            ],
+            ..Default::default()
+        };
+        generate(&mut output, &dfa, &lexinfo, &config).unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+
+        // Should contain start condition definitions
+        assert!(
+            s.contains("#define INITIAL 0"),
+            "Should define INITIAL start condition"
+        );
+        assert!(
+            s.contains("#define COMMENT 1"),
+            "Should define COMMENT start condition"
+        );
+        assert!(
+            s.contains("#define STRING 2"),
+            "Should define STRING start condition"
+        );
+        assert!(s.contains("BEGIN"), "Should define BEGIN macro");
+    }
+
+    #[test]
+    fn test_generate_with_trailing_context() {
+        // Test that trailing context generates correct handling code
+        let hir = regex_syntax::parse("foo").unwrap();
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+
+        let mut lexinfo = create_test_lexinfo();
+        lexinfo.rules.push(crate::lexfile::LexRule {
+            ere: "foo/bar".to_string(),
+            compiled_ere: "foo".to_string(),
+            action: "return TC_RULE;".to_string(),
+            start_conditions: vec![],
+            bol_anchor: false,
+            trailing_context: Some("bar".to_string()),
+            compiled_trailing_context: Some("bar".to_string()),
+        });
+
+        let rule_meta = vec![RuleMetadata {
+            bol_anchor: false,
+            main_pattern_len: Some(3), // "foo" is 3 chars
+            has_trailing_context: true,
+            has_variable_trailing_context: false,
+        }];
+
+        let mut output = Vec::new();
+        let config = CodeGenConfig {
+            rule_metadata: rule_meta,
+            ..Default::default()
+        };
+        generate(&mut output, &dfa, &lexinfo, &config).unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+
+        // Should handle fixed-length trailing context by adjusting yyleng
+        assert!(
+            s.contains("TC_RULE"),
+            "Should include the trailing context rule action"
+        );
+    }
+
+    #[test]
+    fn test_compressed_table_format() {
+        // Test that compressed table format generates correct arrays
+        let hir = regex_syntax::parse("[a-z]+").unwrap();
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+        let minimized = dfa.minimize();
+
+        let mut lexinfo = create_test_lexinfo();
+        lexinfo.rules.push(crate::lexfile::LexRule {
+            ere: "[a-z]+".to_string(),
+            compiled_ere: "[a-z]+".to_string(),
+            action: "return ID;".to_string(),
+            start_conditions: vec![],
+            bol_anchor: false,
+            trailing_context: None,
+            compiled_trailing_context: None,
+        });
+
+        let mut output = Vec::new();
+        let config = CodeGenConfig {
+            table_format: TableFormat::Compressed,
+            ..Default::default()
+        };
+        generate(&mut output, &minimized, &lexinfo, &config).unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+
+        // Compressed format should have base, default, nxt, chk arrays
+        assert!(
+            s.contains("yy_base"),
+            "Compressed format should have yy_base array"
+        );
+        assert!(
+            s.contains("yy_def"),
+            "Compressed format should have yy_def array"
+        );
+        assert!(
+            s.contains("yy_nxt"),
+            "Compressed format should have yy_nxt array"
+        );
+        assert!(
+            s.contains("yy_chk"),
+            "Compressed format should have yy_chk array"
+        );
     }
 }

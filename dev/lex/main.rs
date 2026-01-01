@@ -12,6 +12,8 @@ mod dfa;
 pub mod diag;
 mod lexfile;
 mod nfa;
+mod pattern_escape;
+mod pattern_validate;
 
 use clap::Parser;
 use dfa::Dfa;
@@ -220,8 +222,15 @@ fn get_start_conditions(lexinfo: &lexfile::LexInfo) -> Vec<String> {
 }
 
 /// Write statistics to the given output
-fn write_stats<W: Write + ?Sized>(output: &mut W, dfa: &Dfa, nfa: &Nfa) -> io::Result<()> {
+fn write_stats<W: Write + ?Sized>(
+    output: &mut W,
+    dfa: &Dfa,
+    nfa: &Nfa,
+    lexinfo: &lexfile::LexInfo,
+) -> io::Result<()> {
     writeln!(output, "lex statistics:")?;
+    writeln!(output, "  {} rules", lexinfo.rules.len())?;
+    writeln!(output, "  {} substitution definitions", lexinfo.subs.len())?;
     writeln!(output, "  {} NFA states", nfa.states.len())?;
     writeln!(
         output,
@@ -234,6 +243,22 @@ fn write_stats<W: Write + ?Sized>(output: &mut W, dfa: &Dfa, nfa: &Nfa) -> io::R
         "  {} character equivalence classes",
         dfa.char_classes.num_classes
     )?;
+    // Output declared table sizes if any were specified
+    if !lexinfo.table_sizes.is_empty() {
+        writeln!(output, "  declared table sizes:")?;
+        for (key, value) in &lexinfo.table_sizes {
+            let desc = match key {
+                'p' => "positions",
+                'n' => "states",
+                'a' => "transitions",
+                'e' => "parse tree nodes",
+                'k' => "packed character classes",
+                'o' => "output array size",
+                _ => "unknown",
+            };
+            writeln!(output, "    %{} {} ({})", key, value, desc)?;
+        }
+    }
     Ok(())
 }
 
@@ -337,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &mut io::stdout()
         };
-        write_stats(stats_output, &dfa, &nfa)?;
+        write_stats(stats_output, &dfa, &nfa, &lexinfo)?;
     }
 
     if !args.stdout {

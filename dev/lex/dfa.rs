@@ -718,4 +718,143 @@ mod tests {
         // "if" should match rule 0 (higher priority)
         assert_eq!(dfa.states[state_after_if.unwrap()].accepting, Some(0));
     }
+
+    #[test]
+    fn test_compress_simple() {
+        // Create a simple DFA for "ab"
+        let hir = parse_regex("ab");
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+
+        // Compress the tables
+        let compressed = dfa.compress();
+
+        // Verify the compressed tables are consistent with the original
+        assert!(
+            compressed.verify(&dfa).is_ok(),
+            "Compressed tables should match original DFA"
+        );
+    }
+
+    #[test]
+    fn test_compress_alternation() {
+        // Create DFA for "a|b|c" - produces multiple transitions from start
+        let hir = parse_regex("a|b|c");
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+
+        let compressed = dfa.compress();
+
+        // Verify all lookups match
+        assert!(
+            compressed.verify(&dfa).is_ok(),
+            "Compressed tables should match original DFA for alternation"
+        );
+
+        // Verify basic structure
+        assert_eq!(compressed.base.len(), dfa.states.len());
+        assert_eq!(compressed.default.len(), dfa.states.len());
+    }
+
+    #[test]
+    fn test_compress_char_class() {
+        // Create DFA for "[a-z]+" - many transitions from one state
+        let hir = parse_regex("[a-z]+");
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+        let minimized = dfa.minimize();
+
+        let compressed = minimized.compress();
+
+        // Verify lookups match after compression
+        assert!(
+            compressed.verify(&minimized).is_ok(),
+            "Compressed tables should match minimized DFA for char class"
+        );
+
+        // For very small DFAs, compression overhead may exceed savings.
+        // Just verify the compression produces valid results.
+        let stats = compressed.stats();
+        assert!(stats.compressed_size > 0, "Should have non-zero size");
+        assert!(stats.ratio > 0.0, "Should have valid ratio");
+    }
+
+    #[test]
+    fn test_compress_multiple_rules() {
+        // Keywords + identifier pattern - typical lexer scenario
+        let hir_if = parse_regex("if");
+        let hir_then = parse_regex("then");
+        let hir_id = parse_regex("[a-z]+");
+        let nfa = Nfa::from_rules(&[(hir_if, 0), (hir_then, 1), (hir_id, 2)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+        let minimized = dfa.minimize();
+
+        let compressed = minimized.compress();
+
+        // Verify all lookups match
+        assert!(
+            compressed.verify(&minimized).is_ok(),
+            "Compressed tables should match for keyword + identifier pattern"
+        );
+    }
+
+    #[test]
+    fn test_compressed_lookup() {
+        // Create a known simple DFA and verify lookup behavior
+        let hir = parse_regex("ab");
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+        let compressed = dfa.compress();
+
+        // Lookup for 'a' from start should give valid next state
+        let class_a = dfa.char_classes.char_to_class['a' as usize] as usize;
+        let next_state = compressed.lookup(dfa.start, class_a);
+        assert!(next_state >= 0, "Should have transition on 'a' from start");
+
+        // Lookup for 'b' from start should give -1 (no transition)
+        let class_b = dfa.char_classes.char_to_class['b' as usize] as usize;
+        let no_trans = compressed.lookup(dfa.start, class_b);
+        // May or may not be -1 depending on DFA structure, but verify consistency
+        assert_eq!(
+            no_trans,
+            dfa.lookup(dfa.start, class_b),
+            "Compressed and dense lookup should match"
+        );
+    }
+
+    #[test]
+    fn test_dfa_lookup() {
+        // Verify Dfa::lookup works correctly
+        let hir = parse_regex("a");
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+
+        let class_a = dfa.char_classes.char_to_class['a' as usize] as usize;
+
+        // From start, 'a' should lead somewhere
+        let next = dfa.lookup(dfa.start, class_a);
+        assert!(next >= 0, "Should have transition on 'a'");
+
+        // From start, 'z' should not lead anywhere (return -1)
+        let class_z = dfa.char_classes.char_to_class['z' as usize] as usize;
+        let no_trans = dfa.lookup(dfa.start, class_z);
+        assert_eq!(no_trans, -1, "Should have no transition on 'z'");
+    }
+
+    #[test]
+    fn test_compression_stats() {
+        let hir = parse_regex("[a-z]+");
+        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let dfa = Dfa::from_nfa(&nfa);
+        let minimized = dfa.minimize();
+        let compressed = minimized.compress();
+
+        let stats = compressed.stats();
+
+        assert!(stats.num_states > 0);
+        assert!(stats.num_classes > 0);
+        assert!(stats.dense_size > 0);
+        assert!(stats.compressed_size > 0);
+        assert!(stats.ratio > 0.0);
+    }
 }

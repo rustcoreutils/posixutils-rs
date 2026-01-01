@@ -120,12 +120,21 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
     let mut rules = Vec::new();
 
     for (idx, rule) in lexinfo.rules.iter().enumerate() {
-        let hir = parse_regex_posix(&rule.ere)?;
+        // Use compiled_ere which has substitutions wrapped in parens for correct quantifier handling
+        let hir = parse_regex_posix(&rule.compiled_ere)
+            .map_err(|e| format!("rule {}: pattern '{}': {}", idx + 1, rule.ere, e))?;
 
-        // Parse trailing context if present
+        // Parse trailing context if present (use compiled version)
         let (trailing_context, main_pattern_len, has_variable_tc) =
-            if let Some(ref tc) = rule.trailing_context {
-                let tc_hir = parse_regex_posix(tc)?;
+            if let Some(ref tc) = rule.compiled_trailing_context {
+                let tc_hir = parse_regex_posix(tc).map_err(|e| {
+                    format!(
+                        "rule {}: trailing context '{}': {}",
+                        idx + 1,
+                        rule.trailing_context.as_deref().unwrap_or(""),
+                        e
+                    )
+                })?;
                 // Compute fixed length of MAIN pattern (for setting yyleng correctly)
                 // If main pattern has fixed length, we can set yyleng to that value
                 let main_len = compute_fixed_length(&hir);

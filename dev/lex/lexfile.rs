@@ -14,7 +14,10 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub struct LexRule {
     /// The regular expression pattern (main pattern, excluding trailing context)
+    /// This is the user-visible pattern with substitutions expanded
     pub ere: String,
+    /// The compiled pattern with substitutions wrapped in parens for correct quantifier handling
+    pub compiled_ere: String,
     /// The action (C code) to execute when matched
     pub action: String,
     /// Start conditions this rule is active in (empty means INITIAL or all %s conditions)
@@ -23,16 +26,20 @@ pub struct LexRule {
     pub bol_anchor: bool,
     /// Trailing context pattern (for r/s syntax), None if no trailing context
     pub trailing_context: Option<String>,
+    /// Compiled trailing context pattern
+    pub compiled_trailing_context: Option<String>,
 }
 
 impl LexRule {
     fn new() -> LexRule {
         LexRule {
             ere: String::new(),
+            compiled_ere: String::new(),
             action: String::new(),
             start_conditions: Vec::new(),
             bol_anchor: false,
             trailing_context: None,
+            compiled_trailing_context: None,
         }
     }
 }
@@ -133,21 +140,8 @@ impl ParseState {
         format!("lex: line {}: warning: {}", self.line_number, msg)
     }
 
-    fn push_rule(
-        &mut self,
-        ere: &str,
-        action: &str,
-        start_conditions: Vec<String>,
-        bol_anchor: bool,
-        trailing_context: Option<String>,
-    ) {
-        self.rules.push(LexRule {
-            ere: String::from(ere),
-            action: String::from(action),
-            start_conditions,
-            bol_anchor,
-            trailing_context,
-        });
+    fn push_rule(&mut self, rule: LexRule) {
+        self.rules.push(rule);
     }
 }
 
@@ -499,6 +493,64 @@ fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
     Ok(translate_escape_sequences(&re))
 }
 
+// translate lex-specific regex syntax with substitutions wrapped in parens
+// This is used for compilation where quantifiers need to apply to entire substitutions
+fn translate_ere_compiled(state: &mut ParseState, ere: &str) -> Result<String, String> {
+    let mut re = String::new();
+    let mut in_quotes = false;
+    let mut in_brace = false;
+    let mut brace_content = String::new();
+
+    for ch in ere.chars() {
+        if in_quotes && ch == '"' {
+            in_quotes = false;
+        } else if in_quotes {
+            match ch {
+                '*' => re.push_str(r"\x2a"),
+                '+' => re.push_str(r"\x2b"),
+                '.' => re.push_str(r"\x2e"),
+                '{' => re.push_str(r"\x7b"),
+                _ => re.push(ch),
+            }
+        } else if in_brace && ch == '}' {
+            // Determine if this is an interval expression or a substitution
+            if is_interval_expression(&brace_content) {
+                // Interval expression: pass through as-is
+                re.push('{');
+                re.push_str(&brace_content);
+                re.push('}');
+            } else {
+                // Substitution reference - wrap in group so quantifiers apply correctly
+                match state.subs.get(&brace_content) {
+                    Some(value) => {
+                        re.push('(');
+                        re.push_str(value);
+                        re.push(')');
+                    }
+                    None => {
+                        return Err(
+                            state.error(&format!("undefined substitution: {{{}}}", brace_content))
+                        );
+                    }
+                }
+            }
+            in_brace = false;
+            brace_content.clear();
+        } else if in_brace {
+            brace_content.push(ch);
+        } else if ch == '"' {
+            in_quotes = true;
+        } else if ch == '{' {
+            in_brace = true;
+        } else {
+            re.push(ch);
+        }
+    }
+
+    // Translate POSIX escape sequences to regex_syntax compatible format
+    Ok(translate_escape_sequences(&re))
+}
+
 /// Extract start conditions from a pattern like `<STATE>pattern` or `<STATE1,STATE2>pattern`
 /// Returns (start_conditions, remaining_pattern)
 fn extract_start_conditions(pattern: &str) -> (Vec<String>, &str) {
@@ -734,11 +786,13 @@ fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
 /// Parsed rule information
 struct ParsedRuleInfo {
     ere: String,
+    compiled_ere: String,
     action: String,
     open_braces: u32,
     start_conditions: Vec<String>,
     bol_anchor: bool,
     trailing_context: Option<String>,
+    compiled_trailing_context: Option<String>,
 }
 
 // parse a lex rule line, returning all rule components
@@ -753,15 +807,21 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     validate_pattern_restrictions(&ere_raw).map_err(|e| state.error(&e))?;
 
     // Parse anchoring and trailing context before translating
-    let (bol_anchor, ere_main, trailing_context, _eol_anchor) =
+    let (bol_anchor, ere_main, trailing_context_raw, _eol_anchor) =
         parse_anchoring_and_trailing_context(&ere_raw);
 
     // Translate the main pattern (translate_ere already adds line numbers)
     let ere = translate_ere(state, &ere_main)?;
+    // Compiled version wraps substitutions in parens for correct quantifier handling
+    let compiled_ere = translate_ere_compiled(state, &ere_main)?;
 
     // Translate trailing context if present (translate_ere already adds line numbers)
-    let trailing_context = match trailing_context {
-        Some(tc) => Some(translate_ere(state, &tc)?),
+    let trailing_context = match &trailing_context_raw {
+        Some(tc) => Some(translate_ere(state, tc)?),
+        None => None,
+    };
+    let compiled_trailing_context = match &trailing_context_raw {
+        Some(tc) => Some(translate_ere_compiled(state, tc)?),
         None => None,
     };
 
@@ -778,11 +838,13 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
 
     Ok(ParsedRuleInfo {
         ere,
+        compiled_ere,
         action: action.to_string(),
         open_braces,
         start_conditions,
         bol_anchor,
         trailing_context,
+        compiled_trailing_context,
     })
 }
 
@@ -822,19 +884,8 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
         state.tmp_rule.action.push_str(line);
         state.open_braces = parse_braces(state.open_braces, line).map_err(|e| state.error(&e))?;
         if state.open_braces == 0 {
-            let ere = state.tmp_rule.ere.clone();
-            let action = state.tmp_rule.action.clone();
-            let start_conditions = state.tmp_rule.start_conditions.clone();
-            let bol_anchor = state.tmp_rule.bol_anchor;
-            let trailing_context = state.tmp_rule.trailing_context.clone();
-            state.push_rule(
-                &ere,
-                &action,
-                start_conditions,
-                bol_anchor,
-                trailing_context,
-            );
-            state.tmp_rule = LexRule::new();
+            let rule = std::mem::replace(&mut state.tmp_rule, LexRule::new());
+            state.push_rule(rule);
         }
     } else if state.in_def || (first_char.is_whitespace() && line.len() > 1) {
         state.internal_defs.push(String::from(line));
@@ -843,20 +894,24 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     } else {
         let info = parse_rule(state, line)?;
         if info.open_braces == 0 {
-            state.push_rule(
-                &info.ere,
-                &info.action,
-                info.start_conditions,
-                info.bol_anchor,
-                info.trailing_context,
-            );
-        } else {
-            state.tmp_rule = LexRule {
+            state.push_rule(LexRule {
                 ere: info.ere,
+                compiled_ere: info.compiled_ere,
                 action: info.action,
                 start_conditions: info.start_conditions,
                 bol_anchor: info.bol_anchor,
                 trailing_context: info.trailing_context,
+                compiled_trailing_context: info.compiled_trailing_context,
+            });
+        } else {
+            state.tmp_rule = LexRule {
+                ere: info.ere,
+                compiled_ere: info.compiled_ere,
+                action: info.action,
+                start_conditions: info.start_conditions,
+                bol_anchor: info.bol_anchor,
+                trailing_context: info.trailing_context,
+                compiled_trailing_context: info.compiled_trailing_context,
             };
             state.open_braces = info.open_braces;
         }

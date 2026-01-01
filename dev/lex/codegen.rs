@@ -1274,10 +1274,12 @@ mod tests {
         let mut lexinfo = create_test_lexinfo();
         lexinfo.rules.push(crate::lexfile::LexRule {
             ere: "a".to_string(),
+            compiled_ere: "a".to_string(),
             action: "return 1;".to_string(),
             start_conditions: vec![],
             bol_anchor: false,
             trailing_context: None,
+            compiled_trailing_context: None,
         });
 
         let mut output = Vec::new();

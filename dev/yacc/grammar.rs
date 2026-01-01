@@ -519,6 +519,15 @@ impl Grammar {
         self.symbols[id].is_terminal
     }
 
+    /// Get all terminal symbol IDs
+    pub fn terminals(&self) -> impl Iterator<Item = SymbolId> + '_ {
+        self.symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_terminal)
+            .map(|(i, _)| i)
+    }
+
     /// Get all non-terminal symbol IDs
     pub fn nonterminals(&self) -> impl Iterator<Item = SymbolId> + '_ {
         self.symbols

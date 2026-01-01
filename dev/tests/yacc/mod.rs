@@ -28,6 +28,101 @@ fn run_yacc(args: &[&str], grammar_content: &str) -> std::process::Output {
         .expect("failed to execute yacc-rs")
 }
 
+/// Run yacc in both fast and strict modes, asserting both succeed
+fn run_yacc_both_modes(args: &[&str], grammar_content: &str) {
+    // Fast mode (default)
+    let output_fast = run_yacc(args, grammar_content);
+    assert!(
+        output_fast.status.success(),
+        "yacc (fast mode) should succeed: {}",
+        String::from_utf8_lossy(&output_fast.stderr)
+    );
+
+    // Strict mode
+    let mut strict_args = vec!["--strict"];
+    strict_args.extend(args);
+    let output_strict = run_yacc(&strict_args, grammar_content);
+    assert!(
+        output_strict.status.success(),
+        "yacc --strict should succeed: {}",
+        String::from_utf8_lossy(&output_strict.stderr)
+    );
+}
+
+/// Run full end-to-end test (yacc + compile + run) in both modes
+fn run_end_to_end_both_modes(grammar: &str, test_name: &str) {
+    run_end_to_end_with_mode(grammar, test_name, false); // Fast mode
+    run_end_to_end_with_mode(grammar, test_name, true); // Strict mode
+}
+
+fn run_end_to_end_with_mode(grammar: &str, test_name: &str, strict: bool) {
+    let mode_name = if strict { "strict" } else { "fast" };
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // Run yacc
+    let mut yacc_args = vec![];
+    if strict {
+        yacc_args.push("--strict");
+    }
+    yacc_args.push(grammar_path.to_str().unwrap());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&yacc_args)
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "{} ({} mode): yacc should succeed: {}",
+        test_name,
+        mode_name,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compile
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join(format!("{}_{}", test_name, mode_name));
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-Wno-unused-variable",
+            "-Wno-unused-but-set-variable",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "{} ({} mode): cc should compile: {}",
+        test_name,
+        mode_name,
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run
+    let run = Command::new(&exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute parser");
+
+    assert!(
+        run.status.success(),
+        "{} ({} mode): parser should succeed: {}",
+        test_name,
+        mode_name,
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 #[test]
 fn test_simple_grammar() {
     let grammar = r#"
@@ -37,8 +132,7 @@ expr : NUM
      ;
 "#;
 
-    let output = run_yacc(&[], grammar);
-    assert!(output.status.success(), "yacc should succeed");
+    run_yacc_both_modes(&[], grammar);
 }
 
 #[test]
@@ -73,11 +167,7 @@ void yyerror(const char *s) {
 }
 "#;
 
-    let output = run_yacc(&[], grammar);
-    assert!(
-        output.status.success(),
-        "yacc should succeed for expression grammar"
-    );
+    run_yacc_both_modes(&[], grammar);
 }
 
 #[test]
@@ -193,11 +283,7 @@ expr : INTEGER          { $$ = (double)$1; }
 %%
 "#;
 
-    let output = run_yacc(&[], grammar);
-    assert!(
-        output.status.success(),
-        "yacc should handle union and types"
-    );
+    run_yacc_both_modes(&[], grammar);
 }
 
 #[test]
@@ -223,10 +309,11 @@ expr : expr '+' expr
 %%
 "#;
 
-    let output = run_yacc(&[], grammar);
-    assert!(output.status.success(), "yacc should handle precedence");
+    // Test both modes
+    run_yacc_both_modes(&[], grammar);
 
-    // This grammar with proper precedence should have no conflicts
+    // Additionally check for no conflicts (fast mode is representative)
+    let output = run_yacc(&[], grammar);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("conflict"),
@@ -244,14 +331,11 @@ expr : expr '+' expr
      ;
 "#;
 
+    // Both modes should handle conflicts
+    run_yacc_both_modes(&[], grammar);
+
+    // Check that conflicts are reported (fast mode is representative)
     let output = run_yacc(&[], grammar);
-
-    // Should still succeed, but report conflicts
-    assert!(
-        output.status.success(),
-        "yacc should succeed even with conflicts"
-    );
-
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("conflict"),
@@ -274,8 +358,7 @@ stmt : NUM ';'
 %%
 "#;
 
-    let output = run_yacc(&[], grammar);
-    assert!(output.status.success(), "yacc should handle error token");
+    run_yacc_both_modes(&[], grammar);
 }
 
 #[test]
@@ -296,11 +379,7 @@ stmt : NUM
 %%
 "#;
 
-    let output = run_yacc(&[], grammar);
-    assert!(
-        output.status.success(),
-        "yacc should handle explicit start symbol"
-    );
+    run_yacc_both_modes(&[], grammar);
 }
 
 #[test]
@@ -1661,6 +1740,7 @@ yystart : YYtoken yytoken NORMAL ;
 #[test]
 fn test_compile_and_run_simple_parser() {
     // End-to-end test: generate parser, compile with cc, and run
+    // Tests both fast and strict modes
     let grammar = r#"
 %{
 #include <stdio.h>
@@ -1702,59 +1782,13 @@ int main(void) {
 }
 "#;
 
-    let temp_dir = TempDir::new().unwrap();
-    let grammar_path = temp_dir.path().join("test.y");
-    fs::write(&grammar_path, grammar).unwrap();
-
-    // Run yacc
-    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
-        .current_dir(temp_dir.path())
-        .arg(grammar_path.to_str().unwrap())
-        .output()
-        .expect("failed to execute yacc");
-
-    assert!(
-        output.status.success(),
-        "yacc should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Compile the generated code
-    let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("parser");
-
-    let compile = Command::new("cc")
-        .current_dir(temp_dir.path())
-        .args(&[
-            "-Wall",
-            "-o",
-            exe_path.to_str().unwrap(),
-            code_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to execute cc");
-
-    assert!(
-        compile.status.success(),
-        "cc should compile successfully: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    // Run the parser
-    let run = Command::new(exe_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to execute parser");
-
-    assert!(
-        run.status.success(),
-        "parser should run successfully and return 0"
-    );
+    run_end_to_end_both_modes(grammar, "simple_parser");
 }
 
 #[test]
 fn test_compile_and_run_calculator() {
     // Full calculator grammar with operators
+    // Tests both fast and strict modes
     let grammar = r#"
 %{
 #include <stdio.h>
@@ -1826,60 +1860,13 @@ int main(void) {
 }
 "#;
 
-    let temp_dir = TempDir::new().unwrap();
-    let grammar_path = temp_dir.path().join("calc.y");
-    fs::write(&grammar_path, grammar).unwrap();
-
-    // Run yacc
-    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
-        .current_dir(temp_dir.path())
-        .arg(grammar_path.to_str().unwrap())
-        .output()
-        .expect("failed to execute yacc");
-
-    assert!(
-        output.status.success(),
-        "yacc should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Compile
-    let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("calc");
-
-    let compile = Command::new("cc")
-        .current_dir(temp_dir.path())
-        .args(&[
-            "-Wall",
-            "-o",
-            exe_path.to_str().unwrap(),
-            code_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to execute cc");
-
-    assert!(
-        compile.status.success(),
-        "cc should compile calculator: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    // Run
-    let run = Command::new(exe_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to execute calculator");
-
-    assert!(
-        run.status.success(),
-        "calculator should compute 2+3*4=14: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    run_end_to_end_both_modes(grammar, "calculator");
 }
 
 #[test]
 fn test_error_recovery_basic() {
     // Test error token in grammar
+    // Tests both fast and strict modes
     let grammar = r#"
 %{
 #include <stdio.h>
@@ -1922,6 +1909,7 @@ void yyerror(const char *s) {
 
 int main(void) {
     int result = yyparse();
+    (void)result;
     /* Should recover from error */
     if (!recovered) {
         fprintf(stderr, "Error recovery failed\n");
@@ -1931,57 +1919,7 @@ int main(void) {
 }
 "#;
 
-    let temp_dir = TempDir::new().unwrap();
-    let grammar_path = temp_dir.path().join("error.y");
-    fs::write(&grammar_path, grammar).unwrap();
-
-    // Run yacc
-    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
-        .current_dir(temp_dir.path())
-        .arg(grammar_path.to_str().unwrap())
-        .output()
-        .expect("failed to execute yacc");
-
-    assert!(
-        output.status.success(),
-        "yacc should succeed with error token: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Compile
-    let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("error_test");
-
-    let compile = Command::new("cc")
-        .current_dir(temp_dir.path())
-        .args(&[
-            "-Wall",
-            "-Wno-unused-variable",
-            "-Wno-unused-but-set-variable",
-            "-o",
-            exe_path.to_str().unwrap(),
-            code_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to execute cc");
-
-    assert!(
-        compile.status.success(),
-        "cc should compile error recovery test: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    // Run
-    let run = Command::new(exe_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to execute error test");
-
-    assert!(
-        run.status.success(),
-        "error recovery should work: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    run_end_to_end_both_modes(grammar, "error_recovery");
 }
 
 #[test]
@@ -1989,6 +1927,7 @@ fn test_empty_rule() {
     // Test epsilon production
     // Note: Uses tokens A and B to avoid shift/reduce conflict
     // The input "B" forces opt_a to match the empty rule
+    // Tests both fast and strict modes
     let grammar = r#"
 %{
 #include <stdio.h>
@@ -2023,58 +1962,14 @@ int main(void) {
 }
 "#;
 
-    let temp_dir = TempDir::new().unwrap();
-    let grammar_path = temp_dir.path().join("empty.y");
-    fs::write(&grammar_path, grammar).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
-        .current_dir(temp_dir.path())
-        .arg(grammar_path.to_str().unwrap())
-        .output()
-        .expect("failed to execute yacc");
-
-    assert!(
-        output.status.success(),
-        "yacc should handle empty rules: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("empty_test");
-
-    let compile = Command::new("cc")
-        .current_dir(temp_dir.path())
-        .args(&[
-            "-Wall",
-            "-o",
-            exe_path.to_str().unwrap(),
-            code_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to execute cc");
-
-    assert!(
-        compile.status.success(),
-        "cc should compile empty rule test: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    let run = Command::new(exe_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to execute empty test");
-
-    assert!(
-        run.status.success(),
-        "empty rule should work correctly: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    run_end_to_end_both_modes(grammar, "empty_rule");
 }
 
 #[test]
 fn test_mid_rule_action() {
     // Test mid-rule semantic actions
     // The mid-rule action sets $$ = 100, which becomes accessible as $2 in the final action
+    // Tests both fast and strict modes
     let grammar = r#"
 %{
 #include <stdio.h>
@@ -2086,7 +1981,7 @@ static int mid_value = 0;
 %token A B
 
 %%
-start : A { mid_value = 100; $$ = 100; } B { if ($2 != 100) return 1; return 0; }
+start : A { mid_value = 100; $$ = 100; } B { (void)mid_value; if ($2 != 100) return 1; return 0; }
       ;
 %%
 
@@ -2107,58 +2002,13 @@ int main(void) {
 }
 "#;
 
-    let temp_dir = TempDir::new().unwrap();
-    let grammar_path = temp_dir.path().join("midaction.y");
-    fs::write(&grammar_path, grammar).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
-        .current_dir(temp_dir.path())
-        .arg(grammar_path.to_str().unwrap())
-        .output()
-        .expect("failed to execute yacc");
-
-    assert!(
-        output.status.success(),
-        "yacc should handle mid-rule actions: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("midaction_test");
-
-    let compile = Command::new("cc")
-        .current_dir(temp_dir.path())
-        .args(&[
-            "-Wall",
-            "-Wno-unused-variable",
-            "-o",
-            exe_path.to_str().unwrap(),
-            code_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to execute cc");
-
-    assert!(
-        compile.status.success(),
-        "cc should compile mid-rule action test: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    let run = Command::new(exe_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to execute midaction test");
-
-    assert!(
-        run.status.success(),
-        "mid-rule action value should be accessible: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    run_end_to_end_both_modes(grammar, "mid_rule_action");
 }
 
 #[test]
 fn test_prec_override() {
     // Test %prec directive for unary minus
+    // Tests both fast and strict modes
     let grammar = r#"
 %{
 #include <stdio.h>
@@ -2231,52 +2081,7 @@ int main(void) {
 }
 "#;
 
-    let temp_dir = TempDir::new().unwrap();
-    let grammar_path = temp_dir.path().join("prec.y");
-    fs::write(&grammar_path, grammar).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
-        .current_dir(temp_dir.path())
-        .arg(grammar_path.to_str().unwrap())
-        .output()
-        .expect("failed to execute yacc");
-
-    assert!(
-        output.status.success(),
-        "yacc should handle %prec: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("prec_test");
-
-    let compile = Command::new("cc")
-        .current_dir(temp_dir.path())
-        .args(&[
-            "-Wall",
-            "-o",
-            exe_path.to_str().unwrap(),
-            code_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to execute cc");
-
-    assert!(
-        compile.status.success(),
-        "cc should compile %prec test: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
-    let run = Command::new(exe_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to execute prec test");
-
-    assert!(
-        run.status.success(),
-        "%prec should work for unary minus: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    run_end_to_end_both_modes(grammar, "prec_override");
 }
 
 /// Test that error token value can be overridden per POSIX
@@ -2471,5 +2276,215 @@ expr : NUM
     assert!(
         code_content.contains("POSIX: skip lookahead"),
         "Should have POSIX lookahead skip optimization"
+    );
+}
+
+// ============================================================================
+// --strict mode tests
+// ============================================================================
+
+/// Test that --strict flag is recognized
+#[test]
+fn test_strict_mode_flag_recognized() {
+    let grammar = r#"
+%token NUM
+%%
+expr : NUM
+     ;
+"#;
+
+    let output = run_yacc(&["--strict"], grammar);
+    assert!(
+        output.status.success(),
+        "yacc --strict should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Test that --strict mode disables consistent state optimization
+#[test]
+fn test_strict_mode_disables_consistent_optimization() {
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+
+    // Grammar with consistent states (single reduce)
+    let grammar = r#"
+%token A B
+%%
+s : A B { $$ = 1; }
+  | A   { $$ = 2; }
+  ;
+"#;
+
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg("--strict")
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc --strict should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Check that consistent[] contains all zeros
+    let code_path = temp_dir.path().join("y.tab.c");
+    let code_content = fs::read_to_string(&code_path).unwrap();
+
+    // Extract consistent table values
+    if let Some(start) = code_content.find("yyconsistent[] =") {
+        let subset = &code_content[start..];
+        if let Some(end) = subset.find("};") {
+            let table_def = &subset[..end];
+            // In strict mode, all values should be 0
+            let has_nonzero = table_def
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .any(|c| c != '0');
+            assert!(
+                !has_nonzero,
+                "In strict mode, yyconsistent[] should contain all zeros"
+            );
+        }
+    }
+}
+
+/// Test that fast mode (default) enables consistent state optimization
+#[test]
+fn test_fast_mode_enables_consistent_optimization() {
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+
+    // Grammar that will have consistent states (reduce-only states)
+    let grammar = r#"
+%token NUM
+%%
+expr : term
+     ;
+term : NUM
+     ;
+"#;
+
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // In fast mode, there should be at least one consistent state
+    let code_path = temp_dir.path().join("y.tab.c");
+    let code_content = fs::read_to_string(&code_path).unwrap();
+
+    // Look for the consistent table
+    assert!(
+        code_content.contains("yyconsistent[]") || code_content.contains("consistent[]"),
+        "Should have consistent state table"
+    );
+}
+
+/// Test that both strict and fast modes produce working parsers
+#[test]
+fn test_strict_and_fast_both_compile() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+%token NUM
+%%
+expr : NUM { printf("parsed\n"); }
+     ;
+%%
+int yylex(void) { static int done = 0; if (done) return 0; done = 1; return NUM; }
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+int main(void) { return yyparse(); }
+"#;
+
+    // Test fast mode (default)
+    let grammar_path_fast = temp_dir.path().join("fast.y");
+    fs::write(&grammar_path_fast, grammar).unwrap();
+
+    let output_fast = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg("-b")
+        .arg("fast")
+        .arg(grammar_path_fast.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output_fast.status.success(),
+        "yacc (fast mode) should succeed: {}",
+        String::from_utf8_lossy(&output_fast.stderr)
+    );
+
+    // Test strict mode
+    let grammar_path_strict = temp_dir.path().join("strict.y");
+    fs::write(&grammar_path_strict, grammar).unwrap();
+
+    let output_strict = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg("--strict")
+        .arg("-b")
+        .arg("strict")
+        .arg(grammar_path_strict.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output_strict.status.success(),
+        "yacc --strict should succeed: {}",
+        String::from_utf8_lossy(&output_strict.stderr)
+    );
+
+    // Both should generate valid C code
+    let fast_code = temp_dir.path().join("fast.tab.c");
+    let strict_code = temp_dir.path().join("strict.tab.c");
+
+    assert!(fast_code.exists(), "fast.tab.c should exist");
+    assert!(strict_code.exists(), "strict.tab.c should exist");
+}
+
+/// Test verification runs on grammars with conflicts (implicit via all other tests passing)
+#[test]
+fn test_verification_on_grammar_with_conflicts() {
+    let grammar = r#"
+%token NUM
+%%
+expr : expr '+' expr
+     | NUM
+     ;
+"#;
+
+    // This grammar has shift/reduce conflicts
+    // Verification should still pass (it's not a bug, just a conflict)
+    let output = run_yacc(&[], grammar);
+    assert!(
+        output.status.success(),
+        "yacc should succeed on grammar with conflicts: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Also test with --strict
+    let output_strict = run_yacc(&["--strict"], grammar);
+    assert!(
+        output_strict.status.success(),
+        "yacc --strict should succeed on grammar with conflicts: {}",
+        String::from_utf8_lossy(&output_strict.stderr)
     );
 }

@@ -2094,3 +2094,334 @@ fn test_missing_action_error() {
         c_code
     );
 }
+
+// ============================================================================
+// POSIX Bracket Expression Tests
+// ============================================================================
+
+#[test]
+fn test_posix_character_class_alpha() {
+    // Test POSIX [:alpha:] character class
+    let lex_input = r#"
+%%
+[[:alpha:]]+    printf("ALPHA: %s\n", yytext);
+[[:digit:]]+    printf("DIGIT: %s\n", yytext);
+[ \t\n]+        /* skip whitespace */
+.               printf("OTHER: %s\n", yytext);
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with [[:alpha:]]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "Hello123World\n").unwrap();
+    assert!(
+        result.contains("ALPHA: Hello"),
+        "Should match alpha: {}",
+        result
+    );
+    assert!(
+        result.contains("DIGIT: 123"),
+        "Should match digits: {}",
+        result
+    );
+    assert!(
+        result.contains("ALPHA: World"),
+        "Should match alpha: {}",
+        result
+    );
+}
+
+#[test]
+fn test_posix_character_class_all() {
+    // Test all 12 required POSIX character classes compile correctly
+    let test_cases = vec![
+        ("[[:alnum:]]", "alphanumeric"),
+        ("[[:alpha:]]", "alphabetic"),
+        ("[[:blank:]]", "blank"),
+        ("[[:cntrl:]]", "control"),
+        ("[[:digit:]]", "digit"),
+        ("[[:graph:]]", "graphical"),
+        ("[[:lower:]]", "lowercase"),
+        ("[[:print:]]", "printable"),
+        ("[[:punct:]]", "punctuation"),
+        ("[[:space:]]", "whitespace"),
+        ("[[:upper:]]", "uppercase"),
+        ("[[:xdigit:]]", "hex digit"),
+    ];
+
+    for (class, desc) in test_cases {
+        let lex_input = format!(
+            r#"
+%%
+{}+    printf("MATCH\n", yytext);
+.|\n   /* skip */
+%%
+
+int main() {{ yylex(); return 0; }}
+"#,
+            class
+        );
+
+        let (c_code, success) = run_lex(&lex_input);
+        assert!(success, "lex failed with {} ({}): {}", class, desc, c_code);
+    }
+}
+
+#[test]
+fn test_posix_character_class_mixed() {
+    // Test POSIX class mixed with other bracket content (C identifier pattern)
+    let lex_input = r#"
+%%
+[[:alpha:]_][[:alnum:]_]*    printf("IDENT: %s\n", yytext);
+[ \t\n]+                     /* skip whitespace */
+.                            /* skip other */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with mixed POSIX class: {}", c_code);
+
+    let result = compile_and_run(&c_code, "_foo bar123 42\n").unwrap();
+    assert!(
+        result.contains("IDENT: _foo"),
+        "Should match _foo: {}",
+        result
+    );
+    assert!(
+        result.contains("IDENT: bar123"),
+        "Should match bar123: {}",
+        result
+    );
+    // "42" should NOT match since it starts with a digit
+    assert!(
+        !result.contains("IDENT: 42"),
+        "Should not match 42: {}",
+        result
+    );
+}
+
+#[test]
+fn test_negated_posix_class() {
+    // Test negated POSIX class [^[:alpha:]]
+    let lex_input = r#"
+%%
+[^[:alpha:]\n]+    printf("NON_ALPHA: %s\n", yytext);
+[[:alpha:]]+       printf("ALPHA: %s\n", yytext);
+\n                 /* skip newline */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with negated POSIX class: {}", c_code);
+
+    let result = compile_and_run(&c_code, "123abc456\n").unwrap();
+    assert!(
+        result.contains("NON_ALPHA: 123"),
+        "Should match non-alpha: {}",
+        result
+    );
+    assert!(
+        result.contains("ALPHA: abc"),
+        "Should match alpha: {}",
+        result
+    );
+    assert!(
+        result.contains("NON_ALPHA: 456"),
+        "Should match non-alpha: {}",
+        result
+    );
+}
+
+#[test]
+fn test_equivalence_class_basic() {
+    // Test equivalence class [=c=]
+    // In POSIX locale, [=a=] is equivalent to just [a]
+    let lex_input = r#"
+%%
+[[=a=]]+    printf("EQUIV_A: %s\n", yytext);
+[b-z]+      printf("OTHER: %s\n", yytext);
+[ \t\n]+    /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with equivalence class: {}", c_code);
+
+    let result = compile_and_run(&c_code, "aaa bbb\n").unwrap();
+    assert!(
+        result.contains("EQUIV_A: aaa"),
+        "Should match 'aaa': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: bbb"),
+        "Should match 'bbb': {}",
+        result
+    );
+}
+
+#[test]
+fn test_equivalence_class_in_mixed_bracket() {
+    // Test equivalence class mixed with other bracket content
+    let lex_input = r#"
+%%
+[abc[=d=]ef]+    printf("MATCH: %s\n", yytext);
+[g-z]+           printf("OTHER: %s\n", yytext);
+[ \t\n]+         /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex failed with mixed equivalence class: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "abcdef ghij\n").unwrap();
+    assert!(
+        result.contains("MATCH: abcdef"),
+        "Should match 'abcdef': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: ghij"),
+        "Should match 'ghij': {}",
+        result
+    );
+}
+
+#[test]
+fn test_collating_element_basic() {
+    // Test single-character collating element [.c.]
+    // In POSIX locale, [.a.] is equivalent to just [a]
+    let lex_input = r#"
+%%
+[[.a.]]+    printf("COLLATE_A: %s\n", yytext);
+[b-z]+      printf("OTHER: %s\n", yytext);
+[ \t\n]+    /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with collating element: {}", c_code);
+
+    let result = compile_and_run(&c_code, "aaa bbb\n").unwrap();
+    assert!(
+        result.contains("COLLATE_A: aaa"),
+        "Should match 'aaa': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: bbb"),
+        "Should match 'bbb': {}",
+        result
+    );
+}
+
+#[test]
+fn test_collating_element_special_char() {
+    // Test collating element with special character that needs escaping
+    // [.^.] should match literal ^
+    let lex_input = r#"
+%%
+[[.^.]]+    printf("CARET: %s\n", yytext);
+[a-z]+      printf("WORD: %s\n", yytext);
+[ \t\n]+    /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex failed with collating element [.^.]: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "^^^ abc\n").unwrap();
+    assert!(
+        result.contains("CARET: ^^^"),
+        "Should match '^^^': {}",
+        result
+    );
+    assert!(
+        result.contains("WORD: abc"),
+        "Should match 'abc': {}",
+        result
+    );
+}
+
+#[test]
+fn test_collating_element_dash() {
+    // Test collating element with dash [.-.]
+    // Dash is special in bracket expressions (range operator)
+    // [a[.-.]z]+ matches 'a', '-', or 'z' (dash via collating element)
+    let lex_input = r#"
+%%
+[a[.-.]z]+    printf("MATCH: %s\n", yytext);
+[b-y]+        printf("OTHER: %s\n", yytext);
+[ \t\n]+      /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex failed with collating element [.-.]: {}",
+        c_code
+    );
+
+    // Input "a-z" should match as a single token since all chars are in [a-z] (with - from [.-.])
+    let result = compile_and_run(&c_code, "a-z bbb\n").unwrap();
+    assert!(
+        result.contains("MATCH: a-z"),
+        "Should match 'a-z': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: bbb"),
+        "Should match 'bbb': {}",
+        result
+    );
+}

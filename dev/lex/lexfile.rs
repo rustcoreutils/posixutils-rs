@@ -237,32 +237,55 @@ enum RegexType {
     Curly,
 }
 
+/// Find the end of a POSIX bracket expression construct like [:alpha:], [=a=], or [.ch.]
+/// Returns the index of the closing bracket ']' if found, None otherwise
+fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Option<usize> {
+    // Look for close_char followed by ]  (e.g., :] or =] or .])
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == close_char && chars[i + 1] == ']' {
+            return Some(i + 1); // Return index of the ]
+        }
+        i += 1;
+    }
+    None
+}
+
 // find the end of the regex in a rule line, by matching [ and ( and { and } and "
+// This version properly handles POSIX bracket expression constructs: [:class:], [=equiv=], [.collating.]
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
     let mut inside_quotes = false;
     let mut escape_next = false;
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
 
-    for (i, ch) in line.chars().enumerate() {
+    while i < chars.len() {
+        let ch = chars[i];
+
         // Handle escape sequences
         if escape_next {
             escape_next = false;
+            i += 1;
             continue;
         }
         if ch == '\\' {
             escape_next = true;
+            i += 1;
             continue;
         }
 
         // Handle quoted strings - whitespace inside quotes doesn't end the pattern
         if ch == '"' && !inside_brackets {
             inside_quotes = !inside_quotes;
+            i += 1;
             continue;
         }
 
         // Inside quotes, nothing special happens
         if inside_quotes {
+            i += 1;
             continue;
         }
 
@@ -271,6 +294,19 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 if !inside_brackets {
                     stack.push(RegexType::Square);
                     inside_brackets = true;
+                } else {
+                    // Inside brackets: check for POSIX constructs [:, [=, [.
+                    if i + 1 < chars.len() {
+                        let next = chars[i + 1];
+                        if next == ':' || next == '=' || next == '.' {
+                            // Find the matching closing sequence :], =], or .]
+                            if let Some(end_idx) = find_posix_bracket_end(&chars, i + 2, next) {
+                                i = end_idx + 1; // Skip past the closing ]
+                                continue;
+                            }
+                            // No closing found - continue normally, regex_syntax will report error
+                        }
+                    }
                 }
             }
             '(' => {
@@ -284,10 +320,13 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 }
             }
             ']' => {
-                inside_brackets = false;
-                if stack.pop() != Some(RegexType::Square) {
-                    return Err("unmatched closing square bracket in pattern".to_string());
+                if inside_brackets {
+                    inside_brackets = false;
+                    if stack.pop() != Some(RegexType::Square) {
+                        return Err("unmatched closing square bracket in pattern".to_string());
+                    }
                 }
+                // ] outside brackets: could be part of pattern, let regex_syntax handle
             }
             ')' => {
                 if !inside_brackets && stack.pop() != Some(RegexType::Paren) {
@@ -300,11 +339,12 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 }
             }
             _ => {
-                if ch.is_whitespace() && stack.is_empty() {
+                if ch.is_whitespace() && stack.is_empty() && !inside_brackets {
                     return Ok(i);
                 }
             }
         }
+        i += 1;
     }
 
     if inside_quotes {
@@ -440,6 +480,129 @@ fn is_interval_expression(s: &str) -> bool {
     has_digit_before_comma
 }
 
+/// Expand POSIX equivalence classes [=c=] and collating elements [.c.] within bracket expressions.
+///
+/// In POSIX locale:
+/// - Equivalence class [=c=] matches just the character(s) between the delimiters
+/// - Collating element [.c.] matches the character(s) literally (with escaping if needed)
+///
+/// Examples:
+/// - `[abc[=d=]ef]` becomes `[abcdef]`
+/// - `[[=a=]]` becomes `[a]`
+/// - `[abc[.^.]def]` becomes `[abc\^def]` (^ needs escaping at start of bracket)
+fn expand_posix_bracket_constructs(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut result = String::new();
+    let mut i = 0;
+    let mut in_bracket = false;
+    let mut bracket_content_start = false; // True if we just entered a bracket
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if ch == '\\' && i + 1 < chars.len() {
+            // Escape sequence - copy both characters
+            result.push(ch);
+            result.push(chars[i + 1]);
+            i += 2;
+            bracket_content_start = false;
+            continue;
+        }
+
+        if ch == '[' && !in_bracket {
+            // Entering a bracket expression
+            in_bracket = true;
+            bracket_content_start = true;
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        if in_bracket && ch == '[' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if next == '=' || next == '.' {
+                // Found [= or [. inside brackets - this is a POSIX construct
+                let close_seq = if next == '=' { "=]" } else { ".]" };
+                if let Some((content, end_idx)) =
+                    find_posix_construct_content(&chars, i + 2, close_seq)
+                {
+                    // In POSIX locale: just output the content
+                    // For collating elements with special chars, we need to escape them
+                    if next == '.' {
+                        // Collating element - escape special bracket chars
+                        for c in content.chars() {
+                            match c {
+                                '^' if bracket_content_start => result.push_str("\\^"),
+                                ']' => result.push_str("\\]"),
+                                '\\' => result.push_str("\\\\"),
+                                '-' => result.push_str("\\-"),
+                                _ => result.push(c),
+                            }
+                            bracket_content_start = false;
+                        }
+                    } else {
+                        // Equivalence class - just output the character(s)
+                        result.push_str(&content);
+                        if !content.is_empty() {
+                            bracket_content_start = false;
+                        }
+                    }
+                    i = end_idx + 1;
+                    continue;
+                }
+                // No valid closing found - pass through as-is (regex_syntax will error)
+            }
+            // Not a POSIX construct, just a literal [ inside brackets
+            bracket_content_start = false;
+        }
+
+        if ch == ']' && in_bracket {
+            in_bracket = false;
+        }
+
+        result.push(ch);
+        if in_bracket && ch != '[' {
+            bracket_content_start = false;
+        }
+        i += 1;
+    }
+
+    result
+}
+
+/// Find the content of a POSIX bracket construct and return (content, end_index)
+/// where end_index is the index of the closing bracket ']'
+fn find_posix_construct_content(
+    chars: &[char],
+    start: usize,
+    close_seq: &str,
+) -> Option<(String, usize)> {
+    let close_chars: Vec<char> = close_seq.chars().collect();
+    let mut content = String::new();
+    let mut i = start;
+
+    while i + close_chars.len() <= chars.len() {
+        // Check if we found the closing sequence
+        let mut found = true;
+        for (j, close_char) in close_chars.iter().enumerate() {
+            if chars[i + j] != *close_char {
+                found = false;
+                break;
+            }
+        }
+
+        if found {
+            // Return content and index of the closing ]
+            return Some((content, i + close_chars.len() - 1));
+        }
+
+        content.push(chars[i]);
+        i += 1;
+    }
+
+    None
+}
+
 // translate lex-specific regex syntax to regex crate syntax
 fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
     let mut re = String::new();
@@ -489,8 +652,10 @@ fn translate_ere(state: &mut ParseState, ere: &str) -> Result<String, String> {
         }
     }
 
+    // Expand POSIX equivalence classes [=c=] and collating elements [.c.]
+    let expanded = expand_posix_bracket_constructs(&re);
     // Translate POSIX escape sequences to regex_syntax compatible format
-    Ok(translate_escape_sequences(&re))
+    Ok(translate_escape_sequences(&expanded))
 }
 
 // translate lex-specific regex syntax with substitutions wrapped in parens
@@ -547,8 +712,10 @@ fn translate_ere_compiled(state: &mut ParseState, ere: &str) -> Result<String, S
         }
     }
 
+    // Expand POSIX equivalence classes [=c=] and collating elements [.c.]
+    let expanded = expand_posix_bracket_constructs(&re);
     // Translate POSIX escape sequences to regex_syntax compatible format
-    Ok(translate_escape_sequences(&re))
+    Ok(translate_escape_sequences(&expanded))
 }
 
 /// Extract start conditions from a pattern like `<STATE>pattern` or `<STATE1,STATE2>pattern`

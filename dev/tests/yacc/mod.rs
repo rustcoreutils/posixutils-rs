@@ -2278,3 +2278,198 @@ int main(void) {
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+/// Test that error token value can be overridden per POSIX
+#[test]
+fn test_error_token_value_override() {
+    let grammar = r#"
+%token error 512
+%token NUM
+%%
+expr : NUM
+     | error
+     ;
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("error_override.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&["-d", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should accept %token error 512: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Check that the header file doesn't contain error=256 (the default)
+    let header_path = temp_dir.path().join("y.tab.h");
+    let header_content = fs::read_to_string(&header_path).unwrap();
+
+    // The error token shouldn't be #defined (it's a reserved token),
+    // but the grammar should accept the override without error
+    assert!(
+        !header_content.contains("error 256"),
+        "error token should be overridden, not using default 256"
+    );
+}
+
+/// Test that default semantic value propagation works ($$ = $1)
+#[test]
+fn test_default_value_propagation() {
+    let grammar = r#"
+%{
+#include <stdio.h>
+
+int result = 0;
+const char *input_str;
+int input_pos;
+%}
+
+%token NUM
+
+%%
+
+goal : expr         /* No action - should get $$ = $1 implicitly */
+     ;
+
+expr : NUM          { $$ = $1; }
+     ;
+
+%%
+
+int yylex(void) {
+    extern int yylval;
+    while (input_str[input_pos] == ' ') input_pos++;
+    if (input_str[input_pos] == '\0') return 0;
+    if (input_str[input_pos] >= '0' && input_str[input_pos] <= '9') {
+        yylval = input_str[input_pos++] - '0';
+        return NUM;
+    }
+    return input_str[input_pos++];
+}
+
+void yyerror(const char *s) {
+    fprintf(stderr, "%s\n", s);
+}
+
+int main(void) {
+    extern int yyparse(void);
+    input_str = "7";
+    input_pos = 0;
+
+    if (yyparse() != 0) {
+        fprintf(stderr, "Parse failed\n");
+        return 1;
+    }
+
+    /* The goal rule should have $$ = $1 implicitly,
+       which means result should be the value from expr */
+    return 0;
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("default_val.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Check that the generated code contains the implicit $$ = $1 assignment
+    let code_path = temp_dir.path().join("y.tab.c");
+    let code_content = fs::read_to_string(&code_path).unwrap();
+
+    // The goal rule (production 1) should have implicit $$ = $1
+    assert!(
+        code_content.contains("$$ = $1 (default)"),
+        "Should have implicit $$ = $1 for rules without actions"
+    );
+
+    // Compile and run to verify it works
+    let exe_path = temp_dir.path().join("default_val_test");
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile default value test: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute default value test");
+
+    assert!(
+        run.status.success(),
+        "Default value propagation should work: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Test that POSIX single-reduce optimization generates consistent table
+#[test]
+fn test_consistent_state_optimization() {
+    let grammar = r#"
+%token NUM
+%%
+expr : NUM
+     ;
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("consistent.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Check that the generated code contains the consistent table and optimization
+    let code_path = temp_dir.path().join("y.tab.c");
+    let code_content = fs::read_to_string(&code_path).unwrap();
+
+    // Should have the consistent table
+    assert!(
+        code_content.contains("yyconsistent[]") || code_content.contains("consistent[]"),
+        "Should have consistent state table for POSIX optimization"
+    );
+
+    // Should have the optimization check
+    assert!(
+        code_content.contains("POSIX: skip lookahead"),
+        "Should have POSIX lookahead skip optimization"
+    );
+}

@@ -142,6 +142,35 @@ impl Grammar {
 
         // Pass 1: Add all tokens, registering explicit numbers
         for token in &parsed.tokens {
+            // POSIX: Allow %token error <number> to override error token value
+            // The error token was already added above with default value 256,
+            // so we update it if the user provides an explicit number
+            if token.name == "error" {
+                if let Some(new_num) = token.number {
+                    // Update the error token's number
+                    let error_id = ERROR_SYMBOL;
+                    let old_num = grammar.symbols[error_id]
+                        .token_number
+                        .expect("error should have token number");
+                    grammar.token_number_map.remove(&old_num);
+                    grammar.symbols[error_id].token_number = Some(new_num);
+                    grammar
+                        .token_number_map
+                        .insert(new_num, "error".to_string());
+                }
+                // Update other attributes if specified
+                if let Some(ref tag) = token.tag {
+                    grammar.symbols[ERROR_SYMBOL].tag = Some(tag.clone());
+                }
+                if token.precedence.unwrap_or(0) > 0 {
+                    grammar.symbols[ERROR_SYMBOL].precedence = token.precedence.unwrap_or(0);
+                }
+                if token.associativity.is_some() {
+                    grammar.symbols[ERROR_SYMBOL].associativity = token.associativity;
+                }
+                continue;
+            }
+
             let number = token.number.or_else(|| {
                 // Check if it's a character literal (has implicit number)
                 if token.name.starts_with('\'') && token.name.ends_with('\'') {

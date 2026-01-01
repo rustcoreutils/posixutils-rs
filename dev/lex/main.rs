@@ -9,6 +9,7 @@
 
 mod codegen;
 mod dfa;
+pub mod diag;
 mod lexfile;
 mod nfa;
 
@@ -245,11 +246,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(String::from("-"));
     }
 
+    // Initialize diagnostics with the input filename
+    let input_name = if args.files.len() == 1 && args.files[0] != "-" {
+        args.files[0].clone()
+    } else if args.files.len() == 1 {
+        "<stdin>".to_string()
+    } else {
+        // Multiple files concatenated - use first non-stdin name
+        args.files
+            .iter()
+            .find(|f| *f != "-")
+            .cloned()
+            .unwrap_or_else(|| "<stdin>".to_string())
+    };
+    diag::init(&input_name);
+
     // POSIX says multiple input files are concatenated
     let rawinput = concat_input_files(&args.files)?;
 
     // Parse input lex file into a data structure containing the rules table
     let lexinfo = lexfile::parse(&rawinput)?;
+
+    // Check for parse errors
+    if diag::has_errors() {
+        std::process::exit(1);
+    }
 
     // Parse all regular expressions
     let rules = parse_rules(&lexinfo)?;

@@ -9,6 +9,7 @@
 
 //! Parser for yacc grammar files
 
+use crate::diag;
 use crate::error::YaccError;
 use crate::lexer::{PositionedToken, Token};
 
@@ -123,6 +124,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Create a syntax error, also logging it via diag
+    fn syntax_error(&self, line: usize, msg: String) -> YaccError {
+        diag::error(diag::Position::line_only(line as u32), &msg);
+        YaccError::Syntax { line, msg }
+    }
+
     fn current(&self) -> Option<&PositionedToken> {
         self.tokens.get(self.pos)
     }
@@ -149,14 +156,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(())
             }
-            Some(t) => Err(YaccError::Syntax {
-                line: t.line,
-                msg: format!("expected {:?}, found {:?}", expected, t.token),
-            }),
-            None => Err(YaccError::Syntax {
-                line: 0,
-                msg: format!("expected {:?}, found end of input", expected),
-            }),
+            Some(t) => Err(self.syntax_error(
+                t.line,
+                format!("expected {:?}, found {:?}", expected, t.token),
+            )),
+            None => {
+                Err(self.syntax_error(0, format!("expected {:?}, found end of input", expected)))
+            }
         }
     }
 
@@ -199,10 +205,10 @@ impl<'a> Parser<'a> {
                 }
                 Some(Token::UnionBody(body)) => {
                     if grammar.union_def.is_some() {
-                        return Err(YaccError::Syntax {
-                            line: self.current_line(),
-                            msg: "multiple %union declarations".into(),
-                        });
+                        return Err(self.syntax_error(
+                            self.current_line(),
+                            "multiple %union declarations".into(),
+                        ));
                     }
                     let line = self.current_line();
                     grammar.union_def = Some(CodeBlock {
@@ -243,26 +249,25 @@ impl<'a> Parser<'a> {
                         grammar.start = Some(name.clone());
                         self.advance();
                     } else {
-                        return Err(YaccError::Syntax {
-                            line: self.current_line(),
-                            msg: "expected identifier after %start".into(),
-                        });
+                        return Err(self.syntax_error(
+                            self.current_line(),
+                            "expected identifier after %start".into(),
+                        ));
                     }
                 }
                 None => {
-                    return Err(YaccError::Syntax {
-                        line: 0,
-                        msg: "unexpected end of input in declarations".into(),
-                    })
+                    return Err(
+                        self.syntax_error(0, "unexpected end of input in declarations".into())
+                    )
                 }
                 _ => {
-                    return Err(YaccError::Syntax {
-                        line: self.current_line(),
-                        msg: format!(
+                    return Err(self.syntax_error(
+                        self.current_line(),
+                        format!(
                             "unexpected token in declarations: {:?}",
                             self.current_token()
                         ),
-                    })
+                    ))
                 }
             }
         }
@@ -334,10 +339,7 @@ impl<'a> Parser<'a> {
             self.advance();
             t
         } else {
-            return Err(YaccError::Syntax {
-                line: self.current_line(),
-                msg: "%type requires a <tag>".into(),
-            });
+            return Err(self.syntax_error(self.current_line(), "%type requires a <tag>".into()));
         };
 
         let mut symbols = Vec::new();
@@ -349,10 +351,10 @@ impl<'a> Parser<'a> {
         }
 
         if symbols.is_empty() {
-            return Err(YaccError::Syntax {
-                line: self.current_line(),
-                msg: "%type requires at least one symbol".into(),
-            });
+            return Err(self.syntax_error(
+                self.current_line(),
+                "%type requires at least one symbol".into(),
+            ));
         }
 
         grammar.types.push(TypeDecl { tag, symbols });
@@ -387,10 +389,10 @@ impl<'a> Parser<'a> {
                         if self.is_rule_start() {
                             break;
                         }
-                        return Err(YaccError::Syntax {
-                            line: self.current_line(),
-                            msg: format!("unexpected token in rule: {:?}", self.current_token()),
-                        });
+                        return Err(self.syntax_error(
+                            self.current_line(),
+                            format!("unexpected token in rule: {:?}", self.current_token()),
+                        ));
                     }
                 }
             }
@@ -439,10 +441,10 @@ impl<'a> Parser<'a> {
                             self.advance();
                         }
                         _ => {
-                            return Err(YaccError::Syntax {
-                                line: self.current_line(),
-                                msg: "expected token name after %prec".into(),
-                            });
+                            return Err(self.syntax_error(
+                                self.current_line(),
+                                "expected token name after %prec".into(),
+                            ));
                         }
                     }
                 }
@@ -471,10 +473,10 @@ impl<'a> Parser<'a> {
                 | Some(Token::ProgramsSection(_))
                 | None => break,
                 _ => {
-                    return Err(YaccError::Syntax {
-                        line: self.current_line(),
-                        msg: format!("unexpected token in rule body: {:?}", self.current_token()),
-                    });
+                    return Err(self.syntax_error(
+                        self.current_line(),
+                        format!("unexpected token in rule body: {:?}", self.current_token()),
+                    ));
                 }
             }
         }

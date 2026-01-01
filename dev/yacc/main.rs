@@ -8,6 +8,7 @@
 //
 
 mod codegen;
+pub mod diag;
 mod error;
 mod first_follow;
 mod grammar;
@@ -144,6 +145,9 @@ fn print_usage() {
 }
 
 fn run(opts: &Options) -> Result<(), YaccError> {
+    // Initialize diagnostics with the grammar filename
+    diag::init(&opts.grammar_file);
+
     // Read input grammar
     let input = fs::read_to_string(&opts.grammar_file)
         .map_err(|e| YaccError::Io(format!("cannot read '{}': {}", opts.grammar_file, e)))?;

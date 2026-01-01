@@ -1861,20 +1861,17 @@ fn test_yyin_yyout_redirect() {
 %%
 
 int main(int argc, char *argv[]) {
-    FILE *out = fopen("/tmp/lex_test_output.txt", "w");
+    FILE *out = tmpfile();
     if (out) {
         yyout = out;
         yylex();
-        fclose(out);
-        // Read and print the output file
-        out = fopen("/tmp/lex_test_output.txt", "r");
-        if (out) {
-            char buf[256];
-            while (fgets(buf, sizeof(buf), out)) {
-                printf("%s", buf);
-            }
-            fclose(out);
+        rewind(out);
+        // Read and print the temporary output
+        char buf[256];
+        while (fgets(buf, sizeof(buf), out)) {
+            printf("%s", buf);
         }
+        fclose(out);
     }
     return 0;
 }

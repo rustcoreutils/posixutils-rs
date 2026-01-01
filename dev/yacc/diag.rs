@@ -87,20 +87,7 @@ pub fn has_errors() -> bool {
     ERROR_COUNT.load(Ordering::SeqCst) > 0
 }
 
-/// Get the current error count.
-#[allow(dead_code)]
-pub fn error_count() -> u32 {
-    ERROR_COUNT.load(Ordering::SeqCst)
-}
-
-/// Get the current warning count.
-#[allow(dead_code)]
-pub fn warning_count() -> u32 {
-    WARNING_COUNT.load(Ordering::SeqCst)
-}
-
 /// Report a warning at the given position.
-#[allow(dead_code)]
 pub fn warning(pos: Position, msg: &str) {
     WARNING_COUNT.fetch_add(1, Ordering::SeqCst);
     do_diag("warning", pos, msg);

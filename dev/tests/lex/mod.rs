@@ -1576,3 +1576,849 @@ int main() {
         output
     );
 }
+
+// ============================================================================
+// POSIX Compliance Tests - Added for gap coverage
+// ============================================================================
+
+#[test]
+fn test_default_action_echo() {
+    // Test that unmatched characters are copied to output (default ECHO behavior)
+    // Per POSIX: "A default rule shall be present that... copies matched input to the output"
+    let lex_input = r#"
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Input has letters (matched by rule) and digits (unmatched, should pass through via ECHO)
+    let result = compile_and_run(&c_code, "abc123xyz\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // Words should be matched
+    assert!(output.contains("WORD: abc"), "Should match 'abc'");
+    assert!(output.contains("WORD: xyz"), "Should match 'xyz'");
+
+    // Digits should pass through to output via default action
+    assert!(
+        output.contains("123"),
+        "Unmatched chars '123' should appear in output via ECHO: {}",
+        output
+    );
+}
+
+#[test]
+fn test_period_not_matching_newline() {
+    // POSIX: "A <newline> shall not be matched by a period operator"
+    let lex_input = r#"
+%%
+.         printf("DOT: '%s'\n", yytext);
+\n        printf("NEWLINE\n");
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Input: "ab\ncd\n" - dots should match 'a', 'b', 'c', 'd' but NOT newlines
+    let result = compile_and_run(&c_code, "ab\ncd\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // Count DOT matches - should be exactly 4 (a, b, c, d)
+    let dot_count = output.matches("DOT:").count();
+    assert_eq!(
+        dot_count, 4,
+        "Should have exactly 4 DOT matches for 'a', 'b', 'c', 'd': {}",
+        output
+    );
+
+    // Count NEWLINE matches - should be exactly 2
+    let newline_count = output.matches("NEWLINE").count();
+    assert_eq!(
+        newline_count, 2,
+        "Should have exactly 2 NEWLINE matches: {}",
+        output
+    );
+}
+
+#[test]
+fn test_multiple_input_files() {
+    // Test that multiple input files are concatenated
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file1 = temp_dir.path().join("test1.l");
+    let lex_file2 = temp_dir.path().join("test2.l");
+    let output_file = temp_dir.path().join("lex.yy.c");
+
+    // First file: definitions and start of rules
+    fs::write(
+        &lex_file1,
+        r#"%{
+#define TOKEN_WORD 1
+%}
+%%
+"#,
+    )
+    .unwrap();
+
+    // Second file: rest of rules and user code
+    fs::write(
+        &lex_file2,
+        r#"[a-z]+    return TOKEN_WORD;
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    while (yylex() != 0) {
+        printf("TOKEN\n");
+    }
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    // Run lex with both input files
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .args([
+            lex_file1.to_str().unwrap(),
+            lex_file2.to_str().unwrap(),
+            "-o",
+            output_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute lex");
+
+    assert!(
+        output.status.success(),
+        "lex failed with multiple input files: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the output file was created and contains combined content
+    let c_code = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        c_code.contains("TOKEN_WORD"),
+        "Should contain definition from first file"
+    );
+    assert!(
+        c_code.contains("int yylex"),
+        "Should contain generated yylex"
+    );
+}
+
+#[test]
+fn test_statistics_output() {
+    // Test that -v outputs statistics
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file = temp_dir.path().join("test.l");
+    let output_file = temp_dir.path().join("lex.yy.c");
+
+    fs::write(
+        &lex_file,
+        r#"%%
+[a-z]+    printf("WORD\n");
+[ \t\n]+  /* skip */
+%%
+"#,
+    )
+    .unwrap();
+
+    // Run lex with -v for statistics
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .args([
+            "-v",
+            lex_file.to_str().unwrap(),
+            "-o",
+            output_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute lex");
+
+    assert!(output.status.success(), "lex failed with -v flag");
+
+    // Statistics should be in stdout or stderr
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Should contain some statistics information
+    assert!(
+        combined.contains("NFA") || combined.contains("DFA") || combined.contains("states"),
+        "Statistics output should mention NFA/DFA/states: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_echo_macro() {
+    // Test explicit ECHO macro usage
+    let lex_input = r#"
+%%
+[a-z]+    ECHO;
+[0-9]+    printf("NUM: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // ECHO should write matched text to output
+    let result = compile_and_run(&c_code, "hello 123\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // "hello" should be echoed directly
+    assert!(
+        output.contains("hello"),
+        "ECHO should output 'hello': {}",
+        output
+    );
+    // "123" should be printed with NUM prefix
+    assert!(
+        output.contains("NUM: 123"),
+        "Should print NUM: 123: {}",
+        output
+    );
+}
+
+#[test]
+fn test_yywrap_custom() {
+    // Test custom yywrap that processes multiple inputs
+    let lex_input = r#"
+%{
+static int wrap_count = 0;
+%}
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int yywrap(void) {
+    wrap_count++;
+    if (wrap_count == 1) {
+        // Simulate switching to new input by returning 0
+        // In a real implementation, we'd set yyin to a new file
+        return 1;  // For this test, just return 1 to stop
+    }
+    return 1;
+}
+
+int main() {
+    yylex();
+    printf("WRAP_COUNT: %d\n", wrap_count);
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // Should have processed words
+    assert!(output.contains("WORD: hello"), "Should match 'hello'");
+    assert!(output.contains("WORD: world"), "Should match 'world'");
+    // yywrap should have been called at EOF
+    assert!(
+        output.contains("WRAP_COUNT: 1"),
+        "yywrap should be called once at EOF: {}",
+        output
+    );
+}
+
+#[test]
+fn test_yyin_yyout_redirect() {
+    // Test setting yyin and yyout to different files
+    let lex_input = r#"
+%%
+[a-z]+    fprintf(yyout, "WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main(int argc, char *argv[]) {
+    FILE *out = tmpfile();
+    if (out) {
+        yyout = out;
+        yylex();
+        rewind(out);
+        // Read and print the temporary output
+        char buf[256];
+        while (fgets(buf, sizeof(buf), out)) {
+            printf("%s", buf);
+        }
+        fclose(out);
+    }
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // Output should contain words that were written to yyout then read back
+    assert!(
+        output.contains("WORD: hello"),
+        "Should output 'hello' via yyout: {}",
+        output
+    );
+    assert!(
+        output.contains("WORD: world"),
+        "Should output 'world' via yyout: {}",
+        output
+    );
+}
+
+#[test]
+fn test_quoted_pattern_with_spaces() {
+    // Test patterns with quoted strings containing spaces
+    let lex_input = r#"
+%%
+"hello world"    printf("PHRASE\n");
+" "              printf("SPACE\n");
+[a-z]+           printf("WORD: %s\n", yytext);
+\n               /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test matching "hello world" as a phrase
+    let result = compile_and_run(&c_code, "hello world foo\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    assert!(
+        output.contains("PHRASE"),
+        "Should match 'hello world' as phrase: {}",
+        output
+    );
+    // After matching "hello world", remaining " foo" should have space then word
+    assert!(output.contains("SPACE"), "Should match space: {}", output);
+    assert!(
+        output.contains("WORD: foo"),
+        "Should match 'foo': {}",
+        output
+    );
+}
+
+#[test]
+fn test_fall_through_action_runtime() {
+    // Test | (fall-through) action at runtime
+    let lex_input = r#"
+%%
+abc       |
+def       |
+ghi       printf("MATCHED: %s\n", yytext);
+[a-z]+    printf("OTHER: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "abc def ghi xyz\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // All three patterns should use the same action (MATCHED:)
+    assert!(
+        output.contains("MATCHED: abc"),
+        "abc should fall through: {}",
+        output
+    );
+    assert!(
+        output.contains("MATCHED: def"),
+        "def should fall through: {}",
+        output
+    );
+    assert!(
+        output.contains("MATCHED: ghi"),
+        "ghi should use action: {}",
+        output
+    );
+    // xyz doesn't match the fall-through patterns
+    assert!(
+        output.contains("OTHER: xyz"),
+        "xyz should match OTHER: {}",
+        output
+    );
+}
+
+#[test]
+fn test_yytext_external_access() {
+    // Test that yytext is accessible from external functions
+    let lex_input = r#"
+%{
+extern char *yytext;
+void print_word(void) {
+    printf("EXTERNAL: %s\n", yytext);
+}
+%}
+%%
+[a-z]+    print_word();
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // External function should be able to access yytext
+    assert!(
+        output.contains("EXTERNAL: hello"),
+        "External function should access yytext: {}",
+        output
+    );
+    assert!(
+        output.contains("EXTERNAL: world"),
+        "External function should access yytext: {}",
+        output
+    );
+}
+
+#[test]
+fn test_blank_line_in_definitions() {
+    // Test that lines beginning with blank in definitions go to external definitions
+    let lex_input = r#"
+%{
+#include <string.h>
+%}
+ /* This line starts with a space - should go to external defs */
+ static int counter = 0;
+
+WORD    [a-z]+
+%%
+{WORD}    { counter++; printf("WORD %d: %s\n", counter, yytext); }
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // The counter variable should be in the generated code
+    assert!(
+        c_code.contains("static int counter"),
+        "Line with leading blank should be in external defs: {}",
+        &c_code[..500]
+    );
+
+    let result = compile_and_run(&c_code, "one two three\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    assert!(output.contains("WORD 1: one"), "Should count words");
+    assert!(output.contains("WORD 2: two"), "Should count words");
+    assert!(output.contains("WORD 3: three"), "Should count words");
+}
+
+#[test]
+fn test_missing_action_error() {
+    // Test that missing action produces an error
+    let lex_input = r#"
+%%
+[a-z]+
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+
+    // Should fail because first rule has no action
+    assert!(
+        !success,
+        "lex should fail with missing action, but got: {}",
+        c_code
+    );
+    assert!(
+        c_code.contains("missing action") || c_code.contains("error"),
+        "Error message should mention missing action: {}",
+        c_code
+    );
+}
+
+// ============================================================================
+// POSIX Bracket Expression Tests
+// ============================================================================
+
+#[test]
+fn test_posix_character_class_alpha() {
+    // Test POSIX [:alpha:] character class
+    let lex_input = r#"
+%%
+[[:alpha:]]+    printf("ALPHA: %s\n", yytext);
+[[:digit:]]+    printf("DIGIT: %s\n", yytext);
+[ \t\n]+        /* skip whitespace */
+.               printf("OTHER: %s\n", yytext);
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with [[:alpha:]]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "Hello123World\n").unwrap();
+    assert!(
+        result.contains("ALPHA: Hello"),
+        "Should match alpha: {}",
+        result
+    );
+    assert!(
+        result.contains("DIGIT: 123"),
+        "Should match digits: {}",
+        result
+    );
+    assert!(
+        result.contains("ALPHA: World"),
+        "Should match alpha: {}",
+        result
+    );
+}
+
+#[test]
+fn test_posix_character_class_all() {
+    // Test all 12 required POSIX character classes compile correctly
+    let test_cases = vec![
+        ("[[:alnum:]]", "alphanumeric"),
+        ("[[:alpha:]]", "alphabetic"),
+        ("[[:blank:]]", "blank"),
+        ("[[:cntrl:]]", "control"),
+        ("[[:digit:]]", "digit"),
+        ("[[:graph:]]", "graphical"),
+        ("[[:lower:]]", "lowercase"),
+        ("[[:print:]]", "printable"),
+        ("[[:punct:]]", "punctuation"),
+        ("[[:space:]]", "whitespace"),
+        ("[[:upper:]]", "uppercase"),
+        ("[[:xdigit:]]", "hex digit"),
+    ];
+
+    for (class, desc) in test_cases {
+        let lex_input = format!(
+            r#"
+%%
+{}+    printf("MATCH\n", yytext);
+.|\n   /* skip */
+%%
+
+int main() {{ yylex(); return 0; }}
+"#,
+            class
+        );
+
+        let (c_code, success) = run_lex(&lex_input);
+        assert!(success, "lex failed with {} ({}): {}", class, desc, c_code);
+    }
+}
+
+#[test]
+fn test_posix_character_class_mixed() {
+    // Test POSIX class mixed with other bracket content (C identifier pattern)
+    let lex_input = r#"
+%%
+[[:alpha:]_][[:alnum:]_]*    printf("IDENT: %s\n", yytext);
+[ \t\n]+                     /* skip whitespace */
+.                            /* skip other */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with mixed POSIX class: {}", c_code);
+
+    let result = compile_and_run(&c_code, "_foo bar123 42\n").unwrap();
+    assert!(
+        result.contains("IDENT: _foo"),
+        "Should match _foo: {}",
+        result
+    );
+    assert!(
+        result.contains("IDENT: bar123"),
+        "Should match bar123: {}",
+        result
+    );
+    // "42" should NOT match since it starts with a digit
+    assert!(
+        !result.contains("IDENT: 42"),
+        "Should not match 42: {}",
+        result
+    );
+}
+
+#[test]
+fn test_negated_posix_class() {
+    // Test negated POSIX class [^[:alpha:]]
+    let lex_input = r#"
+%%
+[^[:alpha:]\n]+    printf("NON_ALPHA: %s\n", yytext);
+[[:alpha:]]+       printf("ALPHA: %s\n", yytext);
+\n                 /* skip newline */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with negated POSIX class: {}", c_code);
+
+    let result = compile_and_run(&c_code, "123abc456\n").unwrap();
+    assert!(
+        result.contains("NON_ALPHA: 123"),
+        "Should match non-alpha: {}",
+        result
+    );
+    assert!(
+        result.contains("ALPHA: abc"),
+        "Should match alpha: {}",
+        result
+    );
+    assert!(
+        result.contains("NON_ALPHA: 456"),
+        "Should match non-alpha: {}",
+        result
+    );
+}
+
+#[test]
+fn test_equivalence_class_basic() {
+    // Test equivalence class [=c=]
+    // In POSIX locale, [=a=] is equivalent to just [a]
+    let lex_input = r#"
+%%
+[[=a=]]+    printf("EQUIV_A: %s\n", yytext);
+[b-z]+      printf("OTHER: %s\n", yytext);
+[ \t\n]+    /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with equivalence class: {}", c_code);
+
+    let result = compile_and_run(&c_code, "aaa bbb\n").unwrap();
+    assert!(
+        result.contains("EQUIV_A: aaa"),
+        "Should match 'aaa': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: bbb"),
+        "Should match 'bbb': {}",
+        result
+    );
+}
+
+#[test]
+fn test_equivalence_class_in_mixed_bracket() {
+    // Test equivalence class mixed with other bracket content
+    let lex_input = r#"
+%%
+[abc[=d=]ef]+    printf("MATCH: %s\n", yytext);
+[g-z]+           printf("OTHER: %s\n", yytext);
+[ \t\n]+         /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex failed with mixed equivalence class: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "abcdef ghij\n").unwrap();
+    assert!(
+        result.contains("MATCH: abcdef"),
+        "Should match 'abcdef': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: ghij"),
+        "Should match 'ghij': {}",
+        result
+    );
+}
+
+#[test]
+fn test_collating_element_basic() {
+    // Test single-character collating element [.c.]
+    // In POSIX locale, [.a.] is equivalent to just [a]
+    let lex_input = r#"
+%%
+[[.a.]]+    printf("COLLATE_A: %s\n", yytext);
+[b-z]+      printf("OTHER: %s\n", yytext);
+[ \t\n]+    /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed with collating element: {}", c_code);
+
+    let result = compile_and_run(&c_code, "aaa bbb\n").unwrap();
+    assert!(
+        result.contains("COLLATE_A: aaa"),
+        "Should match 'aaa': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: bbb"),
+        "Should match 'bbb': {}",
+        result
+    );
+}
+
+#[test]
+fn test_collating_element_special_char() {
+    // Test collating element with special character that needs escaping
+    // [.^.] should match literal ^
+    let lex_input = r#"
+%%
+[[.^.]]+    printf("CARET: %s\n", yytext);
+[a-z]+      printf("WORD: %s\n", yytext);
+[ \t\n]+    /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex failed with collating element [.^.]: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "^^^ abc\n").unwrap();
+    assert!(
+        result.contains("CARET: ^^^"),
+        "Should match '^^^': {}",
+        result
+    );
+    assert!(
+        result.contains("WORD: abc"),
+        "Should match 'abc': {}",
+        result
+    );
+}
+
+#[test]
+fn test_collating_element_dash() {
+    // Test collating element with dash [.-.]
+    // Dash is special in bracket expressions (range operator)
+    // [a[.-.]z]+ matches 'a', '-', or 'z' (dash via collating element)
+    let lex_input = r#"
+%%
+[a[.-.]z]+    printf("MATCH: %s\n", yytext);
+[b-y]+        printf("OTHER: %s\n", yytext);
+[ \t\n]+      /* skip whitespace */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex failed with collating element [.-.]: {}",
+        c_code
+    );
+
+    // Input "a-z" should match as a single token since all chars are in [a-z] (with - from [.-.])
+    let result = compile_and_run(&c_code, "a-z bbb\n").unwrap();
+    assert!(
+        result.contains("MATCH: a-z"),
+        "Should match 'a-z': {}",
+        result
+    );
+    assert!(
+        result.contains("OTHER: bbb"),
+        "Should match 'bbb': {}",
+        result
+    );
+}

@@ -9,9 +9,22 @@
 
 //! Grammar representation and symbol table
 
+use crate::diag;
 use crate::error::YaccError;
 use crate::parser::{Associativity, CodeBlock, ParsedGrammar, RhsElement, Symbol as ParsedSymbol};
 use std::collections::HashMap;
+
+/// Create a grammar error, also logging it via diag
+fn grammar_error(msg: String) -> YaccError {
+    diag::error(diag::Position::line_only(0), &msg);
+    YaccError::Grammar(msg)
+}
+
+/// Create a grammar error with line number, also logging it via diag
+fn grammar_error_at(line: usize, msg: String) -> YaccError {
+    diag::error(diag::Position::line_only(line as u32), &msg);
+    YaccError::Grammar(msg)
+}
 
 /// Index type for symbols
 pub type SymbolId = usize;
@@ -203,7 +216,7 @@ impl Grammar {
             if let Some(&id) = grammar.symbol_map.get(start) {
                 id
             } else {
-                return Err(YaccError::Grammar(format!(
+                return Err(grammar_error(format!(
                     "start symbol '{}' not defined",
                     start
                 )));
@@ -212,7 +225,7 @@ impl Grammar {
             // Default: LHS of first rule
             *grammar.symbol_map.get(&parsed.rules[0].lhs).unwrap()
         } else {
-            return Err(YaccError::Grammar("no rules defined".into()));
+            return Err(grammar_error("no rules defined".into()));
         };
 
         grammar.start_symbol = user_start;
@@ -257,10 +270,10 @@ impl Grammar {
         for prod in &grammar.productions {
             for &sym_id in &prod.rhs {
                 if sym_id >= grammar.symbols.len() {
-                    return Err(YaccError::Grammar(format!(
-                        "undefined symbol in production {}",
-                        prod.id
-                    )));
+                    return Err(grammar_error_at(
+                        prod.line,
+                        format!("undefined symbol in production {}", prod.id),
+                    ));
                 }
             }
         }
@@ -271,7 +284,7 @@ impl Grammar {
                 && id != AUGMENTED_START
                 && !grammar.productions_for.contains_key(&id)
             {
-                return Err(YaccError::Grammar(format!(
+                return Err(grammar_error(format!(
                     "non-terminal '{}' has no rules",
                     sym.name
                 )));
@@ -303,7 +316,7 @@ impl Grammar {
             if let Some(new_num) = token_number {
                 if let Some(existing_num) = self.symbols[id].token_number {
                     if existing_num != new_num {
-                        return Err(YaccError::Grammar(format!(
+                        return Err(grammar_error(format!(
                             "token '{}' already has number {}, cannot reassign to {}",
                             name, existing_num, new_num
                         )));
@@ -312,7 +325,7 @@ impl Grammar {
                     // Assigning number to symbol that didn't have one yet
                     // Check for duplicate token numbers
                     if let Some(existing_name) = self.token_number_map.get(&new_num) {
-                        return Err(YaccError::Grammar(format!(
+                        return Err(grammar_error(format!(
                             "duplicate token number {}: already assigned to '{}', cannot assign to '{}'",
                             new_num, existing_name, name
                         )));
@@ -329,9 +342,12 @@ impl Grammar {
         if !name.starts_with('@') && !name.starts_with('\'') {
             // Skip internal symbols like @1 (mid-rule actions) and 'c' (char literals)
             if name.starts_with("yy") || name.starts_with("YY") {
-                eprintln!(
-                    "warning: symbol '{}' begins with 'yy' or 'YY' which is reserved",
-                    name
+                diag::warning(
+                    diag::Position::line_only(0),
+                    &format!(
+                        "symbol '{}' begins with 'yy' or 'YY' which is reserved",
+                        name
+                    ),
                 );
             }
         }
@@ -339,7 +355,7 @@ impl Grammar {
         // New symbol - check for duplicate token number
         if let Some(num) = token_number {
             if let Some(existing_name) = self.token_number_map.get(&num) {
-                return Err(YaccError::Grammar(format!(
+                return Err(grammar_error(format!(
                     "duplicate token number {}: already assigned to '{}', cannot assign to '{}'",
                     num, existing_name, name
                 )));
@@ -361,10 +377,9 @@ impl Grammar {
     }
 
     fn add_production(&mut self, rule: &crate::parser::Rule) -> Result<(), YaccError> {
-        let lhs = *self
-            .symbol_map
-            .get(&rule.lhs)
-            .ok_or_else(|| YaccError::Grammar(format!("undefined non-terminal: {}", rule.lhs)))?;
+        let lhs = *self.symbol_map.get(&rule.lhs).ok_or_else(|| {
+            grammar_error_at(rule.line, format!("undefined non-terminal: {}", rule.lhs))
+        })?;
 
         let mut rhs = Vec::new();
         let mut last_terminal_prec = 0;
@@ -416,10 +431,10 @@ impl Grammar {
             if let Some(&id) = self.symbol_map.get(prec_name) {
                 self.symbols[id].precedence
             } else {
-                return Err(YaccError::Grammar(format!(
-                    "undefined token in %prec: {}",
-                    prec_name
-                )));
+                return Err(grammar_error_at(
+                    rule.line,
+                    format!("undefined token in %prec: {}", prec_name),
+                ));
             }
         } else {
             // Default: precedence of rightmost terminal

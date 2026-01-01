@@ -9,6 +9,7 @@
 
 //! Lexer for yacc grammar files
 
+use crate::diag;
 use crate::error::YaccError;
 
 /// Token types for yacc grammar files
@@ -85,6 +86,12 @@ impl<'a> Lexer<'a> {
             column: 1,
             mark_count: 0,
         }
+    }
+
+    /// Create a lexical error, also logging it via diag
+    fn lexical_error(&self, line: usize, column: usize, msg: String) -> YaccError {
+        diag::error(diag::Position::new(line as u32, column as u16), &msg);
+        YaccError::Lexical { line, column, msg }
     }
 
     fn peek(&mut self) -> Option<char> {
@@ -182,10 +189,8 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        s.parse::<i32>().map_err(|_| YaccError::Lexical {
-            line: self.line,
-            column: self.column,
-            msg: format!("invalid number: {}", s),
+        s.parse::<i32>().map_err(|_| {
+            self.lexical_error(self.line, self.column, format!("invalid number: {}", s))
         })
     }
 
@@ -227,11 +232,11 @@ impl<'a> Lexer<'a> {
                             }
                         }
                         if hex.is_empty() {
-                            return Err(YaccError::Lexical {
-                                line: start_line,
-                                column: start_col,
-                                msg: "\\x used with no following hex digits".into(),
-                            });
+                            return Err(self.lexical_error(
+                                start_line,
+                                start_col,
+                                "\\x used with no following hex digits".into(),
+                            ));
                         }
                         let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
                         char::from_u32(value).unwrap_or('\0')
@@ -262,30 +267,30 @@ impl<'a> Lexer<'a> {
                         c
                     }
                     None => {
-                        return Err(YaccError::Lexical {
-                            line: start_line,
-                            column: start_col,
-                            msg: "unterminated character literal".into(),
-                        })
+                        return Err(self.lexical_error(
+                            start_line,
+                            start_col,
+                            "unterminated character literal".into(),
+                        ))
                     }
                 }
             }
             Some(c) => c,
             None => {
-                return Err(YaccError::Lexical {
-                    line: start_line,
-                    column: start_col,
-                    msg: "unterminated character literal".into(),
-                })
+                return Err(self.lexical_error(
+                    start_line,
+                    start_col,
+                    "unterminated character literal".into(),
+                ))
             }
         };
 
         if self.advance() != Some('\'') {
-            return Err(YaccError::Lexical {
-                line: start_line,
-                column: start_col,
-                msg: "unterminated character literal".into(),
-            });
+            return Err(self.lexical_error(
+                start_line,
+                start_col,
+                "unterminated character literal".into(),
+            ));
         }
 
         Ok(c)
@@ -302,11 +307,11 @@ impl<'a> Lexer<'a> {
                 Some('>') => break,
                 Some(c) => tag.push(c),
                 None => {
-                    return Err(YaccError::Lexical {
-                        line: start_line,
-                        column: start_col,
-                        msg: "unterminated tag".into(),
-                    })
+                    return Err(self.lexical_error(
+                        start_line,
+                        start_col,
+                        "unterminated tag".into(),
+                    ))
                 }
             }
         }
@@ -404,11 +409,11 @@ impl<'a> Lexer<'a> {
                 }
                 Some(c) => action.push(c),
                 None => {
-                    return Err(YaccError::Lexical {
-                        line: start_line,
-                        column: start_col,
-                        msg: "unterminated action".into(),
-                    })
+                    return Err(self.lexical_error(
+                        start_line,
+                        start_col,
+                        "unterminated action".into(),
+                    ))
                 }
             }
         }
@@ -434,11 +439,11 @@ impl<'a> Lexer<'a> {
                 }
                 Some(c) => code.push(c),
                 None => {
-                    return Err(YaccError::Lexical {
-                        line: start_line,
-                        column: start_col,
-                        msg: "unterminated %{ %}".into(),
-                    })
+                    return Err(self.lexical_error(
+                        start_line,
+                        start_col,
+                        "unterminated %{ %}".into(),
+                    ))
                 }
             }
         }
@@ -451,11 +456,11 @@ impl<'a> Lexer<'a> {
         self.skip_whitespace_and_comments();
 
         if self.peek() != Some('{') {
-            return Err(YaccError::Lexical {
-                line: self.line,
-                column: self.column,
-                msg: "expected '{' after %union".into(),
-            });
+            return Err(self.lexical_error(
+                self.line,
+                self.column,
+                "expected '{' after %union".into(),
+            ));
         }
 
         self.read_action()
@@ -506,20 +511,20 @@ impl<'a> Lexer<'a> {
                             }
                             "prec" => Token::Prec,
                             _ => {
-                                return Err(YaccError::Lexical {
+                                return Err(self.lexical_error(
                                     line,
-                                    column: self.column,
-                                    msg: format!("unknown directive: %{}", word),
-                                })
+                                    self.column,
+                                    format!("unknown directive: %{}", word),
+                                ))
                             }
                         }
                     }
                     _ => {
-                        return Err(YaccError::Lexical {
+                        return Err(self.lexical_error(
                             line,
-                            column: self.column,
-                            msg: "invalid character after '%'".into(),
-                        })
+                            self.column,
+                            "invalid character after '%'".into(),
+                        ))
                     }
                 }
             }
@@ -571,11 +576,11 @@ impl<'a> Lexer<'a> {
                 }
             }
             _ => {
-                return Err(YaccError::Lexical {
+                return Err(self.lexical_error(
                     line,
-                    column: self.column,
-                    msg: format!("unexpected character: '{}'", c),
-                })
+                    self.column,
+                    format!("unexpected character: '{}'", c),
+                ))
             }
         };
 

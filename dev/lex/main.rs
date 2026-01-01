@@ -9,13 +9,17 @@
 
 mod codegen;
 mod dfa;
+pub mod diag;
 mod lexfile;
 mod nfa;
+mod pattern_escape;
+mod pattern_validate;
 
 use clap::Parser;
 use dfa::Dfa;
 use nfa::Nfa;
-use regex_syntax::hir::Hir;
+use regex_syntax::ast::parse::ParserBuilder;
+use regex_syntax::hir::{translate::TranslatorBuilder, Hir};
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 
@@ -89,19 +93,51 @@ pub struct ParsedRule {
     pub has_variable_trailing_context: bool,
 }
 
+/// Parse a regex pattern to HIR with POSIX-compliant settings
+/// In particular, '.' should NOT match newlines per POSIX spec
+fn parse_regex_posix(pattern: &str) -> Result<Hir, String> {
+    // Parse to AST
+    let ast = ParserBuilder::new()
+        .build()
+        .parse(pattern)
+        .map_err(|e| format!("Failed to parse regular expression '{}': {}", pattern, e))?;
+
+    // Translate to HIR with POSIX-compliant settings:
+    // - dot_matches_new_line(false): '.' should NOT match newlines per POSIX
+    let hir = TranslatorBuilder::new()
+        .dot_matches_new_line(false)
+        .build()
+        .translate(pattern, &ast)
+        .map_err(|e| {
+            format!(
+                "Failed to translate regular expression '{}': {}",
+                pattern, e
+            )
+        })?;
+
+    Ok(hir)
+}
+
 /// Parse all rule patterns and return them with their indices and start conditions
 fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
     let mut rules = Vec::new();
 
     for (idx, rule) in lexinfo.rules.iter().enumerate() {
-        let hir = regex_syntax::parse(&rule.ere)
-            .map_err(|e| format!("Failed to parse regular expression '{}': {}", rule.ere, e))?;
+        // Use compiled_ere which has substitutions wrapped in parens for correct quantifier handling
+        let hir = parse_regex_posix(&rule.compiled_ere)
+            .map_err(|e| format!("rule {}: pattern '{}': {}", idx + 1, rule.ere, e))?;
 
-        // Parse trailing context if present
+        // Parse trailing context if present (use compiled version)
         let (trailing_context, main_pattern_len, has_variable_tc) =
-            if let Some(ref tc) = rule.trailing_context {
-                let tc_hir = regex_syntax::parse(tc)
-                    .map_err(|e| format!("Failed to parse trailing context '{}': {}", tc, e))?;
+            if let Some(ref tc) = rule.compiled_trailing_context {
+                let tc_hir = parse_regex_posix(tc).map_err(|e| {
+                    format!(
+                        "rule {}: trailing context '{}': {}",
+                        idx + 1,
+                        rule.trailing_context.as_deref().unwrap_or(""),
+                        e
+                    )
+                })?;
                 // Compute fixed length of MAIN pattern (for setting yyleng correctly)
                 // If main pattern has fixed length, we can set yyleng to that value
                 let main_len = compute_fixed_length(&hir);
@@ -186,8 +222,15 @@ fn get_start_conditions(lexinfo: &lexfile::LexInfo) -> Vec<String> {
 }
 
 /// Write statistics to the given output
-fn write_stats<W: Write + ?Sized>(output: &mut W, dfa: &Dfa, nfa: &Nfa) -> io::Result<()> {
+fn write_stats<W: Write + ?Sized>(
+    output: &mut W,
+    dfa: &Dfa,
+    nfa: &Nfa,
+    lexinfo: &lexfile::LexInfo,
+) -> io::Result<()> {
     writeln!(output, "lex statistics:")?;
+    writeln!(output, "  {} rules", lexinfo.rules.len())?;
+    writeln!(output, "  {} substitution definitions", lexinfo.subs.len())?;
     writeln!(output, "  {} NFA states", nfa.states.len())?;
     writeln!(
         output,
@@ -200,6 +243,22 @@ fn write_stats<W: Write + ?Sized>(output: &mut W, dfa: &Dfa, nfa: &Nfa) -> io::R
         "  {} character equivalence classes",
         dfa.char_classes.num_classes
     )?;
+    // Output declared table sizes if any were specified
+    if !lexinfo.table_sizes.is_empty() {
+        writeln!(output, "  declared table sizes:")?;
+        for (key, value) in &lexinfo.table_sizes {
+            let desc = match key {
+                'p' => "positions",
+                'n' => "states",
+                'a' => "transitions",
+                'e' => "parse tree nodes",
+                'k' => "packed character classes",
+                'o' => "output array size",
+                _ => "unknown",
+            };
+            writeln!(output, "    %{} {} ({})", key, value, desc)?;
+        }
+    }
     Ok(())
 }
 
@@ -212,11 +271,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(String::from("-"));
     }
 
+    // Initialize diagnostics with the input filename
+    let input_name = if args.files.len() == 1 && args.files[0] != "-" {
+        args.files[0].clone()
+    } else if args.files.len() == 1 {
+        "<stdin>".to_string()
+    } else {
+        // Multiple files concatenated - use first non-stdin name
+        args.files
+            .iter()
+            .find(|f| *f != "-")
+            .cloned()
+            .unwrap_or_else(|| "<stdin>".to_string())
+    };
+    diag::init(&input_name);
+
     // POSIX says multiple input files are concatenated
     let rawinput = concat_input_files(&args.files)?;
 
     // Parse input lex file into a data structure containing the rules table
     let lexinfo = lexfile::parse(&rawinput)?;
+
+    // Check for parse errors
+    if diag::has_errors() {
+        std::process::exit(1);
+    }
 
     // Parse all regular expressions
     let rules = parse_rules(&lexinfo)?;
@@ -283,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &mut io::stdout()
         };
-        write_stats(stats_output, &dfa, &nfa)?;
+        write_stats(stats_output, &dfa, &nfa, &lexinfo)?;
     }
 
     if !args.stdout {

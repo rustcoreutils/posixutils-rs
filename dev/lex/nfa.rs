@@ -548,4 +548,119 @@ mod tests {
         // Both rules match, but rule 0 has higher priority
         assert_eq!(nfa.get_accepting(&after_if_closure), Some(0));
     }
+
+    #[test]
+    fn test_trailing_context_simple() {
+        // Pattern: "foo/bar" - match "foo" when followed by "bar"
+        let main_hir = parse_regex("foo");
+        let trailing_hir = parse_regex("bar");
+        let nfa =
+            Nfa::from_rules_with_trailing_context(&[(main_hir, Some(trailing_hir), 0)]).unwrap();
+
+        // Verify main_pattern_end is populated
+        assert!(
+            !nfa.main_pattern_end.is_empty(),
+            "main_pattern_end should track end of main pattern"
+        );
+
+        // Verify that rule 0 is recorded as having main pattern end
+        let has_rule_0 = nfa
+            .main_pattern_end
+            .values()
+            .any(|rules| rules.contains(&0));
+        assert!(has_rule_0, "Rule 0 should be tracked in main_pattern_end");
+
+        // Verify the full pattern matches "foobar"
+        let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
+
+        // After "foo"
+        let after_f = nfa.move_on_char(&start_closure, 'f');
+        let after_fo = nfa.move_on_char(&nfa.epsilon_closure(&after_f), 'o');
+        let after_foo = nfa.move_on_char(&nfa.epsilon_closure(&after_fo), 'o');
+        let after_foo_closure = nfa.epsilon_closure(&after_foo);
+
+        // After "foo", should NOT yet be accepting (need trailing context)
+        assert!(
+            nfa.get_accepting(&after_foo_closure).is_none(),
+            "Should not accept after just main pattern"
+        );
+
+        // After "foobar"
+        let after_foob = nfa.move_on_char(&after_foo_closure, 'b');
+        let after_fooba = nfa.move_on_char(&nfa.epsilon_closure(&after_foob), 'a');
+        let after_foobar = nfa.move_on_char(&nfa.epsilon_closure(&after_fooba), 'r');
+        let after_foobar_closure = nfa.epsilon_closure(&after_foobar);
+
+        // After full pattern, should be accepting
+        assert!(
+            nfa.get_accepting(&after_foobar_closure).is_some(),
+            "Should accept after main + trailing context"
+        );
+    }
+
+    #[test]
+    fn test_trailing_context_with_simple_rule() {
+        // Mix: rule 0 has trailing context, rule 1 is simple
+        let main_hir = parse_regex("ab");
+        let trailing_hir = parse_regex("c");
+        let simple_hir = parse_regex("xyz");
+
+        let nfa = Nfa::from_rules_with_trailing_context(&[
+            (main_hir, Some(trailing_hir), 0),
+            (simple_hir, None, 1),
+        ])
+        .unwrap();
+
+        // Rule 0 should be in main_pattern_end
+        let has_rule_0 = nfa
+            .main_pattern_end
+            .values()
+            .any(|rules| rules.contains(&0));
+        assert!(has_rule_0, "Rule 0 should be tracked in main_pattern_end");
+
+        // Rule 1 should NOT be in main_pattern_end (no trailing context)
+        let has_rule_1 = nfa
+            .main_pattern_end
+            .values()
+            .any(|rules| rules.contains(&1));
+        assert!(
+            !has_rule_1,
+            "Rule 1 should NOT be in main_pattern_end (no trailing context)"
+        );
+
+        // Verify "xyz" matches and accepts as rule 1
+        let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
+        let after_x = nfa.move_on_char(&start_closure, 'x');
+        let after_xy = nfa.move_on_char(&nfa.epsilon_closure(&after_x), 'y');
+        let after_xyz = nfa.move_on_char(&nfa.epsilon_closure(&after_xy), 'z');
+        let after_xyz_closure = nfa.epsilon_closure(&after_xyz);
+
+        assert_eq!(
+            nfa.get_accepting(&after_xyz_closure),
+            Some(1),
+            "Simple rule should match"
+        );
+    }
+
+    #[test]
+    fn test_trailing_context_no_context() {
+        // When trailing context is None, should behave like from_rules
+        let hir = parse_regex("abc");
+        let nfa = Nfa::from_rules_with_trailing_context(&[(hir, None, 0)]).unwrap();
+
+        // main_pattern_end should be empty (no trailing context)
+        assert!(
+            nfa.main_pattern_end.is_empty(),
+            "No trailing context means no main_pattern_end entries"
+        );
+
+        // Should match "abc"
+        let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
+        let after_a = nfa.move_on_char(&start_closure, 'a');
+        let after_ab = nfa.move_on_char(&nfa.epsilon_closure(&after_a), 'b');
+        let after_abc = nfa.move_on_char(&nfa.epsilon_closure(&after_ab), 'c');
+        let after_abc_closure = nfa.epsilon_closure(&after_abc);
+
+        assert_eq!(nfa.get_accepting(&after_abc_closure), Some(0));
+    }
 }

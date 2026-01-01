@@ -11,7 +11,7 @@
 //!
 //! This module generates POSIX-compliant C code from the DFA and rule actions.
 
-use crate::dfa::{Dfa, DfaInput};
+use crate::dfa::{CompressedTables, Dfa};
 use crate::lexfile::LexInfo;
 use std::io::{self, Write};
 
@@ -30,6 +30,16 @@ pub struct RuleMetadata {
     pub has_variable_trailing_context: bool,
 }
 
+/// Whether to use compressed or dense table format
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum TableFormat {
+    Dense,
+    Compressed,
+    /// Automatically choose based on compression ratio (default)
+    #[default]
+    Auto,
+}
+
 /// Configuration for code generation
 pub struct CodeGenConfig {
     /// Whether yytext is a pointer (true) or array (false)
@@ -40,6 +50,8 @@ pub struct CodeGenConfig {
     pub start_conditions: Vec<String>,
     /// Metadata for each rule (indexed by rule number)
     pub rule_metadata: Vec<RuleMetadata>,
+    /// Table format: Dense, Compressed, or Auto (default)
+    pub table_format: TableFormat,
 }
 
 impl Default for CodeGenConfig {
@@ -49,6 +61,7 @@ impl Default for CodeGenConfig {
             yytext_size: 8192,
             start_conditions: vec!["INITIAL".to_string()],
             rule_metadata: Vec::new(),
+            table_format: TableFormat::Auto,
         }
     }
 }
@@ -60,11 +73,58 @@ pub fn generate<W: Write>(
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
 ) -> io::Result<()> {
+    // Try compression and decide which format to use
+    let compressed = dfa.compress();
+
+    // Build-time verification: exhaustively check compressed tables match original
+    if let Err(e) = compressed.verify(dfa) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Table compression verification failed: {}", e),
+        ));
+    }
+
+    let stats = compressed.stats();
+
+    // Determine table format based on config
+    let table_format = match config.table_format {
+        TableFormat::Auto => {
+            // Use compressed tables only if they're actually smaller (ratio > 1.0)
+            if stats.ratio > 1.0 {
+                TableFormat::Compressed
+            } else {
+                TableFormat::Dense
+            }
+        }
+        TableFormat::Dense => TableFormat::Dense,
+        TableFormat::Compressed => TableFormat::Compressed,
+    };
+
+    // Log table format decision
+    eprintln!(
+        "lex: {} states, {} classes, dense={}B, compressed={}B (ratio: {:.2}x) -> {}",
+        stats.num_states,
+        stats.num_classes,
+        stats.dense_size,
+        stats.compressed_size,
+        stats.ratio,
+        if table_format == TableFormat::Compressed {
+            "using compressed"
+        } else {
+            "using dense"
+        }
+    );
+
     write_header(output)?;
     write_includes(output)?;
     write_external_definitions(output, lexinfo)?;
     write_macros_and_types(output, config)?;
-    write_state_tables(output, dfa)?;
+
+    match table_format {
+        TableFormat::Compressed => write_compressed_tables(output, dfa, &compressed)?,
+        TableFormat::Dense => write_dense_tables(output, dfa)?,
+        TableFormat::Auto => unreachable!("Auto should have been resolved above"),
+    }
     write_accepting_table(output, dfa)?;
     write_accepting_list_table(output, dfa)?;
     write_char_class_table(output, dfa)?;
@@ -73,7 +133,7 @@ pub fn generate<W: Write>(
     write_main_pattern_end_table(output, dfa, config)?;
     write_internal_definitions(output, lexinfo)?;
     write_helper_functions(output)?;
-    write_yylex_function(output, dfa, lexinfo, config)?;
+    write_yylex_function(output, dfa, lexinfo, config, table_format)?;
     write_user_subroutines(output, lexinfo)?;
 
     Ok(())
@@ -229,17 +289,104 @@ static int yy_unput_pos = 0;
     Ok(())
 }
 
-fn write_state_tables<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
+/// Write compressed DFA tables using row displacement encoding
+fn write_compressed_tables<W: Write>(
+    output: &mut W,
+    dfa: &Dfa,
+    compressed: &CompressedTables,
+) -> io::Result<()> {
     let num_states = dfa.states.len();
     let num_classes = dfa.char_classes.num_classes;
 
-    writeln!(output, "/* DFA state transition table */")?;
+    writeln!(
+        output,
+        "/* Compressed DFA transition tables (row displacement) */"
+    )?;
     writeln!(output, "#define YY_NUM_STATES {}", num_states)?;
     writeln!(output, "#define YY_NUM_CLASSES {}", num_classes)?;
+    writeln!(
+        output,
+        "#define YY_NXT_SIZE {}",
+        compressed.nxt.len().max(1)
+    )?;
     writeln!(output)?;
 
-    // Generate the transition table
-    // yy_nxt[state][char_class] = next_state (-1 for no transition)
+    // Write base array (offset into nxt/chk for each state)
+    writeln!(
+        output,
+        "/* Base offset for each state into nxt/chk arrays */"
+    )?;
+    write!(output, "static const int yy_base[YY_NUM_STATES] = {{ ")?;
+    for (i, &b) in compressed.base.iter().enumerate() {
+        if i > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{}", b)?;
+    }
+    writeln!(output, " }};\n")?;
+
+    // Write default transition array
+    writeln!(output, "/* Default transition for each state */")?;
+    write!(output, "static const short yy_default[YY_NUM_STATES] = {{ ")?;
+    for (i, &d) in compressed.default.iter().enumerate() {
+        if i > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{}", d)?;
+    }
+    writeln!(output, " }};\n")?;
+
+    // Write nxt array (packed next-state transitions)
+    writeln!(output, "/* Packed next-state array */")?;
+    if compressed.nxt.is_empty() {
+        writeln!(output, "static const short yy_nxt[1] = {{ -1 }};\n")?;
+    } else {
+        write!(output, "static const short yy_nxt[YY_NXT_SIZE] = {{")?;
+        for (i, &n) in compressed.nxt.iter().enumerate() {
+            if i % 16 == 0 {
+                write!(output, "\n    ")?;
+            }
+            write!(output, "{:4}", n)?;
+            if i < compressed.nxt.len() - 1 {
+                write!(output, ",")?;
+            }
+        }
+        writeln!(output, "\n}};\n")?;
+    }
+
+    // Write chk array (state ownership verification)
+    writeln!(output, "/* State ownership verification array */")?;
+    if compressed.chk.is_empty() {
+        writeln!(output, "static const short yy_chk[1] = {{ -1 }};\n")?;
+    } else {
+        write!(output, "static const short yy_chk[YY_NXT_SIZE] = {{")?;
+        for (i, &c) in compressed.chk.iter().enumerate() {
+            if i % 16 == 0 {
+                write!(output, "\n    ")?;
+            }
+            write!(output, "{:4}", c)?;
+            if i < compressed.chk.len() - 1 {
+                write!(output, ",")?;
+            }
+        }
+        writeln!(output, "\n}};\n")?;
+    }
+
+    Ok(())
+}
+
+/// Write dense (uncompressed) 2D DFA transition table
+fn write_dense_tables<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
+    let num_states = dfa.states.len();
+    let num_classes = dfa.char_classes.num_classes;
+
+    writeln!(output, "/* Dense DFA state transition table */")?;
+    writeln!(output, "#define YY_NUM_STATES {}", num_states)?;
+    writeln!(output, "#define YY_NUM_CLASSES {}", num_classes)?;
+    writeln!(output, "#define YY_USE_DENSE_TABLES 1")?;
+    writeln!(output)?;
+
+    // Generate the transition table: yy_nxt[state][char_class] = next_state (-1 for no transition)
     writeln!(
         output,
         "static const short yy_nxt[YY_NUM_STATES][YY_NUM_CLASSES] = {{"
@@ -252,8 +399,7 @@ fn write_state_tables<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
         let mut class_transitions: Vec<i16> = vec![-1; num_classes];
 
         for (input, &target) in &state.transitions {
-            let DfaInput::Char(ch) = input;
-            // Only handle ASCII characters (0-255)
+            let crate::dfa::DfaInput::Char(ch) = input;
             let ch_code = *ch as u32;
             if ch_code < 256 {
                 let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
@@ -667,6 +813,7 @@ fn write_yylex_function<W: Write>(
     _dfa: &Dfa,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    table_format: TableFormat,
 ) -> io::Result<()> {
     let has_start_conditions = config.start_conditions.len() > 1;
 
@@ -777,10 +924,34 @@ fn write_yylex_function<W: Write>(
         "            unsigned char yy_c = (unsigned char)yy_buffer[yy_cp];"
     )?;
     writeln!(output, "            int yy_class = yy_ec[yy_c];")?;
-    writeln!(
-        output,
-        "            int yy_next = yy_nxt[yy_current_state][yy_class];"
-    )?;
+
+    // Generate lookup code based on table format
+    // Note: Auto is resolved to Dense or Compressed in generate() before calling this function
+    match table_format {
+        TableFormat::Dense => {
+            writeln!(
+                output,
+                "            int yy_next = yy_nxt[yy_current_state][yy_class];"
+            )?;
+        }
+        TableFormat::Compressed | TableFormat::Auto => {
+            writeln!(
+                output,
+                "            int yy_idx = yy_base[yy_current_state] + yy_class;"
+            )?;
+            writeln!(output, "            int yy_next;")?;
+            writeln!(
+                output,
+                "            if (yy_idx >= 0 && yy_idx < YY_NXT_SIZE && yy_chk[yy_idx] == yy_current_state)"
+            )?;
+            writeln!(output, "                yy_next = yy_nxt[yy_idx];")?;
+            writeln!(output, "            else")?;
+            writeln!(
+                output,
+                "                yy_next = yy_default[yy_current_state];"
+            )?;
+        }
+    }
     writeln!(output)?;
     writeln!(output, "            if (yy_next < 0) {{")?;
     writeln!(
@@ -969,10 +1140,36 @@ fn write_yylex_function<W: Write>(
         output,
         "                        int yy_class = yy_ec[yy_c];"
     )?;
-    writeln!(
-        output,
-        "                        int yy_next = yy_nxt[yy_current_state][yy_class];"
-    )?;
+
+    // Generate lookup code based on table format (same as main loop)
+    match table_format {
+        TableFormat::Dense => {
+            writeln!(
+                output,
+                "                        int yy_next = yy_nxt[yy_current_state][yy_class];"
+            )?;
+        }
+        TableFormat::Compressed | TableFormat::Auto => {
+            writeln!(
+                output,
+                "                        int yy_idx = yy_base[yy_current_state] + yy_class;"
+            )?;
+            writeln!(output, "                        int yy_next;")?;
+            writeln!(
+                output,
+                "                        if (yy_idx >= 0 && yy_idx < YY_NXT_SIZE && yy_chk[yy_idx] == yy_current_state)"
+            )?;
+            writeln!(
+                output,
+                "                            yy_next = yy_nxt[yy_idx];"
+            )?;
+            writeln!(output, "                        else")?;
+            writeln!(
+                output,
+                "                            yy_next = yy_default[yy_current_state];"
+            )?;
+        }
+    }
     writeln!(output, "                        if (yy_next < 0) break;")?;
     writeln!(
         output,

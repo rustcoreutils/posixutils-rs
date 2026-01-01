@@ -355,6 +355,230 @@ impl Dfa {
     pub fn num_transitions(&self) -> usize {
         self.states.iter().map(|s| s.transitions.len()).sum()
     }
+
+    /// Look up the transition for a given state and equivalence class
+    /// Returns the target state index, or -1 if no transition
+    pub fn lookup(&self, state: usize, class: usize) -> i16 {
+        // Find which character maps to this class
+        for (ch, &cls) in self.char_classes.char_to_class.iter().enumerate() {
+            if cls as usize == class {
+                let c = ch as u8 as char;
+                if let Some(&target) = self.states[state].transitions.get(&DfaInput::Char(c)) {
+                    return target as i16;
+                }
+                break;
+            }
+        }
+        -1 // No transition
+    }
+
+    /// Compress the DFA transition tables using row displacement
+    pub fn compress(&self) -> CompressedTables {
+        let num_states = self.states.len();
+        let num_classes = self.char_classes.num_classes;
+
+        // Build dense transition table first (state x class -> target)
+        let mut dense: Vec<Vec<i16>> = vec![vec![-1; num_classes]; num_states];
+        for (state_idx, state) in self.states.iter().enumerate() {
+            for (input, &target) in &state.transitions {
+                let DfaInput::Char(c) = input;
+                let class = self.char_classes.char_to_class[*c as usize] as usize;
+                dense[state_idx][class] = target as i16;
+            }
+        }
+
+        // Find default transition for each state (most common target)
+        let mut default: Vec<i16> = Vec::with_capacity(num_states);
+        for state_row in &dense {
+            let mut counts: HashMap<i16, usize> = HashMap::new();
+            for &target in state_row {
+                *counts.entry(target).or_insert(0) += 1;
+            }
+            // Default is the most frequent transition (often -1 for jam)
+            let most_common = counts
+                .into_iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(target, _)| target)
+                .unwrap_or(-1);
+            default.push(most_common);
+        }
+
+        // Build difference entries: (class, target) pairs where target != default
+        let mut state_diffs: Vec<Vec<(usize, i16)>> = Vec::with_capacity(num_states);
+        for (state_idx, state_row) in dense.iter().enumerate() {
+            let mut diffs = Vec::new();
+            for (class, &target) in state_row.iter().enumerate() {
+                if target != default[state_idx] {
+                    diffs.push((class, target));
+                }
+            }
+            state_diffs.push(diffs);
+        }
+
+        // Row displacement: pack all states into shared nxt/chk arrays
+        // Start with reasonable initial size
+        let initial_size = num_states * num_classes / 2 + num_classes;
+        let mut nxt: Vec<i16> = vec![-1; initial_size];
+        let mut chk: Vec<i16> = vec![-1; initial_size];
+        let mut base: Vec<i32> = vec![0; num_states];
+        let mut firstfree: usize = 0;
+
+        for (state_idx, diffs) in state_diffs.iter().enumerate() {
+            if diffs.is_empty() {
+                // No non-default transitions, base can be 0
+                base[state_idx] = 0;
+                continue;
+            }
+
+            // Find a slot where all our entries fit without collision
+            let max_class = diffs.iter().map(|(c, _)| *c).max().unwrap_or(0);
+            let slot = find_table_space(&chk, firstfree, diffs, max_class, num_classes);
+
+            // Ensure arrays are large enough
+            let needed_size = slot + num_classes;
+            if needed_size > nxt.len() {
+                nxt.resize(needed_size, -1);
+                chk.resize(needed_size, -1);
+            }
+
+            // Store entries
+            base[state_idx] = slot as i32;
+            for &(class, target) in diffs {
+                let idx = slot + class;
+                nxt[idx] = target;
+                chk[idx] = state_idx as i16;
+            }
+
+            // Update firstfree hint
+            while firstfree < chk.len() && chk[firstfree] != -1 {
+                firstfree += 1;
+            }
+        }
+
+        // Trim trailing unused entries
+        let mut actual_len = nxt.len();
+        while actual_len > 0 && chk[actual_len - 1] == -1 {
+            actual_len -= 1;
+        }
+        nxt.truncate(actual_len);
+        chk.truncate(actual_len);
+
+        CompressedTables {
+            base,
+            default,
+            nxt,
+            chk,
+            num_classes,
+        }
+    }
+}
+
+/// Find a slot in the nxt/chk arrays where entries can be placed without collision
+fn find_table_space(
+    chk: &[i16],
+    firstfree: usize,
+    diffs: &[(usize, i16)],
+    _max_class: usize,
+    _num_classes: usize,
+) -> usize {
+    if diffs.is_empty() {
+        return 0;
+    }
+
+    let min_class = diffs.iter().map(|(c, _)| *c).min().unwrap_or(0);
+
+    // Try slots starting from firstfree
+    let mut slot = firstfree.saturating_sub(min_class);
+
+    'outer: loop {
+        // Check if all entries fit at this slot
+        for &(class, _) in diffs {
+            let idx = slot + class;
+            if idx < chk.len() && chk[idx] != -1 {
+                // Collision, try next slot
+                slot += 1;
+                continue 'outer;
+            }
+        }
+        // No collision, use this slot
+        return slot;
+    }
+}
+
+/// Compressed DFA transition tables using row displacement encoding
+///
+/// This format achieves 3-10x size reduction compared to dense 2D tables
+/// by sharing slots in the nxt/chk arrays across states.
+#[derive(Debug)]
+pub struct CompressedTables {
+    /// Base offset into nxt/chk for each state
+    pub base: Vec<i32>,
+    /// Default transition for each state (most common target)
+    pub default: Vec<i16>,
+    /// Packed next-state array (shared across states)
+    pub nxt: Vec<i16>,
+    /// State ownership verification (should equal state index for valid entry)
+    pub chk: Vec<i16>,
+    /// Number of equivalence classes
+    pub num_classes: usize,
+}
+
+impl CompressedTables {
+    /// Look up transition for a given state and equivalence class
+    pub fn lookup(&self, state: usize, class: usize) -> i16 {
+        let idx = self.base[state] as usize + class;
+        if idx < self.chk.len() && self.chk[idx] == state as i16 {
+            self.nxt[idx]
+        } else {
+            self.default[state]
+        }
+    }
+
+    /// Exhaustively verify that compressed tables produce identical results to original DFA
+    /// Returns Ok(()) if all lookups match, or an error describing the first mismatch
+    pub fn verify(&self, dfa: &Dfa) -> Result<(), String> {
+        for state in 0..dfa.states.len() {
+            for class in 0..dfa.char_classes.num_classes {
+                let orig = dfa.lookup(state, class);
+                let comp = self.lookup(state, class);
+                if orig != comp {
+                    return Err(format!(
+                        "Compression mismatch at state={}, class={}: dense={}, compressed={}",
+                        state, class, orig, comp
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Get compression statistics
+    pub fn stats(&self) -> CompressionStats {
+        let num_states = self.base.len();
+        let dense_size = num_states * self.num_classes * 2; // 2 bytes per entry
+        let compressed_size = self.base.len() * 4  // base: i32
+            + self.default.len() * 2               // default: i16
+            + self.nxt.len() * 2                   // nxt: i16
+            + self.chk.len() * 2; // chk: i16
+
+        CompressionStats {
+            num_states,
+            num_classes: self.num_classes,
+            dense_size,
+            compressed_size,
+            ratio: dense_size as f64 / compressed_size as f64,
+        }
+    }
+}
+
+/// Statistics about table compression
+#[derive(Debug)]
+pub struct CompressionStats {
+    pub num_states: usize,
+    pub num_classes: usize,
+    pub dense_size: usize,
+    pub compressed_size: usize,
+    pub ratio: f64,
 }
 
 /// Get all main pattern end rules for a set of NFA states

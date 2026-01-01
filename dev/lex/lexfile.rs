@@ -94,6 +94,8 @@ struct ParseState {
     section: LexSection,
     open_braces: u32,
     in_def: bool,
+    /// True when inside a C-style /* ... */ comment
+    in_comment: bool,
     external_def: Vec<String>,
     sub_re: Regex,
     subs: HashMap<String, String>,
@@ -116,6 +118,7 @@ impl ParseState {
             section: LexSection::Definitions,
             open_braces: 0,
             in_def: false,
+            in_comment: false,
             external_def: Vec::new(),
             sub_re: Regex::new(r"(\w+)\s+(.*)").unwrap(),
             subs: HashMap::new(),
@@ -148,15 +151,71 @@ impl ParseState {
     }
 }
 
+/// Strip C-style comments from a line, updating in_comment state
+/// Returns the line with comments removed (may be empty if entire line is comment)
+fn strip_comments(line: &str, in_comment: &mut bool) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if *in_comment {
+            // Look for end of comment
+            if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                *in_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+        } else {
+            // Look for start of comment
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                *in_comment = true;
+                i += 2;
+                continue;
+            }
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
 // parse line from Definitions section
 fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
-    if line.is_empty() {
+    // Check for %} to end a %{ block first (before early return)
+    let trimmed = line.trim();
+    if trimmed == "%}" {
+        state.in_def = false;
         return Ok(());
     }
 
-    let first_char = line.chars().next().unwrap();
+    // Check for %{ to start a block
+    if trimmed == "%{" {
+        state.in_def = true;
+        return Ok(());
+    }
+
+    // Inside %{ %} blocks, preserve everything as-is (user C code)
+    if state.in_def {
+        state.external_def.push(String::from(line));
+        return Ok(());
+    }
+
+    // Handle C-style comments (can span multiple lines) for lex directives only
+    let stripped = strip_comments(line, &mut state.in_comment);
+    let line_to_parse = stripped.as_str();
+
+    if line_to_parse.is_empty() || line_to_parse.trim().is_empty() {
+        return Ok(());
+    }
+
+    let first_char = line_to_parse.chars().next().unwrap();
 
     if first_char == '%' {
+        // Use stripped line for % commands
+        let line = line_to_parse;
         let mut words = Vec::new();
         for word in line.split_whitespace() {
             words.push(String::from(word));
@@ -164,12 +223,7 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
 
         let cmd = words.remove(0);
         match cmd.to_lowercase().as_str() {
-            "%{" => {
-                state.in_def = true;
-            }
-            "%}" => {
-                state.in_def = false;
-            }
+            // Note: %{ and %} are handled earlier in the function
             "%%" => {
                 state.section = LexSection::Rules;
             }
@@ -199,16 +253,17 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 state.warning(&format!("unknown command in definitions section: {}", cmd));
             }
         }
-    } else if state.in_def || (first_char.is_whitespace() && line.len() > 1) {
+    } else if first_char.is_whitespace() && line_to_parse.len() > 1 {
+        // Lines starting with whitespace are continuation lines (user C code)
         state.external_def.push(String::from(line));
-    } else if let Some(caps) = state.sub_re.captures(line) {
+    } else if let Some(caps) = state.sub_re.captures(line_to_parse) {
         let name = caps.get(1).unwrap().as_str();
         let value = caps.get(2).unwrap().as_str();
         state.subs.insert(String::from(name), String::from(value));
-    } else if !line.trim().is_empty() {
+    } else if !line_to_parse.trim().is_empty() {
         return Err(state.error(&format!(
             "unexpected line in definitions section: {}",
-            line.trim()
+            line_to_parse.trim()
         )));
     }
     Ok(())
@@ -1194,6 +1249,62 @@ int main(int argc, char *argv[])
 
         assert_eq!(lexinfo.rules.len(), 8);
         assert_eq!(lexinfo.rules[0].ere, r#"[0-9]+"#);
+    }
+
+    #[test]
+    fn test_c_style_comments_in_definitions() {
+        // Test that C-style comments are properly handled in the definitions section
+        let test_content = r#"
+/* Header comment
+ * spanning multiple lines
+ */
+%{
+#include <stdio.h>
+/* Comment inside %{ %} block is preserved */
+%}
+
+/* Comment between blocks */
+DIGIT [0-9]
+/* Another comment */
+
+%%
+{DIGIT}+    { printf("digit\n"); }
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let lexinfo = parse(&input).expect("parse failed");
+
+        // Comments in %{ %} should be preserved (2 lines: #include and comment)
+        assert_eq!(lexinfo.external_def.len(), 2);
+        assert!(lexinfo.external_def[0].contains("#include"));
+        assert!(lexinfo.external_def[1].contains("Comment inside"));
+
+        // Substitution should be parsed correctly despite surrounding comments
+        assert_eq!(lexinfo.subs.len(), 1);
+        assert_eq!(lexinfo.subs.get("DIGIT").unwrap(), "[0-9]");
+
+        // Rule should be parsed correctly
+        assert_eq!(lexinfo.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_multiline_comment_spanning_definitions() {
+        // Test multi-line comment that spans across definition lines
+        let test_content = r#"
+/* This is a
+   multi-line
+   comment */
+DIGIT [0-9]
+%%
+{DIGIT}+    { printf("digit\n"); }
+%%
+"#;
+        let input: Vec<String> = test_content.lines().map(|s| s.to_string()).collect();
+        let lexinfo = parse(&input).expect("parse failed");
+
+        // Substitution should be parsed correctly
+        assert_eq!(lexinfo.subs.len(), 1);
+        assert_eq!(lexinfo.subs.get("DIGIT").unwrap(), "[0-9]");
     }
 
     #[test]

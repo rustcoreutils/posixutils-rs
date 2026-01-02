@@ -325,6 +325,27 @@ impl<'a> Parser<'a> {
                         associativity: prec.map(|(_, a)| a),
                     });
                 }
+                // POSIX: Allow %token error <number> to override error token value
+                Some(Token::Error) => {
+                    self.advance();
+
+                    // Optional number to override default (256)
+                    let number = if let Some(Token::Number(n)) = self.current_token() {
+                        let n = *n;
+                        self.advance();
+                        Some(n)
+                    } else {
+                        None
+                    };
+
+                    grammar.tokens.push(TokenDecl {
+                        name: "error".to_string(),
+                        tag: tag.clone(),
+                        number,
+                        precedence: prec.map(|(l, _)| l),
+                        associativity: prec.map(|(_, a)| a),
+                    });
+                }
                 _ => break,
             }
         }

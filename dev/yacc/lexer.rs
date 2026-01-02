@@ -463,7 +463,10 @@ impl<'a> Lexer<'a> {
             ));
         }
 
-        self.read_action()
+        // read_action consumes the braces but doesn't include them in output
+        // For union bodies, we need the braces for valid C syntax
+        let body = self.read_action()?;
+        Ok(format!("{{{}}}", body))
     }
 
     fn next_token(&mut self) -> Result<Option<PositionedToken>, YaccError> {
@@ -737,7 +740,10 @@ mod tests {
         let input = "%union { int ival; double dval; }";
         let tokens = lex(input).unwrap();
         assert_eq!(tokens.len(), 1);
-        assert!(matches!(&tokens[0].token, Token::UnionBody(s) if s.contains("ival")));
+        // Union body must include braces for valid C syntax in generated code
+        assert!(
+            matches!(&tokens[0].token, Token::UnionBody(s) if s.starts_with('{') && s.ends_with('}') && s.contains("ival"))
+        );
     }
 
     #[test]

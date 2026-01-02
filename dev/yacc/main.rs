@@ -16,6 +16,7 @@ mod lalr;
 mod lexer;
 mod lr0;
 mod parser;
+mod verify;
 
 use std::env;
 use std::fs;
@@ -38,6 +39,8 @@ pub struct Options {
     pub debug_enabled: bool,
     /// -v: Write description file
     pub write_description: bool,
+    /// --strict: Disable optimizations that may change yylex timing
+    pub strict_mode: bool,
     /// Input grammar file
     pub grammar_file: String,
 }
@@ -51,6 +54,7 @@ impl Default for Options {
             sym_prefix: "yy".to_string(),
             debug_enabled: false,
             write_description: false,
+            strict_mode: false,
             grammar_file: String::new(),
         }
     }
@@ -63,6 +67,11 @@ fn parse_args() -> Result<Options, YaccError> {
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
+        if arg == "--strict" {
+            opts.strict_mode = true;
+            i += 1;
+            continue;
+        }
         if arg.starts_with('-') {
             let mut chars = arg.chars().skip(1);
             while let Some(c) = chars.next() {
@@ -134,7 +143,7 @@ fn parse_args() -> Result<Options, YaccError> {
 }
 
 fn print_usage() {
-    eprintln!("Usage: yacc [-dltv] [-b file_prefix] [-p sym_prefix] grammar");
+    eprintln!("Usage: yacc [-dltv] [-b file_prefix] [-p sym_prefix] [--strict] grammar");
     eprintln!("Options:");
     eprintln!("  -b file_prefix  Use file_prefix instead of 'y' for output files");
     eprintln!("  -d              Write header file");
@@ -142,6 +151,7 @@ fn print_usage() {
     eprintln!("  -p sym_prefix   Use sym_prefix instead of 'yy' for external names");
     eprintln!("  -t              Enable debugging code in generated parser");
     eprintln!("  -v              Write description file");
+    eprintln!("  --strict        Disable optimizations that may change yylex timing");
 }
 
 fn run(opts: &Options) -> Result<(), YaccError> {

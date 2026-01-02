@@ -274,8 +274,8 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-// parse continued action line, counting open braces
-// Properly skips over character literals, string literals, and comments
+// Parse continued action line, counting braces while properly handling
+// character literals, string literals, and comments.
 fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
     let mut open_braces = open_braces;
     let chars: Vec<char> = line.chars().collect();

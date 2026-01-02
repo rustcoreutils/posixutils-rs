@@ -17,7 +17,6 @@ thiserror.workspace = true
 chrono = { version = "0.4", features = ["unstable-locales"] }
 regex.workspace = true
 terminfo = "0.9.0"
-lazy_static = "1.4"
 
 [dev-dependencies]
 plib = { path = "../plib" }

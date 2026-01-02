@@ -1696,7 +1696,6 @@ dependencies = [
  "chrono",
  "clap",
  "gettext-rs",
- "lazy_static",
  "libc",
  "pest",
  "pest_derive",

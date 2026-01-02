@@ -1,7 +1,7 @@
 use crate::FormattingSettings;
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use terminfo::Database;
 
 use super::{
@@ -12,8 +12,9 @@ use super::{
 /// Max Bl -width parameter value
 const MAX_INDENT: u8 = 20;
 
-lazy_static! {
-    pub static ref REGEX_UNICODE: Regex = {
+fn regex_unicode() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
         Regex::new(
             r"(?x)
             (?:
@@ -22,15 +23,20 @@ lazy_static! {
                 (?P<number_n>\\N'(?P<dec1>[0-9]+)')                      |
                 (?P<number_char>\\\[char(?P<dec2>[0-9]+)\])
             )
-            "
-        ).unwrap()
-    };
+            ",
+        )
+        .unwrap()
+    })
+}
 
-    pub static ref REGEX_NS_MACRO: Regex = {
-        Regex::new(r"\s*\\\[nsmacroescape\]\s*").unwrap()
-    };
+fn regex_ns_macro() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| Regex::new(r"\s*\\\[nsmacroescape\]\s*").unwrap())
+}
 
-    pub static ref SUBSTITUTIONS: HashMap<&'static str, &'static str> = {
+fn substitutions() -> &'static HashMap<&'static str, &'static str> {
+    static CELL: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    CELL.get_or_init(|| {
         let mut m = HashMap::with_capacity(410);
         m.insert(r"\[ssindent]", "   ");
         m.insert(r"\[dq]", "\"");
@@ -47,10 +53,10 @@ lazy_static! {
         m.insert(r"\0", " "); // digit-width space
         m.insert(r"\|", " "); // one-sixth \(em narrow space
         m.insert(r"\^", " "); // one-twelfth \(em half-narrow space
-        m.insert(r"\&", "");  // zero-width space
-        m.insert(r"\)", "");  // zero-width space (transparent to end-of-sentence detection)
-        m.insert(r"\%", "");  // zero-width space allowing hyphenation
-        //m.insert(r"\:", "");  // zero-width space allowing line break
+        m.insert(r"\&", ""); // zero-width space
+        m.insert(r"\)", ""); // zero-width space (transparent to end-of-sentence detection)
+        m.insert(r"\%", ""); // zero-width space allowing hyphenation
+                             //m.insert(r"\:", "");  // zero-width space allowing line break
 
         // Lines:
         m.insert(r"\(ba", "|"); // bar
@@ -61,7 +67,7 @@ lazy_static! {
         m.insert(r"\(bb", "¦"); // broken bar
         m.insert(r"\(sl", "/"); // forward slash
         m.insert(r"\(rs", "\\"); // backward slash
-        // Text markers:
+                                 // Text markers:
         m.insert(r"\(ci", "○"); // circle
         m.insert(r"\(bu", "•"); // bullet
         m.insert(r"\(dd", "‡"); // double dagger
@@ -80,18 +86,18 @@ lazy_static! {
         m.insert(r"\(SP", "♠"); // spade suit
         m.insert(r"\(HE", "♥"); // heart suit
         m.insert(r"\(DI", "♦"); // diamond suit
-        // Legal symbols:
+                                // Legal symbols:
         m.insert(r"\(co", "©"); // copyright
         m.insert(r"\(rg", "®"); // registered
         m.insert(r"\(tm", "™"); // trademarked
-        // Punctuation:
+                                // Punctuation:
         m.insert(r"\(em", "—"); // em-dash
         m.insert(r"\(en", "–"); // en-dash
         m.insert(r"\(hy", "‐"); // hyphen
-        m.insert(r"\e",  "\\");  // back-slash
+        m.insert(r"\e", "\\"); // back-slash
         m.insert(r"\(r!", "¡"); // upside-down exclamation
         m.insert(r"\(r?", "¿"); // upside-down question
-        // Quotes:
+                                // Quotes:
         m.insert(r"\(Bq", "„"); // right low double-quote
         m.insert(r"\(bq", "‚"); // right low single-quote
         m.insert(r"\(lq", "“"); // left double-quote
@@ -104,7 +110,7 @@ lazy_static! {
         m.insert(r"\(Fc", "»"); // right guillemet
         m.insert(r"\(fo", "‹"); // left single guillemet
         m.insert(r"\(fc", "›"); // right single guillemet
-        // Brackets:
+                                // Brackets:
         m.insert(r"\(lB", "[");
         m.insert(r"\(rB", "]");
         m.insert(r"\(lC", "{");
@@ -434,29 +440,28 @@ lazy_static! {
         m.insert(r"\*(Px", "POSIX");
         m.insert(r"\*(Ai", "ANSI");
         m
-    };
+    })
+}
 
-    pub static ref OUTER_REGEX: Regex = {
-        let alternation = SUBSTITUTIONS
+fn outer_regex() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let alternation = substitutions()
             .keys()
             .map(|key| regex::escape(key))
             .collect::<Vec<_>>()
             .join("|");
 
-            let pattern = format!(
-                r#"(?P<esc>{})"#,
-                alternation
-            );
-
+        let pattern = format!(r#"(?P<esc>{})"#, alternation);
         Regex::new(&pattern).unwrap()
-    };
+    })
 }
 
 pub fn replace_escapes(input: &str) -> String {
-    let input = OUTER_REGEX
+    let input = outer_regex()
         .replace_all(input, |caps: &regex::Captures| {
             if let Some(esc) = caps.name("esc") {
-                SUBSTITUTIONS
+                substitutions()
                     .get(esc.as_str())
                     .map(|rep| rep.to_string())
                     .unwrap_or_else(|| esc.as_str().to_string())
@@ -466,7 +471,7 @@ pub fn replace_escapes(input: &str) -> String {
         })
         .to_string();
 
-    REGEX_NS_MACRO.replace_all(&input, "").to_string()
+    regex_ns_macro().replace_all(&input, "").to_string()
 }
 
 /// Formatter state
@@ -544,7 +549,7 @@ impl MdocFormatter {
 
     /// Replaces escape sequences in [`text`] [`str`] to true UTF-8 chars
     fn replace_unicode_escapes(&self, text: &str) -> String {
-        REGEX_UNICODE
+        regex_unicode()
             .replace_all(text, |caps: &regex::Captures| {
                 if let Some(hex) = caps
                     .name("hex1")

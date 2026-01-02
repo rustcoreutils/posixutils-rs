@@ -30,11 +30,11 @@ pub struct PackedTables {
     /// Check array for validating table entries
     pub check: Vec<i16>,
     /// Per-state index into table for actions
-    pub pact: Vec<i16>,
+    pub pact: Vec<i32>,
     /// Per-nonterminal index into table for gotos
-    pub pgoto: Vec<i16>,
+    pub pgoto: Vec<i32>,
     /// Default reduction for each state (production_id + 1, or 0 for none)
-    pub defact: Vec<u8>,
+    pub defact: Vec<u16>,
     /// Default goto for each nonterminal
     pub defgoto: Vec<i16>,
     /// Consistent states: true if only one reduce action exists (no shifts)
@@ -348,16 +348,30 @@ fn generate_rule_tables<W: Write>(
     grammar: &Grammar,
     prefix: &str,
 ) -> Result<(), YaccError> {
-    // yyr1 - LHS symbol of each rule
+    // Build mapping from raw symbol ID to internal symbol number
+    // Non-terminals should be numbered starting at num_terminals (YYNTOKENS)
+    // so that the parser can compute: nt_idx = yylhs - YYNTOKENS
+    let mut symbol_to_internal: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for (nt_idx, nt_id) in grammar.nonterminals().enumerate() {
+        symbol_to_internal.insert(nt_id, grammar.num_terminals + nt_idx);
+    }
+
+    // yyr1 - LHS symbol of each rule (using internal symbol numbers)
     writeln!(w, "/* LHS symbol of each rule */")?;
-    writeln!(w, "static const unsigned char {}r1[] =", prefix)?;
+    writeln!(w, "static const unsigned short {}r1[] =", prefix)?;
     writeln!(w, "{{")?;
     write!(w, "    ")?;
     for (i, prod) in grammar.productions.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
         }
-        write!(w, "{:3}", prod.lhs)?;
+        // Convert raw symbol ID to internal symbol number
+        let internal_sym = symbol_to_internal
+            .get(&prod.lhs)
+            .copied()
+            .unwrap_or(prod.lhs);
+        write!(w, "{:3}", internal_sym)?;
     }
     writeln!(w)?;
     writeln!(w, "}};")?;
@@ -420,7 +434,7 @@ fn generate_action_goto_tables<W: Write>(
 
     // yypact - index into yytable for each state's actions
     writeln!(w, "/* Index into yytable for actions */")?;
-    writeln!(w, "static const short {}pact[] =", prefix)?;
+    writeln!(w, "static const int {}pact[] =", prefix)?;
     writeln!(w, "{{")?;
     for chunk in packed.pact.chunks(10) {
         write!(w, "    ")?;
@@ -437,7 +451,7 @@ fn generate_action_goto_tables<W: Write>(
 
     // yydefact - default reduction for each state
     writeln!(w, "/* Default reduction for each state */")?;
-    writeln!(w, "static const unsigned char {}defact[] =", prefix)?;
+    writeln!(w, "static const unsigned short {}defact[] =", prefix)?;
     writeln!(w, "{{")?;
     for chunk in packed.defact.chunks(10) {
         write!(w, "    ")?;
@@ -475,7 +489,7 @@ fn generate_action_goto_tables<W: Write>(
 
     // yypgoto - index into yytable for goto
     writeln!(w, "/* Index into yytable for goto */")?;
-    writeln!(w, "static const short {}pgoto[] =", prefix)?;
+    writeln!(w, "static const int {}pgoto[] =", prefix)?;
     writeln!(w, "{{")?;
     for chunk in packed.pgoto.chunks(10) {
         write!(w, "    ")?;
@@ -577,9 +591,9 @@ fn build_packed_tables(
     let mut table = vec![0i16; table_size.max(1)];
     let mut check = vec![-1i16; table_size.max(1)];
 
-    let mut pact = vec![0i16; num_states];
-    let mut defact = vec![0u8; num_states];
-    let mut pgoto = vec![0i16; num_nonterminals.max(1)];
+    let mut pact = vec![0i32; num_states];
+    let mut defact = vec![0u16; num_states];
+    let mut pgoto = vec![0i32; num_nonterminals.max(1)];
     let mut defgoto = vec![-1i16; num_nonterminals.max(1)];
     // Per POSIX: track states where only one reduce action exists (no shifts)
     // so the parser can skip calling yylex() in those states
@@ -588,7 +602,7 @@ fn build_packed_tables(
 
     // Fill action table
     for (state_id, actions) in lalr.action_table.iter().enumerate() {
-        pact[state_id] = (state_id * max_terminal_id) as i16;
+        pact[state_id] = (state_id * max_terminal_id) as i32;
 
         // Find default reduction and check if state is "consistent"
         // A state is consistent if:
@@ -627,7 +641,7 @@ fn build_packed_tables(
 
         // Store production_id + 1 so that 0 means "no default action"
         defact[state_id] = match best_reduce {
-            Some(prod_id) => (prod_id + 1) as u8,
+            Some(prod_id) => (prod_id + 1) as u16,
             None => 0,
         };
 
@@ -651,7 +665,7 @@ fn build_packed_tables(
     // Fill goto table (starts after action table)
     for (nt_idx, nt_id) in grammar.nonterminals().enumerate() {
         if nt_idx < pgoto.len() {
-            pgoto[nt_idx] = (action_table_size + nt_idx * num_states) as i16;
+            pgoto[nt_idx] = (action_table_size + nt_idx * num_states) as i32;
         }
 
         // Find default goto

@@ -258,8 +258,6 @@ fn decode_goto(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Unit tests for decode functions would go here
     // These require constructing minimal PackedTables for testing
 }

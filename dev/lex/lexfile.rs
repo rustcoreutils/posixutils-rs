@@ -33,6 +33,8 @@ pub struct LexRule {
     pub trailing_context: Option<String>,
     /// Compiled trailing context pattern
     pub compiled_trailing_context: Option<String>,
+    /// True if this is an <<EOF>> rule (matches end of file)
+    pub is_eof: bool,
 }
 
 impl LexRule {
@@ -45,6 +47,7 @@ impl LexRule {
             bol_anchor: false,
             trailing_context: None,
             compiled_trailing_context: None,
+            is_eof: false,
         }
     }
 }
@@ -272,9 +275,68 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
 }
 
 // parse continued action line, counting open braces
+// Properly skips over character literals, string literals, and comments
 fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
     let mut open_braces = open_braces;
-    for c in line.chars() {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Skip character literals 'x' (including escape sequences like '\'' or '\\')
+        if c == '\'' {
+            i += 1;
+            if i < chars.len() && chars[i] == '\\' {
+                // Escaped character - skip backslash and next char
+                i += 2;
+            } else if i < chars.len() {
+                // Regular character
+                i += 1;
+            }
+            // Skip closing quote if present
+            if i < chars.len() && chars[i] == '\'' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip string literals "..."
+        if c == '"' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    // Skip escaped character
+                    i += 2;
+                } else if chars[i] == '"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Skip line comments //...
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            // Rest of line is comment
+            break;
+        }
+
+        // Skip block comments /* ... */ (partial - may span multiple lines)
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() {
+                if chars[i] == '*' && chars[i + 1] == '/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
         if c == '{' {
             open_braces += 1;
         } else if c == '}' {
@@ -283,6 +345,7 @@ fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
             }
             open_braces -= 1;
         }
+        i += 1;
     }
     Ok(open_braces)
 }
@@ -463,16 +526,65 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
     let mut in_quotes = false;
     let mut in_brace = false;
     let mut brace_content = String::new();
+    let mut escape_next = false;
+    let chars: Vec<char> = ere.chars().collect();
+    let mut i = 0;
 
-    for ch in ere.chars() {
+    while i < chars.len() {
+        let ch = chars[i];
+
+        // Handle escape sequences outside of quotes
+        if escape_next && !in_quotes {
+            escape_next = false;
+            // In lex patterns, \c means literal character c
+            // For regex, most chars just need to be passed through as \c
+            // but some need hex escaping to avoid regex interpretation
+            match ch {
+                // Characters that need hex escaping for regex_syntax
+                'n' => re.push_str("\\x0a"), // newline
+                't' => re.push_str("\\x09"), // tab
+                'r' => re.push_str("\\x0d"), // carriage return
+                // Quote doesn't need escaping in regex, just output literally
+                '"' => re.push('"'),
+                '\'' => re.push('\''),
+                // Backslash needs to be escaped for regex
+                '\\' => re.push_str("\\\\"),
+                // Other characters: pass through as escaped for regex
+                _ => {
+                    re.push('\\');
+                    re.push(ch);
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Check for escape character outside quotes
+        if ch == '\\' && !in_quotes {
+            escape_next = true;
+            i += 1;
+            continue;
+        }
+
         if in_quotes && ch == '"' {
             in_quotes = false;
         } else if in_quotes {
+            // Inside quoted strings, escape regex metacharacters that need escaping
+            // Note: ] doesn't need escaping as it's only special inside brackets
             match ch {
                 '*' => re.push_str(r"\x2a"),
                 '+' => re.push_str(r"\x2b"),
                 '.' => re.push_str(r"\x2e"),
                 '{' => re.push_str(r"\x7b"),
+                '}' => re.push_str(r"\x7d"),
+                '(' => re.push_str(r"\x28"),
+                ')' => re.push_str(r"\x29"),
+                '[' => re.push_str(r"\x5b"),
+                '?' => re.push_str(r"\x3f"),
+                '|' => re.push_str(r"\x7c"),
+                '^' => re.push_str(r"\x5e"),
+                '$' => re.push_str(r"\x24"),
+                '\\' => re.push_str(r"\x5c"),
                 _ => re.push(ch),
             }
         } else if in_brace && ch == '}' {
@@ -483,15 +595,17 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
                 re.push_str(&brace_content);
                 re.push('}');
             } else {
-                // Substitution reference
-                match state.subs.get(&brace_content) {
+                // Substitution reference - recursively expand any nested substitutions
+                match state.subs.get(&brace_content).cloned() {
                     Some(value) => {
+                        // Recursively expand substitutions in the value
+                        let expanded = translate_ere(state, &value, wrap_subs)?;
                         if wrap_subs {
                             re.push('(');
-                            re.push_str(value);
+                            re.push_str(&expanded);
                             re.push(')');
                         } else {
-                            re.push_str(value);
+                            re.push_str(&expanded);
                         }
                     }
                     None => {
@@ -512,6 +626,7 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
         } else {
             re.push(ch);
         }
+        i += 1;
     }
 
     // Expand POSIX equivalence classes [=c=] and collating elements [.c.]
@@ -554,10 +669,36 @@ struct ParsedRuleInfo {
     bol_anchor: bool,
     trailing_context: Option<String>,
     compiled_trailing_context: Option<String>,
+    is_eof: bool,
 }
 
 // parse a lex rule line, returning all rule components
 fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, String> {
+    // Check for <<EOF>> pattern BEFORE extracting start conditions
+    // (since <<EOF>> looks like a start condition but isn't)
+    let trimmed_line = line.trim_start();
+    if let Some(action_ws) = trimmed_line.strip_prefix("<<EOF>>") {
+        let action = action_ws.trim_start();
+
+        if action.is_empty() {
+            return Err(state.error("missing action for <<EOF>> rule"));
+        }
+
+        let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
+
+        return Ok(ParsedRuleInfo {
+            ere: String::new(),
+            compiled_ere: String::new(),
+            action: action.to_string(),
+            open_braces,
+            start_conditions: Vec::new(), // <<EOF>> doesn't support start conditions in this simple impl
+            bol_anchor: false,
+            trailing_context: None,
+            compiled_trailing_context: None,
+            is_eof: true,
+        });
+    }
+
     // First extract any start conditions
     let (start_conditions, remaining) = extract_start_conditions(line);
 
@@ -606,6 +747,7 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
         bol_anchor,
         trailing_context,
         compiled_trailing_context,
+        is_eof: false,
     })
 }
 
@@ -660,6 +802,7 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 bol_anchor: info.bol_anchor,
                 trailing_context: info.trailing_context,
                 compiled_trailing_context: info.compiled_trailing_context,
+                is_eof: info.is_eof,
             });
         } else {
             state.tmp_rule = LexRule {
@@ -670,6 +813,7 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 bol_anchor: info.bol_anchor,
                 trailing_context: info.trailing_context,
                 compiled_trailing_context: info.compiled_trailing_context,
+                is_eof: info.is_eof,
             };
             state.open_braces = info.open_braces;
         }

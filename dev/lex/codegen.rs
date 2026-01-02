@@ -157,7 +157,7 @@ pub fn generate<W: Write>(
     write_rule_condition_table(output, lexinfo, config)?;
     write_rule_metadata_tables(output, lexinfo, config)?;
     write_main_pattern_end_table(output, dfa, config)?;
-    write_internal_definitions(output, lexinfo)?;
+    // Note: internal_defs are written inside yylex(), not here
     write_helper_functions(output)?;
     write_yylex_function(output, dfa, lexinfo, config, table_format)?;
     write_user_subroutines(output, lexinfo)?;
@@ -292,6 +292,9 @@ static int yy_more_len = 0;
 /* Variable-length trailing context support */
 static int yy_main_end_pos = 0; /* Position where main pattern ended */
 static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */
+
+/* EOF rule support */
+static int yy_eof_pending = 0; /* Flag to track if EOF rule should be executed */
 
 #ifndef yymore
 #define yymore() (yy_more_flag = 1)
@@ -745,17 +748,6 @@ fn write_main_pattern_end_table<W: Write>(
     Ok(())
 }
 
-fn write_internal_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Result<()> {
-    if !lexinfo.internal_defs.is_empty() {
-        writeln!(output, "/* User internal definitions */")?;
-        for line in &lexinfo.internal_defs {
-            write!(output, "{}", line)?;
-        }
-        writeln!(output)?;
-    }
-    Ok(())
-}
-
 fn write_helper_functions<W: Write>(output: &mut W) -> io::Result<()> {
     // input() and unput() functions
     writeln!(
@@ -775,8 +767,7 @@ static int input(void)
     /* Need to refill buffer */
     if (yyin == NULL) yyin = stdin;
     c = getc(yyin);
-    if (c == EOF) return 0;
-    return c;
+    return c;  /* Returns EOF (-1) on end of file */
 }}
 
 /* unput - push character back to input */
@@ -831,13 +822,32 @@ fn write_yylex_function<W: Write>(
     // Main scanning loop
     writeln!(output, "    while (1) {{")?;
 
+    // User code from indented lines before first rule (runs at start of each yylex call)
+    // Per POSIX: "Any such input preceding the first rule may be used to specify
+    // user code that is executed upon entry to yylex()"
+    // This must be inside the while(1) loop to run on every call to yylex()
+    if !lexinfo.internal_defs.is_empty() {
+        writeln!(
+            output,
+            "        /* User code from rules section (runs on each yylex call) */"
+        )?;
+        for line in &lexinfo.internal_defs {
+            write!(output, "        {}", line)?;
+        }
+        writeln!(output)?;
+    }
+
+    // Find the EOF rule index (if any)
+    let eof_rule_idx = lexinfo.rules.iter().position(|r| r.is_eof);
+
     // Read input if buffer is empty or depleted
     writeln!(output, "        /* Fill buffer if needed */")?;
     writeln!(output, "        if (yy_buffer_pos >= yy_buffer_len) {{")?;
+    writeln!(output, "            int unput_chars = 0;")?;
     writeln!(output, "            /* First drain any unput buffer */")?;
     writeln!(output, "            if (yy_unput_pos > 0) {{")?;
     writeln!(output, "                int i;")?;
-    writeln!(output, "                yy_buffer_len = yy_unput_pos;")?;
+    writeln!(output, "                unput_chars = yy_unput_pos;")?;
     writeln!(
         output,
         "                for (i = 0; i < yy_unput_pos; i++) {{"
@@ -848,31 +858,60 @@ fn write_yylex_function<W: Write>(
     )?;
     writeln!(output, "                }}")?;
     writeln!(output, "                yy_unput_pos = 0;")?;
-    writeln!(output, "                yy_buffer_pos = 0;")?;
-    writeln!(output, "            }} else {{")?;
+    writeln!(output, "            }}")?;
+    writeln!(
+        output,
+        "            /* Then fill rest of buffer from input */"
+    )?;
+    writeln!(output, "            {{")?;
     writeln!(output, "                int result;")?;
     writeln!(
         output,
-        "                YY_INPUT(yy_buffer, result, YY_BUF_SIZE);"
+        "                YY_INPUT(yy_buffer + unput_chars, result, YY_BUF_SIZE - unput_chars);"
     )?;
-    writeln!(output, "                if (result == 0) {{")?;
     writeln!(
         output,
-        "                    /* EOF - call yywrap() per POSIX */"
+        "                if (result == 0 && unput_chars == 0) {{"
     )?;
-    writeln!(output, "                    if (yywrap()) {{")?;
-    writeln!(
-        output,
-        "                        return 0; /* yywrap returned non-zero, stop */"
-    )?;
-    writeln!(output, "                    }}")?;
-    writeln!(
-        output,
-        "                    /* yywrap returned 0, continue with new input */"
-    )?;
-    writeln!(output, "                    continue;")?;
+
+    // If there's an EOF rule, execute it every time we hit EOF
+    // The user's <<EOF>> rule is responsible for eventually allowing yywrap to be called
+    // (typically by setting a flag that causes return 0 in internal definitions code)
+    if let Some(idx) = eof_rule_idx {
+        writeln!(
+            output,
+            "                    /* EOF reached - execute <<EOF>> rule */"
+        )?;
+        writeln!(output, "                    yyleng = 0;")?;
+        writeln!(output, "                    yytext[0] = '\\0';")?;
+        writeln!(
+            output,
+            "                    yy_act = {}; /* EOF rule */",
+            idx
+        )?;
+        writeln!(output, "                    goto yy_do_action;")?;
+    } else {
+        writeln!(
+            output,
+            "                    /* EOF - call yywrap() per POSIX */"
+        )?;
+        writeln!(output, "                    if (yywrap()) {{")?;
+        writeln!(
+            output,
+            "                        return 0; /* yywrap returned non-zero, stop */"
+        )?;
+        writeln!(output, "                    }}")?;
+        writeln!(
+            output,
+            "                    /* yywrap returned 0, continue with new input */"
+        )?;
+        writeln!(output, "                    continue;")?;
+    }
     writeln!(output, "                }}")?;
-    writeln!(output, "                yy_buffer_len = result;")?;
+    writeln!(
+        output,
+        "                yy_buffer_len = unput_chars + result;"
+    )?;
     writeln!(output, "                yy_buffer_pos = 0;")?;
     writeln!(output, "            }}")?;
     writeln!(output, "        }}")?;
@@ -1358,6 +1397,7 @@ fn write_yylex_function<W: Write>(
     writeln!(output)?;
 
     // Execute action based on rule
+    writeln!(output, "    yy_do_action:")?;
     writeln!(output, "        /* Execute rule action */")?;
     writeln!(output, "        switch (yy_act) {{")?;
 
@@ -1467,6 +1507,7 @@ mod tests {
             bol_anchor: false,
             trailing_context: None,
             compiled_trailing_context: None,
+            is_eof: false,
         });
 
         let mut output = Vec::new();
@@ -1495,6 +1536,7 @@ mod tests {
             bol_anchor: true, // BOL-anchored rule
             trailing_context: None,
             compiled_trailing_context: None,
+            is_eof: false,
         });
 
         let rule_meta = vec![RuleMetadata {
@@ -1544,6 +1586,7 @@ mod tests {
             bol_anchor: false,
             trailing_context: None,
             compiled_trailing_context: None,
+            is_eof: false,
         });
 
         let mut output = Vec::new();
@@ -1591,6 +1634,7 @@ mod tests {
             bol_anchor: false,
             trailing_context: Some("bar".to_string()),
             compiled_trailing_context: Some("bar".to_string()),
+            is_eof: false,
         });
 
         let rule_meta = vec![RuleMetadata {
@@ -1633,6 +1677,7 @@ mod tests {
             bol_anchor: false,
             trailing_context: None,
             compiled_trailing_context: None,
+            is_eof: false,
         });
 
         let mut output = Vec::new();

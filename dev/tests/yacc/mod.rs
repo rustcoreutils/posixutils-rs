@@ -2488,3 +2488,785 @@ expr : expr '+' expr
         String::from_utf8_lossy(&output_strict.stderr)
     );
 }
+
+// ============================================================================
+// Python 3.9 Parser Integration Test
+// ============================================================================
+//
+// This comprehensive test demonstrates the yacc implementation by parsing
+// a maximal subset of Python 3.9 syntax. It exercises all POSIX yacc features:
+// - %token with explicit numbers
+// - %left, %right, %nonassoc for operator precedence
+// - %union and %type for semantic values
+// - %start for explicit start symbol
+// - %prec for precedence override
+// - error token for syntax error recovery
+// - Semantic actions
+//
+// The grammar handles Python's significant whitespace via a custom C lexer
+// that tracks indentation levels and emits INDENT/DEDENT tokens.
+// ============================================================================
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Path to Python 3.9 fixture files
+fn python39_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// Build directory for generated files
+fn python39_build_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python39_parser")
+}
+
+/// Built parser executable path
+fn python39_parser_exe() -> PathBuf {
+    python39_build_dir().join("parser")
+}
+
+/// Build the Python parser once (lazy initialization)
+static PYTHON39_PARSER_BUILT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn ensure_python39_parser_built() -> Result<(), String> {
+    PYTHON39_PARSER_BUILT
+        .get_or_init(|| build_python39_parser())
+        .clone()
+}
+
+fn build_python39_parser() -> Result<(), String> {
+    let fixtures = python39_fixture_dir();
+    let build_dir = python39_build_dir();
+
+    // Create build directory
+    fs::create_dir_all(&build_dir).map_err(|e| format!("mkdir: {}", e))?;
+
+    let grammar_path = fixtures.join("python39.y");
+    let lex_path = fixtures.join("python39.l");
+
+    // Run yacc on fixture file directly
+    let yacc_output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(&build_dir)
+        .args(["-d", grammar_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("yacc exec: {}", e))?;
+
+    if !yacc_output.status.success() {
+        return Err(format!(
+            "yacc failed: {}",
+            String::from_utf8_lossy(&yacc_output.stderr)
+        ));
+    }
+
+    // Run lex on fixture file directly
+    let lex_output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .current_dir(&build_dir)
+        .arg(lex_path.to_str().unwrap())
+        .output()
+        .map_err(|e| format!("lex exec: {}", e))?;
+
+    if !lex_output.status.success() {
+        return Err(format!(
+            "lex failed: {}",
+            String::from_utf8_lossy(&lex_output.stderr)
+        ));
+    }
+
+    // Compile parser
+    let compile = Command::new("cc")
+        .current_dir(&build_dir)
+        .args([
+            "-Wall",
+            "-Wno-unused-variable",
+            "-Wno-unused-but-set-variable",
+            "-Wno-unused-function",
+            "-o",
+            "parser",
+            "y.tab.c",
+            "lex.yy.c",
+        ])
+        .output()
+        .map_err(|e| format!("cc exec: {}", e))?;
+
+    if !compile.status.success() {
+        return Err(format!(
+            "cc failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+/// Run a single Python source through the pre-built parser
+fn run_python_parser_test(python_source: &str, should_pass: bool, desc: &str) {
+    // Ensure parser is built (once)
+    if let Err(e) = ensure_python39_parser_built() {
+        panic!("Failed to build Python parser: {}", e);
+    }
+
+    let parser_exe = python39_parser_exe();
+
+    // Run parser with the Python source as stdin
+    let mut child = Command::new(&parser_exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn parser");
+
+    use std::io::Write;
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(python_source.as_bytes()).unwrap();
+    }
+
+    let output = child.wait_with_output().expect("failed to wait for parser");
+
+    if should_pass {
+        assert!(
+            output.status.success(),
+            "{}: parser should accept valid Python:\n{}\nstderr: {}",
+            desc,
+            python_source,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "{}: parser should reject invalid Python:\n{}",
+            desc,
+            python_source
+        );
+    }
+}
+
+// ============================================================================
+// Python 3.9 Parser Test Cases
+// ============================================================================
+
+#[test]
+fn test_python39_grammar_compiles() {
+    // Build parser from fixtures - this tests yacc, lex, and cc all succeed
+    if let Err(e) = ensure_python39_parser_built() {
+        panic!("Failed to build Python parser: {}", e);
+    }
+}
+
+#[test]
+fn test_python39_expressions() {
+    let samples = [
+        // Arithmetic with precedence
+        ("x = 1 + 2 * 3\n", true, "arithmetic precedence"),
+        ("x = (1 + 2) * 3\n", true, "parenthesized expression"),
+        ("x = 2 ** 3 ** 2\n", true, "right-associative power"),
+        ("x = -5 ** 2\n", true, "unary minus with power"),
+        ("x = 10 // 3\n", true, "floor division"),
+        ("x = 10 % 3\n", true, "modulo"),
+        // Comparison chaining
+        ("x = 1 < 2 < 3\n", true, "comparison chaining"),
+        ("x = a == b != c\n", true, "equality chaining"),
+        ("x = a <= b >= c\n", true, "inequality chaining"),
+        // Boolean operators
+        ("x = a and b or c\n", true, "boolean operators"),
+        ("x = not a and not b\n", true, "not operator"),
+        ("x = not (a or b)\n", true, "not with parens"),
+        // Bitwise operators
+        ("x = a | b ^ c & d\n", true, "bitwise precedence"),
+        ("x = a << 2 | b >> 1\n", true, "shift operators"),
+        ("x = ~a\n", true, "bitwise not"),
+        // Conditional expression
+        ("x = a if b else c\n", true, "conditional expression"),
+        (
+            "x = a if b else c if d else e\n",
+            true,
+            "nested conditional",
+        ),
+        // Lambda
+        ("f = lambda x: x + 1\n", true, "simple lambda"),
+        ("f = lambda x, y: x + y\n", true, "multi-arg lambda"),
+        ("f = lambda: 42\n", true, "no-arg lambda"),
+        // Membership and identity
+        ("x = a in b\n", true, "in operator"),
+        ("x = a not in b\n", true, "not in operator"),
+        ("x = a is b\n", true, "is operator"),
+        ("x = a is not b\n", true, "is not operator"),
+        // Await (syntax only)
+        ("x = await foo()\n", true, "await expression"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_statements() {
+    let samples = [
+        // If/elif/else
+        ("if x:\n    pass\n", true, "simple if"),
+        ("if x:\n    pass\nelif y:\n    pass\n", true, "if-elif"),
+        ("if x:\n    pass\nelse:\n    pass\n", true, "if-else"),
+        (
+            "if x:\n    pass\nelif y:\n    pass\nelse:\n    pass\n",
+            true,
+            "if-elif-else",
+        ),
+        // While
+        ("while True:\n    break\n", true, "while with break"),
+        ("while x:\n    continue\n", true, "while with continue"),
+        ("while x:\n    pass\nelse:\n    pass\n", true, "while-else"),
+        // For
+        ("for i in items:\n    pass\n", true, "for loop"),
+        ("for x, y in items:\n    pass\n", true, "for with unpacking"),
+        (
+            "for i in items:\n    pass\nelse:\n    pass\n",
+            true,
+            "for-else",
+        ),
+        // Try/except
+        ("try:\n    pass\nexcept:\n    pass\n", true, "try-except"),
+        (
+            "try:\n    pass\nexcept E as e:\n    pass\n",
+            true,
+            "try-except-as",
+        ),
+        ("try:\n    pass\nfinally:\n    pass\n", true, "try-finally"),
+        (
+            "try:\n    pass\nexcept:\n    pass\nfinally:\n    pass\n",
+            true,
+            "try-except-finally",
+        ),
+        (
+            "try:\n    pass\nexcept:\n    pass\nelse:\n    pass\n",
+            true,
+            "try-except-else",
+        ),
+        // With
+        ("with open(f):\n    pass\n", true, "with statement"),
+        ("with open(f) as fp:\n    pass\n", true, "with statement as"),
+        (
+            "with a as x, b as y:\n    pass\n",
+            true,
+            "multiple with items",
+        ),
+        // Import
+        ("import os\n", true, "simple import"),
+        ("import os.path\n", true, "dotted import"),
+        ("import os as o\n", true, "import as"),
+        ("from os import path\n", true, "from import"),
+        ("from os import path as p\n", true, "from import as"),
+        ("from os import *\n", true, "from import star"),
+        ("from . import module\n", true, "relative import"),
+        ("from .. import module\n", true, "parent relative import"),
+        ("from .pkg import module\n", true, "relative dotted import"),
+        // Simple statements
+        ("pass\n", true, "pass statement"),
+        ("break\n", true, "break statement"),
+        ("continue\n", true, "continue statement"),
+        ("return\n", true, "return without value"),
+        ("return x\n", true, "return with value"),
+        ("return x, y\n", true, "return tuple"),
+        ("raise\n", true, "bare raise"),
+        ("raise ValueError\n", true, "raise exception"),
+        ("raise ValueError from e\n", true, "raise from"),
+        ("assert x\n", true, "simple assert"),
+        ("assert x, 'message'\n", true, "assert with message"),
+        ("del x\n", true, "del statement"),
+        ("del x, y\n", true, "del multiple"),
+        ("global x\n", true, "global"),
+        ("global x, y\n", true, "global multiple"),
+        ("nonlocal x\n", true, "nonlocal"),
+        // Yield
+        ("yield\n", true, "bare yield"),
+        ("yield x\n", true, "yield value"),
+        ("yield from items\n", true, "yield from"),
+        // Multiple statements on one line
+        ("x = 1; y = 2\n", true, "semicolon statements"),
+        ("pass; pass; pass\n", true, "multiple pass"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_assignments() {
+    let samples = [
+        // Simple assignment
+        ("x = 1\n", true, "simple assignment"),
+        ("x = y = 1\n", true, "chained assignment"),
+        ("x = y = z = 1\n", true, "triple chained"),
+        // Tuple unpacking
+        ("x, y = 1, 2\n", true, "tuple unpacking"),
+        ("x, y, z = items\n", true, "triple unpacking"),
+        ("(x, y) = pair\n", true, "parenthesized unpacking"),
+        ("[x, y] = pair\n", true, "list unpacking"),
+        // Star unpacking
+        ("*x, = items\n", true, "star unpack only"),
+        ("x, *y = items\n", true, "star at end"),
+        ("*x, y = items\n", true, "star at start"),
+        ("x, *y, z = items\n", true, "star in middle"),
+        // Augmented assignment
+        ("x += 1\n", true, "plus equals"),
+        ("x -= 1\n", true, "minus equals"),
+        ("x *= 2\n", true, "times equals"),
+        ("x /= 2\n", true, "divide equals"),
+        ("x //= 2\n", true, "floor divide equals"),
+        ("x %= 2\n", true, "mod equals"),
+        ("x **= 2\n", true, "power equals"),
+        ("x &= mask\n", true, "and equals"),
+        ("x |= mask\n", true, "or equals"),
+        ("x ^= mask\n", true, "xor equals"),
+        ("x <<= 1\n", true, "lshift equals"),
+        ("x >>= 1\n", true, "rshift equals"),
+        ("x @= mat\n", true, "matmul equals"),
+        // Annotated assignment
+        ("x: int\n", true, "type annotation"),
+        ("x: int = 1\n", true, "annotated assignment"),
+        // Walrus operator
+        ("(x := 10)\n", true, "walrus in parens"),
+        // Attribute and subscript assignment
+        ("obj.attr = 1\n", true, "attribute assignment"),
+        ("obj[0] = 1\n", true, "subscript assignment"),
+        ("obj[0:2] = items\n", true, "slice assignment"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_functions() {
+    let samples = [
+        // Basic definitions
+        ("def f():\n    pass\n", true, "simple function"),
+        ("def f(x):\n    return x\n", true, "function with arg"),
+        ("def f(x, y, z):\n    pass\n", true, "multiple args"),
+        ("def f(x, y=1):\n    pass\n", true, "default arg"),
+        ("def f(x=1, y=2):\n    pass\n", true, "multiple defaults"),
+        ("def f(*args):\n    pass\n", true, "varargs"),
+        ("def f(**kwargs):\n    pass\n", true, "keyword args"),
+        (
+            "def f(*args, **kwargs):\n    pass\n",
+            true,
+            "args and kwargs",
+        ),
+        ("def f(x, *args):\n    pass\n", true, "arg and varargs"),
+        ("def f(x, **kwargs):\n    pass\n", true, "arg and kwargs"),
+        (
+            "def f(x, *args, **kwargs):\n    pass\n",
+            true,
+            "all arg types",
+        ),
+        // Keyword-only args
+        ("def f(*, x):\n    pass\n", true, "keyword-only"),
+        (
+            "def f(*args, x):\n    pass\n",
+            true,
+            "keyword-only after star",
+        ),
+        (
+            "def f(*, x=1):\n    pass\n",
+            true,
+            "keyword-only with default",
+        ),
+        // Type hints
+        ("def f(x: int):\n    pass\n", true, "param type hint"),
+        ("def f(x: int = 1):\n    pass\n", true, "typed default"),
+        ("def f() -> int:\n    return 1\n", true, "return type"),
+        (
+            "def f(x: int) -> int:\n    return x\n",
+            true,
+            "full type hints",
+        ),
+        // Function body
+        (
+            "def f():\n    x = 1\n    return x\n",
+            true,
+            "multi-line body",
+        ),
+        (
+            "def f():\n    if True:\n        return 1\n    return 0\n",
+            true,
+            "nested if",
+        ),
+        // Async
+        ("async def f():\n    pass\n", true, "async function"),
+        ("async def f():\n    await x\n", true, "async with await"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_classes() {
+    let samples = [
+        ("class C:\n    pass\n", true, "simple class"),
+        ("class C():\n    pass\n", true, "class with parens"),
+        ("class C(Base):\n    pass\n", true, "class with inheritance"),
+        ("class C(A, B):\n    pass\n", true, "multiple inheritance"),
+        ("class C(A, B, C):\n    pass\n", true, "triple inheritance"),
+        ("class C(metaclass=M):\n    pass\n", true, "metaclass"),
+        (
+            "class C(Base, metaclass=M):\n    pass\n",
+            true,
+            "base and meta",
+        ),
+        // Class body
+        ("class C:\n    x = 1\n", true, "class with attribute"),
+        (
+            "class C:\n    def __init__(self):\n        pass\n",
+            true,
+            "class with method",
+        ),
+        (
+            "class C:\n    def f(self):\n        pass\n    def g(self):\n        pass\n",
+            true,
+            "class with two methods",
+        ),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_decorators() {
+    let samples = [
+        ("@decorator\ndef f():\n    pass\n", true, "single decorator"),
+        (
+            "@decorator()\ndef f():\n    pass\n",
+            true,
+            "decorator with parens",
+        ),
+        (
+            "@decorator(arg)\ndef f():\n    pass\n",
+            true,
+            "decorator with arg",
+        ),
+        (
+            "@decorator(a, b)\ndef f():\n    pass\n",
+            true,
+            "decorator with args",
+        ),
+        (
+            "@decorator(x=1)\ndef f():\n    pass\n",
+            true,
+            "decorator with kwarg",
+        ),
+        (
+            "@d1\n@d2\ndef f():\n    pass\n",
+            true,
+            "multiple decorators",
+        ),
+        (
+            "@d1\n@d2\n@d3\ndef f():\n    pass\n",
+            true,
+            "triple decorators",
+        ),
+        (
+            "@module.decorator\ndef f():\n    pass\n",
+            true,
+            "dotted decorator",
+        ),
+        ("@decorator\nclass C:\n    pass\n", true, "decorated class"),
+        (
+            "@d1\n@d2\nclass C:\n    pass\n",
+            true,
+            "multi-decorated class",
+        ),
+        // Complex decorator expressions
+        ("@d[0]\ndef f():\n    pass\n", true, "subscript decorator"),
+        ("@d.attr\ndef f():\n    pass\n", true, "attribute decorator"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_comprehensions() {
+    let samples = [
+        // List comprehensions
+        ("x = [i for i in items]\n", true, "list comprehension"),
+        (
+            "x = [i for i in items if i > 0]\n",
+            true,
+            "list comp with if",
+        ),
+        (
+            "x = [i*j for i in a for j in b]\n",
+            true,
+            "nested list comp",
+        ),
+        (
+            "x = [i for i in items if i > 0 if i < 10]\n",
+            true,
+            "double filter",
+        ),
+        // Dict comprehensions
+        ("x = {k: v for k, v in items}\n", true, "dict comprehension"),
+        (
+            "x = {k: v for k, v in items if v}\n",
+            true,
+            "dict comp with if",
+        ),
+        // Set comprehensions
+        ("x = {i for i in items}\n", true, "set comprehension"),
+        ("x = {i for i in items if i}\n", true, "set comp with if"),
+        // Generator expressions
+        ("x = (i for i in items)\n", true, "generator expression"),
+        ("x = (i for i in items if i)\n", true, "generator with if"),
+        (
+            "sum(i for i in items)\n",
+            true,
+            "generator in function call",
+        ),
+        // Async comprehension
+        ("x = [i async for i in items]\n", true, "async list comp"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_literals() {
+    let samples = [
+        // Numbers
+        ("x = 42\n", true, "integer"),
+        ("x = 0\n", true, "zero"),
+        ("x = 1_000_000\n", true, "underscore int"),
+        ("x = 3.14\n", true, "float"),
+        ("x = .5\n", true, "float without leading zero"),
+        ("x = 1.\n", true, "float without trailing zero"),
+        ("x = 1e10\n", true, "scientific notation"),
+        ("x = 1E10\n", true, "scientific uppercase"),
+        ("x = 1e+10\n", true, "scientific positive"),
+        ("x = 1e-10\n", true, "scientific negative"),
+        ("x = 3.14e10\n", true, "float scientific"),
+        ("x = 0xff\n", true, "hex lowercase"),
+        ("x = 0xFF\n", true, "hex uppercase"),
+        ("x = 0o77\n", true, "octal"),
+        ("x = 0b1010\n", true, "binary"),
+        ("x = 1j\n", true, "imaginary"),
+        ("x = 3.14j\n", true, "complex"),
+        // Strings
+        ("x = 'hello'\n", true, "single quoted"),
+        ("x = \"hello\"\n", true, "double quoted"),
+        ("x = 'hello' 'world'\n", true, "string concat"),
+        ("x = \"hello\" \"world\"\n", true, "double concat"),
+        ("x = '''multi\nline'''\n", true, "triple single"),
+        ("x = \"\"\"multi\nline\"\"\"\n", true, "triple double"),
+        ("x = r'raw\\string'\n", true, "raw string"),
+        ("x = R'raw\\string'\n", true, "raw uppercase"),
+        ("x = b'bytes'\n", true, "bytes literal"),
+        ("x = B'bytes'\n", true, "bytes uppercase"),
+        ("x = f'hello'\n", true, "f-string simple"),
+        ("x = f'hello {name}'\n", true, "f-string with expr"),
+        ("x = F'hello'\n", true, "f-string uppercase"),
+        ("x = rb'raw bytes'\n", true, "raw bytes"),
+        ("x = br'raw bytes'\n", true, "bytes raw"),
+        ("x = rf'raw fstring'\n", true, "raw f-string"),
+        ("x = fr'raw fstring'\n", true, "f-string raw"),
+        // Escape sequences
+        ("x = 'hello\\nworld'\n", true, "newline escape"),
+        ("x = 'hello\\tworld'\n", true, "tab escape"),
+        ("x = 'it\\'s'\n", true, "quote escape"),
+        ("x = \"it\\\"s\"\n", true, "double quote escape"),
+        // Collections
+        ("x = [1, 2, 3]\n", true, "list"),
+        ("x = [1]\n", true, "single element list"),
+        ("x = [1,]\n", true, "list trailing comma"),
+        ("x = (1, 2, 3)\n", true, "tuple"),
+        ("x = (1,)\n", true, "single element tuple"),
+        ("x = 1, 2, 3\n", true, "tuple without parens"),
+        ("x = {1, 2, 3}\n", true, "set"),
+        ("x = {1}\n", true, "single element set"),
+        ("x = {'a': 1, 'b': 2}\n", true, "dict"),
+        ("x = {'a': 1}\n", true, "single element dict"),
+        ("x = {'a': 1,}\n", true, "dict trailing comma"),
+        ("x = {**other}\n", true, "dict unpacking"),
+        ("x = []\n", true, "empty list"),
+        ("x = ()\n", true, "empty tuple"),
+        ("x = {}\n", true, "empty dict"),
+        // Special
+        ("x = None\n", true, "None"),
+        ("x = True\n", true, "True"),
+        ("x = False\n", true, "False"),
+        ("x = ...\n", true, "Ellipsis"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_subscripts() {
+    let samples = [
+        ("x = a[0]\n", true, "simple subscript"),
+        ("x = a[-1]\n", true, "negative subscript"),
+        ("x = a[0:1]\n", true, "slice"),
+        ("x = a[:1]\n", true, "slice from start"),
+        ("x = a[0:]\n", true, "slice to end"),
+        ("x = a[:]\n", true, "full slice"),
+        ("x = a[::2]\n", true, "slice with step"),
+        ("x = a[0:10:2]\n", true, "full slice with step"),
+        ("x = a[0][1]\n", true, "chained subscript"),
+        ("x = a[0, 1]\n", true, "tuple subscript"),
+        ("x = a[0:1, 2:3]\n", true, "multi-dim slice"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_function_calls() {
+    let samples = [
+        ("f()\n", true, "no args"),
+        ("f(1)\n", true, "single arg"),
+        ("f(1, 2)\n", true, "two args"),
+        ("f(1, 2, 3)\n", true, "three args"),
+        ("f(x=1)\n", true, "keyword arg"),
+        ("f(x=1, y=2)\n", true, "two keyword args"),
+        ("f(1, x=2)\n", true, "positional and keyword"),
+        ("f(*args)\n", true, "star args"),
+        ("f(**kwargs)\n", true, "double star kwargs"),
+        ("f(*args, **kwargs)\n", true, "both stars"),
+        ("f(1, *args)\n", true, "arg and star"),
+        ("f(1, **kwargs)\n", true, "arg and double star"),
+        ("f(1, *args, **kwargs)\n", true, "all types"),
+        ("f(1, x=2, *args, **kwargs)\n", true, "everything"),
+        // Chained calls
+        ("f()()\n", true, "chained calls"),
+        ("f().g()\n", true, "method chain"),
+        ("f()[0]\n", true, "call then subscript"),
+        ("f().attr\n", true, "call then attr"),
+        // Generator in call
+        ("f(x for x in items)\n", true, "generator arg"),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}
+
+#[test]
+fn test_python39_complex_programs() {
+    let samples = [
+        // Fibonacci function
+        (
+            r#"def fib(n):
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+"#,
+            true,
+            "fibonacci function",
+        ),
+        // Class with methods
+        (
+            r#"class Counter:
+    def __init__(self):
+        self.count = 0
+
+    def increment(self):
+        self.count += 1
+
+    def get(self):
+        return self.count
+"#,
+            true,
+            "class with methods",
+        ),
+        // Context manager usage
+        (
+            r#"with open('file.txt') as f:
+    for line in f:
+        print(line)
+"#,
+            true,
+            "context manager",
+        ),
+        // Exception handling
+        (
+            r#"try:
+    result = risky_operation()
+except ValueError as e:
+    handle_error(e)
+except Exception:
+    raise
+finally:
+    cleanup()
+"#,
+            true,
+            "exception handling",
+        ),
+        // Nested functions
+        (
+            r#"def outer():
+    def inner():
+        return 42
+    return inner()
+"#,
+            true,
+            "nested functions",
+        ),
+        // Decorator with argument
+        (
+            r#"@decorator(verbose=True)
+def f():
+    pass
+"#,
+            true,
+            "decorator with kwarg",
+        ),
+        // Lambda in expression
+        (
+            r#"items = sorted(items, key=lambda x: x.value)
+"#,
+            true,
+            "lambda in sorted",
+        ),
+        // Multiple decorators
+        (
+            r#"@staticmethod
+@property
+def value():
+    return 42
+"#,
+            true,
+            "multiple decorators on method",
+        ),
+        // Async function
+        (
+            r#"async def fetch():
+    result = await get_data()
+    return result
+"#,
+            true,
+            "async function",
+        ),
+        // Complex comprehension
+        (
+            r#"matrix = [[i * j for j in range(5)] for i in range(5)]
+"#,
+            true,
+            "nested comprehension",
+        ),
+    ];
+
+    for (source, should_pass, desc) in samples {
+        run_python_parser_test(source, should_pass, desc);
+    }
+}

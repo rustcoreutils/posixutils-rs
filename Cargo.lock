@@ -1636,6 +1636,7 @@ dependencies = [
  "byteorder",
  "clap",
  "gettext-rs",
+ "libc",
  "plib",
  "pretty_assertions",
  "proc-macro2",

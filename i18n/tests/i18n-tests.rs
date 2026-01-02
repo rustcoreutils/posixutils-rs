@@ -8,5 +8,10 @@
 //
 
 mod gencat;
+mod gettext;
 mod iconv;
+mod locale;
+mod localedef;
+mod msgfmt;
+mod ngettext;
 mod xgettext;

@@ -92,19 +92,24 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fuser
  - [x] gencat (i18n)
  - [x] get (SCCS)
+ - [x] gettext (i18n)
  - [x] grep
  - [x] head
  - [x] iconv (i18n)
  - [x] join
  - [x] lex (Development)
  - [x] link
+ - [x] locale (i18n)
+ - [x] localedef (i18n)
  - [x] ls
  - [x] m4
  - [x] mailx
  - [x] make
  - [x] mkdir
  - [x] more
+ - [x] msgfmt (i18n)
  - [x] mv
+ - [x] ngettext (i18n)
  - [x] nl
  - [x] nm (Development)
  - [x] od
@@ -201,12 +206,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 0 - Not started
 
-### i18n category
- - [ ] gettext (i18n)
- - [ ] locale (i18n)
- - [ ] localedef (i18n)
- - [ ] msgfmt (i18n)
- - [ ] ngettext (i18n)
+(none)
 
 ## Installation
 

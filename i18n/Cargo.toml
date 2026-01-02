@@ -11,6 +11,7 @@ rust-version.workspace = true
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
+libc.workspace = true
 bytemuck = { version = "1.17", features = ["derive"] }
 byteorder = "1.5"
 strum = "0.26"
@@ -22,6 +23,10 @@ syn = { version = "2", features = ["parsing", "full"] }
 [dev-dependencies]
 tempfile = "3.10"
 pretty_assertions = "1.4"
+
+[lib]
+name = "posixutils_i18n"
+path = "lib.rs"
 
 [lints]
 workspace = true
@@ -37,3 +42,23 @@ path = "./iconv.rs"
 [[bin]]
 name = "xgettext"
 path = "./xgettext.rs"
+
+[[bin]]
+name = "gettext"
+path = "./gettext.rs"
+
+[[bin]]
+name = "ngettext"
+path = "./ngettext.rs"
+
+[[bin]]
+name = "msgfmt"
+path = "./msgfmt.rs"
+
+[[bin]]
+name = "locale"
+path = "./locale.rs"
+
+[[bin]]
+name = "localedef"
+path = "./localedef.rs"

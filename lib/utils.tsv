@@ -44,6 +44,7 @@ fuser	process/fuser.rs
 gencat	i18n/gencat.rs
 get	sccs/get.rs
 getconf	sys/getconf.rs
+gettext	i18n/gettext.rs
 grep	text/grep.rs
 head	text/head.rs
 iconv	i18n/iconv.rs
@@ -54,6 +55,8 @@ join	text/join.rs
 kill	process/kill.rs
 link	tree/link.rs
 ln	tree/ln.rs
+locale	i18n/locale.rs
+localedef	i18n/localedef.rs
 logger	users/logger.rs
 logname	users/logname.rs
 lp	print/lp.rs
@@ -66,8 +69,10 @@ mesg	users/mesg.rs
 mkdir	tree/mkdir.rs
 mkfifo	tree/mkfifo.rs
 more	display/more.rs
+msgfmt	i18n/msgfmt.rs
 mv	tree/mv.rs
 newgrp	users/newgrp.rs
+ngettext	i18n/ngettext.rs
 nice	process/nice.rs
 nl	text/nl.rs
 nm	dev/nm.rs

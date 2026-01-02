@@ -8,7 +8,7 @@
 //
 
 use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{
     getgid, getgrnam, getgroups, getlogin, getpwnam, getpwuid, getuid, gid_t, passwd, setegid,
     setgid, setgroups, setuid, uid_t,
@@ -44,18 +44,18 @@ const MAX_GROUPS: usize = libc::KERN_NGROUPS_MAX as usize;
 const MAX_GROUPS: usize = 16;
 
 #[derive(Parser)]
-#[command(version, about = "newgrp — change to a new group")]
+#[command(version, about = gettext("newgrp — change to a new group"))]
 struct Args {
     #[arg(
         short = 'l',
-        help = "Change the environment to what would be expected if the user actually logged in again (letter 'l')."
+        help = gettext("Change the environment to what would be expected if the user actually logged in again (letter 'l').")
     )]
     login: bool,
 
     #[arg(
         value_name = "GROUP",
         required = true,
-        help = "Specifies the group ID or group name. This is a positional argument that must be provided."
+        help = gettext("Specifies the group ID or group name. This is a positional argument that must be provided.")
     )]
     group: String,
 }

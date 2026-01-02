@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{paths, SccsFile, Sid};
 
 // Exit status bit masks per POSIX
@@ -28,26 +28,21 @@ const ERR_M_MISMATCH: u8 = 0x01;
 
 /// val - validate SCCS files
 #[derive(Parser)]
-#[command(version, about = "val - validate SCCS files")]
+#[command(version, about = gettext("val - validate SCCS files"))]
 struct Args {
-    /// Silence diagnostic messages
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Silence diagnostic messages"))]
     silent: bool,
 
-    /// Compare module name with %M% keyword
-    #[arg(short = 'm', value_name = "NAME")]
+    #[arg(short = 'm', value_name = "NAME", help = gettext("Compare module name with %M% keyword"))]
     module_name: Option<String>,
 
-    /// Check that SID exists
-    #[arg(short = 'r', value_name = "SID")]
+    #[arg(short = 'r', value_name = "SID", help = gettext("Check that SID exists"))]
     sid: Option<String>,
 
-    /// Compare type with %Y% keyword
-    #[arg(short = 'y', value_name = "TYPE")]
+    #[arg(short = 'y', value_name = "TYPE", help = gettext("Compare type with %Y% keyword"))]
     type_name: Option<String>,
 
-    /// SCCS files to validate (use - for stdin)
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to validate (use - for stdin)"))]
     files: Vec<PathBuf>,
 }
 

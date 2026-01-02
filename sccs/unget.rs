@@ -15,27 +15,23 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{parse_pfile, paths, PfileEntry, Sid};
 
 /// unget - undo a previous get of an SCCS file
 #[derive(Parser)]
-#[command(version, about = "unget - undo a previous get of an SCCS file")]
+#[command(version, about = gettext("unget - undo a previous get of an SCCS file"))]
 struct Args {
-    /// Specify the SID to unget (when user has multiple pending edits)
-    #[arg(short = 'r', value_name = "SID")]
+    #[arg(short = 'r', value_name = "SID", help = gettext("Specify the SID to unget (when user has multiple pending edits)"))]
     sid: Option<String>,
 
-    /// Silent mode (suppress output)
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Silent mode (suppress output)"))]
     silent: bool,
 
-    /// Do not remove the g-file (keep edited file)
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Do not remove the g-file (keep edited file)"))]
     keep_gfile: bool,
 
-    /// SCCS files to process (use - for stdin)
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to process (use - for stdin)"))]
     files: Vec<PathBuf>,
 }
 

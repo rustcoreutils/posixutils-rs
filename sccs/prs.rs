@@ -15,39 +15,32 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
 
 /// prs - print SCCS file information
 #[derive(Parser)]
-#[command(version, about = "prs - print SCCS file information")]
+#[command(version, about = gettext("prs - print SCCS file information"))]
 struct Args {
-    /// Include removed deltas
-    #[arg(short = 'a')]
+    #[arg(short = 'a', help = gettext("Include removed deltas"))]
     all_deltas: bool,
 
-    /// Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])
-    #[arg(short = 'c', value_name = "CUTOFF")]
+    #[arg(short = 'c', value_name = "CUTOFF", help = gettext("Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])"))]
     cutoff: Option<String>,
 
-    /// Data format specification
-    #[arg(short = 'd', value_name = "DATASPEC")]
+    #[arg(short = 'd', value_name = "DATASPEC", help = gettext("Data format specification"))]
     dataspec: Option<String>,
 
-    /// Select deltas earlier than or equal to -c or -r
-    #[arg(short = 'e')]
+    #[arg(short = 'e', help = gettext("Select deltas earlier than or equal to -c or -r"))]
     earlier: bool,
 
-    /// Select deltas later than or equal to -c or -r
-    #[arg(short = 'l')]
+    #[arg(short = 'l', help = gettext("Select deltas later than or equal to -c or -r"))]
     later: bool,
 
-    /// SID to report on
-    #[arg(short = 'r', value_name = "SID")]
+    #[arg(short = 'r', value_name = "SID", help = gettext("SID to report on"))]
     sid: Option<String>,
 
-    /// SCCS files to process (use - for stdin)
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to process (use - for stdin)"))]
     files: Vec<PathBuf>,
 }
 

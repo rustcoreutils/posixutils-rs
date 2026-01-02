@@ -101,6 +101,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] link
  - [x] locale (i18n)
  - [x] localedef (i18n)
+ - [x] logger
  - [x] ls
  - [x] m4
  - [x] mailx
@@ -151,6 +152,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
+ - [x] xargs
+ - [x] id
+ - [x] xgettext (i18n)
  - [x] yacc (Development)
  - [x] zcat (compress cat.)
 
@@ -189,10 +193,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] df
  - [x] dd
  - [x] getconf
- - [x] id
  - [x] ipcs (IPC)
  - [x] kill
- - [x] logger
  - [x] lp
  - [x] patch
  - [x] ps
@@ -201,8 +203,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tput
  - [x] tsort
  - [x] who
- - [x] xargs
- - [x] xgettext (i18n)
 
 ## Stage 0 - Not started
 

@@ -1638,6 +1638,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "posixutils-cc",
  "pretty_assertions",
  "proc-macro2",
  "quote",
@@ -1854,6 +1855,7 @@ dependencies = [
  "libc",
  "libcrypt-rs",
  "plib",
+ "regex",
  "syslog",
  "thiserror 1.0.69",
 ]

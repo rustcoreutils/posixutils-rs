@@ -8,6 +8,8 @@
 //
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 
 fn xargs_test(test_data: &str, expected_output: &str, args: Vec<&str>) {
     run_test(TestPlan {
@@ -348,4 +350,196 @@ fn xargs_insert_arg_size_limit() {
             "Expected limit in error"
         );
     });
+}
+
+#[test]
+fn xargs_escaped_newline() {
+    // Backslash-newline should continue the argument
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["echo".to_string()],
+        stdin_data: String::from("hello\\\nworld\n"),
+        expected_out: String::from("helloworld\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_empty_quoted_strings() {
+    // Empty quoted strings should produce empty arguments
+    // Note: echo with empty args still produces a newline
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["echo".to_string()],
+        stdin_data: String::from("\"\" '' normal\n"),
+        expected_out: String::from("  normal\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_insert_mode_empty_lines() {
+    // Empty lines in -I mode should be skipped
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-I".to_string(),
+            "{}".to_string(),
+            "echo".to_string(),
+            "[{}]".to_string(),
+        ],
+        stdin_data: String::from("one\n\ntwo\n\n\nthree\n"),
+        expected_out: String::from("[one]\n[two]\n[three]\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_eof_string_partial_match() {
+    // EOF string as part of a larger argument should NOT trigger EOF
+    // POSIX: only an argument consisting of JUST the EOF string triggers EOF
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-E".to_string(), "STOP".to_string(), "echo".to_string()],
+        stdin_data: String::from("one STOPNOW two\n"),
+        expected_out: String::from("one STOPNOW two\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_eof_string_quoted_becomes_match() {
+    // A quoted argument that equals EOF string after unquoting DOES trigger EOF
+    // POSIX: EOF detected after quote processing
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-E".to_string(), "STOP".to_string(), "echo".to_string()],
+        stdin_data: String::from("one \"STOP\" two\n"),
+        expected_out: String::from("one\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_line_mode_empty_lines() {
+    // Empty lines should not count toward -L line count
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-L".to_string(), "2".to_string(), "echo".to_string()],
+        stdin_data: String::from("one\n\ntwo\n\nthree\nfour\n"),
+        expected_out: String::from("one two\nthree four\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_explicit_eof_disable() {
+    // -E "" should explicitly disable EOF processing
+    // The underscore should be treated as a normal argument
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-E".to_string(), "".to_string(), "echo".to_string()],
+        stdin_data: String::from("one _ two\n"),
+        expected_out: String::from("one _ two\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_multiple_batch_verification() {
+    // Test that -n correctly batches multiple invocations
+    // With -n 2, we should get 3 invocations for 5 args
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-n".to_string(),
+            "2".to_string(),
+            "echo".to_string(),
+            "prefix".to_string(),
+        ],
+        stdin_data: String::from("a b c d e\n"),
+        expected_out: String::from("prefix a b\nprefix c d\nprefix e\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_whitespace_only_input() {
+    // Input with only whitespace should not invoke utility
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["echo".to_string()],
+        stdin_data: String::from("   \n\t\n  \t  \n"),
+        expected_out: String::from(""),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_insert_mode_preserves_internal_spaces() {
+    // -I mode should preserve internal spaces, only strip leading blanks
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-I".to_string(),
+            "{}".to_string(),
+            "echo".to_string(),
+            "[{}]".to_string(),
+        ],
+        stdin_data: String::from("  hello world  \n"),
+        expected_out: String::from("[hello world  ]\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn xargs_exit_code_126_cannot_invoke() {
+    // Create a file that exists but is not executable
+    let test_dir = std::env::temp_dir().join("xargs_test_126");
+    let _ = fs::create_dir_all(&test_dir);
+    let non_exec_file = test_dir.join("not_executable");
+
+    // Create the file
+    File::create(&non_exec_file).expect("Failed to create test file");
+
+    // Make sure it's not executable (mode 0o644)
+    let mut perms = fs::metadata(&non_exec_file)
+        .expect("Failed to get metadata")
+        .permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&non_exec_file, perms).expect("Failed to set permissions");
+
+    let test_plan = TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![non_exec_file.to_string_lossy().to_string()],
+        stdin_data: String::from("test\n"),
+        expected_out: String::from(""),
+        expected_err: String::from(""),
+        expected_exit_code: 126,
+    };
+
+    run_test_with_checker(test_plan, |plan, output| {
+        assert_eq!(
+            output.status.code(),
+            Some(plan.expected_exit_code),
+            "Expected exit code 126 for non-executable file"
+        );
+        // Stderr should contain an error message
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.is_empty(), "Expected error message on stderr");
+    });
+
+    // Cleanup
+    let _ = fs::remove_file(&non_exec_file);
+    let _ = fs::remove_dir(&test_dir);
 }

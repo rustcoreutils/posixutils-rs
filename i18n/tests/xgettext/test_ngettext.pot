@@ -4,3 +4,4 @@ msgid "One thing"
 msgid_plural "Multiple things"
 msgstr[0] ""
 msgstr[1] ""
+

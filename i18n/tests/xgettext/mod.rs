@@ -122,7 +122,6 @@ fn test_clap() {
     );
 }
 
-#[ignore]
 #[test]
 fn test_xgettext_ngettext() {
     let temp_dir = tempdir().expect("Unable to create temporary directory");
@@ -138,7 +137,6 @@ fn test_xgettext_ngettext() {
     );
 }
 
-#[ignore]
 #[test]
 fn test_xgettext_pgettext() {
     let temp_dir = tempdir().expect("Unable to create temporary directory");
@@ -154,7 +152,6 @@ fn test_xgettext_pgettext() {
     );
 }
 
-#[ignore]
 #[test]
 fn test_xgettext_npgettext() {
     let temp_dir = tempdir().expect("Unable to create temporary directory");
@@ -167,5 +164,20 @@ fn test_xgettext_npgettext() {
         ],
         temp_dir.path().join("messages.pot"),
         "tests/xgettext/test_npgettext.pot",
+    );
+}
+
+#[test]
+fn test_xgettext_c_file() {
+    let temp_dir = tempdir().expect("Unable to create temporary directory");
+    xgettext_test(
+        &[
+            "-n",
+            "-p",
+            &temp_dir.path().to_str().unwrap(),
+            "tests/xgettext/test_c.c",
+        ],
+        temp_dir.path().join("messages.pot"),
+        "tests/xgettext/test_c.pot",
     );
 }

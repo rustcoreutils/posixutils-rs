@@ -18,6 +18,11 @@ libcrypt-rs = "0.1"
 thiserror = "1.0"
 binrw = "0.14"
 
+[dev-dependencies]
+plib = { path = "../plib" }
+libc = { workspace = true }
+regex = { workspace = true }
+
 [lints]
 workspace = true
 

@@ -939,6 +939,48 @@ impl std::fmt::Display for Walker {
     }
 }
 
+/// Unescape a PO/POT file string value.
+/// Handles escape sequences in the correct order to avoid misinterpretation.
+fn unescape_pot_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\\') => {
+                    result.push('\\');
+                    chars.next();
+                }
+                Some('"') => {
+                    result.push('"');
+                    chars.next();
+                }
+                Some('n') => {
+                    result.push('\n');
+                    chars.next();
+                }
+                Some('t') => {
+                    result.push('\t');
+                    chars.next();
+                }
+                Some('r') => {
+                    result.push('\r');
+                    chars.next();
+                }
+                _ => {
+                    // Unknown escape sequence, keep as-is
+                    result.push(c);
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// Parse a .pot file and extract msgid strings for exclusion
 fn parse_exclude_file(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let content = read_to_string(path)?;
@@ -950,12 +992,7 @@ fn parse_exclude_file(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error:
             // Extract the string value
             let value = rest.trim();
             if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                let unescaped = &value[1..value.len() - 1];
-                // Basic unescaping
-                let unescaped = unescaped
-                    .replace("\\\"", "\"")
-                    .replace("\\n", "\n")
-                    .replace("\\\\", "\\");
+                let unescaped = unescape_pot_string(&value[1..value.len() - 1]);
                 if !unescaped.is_empty() {
                     msgids.push(unescaped);
                 }

@@ -226,7 +226,7 @@ fn get_group_info(userinfo: &mut UserInfo, is_named_user: bool) {
     }
 }
 
-fn display_user_info(args: &Args, userinfo: &UserInfo) {
+fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -245,14 +245,14 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) {
             };
             if name.is_empty() {
                 // If name not found, output numeric per POSIX
-                writeln!(out, "{}", uid).ok();
+                writeln!(out, "{}", uid)?;
             } else {
-                writeln!(out, "{}", name).ok();
+                writeln!(out, "{}", name)?;
             }
         } else {
-            writeln!(out, "{}", uid).ok();
+            writeln!(out, "{}", uid)?;
         }
-        return;
+        return Ok(());
     }
 
     // -g: Output only effective group ID (or real if -r)
@@ -264,17 +264,17 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) {
         };
         if args.name {
             if let Some(name) = userinfo.group_names.get(&gid) {
-                writeln!(out, "{}", name).ok();
+                writeln!(out, "{}", name)?;
             } else if let Some(name) = get_groupname(gid) {
-                writeln!(out, "{}", name).ok();
+                writeln!(out, "{}", name)?;
             } else {
                 // If name not found, output numeric per POSIX
-                writeln!(out, "{}", gid).ok();
+                writeln!(out, "{}", gid)?;
             }
         } else {
-            writeln!(out, "{}", gid).ok();
+            writeln!(out, "{}", gid)?;
         }
-        return;
+        return Ok(());
     }
 
     // -G: Output all different group IDs
@@ -282,75 +282,76 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) {
         let mut first = true;
         for gid in &userinfo.groups {
             if !first {
-                write!(out, " ").ok();
+                write!(out, " ")?;
             }
             first = false;
 
             if args.name {
                 if let Some(name) = userinfo.group_names.get(gid) {
-                    write!(out, "{}", name).ok();
+                    write!(out, "{}", name)?;
                 } else if let Some(name) = get_groupname(*gid) {
-                    write!(out, "{}", name).ok();
+                    write!(out, "{}", name)?;
                 } else {
                     // If name not found, output numeric per POSIX
-                    write!(out, "{}", gid).ok();
+                    write!(out, "{}", gid)?;
                 }
             } else {
-                write!(out, "{}", gid).ok();
+                write!(out, "{}", gid)?;
             }
         }
-        writeln!(out).ok();
-        return;
+        writeln!(out)?;
+        return Ok(());
     }
 
     // Default output format: uid=UID(username) gid=GID(groupname) [euid=...] [egid=...] groups=...
 
     // uid=UID(username)
-    write!(out, "uid={}", userinfo.uid).ok();
+    write!(out, "uid={}", userinfo.uid)?;
     if !userinfo.username.is_empty() {
-        write!(out, "({})", userinfo.username).ok();
+        write!(out, "({})", userinfo.username)?;
     }
 
     // gid=GID(groupname)
-    write!(out, " gid={}", userinfo.gid).ok();
+    write!(out, " gid={}", userinfo.gid)?;
     if let Some(name) = userinfo.group_names.get(&userinfo.gid) {
-        write!(out, "({})", name).ok();
+        write!(out, "({})", name)?;
     }
 
     // euid=EUID(eusername) - only if different from uid
     if userinfo.euid != userinfo.uid {
-        write!(out, " euid={}", userinfo.euid).ok();
+        write!(out, " euid={}", userinfo.euid)?;
         if !userinfo.eusername.is_empty() {
-            write!(out, "({})", userinfo.eusername).ok();
+            write!(out, "({})", userinfo.eusername)?;
         }
     }
 
     // egid=EGID(egroupname) - only if different from gid
     if userinfo.egid != userinfo.gid {
-        write!(out, " egid={}", userinfo.egid).ok();
+        write!(out, " egid={}", userinfo.egid)?;
         if let Some(name) = userinfo.group_names.get(&userinfo.egid) {
-            write!(out, "({})", name).ok();
+            write!(out, "({})", name)?;
         }
     }
 
     // groups=GID(name),GID(name),...
     if !userinfo.groups.is_empty() {
-        write!(out, " groups=").ok();
+        write!(out, " groups=")?;
         let mut first = true;
         for gid in &userinfo.groups {
             if !first {
-                write!(out, ",").ok();
+                write!(out, ",")?;
             }
             first = false;
 
-            write!(out, "{}", gid).ok();
+            write!(out, "{}", gid)?;
             if let Some(name) = userinfo.group_names.get(gid) {
-                write!(out, "({})", name).ok();
+                write!(out, "({})", name)?;
             }
         }
     }
 
-    writeln!(out).ok();
+    writeln!(out)?;
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -369,7 +370,11 @@ fn main() -> ExitCode {
     };
 
     get_group_info(&mut userinfo, args.user.is_some());
-    display_user_info(&args, &userinfo);
+
+    if let Err(e) = display_user_info(&args, &userinfo) {
+        eprintln!("id: write error: {}", e);
+        return ExitCode::from(1);
+    }
 
     ExitCode::SUCCESS
 }

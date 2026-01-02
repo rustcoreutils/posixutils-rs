@@ -1855,6 +1855,7 @@ dependencies = [
  "libc",
  "libcrypt-rs",
  "plib",
+ "regex",
  "syslog",
  "thiserror 1.0.69",
 ]

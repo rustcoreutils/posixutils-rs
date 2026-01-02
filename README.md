@@ -153,6 +153,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] wc
  - [x] what (SCCS)
  - [x] xargs
+ - [x] id
  - [x] xgettext (i18n)
  - [x] yacc (Development)
  - [x] zcat (compress cat.)
@@ -192,7 +193,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] df
  - [x] dd
  - [x] getconf
- - [x] id
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp

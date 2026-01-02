@@ -6,33 +6,32 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - bug: only one group is returned, in group list (MacOS-only?)
-//
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::group;
-use std::collections::HashMap;
-use std::io::Error;
+use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
+use std::io::{self, Write};
+use std::process::ExitCode;
 
 /// id - return user identity
 #[derive(Parser)]
 #[command(version, about = gettext("id - return user identity"))]
 struct Args {
-    /// Output all different group IDs (effective, real, and supplementary) only, using a numeric format
+    /// Output all different group IDs (effective, real, and supplementary) only
     #[arg(short = 'G', long, group = "output")]
     groups: bool,
 
-    /// Output only the effective group ID, using the numeric format
+    /// Output only the effective group ID
     #[arg(short, long, group = "output")]
     group: bool,
 
-    /// Output only the effective user ID, using the numeric format
+    /// Output only the effective user ID
     #[arg(short = 'u', long = "user", group = "output")]
     e_user: bool,
 
-    /// Output the real ID instead of the effective ID.
+    /// Output the real ID instead of the effective ID
     #[arg(short, long)]
     real: bool,
 
@@ -52,56 +51,99 @@ struct UserInfo {
     groups: Vec<libc::gid_t>,
 
     username: String,
+    eusername: String,
     group_names: HashMap<libc::gid_t, String>,
 }
 
-fn userinfo_process(userinfo: &mut UserInfo) -> Result<(), Box<dyn std::error::Error>> {
+/// Get supplementary groups for the current process using getgroups() syscall.
+fn get_process_groups() -> Vec<libc::gid_t> {
+    // First call with 0 to get the number of groups
+    let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if ngroups <= 0 {
+        return Vec::new();
+    }
+
+    let mut groups = vec![0 as libc::gid_t; ngroups as usize];
+    let n = unsafe { libc::getgroups(ngroups, groups.as_mut_ptr()) };
+    if n > 0 {
+        groups.truncate(n as usize);
+        groups
+    } else {
+        Vec::new()
+    }
+}
+
+/// Look up username for a given uid.
+fn get_username(uid: libc::uid_t) -> Option<String> {
+    let passwd = unsafe { libc::getpwuid(uid) };
+    if passwd.is_null() {
+        return None;
+    }
+    Some(unsafe {
+        CStr::from_ptr((*passwd).pw_name)
+            .to_string_lossy()
+            .to_string()
+    })
+}
+
+/// Look up group name for a given gid.
+fn get_groupname(gid: libc::gid_t) -> Option<String> {
+    let grp = unsafe { libc::getgrgid(gid) };
+    if grp.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr((*grp).gr_name).to_string_lossy().to_string() })
+}
+
+fn userinfo_process(userinfo: &mut UserInfo) -> Result<(), String> {
     userinfo.uid = unsafe { libc::getuid() };
     userinfo.gid = unsafe { libc::getgid() };
     userinfo.euid = unsafe { libc::geteuid() };
     userinfo.egid = unsafe { libc::getegid() };
 
-    let passwd = unsafe { libc::getpwuid(userinfo.uid) };
-    if passwd.is_null() {
-        let err = Error::last_os_error();
-        eprintln!("getpwuid: {}", err);
-        return Err(Box::new(err));
-    }
+    // Get username for real uid
+    userinfo.username = get_username(userinfo.uid)
+        .ok_or_else(|| format!("id: cannot find name for user ID {}", userinfo.uid))?;
 
-    userinfo.username = unsafe {
-        std::ffi::CStr::from_ptr((*passwd).pw_name)
-            .to_string_lossy()
-            .to_string()
+    // Get username for effective uid (may be same as real)
+    userinfo.eusername = if userinfo.euid == userinfo.uid {
+        userinfo.username.clone()
+    } else {
+        get_username(userinfo.euid).unwrap_or_default()
     };
+
+    // Get supplementary groups using getgroups() syscall
+    userinfo.groups = get_process_groups();
 
     Ok(())
 }
 
-fn userinfo_name(userinfo: &mut UserInfo, user: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let user_str = std::ffi::CString::new(user).unwrap();
+fn userinfo_name(userinfo: &mut UserInfo, user: &str) -> Result<(), String> {
+    let user_str = std::ffi::CString::new(user).map_err(|_| "invalid username".to_string())?;
     let passwd = unsafe { libc::getpwnam(user_str.as_ptr()) };
     if passwd.is_null() {
-        let err = Error::last_os_error();
-        eprintln!("getpwnam: {}", err);
-        return Err(Box::new(err));
+        return Err(format!("id: {}: no such user", user));
     }
 
     unsafe {
         userinfo.uid = (*passwd).pw_uid;
         userinfo.gid = (*passwd).pw_gid;
     }
+    // For a named user, effective IDs are same as real IDs
     userinfo.euid = userinfo.uid;
     userinfo.egid = userinfo.gid;
+
     userinfo.username = unsafe {
-        std::ffi::CStr::from_ptr((*passwd).pw_name)
+        CStr::from_ptr((*passwd).pw_name)
             .to_string_lossy()
             .to_string()
     };
+    userinfo.eusername = userinfo.username.clone();
 
     Ok(())
 }
 
-fn get_user_info(args: &Args) -> Result<UserInfo, Box<dyn std::error::Error>> {
+fn get_user_info(args: &Args) -> Result<UserInfo, String> {
     let mut userinfo = UserInfo {
         uid: 0,
         gid: 0,
@@ -109,10 +151,10 @@ fn get_user_info(args: &Args) -> Result<UserInfo, Box<dyn std::error::Error>> {
         egid: 0,
         groups: Vec::new(),
         username: String::new(),
+        eusername: String::new(),
         group_names: HashMap::new(),
     };
 
-    // fill in uid, gid
     match args.user {
         None => userinfo_process(&mut userinfo)?,
         Some(ref user) => userinfo_name(&mut userinfo, user)?,
@@ -121,88 +163,213 @@ fn get_user_info(args: &Args) -> Result<UserInfo, Box<dyn std::error::Error>> {
     Ok(userinfo)
 }
 
-fn get_group_info(userinfo: &mut UserInfo) -> Result<(), Box<dyn std::error::Error>> {
-    let groups = group::load();
+fn get_group_info(userinfo: &mut UserInfo, is_named_user: bool) {
+    // Build group name lookup map for all groups we might need
+    let mut seen_gids = HashSet::new();
 
-    for group in &groups {
-        // skip groups that the user is not a member of
-        let mut found = false;
-        for member in &group.members {
-            if *member == userinfo.username {
-                found = true;
-                break;
-            }
-        }
-        if !found && group.gid != userinfo.gid {
-            continue;
-        }
+    // Always include primary group
+    if let Some(name) = get_groupname(userinfo.gid) {
+        userinfo.group_names.insert(userinfo.gid, name);
+    }
+    seen_gids.insert(userinfo.gid);
 
-        // add group to user's group list
-        userinfo.groups.push(group.gid);
-        userinfo.group_names.insert(group.gid, group.name.clone());
+    // Include effective group if different
+    if userinfo.egid != userinfo.gid {
+        if let Some(name) = get_groupname(userinfo.egid) {
+            userinfo.group_names.insert(userinfo.egid, name);
+        }
+        seen_gids.insert(userinfo.egid);
     }
 
-    Ok(())
+    if is_named_user {
+        // For named user lookup, scan /etc/group for membership
+        let groups = group::load();
+        let mut user_groups = Vec::new();
+
+        // Add primary group first
+        user_groups.push(userinfo.gid);
+
+        for grp in &groups {
+            // Skip if already added
+            if seen_gids.contains(&grp.gid) {
+                continue;
+            }
+
+            // Check if user is a member of this group
+            if grp.members.iter().any(|m| m == &userinfo.username) {
+                user_groups.push(grp.gid);
+                userinfo.group_names.insert(grp.gid, grp.name.clone());
+                seen_gids.insert(grp.gid);
+            }
+        }
+
+        userinfo.groups = user_groups;
+    } else {
+        // For current process, groups are already set from getgroups()
+        // Just need to look up names and deduplicate
+        let mut unique_groups = Vec::new();
+
+        // Ensure primary group is first
+        unique_groups.push(userinfo.gid);
+
+        for &gid in &userinfo.groups {
+            if !seen_gids.contains(&gid) {
+                unique_groups.push(gid);
+                if let Some(name) = get_groupname(gid) {
+                    userinfo.group_names.insert(gid, name);
+                }
+                seen_gids.insert(gid);
+            }
+        }
+
+        userinfo.groups = unique_groups;
+    }
 }
 
 fn display_user_info(args: &Args, userinfo: &UserInfo) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    // -u: Output only effective user ID (or real if -r)
     if args.e_user {
-        println!("{}", userinfo.euid);
-        return;
-    }
-
-    if args.group {
-        println!("{}", userinfo.egid);
-        return;
-    }
-
-    if args.groups {
-        for gid in &userinfo.groups {
-            print!("{} ", gid);
-        }
-        println!();
-        return;
-    }
-
-    if args.name {
-        let group_name = {
-            match userinfo.group_names.get(&userinfo.egid) {
-                None => "unknown",
-                Some(name) => name,
-            }
+        let uid = if args.real {
+            userinfo.uid
+        } else {
+            userinfo.euid
         };
-        println!(
-            "uid={}({}) gid={}({}) groups={}",
-            userinfo.uid, userinfo.username, userinfo.gid, group_name, userinfo.egid
-        );
-        for gid in &userinfo.groups {
-            print!("{}({}),", gid, userinfo.group_names[gid]);
+        if args.name {
+            let name = if args.real {
+                &userinfo.username
+            } else {
+                &userinfo.eusername
+            };
+            if name.is_empty() {
+                // If name not found, output numeric per POSIX
+                writeln!(out, "{}", uid).ok();
+            } else {
+                writeln!(out, "{}", name).ok();
+            }
+        } else {
+            writeln!(out, "{}", uid).ok();
         }
-        println!();
         return;
     }
 
-    println!(
-        "uid={} gid={} groups={}",
-        userinfo.uid, userinfo.gid, userinfo.egid
-    );
-    for gid in &userinfo.groups {
-        print!("{},", gid);
+    // -g: Output only effective group ID (or real if -r)
+    if args.group {
+        let gid = if args.real {
+            userinfo.gid
+        } else {
+            userinfo.egid
+        };
+        if args.name {
+            if let Some(name) = userinfo.group_names.get(&gid) {
+                writeln!(out, "{}", name).ok();
+            } else if let Some(name) = get_groupname(gid) {
+                writeln!(out, "{}", name).ok();
+            } else {
+                // If name not found, output numeric per POSIX
+                writeln!(out, "{}", gid).ok();
+            }
+        } else {
+            writeln!(out, "{}", gid).ok();
+        }
+        return;
     }
-    println!();
+
+    // -G: Output all different group IDs
+    if args.groups {
+        let mut first = true;
+        for gid in &userinfo.groups {
+            if !first {
+                write!(out, " ").ok();
+            }
+            first = false;
+
+            if args.name {
+                if let Some(name) = userinfo.group_names.get(gid) {
+                    write!(out, "{}", name).ok();
+                } else if let Some(name) = get_groupname(*gid) {
+                    write!(out, "{}", name).ok();
+                } else {
+                    // If name not found, output numeric per POSIX
+                    write!(out, "{}", gid).ok();
+                }
+            } else {
+                write!(out, "{}", gid).ok();
+            }
+        }
+        writeln!(out).ok();
+        return;
+    }
+
+    // Default output format: uid=UID(username) gid=GID(groupname) [euid=...] [egid=...] groups=...
+
+    // uid=UID(username)
+    write!(out, "uid={}", userinfo.uid).ok();
+    if !userinfo.username.is_empty() {
+        write!(out, "({})", userinfo.username).ok();
+    }
+
+    // gid=GID(groupname)
+    write!(out, " gid={}", userinfo.gid).ok();
+    if let Some(name) = userinfo.group_names.get(&userinfo.gid) {
+        write!(out, "({})", name).ok();
+    }
+
+    // euid=EUID(eusername) - only if different from uid
+    if userinfo.euid != userinfo.uid {
+        write!(out, " euid={}", userinfo.euid).ok();
+        if !userinfo.eusername.is_empty() {
+            write!(out, "({})", userinfo.eusername).ok();
+        }
+    }
+
+    // egid=EGID(egroupname) - only if different from gid
+    if userinfo.egid != userinfo.gid {
+        write!(out, " egid={}", userinfo.egid).ok();
+        if let Some(name) = userinfo.group_names.get(&userinfo.egid) {
+            write!(out, "({})", name).ok();
+        }
+    }
+
+    // groups=GID(name),GID(name),...
+    if !userinfo.groups.is_empty() {
+        write!(out, " groups=").ok();
+        let mut first = true;
+        for gid in &userinfo.groups {
+            if !first {
+                write!(out, ",").ok();
+            }
+            first = false;
+
+            write!(out, "{}", gid).ok();
+            if let Some(name) = userinfo.group_names.get(gid) {
+                write!(out, "({})", name).ok();
+            }
+        }
+    }
+
+    writeln!(out).ok();
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let args = Args::parse();
 
-    let mut userinfo = get_user_info(&args)?;
-    get_group_info(&mut userinfo)?;
+    let mut userinfo = match get_user_info(&args) {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("{}", e);
+            return ExitCode::from(1);
+        }
+    };
 
+    get_group_info(&mut userinfo, args.user.is_some());
     display_user_info(&args, &userinfo);
 
-    Ok(())
+    ExitCode::SUCCESS
 }

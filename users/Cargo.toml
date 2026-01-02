@@ -20,6 +20,8 @@ binrw = "0.14"
 
 [dev-dependencies]
 plib = { path = "../plib" }
+libc = { workspace = true }
+regex = { workspace = true }
 
 [lints]
 workspace = true

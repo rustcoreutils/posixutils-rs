@@ -105,6 +105,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ls
  - [x] m4
  - [x] mailx
+ - [x] man
  - [x] make
  - [x] mkdir
  - [x] more
@@ -170,7 +171,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcrm (IPC)
  - [x] ln
  - [x] logname
- - [x] man
  - [x] mesg
  - [x] mkfifo
  - [x] newgrp

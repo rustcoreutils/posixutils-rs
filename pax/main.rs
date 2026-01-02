@@ -58,105 +58,79 @@ impl From<Format> for ArchiveFormat {
 #[derive(Parser, Debug)]
 #[command(author, version, about = gettext("pax - portable archive interchange"), long_about)]
 struct Args {
-    /// Read an archive file from standard input.
-    #[arg(short, long = "read")]
+    #[arg(short, long = "read", help = gettext("Read an archive file from standard input"))]
     read_mode: bool,
 
-    /// Write files to the standard output in the specified archive format.
-    #[arg(short, long = "write")]
+    #[arg(short, long = "write", help = gettext("Write files to the standard output in the specified archive format"))]
     write_mode: bool,
 
-    /// Append files to the end of an existing archive
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, help = gettext("Append files to the end of an existing archive"))]
     append: bool,
 
-    /// Block the output at a positive decimal integer number of bytes per write
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Block the output at a positive decimal integer number of bytes per write"))]
     blocksize: Option<u32>,
 
-    /// Match all file or archive members except those specified by the pattern or file operands.
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, help = gettext("Match all file or archive members except those specified by the pattern or file operands"))]
     exclude: bool,
 
-    /// Cause files of type directory to match only the file or archive member itself
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Cause files of type directory to match only the file or archive member itself"))]
     dir_no_follow: bool,
 
-    /// Specify the pathname of the input or output archive,
-    /// overriding stdin/stdout.
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, help = gettext("Specify the pathname of the input or output archive"))]
     archive: Option<PathBuf>,
 
-    /// Follow symlinks, rather than archiving the symlink itself.
-    #[arg(short = 'H')]
+    #[arg(short = 'H', help = gettext("Follow symlinks on the command line, rather than archiving the symlink itself"))]
     cli_dereference: bool,
 
-    /// Interactively rename files or archive members
-    #[arg(short = 'i', long)]
+    #[arg(short = 'i', long, help = gettext("Interactively rename files or archive members"))]
     interactive: bool,
 
-    /// Do not overwrite existing files
-    #[arg(short = 'k', long)]
+    #[arg(short = 'k', long, help = gettext("Do not overwrite existing files"))]
     no_clobber: bool,
 
-    /// In copy mode, hard links shall be made between the source and destination
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("In copy mode, hard links shall be made between the source and destination"))]
     link: bool,
 
-    /// Follow symlinks
-    #[arg(short = 'L', long)]
+    #[arg(short = 'L', long, help = gettext("Follow symlinks"))]
     dereference: bool,
 
-    /// Select only the first archive member that matches each pattern operand.
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, help = gettext("Select only the first archive member that matches each pattern operand"))]
     first_match: bool,
 
-    /// Format-specific options (keyword[=value][,keyword[=value],...])
-    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append)]
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, help = gettext("Format-specific options"))]
     format_options: Vec<String>,
 
-    /// Modify file/archive member names using substitution expression
-    /// Format: -s /old/new/[gp] where delimiter can be any character
-    #[arg(short = 's', action = clap::ArgAction::Append)]
+    #[arg(short = 's', action = clap::ArgAction::Append, help = gettext("Modify file/archive member names using substitution expression"))]
     substitutions: Vec<String>,
 
-    /// Reset access times of files after reading them
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, help = gettext("Reset access times of files after reading them"))]
     reset_atime: bool,
 
-    /// Ignore files older than existing files/archive members with same name
-    #[arg(short = 'u', long)]
+    #[arg(short = 'u', long, help = gettext("Ignore files older than existing files/archive members with same name"))]
     update: bool,
 
-    /// Specify one or more file characteristic options (privileges).
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Specify one or more file characteristic options (privileges)"))]
     privs: Option<String>,
 
-    /// In list mode, produce a verbose table of contents
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("In list mode, produce a verbose table of contents"))]
     verbose: bool,
 
-    /// Specify the output archive format
-    #[arg(short = 'x', long, value_enum, default_value_t = Format::Ustar)]
+    #[arg(short = 'x', long, value_enum, default_value_t = Format::Ustar, help = gettext("Specify the output archive format"))]
     format: Format,
 
-    /// Do not cross filesystem boundaries
-    #[arg(short = 'X', long)]
+    #[arg(short = 'X', long, help = gettext("Do not cross filesystem boundaries"))]
     one_file_system: bool,
 
-    /// Create/read multi-volume archives (GNU tar compatible)
-    #[arg(short = 'M', long)]
+    #[arg(short = 'M', long, help = gettext("Create/read multi-volume archives"))]
     multi_volume: bool,
 
-    /// Specify the tape/volume length in bytes (used with -M)
-    #[arg(long)]
+    #[arg(long, help = gettext("Specify the tape/volume length in bytes (used with -M)"))]
     tape_length: Option<u64>,
 
-    /// Run this script at end of each volume (for -M mode)
-    #[arg(long)]
+    #[arg(long, help = gettext("Run this script at end of each volume (for -M mode)"))]
     new_volume_script: Option<String>,
 
-    /// Pathnames, patterns and file operands to be processed
+    #[arg(help = gettext("Pathnames, patterns and file operands to be processed"))]
     files_and_patterns: Vec<String>,
 }
 

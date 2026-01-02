@@ -22,40 +22,31 @@ use num_traits::ToPrimitive;
 #[derive(Parser)]
 #[command(version, about = gettext("lp - send files to a printer"))]
 struct Args {
-    /// Exit only after file access is no longer required (effectively always-on)
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Copy files to spool directory before printing"))]
     _copy: bool,
 
-    /// Printer destination (IPP URI, e.g., ipp://host:631/ipp/print)
-    #[arg(short = 'd')]
+    #[arg(short = 'd', help = gettext("Printer destination (IPP URI)"))]
     dest: Option<String>,
 
-    /// Number of copies to print
-    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..), help = gettext("Number of copies to print"))]
     copies: u32,
 
-    /// Send mail after printing (stub: accepted but not implemented)
-    #[arg(short = 'm')]
+    #[arg(short = 'm', help = gettext("Send mail after printing"))]
     _mail: bool,
 
-    /// Suppress messages (no request ID output)
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Suppress messages (no request ID output)"))]
     silent: bool,
 
-    /// Write to terminal after printing (stub: accepted but not implemented)
-    #[arg(short = 'w')]
+    #[arg(short = 'w', help = gettext("Write to terminal after printing"))]
     _write: bool,
 
-    /// Printer-dependent options (can be specified multiple times)
-    #[arg(short = 'o', action = clap::ArgAction::Append)]
+    #[arg(short = 'o', action = clap::ArgAction::Append, help = gettext("Printer-dependent options"))]
     options: Vec<String>,
 
-    /// Title for the banner page
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Title for the banner page"))]
     title: Option<String>,
 
-    /// Files to print (use '-' for stdin)
-    #[arg()]
+    #[arg(help = gettext("Files to print (use '-' for stdin)"))]
     files: Vec<PathBuf>,
 }
 

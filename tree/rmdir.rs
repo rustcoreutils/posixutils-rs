@@ -17,11 +17,10 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(version, about = gettext("rmdir - remove directories"))]
 struct Args {
-    /// Remove all directories in a pathname
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Remove all directories in a pathname"))]
     parents: bool,
 
-    /// Directories to remove
+    #[arg(help = gettext("Directories to remove"))]
     dirs: Vec<String>,
 }
 

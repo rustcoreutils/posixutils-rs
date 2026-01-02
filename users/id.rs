@@ -19,27 +19,22 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(version, about = gettext("id - return user identity"))]
 struct Args {
-    /// Output all different group IDs (effective, real, and supplementary) only
-    #[arg(short = 'G', long, group = "output")]
+    #[arg(short = 'G', long, group = "output", help = gettext("Output all different group IDs (effective, real, and supplementary) only"))]
     groups: bool,
 
-    /// Output only the effective group ID
-    #[arg(short, long, group = "output")]
+    #[arg(short, long, group = "output", help = gettext("Output only the effective group ID"))]
     group: bool,
 
-    /// Output only the effective user ID
-    #[arg(short = 'u', long = "user", group = "output")]
+    #[arg(short = 'u', long = "user", group = "output", help = gettext("Output only the effective user ID"))]
     e_user: bool,
 
-    /// Output the real ID instead of the effective ID
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Output the real ID instead of the effective ID"))]
     real: bool,
 
-    /// Output the name in string format, instead of the numeric
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Output the name in string format, instead of the numeric"))]
     name: bool,
 
-    /// The login name for which information is to be written.
+    #[arg(help = gettext("The login name for which information is to be written"))]
     user: Option<String>,
 }
 

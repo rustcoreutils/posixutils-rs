@@ -22,8 +22,7 @@ use plib::sccsfile::{parse_pfile, paths};
 #[derive(Parser)]
 #[command(version, about = gettext("sact - print current SCCS file-editing activity"))]
 struct Args {
-    /// SCCS files to check (use - for stdin)
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to check (use - for stdin)"))]
     files: Vec<PathBuf>,
 }
 

@@ -14,7 +14,7 @@
 //! whose operational behavior is determined by locale settings.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
@@ -24,40 +24,33 @@ use std::process::exit;
 #[derive(Parser)]
 #[command(
     version,
-    about = "localedef - define locale environment",
+    about = gettext("localedef - define locale environment"),
     disable_help_flag = true,
     disable_version_flag = true
 )]
 struct Args {
-    /// Create permanent output even if warnings occur
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Create permanent output even if warnings occur"))]
     force: bool,
 
-    /// Path of charmap file
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Path of charmap file"))]
     charmap: Option<PathBuf>,
 
-    /// Path of source definitions
-    #[arg(short = 'i')]
+    #[arg(short = 'i', help = gettext("Path of source definitions"))]
     input: Option<PathBuf>,
 
-    /// Target codeset for conversion
-    #[arg(short = 'u')]
+    #[arg(short = 'u', help = gettext("Target codeset for conversion"))]
     code_set: Option<String>,
 
-    /// Verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Verbose output"))]
     verbose: bool,
 
-    /// Print help
-    #[arg(short, long, action = clap::ArgAction::HelpLong)]
+    #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
     help: Option<bool>,
 
-    /// Print version
-    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    /// Name of the locale to define
+    #[arg(help = gettext("Name of the locale to define"))]
     name: String,
 }
 

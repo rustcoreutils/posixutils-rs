@@ -46,8 +46,7 @@ struct Args {
     #[arg(short = 'x', long, help = gettext("Print index to stdout"))]
     index: bool,
 
-    /// Input files
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("Input files"))]
     files: Vec<String>,
 }
 

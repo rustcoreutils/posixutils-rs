@@ -16,26 +16,22 @@ use transformation::translate::TranslateTransformation;
 #[derive(Parser)]
 #[command(version, about = gettext("tr - translate or delete characters"))]
 struct Args {
-    /// Delete characters in STRING1 from the input
-    #[arg(short = 'd')]
+    #[arg(short = 'd', help = gettext("Delete characters in STRING1 from the input"))]
     delete: bool,
 
-    /// Replace each input sequence of a repeated character that is listed in the last specified SET, with a single occurrence of that character
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Replace each input sequence of a repeated character that is listed in the last specified SET, with a single occurrence of that character"))]
     squeeze_repeats: bool,
 
-    /// Use the complement of STRING1's values
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Use the complement of STRING1's values"))]
     complement_val: bool,
 
-    /// Use the complement of STRING1's characters
-    #[arg(short = 'C')]
+    #[arg(short = 'C', help = gettext("Use the complement of STRING1's characters"))]
     complement_char: bool,
 
-    /// First string
+    #[arg(help = gettext("First string"))]
     string1: String,
 
-    /// Second string (not required if delete mode is on)
+    #[arg(help = gettext("Second string (not required if delete mode is on)"))]
     string2: Option<String>,
 }
 

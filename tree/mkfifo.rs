@@ -17,11 +17,10 @@ use std::io;
 #[derive(Parser)]
 #[command(version, about = gettext("mkfifo - make FIFO special files"))]
 struct Args {
-    /// Set the file permission bits of the newly-created FIFO to the specified mode value.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Set the file permission bits of the newly-created FIFO to the specified mode value"))]
     mode: Option<String>,
 
-    /// A pathname of the FIFO special file to be created.
+    #[arg(help = gettext("A pathname of the FIFO special file to be created"))]
     files: Vec<String>,
 }
 

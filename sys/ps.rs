@@ -32,32 +32,25 @@ mod platform {
 #[derive(Parser)]
 #[command(version, about = gettext("ps - report process status"))]
 struct Args {
-    /// List all processes
-    #[arg(short = 'A', long)]
+    #[arg(short = 'A', long, help = gettext("List all processes"))]
     all: bool,
 
-    /// List all processes (alias for -A)
-    #[arg(short = 'e')]
+    #[arg(short = 'e', help = gettext("List all processes (alias for -A)"))]
     all2: bool,
 
-    /// List all processes associated with terminals
-    #[arg(short = 'a')]
+    #[arg(short = 'a', help = gettext("List all processes associated with terminals"))]
     terminal_processes: bool,
 
-    /// Exclude session leaders
-    #[arg(short = 'd')]
+    #[arg(short = 'd', help = gettext("Exclude session leaders"))]
     exclude_session_leaders: bool,
 
-    /// Full output format (-f)
-    #[arg(short = 'f', long = "full")]
+    #[arg(short = 'f', long = "full", help = gettext("Full output format (-f)"))]
     full_format: bool,
 
-    /// Long output format (-l)
-    #[arg(short = 'l', long = "long")]
+    #[arg(short = 'l', long = "long", help = gettext("Long output format (-l)"))]
     long_format: bool,
 
-    /// Custom output format (-o)
-    #[arg(short = 'o', value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(short = 'o', value_parser = clap::builder::NonEmptyStringValueParser::new(), help = gettext("Custom output format (-o)"))]
     output_format: Option<String>,
 }
 

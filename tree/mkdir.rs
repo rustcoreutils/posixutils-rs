@@ -19,15 +19,13 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("mkdir - make directories"))]
 struct Args {
-    /// Create any missing intermediate pathname components.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Create any missing intermediate pathname components"))]
     parents: bool,
 
-    /// Set the file permission bits of the newly-created directory to the specified mode value.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Set the file permission bits of the newly-created directory to the specified mode value"))]
     mode: Option<String>,
 
-    /// A pathname of a directory to be created.
+    #[arg(help = gettext("A pathname of a directory to be created"))]
     dirs: Vec<String>,
 }
 

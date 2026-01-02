@@ -50,20 +50,16 @@ struct Args {
     #[arg(short = 'w', long, default_value = "80", help = gettext("Maximum output width"))]
     width: usize,
 
-    /// Preprocessor defines
-    #[arg(short = 'D', action = clap::ArgAction::Append)]
+    #[arg(short = 'D', action = clap::ArgAction::Append, help = gettext("Preprocessor defines"))]
     defines: Vec<String>,
 
-    /// Include paths
-    #[arg(short = 'I', action = clap::ArgAction::Append)]
+    #[arg(short = 'I', action = clap::ArgAction::Append, help = gettext("Include paths"))]
     include_paths: Vec<String>,
 
-    /// Undefine macros
-    #[arg(short = 'U', action = clap::ArgAction::Append)]
+    #[arg(short = 'U', action = clap::ArgAction::Append, help = gettext("Undefine macros"))]
     undefines: Vec<String>,
 
-    /// Input files
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("Input files"))]
     files: Vec<String>,
 }
 

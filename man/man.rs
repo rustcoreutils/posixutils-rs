@@ -55,35 +55,29 @@ const MAN_CONFS: [&str; 3] = [
     about = gettext("man - display system documentation")
 )]
 struct Args {
-    /// Display all matching manual pages
-    #[arg(short, long, help = "Display all matching manual pages")]
+    #[arg(short, long, help = gettext("Display all matching manual pages"))]
     all: bool,
 
-    /// Use the specified file instead of the default configuration file
     #[arg(
         short = 'C',
         long,
-        help = "Use the specified file instead of the default configuration file"
+        help = gettext("Use the specified file instead of the default configuration file")
     )]
     config_file: Option<PathBuf>,
 
-    /// Copy the manual page to the standard output instead of using less(1) to paginate it
-    #[arg(short, long, help = "Copy the manual page to the standard output")]
+    #[arg(short, long, help = gettext("Copy the manual page to the standard output"))]
     copy: bool,
 
-    /// A synonym for whatis(1). It searches for name in manual page names and displays the header lines from all matching pages
-    #[arg(short = 'f', long, help = "A synonym for whatis(1)")]
+    #[arg(short = 'f', long, help = gettext("A synonym for whatis(1)"))]
     whatis: bool,
 
-    /// Display only the SYNOPSIS lines of the requested manual pages
     #[arg(
         short = 'h',
         long,
-        help = "Display only the SYNOPSIS lines of the requested manual pages"
+        help = gettext("Display only the SYNOPSIS lines of the requested manual pages")
     )]
     synopsis: bool,
 
-    /// Displays the header lines of all matching pages. A synonym for apropos(1)
     #[arg(
         short = 'k',
         long,
@@ -91,16 +85,14 @@ struct Args {
     )]
     apropos: bool,
 
-    /// A synonym for mandoc(1). Interpret PAGE argument(s) as local filename(s)
     #[arg(
         short = 'l',
-        long = "local-file", 
-        help = "interpret PAGE argument(s) as local filename(s)", 
+        long = "local-file",
+        help = gettext("Interpret PAGE argument(s) as local filename(s)"),
         num_args = 1..
     )]
     local_file: Option<Vec<PathBuf>>,
 
-    /// Override the list of directories to search for manual pages
     #[arg(
         short = 'M',
         value_delimiter = ':',
@@ -108,7 +100,6 @@ struct Args {
     )]
     override_paths: Vec<PathBuf>,
 
-    /// Augment the list of directories to search for manual pages
     #[arg(
         short = 'm',
         value_delimiter = ':',
@@ -116,14 +107,12 @@ struct Args {
     )]
     augment_paths: Vec<PathBuf>,
 
-    /// Only show pages for the specified machine(1) architecture
     #[arg(
         short = 'S',
         help = gettext("Only show pages for the specified machine(1) architecture")
     )]
     subsection: Option<String>,
 
-    /// Only select manuals from the specified section
     #[arg(
         short = 's',
         value_enum,
@@ -131,7 +120,6 @@ struct Args {
     )]
     section: Option<Section>,
 
-    /// List the pathnames of all matching manual pages instead of displaying any of them
     #[arg(
         short = 'w',
         help = gettext("List the pathnames of all matching manual pages instead of displaying any of them")
@@ -141,11 +129,10 @@ struct Args {
     #[arg(
         long = "help",
         action = ArgAction::Help,
-        help = "Print help information"
+        help = gettext("Print help information")
     )]
     help: Option<bool>,
 
-    /// Commands names for which documentation search must be performed
     #[arg(
         help = gettext("Names of the utilities or keywords to display documentation for"),
         num_args = 0..

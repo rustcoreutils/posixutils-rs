@@ -22,63 +22,49 @@ use plib::{curuser, platform, utmpx};
 #[derive(Parser)]
 #[command(version, about = gettext("who - display who is on the system"))]
 struct Args {
-    /// Process all utmpx entries
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Process all utmpx entries"))]
     all: bool,
 
-    /// Print the time and date of the last reboot.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Print the time and date of the last reboot"))]
     boot: bool,
 
-    /// List all processes that have expired and not been respawned.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("List all processes that have expired and not been respawned"))]
     dead: bool,
 
-    /// Print column headings above the regular output.
-    #[arg(short = 'H', long)]
+    #[arg(short = 'H', long, help = gettext("Print column headings above the regular output"))]
     heading: bool,
 
-    /// List only those lines on which the system is waiting for someone to login.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("List only those lines on which the system is waiting for someone to login"))]
     login: bool,
 
-    /// Output only information about the current terminal.
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, help = gettext("Output only information about the current terminal"))]
     current_terminal: bool,
 
-    /// List any other process that is currently active and has been previously spawned by init.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("List any other process that is currently active and has been previously spawned by init"))]
     process: bool,
 
-    /// List only the names and the number of users currently logged on.
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, help = gettext("List only the names and the number of users currently logged on"))]
     summary: bool,
 
-    /// Print the current run-level of the init process.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Print the current run-level of the init process"))]
     runlevel: bool,
 
-    /// List only the name, line, and time fields (default).
-    #[arg(short, long = "short", default_value_t = true, group = "output")]
+    #[arg(short, long = "short", default_value_t = true, group = "output", help = gettext("List only the name, line, and time fields (default)"))]
     short_format: bool,
 
-    /// Indicate the last change to the system clock.
-    #[arg(short = 't', long = "time")]
+    #[arg(short = 't', long = "time", help = gettext("Indicate the last change to the system clock"))]
     last_change: bool,
 
-    /// Show the state of each terminal
-    #[arg(short = 'T', long, group = "output")]
+    #[arg(short = 'T', long, group = "output", help = gettext("Show the state of each terminal"))]
     terminals: bool,
 
-    /// Normal selection of information
-    #[arg(long)]
+    #[arg(long, help = gettext("Normal selection of information"))]
     userproc: bool,
 
-    /// Write "idle time" for each displayed user
-    #[arg(short = 'u', long = "users")]
+    #[arg(short = 'u', long = "users", help = gettext("Write \"idle time\" for each displayed user"))]
     idle_time: bool,
 
-    /// Gather information from FILE, instead of default utmp file.
+    #[arg(help = gettext("Gather information from FILE, instead of default utmp file"))]
     file: Option<PathBuf>,
 }
 

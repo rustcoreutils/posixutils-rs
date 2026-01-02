@@ -21,23 +21,19 @@ const NAME_MAX: usize = 255;
 #[derive(Parser)]
 #[command(version, about = gettext("compress - compress data"))]
 struct Args {
-    /// Specify the maximum number of bits to use in a code. 9 <= bits <= 14
-    #[arg(short = 'b')]
+    #[arg(short = 'b', help = gettext("Specify the maximum number of bits to use in a code. 9 <= bits <= 14"))]
     bits: Option<u32>,
 
-    /// Write to the standard output; the input file is not changed, and no .Z files are created.
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, help = gettext("Write to the standard output; the input file is not changed, and no .Z files are created"))]
     stdout: bool,
 
-    /// Do not prompt for overwriting files
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, help = gettext("Do not prompt for overwriting files"))]
     force: bool,
 
-    /// Write messages to standard error concerning the expansion of each file.
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v', long, help = gettext("Write messages to standard error concerning the expansion of each file"))]
     verbose: bool,
 
-    /// Files to read as input.  Use "-" or no-args for stdin.
+    #[arg(help = gettext("Files to read as input. Use \"-\" or no-args for stdin"))]
     files: Vec<PathBuf>,
 }
 

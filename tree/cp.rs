@@ -20,11 +20,9 @@ use std::{fs, io};
 #[derive(Parser)]
 #[command(version, about = gettext("cp - copy files"))]
 struct Args {
-    /// Do not prompt for confirmation if the destination path exists
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Do not prompt for confirmation if the destination path exists"))]
     force: bool,
 
-    /// Follow command line symlinks
     #[arg(
         short = 'H',
         long,
@@ -33,11 +31,11 @@ struct Args {
             "dereference",
             "no_dereference"
         ],
-        requires = "recursive"
+        requires = "recursive",
+        help = gettext("Follow command line symlinks")
     )]
     follow_cli: bool,
 
-    /// Follow symlinks in source
     #[arg(
         short = 'L',
         long,
@@ -48,10 +46,10 @@ struct Args {
         ],
         requires = "recursive",
         default_value_t = true,
+        help = gettext("Follow symlinks in source")
     )]
     dereference: bool,
 
-    /// Never follow symlinks in source
     #[arg(
         short = 'P',
         long,
@@ -59,23 +57,21 @@ struct Args {
             "follow_cli",
             "dereference",
             "no_dereference"
-        ]
+        ],
+        help = gettext("Never follow symlinks in source")
     )]
     no_dereference: bool,
 
-    /// Prompt for confirmation if the destination path exists.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Prompt for confirmation if the destination path exists"))]
     interactive: bool,
 
-    /// Duplicate the characteristics of each source file in the corresponding destination file.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Duplicate the characteristics of each source file in the corresponding destination file"))]
     preserve: bool,
 
-    /// Copy file hierarchies.
-    #[arg(short = 'R', visible_short_alias = 'r', long)]
+    #[arg(short = 'R', visible_short_alias = 'r', long, help = gettext("Copy file hierarchies"))]
     recursive: bool,
 
-    /// Source(s) and target of move(s)
+    #[arg(help = gettext("Source(s) and target of move(s)"))]
     files: Vec<PathBuf>,
 }
 

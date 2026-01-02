@@ -22,12 +22,10 @@ use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid};
 #[derive(Parser)]
 #[command(version, about = gettext("rmdel - remove a delta from an SCCS file"))]
 struct Args {
-    /// SID of delta to remove (required)
-    #[arg(short = 'r', value_name = "SID", required = true)]
+    #[arg(short = 'r', value_name = "SID", required = true, help = gettext("SID of delta to remove (required)"))]
     sid: String,
 
-    /// SCCS files to process (use - for stdin)
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to process (use - for stdin)"))]
     files: Vec<PathBuf>,
 }
 

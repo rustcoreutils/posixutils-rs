@@ -28,34 +28,24 @@ use std::{
 #[derive(Parser)]
 #[command(version, about = gettext("ls - list directory contents"))]
 struct Args {
-    /// Write out all directory entries, including those whose names begin with
-    /// a <period> ( '.' ).
-    #[arg(short = 'a', long, overrides_with_all = ["almost_all", "all"])]
+    #[arg(short = 'a', long, overrides_with_all = ["almost_all", "all"],
+          help = gettext("Write out all directory entries, including those whose names begin with a <period> ( '.' )"))]
     all: bool,
 
-    /// Write out all directory entries, including those whose names begin with
-    /// a <period> ( '.' ) but excluding the entries dot and dot-dot (if they
-    /// exist).
-    #[arg(short = 'A', long, overrides_with_all = ["almost_all", "all"])]
+    #[arg(short = 'A', long, overrides_with_all = ["almost_all", "all"],
+          help = gettext("Write out all directory entries, including those whose names begin with a <period> ( '.' ) but excluding the entries dot and dot-dot (if they exist)"))]
     almost_all: bool,
 
-    /// Use time of last modification of the file status information (see XBD
-    /// <sys/stat.h>) instead of last modification of the file itself for
-    /// sorting ( -t) or writing (-l).
     #[arg(
         short = 'c',
         overrides_with_all = [
             "use_last_status_change_time",
             "use_last_access_time"
-        ]
+        ],
+        help = gettext("Use time of last modification of the file status information (see XBD <sys/stat.h>) instead of last modification of the file itself for sorting ( -t) or writing (-l)")
     )]
     use_last_status_change_time: bool,
 
-    /// Write multi-text-column output with entries sorted down the columns,
-    /// according to the collating sequence. The number of text columns and the
-    /// column separator characters are unspecified, but should be adapted to
-    /// the nature of the output device. This option disables long format
-    /// output.
     #[arg(
         short = 'C',
         overrides_with_all = [
@@ -63,96 +53,66 @@ struct Args {
             "stream_output_format",
             "muti_column_across",
             "one_entry_per_line",
-        ]
+        ],
+        help = gettext("Write multi-text-column output with entries sorted down the columns, according to the collating sequence. The number of text columns and the column separator characters are unspecified, but should be adapted to the nature of the output device. This option disables long format output")
     )]
     multi_column: bool,
 
-    /// Do not follow symbolic links named as operands unless the -H or -L
-    /// options are specified. Do not treat directories differently than other
-    /// types of files. The use of -d with -R or -f produces unspecified
-    /// results.
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long,
+          help = gettext("Do not follow symbolic links named as operands unless the -H or -L options are specified. Do not treat directories differently than other types of files. The use of -d with -R or -f produces unspecified results"))]
     directory: bool,
 
-    /// List the entries in directory operands in the order they appear in the
-    /// directory. The behavior for non-directory operands is unspecified.
-    /// This option shall turn on -a. When -f is specified, any occurrences of
-    /// the -r, -S, and -t options shall be ignored and any occurrences of the
-    /// -A, -g, -l, -n, -o, and -s options may be ignored. The use of -f with
-    /// -R or -d produces unspecified results.
     #[arg(
         short = 'f',
         overrides_with_all = [
             "sort_by_file_size",
             "sort_by_directory_order",
             "sort_by_last_modified_time",
-        ]
+        ],
+        help = gettext("List the entries in directory operands in the order they appear in the directory. The behavior for non-directory operands is unspecified. This option shall turn on -a. When -f is specified, any occurrences of the -r, -S, and -t options shall be ignored and any occurrences of the -A, -g, -l, -n, -o, and -s options may be ignored. The use of -f with -R or -d produces unspecified results")
     )]
     sort_by_directory_order: bool,
 
-    /// Do not follow symbolic links named as operands unless the -H or -L
-    /// options are specified. Write a <slash> ( '/' ) immediately after each
-    /// pathname that is a directory, an <asterisk> ( '*' ) after each that is
-    /// executable, a <vertical-line> ( '|' ) after each that is a FIFO, and an
-    /// at-sign ( '@' ) after each that is a symbolic link. For other file
-    /// types, other symbols may be written.
     #[arg(
         short = 'F',
         long,
-        overrides_with_all = ["classify", "write_slash_if_directory"]
+        overrides_with_all = ["classify", "write_slash_if_directory"],
+        help = gettext("Do not follow symbolic links named as operands unless the -H or -L options are specified. Write a <slash> ( '/' ) immediately after each pathname that is a directory, an <asterisk> ( '*' ) after each that is executable, a <vertical-line> ( '|' ) after each that is a FIFO, and an at-sign ( '@' ) after each that is a symbolic link. For other file types, other symbols may be written")
     )]
     classify: bool,
 
-    /// Turn on the -l (ell) option, but disable writing the file's owner name
-    /// or number. Disable the -C, -m, and -x options.
-    #[arg(short = 'g')]
+    #[arg(short = 'g',
+          help = gettext("Turn on the -l (ell) option, but disable writing the file's owner name or number. Disable the -C, -m, and -x options"))]
     long_format_without_owner: bool,
 
-    /// Evaluate the file information and file type for symbolic links specified
-    /// on the command line to be those of the file referenced by the link, and
-    /// not the link itself; however, ls shall write the name of the link itself
-    /// and not the file referenced by the link.
     #[arg(
         short = 'H',
         long,
-        overrides_with_all = ["dereference_command_line", "dereference"]
+        overrides_with_all = ["dereference_command_line", "dereference"],
+        help = gettext("Evaluate the file information and file type for symbolic links specified on the command line to be those of the file referenced by the link, and not the link itself; however, ls shall write the name of the link itself and not the file referenced by the link")
     )]
     dereference_command_line: bool,
 
-    /// For each file, write the file's file serial number.
-    #[arg(short = 'i', long, overrides_with = "inode")]
+    #[arg(short = 'i', long, overrides_with = "inode",
+          help = gettext("For each file, write the file's file serial number"))]
     inode: bool,
 
-    /// Set the block size for the -s option and the per-directory block count
-    /// written for the -l, -n, -s, -g, and -o options to 1024
-    /// bytes.
-    #[arg(short = 'k', long)]
+    #[arg(short = 'k', long,
+          help = gettext("Set the block size for the -s option and the per-directory block count written for the -l, -n, -s, -g, and -o options to 1024 bytes"))]
     kibibytes: bool,
 
-    /// (The letter ell.) Do not follow symbolic links named as operands unless
-    /// the -H or -L options are specified. Write out in long format.
-    /// Disable the -C, -m, and -x options.
-    #[arg(short = 'l')]
+    #[arg(short = 'l',
+          help = gettext("(The letter ell.) Do not follow symbolic links named as operands unless the -H or -L options are specified. Write out in long format. Disable the -C, -m, and -x options"))]
     long_format: bool,
 
-    /// Evaluate the file information and file type for all symbolic links
-    /// (whether named on the command line or encountered in a file hierarchy)
-    /// to be those of the file referenced by the link, and not the link itself;
-    /// however, ls shall write the name of the link itself and not the file
-    /// referenced by the link. When -L is used with -l, write the contents of
-    /// symbolic links in the long format.
     #[arg(
         short = 'L',
         long,
-        overrides_with_all = ["dereference_command_line", "dereference"]
+        overrides_with_all = ["dereference_command_line", "dereference"],
+        help = gettext("Evaluate the file information and file type for all symbolic links (whether named on the command line or encountered in a file hierarchy) to be those of the file referenced by the link, and not the link itself; however, ls shall write the name of the link itself and not the file referenced by the link. When -L is used with -l, write the contents of symbolic links in the long format")
     )]
     dereference: bool,
 
-    /// Stream output format; list pathnames across the page, separated by a
-    /// <comma> character followed by a <space> character. Use a <newline>
-    /// character as the list terminator and after the separator sequence when
-    /// there is not room on a line for the next list entry. This option
-    /// disables long format output.
     #[arg(
         short = 'm',
         overrides_with_all = [
@@ -160,95 +120,74 @@ struct Args {
             "stream_output_format",
             "muti_column_across",
             "one_entry_per_line",
-        ]
+        ],
+        help = gettext("Stream output format; list pathnames across the page, separated by a <comma> character followed by a <space> character. Use a <newline> character as the list terminator and after the separator sequence when there is not room on a line for the next list entry. This option disables long format output")
     )]
     stream_output_format: bool,
 
-    /// Turn on the -l (ell) option, but when writing the file's owner or group,
-    /// write the file's numeric UID or GID rather than the user or group name,
-    /// respectively. Disable the -C, -m, and -x options.
-    #[arg(short = 'n', long = "numeric-uid-gid")]
+    #[arg(short = 'n', long = "numeric-uid-gid",
+          help = gettext("Turn on the -l (ell) option, but when writing the file's owner or group, write the file's numeric UID or GID rather than the user or group name, respectively. Disable the -C, -m, and -x options"))]
     long_format_numeric_uid_gid: bool,
 
-    /// Turn on the -l (ell) option, but disable writing the file's group name
-    /// or number. Disable the -C, -m, and -x options.
-    #[arg(short = 'o')]
+    #[arg(short = 'o',
+          help = gettext("Turn on the -l (ell) option, but disable writing the file's group name or number. Disable the -C, -m, and -x options"))]
     long_format_without_group: bool,
 
-    /// Write a <slash> ( '/' ) after each filename if that file is a directory.
     #[arg(
         short = 'p',
-        overrides_with_all = ["classify", "write_slash_if_directory"]
+        overrides_with_all = ["classify", "write_slash_if_directory"],
+        help = gettext("Write a <slash> ( '/' ) after each filename if that file is a directory")
     )]
     write_slash_if_directory: bool,
 
-    /// Force each instance of non-printable filename characters and <tab>
-    /// characters to be written as the <question-mark> ( '?' ) character.
-    /// Implementations may provide this option by default if the output is to a
-    /// terminal device.
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long,
+          help = gettext("Force each instance of non-printable filename characters and <tab> characters to be written as the <question-mark> ( '?' ) character. Implementations may provide this option by default if the output is to a terminal device"))]
     hide_control_chars: bool,
 
-    /// Reverse the order of the sort to get reverse collating sequence oldest
-    /// first, or smallest file size first depending on the other options given.
-    #[arg(short = 'r', long = "reverse")]
+    #[arg(short = 'r', long = "reverse",
+          help = gettext("Reverse the order of the sort to get reverse collating sequence oldest first, or smallest file size first depending on the other options given"))]
     reverse_sorting: bool,
 
-    /// Recursively list subdirectories encountered. When a symbolic link to a
-    /// directory is encountered, the directory shall not be recursively listed
-    /// unless the -L option is specified. The use of -R with -d or -f produces
-    /// unspecified results.
-    #[arg(short = 'R', long)]
+    #[arg(short = 'R', long,
+          help = gettext("Recursively list subdirectories encountered. When a symbolic link to a directory is encountered, the directory shall not be recursively listed unless the -L option is specified. The use of -R with -d or -f produces unspecified results"))]
     recursive: bool,
 
-    /// Indicate the total number of file system blocks consumed by each file
-    /// displayed. If the -k option is also specified, the block size shall be
-    /// 1024 bytes; otherwise, the block size is implementation-defined.
-    #[arg(short = 's', long = "size")]
+    #[arg(short = 's', long = "size",
+          help = gettext("Indicate the total number of file system blocks consumed by each file displayed. If the -k option is also specified, the block size shall be 1024 bytes; otherwise, the block size is implementation-defined"))]
     display_size: bool,
 
-    /// Sort with the primary key being file size (in decreasing order) and the
-    /// secondary key being filename in the collating sequence (in increasing
-    /// order).
     #[arg(
         short = 'S',
         overrides_with_all = [
             "sort_by_file_size",
             "sort_by_directory_order",
             "sort_by_last_modified_time",
-        ]
+        ],
+        help = gettext("Sort with the primary key being file size (in decreasing order) and the secondary key being filename in the collating sequence (in increasing order)")
     )]
     sort_by_file_size: bool,
 
-    /// Sort with the primary key being time modified (most recently modified
-    /// first) and the secondary key being filename in the collating sequence.
-    /// For a symbolic link, the time used as the sort key is that of the
-    /// symbolic link itself, unless ls is evaluating its file information to be
-    /// that of the file referenced by the link (see the -H and -L options).
     #[arg(
         short = 't',
         overrides_with_all = [
             "sort_by_file_size",
             "sort_by_directory_order",
             "sort_by_last_modified_time",
-        ]
+        ],
+        help = gettext("Sort with the primary key being time modified (most recently modified first) and the secondary key being filename in the collating sequence. For a symbolic link, the time used as the sort key is that of the symbolic link itself, unless ls is evaluating its file information to be that of the file referenced by the link (see the -H and -L options)")
     )]
     sort_by_last_modified_time: bool,
 
-    /// Use time of last access instead of last modification of the file for
-    /// sorting (-t) or writing (-l).
     #[arg(
         short = 'u',
         overrides_with_all = [
             "use_last_status_change_time",
             "use_last_access_time"
-        ]
+        ],
+        help = gettext("Use time of last access instead of last modification of the file for sorting (-t) or writing (-l)")
     )]
     use_last_access_time: bool,
 
-    /// The same as -C, except that the multi-text-column output is produced
-    /// with entries sorted across, rather than down, the columns. This option
-    /// disables long format output.
     #[arg(
         short = 'x',
         overrides_with_all = [
@@ -256,13 +195,11 @@ struct Args {
             "stream_output_format",
             "muti_column_across",
             "one_entry_per_line",
-        ]
+        ],
+        help = gettext("The same as -C, except that the multi-text-column output is produced with entries sorted across, rather than down, the columns. This option disables long format output")
     )]
     muti_column_across: bool,
 
-    /// (The numeric digit one.) Force output to be one entry per line. This
-    /// option does not disable long format output. (Long format output is
-    /// enabled by -g, -l (ell), -n, and -o; and disabled by -C, -m, and -x.)
     #[arg(
         short = '1',
         overrides_with_all = [
@@ -270,13 +207,12 @@ struct Args {
             "stream_output_format",
             "muti_column_across",
             "one_entry_per_line",
-        ]
+        ],
+        help = gettext("(The numeric digit one.) Force output to be one entry per line. This option does not disable long format output. (Long format output is enabled by -g, -l (ell), -n, and -o; and disabled by -C, -m, and -x.)")
     )]
     one_entry_per_line: bool,
 
-    /// A pathname of a file to be written. If the file specified is not found,
-    /// a diagnostic message shall be output on standard error.
-    #[arg()]
+    #[arg(help = gettext("A pathname of a file to be written. If the file specified is not found, a diagnostic message shall be output on standard error"))]
     file: Vec<PathBuf>,
 }
 

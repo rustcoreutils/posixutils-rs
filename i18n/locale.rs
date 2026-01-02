@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use gettextrs::{
-    bind_textdomain_codeset, setlocale, textdomain, LocaleCategory as GettextCategory,
+    bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory as GettextCategory,
 };
 use posixutils_i18n::locale_lib::env::LocaleSettings;
 use posixutils_i18n::locale_lib::platform;
@@ -24,36 +24,30 @@ use posixutils_i18n::locale_lib::types::LocaleCategory;
 #[derive(Parser)]
 #[command(
     version,
-    about = "locale - get locale-specific information",
+    about = gettext("locale - get locale-specific information"),
     disable_help_flag = true,
     disable_version_flag = true
 )]
 struct Args {
-    /// Write names of all available public locales
-    #[arg(short = 'a')]
+    #[arg(short = 'a', help = gettext("Write names of all available public locales"))]
     all_locales: bool,
 
-    /// Write names of available charmaps
-    #[arg(short = 'm')]
+    #[arg(short = 'm', help = gettext("Write names of available charmaps"))]
     charmaps: bool,
 
-    /// Write the names of selected categories
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Write the names of selected categories"))]
     category_names: bool,
 
-    /// Write names and values of selected keywords
-    #[arg(short = 'k')]
+    #[arg(short = 'k', help = gettext("Write names and values of selected keywords"))]
     keyword_names: bool,
 
-    /// Print help
-    #[arg(short, long, action = clap::ArgAction::HelpLong)]
+    #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
     help: Option<bool>,
 
-    /// Print version
-    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    /// Names of categories or keywords to query
+    #[arg(help = gettext("Names of categories or keywords to query"))]
     names: Vec<String>,
 }
 

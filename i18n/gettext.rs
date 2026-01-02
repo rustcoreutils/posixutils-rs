@@ -13,7 +13,7 @@
 //! to a given msgid from a message catalog for the current locale.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use posixutils_i18n::gettext_lib::lookup::{expand_escapes, MessageLookup};
 use std::process::exit;
 
@@ -21,39 +21,30 @@ use std::process::exit;
 #[derive(Parser)]
 #[command(
     version,
-    about = "gettext - retrieve text string from message database",
+    about = gettext("gettext - retrieve text string from message database"),
     disable_help_flag = true,
     disable_version_flag = true
 )]
 struct Args {
-    /// Use TEXTDOMAIN as the text domain for translating MSGID
-    #[arg(short = 'd', long = "domain")]
+    #[arg(short = 'd', long = "domain", help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
     domain: Option<String>,
 
-    /// Enable interpretation of some escape sequences
-    #[arg(short = 'e')]
+    #[arg(short = 'e', help = gettext("Enable interpretation of some escape sequences"))]
     expand_escapes: bool,
 
-    /// Suppress trailing newline
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Suppress trailing newline"))]
     no_newline: bool,
 
-    /// Behave like echo command (interpret multiple MSGIDs)
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Behave like echo command (interpret multiple MSGIDs)"))]
     shell_mode: bool,
 
-    /// Print help
-    #[arg(short, long, action = clap::ArgAction::HelpLong)]
+    #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
     help: Option<bool>,
 
-    /// Print version
-    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    /// TEXTDOMAIN and/or MSGID
-    /// If one argument: MSGID
-    /// If two arguments: TEXTDOMAIN MSGID
-    #[arg(trailing_var_arg = true)]
+    #[arg(trailing_var_arg = true, help = gettext("TEXTDOMAIN and/or MSGID. If one argument: MSGID. If two arguments: TEXTDOMAIN MSGID"))]
     args: Vec<String>,
 }
 

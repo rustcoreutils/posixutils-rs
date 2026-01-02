@@ -20,63 +20,46 @@ use std::{
 #[derive(Parser)]
 #[command(version, about = gettext("grep - search a file for a pattern"))]
 struct Args {
-    /// Match using extended regular expressions.
-    #[arg(short = 'E', long)]
+    #[arg(short = 'E', long, help = gettext("Match using extended regular expressions"))]
     extended_regexp: bool,
 
-    /// Match using fixed strings.
-    #[arg(short = 'F', long)]
+    #[arg(short = 'F', long, help = gettext("Match using fixed strings"))]
     fixed_strings: bool,
 
-    /// Write only a count of selected lines to standard output.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write only a count of selected lines to standard output"))]
     count: bool,
 
-    /// Specify one or more patterns to be used during the search for input.
-    #[arg(short = 'e', long)]
+    #[arg(short = 'e', long, help = gettext("Specify one or more patterns to be used during the search for input"))]
     regexp: Vec<String>,
 
-    /// Read one or more patterns from the file named by the pathname *file*.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Read one or more patterns from the file named by the pathname"))]
     file: Vec<PathBuf>,
 
-    /// Perform pattern matching in searches without regard to case.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Perform pattern matching in searches without regard to case"))]
     ignore_case: bool,
 
-    /// Write only the names of input_files containing selected lines to standard output.
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, help = gettext("Write only the names of files containing selected lines to standard output"))]
     files_with_matches: bool,
 
-    /// Precede each output line by its relative line number in the file, each file starting at line 1.
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, help = gettext("Precede each output line by its relative line number in the file"))]
     line_number: bool,
 
-    /// Write only the names of input_files containing selected lines to standard output.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Quiet mode, only return exit status"))]
     quiet: bool,
 
-    /// Suppress the error messages ordinarily written for nonexistent or unreadable input_files.
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, help = gettext("Suppress the error messages for nonexistent or unreadable files"))]
     no_messages: bool,
 
-    /// Select lines not matching any of the specified patterns.
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v', long, help = gettext("Select lines not matching any of the specified patterns"))]
     invert_match: bool,
 
-    /// Consider only input lines that use all characters in the line excluding the terminating
-    /// <newline> to match an entire fixed string or regular expression to be matching lines.
-    #[arg(short = 'x', long)]
+    #[arg(short = 'x', long, help = gettext("Match entire lines only"))]
     line_regexp: bool,
 
-    /// Specify one or more patterns to be used during the search for input. This operand shall be
-    /// treated as if it were specified as -e regexp.
-    #[arg(name = "PATTERNS")]
+    #[arg(name = "PATTERNS", help = gettext("Pattern to search for"))]
     single_pattern: Option<String>,
 
-    /// A pathname of a file to be searched for the patterns. If no file operands are specified, the
-    /// standard input shall be used.
-    #[arg(name = "FILE")]
+    #[arg(name = "FILE", help = gettext("Files to search (stdin if not specified)"))]
     input_files: Vec<String>,
 
     #[arg(skip)]

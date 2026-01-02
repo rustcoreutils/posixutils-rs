@@ -16,19 +16,16 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 #[derive(Parser)]
 #[command(version, about = gettext("realpath - return resolved canonical path"))]
 struct Args {
-    /// Error if the path cannot be resolved
-    #[arg(short = 'e', overrides_with = "_canonicalize_missing")]
+    #[arg(short = 'e', overrides_with = "_canonicalize_missing", help = gettext("Error if the path cannot be resolved"))]
     canonicalize_existing: bool,
 
-    /// Do not error if the path cannot be resolved (default)
-    #[arg(short = 'E', overrides_with = "canonicalize_existing")]
+    #[arg(short = 'E', overrides_with = "canonicalize_existing", help = gettext("Do not error if the path cannot be resolved (default)"))]
     _canonicalize_missing: bool,
 
-    /// Don't print errors when paths cannot be resolved
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Don't print errors when paths cannot be resolved"))]
     quiet: bool,
 
-    #[arg(value_name = "PATH", default_value = ".")]
+    #[arg(value_name = "PATH", default_value = ".", help = gettext("Paths to resolve"))]
     paths: Vec<PathBuf>,
 }
 

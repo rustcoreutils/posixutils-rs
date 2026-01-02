@@ -20,20 +20,17 @@ use std::path::{Component, Path};
 #[derive(Parser)]
 #[command(version, about = gettext("readlink - display the contents of a symbolic link"))]
 struct Args {
-    /// Do not output a trailing <newline> character.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Do not output a trailing <newline> character"))]
     no_newline: bool,
 
     // Not POSIX, but implemented by BusyBox, FreeBSD, GNU Core Utilities, toybox, and others
-    /// Canonicalize the provided path, resolving symbolic links repeatedly if needed. The absolute path of the resolved file is printed.
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Canonicalize the provided path, resolving symbolic links repeatedly if needed. The absolute path of the resolved file is printed"))]
     canonicalize: bool,
 
-    /// Print an error description to standard error when an error occurs and the specified file could not be resolved
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Print an error description to standard error when an error occurs and the specified file could not be resolved"))]
     verbose: bool,
 
-    /// The pathname of an existing symbolic link
+    #[arg(help = gettext("The pathname of an existing symbolic link"))]
     pathname: PathBuf,
 }
 

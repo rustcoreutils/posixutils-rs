@@ -24,44 +24,34 @@ use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, Sccs
 #[derive(Parser)]
 #[command(version, about = gettext("get - get a version of an SCCS file"))]
 struct Args {
-    /// SID to retrieve
-    #[arg(short = 'r', value_name = "SID")]
+    #[arg(short = 'r', value_name = "SID", help = gettext("SID to retrieve"))]
     sid: Option<String>,
 
-    /// Get for editing (create p-file)
-    #[arg(short = 'e')]
+    #[arg(short = 'e', help = gettext("Get for editing (create p-file)"))]
     edit: bool,
 
-    /// Create branch (with -e)
-    #[arg(short = 'b')]
+    #[arg(short = 'b', help = gettext("Create branch (with -e)"))]
     branch: bool,
 
-    /// Suppress keyword expansion
-    #[arg(short = 'k')]
+    #[arg(short = 'k', help = gettext("Suppress keyword expansion"))]
     no_keywords: bool,
 
-    /// Write to stdout instead of g-file
-    #[arg(short = 'p')]
+    #[arg(short = 'p', help = gettext("Write to stdout instead of g-file"))]
     to_stdout: bool,
 
-    /// Silent mode (suppress informational messages)
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Silent mode (suppress informational messages)"))]
     silent: bool,
 
-    /// Suppress retrieval, just verify SID exists
-    #[arg(short = 'g')]
+    #[arg(short = 'g', help = gettext("Suppress retrieval, just verify SID exists"))]
     no_get: bool,
 
-    /// Prefix each line with SID of inserting delta
-    #[arg(short = 'm')]
+    #[arg(short = 'm', help = gettext("Prefix each line with SID of inserting delta"))]
     show_sid: bool,
 
-    /// Prefix each line with module name
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Prefix each line with module name"))]
     show_module: bool,
 
-    /// SCCS files to process
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to process"))]
     files: Vec<PathBuf>,
 }
 

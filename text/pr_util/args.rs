@@ -21,155 +21,83 @@ use std::str::FromStr;
 #[derive(Parser)]
 #[command(version, about = gettext("pr - print files"), disable_help_flag = true)]
 pub struct Args {
-    /// Begin output at page number FIRST_PAGE of the formatted input. Stop
-    /// printing at LAST_PAGE if present.
-    #[arg(long, value_parser = parse_pages, value_name = "FIRST_PAGE[:LAST_PAGE]")]
+    #[arg(long, value_parser = parse_pages, value_name = "FIRST_PAGE[:LAST_PAGE]",
+          help = gettext("Begin output at page number FIRST_PAGE, stop at LAST_PAGE if present"))]
     pages: Option<(usize, Option<usize>)>,
 
-    /// Produce multi-column output that is arranged in COLUMN columns (the
-    /// default shall be 1) and is written down each column in the order in
-    /// which the text is received from the input file. This option should not
-    /// be used with -m. The options -e and -i shall be assumed for multiple
-    /// text-column output. Whether or not text columns are produced with
-    /// identical vertical lengths is unspecified, but a text column shall never
-    /// exceed the length of the page (see the -l option). When used with -t,
-    /// use the minimum number of lines to write the output.
-    #[arg(long, group = "multi_column", conflicts_with = "merge")]
+    #[arg(long, group = "multi_column", conflicts_with = "merge",
+          help = gettext("Produce multi-column output arranged in COLUMN columns"))]
     columns: Option<usize>,
 
-    /// Modify the effect of the - column option so that the columns are filled
-    /// across the page in a round-robin order (for example, when column is 2,
-    /// the first input line heads column 1, the second heads column 2, the
-    /// third is the second line in column 1, and so on).
-    #[arg(short = 'a', long, requires = "columns")]
+    #[arg(short = 'a', long, requires = "columns",
+          help = gettext("Fill columns across the page in round-robin order"))]
     across: bool,
 
-    /// Produce output that is double-spaced; append an extra <newline>
-    /// following every <newline> found in the input.
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, help = gettext("Produce double-spaced output"))]
     double_space: bool,
 
-    /// Expand each input <tab> to the next greater column position specified by
-    /// the formula n* WIDTH+1, where n is an integer > 0. If WIDTH is zero or
-    /// is omitted, it shall default to 8. All <tab> characters in the input
-    /// shall be expanded into the appropriate number of <space> characters. If
-    /// any non-digit character, CHAR, is specified, it shall be used as the
-    /// input <tab>. If the first character of the -e option-argument is a digit,
-    /// the entire option-argument shall be assumed to be gap.
-    #[arg(short = 'e', long, value_name = "[CHAR][WIDTH]")]
+    #[arg(short = 'e', long, value_name = "[CHAR][WIDTH]",
+          help = gettext("Expand input tabs to column positions"))]
     expand_tabs: Option<ExpandTabsArg>,
 
-    /// Use a <form-feed> for new pages, instead of the default behavior that
-    /// uses a sequence of <newline> characters. Pause before beginning the
-    /// first page if the standard output is associated with a terminal.
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Use form-feed for new pages, pause before first page"))]
     form_feed_with_pause: bool,
 
-    /// Use a <form-feed> for new pages, instead of the default behavior that
-    /// uses a sequence of <newline> characters.
-    #[arg(short = 'F', long)]
+    #[arg(short = 'F', long, help = gettext("Use form-feed for new pages"))]
     form_feed: bool,
 
-    /// Use the string HEADER to replace the contents of the file operand in the
-    /// page header.
-    #[arg(short = 'h', long, value_name = "HEADER")]
+    #[arg(short = 'h', long, value_name = "HEADER",
+          help = gettext("Use string HEADER to replace the file name in page header"))]
     header: Option<String>,
 
-    /// In output, replace <space> characters with <tab> characters wherever one
-    /// or more adjacent <space> characters reach column positions WIDTH+1,
-    /// 2* WIDTH+1, 3* WIDTH+1, and so on. If WIDTH is zero or is omitted,
-    /// default tab  settings at every eighth column position shall be assumed.
-    /// If any non-digit character, CHAR, is specified, it shall be used as the
-    /// output <tab>. If the first character of the -i option-argument is a
-    /// digit, the entire option-argument shall be assumed to be WIDTH.
-    #[arg(short = 'i', long, value_name = "[CHAR][WIDTH]")]
+    #[arg(short = 'i', long, value_name = "[CHAR][WIDTH]",
+          help = gettext("Replace spaces with tabs in output"))]
     output_tabs: Option<OutputTabsArg>,
 
-    /// Override the 66-line default and reset the page length to lines. If
-    /// lines is not greater than the sum of both the header and trailer depths
-    /// (in lines), the pr utility shall suppress both the header and trailer,
-    /// as if the -t option were in effect.
-    #[arg(short = 'l', long, value_name = "PAGE_LENGTH")]
+    #[arg(short = 'l', long, value_name = "PAGE_LENGTH",
+          help = gettext("Override the 66-line default page length"))]
     length: Option<usize>,
 
-    /// Merge files. Standard output shall be formatted so the pr utility writes
-    /// one line from each file specified by a file operand, side by side into
-    /// text columns of equal fixed widths, in terms of the number of column
-    /// positions. Implementations shall support merging of at least nine file
-    /// operands.
-    #[arg(short = 'm', long, group = "multi_column")]
+    #[arg(short = 'm', long, group = "multi_column",
+          help = gettext("Merge files, printing one line from each file side by side"))]
     merge: bool,
 
-    /// Provide DIGITS-digit line numbering (default for DIGITS shall be 5). The
-    /// number shall occupy the first DIGITS column positions of each text
-    /// column of default output or each line of -m output. If SEP (any
-    /// non-digit character) is given, it shall be appended to the line number
-    /// to separate it from whatever follows (default for SEP is a <tab>).
-    #[arg(short = 'n', long, value_name = "[SEP][DIGITS]")]
+    #[arg(short = 'n', long, value_name = "[SEP][DIGITS]",
+          help = gettext("Provide line numbering with specified width and separator"))]
     number_lines: Option<NumberLinesArg>,
 
-    /// Start counting with NUMBER at 1st line of first page printed.
-    #[arg(short = 'N', long, default_value_t = 1, value_name = "NUMBER")]
+    #[arg(short = 'N', long, default_value_t = 1, value_name = "NUMBER",
+          help = gettext("Start line counting with NUMBER at first line of first page"))]
     first_line_number: usize,
 
-    /// Each line of output shall be preceded by MARGIN <space> characters. If
-    /// the -o option is not specified, the default MARGIN shall be zero. The
-    /// space taken is in addition to the output line width (see the -w option
-    /// below).
-    #[arg(short = 'o', long, default_value_t = 0, value_name = "MARGIN")]
+    #[arg(short = 'o', long, default_value_t = 0, value_name = "MARGIN",
+          help = gettext("Precede each line with MARGIN space characters"))]
     indent: usize,
 
-    /// Pause before beginning each page if the standard output is directed to a
-    /// terminal (pr shall write an <alert> to standard error and wait for a
-    /// <carriage-return> to be read on /dev/tty).
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long, help = gettext("Pause before beginning each page on terminal output"))]
     pause: bool,
 
-    /// Write no diagnostic reports on failure to open files.
-    #[arg(short = 'r', long)]
+    #[arg(short = 'r', long, help = gettext("Write no diagnostic reports on failure to open files"))]
     no_file_warnings: bool,
 
-    /// Separate text columns by the single character CHAR instead of by the
-    /// appropriate number of <space> characters.
-    #[arg(
-        short = 's',
-        long,
-        value_parser = parse_separator,
-        value_name = "CHAR",
-        requires = "multi_column"
-    )]
+    #[arg(short = 's', long, value_parser = parse_separator, value_name = "CHAR", requires = "multi_column",
+          help = gettext("Separate text columns by single character CHAR"))]
     separator: Option<char>,
 
-    /// Write neither the five-line identifying header nor the five-line trailer
-    /// usually supplied for each page. Quit writing after the last line of each
-    /// file without spacing to the end of the page.
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, help = gettext("Omit header and trailer, quit after last line"))]
     omit_header: bool,
 
-    /// Set the width of the line to PAGE_WIDTH column positions for multiple
-    /// text-column output only. If the -w option is not specified and the -s
-    /// option is not specified, the default width shall be 72. If the -w option
-    /// is not specified and the -s option is specified, the default width shall
-    /// be 512.
-    #[arg(
-        short = 'w',
-        long,
-        value_name = "PAGE_WIDTH",
-        requires = "multi_column"
-    )]
+    #[arg(short = 'w', long, value_name = "PAGE_WIDTH", requires = "multi_column",
+          help = gettext("Set line width to PAGE_WIDTH for multi-column output"))]
     width: Option<usize>,
 
-    /// Enable pretty printing of headers.
-    #[arg(long)]
+    #[arg(long, help = gettext("Enable pretty printing of headers"))]
     prettify_headers: bool,
 
-    /// Print help
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
 
-    /// A pathname of a file to be written. If no file operands are specified,
-    /// or if a file operand is '-', the standard input shall be used.
-    #[arg()]
+    #[arg(help = gettext("Files to print (use - for stdin)"))]
     file: Vec<PathBuf>,
 }
 

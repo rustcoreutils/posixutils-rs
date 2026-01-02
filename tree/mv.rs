@@ -27,19 +27,17 @@ use std::{
 #[derive(Parser)]
 #[command(version, about = gettext("mv - move files"))]
 struct Args {
-    /// Do not prompt for confirmation if the destination path exists
-    #[arg(short, long, overrides_with_all = ["force", "interactive"])]
+    #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Do not prompt for confirmation if the destination path exists"))]
     force: bool,
 
-    /// Prompt for confirmation if the destination path exists.
-    #[arg(short, long, overrides_with_all = ["force", "interactive"])]
+    #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Prompt for confirmation if the destination path exists"))]
     interactive: bool,
 
-    /// Source(s) and target of move(s)
     // `PathBuf` instead of `String` avoids the inefficient reconverting of a
     // `String` to a `&Path` when calling the `std::fs` functions. It also
     // facilitates processing filenames that are non-UTF8 but are still valid in
     // Unix.
+    #[arg(help = gettext("Source(s) and target of move(s)"))]
     files: Vec<PathBuf>,
 }
 

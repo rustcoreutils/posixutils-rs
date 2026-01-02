@@ -25,24 +25,19 @@ use std::process::ExitCode;
     override_usage = "uustat [-q|-k jobid|-r jobid]\n       uustat [-s system] [-u user]"
 )]
 struct Args {
-    /// Report queue summary (jobs per system)
-    #[arg(short = 'q', conflicts_with_all = ["kill_job", "rejuvenate_job", "system", "user"])]
+    #[arg(short = 'q', conflicts_with_all = ["kill_job", "rejuvenate_job", "system", "user"], help = gettext("Report queue summary (jobs per system)"))]
     queue_summary: bool,
 
-    /// Kill (remove) the specified job
-    #[arg(short = 'k', value_name = "JOBID", conflicts_with_all = ["queue_summary", "rejuvenate_job", "system", "user"])]
+    #[arg(short = 'k', value_name = "JOBID", conflicts_with_all = ["queue_summary", "rejuvenate_job", "system", "user"], help = gettext("Kill (remove) the specified job"))]
     kill_job: Option<String>,
 
-    /// Rejuvenate (touch) the specified job
-    #[arg(short = 'r', value_name = "JOBID", conflicts_with_all = ["queue_summary", "kill_job", "system", "user"])]
+    #[arg(short = 'r', value_name = "JOBID", conflicts_with_all = ["queue_summary", "kill_job", "system", "user"], help = gettext("Rejuvenate (touch) the specified job"))]
     rejuvenate_job: Option<String>,
 
-    /// Filter jobs by system name
-    #[arg(short = 's', value_name = "SYSTEM", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"])]
+    #[arg(short = 's', value_name = "SYSTEM", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"], help = gettext("Filter jobs by system name"))]
     system: Option<String>,
 
-    /// Filter jobs by user name
-    #[arg(short = 'u', value_name = "USER", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"])]
+    #[arg(short = 'u', value_name = "USER", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"], help = gettext("Filter jobs by user name"))]
     user: Option<String>,
 }
 

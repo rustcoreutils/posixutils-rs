@@ -13,7 +13,7 @@
 //! into machine object (.mo) files for use by gettext functions.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use posixutils_i18n::gettext_lib::mo_file::MO_MAGIC_LE;
 use posixutils_i18n::gettext_lib::po_file::PoFile;
 use std::collections::HashMap;
@@ -26,45 +26,36 @@ use std::process::exit;
 #[derive(Parser)]
 #[command(
     version,
-    about = "msgfmt - compile message catalog to binary format",
+    about = gettext("msgfmt - compile message catalog to binary format"),
     disable_help_flag = true,
     disable_version_flag = true
 )]
 struct Args {
-    /// Check the PO file for validity
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Check the PO file for validity"))]
     check: bool,
 
-    /// Include fuzzy entries in the output
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Include fuzzy entries in the output"))]
     include_fuzzy: bool,
 
-    /// Append .mo suffix to output file names
-    #[arg(short = 'S')]
+    #[arg(short = 'S', help = gettext("Append .mo suffix to output file names"))]
     add_suffix: bool,
 
-    /// Verbose mode - print warnings
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Verbose mode - print warnings"))]
     verbose: bool,
 
-    /// Add directory to search path for input files
-    #[arg(short = 'D', action = clap::ArgAction::Append)]
+    #[arg(short = 'D', action = clap::ArgAction::Append, help = gettext("Add directory to search path for input files"))]
     directories: Vec<PathBuf>,
 
-    /// Output file name
-    #[arg(short = 'o', long = "output-file")]
+    #[arg(short = 'o', long = "output-file", help = gettext("Output file name"))]
     output: Option<PathBuf>,
 
-    /// Print help
-    #[arg(short, long, action = clap::ArgAction::HelpLong)]
+    #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
     help: Option<bool>,
 
-    /// Print version
-    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    /// Input .po files
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("Input .po files"))]
     files: Vec<PathBuf>,
 }
 

@@ -25,20 +25,16 @@ use std::{
 #[derive(Parser)]
 #[command(version, about = gettext("rm - remove directory entries"))]
 struct Args {
-    /// Do not prompt for confirmation.
-    #[arg(short, long, overrides_with_all = ["force", "interactive"])]
+    #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Do not prompt for confirmation"))]
     force: bool,
 
-    /// Prompt for confirmation.
-    #[arg(short, long, overrides_with_all = ["force", "interactive"])]
+    #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Prompt for confirmation"))]
     interactive: bool,
 
-    /// Remove file hierarchies.
-    #[arg(short, visible_short_alias = 'R', long)]
+    #[arg(short, visible_short_alias = 'R', long, help = gettext("Remove file hierarchies"))]
     recurse: bool,
 
-    /// Filepaths to remove
-    #[arg(value_parser = parse_pathbuf)]
+    #[arg(value_parser = parse_pathbuf, help = gettext("Filepaths to remove"))]
     files: Vec<PathBuf>,
 }
 

@@ -21,12 +21,10 @@ const PWD_ENV: &str = "PWD";
 #[derive(Parser)]
 #[command(version, about = gettext("pwd - return working directory name"))]
 struct Args {
-    /// Count number of bytes in each file
-    #[arg(short = 'L', long)]
+    #[arg(short = 'L', long, help = gettext("Use PWD from environment if valid"))]
     env: bool,
 
-    /// Count number of bytes in each file
-    #[arg(short = 'P', long)]
+    #[arg(short = 'P', long, help = gettext("Use current working directory from process"))]
     process: bool,
 }
 

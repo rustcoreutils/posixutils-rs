@@ -20,19 +20,16 @@ use std::path::Path;
 #[derive(clap::Args)]
 #[group(required = false, multiple = false)]
 struct InsertArgs {
-    /// Insert the files after the specified member
-    #[arg(short = 'a')]
+    #[arg(short = 'a', help = gettext("Insert the files after the specified member"))]
     insert_after: bool,
 
-    /// Insert the files before the specified member
-    #[arg(short = 'b', short_alias = 'i')]
+    #[arg(short = 'b', short_alias = 'i', help = gettext("Insert the files before the specified member"))]
     insert_before: bool,
 }
 
 #[derive(clap::Args)]
 struct DeleteArgs {
-    /// Give verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
     archive: OsString,
@@ -49,12 +46,10 @@ struct MoveArgs {
 
 #[derive(clap::Args)]
 struct PrintArgs {
-    /// Give verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
-    /// Force regeneration of the archive's symbol table
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Force regeneration of the archive's symbol table"))]
     regenerate_symbol_table: bool,
 
     archive: OsString,
@@ -63,12 +58,10 @@ struct PrintArgs {
 
 #[derive(clap::Args)]
 struct QuickAppendArgs {
-    /// Suppress archive creation diagnostics
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Suppress archive creation diagnostics"))]
     no_create_message: bool,
 
-    /// Give verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
     archive: String,
@@ -77,16 +70,13 @@ struct QuickAppendArgs {
 
 #[derive(clap::Args)]
 struct ReplaceArgs {
-    /// Suppress archive creation diagnostics
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Suppress archive creation diagnostics"))]
     no_create_message: bool,
 
-    /// Update older files in the archive
-    #[arg(short = 'u')]
+    #[arg(short = 'u', help = gettext("Update older files in the archive"))]
     update_if_not_newer: bool,
 
-    /// Give verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
     #[command(flatten)]
@@ -97,12 +87,10 @@ struct ReplaceArgs {
 
 #[derive(clap::Args)]
 struct ListArgs {
-    /// Give verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
-    /// Force regeneration of the archive's symbol table
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Force regeneration of the archive's symbol table"))]
     regenerate_symbol_table: bool,
 
     archive: OsString,
@@ -111,20 +99,16 @@ struct ListArgs {
 
 #[derive(clap::Args)]
 struct ExtractArgs {
-    /// Give verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
-    /// Force regeneration of the archive's symbol table
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Force regeneration of the archive's symbol table"))]
     regenerate_symbol_table: bool,
 
-    /// Do not replace existing files
-    #[arg(short = 'C')]
+    #[arg(short = 'C', help = gettext("Do not replace existing files"))]
     dont_replace_files: bool,
 
-    /// Allow truncation of file names from the archive
-    #[arg(short = 'T')]
+    #[arg(short = 'T', help = gettext("Allow truncation of file names from the archive"))]
     allow_truncation: bool,
 
     archive: OsString,
@@ -133,26 +117,19 @@ struct ExtractArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Delete one or more files from the archive
-    #[command(name = "-d")]
+    #[command(name = "-d", about = gettext("Delete one or more files from the archive"))]
     Delete(DeleteArgs),
-    /// Move named files within the archive
-    #[command(name = "-m")]
+    #[command(name = "-m", about = gettext("Move named files within the archive"))]
     Move(MoveArgs),
-    /// Print the contents of the files in the archive
-    #[command(name = "-p")]
+    #[command(name = "-p", about = gettext("Print the contents of the files in the archive"))]
     Print(PrintArgs),
-    /// Append files to the archive without checking for duplicates
-    #[command(name = "-q")]
+    #[command(name = "-q", about = gettext("Append files to the archive without checking for duplicates"))]
     QuickAppend(QuickAppendArgs),
-    /// Replace or add files to the archive
-    #[command(name = "-r")]
+    #[command(name = "-r", about = gettext("Replace or add files to the archive"))]
     Replace(ReplaceArgs),
-    /// List the contents of the archive
-    #[command(name = "-t")]
+    #[command(name = "-t", about = gettext("List the contents of the archive"))]
     List(ListArgs),
-    /// Extract files from the archive
-    #[command(name = "-x")]
+    #[command(name = "-x", about = gettext("Extract files from the archive"))]
     Extract(ExtractArgs),
 }
 

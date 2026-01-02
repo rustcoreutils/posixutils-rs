@@ -7,15 +7,13 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("unexpand - convert spaces to tabs"))]
 struct Args {
-    /// Convert all sequences of two or more spaces to tabs
-    #[arg(short = 'a')]
+    #[arg(short = 'a', help = gettext("Convert all sequences of two or more spaces to tabs"))]
     all_spaces: bool,
 
-    /// Specify tab stops
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Specify tab stops"))]
     tablist: Option<String>,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 }
 

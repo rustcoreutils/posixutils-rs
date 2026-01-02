@@ -1364,18 +1364,16 @@ mod macos {
 #[derive(Parser)]
 #[command(version, about = gettext("fuser - list process IDs of all processes that have one or more files open"))]
 struct Args {
-    /// The file is treated as a mount point and the utility shall report on any files open in the file system.
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Treat file as mount point, report on any files open in the file system"))]
     mount: bool,
-    /// The report shall be only for the named files.
-    #[arg(short = 'f')]
+
+    #[arg(short = 'f', help = gettext("Report only for the named files"))]
     named_files: bool,
-    /// The user name, in parentheses, associated with each process ID written to standard output shall be written to standard error.
-    #[arg(short = 'u')]
+
+    #[arg(short = 'u', help = gettext("Write user name associated with each process ID to standard error"))]
     user: bool,
 
-    #[arg(required = true, name = "FILE", num_args(0..))]
-    /// A pathname on which the file or file system is to be reported.
+    #[arg(required = true, name = "FILE", num_args(0..), help = gettext("Pathname on which the file or file system is to be reported"))]
     file: Vec<PathBuf>,
 }
 

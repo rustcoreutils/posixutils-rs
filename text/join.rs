@@ -18,38 +18,31 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("join - relational database operator"))]
 struct Args {
-    /// Additional lines to include when there are no matches
-    #[arg(short, default_value_t = 0)]
+    #[arg(short, default_value_t = 0, help = gettext("Additional lines to include when there are no matches"))]
     additional: u8,
 
-    /// Replace empty output fields with the specified string
-    #[arg(short)]
+    #[arg(short, help = gettext("Replace empty output fields with the specified string"))]
     empty: Option<String>,
 
-    /// Output fields in specified order
-    #[arg(short, value_delimiter = ',')]
+    #[arg(short, value_delimiter = ',', help = gettext("Output fields in specified order"))]
     order: Option<Vec<String>>,
 
-    /// Field separator character
-    #[arg(short = 't', default_value_t = ' ')]
+    #[arg(short = 't', default_value_t = ' ', help = gettext("Field separator character"))]
     separator: char,
 
-    /// Output only unpairable lines from file_number
-    #[arg(short = 'v', default_value_t = 0)]
+    #[arg(short = 'v', default_value_t = 0, help = gettext("Output only unpairable lines from file_number"))]
     unpairable: u8,
 
-    /// Join on the specified field of file 1
-    #[arg(short = '1', default_value_t = 1)]
+    #[arg(short = '1', default_value_t = 1, help = gettext("Join on the specified field of file 1"))]
     field1: usize,
 
-    /// Join on the specified field of file 2
-    #[arg(short = '2', default_value_t = 1)]
+    #[arg(short = '2', default_value_t = 1, help = gettext("Join on the specified field of file 2"))]
     field2: usize,
 
-    /// File 1
+    #[arg(help = gettext("File 1"))]
     file1: PathBuf,
 
-    /// File 2
+    #[arg(help = gettext("File 2"))]
     file2: PathBuf,
 }
 

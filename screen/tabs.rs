@@ -34,68 +34,49 @@ struct Args {
     )]
     rep_1: bool,
 
-    /// Specify repetitive tab stops separated by (2) columns
-    #[arg(short = '2', long)]
+    #[arg(short = '2', long, help = gettext("Specify repetitive tab stops separated by (2) columns"))]
     rep_2: bool,
 
-    /// Specify repetitive tab stops separated by (3) columns
-    #[arg(short = '3', long)]
+    #[arg(short = '3', long, help = gettext("Specify repetitive tab stops separated by (3) columns"))]
     rep_3: bool,
 
-    /// Specify repetitive tab stops separated by (4) columns
-    #[arg(short = '4', long)]
+    #[arg(short = '4', long, help = gettext("Specify repetitive tab stops separated by (4) columns"))]
     rep_4: bool,
 
-    /// Specify repetitive tab stops separated by (5) columns
-    #[arg(short = '5', long)]
+    #[arg(short = '5', long, help = gettext("Specify repetitive tab stops separated by (5) columns"))]
     rep_5: bool,
 
-    /// Specify repetitive tab stops separated by (6) columns
-    #[arg(short = '6', long)]
+    #[arg(short = '6', long, help = gettext("Specify repetitive tab stops separated by (6) columns"))]
     rep_6: bool,
 
-    /// Specify repetitive tab stops separated by (7) columns
-    #[arg(short = '7', long)]
+    #[arg(short = '7', long, help = gettext("Specify repetitive tab stops separated by (7) columns"))]
     rep_7: bool,
 
-    /// Specify repetitive tab stops separated by (8) columns
-    #[arg(short = '8', long)]
+    #[arg(short = '8', long, help = gettext("Specify repetitive tab stops separated by (8) columns"))]
     rep_8: bool,
 
-    /// Specify repetitive tab stops separated by (9) columns
-    #[arg(short = '9', long)]
+    #[arg(short = '9', long, help = gettext("Specify repetitive tab stops separated by (9) columns"))]
     rep_9: bool,
 
-    /// Assembler, applicable to some mainframes.
-    /// 1=[1,10,16,36,72]
-    /// 2=[1,10,16,40,72]
-    #[arg(short, long, default_missing_value="1", value_parser = clap::value_parser!(u8).range(1..=2))]
+    #[arg(short, long, default_missing_value="1", value_parser = clap::value_parser!(u8).range(1..=2), help = gettext("Assembler tab stops"))]
     assembler: Option<u8>,
 
-    /// COBOL, normal and compact formats.
-    /// 1=[1,8,12,16,20,55]
-    /// 2=[1,6,10,14,49]
-    /// 3=[1,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,67]
-    #[arg(short, long, default_missing_value="1", value_parser = clap::value_parser!(u8).range(1..=3))]
+    #[arg(short, long, default_missing_value="1", value_parser = clap::value_parser!(u8).range(1..=3), help = gettext("COBOL tab stops"))]
     cobol: Option<u8>,
 
-    /// FORTAN: [1,7,11,15,19,23]
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("FORTRAN tab stops: [1,7,11,15,19,23]"))]
     fortran: bool,
 
-    /// SNOBOL: [1,10,55]
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("SNOBOL tab stops: [1,10,55]"))]
     snobol: bool,
 
-    /// Assembler, applicable to some mainframes. [1,12,20,44]
-    #[arg(short = 'u')]
+    #[arg(short = 'u', help = gettext("Assembler tab stops: [1,12,20,44]"))]
     assembler_u: bool,
 
-    /// PL/1: [1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61]
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("PL/1 tab stops: [1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61]"))]
     pl1: bool,
 
-    /// Optional: A single command line argument that consists of one or more tab-stop values (n) separated by a separator character
+    #[arg(help = gettext("Tab-stop values separated by a separator character"))]
     tabstops: Option<String>,
 }
 

@@ -23,18 +23,17 @@ const N_C_GROUP: &str = "N_C_GROUP";
 #[derive(Parser)]
 #[command(version, about = gettext("head - copy the first part of files"))]
 struct Args {
-    /// The first <N> lines of each input file shall be copied to standard output (mutually exclusive with -c)
-    #[arg(long = "lines", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP)]
+    #[arg(long = "lines", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP,
+          help = gettext("The first <N> lines of each input file shall be copied to standard output (mutually exclusive with -c)"))]
     n: Option<usize>,
 
     // Note: -c was added to POSIX in POSIX.1-2024, but has been supported on most platforms since the late 1990s
     // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/head.html
-    //
-    /// The first <N> bytes of each input file shall be copied to standard output (mutually exclusive with -n)
-    #[arg(long = "bytes", short = 'c', value_parser = clap::value_parser!(usize), group = N_C_GROUP)]
+    #[arg(long = "bytes", short = 'c', value_parser = clap::value_parser!(usize), group = N_C_GROUP,
+          help = gettext("The first <N> bytes of each input file shall be copied to standard output (mutually exclusive with -n)"))]
     bytes_to_copy: Option<usize>,
 
-    /// Files to read as input.
+    #[arg(help = gettext("Files to read as input."))]
     files: Vec<PathBuf>,
 }
 

@@ -24,16 +24,14 @@ use std::slice::Iter;
 #[derive(Parser)]
 #[command(version, about = gettext("paste - merge corresponding or subsequent lines of files"))]
 struct Args {
-    /// Concatenate all of the lines from each input file into one line of output per file, in command line order
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Concatenate all of the lines from each input file into one line of output per file, in command line order"))]
     serial: bool,
 
-    /// Delimiter list
     // Other implementations use "delimiters" as the long form, so mirror that
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Delimiter list"))]
     delimiters: Option<String>,
 
-    /// One or more input files
+    #[arg(help = gettext("One or more input files"))]
     files: Vec<String>,
 }
 

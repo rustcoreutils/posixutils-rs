@@ -14,28 +14,22 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 #[derive(Parser)]
 #[command(version, about = gettext("uname - return system name"))]
 struct Args {
-    /// Behave as though all of the options -mnrsv were specified.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Behave as though all of the options -mnrsv were specified"))]
     all: bool,
 
-    /// Write the name of the hardware type on which the system is running to standard output.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write the name of the hardware type on which the system is running to standard output"))]
     machine: bool,
 
-    /// Write the name of this node within an implementation-defined communications network.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write the name of this node within an implementation-defined communications network"))]
     node: bool,
 
-    /// Write the current release level of the operating system implementation.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write the current release level of the operating system implementation"))]
     release: bool,
 
-    /// Write the name of the implementation of the operating system.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write the name of the implementation of the operating system"))]
     system: bool,
 
-    /// Write the current version level of this release of the operating system implementation.
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v', long, help = gettext("Write the current version level of this release of the operating system implementation"))]
     osversion: bool,
 }
 

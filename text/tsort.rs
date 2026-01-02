@@ -19,7 +19,7 @@ use topological_sort::TopologicalSort;
 #[derive(Parser)]
 #[command(version, about = gettext("tsort - topological sort"))]
 struct Args {
-    /// File to read as input.
+    #[arg(help = gettext("File to read as input"))]
     file: Option<PathBuf>,
 }
 

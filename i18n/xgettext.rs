@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env::current_dir;
 use std::ffi::OsStr;
 use std::fs::{read_to_string, File};
-use std::io::Write;
+use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -19,7 +19,14 @@ use clap::Parser;
 #[cfg(debug_assertions)]
 use gettextrs::bindtextdomain;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use proc_macro2::{TokenStream, TokenTree};
+use posixutils_cc::parse::ast::{BlockItem, ExprKind, ExternalDecl, ForInit, Stmt};
+use posixutils_cc::parse::Parser as CParser;
+use posixutils_cc::strings::StringTable;
+use posixutils_cc::symbol::SymbolTable;
+use posixutils_cc::target::Target;
+use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::types::TypeTable;
+use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::{parse_file, parse_str, LitStr};
 
@@ -106,70 +113,288 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
-// #[cfg_attr(test, derive(Debug))]
-pub struct Walker {
-    keywords: HashSet<String>,
-    numbers_lines: bool,
-    /// msgid
-    messages: HashMap<String, Vec<Line>>,
+/// Parsed keyword specification for gettext functions
+#[derive(Debug, Clone)]
+pub struct KeywordSpec {
+    /// Function/macro name to look for
+    pub name: String,
+    /// 1-indexed position of msgid argument
+    pub msgid_arg: usize,
+    /// 1-indexed position of msgid_plural argument (for ngettext-style)
+    pub msgid_plural_arg: Option<usize>,
+    /// 1-indexed position of msgctxt argument (for pgettext-style)
+    pub msgctxt_arg: Option<usize>,
 }
 
-#[derive(Eq, PartialEq, PartialOrd, Ord)]
+impl KeywordSpec {
+    /// Parse a keyword spec string.
+    /// Formats:
+    /// - "id" -> msgid at arg 1
+    /// - "id:N" -> msgid at arg N
+    /// - "id:N,M" -> msgid at arg N, msgid_plural at arg M
+    /// - "id:Nc,M" -> msgctxt at arg N, msgid at arg M
+    /// - "id:Nc,M,P" -> msgctxt at arg N, msgid at arg M, msgid_plural at arg P
+    pub fn parse(spec: &str) -> Option<Self> {
+        if spec.is_empty() {
+            return None;
+        }
+
+        let (name, args) = if let Some(idx) = spec.find(':') {
+            (&spec[..idx], Some(&spec[idx + 1..]))
+        } else {
+            (spec, None)
+        };
+
+        if name.is_empty() {
+            return None;
+        }
+
+        let (msgid_arg, msgid_plural_arg, msgctxt_arg) = if let Some(args) = args {
+            Self::parse_args(args)?
+        } else {
+            (1, None, None)
+        };
+
+        Some(KeywordSpec {
+            name: name.to_string(),
+            msgid_arg,
+            msgid_plural_arg,
+            msgctxt_arg,
+        })
+    }
+
+    /// Parse the argument specification after the colon
+    fn parse_args(args: &str) -> Option<(usize, Option<usize>, Option<usize>)> {
+        let parts: Vec<&str> = args.split(',').collect();
+
+        match parts.len() {
+            1 => {
+                // "N" or "Nc"
+                let (num, is_context) = Self::parse_arg_part(parts[0])?;
+                if is_context {
+                    // Just context specified, need at least msgid
+                    None
+                } else {
+                    Some((num, None, None))
+                }
+            }
+            2 => {
+                // "N,M" or "Nc,M"
+                let (num1, is_ctx1) = Self::parse_arg_part(parts[0])?;
+                let (num2, is_ctx2) = Self::parse_arg_part(parts[1])?;
+                if is_ctx2 {
+                    // Second arg can't be context
+                    None
+                } else if is_ctx1 {
+                    // Context, msgid
+                    Some((num2, None, Some(num1)))
+                } else {
+                    // msgid, msgid_plural
+                    Some((num1, Some(num2), None))
+                }
+            }
+            3 => {
+                // "Nc,M,P" -> context, msgid, msgid_plural
+                let (num1, is_ctx1) = Self::parse_arg_part(parts[0])?;
+                let (num2, is_ctx2) = Self::parse_arg_part(parts[1])?;
+                let (num3, is_ctx3) = Self::parse_arg_part(parts[2])?;
+                if !is_ctx1 || is_ctx2 || is_ctx3 {
+                    None
+                } else {
+                    Some((num2, Some(num3), Some(num1)))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse a single argument part, returning (number, is_context)
+    fn parse_arg_part(part: &str) -> Option<(usize, bool)> {
+        let is_context = part.ends_with('c');
+        let num_str = if is_context {
+            &part[..part.len() - 1]
+        } else {
+            part
+        };
+        let num: usize = num_str.parse().ok()?;
+        if num == 0 {
+            return None;
+        }
+        Some((num, is_context))
+    }
+
+    /// Get default keyword specs for gettext family functions
+    pub fn defaults() -> Vec<KeywordSpec> {
+        vec![
+            // Basic gettext
+            KeywordSpec {
+                name: "gettext".to_string(),
+                msgid_arg: 1,
+                msgid_plural_arg: None,
+                msgctxt_arg: None,
+            },
+            // Plural forms
+            KeywordSpec {
+                name: "ngettext".to_string(),
+                msgid_arg: 1,
+                msgid_plural_arg: Some(2),
+                msgctxt_arg: None,
+            },
+            // Context-aware
+            KeywordSpec {
+                name: "pgettext".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: None,
+                msgctxt_arg: Some(1),
+            },
+            // Context-aware plural
+            KeywordSpec {
+                name: "npgettext".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: Some(3),
+                msgctxt_arg: Some(1),
+            },
+            // Domain-specific variants
+            KeywordSpec {
+                name: "dgettext".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: None,
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dngettext".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: Some(3),
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dcgettext".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: None,
+                msgctxt_arg: None,
+            },
+            KeywordSpec {
+                name: "dcngettext".to_string(),
+                msgid_arg: 2,
+                msgid_plural_arg: Some(3),
+                msgctxt_arg: None,
+            },
+        ]
+    }
+}
+
+/// A message key combining context and msgid for deduplication
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageKey {
+    pub msgctxt: Option<String>,
+    pub msgid: String,
+}
+
+/// An extracted message with all its metadata
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub msgctxt: Option<String>,
+    pub msgid: String,
+    pub msgid_plural: Option<String>,
+    pub locations: Vec<Line>,
+}
+
+impl Message {
+    pub fn key(&self) -> MessageKey {
+        MessageKey {
+            msgctxt: self.msgctxt.clone(),
+            msgid: self.msgid.clone(),
+        }
+    }
+}
+
+/// Source location of a message
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
 pub struct Line {
-    path: String,
-    line: usize,
+    pub path: String,
+    pub line: usize,
 }
 
 impl std::fmt::Display for Line {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.path, self.line)?;
-        Ok(())
+        write!(f, "{}:{}", self.path, self.line)
     }
 }
 
-// #[cfg(test)]
-impl std::fmt::Debug for Line {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)?;
-        Ok(())
-    }
+/// Main message extractor
+#[derive(Debug)]
+pub struct Walker {
+    keywords: HashMap<String, KeywordSpec>,
+    numbers_lines: bool,
+    extract_all: bool,
+    exclude_msgids: Vec<String>,
+    messages: HashMap<MessageKey, Message>,
 }
 
 impl Walker {
-    pub fn new(keyword_spec: Vec<String>, numbers_lines: bool) -> Self {
-        assert!(!keyword_spec.is_empty());
-        let mut keywords = HashSet::new();
-        for value in keyword_spec {
-            keywords.insert(value);
+    /// Create a new Walker from keyword specs
+    pub fn new(
+        keyword_specs: Vec<String>,
+        numbers_lines: bool,
+        extract_all: bool,
+        exclude_msgids: Vec<String>,
+    ) -> Self {
+        let mut keywords = HashMap::new();
+
+        // Check if default keywords should be disabled (empty string in specs)
+        let use_defaults = !keyword_specs.iter().any(|s| s.is_empty());
+
+        if use_defaults {
+            // Add default keywords
+            for spec in KeywordSpec::defaults() {
+                keywords.insert(spec.name.clone(), spec);
+            }
+        }
+
+        // Parse and add user-specified keywords
+        for spec_str in &keyword_specs {
+            if spec_str.is_empty() {
+                continue;
+            }
+            if let Some(spec) = KeywordSpec::parse(spec_str) {
+                keywords.insert(spec.name.clone(), spec);
+            }
         }
 
         Self {
             keywords,
             numbers_lines,
+            extract_all,
+            exclude_msgids,
             messages: HashMap::new(),
         }
     }
 
+    /// Process a Rust source file
     pub fn process_rust_file(&mut self, content: String, path: String) -> Result<(), syn::Error> {
         let file = parse_file(&content)?;
-        self.walk(file.into_token_stream(), &path);
+        if self.extract_all {
+            self.walk_all_strings(file.into_token_stream(), &path);
+        } else {
+            self.walk(file.into_token_stream(), &path);
+        }
         Ok(())
     }
 
+    /// Walk token stream looking for gettext function calls
     fn walk(&mut self, stream: TokenStream, path: &str) {
         let mut iter = stream.into_iter().peekable();
         while let Some(token) = iter.next() {
             match token {
                 TokenTree::Group(group) => {
-                    // going into recursion
                     self.walk(group.stream(), path);
                 }
                 TokenTree::Ident(ident) => {
-                    if self.keywords.contains(&ident.to_string()) {
+                    let name = ident.to_string();
+                    if let Some(spec) = self.keywords.get(&name).cloned() {
                         if let Some(TokenTree::Group(group)) = iter.peek() {
-                            if let Some(literal) = Self::extract(group.stream()) {
-                                self.push(literal, path);
+                            if let Some(msg) = self.extract_message(&spec, group.stream(), path) {
+                                self.push_message(msg);
                             }
                             let _ = iter.next();
                         }
@@ -180,58 +405,504 @@ impl Walker {
         }
     }
 
-    // literal string only
-    fn extract(stream: TokenStream) -> Option<LitStr> {
-        let mut iter = stream.into_iter().peekable();
-        if let Some(TokenTree::Literal(literal)) = iter.next() {
-            let span = literal.span();
-            let literal: Option<LitStr> = parse_str(&literal.to_string()).ok();
-            if let Some(mut literal) = literal {
-                literal.set_span(span);
-                return Some(literal);
+    /// Walk token stream extracting all string literals (for -a flag)
+    fn walk_all_strings(&mut self, stream: TokenStream, path: &str) {
+        for token in stream {
+            match token {
+                TokenTree::Group(group) => {
+                    self.walk_all_strings(group.stream(), path);
+                }
+                TokenTree::Literal(literal) => {
+                    let span = literal.span();
+                    if let Ok(lit_str) = parse_str::<LitStr>(&literal.to_string()) {
+                        let value = lit_str.value();
+                        if !self.exclude_msgids.contains(&value) {
+                            let msg = Message {
+                                msgctxt: None,
+                                msgid: value,
+                                msgid_plural: None,
+                                locations: if self.numbers_lines {
+                                    vec![Line {
+                                        path: path.to_string(),
+                                        line: span.start().line,
+                                    }]
+                                } else {
+                                    vec![]
+                                },
+                            };
+                            self.push_message(msg);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Extract arguments from a function call as a list of token streams
+    fn extract_args(stream: TokenStream) -> Vec<(TokenStream, Span)> {
+        let mut args = Vec::new();
+        let mut current_arg = Vec::new();
+        let mut first_span: Option<Span> = None;
+
+        for token in stream {
+            match &token {
+                TokenTree::Punct(p) if p.as_char() == ',' => {
+                    if !current_arg.is_empty() {
+                        let stream: TokenStream = current_arg.drain(..).collect();
+                        args.push((stream, first_span.unwrap_or_else(Span::call_site)));
+                        first_span = None;
+                    }
+                }
+                _ => {
+                    if first_span.is_none() {
+                        first_span = Some(token.span());
+                    }
+                    current_arg.push(token);
+                }
+            }
+        }
+
+        if !current_arg.is_empty() {
+            let stream: TokenStream = current_arg.drain(..).collect();
+            args.push((stream, first_span.unwrap_or_else(Span::call_site)));
+        }
+
+        args
+    }
+
+    /// Extract a string literal from a token stream (first literal only)
+    fn extract_string(stream: &TokenStream) -> Option<(String, Span)> {
+        for token in stream.clone() {
+            if let TokenTree::Literal(literal) = token {
+                let span = literal.span();
+                if let Ok(lit_str) = parse_str::<LitStr>(&literal.to_string()) {
+                    return Some((lit_str.value(), span));
+                }
             }
         }
         None
     }
 
-    fn push(&mut self, literal: LitStr, path: &str) {
-        let value = literal.value();
-        if self.numbers_lines {
-            let path = path.to_owned();
-            let lc = literal.span().start();
-            let line = lc.line;
-            // let column = lc.column;
-            let line = Line { path, line };
-            match self.messages.get_mut(&value) {
-                Some(v) => v.push(line),
-                None => {
-                    self.messages.insert(value, vec![line]);
-                }
-            };
+    /// Extract a message from a function call based on keyword spec
+    fn extract_message(
+        &self,
+        spec: &KeywordSpec,
+        stream: TokenStream,
+        path: &str,
+    ) -> Option<Message> {
+        let args = Self::extract_args(stream);
+
+        // Extract msgid (required)
+        let msgid_idx = spec.msgid_arg.checked_sub(1)?;
+        let (msgid_stream, msgid_span) = args.get(msgid_idx)?;
+        let (msgid, _) = Self::extract_string(msgid_stream)?;
+
+        // Check exclusion list
+        if self.exclude_msgids.contains(&msgid) {
+            return None;
+        }
+
+        // Extract msgid_plural (optional)
+        let msgid_plural = if let Some(plural_arg) = spec.msgid_plural_arg {
+            let plural_idx = plural_arg.checked_sub(1)?;
+            args.get(plural_idx)
+                .and_then(|(s, _)| Self::extract_string(s))
+                .map(|(s, _)| s)
         } else {
-            match self.messages.get_mut(&value) {
-                Some(_) => {}
-                None => {
-                    self.messages.insert(value, vec![]);
-                }
-            };
+            None
+        };
+
+        // Extract msgctxt (optional)
+        let msgctxt = if let Some(ctx_arg) = spec.msgctxt_arg {
+            let ctx_idx = ctx_arg.checked_sub(1)?;
+            args.get(ctx_idx)
+                .and_then(|(s, _)| Self::extract_string(s))
+                .map(|(s, _)| s)
+        } else {
+            None
+        };
+
+        let locations = if self.numbers_lines {
+            vec![Line {
+                path: path.to_string(),
+                line: msgid_span.start().line,
+            }]
+        } else {
+            vec![]
+        };
+
+        Some(Message {
+            msgctxt,
+            msgid,
+            msgid_plural,
+            locations,
+        })
+    }
+
+    /// Add a message to the collection, merging with existing if present
+    fn push_message(&mut self, msg: Message) {
+        let key = msg.key();
+        if let Some(existing) = self.messages.get_mut(&key) {
+            // Merge locations
+            existing.locations.extend(msg.locations);
+            // Prefer existing msgid_plural if set, otherwise use new one
+            if existing.msgid_plural.is_none() {
+                existing.msgid_plural = msg.msgid_plural;
+            }
+        } else {
+            self.messages.insert(key, msg);
         }
     }
 
+    /// Sort locations within each message
     pub fn sort(&mut self) {
         if !self.numbers_lines {
             return;
         }
-        for lines in self.messages.values_mut() {
-            lines.sort();
+        for msg in self.messages.values_mut() {
+            msg.locations.sort();
         }
     }
 
+    /// Escape a string for .pot file format
     fn escape(value: &str) -> String {
         format!(
             "\"{}\"",
-            value.replace("\"", "\\\"").replace("\n", "\\n\"\n\"")
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n\"\n\"")
         )
+    }
+
+    /// Process a C source file
+    pub fn process_c_file(
+        &mut self,
+        content: &[u8],
+        path: String,
+        streams: &mut StreamTable,
+    ) -> Result<(), String> {
+        // Create stream
+        let stream_id = streams.add(path.clone());
+
+        // Create string table for identifier interning
+        let mut strings = StringTable::new();
+
+        // Tokenize
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(content, stream_id, &mut strings);
+            tokenizer.tokenize()
+        };
+
+        // Preprocess
+        let target = Target::host();
+        let preprocessed = preprocess_with_defines(
+            tokens,
+            &target,
+            &mut strings,
+            &path,
+            &PreprocessConfig {
+                defines: &[],
+                undefines: &[],
+                include_paths: &[],
+                no_std_inc: true,
+                no_builtin_inc: true,
+            },
+        );
+
+        // Create symbol table and type table
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(target.pointer_width);
+
+        // Parse
+        let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
+        let ast = match parser.parse_translation_unit() {
+            Ok(ast) => ast,
+            Err(e) => {
+                return Err(format!("Parse error in {}: {:?}", path, e));
+            }
+        };
+
+        // Walk AST to extract gettext calls
+        for item in &ast.items {
+            match item {
+                ExternalDecl::FunctionDef(func) => {
+                    self.extract_from_c_stmt(&func.body, &strings, streams, &path);
+                }
+                ExternalDecl::Declaration(decl) => {
+                    for d in &decl.declarators {
+                        if let Some(init) = &d.init {
+                            self.extract_from_c_expr(init, &strings, streams, &path);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract gettext calls from a C expression
+    fn extract_from_c_expr(
+        &mut self,
+        expr: &posixutils_cc::parse::ast::Expr,
+        strings: &StringTable,
+        streams: &StreamTable,
+        path: &str,
+    ) {
+        match &expr.kind {
+            ExprKind::Call { func, args } => {
+                // Check if this is a gettext-family function call
+                if let ExprKind::Ident { name } = &func.kind {
+                    let func_name = strings.get(*name).to_string();
+                    if let Some(spec) = self.keywords.get(&func_name).cloned() {
+                        // Extract message based on keyword spec
+                        if let Some(msg) = self.extract_c_message(
+                            &spec,
+                            args,
+                            strings,
+                            streams,
+                            path,
+                            expr.pos.line,
+                        ) {
+                            self.push_message(msg);
+                        }
+                    }
+                }
+                // Recurse into arguments
+                for arg in args {
+                    self.extract_from_c_expr(arg, strings, streams, path);
+                }
+            }
+            ExprKind::StringLit(s) => {
+                // Handle -a flag (extract all strings)
+                if self.extract_all && !self.exclude_msgids.contains(s) {
+                    let msg = Message {
+                        msgctxt: None,
+                        msgid: s.clone(),
+                        msgid_plural: None,
+                        locations: if self.numbers_lines {
+                            vec![Line {
+                                path: path.to_string(),
+                                line: expr.pos.line as usize,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    };
+                    self.push_message(msg);
+                }
+            }
+            ExprKind::Unary { operand, .. } => {
+                self.extract_from_c_expr(operand, strings, streams, path);
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.extract_from_c_expr(left, strings, streams, path);
+                self.extract_from_c_expr(right, strings, streams, path);
+            }
+            ExprKind::Assign { target, value, .. } => {
+                self.extract_from_c_expr(target, strings, streams, path);
+                self.extract_from_c_expr(value, strings, streams, path);
+            }
+            ExprKind::PostInc(e) | ExprKind::PostDec(e) => {
+                self.extract_from_c_expr(e, strings, streams, path);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.extract_from_c_expr(cond, strings, streams, path);
+                self.extract_from_c_expr(then_expr, strings, streams, path);
+                self.extract_from_c_expr(else_expr, strings, streams, path);
+            }
+            ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
+                self.extract_from_c_expr(expr, strings, streams, path);
+            }
+            ExprKind::Index { array, index } => {
+                self.extract_from_c_expr(array, strings, streams, path);
+                self.extract_from_c_expr(index, strings, streams, path);
+            }
+            ExprKind::Cast { expr, .. } => {
+                self.extract_from_c_expr(expr, strings, streams, path);
+            }
+            ExprKind::SizeofExpr(e) => {
+                self.extract_from_c_expr(e, strings, streams, path);
+            }
+            ExprKind::Comma(exprs) => {
+                for e in exprs {
+                    self.extract_from_c_expr(e, strings, streams, path);
+                }
+            }
+            ExprKind::InitList { elements } => {
+                for elem in elements {
+                    self.extract_from_c_expr(&elem.value, strings, streams, path);
+                }
+            }
+            ExprKind::CompoundLiteral { elements, .. } => {
+                for elem in elements {
+                    self.extract_from_c_expr(&elem.value, strings, streams, path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract gettext calls from a C statement
+    fn extract_from_c_stmt(
+        &mut self,
+        stmt: &Stmt,
+        strings: &StringTable,
+        streams: &StreamTable,
+        path: &str,
+    ) {
+        match stmt {
+            Stmt::Empty => {}
+            Stmt::Expr(expr) => {
+                self.extract_from_c_expr(expr, strings, streams, path);
+            }
+            Stmt::Block(items) => {
+                for item in items {
+                    match item {
+                        BlockItem::Statement(s) => {
+                            self.extract_from_c_stmt(s, strings, streams, path);
+                        }
+                        BlockItem::Declaration(decl) => {
+                            for d in &decl.declarators {
+                                if let Some(init) = &d.init {
+                                    self.extract_from_c_expr(init, strings, streams, path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::If {
+                cond,
+                then_stmt,
+                else_stmt,
+            } => {
+                self.extract_from_c_expr(cond, strings, streams, path);
+                self.extract_from_c_stmt(then_stmt, strings, streams, path);
+                if let Some(else_s) = else_stmt {
+                    self.extract_from_c_stmt(else_s, strings, streams, path);
+                }
+            }
+            Stmt::While { cond, body } => {
+                self.extract_from_c_expr(cond, strings, streams, path);
+                self.extract_from_c_stmt(body, strings, streams, path);
+            }
+            Stmt::DoWhile { body, cond } => {
+                self.extract_from_c_stmt(body, strings, streams, path);
+                self.extract_from_c_expr(cond, strings, streams, path);
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+            } => {
+                if let Some(i) = init {
+                    match i {
+                        ForInit::Expression(e) => {
+                            self.extract_from_c_expr(e, strings, streams, path);
+                        }
+                        ForInit::Declaration(d) => {
+                            for decl in &d.declarators {
+                                if let Some(init_expr) = &decl.init {
+                                    self.extract_from_c_expr(init_expr, strings, streams, path);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = cond {
+                    self.extract_from_c_expr(c, strings, streams, path);
+                }
+                if let Some(p) = post {
+                    self.extract_from_c_expr(p, strings, streams, path);
+                }
+                self.extract_from_c_stmt(body, strings, streams, path);
+            }
+            Stmt::Switch { expr, body } => {
+                self.extract_from_c_expr(expr, strings, streams, path);
+                self.extract_from_c_stmt(body, strings, streams, path);
+            }
+            Stmt::Case(expr) => {
+                self.extract_from_c_expr(expr, strings, streams, path);
+            }
+            Stmt::Default => {}
+            Stmt::Return(Some(expr)) => {
+                self.extract_from_c_expr(expr, strings, streams, path);
+            }
+            Stmt::Label { stmt, .. } => {
+                self.extract_from_c_stmt(stmt, strings, streams, path);
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract a message from C function call arguments based on keyword spec
+    fn extract_c_message(
+        &self,
+        spec: &KeywordSpec,
+        args: &[posixutils_cc::parse::ast::Expr],
+        _strings: &StringTable,
+        _streams: &StreamTable,
+        path: &str,
+        line: u32,
+    ) -> Option<Message> {
+        // Extract msgid (required)
+        let msgid_idx = spec.msgid_arg.checked_sub(1)?;
+        let msgid = Self::extract_c_string(&args.get(msgid_idx)?.kind)?;
+
+        // Check exclusion list
+        if self.exclude_msgids.contains(&msgid) {
+            return None;
+        }
+
+        // Extract msgid_plural (optional)
+        let msgid_plural = if let Some(plural_arg) = spec.msgid_plural_arg {
+            let plural_idx = plural_arg.checked_sub(1)?;
+            args.get(plural_idx)
+                .and_then(|e| Self::extract_c_string(&e.kind))
+        } else {
+            None
+        };
+
+        // Extract msgctxt (optional)
+        let msgctxt = if let Some(ctx_arg) = spec.msgctxt_arg {
+            let ctx_idx = ctx_arg.checked_sub(1)?;
+            args.get(ctx_idx)
+                .and_then(|e| Self::extract_c_string(&e.kind))
+        } else {
+            None
+        };
+
+        let locations = if self.numbers_lines {
+            vec![Line {
+                path: path.to_string(),
+                line: line as usize,
+            }]
+        } else {
+            vec![]
+        };
+
+        Some(Message {
+            msgctxt,
+            msgid,
+            msgid_plural,
+            locations,
+        })
+    }
+
+    /// Extract string literal from a C expression kind
+    fn extract_c_string(kind: &ExprKind) -> Option<String> {
+        match kind {
+            ExprKind::StringLit(s) => Some(s.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -239,19 +910,68 @@ impl std::fmt::Display for Walker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut vec: Vec<_> = self.messages.iter().collect();
         vec.sort_by(|a, b| a.0.cmp(b.0));
-        for (str, lines) in vec {
-            debug_assert!(
-                (self.numbers_lines && !lines.is_empty())
-                    || (!self.numbers_lines && lines.is_empty())
-            );
-            for line in lines {
+        for (_, msg) in vec {
+            // Write location comments
+            for line in &msg.locations {
                 writeln!(f, "#: {}", line)?;
             }
-            writeln!(f, "msgid {}", Self::escape(str))?;
-            writeln!(f, "msgstr \"\"")?;
+
+            // Write msgctxt if present
+            if let Some(ref ctx) = msg.msgctxt {
+                writeln!(f, "msgctxt {}", Self::escape(ctx))?;
+            }
+
+            // Write msgid
+            writeln!(f, "msgid {}", Self::escape(&msg.msgid))?;
+
+            // Write msgid_plural and msgstr[n] if plural form
+            if let Some(ref plural) = msg.msgid_plural {
+                writeln!(f, "msgid_plural {}", Self::escape(plural))?;
+                writeln!(f, "msgstr[0] \"\"")?;
+                writeln!(f, "msgstr[1] \"\"")?;
+            } else {
+                writeln!(f, "msgstr \"\"")?;
+            }
+
             writeln!(f)?;
         }
         Ok(())
+    }
+}
+
+/// Parse a .pot file and extract msgid strings for exclusion
+fn parse_exclude_file(path: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let content = read_to_string(path)?;
+    let mut msgids = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("msgid ") {
+            // Extract the string value
+            let value = rest.trim();
+            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                let unescaped = &value[1..value.len() - 1];
+                // Basic unescaping
+                let unescaped = unescaped
+                    .replace("\\\"", "\"")
+                    .replace("\\n", "\n")
+                    .replace("\\\\", "\\");
+                if !unescaped.is_empty() {
+                    msgids.push(unescaped);
+                }
+            }
+        }
+    }
+
+    Ok(msgids)
+}
+
+/// Parse existing .pot file for -j (join) option
+fn parse_existing_pot(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+    if path.exists() {
+        Ok(read_to_string(path)?)
+    } else {
+        Ok(String::new())
     }
 }
 
@@ -269,17 +989,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exit(1);
     }
 
-    let mut walker = Walker::new(args.keyword_spec, args.numbers_lines);
+    // Parse exclude file if specified
+    let exclude_msgids = if let Some(ref exclude_path) = args.exclude_file {
+        parse_exclude_file(exclude_path)?
+    } else {
+        Vec::new()
+    };
 
-    for path in args.files {
+    let mut walker = Walker::new(
+        args.keyword_spec,
+        args.numbers_lines,
+        args.all,
+        exclude_msgids,
+    );
+
+    // Stream table for C file processing
+    let mut streams = StreamTable::new();
+
+    for path in &args.files {
+        let path_str = path.to_string_lossy().to_string();
+
+        // Handle stdin
+        if path_str == "-" {
+            let mut content = Vec::new();
+            io::stdin().read_to_end(&mut content)?;
+            // Default to C for stdin (POSIX spec)
+            if let Err(e) = walker.process_c_file(&content, "<stdin>".to_string(), &mut streams) {
+                eprintln!("xgettext: {}", e);
+                exit(1);
+            }
+            continue;
+        }
+
         match path.extension().and_then(OsStr::to_str) {
             Some("rs") => {
-                let content = read_to_string(&path)?;
-                let path = path.into_os_string().into_string().unwrap();
-                walker.process_rust_file(content, path)?;
+                let content = read_to_string(path)?;
+                walker.process_rust_file(content, path_str)?;
+            }
+            Some("c") | Some("h") => {
+                let file = File::open(path)?;
+                let mut reader = BufReader::new(file);
+                let mut content = Vec::new();
+                reader.read_to_end(&mut content)?;
+                if let Err(e) = walker.process_c_file(&content, path_str, &mut streams) {
+                    eprintln!("xgettext: {}", e);
+                    exit(1);
+                }
             }
             _ => {
-                eprintln!("xgettext: {}", gettext("unsupported file type"));
+                eprintln!(
+                    "xgettext: {}: {}",
+                    path_str,
+                    gettext("unsupported file type")
+                );
                 exit(1);
             }
         }
@@ -287,13 +1049,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     walker.sort();
 
-    let output = args
+    let output_path = args
         .pathname
         .unwrap_or_else(|| current_dir().unwrap())
         .join(format!("{}.pot", args.default_domain));
 
-    let mut output = File::create(output)?;
-    write!(output, "{}", walker)?;
+    // Handle -j (join) option
+    let existing_content = if args.join {
+        parse_existing_pot(&output_path)?
+    } else {
+        String::new()
+    };
+
+    let new_content = format!("{}", walker);
+
+    let final_content = if args.join && !existing_content.is_empty() {
+        // Simple join: prepend existing content
+        // A more sophisticated implementation would merge and deduplicate
+        format!("{}{}", existing_content, new_content)
+    } else {
+        new_content
+    };
+
+    let mut output = File::create(output_path)?;
+    write!(output, "{}", final_content)?;
 
     exit(0)
 }
@@ -304,6 +1083,65 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    // KeywordSpec parsing tests
+    #[test]
+    fn test_keyword_spec_simple() {
+        let spec = KeywordSpec::parse("gettext").unwrap();
+        assert_eq!(spec.name, "gettext");
+        assert_eq!(spec.msgid_arg, 1);
+        assert_eq!(spec.msgid_plural_arg, None);
+        assert_eq!(spec.msgctxt_arg, None);
+    }
+
+    #[test]
+    fn test_keyword_spec_argnum() {
+        let spec = KeywordSpec::parse("dgettext:2").unwrap();
+        assert_eq!(spec.name, "dgettext");
+        assert_eq!(spec.msgid_arg, 2);
+        assert_eq!(spec.msgid_plural_arg, None);
+        assert_eq!(spec.msgctxt_arg, None);
+    }
+
+    #[test]
+    fn test_keyword_spec_plural() {
+        let spec = KeywordSpec::parse("ngettext:1,2").unwrap();
+        assert_eq!(spec.name, "ngettext");
+        assert_eq!(spec.msgid_arg, 1);
+        assert_eq!(spec.msgid_plural_arg, Some(2));
+        assert_eq!(spec.msgctxt_arg, None);
+    }
+
+    #[test]
+    fn test_keyword_spec_context() {
+        let spec = KeywordSpec::parse("pgettext:1c,2").unwrap();
+        assert_eq!(spec.name, "pgettext");
+        assert_eq!(spec.msgid_arg, 2);
+        assert_eq!(spec.msgid_plural_arg, None);
+        assert_eq!(spec.msgctxt_arg, Some(1));
+    }
+
+    #[test]
+    fn test_keyword_spec_context_plural() {
+        let spec = KeywordSpec::parse("npgettext:1c,2,3").unwrap();
+        assert_eq!(spec.name, "npgettext");
+        assert_eq!(spec.msgid_arg, 2);
+        assert_eq!(spec.msgid_plural_arg, Some(3));
+        assert_eq!(spec.msgctxt_arg, Some(1));
+    }
+
+    #[test]
+    fn test_keyword_spec_empty() {
+        assert!(KeywordSpec::parse("").is_none());
+    }
+
+    #[test]
+    fn test_keyword_spec_invalid() {
+        assert!(KeywordSpec::parse(":1").is_none());
+        assert!(KeywordSpec::parse("func:0").is_none());
+        assert!(KeywordSpec::parse("func:1c").is_none()); // context alone is invalid
+    }
+
+    // Walker tests
     #[test]
     fn test_process_rust_file() {
         let code = String::from(
@@ -312,15 +1150,19 @@ mod tests {
 }
 "#,
         );
-        let mut walker = Walker::new(vec!["gettext".into()], true);
+        let mut walker = Walker::new(vec!["gettext".into()], true, false, vec![]);
         walker
             .process_rust_file(code, "test_process_rust_file.rs".to_string())
             .unwrap();
-        assert_eq!(walker.messages.keys().len(), 1);
-        let lines = &walker.messages["Hello, world!"];
-        assert_eq!(lines.len(), 1);
+        assert_eq!(walker.messages.len(), 1);
+        let key = MessageKey {
+            msgctxt: None,
+            msgid: "Hello, world!".to_string(),
+        };
+        let msg = &walker.messages[&key];
+        assert_eq!(msg.locations.len(), 1);
         assert_eq!(
-            lines[0],
+            msg.locations[0],
             Line {
                 path: "test_process_rust_file.rs".into(),
                 line: 2
@@ -336,7 +1178,7 @@ mod tests {
 }
 "#,
         );
-        let mut walker = Walker::new(vec!["gettext".into()], true);
+        let mut walker = Walker::new(vec!["gettext".into()], true, false, vec![]);
         walker
             .process_rust_file(code, "test_process_rust_file_format.rs".to_string())
             .unwrap();
@@ -348,6 +1190,68 @@ msgstr ""
 
 "#
         );
+    }
+
+    #[test]
+    fn test_ngettext_extraction() {
+        let code = String::from(
+            r#"fn main() {
+    println!("{}", ngettext("One thing", "Multiple things", n));
+}
+"#,
+        );
+        let mut walker = Walker::new(vec!["ngettext:1,2".into()], true, false, vec![]);
+        walker
+            .process_rust_file(code, "test.rs".to_string())
+            .unwrap();
+        assert_eq!(walker.messages.len(), 1);
+        let key = MessageKey {
+            msgctxt: None,
+            msgid: "One thing".to_string(),
+        };
+        let msg = &walker.messages[&key];
+        assert_eq!(msg.msgid_plural, Some("Multiple things".to_string()));
+    }
+
+    #[test]
+    fn test_pgettext_extraction() {
+        let code = String::from(
+            r#"fn main() {
+    println!("{}", pgettext("Context", "Message"));
+}
+"#,
+        );
+        let mut walker = Walker::new(vec!["pgettext:1c,2".into()], true, false, vec![]);
+        walker
+            .process_rust_file(code, "test.rs".to_string())
+            .unwrap();
+        assert_eq!(walker.messages.len(), 1);
+        let key = MessageKey {
+            msgctxt: Some("Context".to_string()),
+            msgid: "Message".to_string(),
+        };
+        assert!(walker.messages.contains_key(&key));
+    }
+
+    #[test]
+    fn test_npgettext_extraction() {
+        let code = String::from(
+            r#"fn main() {
+    println!("{}", npgettext("Context", "One", "Many", n));
+}
+"#,
+        );
+        let mut walker = Walker::new(vec!["npgettext:1c,2,3".into()], true, false, vec![]);
+        walker
+            .process_rust_file(code, "test.rs".to_string())
+            .unwrap();
+        assert_eq!(walker.messages.len(), 1);
+        let key = MessageKey {
+            msgctxt: Some("Context".to_string()),
+            msgid: "One".to_string(),
+        };
+        let msg = &walker.messages[&key];
+        assert_eq!(msg.msgid_plural, Some("Many".to_string()));
     }
 
     #[test]
@@ -373,5 +1277,53 @@ msgstr ""
     fn test_escape2() {
         let value = Walker::escape("string \"string2\" string");
         assert_eq!(value, r#""string \"string2\" string""#);
+    }
+
+    #[test]
+    fn test_escape_backslash() {
+        let value = Walker::escape("path\\to\\file");
+        assert_eq!(value, r#""path\\to\\file""#);
+    }
+
+    #[test]
+    fn test_extract_all_strings() {
+        let code = String::from(
+            r#"fn main() {
+    let s = "string1";
+    let t = "string2";
+}
+"#,
+        );
+        let mut walker = Walker::new(vec!["gettext".into()], true, true, vec![]);
+        walker
+            .process_rust_file(code, "test.rs".to_string())
+            .unwrap();
+        assert_eq!(walker.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_exclude_msgids() {
+        let code = String::from(
+            r#"fn main() {
+    gettext("keep");
+    gettext("exclude");
+}
+"#,
+        );
+        let mut walker = Walker::new(
+            vec!["gettext".into()],
+            true,
+            false,
+            vec!["exclude".to_string()],
+        );
+        walker
+            .process_rust_file(code, "test.rs".to_string())
+            .unwrap();
+        assert_eq!(walker.messages.len(), 1);
+        let key = MessageKey {
+            msgctxt: None,
+            msgid: "keep".to_string(),
+        };
+        assert!(walker.messages.contains_key(&key));
     }
 }

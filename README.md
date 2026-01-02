@@ -151,6 +151,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
+ - [x] xgettext (i18n)
  - [x] yacc (Development)
  - [x] zcat (compress cat.)
 
@@ -202,7 +203,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tsort
  - [x] who
  - [x] xargs
- - [x] xgettext (i18n)
 
 ## Stage 0 - Not started
 

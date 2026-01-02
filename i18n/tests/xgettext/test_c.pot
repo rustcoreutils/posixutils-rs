@@ -1,0 +1,10 @@
+#: tests/xgettext/test_c.c:6
+msgid "Hello from C!"
+msgstr ""
+
+#: tests/xgettext/test_c.c:7
+msgid "One item"
+msgid_plural "Many items"
+msgstr[0] ""
+msgstr[1] ""
+

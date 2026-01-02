@@ -7,8 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::mem;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -20,6 +22,7 @@ const FALLBACK_ARG_MAX: usize = 131072;
 // POSIX requires at least 255 bytes for -I constructed arguments
 // We use a higher limit for better usability
 const INSERT_ARG_MAX: usize = 4096;
+const ERR_ARG_TOO_LONG: &str = "xargs: argument line too long";
 
 fn get_arg_max() -> usize {
     let result = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
@@ -109,11 +112,6 @@ struct Args {
 
     #[arg(allow_hyphen_values = true, help = gettext("Utility arguments"))]
     util_args: Vec<String>,
-}
-
-// find a string in a vector of strings
-fn find_str(needle: &str, haystack: &[String]) -> Option<usize> {
-    haystack.iter().position(|s| s == needle)
 }
 
 /// Result of executing a utility
@@ -226,7 +224,7 @@ struct ParseState {
     exit_on_overflow: bool,
 
     // parsed args, ready for exec
-    args: Vec<String>,
+    args: VecDeque<String>,
 }
 
 impl ParseState {
@@ -255,7 +253,7 @@ impl ParseState {
             max_bytes: args.maxsize.unwrap_or_else(get_max_args_bytes),
             max_args: args.maxnum,
             exit_on_overflow,
-            args: Vec::new(),
+            args: VecDeque::new(),
         }
     }
 
@@ -297,14 +295,14 @@ impl ParseState {
         let mut total = self.util_size;
         let mut ret = Vec::new();
 
-        while !self.args.is_empty() {
+        while let Some(front) = self.args.front() {
             // stop if adding the next arg would exceed the max size
-            if (total + self.args[0].len() + 1) > self.max_bytes {
+            if (total + front.len() + 1) > self.max_bytes {
                 break;
             }
 
             // add the next arg
-            let arg = self.args.remove(0);
+            let arg = self.args.pop_front().unwrap();
             total += arg.len() + 1; // +1 for null terminator
             ret.push(arg);
 
@@ -329,9 +327,9 @@ impl ParseState {
     // args are null-separated, without any further processing.
     // if the input data crosses a null boundary, the remainder is
     // stored as state for the next call to parse_buf_null.
-    fn parse_buf_null(&mut self, in_buf: &[u8]) -> io::Result<()> {
+    fn parse_buf_null(&mut self, in_buf: &[u8]) {
         if self.skip_remainder {
-            return Ok(());
+            return;
         }
 
         // pull prior state into current buffer
@@ -346,7 +344,7 @@ impl ParseState {
         while end < buf.len() {
             if buf[end] == 0 {
                 let s = String::from_utf8_lossy(&buf[start..end]).to_string();
-                self.args.push(s);
+                self.args.push_back(s);
                 start = end + 1;
             }
             end += 1;
@@ -356,13 +354,11 @@ impl ParseState {
         if start < buf.len() {
             self.null_slop.extend_from_slice(&buf[start..]);
         }
-
-        Ok(())
     }
 
-    fn parse_buf(&mut self, buf: &[u8]) -> io::Result<()> {
+    fn parse_buf(&mut self, buf: &[u8]) {
         if self.skip_remainder {
-            return Ok(());
+            return;
         }
 
         let mut prev_was_blank = false;
@@ -374,9 +370,8 @@ impl ParseState {
                 if ch == self.quote_char {
                     self.in_quote = false;
                     self.in_arg = false;
-                    self.args.push(self.tmp_arg.clone());
+                    self.args.push_back(mem::take(&mut self.tmp_arg));
                     self.line_has_content = true;
-                    self.tmp_arg.clear();
                 } else {
                     self.tmp_arg.push(ch);
                 }
@@ -394,9 +389,8 @@ impl ParseState {
                 // End of line
                 if self.in_arg {
                     self.in_arg = false;
-                    self.args.push(self.tmp_arg.clone());
+                    self.args.push_back(mem::take(&mut self.tmp_arg));
                     self.line_has_content = true;
-                    self.tmp_arg.clear();
                 }
 
                 // In -L mode: count non-empty lines
@@ -425,9 +419,8 @@ impl ParseState {
                 prev_was_blank = false;
             } else if self.in_arg && (ch == ' ' || ch == '\t') {
                 self.in_arg = false;
-                self.args.push(self.tmp_arg.clone());
+                self.args.push_back(mem::take(&mut self.tmp_arg));
                 self.line_has_content = true;
-                self.tmp_arg.clear();
                 prev_was_blank = true;
             } else if ch == '\'' || ch == '"' {
                 self.in_arg = true;
@@ -446,15 +439,13 @@ impl ParseState {
                 prev_was_blank = false;
             }
         }
-
-        Ok(())
     }
 
     /// Parse buffer for -I insert mode: lines are separated only by newlines,
     /// blanks are preserved within arguments
-    fn parse_buf_insert(&mut self, buf: &[u8]) -> io::Result<()> {
+    fn parse_buf_insert(&mut self, buf: &[u8]) {
         if self.skip_remainder {
-            return Ok(());
+            return;
         }
 
         for &c8 in buf {
@@ -471,7 +462,7 @@ impl ParseState {
                 // End of line - this is our argument (trim leading blanks)
                 let trimmed = self.tmp_arg.trim_start().to_string();
                 if !trimmed.is_empty() {
-                    self.args.push(trimmed);
+                    self.args.push_back(trimmed);
                 }
                 self.tmp_arg.clear();
             } else if ch == '\\' {
@@ -480,28 +471,25 @@ impl ParseState {
                 self.tmp_arg.push(ch);
             }
         }
-
-        Ok(())
     }
 
     fn parse_finalize(&mut self) {
         if self.in_arg {
             self.in_arg = false;
-            self.args.push(self.tmp_arg.clone());
+            self.args.push_back(mem::take(&mut self.tmp_arg));
             self.line_has_content = true;
-            self.tmp_arg.clear();
         } else if !self.tmp_arg.is_empty() {
             // For insert mode: finalize any remaining content
             let trimmed = self.tmp_arg.trim_start().to_string();
             if !trimmed.is_empty() {
-                self.args.push(trimmed);
+                self.args.push_back(trimmed);
             }
             self.tmp_arg.clear();
         }
 
         if !self.null_slop.is_empty() {
             let s = String::from_utf8_lossy(&self.null_slop).to_string();
-            self.args.push(s);
+            self.args.push_back(s);
             self.null_slop.clear();
         }
 
@@ -511,15 +499,13 @@ impl ParseState {
         }
     }
 
-    fn postprocess(&mut self, args: &Args) -> io::Result<()> {
+    fn postprocess(&mut self, args: &Args) {
         if !args.eofstr.is_empty() {
-            if let Some(pos) = find_str(&args.eofstr, &self.args) {
+            if let Some(pos) = self.args.iter().position(|s| s == &args.eofstr) {
                 self.args.truncate(pos);
                 self.skip_remainder = true;
             }
         }
-
-        Ok(())
     }
 }
 
@@ -555,27 +541,21 @@ fn exec_insert_mode(
     exec_util(&args.util, util_args, trace, prompt)
 }
 
-/// Result from read_and_spawn
-struct SpawnResult {
-    /// Final exit code to return
-    exit_code: i32,
-}
-
 /// Helper macro to handle exec result
 macro_rules! handle_exec_result {
     ($result:expr, $any_failed:expr) => {
         match $result {
             ExecResult::Exited(255) => {
-                return Ok(SpawnResult { exit_code: 1 });
+                return Ok(1);
             }
             ExecResult::Exited(code) if code != 0 => {
                 $any_failed = true;
             }
             ExecResult::NotFound => {
-                return Ok(SpawnResult { exit_code: 127 });
+                return Ok(127);
             }
             ExecResult::CannotInvoke => {
-                return Ok(SpawnResult { exit_code: 126 });
+                return Ok(126);
             }
             ExecResult::Skipped | ExecResult::Exited(0) => {}
             ExecResult::Exited(_) => {}
@@ -583,7 +563,7 @@ macro_rules! handle_exec_result {
     };
 }
 
-fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
+fn read_and_spawn(args: &Args) -> io::Result<i32> {
     let mut state = ParseState::new(args);
     let mut any_failed = false;
     let trace = args.trace || args.prompt; // -p implies -t
@@ -600,14 +580,14 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
 
             // Parse the line (add newline since BufReader strips it)
             let line_with_nl = format!("{}\n", line);
-            state.parse_buf(line_with_nl.as_bytes())?;
-            state.postprocess(args)?;
+            state.parse_buf(line_with_nl.as_bytes());
+            state.postprocess(args);
 
             // Check if we have enough lines to execute
             while state.full() && !state.args.is_empty() {
                 if state.exit_on_overflow && state.arg_too_large(&state.args[0]) {
-                    eprintln!("xargs: argument line too long");
-                    return Ok(SpawnResult { exit_code: 1 });
+                    eprintln!("{}", ERR_ARG_TOO_LONG);
+                    return Ok(1);
                 }
 
                 let mut util_args = args.util_args.clone();
@@ -632,23 +612,23 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
             }
 
             if args.null_mode {
-                state.parse_buf_null(&buffer[..n_read])?;
+                state.parse_buf_null(&buffer[..n_read]);
             } else if insert_mode {
-                state.parse_buf_insert(&buffer[..n_read])?;
+                state.parse_buf_insert(&buffer[..n_read]);
             } else {
-                state.parse_buf(&buffer[..n_read])?;
-                state.postprocess(args)?;
+                state.parse_buf(&buffer[..n_read]);
+                state.postprocess(args);
             }
 
             // For insert mode: execute once per input line
             if insert_mode {
                 let replstr = args.replstr.as_ref().unwrap();
                 while !state.args.is_empty() {
-                    let input_arg = state.args.remove(0);
+                    let input_arg = state.args.pop_front().unwrap();
 
                     if state.exit_on_overflow && state.arg_too_large(&input_arg) {
-                        eprintln!("xargs: argument line too long");
-                        return Ok(SpawnResult { exit_code: 1 });
+                        eprintln!("{}", ERR_ARG_TOO_LONG);
+                        return Ok(1);
                     }
 
                     let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
@@ -661,15 +641,15 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
                         && !state.args.is_empty()
                         && state.arg_too_large(&state.args[0])
                     {
-                        eprintln!("xargs: argument line too long");
-                        return Ok(SpawnResult { exit_code: 1 });
+                        eprintln!("{}", ERR_ARG_TOO_LONG);
+                        return Ok(1);
                     }
 
                     let mut util_args = args.util_args.clone();
                     let batch = state.remove_args();
                     if batch.is_empty() && state.exit_on_overflow {
-                        eprintln!("xargs: argument line too long");
-                        return Ok(SpawnResult { exit_code: 1 });
+                        eprintln!("{}", ERR_ARG_TOO_LONG);
+                        return Ok(1);
                     }
                     util_args.extend(batch);
 
@@ -687,55 +667,25 @@ fn read_and_spawn(args: &Args) -> io::Result<SpawnResult> {
     if insert_mode {
         let replstr = args.replstr.as_ref().unwrap();
         while !state.args.is_empty() {
-            let input_arg = state.args.remove(0);
+            let input_arg = state.args.pop_front().unwrap();
 
             if state.exit_on_overflow && state.arg_too_large(&input_arg) {
-                eprintln!("xargs: argument line too long");
-                return Ok(SpawnResult { exit_code: 1 });
+                eprintln!("{}", ERR_ARG_TOO_LONG);
+                return Ok(1);
             }
 
-            match exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)? {
-                ExecResult::Exited(255) => {
-                    return Ok(SpawnResult { exit_code: 1 });
-                }
-                ExecResult::Exited(code) if code != 0 => {
-                    any_failed = true;
-                }
-                ExecResult::NotFound => {
-                    return Ok(SpawnResult { exit_code: 127 });
-                }
-                ExecResult::CannotInvoke => {
-                    return Ok(SpawnResult { exit_code: 126 });
-                }
-                ExecResult::Skipped | ExecResult::Exited(0) => {}
-                ExecResult::Exited(_) => {}
-            }
+            let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
+            handle_exec_result!(result, any_failed);
         }
     } else if !state.args.is_empty() {
         let mut util_args = args.util_args.clone();
         util_args.extend(state.remove_args());
 
-        match exec_util(&args.util, util_args, trace, args.prompt)? {
-            ExecResult::Exited(255) => {
-                return Ok(SpawnResult { exit_code: 1 });
-            }
-            ExecResult::Exited(code) if code != 0 => {
-                any_failed = true;
-            }
-            ExecResult::NotFound => {
-                return Ok(SpawnResult { exit_code: 127 });
-            }
-            ExecResult::CannotInvoke => {
-                return Ok(SpawnResult { exit_code: 126 });
-            }
-            ExecResult::Skipped | ExecResult::Exited(0) => {}
-            ExecResult::Exited(_) => {}
-        }
+        let result = exec_util(&args.util, util_args, trace, args.prompt)?;
+        handle_exec_result!(result, any_failed);
     }
 
-    Ok(SpawnResult {
-        exit_code: if any_failed { 1 } else { 0 },
-    })
+    Ok(if any_failed { 1 } else { 0 })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -745,7 +695,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let result = read_and_spawn(&args)?;
+    let exit_code = read_and_spawn(&args)?;
 
-    std::process::exit(result.exit_code);
+    std::process::exit(exit_code);
 }

@@ -204,7 +204,6 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
 struct ParseState {
     // cmdline-related state
     util_size: usize,
-    util_n_args: usize,
 
     // input state
     tmp_arg: String,
@@ -242,7 +241,6 @@ impl ParseState {
 
         ParseState {
             util_size: total,
-            util_n_args: args.util_args.len(),
             tmp_arg: String::new(),
             in_arg: false,
             in_quote: false,
@@ -275,7 +273,8 @@ impl ParseState {
         }
 
         if let Some(max_args) = self.max_args {
-            if (self.util_n_args + self.args.len()) >= max_args {
+            // POSIX: -n limits stdin arguments only, not utility command-line args
+            if self.args.len() >= max_args {
                 return true;
             }
         }
@@ -310,8 +309,9 @@ impl ParseState {
             ret.push(arg);
 
             // stop if we have reached the max number of args
+            // POSIX: -n limits stdin arguments only, not utility command-line args
             if let Some(max_args) = self.max_args {
-                if (ret.len() + self.util_n_args) >= max_args {
+                if ret.len() >= max_args {
                     break;
                 }
             }

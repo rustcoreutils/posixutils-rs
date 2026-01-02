@@ -101,6 +101,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] link
  - [x] locale (i18n)
  - [x] localedef (i18n)
+ - [x] logger
  - [x] ls
  - [x] m4
  - [x] mailx
@@ -194,7 +195,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
- - [x] logger
  - [x] lp
  - [x] patch
  - [x] ps

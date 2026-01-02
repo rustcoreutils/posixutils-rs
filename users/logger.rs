@@ -8,12 +8,13 @@
 //
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use std::process::ExitCode;
 use syslog::{Facility, Formatter3164};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
     let mut args: Vec<String> = std::env::args().collect();
     args.remove(0);
@@ -27,11 +28,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match syslog::unix(formatter) {
-        Err(e) => eprintln!("Unable to connect to syslog: {:?}", e),
-        Ok(mut writer) => {
-            writer.err(&log_str).expect("could not write error message");
+        Err(e) => {
+            eprintln!("logger: unable to connect to syslog: {:?}", e);
+            ExitCode::from(1)
         }
+        Ok(mut writer) => match writer.err(&log_str) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("logger: could not write message: {:?}", e);
+                ExitCode::from(1)
+            }
+        },
     }
-
-    Ok(())
 }

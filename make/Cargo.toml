@@ -1,10 +1,11 @@
 [package]
 name = "posixutils-make"
 version = "0.7.0"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
@@ -15,6 +16,9 @@ rowan = "0.15"
 
 [dev-dependencies]
 plib = { path = "../plib" }
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "make"

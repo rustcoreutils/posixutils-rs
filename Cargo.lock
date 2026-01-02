@@ -1660,7 +1660,6 @@ dependencies = [
  "log",
  "m4-test-manager",
  "nom",
- "once_cell",
  "regex-lite",
  "similar-asserts",
  "test-log",
@@ -1827,7 +1826,6 @@ dependencies = [
  "regex",
  "thiserror 1.0.69",
  "topological-sort",
- "walkdir",
 ]
 
 [[package]]

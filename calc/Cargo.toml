@@ -10,8 +10,8 @@ rust-version.workspace = true
 gettext-rs.workspace = true
 regex.workspace = true
 clap.workspace = true
-pest = { version = "2.7", default-features = false }
-pest_derive = "2.7"
+pest = { workspace = true, default-features = false }
+pest_derive.workspace = true
 bigdecimal = "0.4"
 rustyline = { version = "14.0", default-features = false }
 

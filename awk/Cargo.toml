@@ -10,14 +10,12 @@ rust-version.workspace = true
 gettext-rs.workspace = true
 clap.workspace = true
 libc.workspace = true
-pest = "2.7"
-pest_derive = "2.7"
+pest.workspace = true
+pest_derive.workspace = true
 lexical = { version = "7", features = ["format"] }
 plib = { path = "../plib" }
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 
-[dev-dependencies]
-plib = { path = "../plib" }
 
 [lints]
 workspace = true

@@ -15,11 +15,10 @@ libc.workspace = true
 chrono.workspace = true
 syslog = "6.1"
 libcrypt-rs = "0.1"
-thiserror = "1.0"
+thiserror.workspace = true
 binrw = "0.14"
 
 [dev-dependencies]
-plib = { path = "../plib" }
 libc = { workspace = true }
 regex = { workspace = true }
 

@@ -15,11 +15,10 @@ topological-sort = "0.2"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
-thiserror = "1.0"
+thiserror.workspace = true
 notify-debouncer-full = "0.3"
 diff = "0.1"
-dirs = "5.0"
-walkdir = "2"
+dirs.workspace = true
 
 [dev-dependencies]
 proptest = "1"

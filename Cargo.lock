@@ -1782,6 +1782,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
+ "plib",
  "terminfo 0.8.0",
  "termios",
 ]

@@ -133,10 +133,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] split
  - [x] strings
  - [x] strip (Development)
+ - [x] stty
  - [x] tail
  - [x] test
  - [x] time
  - [x] timeout
+ - [x] tput
  - [x] tr
  - [x] true
  - [x] uncompress (compress cat.)
@@ -199,9 +201,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] lp
  - [x] patch
  - [x] ps
- - [x] stty
  - [x] tabs
- - [x] tput
  - [x] tsort
 
 ## Stage 0 - Not started

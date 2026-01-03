@@ -141,6 +141,7 @@ pub enum ParamType {
     Ofl(u32, tcflag_t, tcflag_t),
     Lfl(u32, tcflag_t, tcflag_t),
     Cchar(u32, usize),
+    CcNum(u32, usize), // Numeric c_cc values (min, time)
 }
 
 pub const PNEG: u32 = 1 << 0;
@@ -157,7 +158,7 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
         ("ispeed", ParamType::Ispeed(0)),
         ("ospeed", ParamType::Ospeed(0)),
         ("hupcl", ParamType::Cfl(PNEG, HUPCL, HUPCL)),
-        /* FIXME: support "hup", alias for "hupcl" */
+        ("hup", ParamType::Cfl(PNEG, HUPCL, HUPCL)), // POSIX alias for hupcl
         ("cstopb", ParamType::Cfl(PNEG, CSTOPB, CSTOPB)),
         ("cread", ParamType::Cfl(PNEG, CREAD, CREAD)),
         ("clocal", ParamType::Cfl(PNEG, CLOCAL, CLOCAL)),
@@ -205,7 +206,6 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
         ("cr3", ParamType::Ofl(0, CR3, CRDLY)),
         ("nl0", ParamType::Ofl(0, NL0, NLDLY)),
         ("nl1", ParamType::Ofl(0, NL1, NLDLY)),
-        /* FIXME: support "tabs", alias for "tab0" */
         ("tab0", ParamType::Ofl(0, TAB0, TABDLY)),
         ("tab1", ParamType::Ofl(0, TAB1, TABDLY)),
         ("tab2", ParamType::Ofl(0, TAB2, TABDLY)),
@@ -253,5 +253,10 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
         ("susp", ParamType::Cchar(PARG, VSUSP)),
         ("start", ParamType::Cchar(PARG, VSTART)),
         ("stop", ParamType::Cchar(PARG, VSTOP)),
+        /*
+         * min/time for non-canonical mode
+         */
+        ("min", ParamType::CcNum(PARG, VMIN)),
+        ("time", ParamType::CcNum(PARG, VTIME)),
     ])
 }

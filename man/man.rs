@@ -503,11 +503,9 @@ fn extract_name_info(document: &MdocDocument) -> Option<(Vec<String>, String)> {
                 Macro::Sh { title } => {
                     in_name_section = title.eq_ignore_ascii_case("NAME");
                 }
-                Macro::Nm { name } if in_name_section => {
-                    if let Some(n) = name {
-                        if !n.is_empty() && !names.contains(n) {
-                            names.push(n.clone());
-                        }
+                Macro::Nm { name: Some(n) } if in_name_section => {
+                    if !n.is_empty() && !names.contains(n) {
+                        names.push(n.clone());
                     }
                 }
                 Macro::Nd if in_name_section => {

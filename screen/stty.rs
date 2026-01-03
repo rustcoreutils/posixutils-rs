@@ -18,9 +18,15 @@ use std::io::{self, Error};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use osdata::{ParamType, PARG, PNEG};
+#[cfg(target_os = "linux")]
+use termios::os::linux::{TAB0, TAB3, TABDLY};
+#[cfg(target_os = "macos")]
+use termios::os::macos::{TAB0, TAB3, TABDLY};
 use termios::{
     cc_t, cfgetispeed, cfgetospeed, cfsetispeed, cfsetospeed, speed_t, tcflag_t, tcsetattr,
-    Termios, TCSANOW,
+    Termios, BRKINT, CREAD, CS5, CS6, CS7, CS8, CSIZE, ECHO, ECHOE, ECHOK, HUPCL, ICANON, ICRNL,
+    IEXTEN, IGNCR, IGNPAR, INLCR, INPCK, ISIG, IXON, OPOST, PARENB, PARODD, TCSANOW, VERASE, VKILL,
+    VMIN, VTIME,
 };
 
 const HDR_SAVE: &str = "pfmt1";
@@ -72,9 +78,101 @@ fn ti_baud_str(revspeed: &HashMap<speed_t, &'static str>, ti: &Termios) -> Strin
     }
 }
 
-// display short-form stty values
+// display short-form stty values (abbreviated, non-defaults)
 fn stty_show_short(ti: Termios) -> io::Result<()> {
-    stty_show_long(ti)
+    let speedmap = osdata::load_speeds();
+    let revspeed = osdata::load_speeds_rev(&speedmap);
+    let cchar_xlat = osdata::load_cchar_xlat();
+    let cchar_rev = osdata::reverse_charmap(&cchar_xlat);
+
+    // Always show baud rate
+    print!("{} ", ti_baud_str(&revspeed, &ti));
+
+    // Show key settings that may differ from typical defaults
+    let mut settings: Vec<String> = Vec::new();
+
+    // Character size (default is typically cs8)
+    let csize = ti.c_cflag & CSIZE;
+    if csize != CS8 {
+        let csname = match csize {
+            CS5 => "cs5",
+            CS6 => "cs6",
+            CS7 => "cs7",
+            _ => "cs8",
+        };
+        settings.push(csname.to_string());
+    }
+
+    // Common local flags
+    if (ti.c_lflag & ECHO) == 0 {
+        settings.push("-echo".to_string());
+    }
+    if (ti.c_lflag & ICANON) == 0 {
+        settings.push("-icanon".to_string());
+    }
+    if (ti.c_lflag & ISIG) == 0 {
+        settings.push("-isig".to_string());
+    }
+    if (ti.c_lflag & IEXTEN) == 0 {
+        settings.push("-iexten".to_string());
+    }
+
+    // Common input flags
+    if (ti.c_iflag & ICRNL) == 0 {
+        settings.push("-icrnl".to_string());
+    }
+    if (ti.c_iflag & IXON) == 0 {
+        settings.push("-ixon".to_string());
+    }
+
+    // Common output flags
+    if (ti.c_oflag & OPOST) == 0 {
+        settings.push("-opost".to_string());
+    }
+
+    // Show min/time if non-canonical mode
+    if (ti.c_lflag & ICANON) == 0 {
+        settings.push(format!("min = {}", ti.c_cc[VMIN]));
+        settings.push(format!("time = {}", ti.c_cc[VTIME]));
+    }
+
+    // Show key control characters with non-default values
+    let show_cchar = |name: &str, idx: usize, default: u8| -> Option<String> {
+        let ch = ti.c_cc[idx];
+        if ch != default as cc_t {
+            let ch_str = if ch == 0 {
+                "<undef>".to_string()
+            } else if let Some(xlat) = cchar_rev.get(&(ch as char)) {
+                format!("^{}", xlat)
+            } else if ch < 0x20 {
+                format!("^{}", (ch + 0x40) as char)
+            } else {
+                format!("{}", ch)
+            };
+            Some(format!("{} = {}", name, ch_str))
+        } else {
+            None
+        }
+    };
+
+    // Check key control characters against common defaults
+    if let Some(s) = show_cchar("erase", VERASE, 0x7f) {
+        settings.push(s);
+    }
+    if let Some(s) = show_cchar("kill", VKILL, 0x15) {
+        settings.push(s);
+    }
+    if let Some(s) = show_cchar("intr", termios::VINTR, 0x03) {
+        settings.push(s);
+    }
+
+    if settings.is_empty() {
+        println!();
+    } else {
+        println!("{}", settings.join("; "));
+    }
+
+    Ok(())
 }
 
 fn build_flagstr(name: &str, flag: tcflag_t, pflg: u32, vset: tcflag_t, mask: tcflag_t) -> String {
@@ -428,6 +526,117 @@ fn stty_set_compact(mut ti: Termios, compact: &str) -> io::Result<()> {
     Ok(())
 }
 
+// Handle POSIX combination modes
+// Returns Some(true) if mode was handled and changed settings
+// Returns Some(false) if mode was handled but didn't change settings
+// Returns None if not a combination mode
+fn handle_combination_mode(ti: &mut Termios, operand: &str, negate: bool) -> Option<bool> {
+    match operand {
+        "tabs" => {
+            // tabs = tab0, -tabs = tab3
+            let newval = if negate { TAB3 } else { TAB0 };
+            let oldval = ti.c_oflag & TABDLY;
+            if oldval != newval {
+                ti.c_oflag = (ti.c_oflag & !TABDLY) | newval;
+                Some(true)
+            } else {
+                Some(false)
+            }
+        }
+        "evenp" | "parity" => {
+            // Enable parenb and cs7; disable parodd
+            // -evenp/-parity: disable parenb, set cs8
+            if negate {
+                ti.c_cflag &= !PARENB;
+                ti.c_cflag = (ti.c_cflag & !CSIZE) | CS8;
+            } else {
+                ti.c_cflag |= PARENB;
+                ti.c_cflag &= !PARODD;
+                ti.c_cflag = (ti.c_cflag & !CSIZE) | CS7;
+            }
+            Some(true)
+        }
+        "oddp" => {
+            // Enable parenb, cs7, and parodd
+            // -oddp: disable parenb, set cs8
+            if negate {
+                ti.c_cflag &= !PARENB;
+                ti.c_cflag = (ti.c_cflag & !CSIZE) | CS8;
+            } else {
+                ti.c_cflag |= PARENB | PARODD;
+                ti.c_cflag = (ti.c_cflag & !CSIZE) | CS7;
+            }
+            Some(true)
+        }
+        "raw" => {
+            // raw mode: cs8, disable erase/kill/intr/quit/eof/eol, disable opost/inpck
+            // POSIX: stty cs8 erase ^- kill ^- intr ^- quit ^- eof ^- eol ^- -post -inpck
+            if negate {
+                // -raw (cooked): restore normal processing
+                ti.c_oflag |= OPOST;
+                ti.c_iflag |= BRKINT | IGNPAR | ICRNL | IXON;
+                ti.c_lflag |= ISIG | ICANON | ECHO | ECHOK | IEXTEN;
+            } else {
+                ti.c_cflag = (ti.c_cflag & !CSIZE) | CS8;
+                ti.c_cc[VERASE] = 0;
+                ti.c_cc[VKILL] = 0;
+                ti.c_cc[termios::VINTR] = 0;
+                ti.c_cc[termios::VQUIT] = 0;
+                ti.c_cc[termios::VEOF] = 0;
+                ti.c_cc[termios::VEOL] = 0;
+                ti.c_oflag &= !OPOST;
+                ti.c_iflag &= !INPCK;
+            }
+            Some(true)
+        }
+        "cooked" => {
+            // Same as -raw
+            ti.c_oflag |= OPOST;
+            ti.c_iflag |= BRKINT | IGNPAR | ICRNL | IXON;
+            ti.c_lflag |= ISIG | ICANON | ECHO | ECHOK | IEXTEN;
+            Some(true)
+        }
+        "nl" => {
+            // nl: disable icrnl
+            // -nl: enable icrnl, unset inlcr and igncr
+            if negate {
+                ti.c_iflag |= ICRNL;
+                ti.c_iflag &= !(INLCR | IGNCR);
+            } else {
+                ti.c_iflag &= !ICRNL;
+            }
+            Some(true)
+        }
+        "ek" => {
+            // Reset ERASE and KILL to system defaults
+            // Using common default values
+            ti.c_cc[VERASE] = 0x7f; // DEL
+            ti.c_cc[VKILL] = 0x15; // ^U
+            Some(true)
+        }
+        "sane" => {
+            // Reset to reasonable values
+            ti.c_iflag = BRKINT | ICRNL | IXON;
+            ti.c_oflag = OPOST;
+            ti.c_cflag = (ti.c_cflag & !CSIZE) | CS8 | CREAD | HUPCL;
+            ti.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
+            // Set default control characters
+            ti.c_cc[VERASE] = 0x7f;
+            ti.c_cc[VKILL] = 0x15;
+            ti.c_cc[termios::VINTR] = 0x03; // ^C
+            ti.c_cc[termios::VQUIT] = 0x1c; // ^\
+            ti.c_cc[termios::VEOF] = 0x04; // ^D
+            ti.c_cc[termios::VSTART] = 0x11; // ^Q
+            ti.c_cc[termios::VSTOP] = 0x13; // ^S
+            ti.c_cc[termios::VSUSP] = 0x1a; // ^Z
+            ti.c_cc[VMIN] = 1;
+            ti.c_cc[VTIME] = 0;
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 // update termio settings based on setting-per-arg parsed values
 fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
     assert!(args.operands.len() > 1);
@@ -463,6 +672,15 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             continue;
         }
 
+        // Handle combination modes (evenp, oddp, raw, cooked, nl, ek, sane, tabs)
+        if let Some(changed) = handle_combination_mode(&mut ti, operand, negate) {
+            if changed {
+                dirty = true;
+            }
+            idx += 1;
+            continue;
+        }
+
         // lookup operand in param map
         let param_res = tty_params.get(operand);
         if param_res.is_none() {
@@ -477,6 +695,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             ParamType::Ofl(pflg, _, _) => pflg,
             ParamType::Lfl(pflg, _, _) => pflg,
             ParamType::Cchar(pflg, _) => pflg,
+            ParamType::CcNum(pflg, _) => pflg,
             ParamType::Ispeed(pflg) => pflg,
             ParamType::Ospeed(pflg) => pflg,
         };
@@ -519,6 +738,21 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
                 }
 
                 dirty = dirty_res.unwrap();
+            }
+            ParamType::CcNum(_pflg, ccidx) => {
+                // min/time take numeric arguments
+                match op_arg.parse::<u8>() {
+                    Ok(n) => {
+                        if ti.c_cc[*ccidx] != n as cc_t {
+                            ti.c_cc[*ccidx] = n as cc_t;
+                            dirty = true;
+                        }
+                    }
+                    Err(_) => {
+                        let errstr = format!("Invalid numeric value for {}", operand);
+                        return Err(Error::other(errstr));
+                    }
+                }
             }
             ParamType::Ispeed(_pflg) => {
                 set_ti_speed(&mut ti, &speedmap, true, &op_arg)?;

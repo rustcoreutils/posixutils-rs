@@ -16,6 +16,11 @@ use std::io::{self, BufRead, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::exit;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+
+/// Static storage for the recipient terminal path, used by signal handler
+static RECIPIENT_TERMINAL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 const ALERT_CHAR: char = '\u{07}';
 const INTR_CHAR: char = '\u{03}';
@@ -35,7 +40,7 @@ struct Args {
 }
 
 // Select terminal in an implementation-defined manner and return terminal
-// Print an informational message about the chosen terminal
+// Print an informational message about the chosen terminal if user has multiple
 fn select_terminal(user_name: &str) -> String {
     let entries = utmpx::load();
 
@@ -54,6 +59,15 @@ fn select_terminal(user_name: &str) -> String {
     for entry in &user_entries {
         if entry.line != "console" {
             let terminal = format!("/dev/{}", &entry.line);
+            // POSIX: If user is logged in more than once, write informational message to stdout
+            if user_entries.len() > 1 {
+                println!(
+                    "{} {} {}",
+                    user_name,
+                    gettext("is logged on more than one terminal, writing to"),
+                    &entry.line
+                );
+            }
             return terminal;
         }
     }
@@ -161,14 +175,14 @@ fn alert_sender_terminal() {
     handle.flush().expect("Failed to flush alert");
 }
 
-// Check if the line contains interrupt or end-of-file characters
+// Check if the line contains only interrupt or end-of-file characters
 fn is_interrupt_or_eof(line: &str) -> bool {
-    line.chars().all(|c| c == INTR_CHAR || c == EOF_CHAR)
+    !line.is_empty() && line.chars().all(|c| c == INTR_CHAR || c == EOF_CHAR)
 }
 
-// Check if the line contains the alert character
-fn contains_alert_character(line: &str) -> bool {
-    line.chars().all(|c| c == ALERT_CHAR)
+// Check if the line contains only alert characters
+fn is_only_alert(line: &str) -> bool {
+    !line.is_empty() && line.chars().all(|c| c == ALERT_CHAR)
 }
 
 // Return the alert character
@@ -176,9 +190,9 @@ fn get_alert_character() -> String {
     ALERT_CHAR.to_string()
 }
 
-// Check if the line contains erase or kill characters
-fn contains_erase_or_kill_character(line: &str) -> bool {
-    line.chars().all(|c| c == ERASE_CHAR || c == KILL_CHAR)
+// Check if the line contains only erase or kill characters
+fn is_only_erase_or_kill(line: &str) -> bool {
+    !line.is_empty() && line.chars().all(|c| c == ERASE_CHAR || c == KILL_CHAR)
 }
 
 // Check if the line contains printable or space characters
@@ -188,18 +202,57 @@ fn contains_printable_or_space(line: &str) -> bool {
 }
 
 // Process non-printable characters to implementation-defined sequences of printable characters
+// Control characters 0-31 are displayed as ^@ through ^_ (caret + char+64)
+// DEL (127) is displayed as ^?
 fn process_non_printable(line: &str) -> String {
-    let mut s = String::with_capacity(line.len());
+    let mut s = String::with_capacity(line.len() * 2);
 
     for ch in line.chars() {
-        if ch.is_ascii_control() {
-            s.push_str(&format!("^{}", ch.to_ascii_uppercase()));
+        let byte = ch as u32;
+        if byte < 32 {
+            // Control characters 0-31: ^@ ^A ^B ... ^Z ^[ ^\ ^] ^^ ^_
+            s.push('^');
+            s.push((byte as u8 + 64) as char);
+        } else if byte == 127 {
+            // DEL character
+            s.push('^');
+            s.push('?');
+        } else if ch.is_ascii_graphic() || ch.is_ascii_whitespace() {
+            // Printable characters pass through
+            s.push(ch);
         } else {
+            // Non-ASCII characters: pass through as-is
             s.push(ch);
         }
     }
 
     s
+}
+
+/// Signal handler for SIGINT - writes EOT to recipient terminal and exits with 0
+/// POSIX: "If an interrupt signal is received, write shall write an appropriate
+/// message on the recipient's terminal and exit with a status of zero."
+extern "C" fn handle_sigint(_sig: libc::c_int) {
+    // Try to write EOT message to recipient terminal
+    if let Ok(guard) = RECIPIENT_TERMINAL.lock() {
+        if let Some(ref terminal) = *guard {
+            // Use low-level write to be signal-safe
+            if let Ok(mut file) = OpenOptions::new().write(true).open(terminal) {
+                let _ = file.write_all(b"EOT\n");
+            }
+        }
+    }
+    // POSIX requires exit status 0 for interrupt
+    std::process::exit(0);
+}
+
+/// Register signal handler for SIGINT
+fn register_sigint_handler() {
+    unsafe {
+        if libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t) == libc::SIG_ERR {
+            eprintln!("{}", gettext("Failed to register signal handler"));
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -226,6 +279,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exit(1);
     }
 
+    // Store terminal path for signal handler and register SIGINT handler
+    *RECIPIENT_TERMINAL.lock().unwrap() = Some(terminal.clone());
+    register_sigint_handler();
+
     let sender_login_id = curuser::login_name();
     let sending_terminal = curuser::tty().unwrap_or_else(|| "???".to_string());
     let date = get_current_date();
@@ -244,9 +301,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if is_interrupt_or_eof(&line) {
             write_to_terminal(&terminal, "EOT\n");
             exit(0);
-        } else if contains_alert_character(&line) {
+        } else if is_only_alert(&line) {
             write_to_terminal(&terminal, &get_alert_character());
-        } else if contains_erase_or_kill_character(&line) {
+        } else if is_only_erase_or_kill(&line) {
             process_erase_or_kill(&line);
         } else if contains_printable_or_space(&line) {
             write_to_terminal(&terminal, &format!("{}\n", line));
@@ -255,8 +312,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Add the EOF message before exiting
-    write_to_terminal(&terminal, "EOF\n");
+    // POSIX: Write EOT message when input ends
+    write_to_terminal(&terminal, "EOT\n");
 
     Ok(())
 }

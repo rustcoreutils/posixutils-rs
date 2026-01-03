@@ -163,6 +163,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] wc
  - [x] what (SCCS)
  - [x] who
+ - [x] write
  - [x] dd
  - [x] xargs
  - [x] id
@@ -199,7 +200,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] touch
  - [x] tty
  - [x] uname
- - [x] write
 
 ## Stage 1 - Rough draft
 

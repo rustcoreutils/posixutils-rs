@@ -10,4 +10,5 @@
 mod id;
 mod logger;
 mod talk;
+mod tty;
 mod write;

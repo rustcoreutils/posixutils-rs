@@ -7,10 +7,23 @@
 // SPDX-License-Identifier: MIT
 //
 
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::curuser::tty;
 use std::io::{self, IsTerminal};
 
+/// tty - return user's terminal name
+#[derive(Parser)]
+#[command(version, about = gettext("tty - return user's terminal name"))]
+struct Args {}
+
 fn main() {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    let _args = Args::parse();
+
     let is_tty = io::stdin().is_terminal();
     if !is_tty {
         println!("not a tty");

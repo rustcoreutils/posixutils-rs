@@ -229,6 +229,15 @@ pub fn matches_any(patterns: &[Pattern], path: &str) -> bool {
     patterns.iter().any(|p| p.matches(path))
 }
 
+/// Find the index of the first pattern that matches the given path
+/// Returns None if no pattern matches, or if patterns is empty (which means "match all")
+pub fn find_matching_pattern(patterns: &[Pattern], path: &str) -> Option<usize> {
+    if patterns.is_empty() {
+        return None; // No patterns means match all - return None to indicate no specific pattern
+    }
+    patterns.iter().position(|p| p.matches(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

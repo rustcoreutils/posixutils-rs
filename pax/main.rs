@@ -212,6 +212,7 @@ fn run_list(args: &Args) -> PaxResult<()> {
         exclude: args.exclude,
         format_options,
         substitutions,
+        first_match: args.first_match,
     };
 
     // Check for multi-volume mode
@@ -262,6 +263,7 @@ fn run_read(args: &Args) -> PaxResult<()> {
         interactive: args.interactive,
         update: args.update,
         substitutions,
+        first_match: args.first_match,
     };
 
     // Check for multi-volume mode

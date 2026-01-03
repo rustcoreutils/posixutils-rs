@@ -504,3 +504,72 @@ fn test_option_multiple_combined() {
     let content = fs::read_to_string(dst_dir.join("combined.txt")).unwrap();
     assert!(content.contains("Combined options test"));
 }
+
+#[test]
+fn test_first_match_option() {
+    // Test -n flag: select only the first archive member that matches each pattern
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source files - multiple files matching *.txt pattern
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("a.txt")).unwrap();
+    writeln!(f, "File A").unwrap();
+    let mut f = File::create(src_dir.join("b.txt")).unwrap();
+    writeln!(f, "File B").unwrap();
+    let mut f = File::create(src_dir.join("c.txt")).unwrap();
+    writeln!(f, "File C").unwrap();
+
+    // Create archive
+    let output = run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+    assert_success(&output, "pax write");
+
+    // List with -n and pattern - should only show first match
+    let output = run_pax(&["-n", "-f", archive.to_str().unwrap(), "*.txt"]);
+    assert_success(&output, "pax list with -n");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let matching_lines: Vec<&str> = stdout.lines().filter(|l| l.ends_with(".txt")).collect();
+
+    // With -n, only one .txt file should be listed (the first match)
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "Expected exactly 1 .txt file with -n flag, got {}: {:?}",
+        matching_lines.len(),
+        matching_lines
+    );
+
+    // Extract with -n - should only extract first match
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(
+        &["-r", "-n", "-f", archive.to_str().unwrap(), "*.txt"],
+        &dst_dir,
+    );
+    assert_success(&output, "pax read with -n");
+
+    // Count extracted .txt files - should be exactly 1
+    let mut txt_count = 0;
+    for entry in fs::read_dir(&dst_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .path()
+            .extension()
+            .map(|e| e == "txt")
+            .unwrap_or(false)
+        {
+            txt_count += 1;
+        }
+    }
+
+    assert_eq!(
+        txt_count, 1,
+        "Expected exactly 1 .txt file extracted with -n flag, got {}",
+        txt_count
+    );
+}

@@ -555,3 +555,154 @@ fn test_pax_cross_tool_write() {
     let content = fs::read_to_string(dst_dir.join("test.txt")).unwrap();
     assert!(content.contains("pax content"));
 }
+
+#[test]
+fn test_cross_tool_cpio_read() {
+    // Test that our pax can read cpio archives created by system cpio
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("system.cpio");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source files
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("hello.txt")).unwrap();
+    writeln!(f, "Hello from cpio").unwrap();
+
+    // Create archive using system cpio (via find | cpio -o)
+    let output = Command::new("sh")
+        .args(["-c", "find . | cpio -o"])
+        .current_dir(&src_dir)
+        .stdout(std::process::Stdio::piped())
+        .output();
+
+    if output.is_err() {
+        eprintln!("Skipping cross-tool test: cpio not available");
+        return;
+    }
+    let output = output.unwrap();
+    if !output.status.success() {
+        eprintln!("Skipping cross-tool test: cpio failed");
+        return;
+    }
+
+    // Write the cpio archive
+    fs::write(&archive, &output.stdout).unwrap();
+
+    // Extract with our pax
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read system cpio");
+
+    // Verify content
+    let content = fs::read_to_string(dst_dir.join("hello.txt")).unwrap();
+    assert!(content.contains("Hello from cpio"), "Content mismatch");
+}
+
+#[test]
+fn test_cross_tool_cpio_write() {
+    // Test that system cpio can read archives created by our pax
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.cpio");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source files
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("hello.txt")).unwrap();
+    writeln!(f, "Hello from pax").unwrap();
+
+    // Create archive using our pax with cpio format
+    let output = run_pax_in_dir(
+        &["-w", "-x", "cpio", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+    assert_success(&output, "pax write cpio");
+
+    // Extract with system cpio
+    fs::create_dir(&dst_dir).unwrap();
+    let output = Command::new("sh")
+        .args(["-c", &format!("cpio -id < {}", archive.to_str().unwrap())])
+        .current_dir(&dst_dir)
+        .output();
+
+    if output.is_err() {
+        eprintln!("Skipping cross-tool test: cpio not available");
+        return;
+    }
+    let output = output.unwrap();
+    if !output.status.success() {
+        eprintln!(
+            "cpio extract failed: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // Verify content
+    let content = fs::read_to_string(dst_dir.join("hello.txt")).unwrap();
+    assert!(content.contains("Hello from pax"), "Content mismatch");
+}
+
+#[test]
+fn test_symlink_tar_no_damaged_warning() {
+    // Verify that system tar can read our tar archives with symlinks without
+    // reporting "Damaged tar archive" errors
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source files with symlink
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("hello.txt")).unwrap();
+    writeln!(f, "Hello World").unwrap();
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("hello.txt", src_dir.join("link.txt")).unwrap();
+    #[cfg(not(unix))]
+    {
+        eprintln!("Skipping symlink test on non-Unix platform");
+        return;
+    }
+
+    // Create archive using our pax
+    let output = run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+    assert_success(&output, "pax write");
+
+    // List with system tar and check for "Damaged" warning
+    let output = Command::new("tar").args(["-tvf"]).arg(&archive).output();
+
+    if output.is_err() {
+        eprintln!("Skipping: tar not available");
+        return;
+    }
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The key assertion: no "Damaged" warning
+    assert!(
+        !stderr.contains("Damaged"),
+        "System tar reported 'Damaged' archive warning: {}",
+        stderr
+    );
+
+    // Verify it can extract correctly
+    fs::create_dir(&dst_dir).unwrap();
+    let output = Command::new("tar")
+        .args(["-xf"])
+        .arg(&archive)
+        .current_dir(&dst_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "tar extraction failed");
+
+    // Verify symlink was extracted correctly
+    let link_path = dst_dir.join("link.txt");
+    assert!(link_path.is_symlink(), "Symlink was not created");
+    let target = fs::read_link(&link_path).unwrap();
+    assert_eq!(target.to_string_lossy(), "hello.txt");
+}

@@ -61,7 +61,8 @@ impl TopoSort {
 
     /// Perform topological sort, returning (sorted_nodes, cycle_nodes)
     fn sort(mut self) -> (Vec<String>, Vec<String>) {
-        let mut result = Vec::new();
+        let node_count = self.in_degree.len();
+        let mut result = Vec::with_capacity(node_count);
         let mut queue: VecDeque<String> = VecDeque::new();
 
         // Find all nodes with in-degree 0
@@ -90,7 +91,8 @@ impl TopoSort {
         }
 
         // Any remaining nodes are in cycles
-        let cycle_nodes: Vec<String> = self.in_degree.keys().cloned().collect();
+        let mut cycle_nodes = Vec::with_capacity(self.in_degree.len());
+        cycle_nodes.extend(self.in_degree.into_keys());
 
         (result, cycle_nodes)
     }
@@ -101,7 +103,7 @@ fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
     let reader = io::BufReader::new(file);
 
     let mut ts = TopoSort::new();
-    let mut sv: Vec<String> = Vec::new();
+    let mut sv: Vec<String> = Vec::with_capacity(2);
 
     for line in reader.lines() {
         for token in line?.split_whitespace() {

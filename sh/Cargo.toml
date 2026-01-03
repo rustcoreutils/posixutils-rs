@@ -1,15 +1,18 @@
 [package]
 name = "posixutils-sh"
 version = "0.7.0"
-edition = "2021"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
 
-[dev-dependencies]
-plib = { path = "../plib" }
+[lints]
+workspace = true
 
 [[bin]]
 name = "sh"

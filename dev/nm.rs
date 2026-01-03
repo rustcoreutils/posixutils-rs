@@ -32,47 +32,37 @@ enum OutputType {
 #[derive(Parser)]
 #[command(version, about = gettext("nm - write the name list of an object file"))]
 struct Args {
-    /// Write the full pathname or library name of an object on each line.
-    #[arg(short = 'A', long = "print-file-name")]
+    #[arg(short = 'A', long = "print-file-name", help = gettext("Write the full pathname or library name of an object on each line"))]
     print_name: bool,
 
-    /// Write only external (global) and static symbol information.
-    #[arg(short = 'e', long = "external")]
+    #[arg(short = 'e', long = "external", help = gettext("Write only external (global) and static symbol information"))]
     external_only: bool,
 
-    /// Produce full output.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Produce full output"))]
     full: bool,
 
-    /// Write only external (global) symbol information.
-    #[arg(short, long = "extern-only")]
+    #[arg(short, long = "extern-only", help = gettext("Write only external (global) symbol information"))]
     global: bool,
 
-    /// Write numeric values in octal (equivalent to -t o).
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write numeric values in octal (equivalent to -t o)"))]
     octal: bool,
 
-    /// Write numeric values in hexadecimal (equivalent to -t x).
-    #[arg(short = 'x', long)]
+    #[arg(short = 'x', long, help = gettext("Write numeric values in hexadecimal (equivalent to -t x)"))]
     hex: bool,
 
-    /// Write information in a portable output format
-    #[arg(short = 'P', long = "portability")]
+    #[arg(short = 'P', long = "portability", help = gettext("Write information in a portable output format"))]
     portable: bool,
 
-    /// Write each numeric value in the specified format.
-    #[arg(short = 't', long = "format", value_enum, default_value = "d")]
+    #[arg(short = 't', long = "format", value_enum, default_value = "d", help = gettext("Write each numeric value in the specified format"))]
     out_type: OutputType,
 
-    /// Write only undefined symbols.
-    #[arg(short, long = "undefined-only")]
+    #[arg(short, long = "undefined-only", help = gettext("Write only undefined symbols"))]
     undef: bool,
 
-    /// Sort output by value instead of by symbol name.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Sort output by value instead of by symbol name"))]
     value_sort: bool,
 
-    /// Input object file
+    #[arg(help = gettext("Input object file"))]
     file: String,
 }
 

@@ -8,17 +8,15 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap.workspace = true
-clap.features = ["env"]
+clap = { workspace = true, features = ["env"] }
 gettext-rs.workspace = true
 libc.workspace = true
-pest = "2.7"
-pest_derive = "2.7"
-thiserror = "1.0"
+pest.workspace = true
+pest_derive.workspace = true
+thiserror.workspace = true
 chrono = { version = "0.4", features = ["unstable-locales"] }
 regex.workspace = true
 terminfo = "0.9.0"
-lazy_static = "1.4"
 
 [dev-dependencies]
 plib = { path = "../plib" }

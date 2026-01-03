@@ -29,40 +29,31 @@ use std::process::ExitCode;
     override_usage = "uucp [-cCdfjmr] [-n user] source-file... destination-file"
 )]
 struct Args {
-    /// Do not copy local file to spool directory (default)
-    #[arg(short = 'c', overrides_with = "copy_to_spool")]
+    #[arg(short = 'c', overrides_with = "copy_to_spool", help = gettext("Do not copy local file to spool directory (default)"))]
     no_copy_to_spool: bool,
 
-    /// Force copy of local file to spool directory
-    #[arg(short = 'C')]
+    #[arg(short = 'C', help = gettext("Force copy of local file to spool directory"))]
     copy_to_spool: bool,
 
-    /// Create intermediate directories as needed (default)
-    #[arg(short = 'd', overrides_with = "no_create_dirs")]
+    #[arg(short = 'd', overrides_with = "no_create_dirs", help = gettext("Create intermediate directories as needed (default)"))]
     create_dirs: bool,
 
-    /// Do not create intermediate directories
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Do not create intermediate directories"))]
     no_create_dirs: bool,
 
-    /// Write job ID to stdout
-    #[arg(short = 'j')]
+    #[arg(short = 'j', help = gettext("Write job ID to stdout"))]
     print_job_id: bool,
 
-    /// Send mail to requester when copy completes
-    #[arg(short = 'm')]
+    #[arg(short = 'm', help = gettext("Send mail to requester when copy completes"))]
     mail_requester: bool,
 
-    /// Notify user on remote system when copy completes
-    #[arg(short = 'n', value_name = "USER")]
+    #[arg(short = 'n', value_name = "USER", help = gettext("Notify user on remote system when copy completes"))]
     notify_user: Option<String>,
 
-    /// Queue job only, do not start transfer
-    #[arg(short = 'r')]
+    #[arg(short = 'r', help = gettext("Queue job only, do not start transfer"))]
     queue_only: bool,
 
-    /// Source files and destination (last argument is destination)
-    #[arg(required = true, num_args = 2..)]
+    #[arg(required = true, num_args = 2.., help = gettext("Source files and destination"))]
     files: Vec<String>,
 }
 

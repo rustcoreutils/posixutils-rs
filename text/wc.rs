@@ -23,23 +23,19 @@ use plib::BUFSZ;
 #[derive(Parser)]
 #[command(version, about = gettext("wc - word, line, and byte or character count"))]
 struct Args {
-    /// Count number of bytes in each file
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, help = gettext("Count number of bytes in each file"))]
     bytes: bool,
 
-    /// Count number of lines in each file
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Count number of lines in each file"))]
     lines: bool,
 
-    /// Count number of characters in each file
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, help = gettext("Count number of characters in each file"))]
     chars: bool,
 
-    /// Count number of lines in each file
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Count number of words in each file"))]
     words: bool,
 
-    /// Files to read as input.
+    #[arg(help = gettext("Files to read as input."))]
     files: Vec<PathBuf>,
 }
 

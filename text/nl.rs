@@ -23,72 +23,51 @@ struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
 
-    /// Specify which logical page body lines shall be numbered.
-    ///
-    /// - a - Number all lines.
-    ///
-    /// - t - Number only non-empty lines.
-    ///
-    /// - n - No line numbering.
-    ///
-    /// - pREGEX - Number only lines that contain the basic regular expression
-    ///   specified in *REGEX*.
-    #[arg(short = 'b', long, default_value_t = LineNumberingStyle::NonEmpty)]
+    #[arg(short = 'b', long, default_value_t = LineNumberingStyle::NonEmpty,
+          help = gettext("Specify which logical page body lines shall be numbered (a=all, t=non-empty, n=none, pREGEX=matching)"))]
     body_numbering: LineNumberingStyle,
 
-    /// Specify the delimiter characters that indicate the start of a logical
-    /// page section. These can be changed from the default characters "\:" to
-    /// two user-specified characters. If only one character is entered, the
-    /// second character shall remain the default character ':'.
-    #[arg(short = 'd', long, default_value_t = String::from("\\:"))]
+    #[arg(short = 'd', long, default_value_t = String::from("\\:"),
+          help = gettext("Specify the delimiter characters that indicate the start of a logical page section"))]
     section_delimiter: String,
 
-    /// Specify the same as b type except for footer.
-    #[arg(short = 'f', long, default_value_t = LineNumberingStyle::None)]
+    #[arg(short = 'f', long, default_value_t = LineNumberingStyle::None,
+          help = gettext("Specify the same as -b type except for footer"))]
     footer_numbering: LineNumberingStyle,
 
-    /// Specify the same as b type except for header.
-    #[arg(short = 'h', long, default_value_t = LineNumberingStyle::None)]
+    #[arg(short = 'h', long, default_value_t = LineNumberingStyle::None,
+          help = gettext("Specify the same as -b type except for header"))]
     header_numbering: LineNumberingStyle,
 
-    /// Specify the increment value used to number logical page lines.
-    #[arg(short = 'i', long, default_value_t = 1)]
+    #[arg(short = 'i', long, default_value_t = 1,
+          help = gettext("Specify the increment value used to number logical page lines"))]
     line_increment: i64,
 
-    /// Specify the number of blank lines to be considered as one. For example,
-    /// -l 2 results in only the second adjacent blank line being numbered (if
-    /// the appropriate -h a, -b a, or -f a option is set).
-    #[arg(short = 'l', long, default_value_t = 1, value_parser = clap::value_parser!(i64).range(1..))]
+    #[arg(short = 'l', long, default_value_t = 1, value_parser = clap::value_parser!(i64).range(1..),
+          help = gettext("Specify the number of blank lines to be considered as one"))]
     join_blank_lines: i64,
 
-    /// Specify the line numbering format. Recognized values are: ln, left
-    /// justified, leading zeros suppressed; rn, right justified, leading zeros
-    /// suppressed; rz, right justified, leading zeros kept.
-    #[arg(short = 'n', long, default_value_t = NumberFormat::Rn)]
+    #[arg(short = 'n', long, default_value_t = NumberFormat::Rn,
+          help = gettext("Specify the line numbering format (ln=left, rn=right, rz=right with zeros)"))]
     number_format: NumberFormat,
 
-    /// Specify that numbering should not be restarted at logical page
-    /// delimiters.
-    #[arg(short = 'p', long, default_value_t = false)]
+    #[arg(short = 'p', long, default_value_t = false,
+          help = gettext("Specify that numbering should not be restarted at logical page delimiters"))]
     no_renumber: bool,
 
-    /// Specify the characters used in separating the line number and the
-    /// corresponding text line.
-    #[arg(short = 's', long, default_value_t = String::from("\t"))]
+    #[arg(short = 's', long, default_value_t = String::from("\t"),
+          help = gettext("Specify the characters used in separating the line number and the corresponding text line"))]
     number_separator: String,
 
-    /// Specify the initial value used to number logical page lines.
-    #[arg(short = 'v', long, default_value_t = 1)]
+    #[arg(short = 'v', long, default_value_t = 1,
+          help = gettext("Specify the initial value used to number logical page lines"))]
     starting_line_number: i64,
 
-    /// Specify the number of characters to be used for the line number.
-    #[arg(short = 'w', long, default_value_t = 6, value_parser = clap::value_parser!(i64).range(1..))]
+    #[arg(short = 'w', long, default_value_t = 6, value_parser = clap::value_parser!(i64).range(1..),
+          help = gettext("Specify the number of characters to be used for the line number"))]
     number_width: i64,
 
-    /// The standard input shall be used if no file operand is specified,
-    /// and shall be used if the file operand is '-' and the implementation
-    /// treats the '-' as meaning standard input.
-    #[arg()]
+    #[arg(help = gettext("File to read as input (use - for stdin)"))]
     file: Option<PathBuf>,
 }
 

@@ -14,7 +14,7 @@
 //! choosing the appropriate plural form based on a count value.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use posixutils_i18n::gettext_lib::lookup::{expand_escapes, MessageLookup};
 use std::process::exit;
 
@@ -22,34 +22,30 @@ use std::process::exit;
 #[derive(Parser)]
 #[command(
     version,
-    about = "ngettext - translate message and choose plural form",
+    about = gettext("ngettext - translate message and choose plural form"),
     disable_help_flag = true,
     disable_version_flag = true
 )]
 struct Args {
-    /// Use TEXTDOMAIN as the text domain for translating MSGID
-    #[arg(short = 'd', long = "domain")]
+    #[arg(short = 'd', long = "domain", help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
     domain: Option<String>,
 
-    /// Enable interpretation of some escape sequences
-    #[arg(short = 'e')]
+    #[arg(short = 'e', help = gettext("Enable interpretation of some escape sequences"))]
     expand_escapes: bool,
 
-    /// Print help
-    #[arg(short, long, action = clap::ArgAction::HelpLong)]
+    #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
     help: Option<bool>,
 
-    /// Print version
-    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, help = gettext("Print version"))]
     version: Option<bool>,
 
-    /// Singular form (MSGID1)
+    #[arg(help = gettext("Singular form (MSGID1)"))]
     msgid1: String,
 
-    /// Plural form (MSGID2)
+    #[arg(help = gettext("Plural form (MSGID2)"))]
     msgid2: String,
 
-    /// Count for plural selection
+    #[arg(help = gettext("Count for plural selection"))]
     count: String,
 }
 

@@ -22,19 +22,16 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("uncompress - expand compressed data"))]
 struct Args {
-    /// Write to standard output; no files are changed.
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, help = gettext("Write to standard output; no files are changed"))]
     stdout: bool,
 
-    /// Do not prompt for overwriting files
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Do not prompt for overwriting files"))]
     force: bool,
 
-    /// Write messages to standard error concerning the expansion of each file.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write messages to standard error concerning the expansion of each file"))]
     verbose: bool,
 
-    /// Files to read as input.  Use "-" or no-args for stdin.
+    #[arg(help = gettext("Files to read as input. Use \"-\" or no-args for stdin"))]
     files: Vec<PathBuf>,
 }
 

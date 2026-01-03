@@ -7,12 +7,19 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::fs;
-use std::io::{self, Read, Write};
-
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEF_BLOCK_SIZE: usize = 512;
+
+// Global flag for SIGINT handling
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigint_handler(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
 
 const CONV_ASCII_IBM: [u8; 256] = [
     0x0, 0x1, 0x2, 0x3, 0x37, 0x2d, 0x2e, 0x2f, 0x16, 0x5, 0x25, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10,
@@ -72,12 +79,14 @@ const CONV_ASCII_EBCDIC: [u8; 256] = [
 ];
 
 #[allow(clippy::upper_case_acronyms)]
+#[derive(Clone, Copy)]
 enum AsciiConv {
     Ascii,
     EBCDIC,
     IBM,
 }
 
+#[derive(Clone, Copy)]
 enum Conversion {
     Ascii(AsciiConv),
     Lcase,
@@ -88,6 +97,31 @@ enum Conversion {
     Sync,
 }
 
+/// Statistics for dd operations
+#[derive(Default)]
+struct Stats {
+    in_full: u64,     // Full input blocks read
+    in_partial: u64,  // Partial input blocks read
+    out_full: u64,    // Full output blocks written
+    out_partial: u64, // Partial output blocks written
+    truncated: u64,   // Truncated records (for conv=block)
+}
+
+impl Stats {
+    fn print(&self) {
+        eprintln!("{}+{} records in", self.in_full, self.in_partial);
+        eprintln!("{}+{} records out", self.out_full, self.out_partial);
+        if self.truncated > 0 {
+            let word = if self.truncated == 1 {
+                "record"
+            } else {
+                "records"
+            };
+            eprintln!("{} truncated {}", self.truncated, word);
+        }
+    }
+}
+
 struct Config {
     ifile: String,
     ofile: String,
@@ -96,10 +130,11 @@ struct Config {
     cbs: usize,
     seek: usize,
     skip: usize,
-    count: usize,
+    count: Option<usize>,
     conversions: Vec<Conversion>,
     noerror: bool,
     notrunc: bool,
+    bs_mode: bool, // True if bs= was used (passthrough mode)
 }
 
 impl Default for Config {
@@ -112,11 +147,29 @@ impl Default for Config {
             cbs: Default::default(),
             seek: Default::default(),
             skip: Default::default(),
-            count: Default::default(),
+            count: None,
             conversions: Default::default(),
             noerror: Default::default(),
             notrunc: Default::default(),
+            bs_mode: false,
         }
+    }
+}
+
+impl Config {
+    /// Check if block/unblock conversion is requested
+    fn has_block_unblock(&self) -> bool {
+        self.conversions
+            .iter()
+            .any(|c| matches!(c, Conversion::Block | Conversion::Unblock))
+    }
+
+    /// Check if only "simple" conversions are used (sync, noerror, notrunc)
+    /// which allows passthrough mode with bs=
+    fn has_complex_conversions(&self) -> bool {
+        self.conversions
+            .iter()
+            .any(|c| !matches!(c, Conversion::Sync))
     }
 }
 
@@ -162,19 +215,23 @@ fn convert_ucase(data: &mut [u8]) {
     }
 }
 
-fn convert_sync(data: &mut Vec<u8>, block_size: usize) {
+fn convert_sync(data: &mut Vec<u8>, block_size: usize, use_space: bool) {
     let current_len = data.len();
     if current_len < block_size {
-        data.resize(block_size, 0); // Pad with null bytes (0x00)
+        let pad_char = if use_space { b' ' } else { 0u8 };
+        data.resize(block_size, pad_char);
     }
 }
 
-fn convert_block(data: &mut Vec<u8>, cbs: usize) {
+fn convert_block(data: &mut Vec<u8>, cbs: usize, truncated: &mut u64) {
     let mut result = Vec::new();
     let mut line = Vec::new();
 
     for &byte in data.iter() {
         if byte == b'\n' {
+            if line.len() > cbs {
+                *truncated += 1;
+            }
             while line.len() < cbs {
                 line.push(b' ');
             }
@@ -186,6 +243,9 @@ fn convert_block(data: &mut Vec<u8>, cbs: usize) {
     }
 
     if !line.is_empty() {
+        if line.len() > cbs {
+            *truncated += 1;
+        }
         while line.len() < cbs {
             line.push(b' ');
         }
@@ -201,93 +261,238 @@ fn convert_unblock(data: &mut Vec<u8>, cbs: usize) {
         let trimmed_chunk = chunk
             .iter()
             .rposition(|&b| b != b' ')
-            .map_or(chunk, |pos| &chunk[..=pos]);
+            .map_or(&chunk[..0], |pos| &chunk[..=pos]);
         result.extend_from_slice(trimmed_chunk);
         result.push(b'\n');
     }
     *data = result;
 }
 
-fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
+fn apply_conversions(data: &mut Vec<u8>, config: &Config, stats: &mut Stats) {
+    let use_space_padding = config.has_block_unblock();
+
     for conversion in &config.conversions {
         match conversion {
             Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
             Conversion::Lcase => convert_lcase(data),
             Conversion::Ucase => convert_ucase(data),
             Conversion::Swab => convert_swab(data),
-            Conversion::Sync => convert_sync(data, config.ibs),
-            Conversion::Block => convert_block(data, config.cbs),
+            Conversion::Sync => convert_sync(data, config.ibs, use_space_padding),
+            Conversion::Block => convert_block(data, config.cbs, &mut stats.truncated),
             Conversion::Unblock => convert_unblock(data, config.cbs),
         }
     }
 }
 
-fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ifile: Box<dyn Read> = if config.ifile.is_empty() {
-        Box::new(io::stdin().lock())
-    } else {
-        Box::new(fs::File::open(&config.ifile)?)
-    };
-    let mut ofile: Box<dyn Write> = if config.ofile.is_empty() {
-        Box::new(io::stdout().lock())
-    } else {
-        Box::new(fs::File::create(&config.ofile)?)
-    };
+/// Wrapper for input that may or may not be seekable
+enum InputFile {
+    Stdin(io::Stdin),
+    File(File),
+}
 
-    let mut ibuf = vec![0u8; config.ibs];
-    let obuf = vec![0u8; config.obs];
+impl Read for InputFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            InputFile::Stdin(s) => s.read(buf),
+            InputFile::File(f) => f.read(buf),
+        }
+    }
+}
 
-    let mut count = 0;
-    let mut skip = config.skip;
-    let mut seek = config.seek;
-
-    loop {
-        if skip > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
+impl InputFile {
+    fn try_seek(&mut self, pos: SeekFrom) -> io::Result<bool> {
+        match self {
+            InputFile::Stdin(_) => Ok(false),
+            InputFile::File(f) => {
+                f.seek(pos)?;
+                Ok(true)
             }
-            skip -= n;
-            continue;
         }
+    }
+}
 
-        if seek > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            seek -= n;
-            continue;
-        }
+/// Wrapper for output that may or may not be seekable
+enum OutputFile {
+    Stdout(io::Stdout),
+    File(File),
+}
 
-        let n = ifile.read(&mut ibuf)?;
-        if n == 0 {
-            break;
-        }
-
-        if config.count > 0 {
-            if count >= config.count {
-                break;
-            }
-            count += 1;
-        }
-
-        let mut ibuf = ibuf[..n].to_vec();
-
-        apply_conversions(&mut ibuf, config);
-
-        if config.obs != 0 {
-            ofile.write_all(&ibuf)?;
-        } else {
-            ofile.write_all(&obuf[..n])?;
+impl Write for OutputFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            OutputFile::Stdout(s) => s.write(buf),
+            OutputFile::File(f) => f.write(buf),
         }
     }
 
-    Ok(())
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            OutputFile::Stdout(s) => s.flush(),
+            OutputFile::File(f) => f.flush(),
+        }
+    }
+}
+
+impl OutputFile {
+    fn try_seek(&mut self, pos: SeekFrom) -> io::Result<bool> {
+        match self {
+            OutputFile::Stdout(_) => Ok(false),
+            OutputFile::File(f) => {
+                f.seek(pos)?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error>> {
+    let mut stats = Stats::default();
+
+    // Open input file
+    let mut ifile: InputFile = if config.ifile.is_empty() {
+        InputFile::Stdin(io::stdin())
+    } else {
+        InputFile::File(File::open(&config.ifile)?)
+    };
+
+    // Open output file with proper truncation behavior
+    let mut ofile: OutputFile = if config.ofile.is_empty() {
+        OutputFile::Stdout(io::stdout())
+    } else {
+        // POSIX: truncate unless notrunc or seek is specified
+        let should_truncate = !config.notrunc && config.seek == 0;
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(should_truncate)
+            .open(&config.ofile)?;
+        OutputFile::File(file)
+    };
+
+    let mut ibuf = vec![0u8; config.ibs];
+
+    // Handle skip (input positioning)
+    if config.skip > 0 {
+        let skip_bytes = config.skip * config.ibs;
+        // Try to seek first
+        if !ifile.try_seek(SeekFrom::Start(skip_bytes as u64))? {
+            // Non-seekable: read and discard
+            let mut remaining = config.skip;
+            while remaining > 0 {
+                let n = ifile.read(&mut ibuf)?;
+                if n == 0 {
+                    break;
+                }
+                remaining -= 1;
+            }
+        }
+    }
+
+    // Handle seek (output positioning)
+    if config.seek > 0 {
+        let seek_bytes = config.seek * config.obs;
+        // Try to seek first
+        if !ofile.try_seek(SeekFrom::Start(seek_bytes as u64))? {
+            // Non-seekable: write null bytes
+            let zeros = vec![0u8; config.obs];
+            for _ in 0..config.seek {
+                ofile.write_all(&zeros)?;
+            }
+        }
+    }
+
+    // Output buffer for aggregation
+    let mut obuf: Vec<u8> = Vec::new();
+    let use_passthrough = config.bs_mode && !config.has_complex_conversions();
+
+    let mut blocks_read: usize = 0;
+
+    loop {
+        // Check for SIGINT
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Check count limit
+        if let Some(count) = config.count {
+            if blocks_read >= count {
+                break;
+            }
+        }
+
+        let n = match ifile.read(&mut ibuf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                if config.noerror {
+                    eprintln!("{}: {}", gettext("read error"), e);
+                    stats.print();
+                    // If sync is specified, replace with nulls
+                    let has_sync = config
+                        .conversions
+                        .iter()
+                        .any(|c| matches!(c, Conversion::Sync));
+                    if has_sync {
+                        ibuf.fill(0);
+                        config.ibs
+                    } else {
+                        // Skip this block
+                        blocks_read += 1;
+                        continue;
+                    }
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        blocks_read += 1;
+
+        // Track input block statistics
+        if n == config.ibs {
+            stats.in_full += 1;
+        } else {
+            stats.in_partial += 1;
+        }
+
+        let mut data = ibuf[..n].to_vec();
+
+        // Apply conversions
+        apply_conversions(&mut data, config, &mut stats);
+
+        if use_passthrough {
+            // bs= mode: write each input block as separate output block
+            if data.len() == config.obs {
+                stats.out_full += 1;
+            } else {
+                stats.out_partial += 1;
+            }
+            ofile.write_all(&data)?;
+        } else {
+            // Aggregate output to obs-sized blocks
+            obuf.extend_from_slice(&data);
+
+            while obuf.len() >= config.obs {
+                let block: Vec<u8> = obuf.drain(..config.obs).collect();
+                stats.out_full += 1;
+                ofile.write_all(&block)?;
+            }
+        }
+    }
+
+    // Write any remaining data in output buffer
+    if !obuf.is_empty() {
+        stats.out_partial += 1;
+        ofile.write_all(&obuf)?;
+    }
+
+    ofile.flush()?;
+
+    Ok(stats)
 }
 
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {
-    for convstr in s.split(",") {
+    for convstr in s.split(',') {
         let conversion = match convstr {
             "ascii" => Conversion::Ascii(AsciiConv::Ascii),
             "ebcdic" => Conversion::Ascii(AsciiConv::EBCDIC),
@@ -316,28 +521,54 @@ fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut s = s.to_string();
-    let mut scale = 1;
-    let suffix = s.pop().unwrap();
-    if suffix.is_alphabetic() {
-        match suffix {
-            'c' => scale = 1,
-            'w' => scale = 2,
-            'b' => scale = 512,
-            'k' | 'K' => scale = 1024,
-            'm' | 'M' => scale = 1024 * 1024,
-            'g' | 'G' => scale = 1024 * 1024 * 1024,
-            _ => {
-                eprintln!("{}: {}", gettext("invalid block size suffix"), suffix);
-                return Err("invalid block size suffix".into());
+/// Parse a single component of a block size expression (number with optional suffix)
+fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    if s.is_empty() {
+        return Err("empty block size".into());
+    }
+
+    let mut chars: Vec<char> = s.chars().collect();
+    let mut scale: usize = 1;
+
+    if let Some(&last) = chars.last() {
+        if last.is_alphabetic() {
+            chars.pop();
+            match last {
+                'c' => scale = 1,
+                'w' => scale = 2,
+                'b' => scale = 512,
+                'k' | 'K' => scale = 1024,
+                'm' | 'M' => scale = 1024 * 1024,
+                'g' | 'G' => scale = 1024 * 1024 * 1024,
+                _ => {
+                    eprintln!("{}: {}", gettext("invalid block size suffix"), last);
+                    return Err("invalid block size suffix".into());
+                }
             }
         }
-    } else {
-        s.push(suffix);
     }
-    let size = s.parse::<usize>()?;
+
+    let num_str: String = chars.into_iter().collect();
+    let size = num_str.parse::<usize>()?;
     Ok(size * scale)
+}
+
+/// Parse block size expression with 'x' multiplier support
+/// POSIX: "Two or more positive decimal numbers separated by x, specifying the product"
+fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = s.split('x').collect();
+
+    let mut result: usize = 1;
+    for part in parts {
+        let component = parse_block_size_component(part)?;
+        result = result.checked_mul(component).ok_or("block size overflow")?;
+    }
+
+    if result == 0 {
+        return Err("block size cannot be zero".into());
+    }
+
+    Ok(result)
 }
 
 fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> {
@@ -346,7 +577,7 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
     for arg in args {
         // Split arg into option and argument
         let (op, oparg) = {
-            match arg.split_once("=") {
+            match arg.split_once('=') {
                 None => {
                     let msg = format!("{}: {}", gettext("invalid option"), arg);
                     eprintln!("{}", msg);
@@ -366,15 +597,18 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
                 let block_sz = parse_block_size(&oparg)?;
                 config.ibs = block_sz;
                 config.obs = block_sz;
+                config.bs_mode = true;
             }
             "cbs" => config.cbs = parse_block_size(&oparg)?,
             "skip" => config.skip = oparg.parse::<usize>()?,
             "seek" => config.seek = oparg.parse::<usize>()?,
-            "count" => config.count = oparg.parse::<usize>()?,
+            "count" => config.count = Some(oparg.parse::<usize>()?),
+
             "conv" => parse_conv_list(&mut config, &oparg)?,
 
             _ => {
                 eprintln!("{}: {}", gettext("invalid option"), op);
+                return Err(format!("invalid option: {}", op).into());
             }
         }
     }
@@ -386,10 +620,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
+    // Install SIGINT handler
+    unsafe {
+        libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = parse_cmdline(&args)?;
 
-    copy_convert_file(&config)?;
+    let stats = copy_convert_file(&config)?;
+    stats.print();
+
+    // If we were interrupted, exit with signal status
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        std::process::exit(128 + libc::SIGINT);
+    }
 
     Ok(())
 }

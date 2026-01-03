@@ -78,6 +78,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cxref (Development)
  - [x] delta (SCCS)
  - [x] diff
+ - [x] df
  - [x] dirname
  - [x] du
  - [x] echo
@@ -92,6 +93,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fuser
  - [x] gencat (i18n)
  - [x] get (SCCS)
+ - [x] getconf
  - [x] gettext (i18n)
  - [x] grep
  - [x] head
@@ -105,6 +107,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ls
  - [x] m4
  - [x] mailx
+ - [x] man
  - [x] make
  - [x] mkdir
  - [x] more
@@ -115,6 +118,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nm (Development)
  - [x] od
  - [x] paste
+ - [x] patch
  - [x] pax
  - [x] pr
  - [x] printf
@@ -132,10 +136,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] split
  - [x] strings
  - [x] strip (Development)
+ - [x] stty
+ - [x] tabs
  - [x] tail
  - [x] test
  - [x] time
  - [x] timeout
+ - [x] tput
  - [x] tr
  - [x] true
  - [x] uncompress (compress cat.)
@@ -152,6 +159,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
+ - [x] who
+ - [x] dd
  - [x] xargs
  - [x] id
  - [x] xgettext (i18n)
@@ -170,7 +179,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcrm (IPC)
  - [x] ln
  - [x] logname
- - [x] man
  - [x] mesg
  - [x] mkfifo
  - [x] newgrp
@@ -190,19 +198,11 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 1 - Rough draft
 
  - [x] cal
- - [x] df
- - [x] dd
- - [x] getconf
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp
- - [x] patch
  - [x] ps
- - [x] stty
- - [x] tabs
- - [x] tput
  - [x] tsort
- - [x] who
 
 ## Stage 0 - Not started
 

@@ -19,11 +19,10 @@ use plib::BUFSZ;
 #[derive(Parser)]
 #[command(version, about = gettext("expand - convert tabs to spaces"))]
 struct Args {
-    /// Tab stops, either a single positive decimal integer or a list of tabstops separated by commas.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Tab stops, either a single positive decimal integer or a list of tabstops separated by commas."))]
     tablist: Option<String>,
 
-    /// Files to read as input.
+    #[arg(help = gettext("Files to read as input."))]
     files: Vec<PathBuf>,
 }
 

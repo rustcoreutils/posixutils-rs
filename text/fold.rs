@@ -21,19 +21,17 @@ const TABSTOP: usize = 8;
 #[derive(Parser, Clone)]
 #[command(version, about = gettext("fold - filter for folding lines"))]
 struct Args {
-    /// Count width in bytes rather than column positions.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Count width in bytes rather than column positions."))]
     bytes: bool,
 
-    /// Break on spaces.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Break on spaces."))]
     spaces: bool,
 
-    /// Specify the maximum line length, in column positions (or bytes if -b is specified).
-    #[arg(short, long, default_value_t = 80, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(short, long, default_value_t = 80, value_parser = clap::value_parser!(u64).range(1..),
+          help = gettext("Specify the maximum line length, in column positions (or bytes if -b is specified)."))]
     width: u64,
 
-    /// Files to read as input.
+    #[arg(help = gettext("Files to read as input."))]
     files: Vec<PathBuf>,
 }
 

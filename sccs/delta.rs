@@ -25,28 +25,22 @@ use plib::sccsfile::{
 #[derive(Parser)]
 #[command(version, about = gettext("delta - make a delta (change) to an SCCS file"))]
 struct Args {
-    /// SID of delta to create (if multiple edits pending)
-    #[arg(short = 'r', value_name = "SID")]
+    #[arg(short = 'r', value_name = "SID", help = gettext("SID of delta to create (if multiple edits pending)"))]
     sid: Option<String>,
 
-    /// Comment for delta
-    #[arg(short = 'y', value_name = "COMMENT")]
+    #[arg(short = 'y', value_name = "COMMENT", help = gettext("Comment for delta"))]
     comment: Option<Option<String>>,
 
-    /// Retain g-file after delta
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Retain g-file after delta"))]
     keep_gfile: bool,
 
-    /// Print diff output
-    #[arg(short = 'p')]
+    #[arg(short = 'p', help = gettext("Print diff output"))]
     print_diff: bool,
 
-    /// Silent mode (suppress informational messages)
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Silent mode (suppress informational messages)"))]
     silent: bool,
 
-    /// SCCS files to process
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to process"))]
     files: Vec<PathBuf>,
 }
 

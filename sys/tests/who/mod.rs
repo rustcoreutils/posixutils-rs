@@ -168,3 +168,31 @@ fn who_userproc() {
     // --userproc should show normal user processes
     run_who_test(vec!["--userproc"], 0, check_exit_success);
 }
+
+#[test]
+fn who_am_i() {
+    // "who am i" should be equivalent to -m option
+    run_who_test(vec!["am", "i"], 0, check_exit_success);
+}
+
+#[test]
+fn who_am_capital_i() {
+    // "who am I" should also work
+    run_who_test(vec!["am", "I"], 0, check_exit_success);
+}
+
+#[test]
+fn who_file_operand() {
+    // Test reading from an alternate utmpx file
+    // On macOS, the default file is /var/run/utmpx
+    // On Linux, it's typically /var/run/utmp
+    #[cfg(target_os = "macos")]
+    let utmpx_file = "/var/run/utmpx";
+    #[cfg(target_os = "linux")]
+    let utmpx_file = "/var/run/utmp";
+
+    // Only run if the file exists
+    if std::path::Path::new(utmpx_file).exists() {
+        run_who_test(vec![utmpx_file], 0, check_exit_success);
+    }
+}

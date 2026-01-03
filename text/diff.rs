@@ -34,48 +34,40 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 #[derive(Parser, Clone)]
 #[command(version, about = gettext("diff - compare two files"))]
 struct Args {
-    /// Cause EOL whitespace to be treated as blanks
-    #[arg(short = 'b', long = "ignore-space-change")]
+    #[arg(short = 'b', long = "ignore-space-change", help = gettext("Cause EOL whitespace to be treated as blanks"))]
     ignore_eol_space: bool,
 
-    /// Output 3 lines of copied context
-    #[arg(short)]
+    #[arg(short, help = gettext("Output 3 lines of copied context"))]
     context3: bool,
 
-    /// Output <N> lines of copied context
-    #[arg(short='C', value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(short='C', value_parser = clap::value_parser!(u32).range(1..), help = gettext("Output <N> lines of copied context"))]
     context: Option<u32>,
 
-    /// Produce output in a form suitable as input for the ed utility
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Produce output in a form suitable as input for the ed utility"))]
     ed: bool,
 
-    /// Produce output in an alternative form, similar in format to -e
-    #[arg(short)]
+    #[arg(short, help = gettext("Produce output in an alternative form, similar in format to -e"))]
     fed: bool,
 
-    /// Apply diff recursively to files and directories of the same name
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Apply diff recursively to files and directories of the same name"))]
     recurse: bool,
 
-    /// Output 3 lines of unified context
-    #[arg(short)]
+    #[arg(short, help = gettext("Output 3 lines of unified context"))]
     unified3: bool,
 
-    /// Output <N> lines of unified context
-    #[arg(short='U', value_parser = clap::value_parser!(u32).range(0..))]
+    #[arg(short='U', value_parser = clap::value_parser!(u32).range(0..), help = gettext("Output <N> lines of unified context"))]
     unified: Option<u32>,
 
-    /// First comparison file (or directory, if -r is specified)
+    #[arg(help = gettext("First comparison file (or directory, if -r is specified)"))]
     file1: String,
 
-    #[arg(long, value_parser= clap::value_parser!(String))]
+    #[arg(long, value_parser= clap::value_parser!(String), help = gettext("Label for first file"))]
     label: Option<String>,
 
-    #[arg(long, value_parser= clap::value_parser!(String))]
+    #[arg(long, value_parser= clap::value_parser!(String), help = gettext("Label for second file"))]
     label2: Option<String>,
 
-    /// Second comparison file (or directory, if -r is specified)
+    #[arg(help = gettext("Second comparison file (or directory, if -r is specified)"))]
     file2: String,
 }
 

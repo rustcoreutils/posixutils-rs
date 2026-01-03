@@ -22,14 +22,13 @@ const RW: u32 = 0o666;
 #[derive(Parser)]
 #[command(version, about = gettext("uuencode - encode a binary file"))]
 struct Args {
-    /// Encode to base64 (MIME) standard, rather than UUE format.
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, help = gettext("Encode to base64 (MIME) standard, rather than UUE format"))]
     base64: bool,
 
-    /// File to read as input.
+    #[arg(help = gettext("File to read as input"))]
     file: Option<PathBuf>,
 
-    /// Decode pathname
+    #[arg(help = gettext("Decode pathname"))]
     decode_path: Option<String>,
 }
 

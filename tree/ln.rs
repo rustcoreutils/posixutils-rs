@@ -16,15 +16,13 @@ use std::{fs, io};
 #[derive(Parser)]
 #[command(version, about = gettext("ln - link files"))]
 struct Args {
-    /// Force existing destination pathnames to be removed to allow the link.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Force existing destination pathnames to be removed to allow the link"))]
     force: bool,
 
-    /// Create symbolic links instead of hard links.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Create symbolic links instead of hard links"))]
     symlink: bool,
 
-    /// Source(s) and target of link(s).
+    #[arg(help = gettext("Source(s) and target of link(s)"))]
     files: Vec<String>,
 }
 

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+gettext-rs.workspace = true
 termios = "0.3"
 libc.workspace = true
 regex.workspace = true
@@ -16,6 +17,9 @@ plib = { path = "../plib" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true
 
 [lib]
 name = "vi_rs"

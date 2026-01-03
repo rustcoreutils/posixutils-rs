@@ -28,20 +28,16 @@ use std::process::ExitCode;
     override_usage = "uux [-jnp] [-] command-string"
 )]
 struct Args {
-    /// Write job ID to stdout
-    #[arg(short = 'j')]
+    #[arg(short = 'j', help = gettext("Write job ID to stdout"))]
     print_job_id: bool,
 
-    /// Do not send mail notification on failure
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Do not send mail notification on failure"))]
     no_notify: bool,
 
-    /// Read stdin and pipe to command
-    #[arg(short = 'p')]
+    #[arg(short = 'p', help = gettext("Read stdin and pipe to command"))]
     pipe_stdin: bool,
 
-    /// Command string to execute (use - before command to pipe stdin)
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("Command string to execute"))]
     command: Vec<String>,
 }
 

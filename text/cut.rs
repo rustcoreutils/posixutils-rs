@@ -17,31 +17,25 @@ use std::path::PathBuf;
 #[derive(Parser, Clone)]
 #[command(version, about = gettext("cut - cut out selected fields of each line of a file"))]
 struct Args {
-    /// Cut based on a list of bytes
-    #[arg(short = 'b', long)]
+    #[arg(short = 'b', long, help = gettext("Cut based on a list of bytes"))]
     bytes: Option<String>,
 
-    /// Cut based on a list of characters
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, help = gettext("Cut based on a list of characters"))]
     characters: Option<String>,
 
-    /// Cut based on a list of fields
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, help = gettext("Cut based on a list of fields"))]
     fields: Option<String>,
 
-    /// Set the field delimiter
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, help = gettext("Set the field delimiter"))]
     delimiter: Option<char>,
 
-    /// Suppress lines with no delimiter characters
-    #[structopt(short = 's', long)]
+    #[structopt(short = 's', long, help = gettext("Suppress lines with no delimiter characters"))]
     suppress: bool,
 
-    /// Do not split characters
-    #[structopt(short = 'n')]
+    #[structopt(short = 'n', help = gettext("Do not split characters"))]
     no_split: bool,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     filenames: Vec<PathBuf>,
 }
 

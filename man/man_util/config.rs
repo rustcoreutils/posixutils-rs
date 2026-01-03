@@ -22,10 +22,10 @@ pub struct ManConfig {
 
 /// # parse_config_file
 ///
-/// Parses `man`` cofiguration file.
+/// Parses man configuration file.
 ///
 /// # Params:
-/// * path - path to onfiguration file
+/// * path - path to configuration file
 ///
 /// # Errors:
 /// * io
@@ -61,7 +61,7 @@ pub fn parse_config_file(path: PathBuf) -> Result<ManConfig, ManError> {
                     conf.output_options.insert(option_name.to_string(), value);
                 }
             }
-            _ => unreachable!("Unexpected directive: {directive}"),
+            _ => continue, // Ignore unknown directives for forward compatibility
         }
     }
 

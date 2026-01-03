@@ -21,22 +21,19 @@ const NODUP: u32 = 1 << 2;
 #[derive(Parser)]
 #[command(version, about = gettext("comm - select or reject lines common to two files"))]
 struct Args {
-    /// Suppress the output column of lines unique to file1.
-    #[arg(short = '1', long)]
+    #[arg(short = '1', long, help = gettext("Suppress the output column of lines unique to file1."))]
     no1: bool,
 
-    /// Suppress the output column of lines unique to file2.
-    #[arg(short = '2', long)]
+    #[arg(short = '2', long, help = gettext("Suppress the output column of lines unique to file2."))]
     no2: bool,
 
-    /// Suppress the output column of lines duplicated in file1 and file2.
-    #[arg(short = '3', long)]
+    #[arg(short = '3', long, help = gettext("Suppress the output column of lines duplicated in file1 and file2."))]
     no_dup: bool,
 
-    /// Comparison file1
+    #[arg(help = gettext("Comparison file1"))]
     file1: PathBuf,
 
-    /// Comparison file2
+    #[arg(help = gettext("Comparison file2"))]
     file2: PathBuf,
 }
 

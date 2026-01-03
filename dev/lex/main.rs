@@ -17,6 +17,7 @@ mod pattern_validate;
 
 use clap::Parser;
 use dfa::Dfa;
+use gettextrs::gettext;
 use nfa::Nfa;
 use regex_syntax::ast::parse::ParserBuilder;
 use regex_syntax::hir::{translate::TranslatorBuilder, Hir};
@@ -25,25 +26,21 @@ use std::io::{self, BufRead, Read, Write};
 
 /// lex - generate programs for lexical tasks (POSIX compatible)
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[command(author, version, about = gettext("lex - generate programs for lexical tasks (POSIX compatible)"))]
 struct Args {
-    /// Suppress the summary of statistics usually written with the -v option.
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, help = gettext("Suppress the summary of statistics usually written with the -v option"))]
     no_stats: bool,
 
-    /// Write the resulting program to standard output instead of lex.yy.c.
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, help = gettext("Write the resulting program to standard output instead of lex.yy.c"))]
     stdout: bool,
 
-    /// Write a summary of lex statistics to the standard output.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write a summary of lex statistics to the standard output"))]
     verbose: bool,
 
-    /// Write output to this filename (unless superceded by -t).
-    #[arg(short, long, default_value = "lex.yy.c")]
+    #[arg(short, long, default_value = "lex.yy.c", help = gettext("Write output to this filename (unless superceded by -t)"))]
     outfile: String,
 
-    /// Files to read as input.
+    #[arg(help = gettext("Files to read as input"))]
     files: Vec<String>,
 }
 

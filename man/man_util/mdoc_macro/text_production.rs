@@ -312,8 +312,7 @@ impl Display for StType {
             // POSIX Issues 7 and 8 Standards
             StType::P100312008 => "IEEE Std 1003.1-2008 (“POSIX.1”)".to_string(),
             StType::Susv4 => "Version 4 of the Single UNIX Specification (“SUSv4”)".to_string(),
-            // TODO: documentation doesn't containt needed text.
-            StType::P100312024 => "".to_string(),
+            StType::P100312024 => "IEEE Std 1003.1-2024 (\"POSIX.1\")".to_string(),
             // Other Standards
             StType::Ieee754 => "IEEE Std 754-1985".to_string(),
             StType::Iso8601 => "ISO 8601".to_string(),

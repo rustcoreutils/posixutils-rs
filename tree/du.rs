@@ -19,31 +19,25 @@ use std::{
 #[derive(Parser)]
 #[command(version, about = gettext("du - estimate file space usage"))]
 struct Args {
-    /// Write counts for all files, not just directories
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write counts for all files, not just directories"))]
     all: bool,
 
-    /// Follow command line symlinks
-    #[arg(short = 'H', long)]
+    #[arg(short = 'H', long, help = gettext("Follow command line symlinks"))]
     follow_cli: bool,
 
-    /// Dereference all symlinks
-    #[arg(short = 'L', long)]
+    #[arg(short = 'L', long, help = gettext("Dereference all symlinks"))]
     dereference: bool,
 
-    /// Write the files sizes in units of 1024 bytes, rather than the default 512-byte units.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write the files sizes in units of 1024 bytes, rather than the default 512-byte units"))]
     kilo: bool,
 
-    /// Write only the sum of all arguments
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Write only the sum of all arguments"))]
     sum: bool,
 
-    /// When evaluating file sizes, evaluate only those files that have the same device as the file specified by the file operand.
-    #[arg(short = 'x', long)]
+    #[arg(short = 'x', long, help = gettext("When evaluating file sizes, evaluate only those files that have the same device as the file specified by the file operand"))]
     one_fs: bool,
 
-    /// The files to receive metadata processing
+    #[arg(help = gettext("The files to receive metadata processing"))]
     files: Vec<String>,
 }
 

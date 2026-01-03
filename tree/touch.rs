@@ -15,31 +15,25 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 #[derive(Parser)]
 #[command(version, about = gettext("touch - change file access and modification times"))]
 struct Args {
-    /// Change the access time of file.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Change the access time of file"))]
     access: bool,
 
-    /// Do not create a specified file if it does not exist.
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, help = gettext("Do not create a specified file if it does not exist"))]
     no_create: bool,
 
-    /// Change the modification time of file.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Change the modification time of file"))]
     mtime: bool,
 
-    /// Use the specified ISO 8601:2000 date-time format, instead of the current time.
-    #[arg(short, long, group = "timefmt")]
+    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format, instead of the current time"))]
     datetime: Option<String>,
 
-    /// Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time.
-    #[arg(short, long, group = "timefmt")]
+    #[arg(short, long, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
     time: Option<String>,
 
-    /// Use the corresponding time of the file named by the pathname ref_file instead of the current time.
-    #[arg(short, long, group = "timefmt")]
+    #[arg(short, long, group = "timefmt", help = gettext("Use the corresponding time of the file named by the pathname ref_file instead of the current time"))]
     ref_file: Option<String>,
 
-    /// A pathname of a file whose times shall be modified.
+    #[arg(help = gettext("A pathname of a file whose times shall be modified"))]
     files: Vec<String>,
 }
 

@@ -30,7 +30,7 @@ use plib::io::input_reader;
 #[derive(Parser)]
 #[command(version, about = gettext("asa - interpret carriage-control characters"))]
 struct Args {
-    /// Files to read as input.
+    #[arg(help = gettext("Files to read as input"))]
     files: Vec<PathBuf>,
 }
 

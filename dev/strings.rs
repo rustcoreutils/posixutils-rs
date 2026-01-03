@@ -25,16 +25,13 @@ enum OffsetFormat {
 
 #[derive(clap::Args, Clone, Copy)]
 struct OutputOptions {
-    /// Scan the input files in their entirety
-    #[arg(short = 'a')]
+    #[arg(short = 'a', help = gettext("Scan the input files in their entirety"))]
     scan_all: bool,
 
-    /// Byte offset format
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Byte offset format"))]
     format: Option<OffsetFormat>,
 
-    /// Minimum string length
-    #[arg(short = 'n', default_value_t = 4)]
+    #[arg(short = 'n', default_value_t = 4, help = gettext("Minimum string length"))]
     minimum_string_length: usize,
 }
 

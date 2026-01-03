@@ -81,19 +81,18 @@ impl FromStr for RelativeFrom {
 #[derive(Parser)]
 #[command(version, about = gettext("tail - copy the last part of a file"))]
 struct Args {
-    /// The number of lines to print from the end of the file
-    #[arg(short = 'n', long = "lines", allow_hyphen_values = true)]
+    #[arg(short = 'n', long = "lines", allow_hyphen_values = true,
+          help = gettext("The number of lines to print from the end of the file"))]
     lines: Option<String>,
 
-    /// The number of bytes to print from the end of the file
-    #[arg(short = 'c', long = "bytes", allow_hyphen_values = true)]
+    #[arg(short = 'c', long = "bytes", allow_hyphen_values = true,
+          help = gettext("The number of bytes to print from the end of the file"))]
     bytes: Option<String>,
 
-    /// Output appended data as the file grows
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Output appended data as the file grows"))]
     follow: bool,
 
-    /// The file to read
+    #[arg(help = gettext("The file to read"))]
     file: Option<PathBuf>,
 }
 

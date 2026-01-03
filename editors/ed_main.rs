@@ -14,6 +14,7 @@
 mod ed;
 
 use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::io::{self, BufReader, BufWriter};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,18 +26,15 @@ pub static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// ed - edit text
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(version, about = gettext("ed - edit text"))]
 struct Args {
-    /// Use string as the prompt when in command mode
-    #[arg(short, long, default_value = "")]
+    #[arg(short, long, default_value = "", help = gettext("Use string as the prompt when in command mode"))]
     prompt: String,
 
-    /// Suppress the writing of byte counts by e, E, r, and w commands
-    /// and the '!' prompt after !command
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Suppress the writing of byte counts by e, E, r, and w commands and the '!' prompt after !command"))]
     silent: bool,
 
-    /// File to edit
+    #[arg(help = gettext("File to edit"))]
     file: Option<String>,
 }
 
@@ -65,6 +63,10 @@ fn setup_signals() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs").ok();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
     let args = Args::parse();
 
     // Set up signal handlers

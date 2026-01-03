@@ -9,12 +9,15 @@ rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true
-dirs = "5"
+dirs.workspace = true
 plib = { path = "../plib" }
 
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "mailx"

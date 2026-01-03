@@ -32,6 +32,7 @@ cfg_if::cfg_if! {
             pub fn pututxline(ut: *const libc::utmpx) -> *mut libc::utmpx;
             pub fn setutxent();
             pub fn endutxent();
+            pub fn utmpxname(file: *const libc::c_char) -> libc::c_int;
         }
 
         type LocalPIoctlOp = libc::c_int;
@@ -40,6 +41,7 @@ cfg_if::cfg_if! {
             endutxent,
             getutxent,
             setutxent,
+            utmpxname,
             BOOT_TIME,
             DEAD_PROCESS,
             EMPTY,

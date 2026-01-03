@@ -23,59 +23,46 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 #[derive(Parser)]
 #[command(version, about = gettext("sort - sort, merge, or sequence check text files"))]
 struct Args {
-    /// Check that the single input file is ordered as specified
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Check that the single input file is ordered as specified"))]
     check_order: bool,
 
-    /// Same as -c, except that a warning message shall not be sent to standard error if disorder or, with -u, a duplicate key is detected.
-    #[arg(short = 'C')]
+    #[arg(short = 'C', help = gettext("Same as -c, but without warning message for disorder or duplicate keys"))]
     check_order_without_war_mess: bool,
 
-    /// Merge only; the input file shall be assumed to be already sorted
-    #[arg(short = 'm')]
+    #[arg(short = 'm', help = gettext("Merge only; the input file shall be assumed to be already sorted"))]
     merge_only: bool,
 
-    /// Specify the name of an output file to be used instead of the standard output
-    #[arg(short = 'o')]
+    #[arg(short = 'o', help = gettext("Specify the name of an output file to be used instead of the standard output"))]
     output_file: Option<PathBuf>,
 
-    /// Unique: suppress all but one in each set of lines having equal keys
-    #[arg(short = 'u')]
+    #[arg(short = 'u', help = gettext("Unique: suppress all but one in each set of lines having equal keys"))]
     unique: bool,
 
-    /// Specify that only <blank> characters and alphanumeric characters, according to the current setting of LC_CTYPE, shall be significant in comparisons. The behavior is undefined for a sort key to which -i or -n also applies.
-    #[arg(short = 'd')]
+    #[arg(short = 'd', help = gettext("Dictionary order: only blank and alphanumeric characters are significant"))]
     dictionary_order: bool,
 
-    /// Consider all lowercase characters that have uppercase equivalents to be the uppercase equivalent for the purposes of comparison
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Fold lowercase to uppercase for comparison"))]
     fold_case: bool,
 
-    /// Ignore all characters that are non-printable
-    #[arg(short = 'i')]
+    #[arg(short = 'i', help = gettext("Ignore all characters that are non-printable"))]
     ignore_nonprintable: bool,
 
-    /// Restrict the sort key to an initial numeric string
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Restrict the sort key to an initial numeric string"))]
     numeric_sort: bool,
 
-    /// Reverse the sense of comparisons
-    #[arg(short = 'r')]
+    #[arg(short = 'r', help = gettext("Reverse the sense of comparisons"))]
     reverse: bool,
 
-    /// Ignore leading <blank> characters when determining the starting and ending positions of a restricted sort key
-    #[arg(short = 'b')]
+    #[arg(short = 'b', help = gettext("Ignore leading blank characters in sort keys"))]
     ignore_leading_blanks: bool,
 
-    /// Specify the field separator character
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Specify the field separator character"))]
     field_separator: Option<char>,
 
-    /// Specify the key definition for sorting
-    #[arg(short = 'k')]
+    #[arg(short = 'k', help = gettext("Specify the key definition for sorting"))]
     key_definition: Vec<String>,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     filenames: Vec<PathBuf>,
 }
 

@@ -51,7 +51,11 @@ libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
-tempfile = "3.14"
+tempfile = "3"
+dirs = "5"
+thiserror = "1"
+pest = { version = "2", default-features = false }
+pest_derive = "2"
 
 [workspace.lints]
 

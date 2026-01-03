@@ -1600,6 +1600,7 @@ name = "posixutils-editors"
 version = "0.7.0"
 dependencies = [
  "clap",
+ "gettext-rs",
  "libc",
  "plib",
  "regex",
@@ -1626,6 +1627,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
+ "plib",
 ]
 
 [[package]]
@@ -1659,7 +1661,6 @@ dependencies = [
  "log",
  "m4-test-manager",
  "nom",
- "once_cell",
  "regex-lite",
  "similar-asserts",
  "test-log",
@@ -1696,7 +1697,6 @@ dependencies = [
  "chrono",
  "clap",
  "gettext-rs",
- "lazy_static",
  "libc",
  "pest",
  "pest_derive",
@@ -1783,6 +1783,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
+ "plib",
  "terminfo 0.8.0",
  "termios",
 ]
@@ -1826,7 +1827,6 @@ dependencies = [
  "regex",
  "thiserror 1.0.69",
  "topological-sort",
- "walkdir",
 ]
 
 [[package]]

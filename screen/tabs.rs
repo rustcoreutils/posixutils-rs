@@ -6,20 +6,31 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - (efficiency): collect all output in a buffer, then write to stdout
-// - Research if 100 is a POSIX-compliant limit for MAX_STOPS
-// - gettext("Specify repetitive tab stops separated by ({}) columns")
-//
 
-use std::io::{self, Error, Write};
+use std::io::{self, Write};
+use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use terminfo::{capability as cap, Database};
 
-// arbitrarily chosen.  todo: search if POSIX-ly correct.
-const MAX_STOPS: usize = 100;
+// POSIX doesn't specify a maximum, but terminals have practical limits.
+// 160 columns is a reasonable upper bound for most terminals.
+const MAX_COLUMN: u16 = 160;
+
+/// Pre-process command line arguments to handle POSIX multi-character options.
+/// Converts -a2 -> --a2, -c2 -> --c2, -c3 -> --c3, and -0 -> --rep-0
+fn preprocess_args() -> Vec<String> {
+    std::env::args()
+        .map(|arg| match arg.as_str() {
+            "-a2" => "--a2".to_string(),
+            "-c2" => "--c2".to_string(),
+            "-c3" => "--c3".to_string(),
+            "-0" => "--rep-0".to_string(),
+            _ => arg,
+        })
+        .collect()
+}
 
 #[derive(Parser)]
 #[command(version, about = gettext("tabs - set terminal tabs"))]
@@ -27,202 +38,389 @@ struct Args {
     #[arg(short = 'T', long, help = gettext("Indicate the type of terminal"))]
     term: Option<String>,
 
-    #[arg(
-        short = '1',
-        long,
-        help = gettext("Specify repetitive tab stops separated by (1) columns")
-    )]
+    // Repetitive tab stops -0 through -9
+    #[arg(long = "rep-0", help = gettext("Clear all tab stops"))]
+    rep_0: bool,
+
+    #[arg(short = '1', help = gettext("Tab stops every 1 column"))]
     rep_1: bool,
 
-    /// Specify repetitive tab stops separated by (2) columns
-    #[arg(short = '2', long)]
+    #[arg(short = '2', help = gettext("Tab stops every 2 columns"))]
     rep_2: bool,
 
-    /// Specify repetitive tab stops separated by (3) columns
-    #[arg(short = '3', long)]
+    #[arg(short = '3', help = gettext("Tab stops every 3 columns"))]
     rep_3: bool,
 
-    /// Specify repetitive tab stops separated by (4) columns
-    #[arg(short = '4', long)]
+    #[arg(short = '4', help = gettext("Tab stops every 4 columns"))]
     rep_4: bool,
 
-    /// Specify repetitive tab stops separated by (5) columns
-    #[arg(short = '5', long)]
+    #[arg(short = '5', help = gettext("Tab stops every 5 columns"))]
     rep_5: bool,
 
-    /// Specify repetitive tab stops separated by (6) columns
-    #[arg(short = '6', long)]
+    #[arg(short = '6', help = gettext("Tab stops every 6 columns"))]
     rep_6: bool,
 
-    /// Specify repetitive tab stops separated by (7) columns
-    #[arg(short = '7', long)]
+    #[arg(short = '7', help = gettext("Tab stops every 7 columns"))]
     rep_7: bool,
 
-    /// Specify repetitive tab stops separated by (8) columns
-    #[arg(short = '8', long)]
+    #[arg(short = '8', help = gettext("Tab stops every 8 columns"))]
     rep_8: bool,
 
-    /// Specify repetitive tab stops separated by (9) columns
-    #[arg(short = '9', long)]
+    #[arg(short = '9', help = gettext("Tab stops every 9 columns"))]
     rep_9: bool,
 
-    /// Assembler, applicable to some mainframes.
-    /// 1=[1,10,16,36,72]
-    /// 2=[1,10,16,40,72]
-    #[arg(short, long, default_missing_value="1", value_parser = clap::value_parser!(u8).range(1..=2))]
-    assembler: Option<u8>,
+    // XSI language preset options
+    #[arg(short = 'a', help = gettext("Assembler: 1,10,16,36,72"))]
+    assembler: bool,
 
-    /// COBOL, normal and compact formats.
-    /// 1=[1,8,12,16,20,55]
-    /// 2=[1,6,10,14,49]
-    /// 3=[1,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,67]
-    #[arg(short, long, default_missing_value="1", value_parser = clap::value_parser!(u8).range(1..=3))]
-    cobol: Option<u8>,
+    #[arg(long = "a2", help = gettext("Assembler variant: 1,10,16,40,72"))]
+    assembler2: bool,
 
-    /// FORTAN: [1,7,11,15,19,23]
-    #[arg(short, long)]
+    #[arg(short = 'c', help = gettext("COBOL: 1,8,12,16,20,55"))]
+    cobol: bool,
+
+    #[arg(long = "c2", help = gettext("COBOL compact: 1,6,10,14,49"))]
+    cobol2: bool,
+
+    #[arg(long = "c3", help = gettext("COBOL compact extended: 1,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,67"))]
+    cobol3: bool,
+
+    #[arg(short = 'f', help = gettext("FORTRAN: 1,7,11,15,19,23"))]
     fortran: bool,
 
-    /// SNOBOL: [1,10,55]
-    #[arg(short, long)]
-    snobol: bool,
-
-    /// Assembler, applicable to some mainframes. [1,12,20,44]
-    #[arg(short = 'u')]
-    assembler_u: bool,
-
-    /// PL/1: [1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61]
-    #[arg(short, long)]
+    #[arg(short = 'p', help = gettext("PL/1: 1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61"))]
     pl1: bool,
 
-    /// Optional: A single command line argument that consists of one or more tab-stop values (n) separated by a separator character
+    #[arg(short = 's', help = gettext("SNOBOL: 1,10,55"))]
+    snobol: bool,
+
+    #[arg(short = 'u', help = gettext("Assembler: 1,12,20,44"))]
+    assembler_u: bool,
+
+    #[arg(help = gettext("Tab-stop values (comma or blank separated, +N for increments)"))]
     tabstops: Option<String>,
 }
 
-fn parse_cmd_line(args: &Args) -> Result<Vec<u16>, &'static str> {
-    let mut tabstops: Vec<u16> = Vec::new();
-    let mut repeating_stop: Option<u16> = None;
+/// Parse tab stop specification from operand string.
+/// Supports comma and blank separators, and +N increment notation.
+fn parse_tabstops(spec: &str) -> Result<Vec<u16>, String> {
+    let mut result = Vec::new();
+    let mut prev_value: u16 = 0;
 
-    if args.rep_9 {
-        repeating_stop = Some(9);
-    } else if args.rep_8 {
-        repeating_stop = Some(8);
-    } else if args.rep_7 {
-        repeating_stop = Some(7);
-    } else if args.rep_6 {
-        repeating_stop = Some(6);
-    } else if args.rep_5 {
-        repeating_stop = Some(5);
-    } else if args.rep_4 {
-        repeating_stop = Some(4);
-    } else if args.rep_3 {
-        repeating_stop = Some(3);
-    } else if args.rep_2 {
-        repeating_stop = Some(2);
-    } else if args.rep_1 {
-        repeating_stop = Some(1);
-    } else if let Some(variant) = args.assembler {
-        match variant {
-            1 => tabstops = vec![1, 10, 16, 36, 72],
-            2 => tabstops = vec![1, 10, 16, 40, 72],
-            _ => unreachable!(),
+    // Split on comma or whitespace
+    for token in spec.split(|c: char| c == ',' || c.is_whitespace()) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
         }
-    } else if let Some(variant) = args.cobol {
-        match variant {
-            1 => tabstops = vec![1, 8, 12, 16, 20, 55],
-            2 => tabstops = vec![1, 6, 10, 14, 49],
-            3 => {
-                tabstops = vec![
-                    1, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 67,
-                ]
-            }
-            _ => unreachable!(),
+
+        let (is_increment, num_str) = if let Some(stripped) = token.strip_prefix('+') {
+            (true, stripped)
+        } else {
+            (false, token)
+        };
+
+        let value: u16 = num_str
+            .parse()
+            .map_err(|_| format!("{}: '{}'", gettext("invalid tab stop specification"), token))?;
+
+        if value == 0 && !is_increment {
+            return Err(gettext("tab stop must be positive").to_string());
         }
-    } else if args.fortran {
-        tabstops = vec![1, 7, 11, 15, 19, 23];
-    } else if args.pl1 {
-        tabstops = vec![1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61];
-    } else if args.snobol {
-        tabstops = vec![1, 10, 55];
-    } else if args.assembler_u {
-        tabstops = vec![1, 12, 20, 44];
-    } else if let Some(ref tabstops_str) = args.tabstops {
-        for stop in tabstops_str.split(',') {
-            tabstops.push(
-                stop.parse()
-                    .unwrap_or_else(|_| panic!("{}", gettext("Invalid tabstop value."))),
-            );
+
+        let absolute_value = if is_increment {
+            prev_value
+                .checked_add(value)
+                .ok_or_else(|| gettext("tab stop value overflow").to_string())?
+        } else {
+            value
+        };
+
+        // POSIX: tab stops must be in strictly ascending order
+        if !result.is_empty() && absolute_value <= prev_value {
+            return Err(gettext("tab stops must be in strictly ascending order").to_string());
         }
+
+        result.push(absolute_value);
+        prev_value = absolute_value;
     }
 
-    // handle repetitive tab stops
-    if let Some(stop_n) = repeating_stop {
-        for _i in 0..MAX_STOPS {
-            tabstops.push(stop_n);
-        }
+    if result.is_empty() {
+        return Err(gettext("no tab stops specified").to_string());
     }
 
-    // validate that stops are in strictly ascending order
-    for i in 1..tabstops.len() {
-        if tabstops[i] <= tabstops[i - 1] {
-            return Err("Tabstops must be in strictly ascending order.");
-        }
-    }
-
-    Ok(tabstops)
+    Ok(result)
 }
 
-// set hardware tabs.
-fn set_hw_tabs(info: &Database, tabstops: &Vec<u16>) -> io::Result<()> {
+/// Generate repetitive tab stops at a given interval.
+fn generate_repetitive_tabs(interval: u16) -> Vec<u16> {
+    let mut result = Vec::new();
+    let mut pos = interval;
+
+    while pos <= MAX_COLUMN {
+        result.push(pos);
+        pos = match pos.checked_add(interval) {
+            Some(p) => p,
+            None => break,
+        };
+    }
+
+    result
+}
+
+/// Determine tab stops from command line arguments.
+fn parse_cmd_line(args: &Args) -> Result<Vec<u16>, String> {
+    // Check for repetitive tab stop options (-0 through -9)
+    if args.rep_0 {
+        // -0: clear tabs, set none
+        return Ok(Vec::new());
+    }
+    if args.rep_1 {
+        return Ok(generate_repetitive_tabs(1));
+    }
+    if args.rep_2 {
+        return Ok(generate_repetitive_tabs(2));
+    }
+    if args.rep_3 {
+        return Ok(generate_repetitive_tabs(3));
+    }
+    if args.rep_4 {
+        return Ok(generate_repetitive_tabs(4));
+    }
+    if args.rep_5 {
+        return Ok(generate_repetitive_tabs(5));
+    }
+    if args.rep_6 {
+        return Ok(generate_repetitive_tabs(6));
+    }
+    if args.rep_7 {
+        return Ok(generate_repetitive_tabs(7));
+    }
+    if args.rep_8 {
+        return Ok(generate_repetitive_tabs(8));
+    }
+    if args.rep_9 {
+        return Ok(generate_repetitive_tabs(9));
+    }
+
+    // Check for XSI language preset options
+    if args.assembler {
+        return Ok(vec![1, 10, 16, 36, 72]);
+    }
+    if args.assembler2 {
+        return Ok(vec![1, 10, 16, 40, 72]);
+    }
+    if args.cobol {
+        return Ok(vec![1, 8, 12, 16, 20, 55]);
+    }
+    if args.cobol2 {
+        return Ok(vec![1, 6, 10, 14, 49]);
+    }
+    if args.cobol3 {
+        return Ok(vec![
+            1, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 67,
+        ]);
+    }
+    if args.fortran {
+        return Ok(vec![1, 7, 11, 15, 19, 23]);
+    }
+    if args.pl1 {
+        return Ok(vec![
+            1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61,
+        ]);
+    }
+    if args.snobol {
+        return Ok(vec![1, 10, 55]);
+    }
+    if args.assembler_u {
+        return Ok(vec![1, 12, 20, 44]);
+    }
+
+    // Check for custom tab stop specification
+    if let Some(ref tabstops_str) = args.tabstops {
+        return parse_tabstops(tabstops_str);
+    }
+
+    // POSIX default: equivalent to -8
+    Ok(generate_repetitive_tabs(8))
+}
+
+/// Set hardware tabs using terminfo capabilities.
+fn set_hw_tabs(info: &Database, tabstops: &[u16]) -> io::Result<()> {
     let clear_cap = info.get::<cap::ClearAllTabs>();
     let set_cap = info.get::<cap::SetTab>();
 
     if clear_cap.is_none() || set_cap.is_none() {
-        let msg = gettext("Terminal does not support hardware tabs.");
-        return Err(Error::other(msg));
+        let msg = gettext("terminal does not support setting tab stops");
+        return Err(io::Error::other(msg));
     }
     let clear_cap = clear_cap.unwrap();
     let set_cap = set_cap.unwrap();
 
-    // clear existing tabs
+    // Clear existing tabs
     if let Err(e) = clear_cap.expand().to(io::stdout()) {
-        let msg = format!("{}: {}", gettext("Failed to clear tabs"), e);
-        return Err(Error::other(msg));
+        let msg = format!("{}: {}", gettext("failed to clear tabs"), e);
+        return Err(io::Error::other(msg));
     }
 
-    // set new tabs
-    let mut col = 0;
-    for stop in tabstops {
-        let stop = *stop as usize;
-
+    // Set new tabs (if any - might be empty for -0)
+    let mut col: u16 = 0;
+    for &stop in tabstops {
         while col < stop {
             io::stdout().write_all(b" ")?;
             col += 1;
         }
 
         if let Err(e) = set_cap.expand().to(io::stdout()) {
-            let msg = format!("{}: {}", gettext("Failed to set tab"), e);
-            return Err(Error::other(msg));
+            let msg = format!("{}: {}", gettext("failed to set tab stop"), e);
+            return Err(io::Error::other(msg));
         }
     }
+
+    // Carriage return to reset cursor position
+    io::stdout().write_all(b"\r")?;
+    io::stdout().flush()?;
 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    if let Err(e) = textdomain("posixutils-rs") {
+        eprintln!("textdomain: {}", e);
+    }
+    if let Err(e) = bind_textdomain_codeset("posixutils-rs", "UTF-8") {
+        eprintln!("bind_textdomain_codeset: {}", e);
+    }
 
-    let args = Args::parse();
-
-    let info = match args.term {
-        None => Database::from_env().unwrap(),
-        Some(ref termtype) => Database::from_name(termtype).unwrap(),
+    let preprocessed_args = preprocess_args();
+    let args = match Args::try_parse_from(&preprocessed_args) {
+        Ok(args) => args,
+        Err(e) => {
+            // Handle --help and --version specially (they exit with 0)
+            if e.kind() == clap::error::ErrorKind::DisplayHelp
+                || e.kind() == clap::error::ErrorKind::DisplayVersion
+            {
+                print!("{}", e);
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("{}", e);
+            return ExitCode::from(1);
+        }
     };
 
-    let tabstops = parse_cmd_line(&args)?;
-    set_hw_tabs(&info, &tabstops)?;
+    // Get terminal database
+    let info = match &args.term {
+        Some(termtype) => match Database::from_name(termtype) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!(
+                    "{}: {}: {}",
+                    gettext("tabs"),
+                    gettext("unknown terminal type"),
+                    e
+                );
+                return ExitCode::from(1);
+            }
+        },
+        None => match Database::from_env() {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!(
+                    "{}: {}: {}",
+                    gettext("tabs"),
+                    gettext("cannot determine terminal type"),
+                    e
+                );
+                return ExitCode::from(1);
+            }
+        },
+    };
 
-    Ok(())
+    // Parse tab stops from arguments
+    let tabstops = match parse_cmd_line(&args) {
+        Ok(stops) => stops,
+        Err(e) => {
+            eprintln!("{}: {}", gettext("tabs"), e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // Set the hardware tabs
+    if let Err(e) = set_hw_tabs(&info, &tabstops) {
+        eprintln!("{}: {}", gettext("tabs"), e);
+        return ExitCode::from(1);
+    }
+
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_tabstops_comma_separated() {
+        let result = parse_tabstops("1,10,20,30").unwrap();
+        assert_eq!(result, vec![1, 10, 20, 30]);
+    }
+
+    #[test]
+    fn test_parse_tabstops_blank_separated() {
+        let result = parse_tabstops("1 10 20 30").unwrap();
+        assert_eq!(result, vec![1, 10, 20, 30]);
+    }
+
+    #[test]
+    fn test_parse_tabstops_mixed_separators() {
+        let result = parse_tabstops("1,10 20,30").unwrap();
+        assert_eq!(result, vec![1, 10, 20, 30]);
+    }
+
+    #[test]
+    fn test_parse_tabstops_with_increments() {
+        let result = parse_tabstops("1 10 +10 +10").unwrap();
+        assert_eq!(result, vec![1, 10, 20, 30]);
+    }
+
+    #[test]
+    fn test_parse_tabstops_mixed_absolute_and_increment() {
+        let result = parse_tabstops("1,10,+5,+5").unwrap();
+        assert_eq!(result, vec![1, 10, 15, 20]);
+    }
+
+    #[test]
+    fn test_parse_tabstops_not_ascending() {
+        let result = parse_tabstops("10,5,20");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_tabstops_invalid_number() {
+        let result = parse_tabstops("1,abc,10");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_tabstops_zero_value() {
+        let result = parse_tabstops("0,10,20");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_repetitive_tabs() {
+        let result = generate_repetitive_tabs(8);
+        assert_eq!(result[0], 8);
+        assert_eq!(result[1], 16);
+        assert_eq!(result[2], 24);
+        assert!(result.len() >= 10); // Should have at least 10 stops
+    }
+
+    #[test]
+    fn test_generate_repetitive_tabs_1() {
+        let result = generate_repetitive_tabs(1);
+        assert_eq!(result[0], 1);
+        assert_eq!(result[1], 2);
+        assert!(result.len() >= MAX_COLUMN as usize);
+    }
 }

@@ -18,26 +18,26 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("csplit - split files based on context"))]
 struct Args {
-    /// Name the created files prefix 00, prefix 01, ..., prefixn.
-    #[arg(short = 'f', long, default_value = "xx")]
+    #[arg(short = 'f', long, default_value = "xx",
+          help = gettext("Name the created files prefix 00, prefix 01, ..., prefixn"))]
     prefix: String,
 
-    /// Leave previously created files intact. By default, csplit shall remove created files if an error occurs.
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long, default_value_t = false,
+          help = gettext("Leave previously created files intact. By default, csplit shall remove created files if an error occurs"))]
     keep: bool,
 
-    /// Use number decimal digits to form filenames for the file pieces.
-    #[arg(short, long, default_value_t = 2)]
+    #[arg(short, long, default_value_t = 2,
+          help = gettext("Use number decimal digits to form filenames for the file pieces"))]
     num: u8,
 
-    /// Suppress the output of file size messages.
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long, default_value_t = false,
+          help = gettext("Suppress the output of file size messages"))]
     suppress: bool,
 
-    /// File to read as input.
+    #[arg(help = gettext("File to read as input"))]
     filename: PathBuf,
 
-    /// Operands defining context on which to split.
+    #[arg(help = gettext("Operands defining context on which to split"))]
     operands: Vec<String>,
 }
 

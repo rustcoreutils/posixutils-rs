@@ -26,56 +26,43 @@ use plib::sccsfile::{
 #[derive(Parser)]
 #[command(version, about = gettext("admin - create and administer SCCS files"), disable_help_flag = true)]
 struct Args {
-    /// Print help information
-    #[arg(long = "help")]
+    #[arg(long = "help", help = gettext("Print help information"))]
     help: bool,
 
-    /// Create a new SCCS file
-    #[arg(short = 'n')]
+    #[arg(short = 'n', help = gettext("Create a new SCCS file"))]
     new_file: bool,
 
-    /// Initialize from file (use stdin if no name given)
-    #[arg(short = 'i', value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    #[arg(short = 'i', value_name = "NAME", num_args = 0..=1, default_missing_value = "", help = gettext("Initialize from file (use stdin if no name given)"))]
     init_file: Option<String>,
 
-    /// Initial SID for new file
-    #[arg(short = 'r', value_name = "SID")]
+    #[arg(short = 'r', value_name = "SID", help = gettext("Initial SID for new file"))]
     initial_sid: Option<String>,
 
-    /// Comment for initial delta
-    #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "")]
+    #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "", help = gettext("Comment for initial delta"))]
     comment: Option<String>,
 
-    /// Descriptive text file
-    #[arg(short = 't', value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    #[arg(short = 't', value_name = "NAME", num_args = 0..=1, default_missing_value = "", help = gettext("Descriptive text file"))]
     desc_text: Option<String>,
 
-    /// Set flag (can be repeated)
-    #[arg(short = 'f', value_name = "FLAG")]
+    #[arg(short = 'f', value_name = "FLAG", help = gettext("Set flag (can be repeated)"))]
     set_flags: Vec<String>,
 
-    /// Delete flag (can be repeated)
-    #[arg(short = 'd', value_name = "FLAG")]
+    #[arg(short = 'd', value_name = "FLAG", help = gettext("Delete flag (can be repeated)"))]
     delete_flags: Vec<String>,
 
-    /// Add user to authorized list
-    #[arg(short = 'a', value_name = "LOGIN")]
+    #[arg(short = 'a', value_name = "LOGIN", help = gettext("Add user to authorized list"))]
     add_users: Vec<String>,
 
-    /// Remove user from authorized list
-    #[arg(short = 'e', value_name = "LOGIN")]
+    #[arg(short = 'e', value_name = "LOGIN", help = gettext("Remove user from authorized list"))]
     erase_users: Vec<String>,
 
-    /// Check file structure and checksum
-    #[arg(short = 'h')]
+    #[arg(short = 'h', help = gettext("Check file structure and checksum"))]
     check: bool,
 
-    /// Recompute and store checksum
-    #[arg(short = 'z')]
+    #[arg(short = 'z', help = gettext("Recompute and store checksum"))]
     recompute_checksum: bool,
 
-    /// SCCS files to process
-    #[arg(required = true)]
+    #[arg(required = true, help = gettext("SCCS files to process"))]
     files: Vec<PathBuf>,
 }
 

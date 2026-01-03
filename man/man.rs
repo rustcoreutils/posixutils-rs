@@ -11,7 +11,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
-use man_util::parser::MdocParser;
+use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::num::ParseIntError;
@@ -55,35 +55,29 @@ const MAN_CONFS: [&str; 3] = [
     about = gettext("man - display system documentation")
 )]
 struct Args {
-    /// Display all matching manual pages
-    #[arg(short, long, help = "Display all matching manual pages")]
+    #[arg(short, long, help = gettext("Display all matching manual pages"))]
     all: bool,
 
-    /// Use the specified file instead of the default configuration file
     #[arg(
         short = 'C',
         long,
-        help = "Use the specified file instead of the default configuration file"
+        help = gettext("Use the specified file instead of the default configuration file")
     )]
     config_file: Option<PathBuf>,
 
-    /// Copy the manual page to the standard output instead of using less(1) to paginate it
-    #[arg(short, long, help = "Copy the manual page to the standard output")]
+    #[arg(short, long, help = gettext("Copy the manual page to the standard output"))]
     copy: bool,
 
-    /// A synonym for whatis(1). It searches for name in manual page names and displays the header lines from all matching pages
-    #[arg(short = 'f', long, help = "A synonym for whatis(1)")]
+    #[arg(short = 'f', long, help = gettext("A synonym for whatis(1)"))]
     whatis: bool,
 
-    /// Display only the SYNOPSIS lines of the requested manual pages
     #[arg(
         short = 'h',
         long,
-        help = "Display only the SYNOPSIS lines of the requested manual pages"
+        help = gettext("Display only the SYNOPSIS lines of the requested manual pages")
     )]
     synopsis: bool,
 
-    /// Displays the header lines of all matching pages. A synonym for apropos(1)
     #[arg(
         short = 'k',
         long,
@@ -91,16 +85,14 @@ struct Args {
     )]
     apropos: bool,
 
-    /// A synonym for mandoc(1). Interpret PAGE argument(s) as local filename(s)
     #[arg(
         short = 'l',
-        long = "local-file", 
-        help = "interpret PAGE argument(s) as local filename(s)", 
+        long = "local-file",
+        help = gettext("Interpret PAGE argument(s) as local filename(s)"),
         num_args = 1..
     )]
     local_file: Option<Vec<PathBuf>>,
 
-    /// Override the list of directories to search for manual pages
     #[arg(
         short = 'M',
         value_delimiter = ':',
@@ -108,7 +100,6 @@ struct Args {
     )]
     override_paths: Vec<PathBuf>,
 
-    /// Augment the list of directories to search for manual pages
     #[arg(
         short = 'm',
         value_delimiter = ':',
@@ -116,14 +107,12 @@ struct Args {
     )]
     augment_paths: Vec<PathBuf>,
 
-    /// Only show pages for the specified machine(1) architecture
     #[arg(
         short = 'S',
         help = gettext("Only show pages for the specified machine(1) architecture")
     )]
     subsection: Option<String>,
 
-    /// Only select manuals from the specified section
     #[arg(
         short = 's',
         value_enum,
@@ -131,7 +120,6 @@ struct Args {
     )]
     section: Option<Section>,
 
-    /// List the pathnames of all matching manual pages instead of displaying any of them
     #[arg(
         short = 'w',
         help = gettext("List the pathnames of all matching manual pages instead of displaying any of them")
@@ -141,11 +129,10 @@ struct Args {
     #[arg(
         long = "help",
         action = ArgAction::Help,
-        help = "Print help information"
+        help = gettext("Print help information")
     )]
     help: Option<bool>,
 
-    /// Commands names for which documentation search must be performed
     #[arg(
         help = gettext("Names of the utilities or keywords to display documentation for"),
         num_args = 0..
@@ -498,23 +485,162 @@ fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
     Ok(())
 }
 
-/// Displays man page summaries for the given keyword.
+/// Extracts NAME section info from a parsed mdoc document.
 ///
-/// # Arguments
-///
-/// `keyword` - [str] name of keyword.
-///
-/// # Returns
-///
-/// [true] if `apropos` finished successfully, otherwise [false].
-///
-/// # Errors
-///
-/// [ManError] if call of `apropros` utility failed.
-fn display_summary_database(command: &str, keyword: &str) -> Result<bool, ManError> {
-    let status = Command::new(command).arg(keyword).spawn()?.wait()?;
+/// Returns (names, description) where names is the list of command names
+/// from .Nm macros and description is the text from .Nd macro.
+fn extract_name_info(document: &MdocDocument) -> Option<(Vec<String>, String)> {
+    use man_util::mdoc_macro::Macro;
+    use man_util::parser::Element;
 
-    Ok(status.success())
+    let mut names: Vec<String> = Vec::new();
+    let mut description = String::new();
+    let mut in_name_section = false;
+
+    for element in &document.elements {
+        if let Element::Macro(node) = element {
+            match &node.mdoc_macro {
+                Macro::Sh { title } => {
+                    in_name_section = title.eq_ignore_ascii_case("NAME");
+                }
+                Macro::Nm { name: Some(n) } if in_name_section => {
+                    if !n.is_empty() && !names.contains(n) {
+                        names.push(n.clone());
+                    }
+                }
+                Macro::Nd if in_name_section => {
+                    // Collect text from child nodes
+                    for child in &node.nodes {
+                        if let Element::Text(text) = child {
+                            if !description.is_empty() {
+                                description.push(' ');
+                            }
+                            description.push_str(text.trim());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if names.is_empty() && description.is_empty() {
+        None
+    } else {
+        Some((names, description))
+    }
+}
+
+/// Information about a man page for keyword search.
+struct ManPageInfo {
+    names: Vec<String>,
+    description: String,
+    section: String,
+}
+
+/// Scans man page directories and extracts NAME section info from all pages.
+fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPageInfo> {
+    use std::panic;
+
+    // Temporarily suppress panic output for parsing non-mdoc format pages
+    let prev_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+
+    let mut results = Vec::new();
+
+    for search_path in search_paths {
+        for section in sections {
+            let section_str = section.to_string();
+            let section_dir = search_path.join(format!("man{}", section_str));
+
+            if !section_dir.is_dir() {
+                continue;
+            }
+
+            let entries = match std::fs::read_dir(&section_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+
+                // Try to read and parse the man page
+                let raw = match get_man_page_from_path(&path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                let content = match String::from_utf8(raw) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Use catch_unwind to handle parser panics on non-mdoc format pages
+                let parse_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    MdocParser::parse_mdoc(&content)
+                }));
+
+                let document = match parse_result {
+                    Ok(Ok(d)) => d,
+                    _ => continue, // Skip on parse error or panic
+                };
+
+                if let Some((names, description)) = extract_name_info(&document) {
+                    results.push(ManPageInfo {
+                        names,
+                        description,
+                        section: section_str.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Restore the previous panic hook
+    panic::set_hook(prev_hook);
+
+    results
+}
+
+/// Performs native keyword search across man pages.
+///
+/// Returns lines in format: "command(section) - description"
+fn native_keyword_search(
+    search_paths: &[PathBuf],
+    sections: &[Section],
+    keywords: &[String],
+) -> Vec<String> {
+    let pages = scan_man_pages(search_paths, sections);
+    let mut results = Vec::new();
+
+    for page in &pages {
+        // Check if any keyword matches name or description (case-insensitive)
+        let matches = keywords.iter().any(|keyword| {
+            let keyword_lower = keyword.to_lowercase();
+            page.names
+                .iter()
+                .any(|n| n.to_lowercase().contains(&keyword_lower))
+                || page.description.to_lowercase().contains(&keyword_lower)
+        });
+
+        if matches {
+            // Format output: "name(section) - description"
+            for name in &page.names {
+                results.push(format!("{}({}) - {}", name, page.section, page.description));
+            }
+        }
+    }
+
+    // Sort results alphabetically
+    results.sort();
+    // Remove duplicates
+    results.dedup();
+
+    results
 }
 
 /// Man formatting state structure
@@ -727,16 +853,43 @@ impl Man {
             }
             return Ok(no_errors);
         } else if self.args.apropos || self.args.whatis {
+            // Try external apropos/whatis first (uses pre-built database, fast)
+            // Fall back to native search if external command not available
             let command = if self.args.apropos {
                 "apropos"
             } else {
                 "whatis"
             };
 
-            for keyword in &self.args.names {
-                let success = display_summary_database(command, keyword)?;
-                if !success {
+            // Check if external command exists and use it
+            let external_available = Command::new("which")
+                .arg(command)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if external_available {
+                // Use external command (fast, uses system database)
+                for keyword in &self.args.names {
+                    let status = Command::new(command).arg(keyword).spawn()?.wait()?;
+                    if !status.success() {
+                        no_errors = false;
+                    }
+                }
+            } else {
+                // Fall back to native keyword search (slower, no database)
+                let results =
+                    native_keyword_search(&self.search_paths, &self.sections, &self.args.names);
+
+                if results.is_empty() {
+                    for keyword in &self.args.names {
+                        eprintln!("{}: nothing appropriate", keyword);
+                    }
                     no_errors = false;
+                } else {
+                    for line in results {
+                        println!("{}", line);
+                    }
                 }
             }
 

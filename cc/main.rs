@@ -44,8 +44,7 @@ use token::{
 #[derive(Parser)]
 #[command(version, about = gettext("pcc - compile standard C programs"))]
 struct Args {
-    /// Input files
-    #[arg(required_unless_present = "print_targets")]
+    #[arg(required_unless_present = "print_targets", help = gettext("Input files"))]
     files: Vec<String>,
 
     /// Print registered targets
@@ -76,16 +75,13 @@ struct Args {
     )]
     verbose: bool,
 
-    /// Define a macro (-D name or -D name=value)
-    #[arg(short = 'D', action = clap::ArgAction::Append, value_name = "macro")]
+    #[arg(short = 'D', action = clap::ArgAction::Append, value_name = "macro", help = gettext("Define a macro (-D name or -D name=value)"))]
     defines: Vec<String>,
 
-    /// Undefine a macro
-    #[arg(short = 'U', action = clap::ArgAction::Append, value_name = "macro")]
+    #[arg(short = 'U', action = clap::ArgAction::Append, value_name = "macro", help = gettext("Undefine a macro"))]
     undefines: Vec<String>,
 
-    /// Add include path
-    #[arg(short = 'I', action = clap::ArgAction::Append, value_name = "dir")]
+    #[arg(short = 'I', action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add include path"))]
     include_paths: Vec<String>,
 
     /// Disable all standard include paths (system and builtin)
@@ -135,22 +131,17 @@ struct Args {
           num_args = 0..=1, value_name = "level", help = gettext("Optimization level"))]
     opt_level: u32,
 
-    /// Warning flags (e.g., -Wall, -Wextra, -Wno-unused)
-    /// Currently accepted but not enforced
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
-          num_args = 0..=1, default_missing_value = "extra")]
+          num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
     warnings: Vec<String>,
 
-    /// Pedantic mode (compatibility, currently no-op)
-    #[arg(long = "pedantic", hide = true)]
+    #[arg(long = "pedantic", hide = true, help = gettext("Pedantic mode (compatibility)"))]
     pedantic: bool,
 
-    /// Add library search path (passed to linker)
-    #[arg(short = 'L', action = clap::ArgAction::Append, value_name = "dir")]
+    #[arg(short = 'L', action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add library search path (passed to linker)"))]
     lib_paths: Vec<String>,
 
-    /// Link library (passed to linker)
-    #[arg(short = 'l', action = clap::ArgAction::Append, value_name = "library")]
+    #[arg(short = 'l', action = clap::ArgAction::Append, value_name = "library", help = gettext("Link library (passed to linker)"))]
     libraries: Vec<String>,
 }
 

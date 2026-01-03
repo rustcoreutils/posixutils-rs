@@ -8,30 +8,25 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = gettext("uniq - report or filter out repeated lines in a file"))]
 struct Args {
-    /// Count the number of repeated lines
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help = gettext("Count the number of repeated lines"))]
     count: bool,
 
-    /// Print only the repeated lines
-    #[arg(short = 'd')]
+    #[arg(short = 'd', help = gettext("Print only the repeated lines"))]
     repeated: bool,
 
-    /// Print only unique lines
-    #[arg(short = 'u')]
+    #[arg(short = 'u', help = gettext("Print only unique lines"))]
     unique: bool,
 
-    /// Ignore the first fields fields on each input line
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help = gettext("Ignore the first fields fields on each input line"))]
     fields: Option<usize>,
 
-    /// Ignore the first chars characters on each input line
-    #[arg(short = 's')]
+    #[arg(short = 's', help = gettext("Ignore the first chars characters on each input line"))]
     chars: Option<usize>,
 
-    /// Input file (if not specified, use stdin)
+    #[arg(help = gettext("Input file (if not specified, use stdin)"))]
     input_file: Option<PathBuf>,
 
-    /// Output file (if not specified, use stdout)
+    #[arg(help = gettext("Output file (if not specified, use stdout)"))]
     output_file: Option<PathBuf>,
 }
 

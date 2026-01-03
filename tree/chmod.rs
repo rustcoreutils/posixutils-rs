@@ -20,15 +20,14 @@ use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 #[derive(Parser)]
 #[command(version, about = gettext("chmod - change the file modes"))]
 struct Args {
-    /// Recursively change file mode bits.
-    #[arg(short = 'R', long)]
+    #[arg(short = 'R', long, help = gettext("Recursively change file mode bits"))]
     recurse: bool,
 
-    /// Represents the change to be made to the file mode bits of each file named by one of the file operands.
-    #[arg(allow_hyphen_values = true)] // To allow passing `chmod -x f`
+    // To allow passing `chmod -x f`
+    #[arg(allow_hyphen_values = true, help = gettext("Represents the change to be made to the file mode bits of each file named by one of the file operands"))]
     mode: String,
 
-    /// The files to change
+    #[arg(help = gettext("The files to change"))]
     files: Vec<String>,
 }
 

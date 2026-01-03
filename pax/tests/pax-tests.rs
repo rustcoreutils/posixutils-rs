@@ -11,6 +11,7 @@ mod common;
 
 mod append;
 mod archive;
+mod compression;
 mod copy;
 mod list;
 mod multivolume;

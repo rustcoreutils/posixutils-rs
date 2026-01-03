@@ -17,6 +17,7 @@ requires_root = ["posixutils_test_all"]
 libc.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
+libflate = "2"
 plib = { path = "../plib" }
 
 [dev-dependencies]

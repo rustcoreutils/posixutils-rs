@@ -213,6 +213,12 @@ impl<W: Write> Drop for BlockedWriter<W> {
             // Try to flush any remaining data, ignore errors in drop
             let _ = self.flush_record();
             let _ = self.writer.flush();
+            // SAFETY: We must drop the inner writer to ensure it finalizes properly
+            // (e.g., GzipWriter needs Drop to write the gzip trailer)
+            // ManuallyDrop::take was not called, so we own the writer
+            unsafe {
+                ManuallyDrop::drop(&mut self.writer);
+            }
         }
         // Note: We don't drop the writer here if finished=true because
         // ManuallyDrop::take already took ownership in finish()

@@ -147,6 +147,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tput
  - [x] tr
  - [x] true
+ - [x] tsort
  - [x] uncompress (compress cat.)
  - [x] uudecode (uue)
  - [x] uuencode (uue)
@@ -202,7 +203,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 1 - Rough draft
 
  - [x] lp
- - [x] tsort
 
 ## Stage 0 - Not started
 

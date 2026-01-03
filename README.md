@@ -140,6 +140,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strip (Development)
  - [x] stty
  - [x] tabs
+ - [x] talk (with talkd local daemon)
  - [x] tail
  - [x] test
  - [x] time
@@ -195,7 +196,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pwd
  - [x] renice
  - [x] sleep
- - [x] talk
  - [x] tee
  - [x] touch
  - [x] tty

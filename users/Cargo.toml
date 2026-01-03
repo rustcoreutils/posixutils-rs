@@ -63,3 +63,7 @@ path = "./newgrp.rs"
 name = "talk"
 path = "./talk.rs"
 
+[[bin]]
+name = "talkd"
+path = "./talkd.rs"
+

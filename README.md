@@ -149,6 +149,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tr
  - [x] true
  - [x] tsort
+ - [x] uname
  - [x] uncompress (compress cat.)
  - [x] uudecode (uue)
  - [x] uuencode (uue)
@@ -199,7 +200,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tee
  - [x] touch
  - [x] tty
- - [x] uname
 
 ## Stage 1 - Rough draft
 

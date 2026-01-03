@@ -26,7 +26,7 @@
 //! Followed by c_filesize bytes of file data
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{PaxError, PaxResult};
+use crate::error::{is_eof_error, PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -84,7 +84,7 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         // Read header
         let mut header = [0u8; HEADER_SIZE];
         if let Err(e) = self.read_exact(&mut header) {
-            if e.to_string().contains("unexpected end of file") {
+            if is_eof_error(&e) {
                 return Ok(None);
             }
             return Err(e);

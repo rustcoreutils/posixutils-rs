@@ -510,7 +510,16 @@ fn extract_fifo(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> Pax
     let result = unsafe { libc::mkfifo(path_cstr.as_ptr(), entry.mode as libc::mode_t) };
 
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let err = std::io::Error::last_os_error();
+        // EPERM usually means we're not root or filesystem doesn't support FIFOs
+        if err.raw_os_error() == Some(libc::EPERM) {
+            eprintln!(
+                "pax: cannot create FIFO {}: Operation not permitted",
+                path.display()
+            );
+            return Ok(());
+        }
+        return Err(err.into());
     }
 
     set_owner(path, entry, options)?;
@@ -700,8 +709,23 @@ fn set_times(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxRes
             },
         ];
 
-        unsafe {
-            libc::utimes(path_cstr.as_ptr(), times.as_ptr());
+        let result = unsafe { libc::utimes(path_cstr.as_ptr(), times.as_ptr()) };
+
+        if result != 0 {
+            let err = std::io::Error::last_os_error();
+            // EPERM means we don't have permission - warn but continue
+            if err.raw_os_error() == Some(libc::EPERM) {
+                eprintln!(
+                    "pax: warning: cannot set times on {}: Operation not permitted",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "pax: warning: cannot set times on {}: {}",
+                    path.display(),
+                    err
+                );
+            }
         }
     }
 

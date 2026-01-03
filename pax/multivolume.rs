@@ -33,7 +33,7 @@
 //! - Volume scripts are executed synchronously
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{PaxError, PaxResult};
+use crate::error::{is_eof_error, PaxError, PaxResult};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -592,7 +592,7 @@ impl ArchiveReader for MultiVolumeReader {
                 if self.in_split_file && self.open_next_volume()? {
                     continue;
                 }
-                if e.to_string().contains("unexpected end of file") {
+                if is_eof_error(&e) {
                     return Ok(None);
                 }
                 return Err(e);

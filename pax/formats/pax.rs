@@ -24,7 +24,7 @@
 //! - Data format: "%d %s=%s\n" (length, keyword, value)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{PaxError, PaxResult};
+use crate::error::{is_eof_error, PaxError, PaxResult};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -482,7 +482,7 @@ impl<R: Read> PaxReader<R> {
     fn read_header_block(&mut self) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
         let mut header = [0u8; BLOCK_SIZE];
         if let Err(e) = self.read_exact(&mut header) {
-            if e.to_string().contains("unexpected end of file") {
+            if is_eof_error(&e) {
                 return Ok(None);
             }
             return Err(e);

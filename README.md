@@ -159,6 +159,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] wc
  - [x] what (SCCS)
  - [x] who
+ - [x] dd
  - [x] xargs
  - [x] id
  - [x] xgettext (i18n)
@@ -197,7 +198,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] cal
  - [x] df
- - [x] dd
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp

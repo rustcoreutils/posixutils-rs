@@ -168,6 +168,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
+ - [x] lp
  - [x] xgettext (i18n)
  - [x] yacc (Development)
  - [x] zcat (compress cat.)
@@ -202,7 +203,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 1 - Rough draft
 
- - [x] lp
+(none)
 
 ## Stage 0 - Not started
 

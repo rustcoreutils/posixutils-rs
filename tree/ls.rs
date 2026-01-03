@@ -839,8 +839,9 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
 fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     let mut exit_code = 0;
 
-    let mut directories = Vec::new();
-    let mut files = Vec::new();
+    // Upper bound: all paths could be one type
+    let mut directories = Vec::with_capacity(paths.len());
+    let mut files = Vec::with_capacity(paths.len());
 
     // Categorize into directories/files
     for path in paths {
@@ -856,7 +857,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     let num_args = num_file_args + num_directory_args;
 
     // Files get processed first
-    let mut file_entries = Vec::new();
+    let mut file_entries = Vec::with_capacity(num_file_args);
     for path in files {
         let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
         let metadata = match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, false) {

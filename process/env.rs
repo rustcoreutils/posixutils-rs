@@ -33,8 +33,9 @@ struct Args {
 }
 
 fn separate_ops(sv: &Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut envs = Vec::new();
-    let mut util_args = Vec::new();
+    // Upper bound: all operands could be envs or all could be args
+    let mut envs = Vec::with_capacity(sv.len());
+    let mut util_args = Vec::with_capacity(sv.len());
     let mut in_envs = true;
 
     for s in sv {
@@ -56,12 +57,16 @@ fn separate_ops(sv: &Vec<String>) -> (Vec<String>, Vec<String>) {
 }
 
 fn merge_env(new_env: &Vec<String>, clear: bool) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+    // Collect inherited env vars first to know capacity
+    let inherited: Vec<_> = if clear {
+        Vec::new()
+    } else {
+        env::vars().collect()
+    };
+    let mut map = HashMap::with_capacity(inherited.len() + new_env.len());
 
-    if !clear {
-        for (key, value) in env::vars() {
-            map.insert(key, value);
-        }
+    for (key, value) in inherited {
+        map.insert(key, value);
     }
 
     for env_op in new_env {

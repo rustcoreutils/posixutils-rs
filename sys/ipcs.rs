@@ -102,13 +102,14 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// Format permission mode as 11-character string per POSIX
-/// Format: [S-][RC-][rwa][rwa][rwa]
+/// Format permission mode as 12-character string per POSIX
+/// Format: [S-][RC-][rwa][rwa][rwa][ACL]
 /// - First char: S if process waiting on msgsnd, else -
 /// - Second char: R if process waiting on msgrcv, C if shm marked for removal, else -
 /// - Chars 3-5: owner permissions (r/w/a)
 /// - Chars 6-8: group permissions (r/w/a)
 /// - Chars 9-11: other permissions (r/w/a)
+/// - Char 12: space if no alternate access control, other printable char if ACL present
 ///
 /// IPC permission bits map to file permission bits:
 /// - read (r): 0400/040/004
@@ -135,9 +136,23 @@ fn format_mode(mode: u16, facility: char, _waiting_send: bool, _waiting_recv: bo
     let other_w = if mode & 0o002 != 0 { 'w' } else { '-' };
     let other_a = if mode & 0o001 != 0 { 'a' } else { '-' };
 
+    // 12th character: space means no alternate access control method
+    let acl = ' ';
+
     format!(
-        "{}{}{}{}{}{}{}{}{}{}{}",
-        c1, c2, owner_r, owner_w, owner_a, group_r, group_w, group_a, other_r, other_w, other_a
+        "{}{}{}{}{}{}{}{}{}{}{}{}",
+        c1,
+        c2,
+        owner_r,
+        owner_w,
+        owner_a,
+        group_r,
+        group_w,
+        group_a,
+        other_r,
+        other_w,
+        other_a,
+        acl
     )
 }
 
@@ -485,7 +500,7 @@ fn display_message_queues(_args: &Args) {
         let entries = read_proc_msg().unwrap_or_default();
 
         // Build header - always show header per POSIX, even when empty
-        let mut header = String::from("T     ID     KEY        MODE       OWNER    GROUP");
+        let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
         if args.creator {
             header.push_str("  CREATOR   CGROUP");
         }
@@ -510,7 +525,7 @@ fn display_message_queues(_args: &Args) {
             let group = get_groupname(entry.gid);
 
             let mut line = format!(
-                "q {:>6} 0x{:08x} {:11} {:>8} {:>8}",
+                "q {:>6} 0x{:08x} {:12} {:>8} {:>8}",
                 entry.msqid,
                 entry.key as u32,
                 mode_str,
@@ -567,7 +582,7 @@ fn display_shared_memory(args: &Args) {
     let entries = read_macos_shm();
 
     // Build header - always show header per POSIX, even when empty
-    let mut header = String::from("T     ID     KEY        MODE       OWNER    GROUP");
+    let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
     if args.creator {
         header.push_str("  CREATOR   CGROUP");
     }
@@ -592,7 +607,7 @@ fn display_shared_memory(args: &Args) {
         let group = get_groupname(entry.gid);
 
         let mut line = format!(
-            "m {:>6} 0x{:08x} {:11} {:>8} {:>8}",
+            "m {:>6} 0x{:08x} {:12} {:>8} {:>8}",
             entry.shmid,
             entry.key as u32,
             mode_str,
@@ -641,7 +656,7 @@ fn display_semaphores(args: &Args) {
     let entries = read_macos_sem();
 
     // Build header - always show header per POSIX, even when empty
-    let mut header = String::from("T     ID     KEY        MODE       OWNER    GROUP");
+    let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
     if args.creator {
         header.push_str("  CREATOR   CGROUP");
     }
@@ -660,7 +675,7 @@ fn display_semaphores(args: &Args) {
         let group = get_groupname(entry.gid);
 
         let mut line = format!(
-            "s {:>6} 0x{:08x} {:11} {:>8} {:>8}",
+            "s {:>6} 0x{:08x} {:12} {:>8} {:>8}",
             entry.semid,
             entry.key as u32,
             mode_str,

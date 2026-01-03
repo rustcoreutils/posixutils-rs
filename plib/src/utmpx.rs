@@ -7,8 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::platform::{self, endutxent, getutxent, setutxent};
-use std::ffi::CStr;
+use crate::platform::{self, endutxent, getutxent, setutxent, utmpxname};
+use std::ffi::{CStr, CString};
+use std::io;
+use std::path::Path;
 
 pub struct Utmpx {
     pub user: String,
@@ -36,11 +38,11 @@ pub fn ut_type_str(typ: libc::c_short) -> &'static str {
     }
 }
 
-pub fn load() -> Vec<Utmpx> {
+// Internal function to load entries after utmpx stream is initialized
+fn load_entries() -> Vec<Utmpx> {
     let mut entries = Vec::new();
 
     unsafe {
-        setutxent(); // Initialize the utx entry stream
         let mut utxent = getutxent(); // Get the first utx entry
 
         // Loop through all utx entries
@@ -81,4 +83,34 @@ pub fn load() -> Vec<Utmpx> {
     }
 
     entries
+}
+
+/// Load utmpx entries from the system default utmpx database.
+pub fn load() -> Vec<Utmpx> {
+    unsafe {
+        setutxent(); // Initialize the utx entry stream
+    }
+    load_entries()
+}
+
+/// Load utmpx entries from a specified file.
+///
+/// This sets the utmpx database file to the given path before reading entries.
+/// Returns an error if the path cannot be converted to a C string.
+pub fn load_from_file(path: &Path) -> io::Result<Vec<Utmpx>> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+    let c_path =
+        CString::new(path_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    unsafe {
+        // Set the utmpx database file
+        // Note: Return value semantics differ between platforms (macOS returns 1 on success,
+        // glibc returns 0), so we don't check it. File validity is checked by getutxent.
+        utmpxname(c_path.as_ptr());
+        setutxent(); // Initialize the utx entry stream for the new file
+    }
+
+    Ok(load_entries())
 }

@@ -6,9 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - implement -f option (requires updates to utmpx module)
-//
 
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -273,7 +270,7 @@ fn print_entry(args: &Args, entry: &Utmpx) {
     }
 }
 
-fn show_utmpx_entries(args: &Args) {
+fn show_utmpx_entries(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.heading {
         if args.idle_time && args.terminals {
             // -H -u -T format
@@ -316,14 +313,21 @@ fn show_utmpx_entries(args: &Args) {
         }
     }
 
-    let entries = utmpx::load();
+    let entries = match &args.file {
+        Some(path) => utmpx::load_from_file(path)?,
+        None => utmpx::load(),
+    };
     for entry in &entries {
         print_entry(args, entry);
     }
+    Ok(())
 }
 
-fn show_utmpx_summary() {
-    let entries = utmpx::load();
+fn show_utmpx_summary(file: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = match file {
+        Some(path) => utmpx::load_from_file(path)?,
+        None => utmpx::load(),
+    };
     let users: Vec<&str> = entries
         .iter()
         .filter(|e| !e.user.is_empty() && e.typ == platform::USER_PROCESS)
@@ -333,6 +337,7 @@ fn show_utmpx_summary() {
     // Print users horizontally, space-separated (POSIX format)
     println!("{}", users.join(" "));
     println!("# users={}", users.len());
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -365,16 +370,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.userproc = true;
     }
 
-    let mut exit_code = 0;
-
-    if args.file.is_some() {
-        eprintln!("{}", gettext("who: -f option not yet implemented"));
-        exit_code = 1;
-    } else if args.summary {
-        show_utmpx_summary();
+    if args.summary {
+        show_utmpx_summary(args.file.as_ref())?;
     } else {
-        show_utmpx_entries(&args);
+        show_utmpx_entries(&args)?;
     }
 
-    std::process::exit(exit_code)
+    Ok(())
 }

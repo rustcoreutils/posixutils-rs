@@ -153,6 +153,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
+ - [x] who
  - [x] xargs
  - [x] id
  - [x] xgettext (i18n)
@@ -202,7 +203,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tabs
  - [x] tput
  - [x] tsort
- - [x] who
 
 ## Stage 0 - Not started
 

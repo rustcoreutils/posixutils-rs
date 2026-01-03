@@ -92,6 +92,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fuser
  - [x] gencat (i18n)
  - [x] get (SCCS)
+ - [x] getconf
  - [x] gettext (i18n)
  - [x] grep
  - [x] head
@@ -197,7 +198,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cal
  - [x] df
  - [x] dd
- - [x] getconf
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp

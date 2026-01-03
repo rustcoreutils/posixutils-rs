@@ -9,7 +9,6 @@
 // TODO:
 // - How to obtain a complete list of sysconf and pathconf variables,
 //   POSIX spec, OS headers, or another source?
-// - Proper -v specification support.  is it even necessary?
 //
 
 use std::collections::HashMap;
@@ -89,17 +88,6 @@ fn handle_sysconf(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn handle_confstr(
-    var: &str,
-    _confstr_mappings: &HashMap<&'static str, libc::c_int>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Linux libc crate doesn't expose confstr constants yet
-    eprintln!("getconf: {}: {}", gettext("unrecognized variable"), var);
-    std::process::exit(1);
-}
-
-#[cfg(not(target_os = "linux"))]
 fn handle_confstr(
     var: &str,
     confstr_mappings: &HashMap<&'static str, libc::c_int>,
@@ -313,10 +301,229 @@ fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
         ])
     }
 
-    // upstream libc crate needs Linux confstr definitions
+    // Linux confstr definitions - libc crate exposes confstr() but not all constants
     #[cfg(target_os = "linux")]
     {
-        HashMap::new()
+        // Linux confstr constants from /usr/include/bits/confname.h
+        const _CS_PATH: libc::c_int = 0;
+        const _CS_V6_WIDTH_RESTRICTED_ENVS: libc::c_int = 1;
+        const _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS: libc::c_int = 1;
+        const _CS_GNU_LIBC_VERSION: libc::c_int = 2;
+        const _CS_GNU_LIBPTHREAD_VERSION: libc::c_int = 3;
+        const _CS_V5_WIDTH_RESTRICTED_ENVS: libc::c_int = 4;
+        const _CS_V7_WIDTH_RESTRICTED_ENVS: libc::c_int = 5;
+        const _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS: libc::c_int = 5;
+        // POSIX_V6 environment strings
+        const _CS_POSIX_V6_ILP32_OFF32_CFLAGS: libc::c_int = 1116;
+        const _CS_POSIX_V6_ILP32_OFF32_LDFLAGS: libc::c_int = 1117;
+        const _CS_POSIX_V6_ILP32_OFF32_LIBS: libc::c_int = 1118;
+        const _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS: libc::c_int = 1120;
+        const _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS: libc::c_int = 1121;
+        const _CS_POSIX_V6_ILP32_OFFBIG_LIBS: libc::c_int = 1122;
+        const _CS_POSIX_V6_LP64_OFF64_CFLAGS: libc::c_int = 1124;
+        const _CS_POSIX_V6_LP64_OFF64_LDFLAGS: libc::c_int = 1125;
+        const _CS_POSIX_V6_LP64_OFF64_LIBS: libc::c_int = 1126;
+        const _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS: libc::c_int = 1128;
+        const _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS: libc::c_int = 1129;
+        const _CS_POSIX_V6_LPBIG_OFFBIG_LIBS: libc::c_int = 1130;
+        // POSIX_V7 environment strings
+        const _CS_POSIX_V7_ILP32_OFF32_CFLAGS: libc::c_int = 1132;
+        const _CS_POSIX_V7_ILP32_OFF32_LDFLAGS: libc::c_int = 1133;
+        const _CS_POSIX_V7_ILP32_OFF32_LIBS: libc::c_int = 1134;
+        const _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS: libc::c_int = 1136;
+        const _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS: libc::c_int = 1137;
+        const _CS_POSIX_V7_ILP32_OFFBIG_LIBS: libc::c_int = 1138;
+        const _CS_POSIX_V7_LP64_OFF64_CFLAGS: libc::c_int = 1140;
+        const _CS_POSIX_V7_LP64_OFF64_LDFLAGS: libc::c_int = 1141;
+        const _CS_POSIX_V7_LP64_OFF64_LIBS: libc::c_int = 1142;
+        const _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS: libc::c_int = 1144;
+        const _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS: libc::c_int = 1145;
+        const _CS_POSIX_V7_LPBIG_OFFBIG_LIBS: libc::c_int = 1146;
+
+        HashMap::from([
+            ("_CS_PATH", _CS_PATH),
+            ("PATH", _CS_PATH),
+            ("_CS_GNU_LIBC_VERSION", _CS_GNU_LIBC_VERSION),
+            ("GNU_LIBC_VERSION", _CS_GNU_LIBC_VERSION),
+            ("_CS_GNU_LIBPTHREAD_VERSION", _CS_GNU_LIBPTHREAD_VERSION),
+            ("GNU_LIBPTHREAD_VERSION", _CS_GNU_LIBPTHREAD_VERSION),
+            // V6 width restricted envs
+            (
+                "_CS_POSIX_V6_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
+            ),
+            (
+                "POSIX_V6_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
+            ),
+            // V7 width restricted envs
+            (
+                "_CS_POSIX_V7_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS,
+            ),
+            (
+                "POSIX_V7_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS,
+            ),
+            // POSIX_V6 compilation environment strings
+            (
+                "_CS_POSIX_V6_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "POSIX_V6_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "POSIX_V6_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFF32_LIBS",
+                _CS_POSIX_V6_ILP32_OFF32_LIBS,
+            ),
+            ("POSIX_V6_ILP32_OFF32_LIBS", _CS_POSIX_V6_ILP32_OFF32_LIBS),
+            (
+                "_CS_POSIX_V6_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "POSIX_V6_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "POSIX_V6_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LIBS,
+            ),
+            ("POSIX_V6_ILP32_OFFBIG_LIBS", _CS_POSIX_V6_ILP32_OFFBIG_LIBS),
+            (
+                "_CS_POSIX_V6_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_CFLAGS,
+            ),
+            ("POSIX_V6_LP64_OFF64_CFLAGS", _CS_POSIX_V6_LP64_OFF64_CFLAGS),
+            (
+                "_CS_POSIX_V6_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_LDFLAGS,
+            ),
+            (
+                "POSIX_V6_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V6_LP64_OFF64_LIBS", _CS_POSIX_V6_LP64_OFF64_LIBS),
+            ("POSIX_V6_LP64_OFF64_LIBS", _CS_POSIX_V6_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "POSIX_V6_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "POSIX_V6_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LIBS,
+            ),
+            ("POSIX_V6_LPBIG_OFFBIG_LIBS", _CS_POSIX_V6_LPBIG_OFFBIG_LIBS),
+            // POSIX_V7 compilation environment strings
+            (
+                "_CS_POSIX_V7_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "POSIX_V7_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "POSIX_V7_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFF32_LIBS",
+                _CS_POSIX_V7_ILP32_OFF32_LIBS,
+            ),
+            ("POSIX_V7_ILP32_OFF32_LIBS", _CS_POSIX_V7_ILP32_OFF32_LIBS),
+            (
+                "_CS_POSIX_V7_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "POSIX_V7_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "POSIX_V7_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V7_ILP32_OFFBIG_LIBS,
+            ),
+            ("POSIX_V7_ILP32_OFFBIG_LIBS", _CS_POSIX_V7_ILP32_OFFBIG_LIBS),
+            (
+                "_CS_POSIX_V7_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_CFLAGS,
+            ),
+            ("POSIX_V7_LP64_OFF64_CFLAGS", _CS_POSIX_V7_LP64_OFF64_CFLAGS),
+            (
+                "_CS_POSIX_V7_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_LDFLAGS,
+            ),
+            (
+                "POSIX_V7_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V7_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V7_LP64_OFF64_LIBS", _CS_POSIX_V7_LP64_OFF64_LIBS),
+            ("POSIX_V7_LP64_OFF64_LIBS", _CS_POSIX_V7_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "POSIX_V7_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "POSIX_V7_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V7_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V7_LPBIG_OFFBIG_LIBS,
+            ),
+            ("POSIX_V7_LPBIG_OFFBIG_LIBS", _CS_POSIX_V7_LPBIG_OFFBIG_LIBS),
+        ])
     }
 }
 
@@ -330,6 +537,22 @@ fn is_confstr_var(var: &str, mapping: &HashMap<&'static str, libc::c_int>) -> bo
     }
 
     true
+}
+
+/// Check if a specification name is a valid POSIX compilation environment.
+/// We accept POSIX_V6_* and POSIX_V7_* specifications as no-op (using default environment).
+fn is_valid_specification(spec: &str) -> bool {
+    matches!(
+        spec,
+        "POSIX_V7_ILP32_OFF32"
+            | "POSIX_V7_ILP32_OFFBIG"
+            | "POSIX_V7_LP64_OFF64"
+            | "POSIX_V7_LPBIG_OFFBIG"
+            | "POSIX_V6_ILP32_OFF32"
+            | "POSIX_V6_ILP32_OFFBIG"
+            | "POSIX_V6_LP64_OFF64"
+            | "POSIX_V6_LPBIG_OFFBIG"
+    )
 }
 
 fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
@@ -516,15 +739,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Handle -v specification option
-    // POSIX requires this for selecting different compilation environments,
-    // but we currently only support the default environment.
+    // POSIX requires this for selecting different compilation environments.
+    // We accept known specifications as a no-op (using default environment).
     if let Some(ref spec) = args.specification {
-        eprintln!(
-            "getconf: {}: {}",
-            gettext("unsupported specification"),
-            spec
-        );
-        std::process::exit(1);
+        if !is_valid_specification(spec) {
+            eprintln!("getconf: {}: {}", gettext("invalid specification"), spec);
+            std::process::exit(1);
+        }
+        // Valid specification - proceed with default environment
     }
 
     if let Some(pathname) = args.pathname {

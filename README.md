@@ -123,6 +123,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pr
  - [x] printf
  - [x] prs (SCCS)
+ - [x] ps
  - [x] readlink
  - [x] realpath
  - [x] rm
@@ -201,7 +202,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] cal
  - [x] lp
- - [x] ps
  - [x] tsort
 
 ## Stage 0 - Not started

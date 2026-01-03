@@ -37,13 +37,6 @@ struct Args {
     portable: bool,
 
     #[arg(
-        short,
-        long,
-        help = gettext("Include total allocated-space figures in the output")
-    )]
-    total: bool,
-
-    #[arg(
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
     )]
     files: Vec<String>,
@@ -233,9 +226,8 @@ impl Mount {
 
         // The percentage value shall be expressed as a positive integer,
         // with any fractional result causing it to be rounded to the next highest integer.
-        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
-        let percentage_used = percentage_used * 100.0;
-        let percentage_used = percentage_used.ceil() as u32;
+        let percentage_used = used as f64 / (used + free) as f64;
+        let percentage_used = (percentage_used * 100.0).ceil() as u32;
 
         FieldsData {
             fields,
@@ -370,12 +362,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let mut info = read_mount_info()?;
+    let mut exit_code = 0;
 
     if args.files.is_empty() {
         info.mask_all();
     } else {
         for file in &args.files {
-            mask_fs_by_file(&mut info, file)?;
+            if mask_fs_by_file(&mut info, file).is_err() {
+                exit_code = 1;
+            }
         }
     }
 
@@ -393,5 +388,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(())
+    std::process::exit(exit_code);
 }

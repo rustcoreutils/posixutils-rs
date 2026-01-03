@@ -78,6 +78,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cxref (Development)
  - [x] delta (SCCS)
  - [x] diff
+ - [x] df
  - [x] dirname
  - [x] du
  - [x] echo
@@ -197,7 +198,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 1 - Rough draft
 
  - [x] cal
- - [x] df
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp

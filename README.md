@@ -134,6 +134,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strings
  - [x] strip (Development)
  - [x] stty
+ - [x] tabs
  - [x] tail
  - [x] test
  - [x] time
@@ -201,7 +202,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] lp
  - [x] patch
  - [x] ps
- - [x] tabs
  - [x] tsort
 
 ## Stage 0 - Not started

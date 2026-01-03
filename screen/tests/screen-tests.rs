@@ -11,4 +11,5 @@
 // and automated test environments typically don't provide one.
 // See screen/tests/stty/mod.rs for details.
 
+mod tabs;
 mod tput;

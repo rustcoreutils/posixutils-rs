@@ -76,6 +76,11 @@ fn tput_clear(info: &Database) -> terminfo::Result<()> {
     Ok(())
 }
 
+/// Check if an operand is a valid tput operand name
+fn is_valid_operand(operand: &str) -> bool {
+    matches!(operand, "clear" | "init" | "reset")
+}
+
 /// Process a single operand
 /// Returns true on success, false on failure
 fn process_operand(info: &Database, operand: &str) -> Result<(), u8> {
@@ -120,6 +125,16 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE_ERROR);
         }
     };
+
+    // Validate operands before loading terminal database
+    // This ensures invalid operand errors (exit 4) take precedence over
+    // terminal database errors (exit 3) per POSIX semantics
+    for operand in &args.operands {
+        if !is_valid_operand(operand) {
+            eprintln!("{}: {}", gettext("Invalid operand"), operand);
+            return ExitCode::from(EXIT_INVALID_OPERAND);
+        }
+    }
 
     // Load terminfo database
     let info = match &args.term {

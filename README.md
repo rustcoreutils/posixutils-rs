@@ -65,6 +65,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] basename
  - [x] bc
  - [x] c99 (Development)
+ - [x] cal
  - [x] cflow (Development)
  - [x] cksum
  - [x] cmp
@@ -200,7 +201,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 1 - Rough draft
 
- - [x] cal
  - [x] lp
  - [x] tsort
 

@@ -116,6 +116,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nm (Development)
  - [x] od
  - [x] paste
+ - [x] patch
  - [x] pax
  - [x] pr
  - [x] printf
@@ -200,7 +201,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp
- - [x] patch
  - [x] ps
  - [x] tsort
 

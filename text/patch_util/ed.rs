@@ -57,21 +57,19 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
 
             pos += 1;
 
-            // Collect text until "." on its own line
-            let mut text_lines: Vec<String> = Vec::new();
-            while pos < lines.len() {
-                let text_line = lines[pos];
-                if text_line == "." {
-                    pos += 1;
-                    break;
-                }
-                text_lines.push(text_line.to_string());
-                pos += 1;
-            }
-
             let hunk = match cmd {
                 "a" => {
-                    // Append after line start_line
+                    // Append after line start_line - collect text until "."
+                    let mut text_lines: Vec<String> = Vec::new();
+                    while pos < lines.len() {
+                        let text_line = lines[pos];
+                        if text_line == "." {
+                            pos += 1;
+                            break;
+                        }
+                        text_lines.push(text_line.to_string());
+                        pos += 1;
+                    }
                     let mut h = Hunk::new(start_line + 1, 0, start_line + 1, text_lines.len());
                     for line in text_lines {
                         h.lines.push(LineOp::Add(line));
@@ -79,7 +77,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     h
                 }
                 "d" => {
-                    // Delete lines start_line to end_line
+                    // Delete lines start_line to end_line - no text block
                     let count = end_line - start_line + 1;
                     let mut h = Hunk::new(start_line, count, start_line, 0);
                     // Ed scripts don't include the deleted text, so we'll have to match by position
@@ -90,7 +88,17 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     h
                 }
                 "c" => {
-                    // Change lines start_line to end_line
+                    // Change lines start_line to end_line - collect text until "."
+                    let mut text_lines: Vec<String> = Vec::new();
+                    while pos < lines.len() {
+                        let text_line = lines[pos];
+                        if text_line == "." {
+                            pos += 1;
+                            break;
+                        }
+                        text_lines.push(text_line.to_string());
+                        pos += 1;
+                    }
                     let old_count = end_line - start_line + 1;
                     let mut h = Hunk::new(start_line, old_count, start_line, text_lines.len());
                     // Add delete placeholders
@@ -112,9 +120,9 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
         }
     }
 
-    // Ed scripts are typically in reverse order (last change first)
-    // We need to reverse them to apply in order
-    patch.hunks.reverse();
+    // Ed scripts are written with commands from higher to lower line numbers
+    // so that earlier commands don't shift line numbers for later commands.
+    // We must apply them in the order they appear (no reversal needed).
 
     Ok((patch, pos))
 }

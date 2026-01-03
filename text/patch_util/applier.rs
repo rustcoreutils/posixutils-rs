@@ -56,8 +56,12 @@ impl<'a> PatchApplier<'a> {
                         had_fuzz = true;
                         eprintln!("Hunk #{} succeeded with fuzz {}", hunk_num, fuzz);
                     }
-                    // Update cumulative offset
-                    self.offset += (hunk.new_count as i64) - (hunk.old_count as i64);
+                    // Update cumulative offset (but not for ed scripts, where line numbers
+                    // are already correct for the file state at execution time)
+                    let is_ed_script = hunk.get_old_lines().iter().all(|s| s.is_empty());
+                    if !is_ed_script {
+                        self.offset += (hunk.new_count as i64) - (hunk.old_count as i64);
+                    }
                 }
                 HunkResult::AlreadyApplied => {
                     if !self.config.ignore_applied {
@@ -86,17 +90,33 @@ impl<'a> PatchApplier<'a> {
 
         if old_lines.is_empty() {
             // Pure addition - insert at the right position
+            // For ed scripts, don't apply cumulative offset (line numbers are absolute)
             let insert_pos = if hunk.old_start == 0 {
                 0
             } else {
-                ((hunk.old_start as i64 - 1 + self.offset).max(0) as usize)
-                    .min(self.file_lines.len())
+                ((hunk.old_start as i64 - 1).max(0) as usize).min(self.file_lines.len())
             };
 
             let new_lines: Vec<String> =
                 hunk.get_new_lines().iter().map(|s| s.to_string()).collect();
             // Use splice for O(n) instead of multiple insert() which is O(n²)
             self.file_lines.splice(insert_pos..insert_pos, new_lines);
+            return HunkResult::Applied { offset: 0, fuzz: 0 };
+        }
+
+        // Check if this is an ed script hunk (all old_lines are empty)
+        // Ed scripts don't include the content being deleted, so we apply by position.
+        // Ed scripts also have line numbers that are correct for the file state at
+        // execution time, so we don't apply cumulative offset.
+        let is_ed_script = old_lines.iter().all(|s| s.is_empty());
+        if is_ed_script {
+            let pos = if hunk.old_start == 0 {
+                0
+            } else {
+                (hunk.old_start - 1).min(self.file_lines.len())
+            };
+            self.perform_changes(hunk, pos);
+            // Don't update self.offset - ed script line numbers are already correct
             return HunkResult::Applied { offset: 0, fuzz: 0 };
         }
 

@@ -10,26 +10,34 @@
 use std::ffi::CStr;
 
 pub fn login_name() -> String {
-    let username = unsafe {
-        // Call getlogin to get the username as a *mut c_char
+    // Try getlogin() first
+    unsafe {
         let c_str = libc::getlogin();
-
-        // Check if the pointer is not null
-        if c_str.is_null() {
-            panic!("Failed to get login name");
+        if !c_str.is_null() {
+            if let Ok(s) = CStr::from_ptr(c_str).to_str() {
+                return s.to_owned();
+            }
         }
+    }
 
-        // Convert the *mut c_char to a &CStr
-        let c_str = CStr::from_ptr(c_str);
+    // Fall back to USER environment variable
+    if let Ok(user) = std::env::var("USER") {
+        return user;
+    }
 
-        // Convert the &CStr to a Rust String
-        match c_str.to_str() {
-            Ok(s) => s.to_owned(), // Successfully converted CStr to Rust String
-            Err(e) => panic!("Failed to convert login name to a Rust String: {}", e),
+    // Fall back to getpwuid
+    unsafe {
+        let uid = libc::getuid();
+        let pw = libc::getpwuid(uid);
+        if !pw.is_null() && !(*pw).pw_name.is_null() {
+            if let Ok(s) = CStr::from_ptr((*pw).pw_name).to_str() {
+                return s.to_owned();
+            }
         }
-    };
+    }
 
-    username
+    // Last resort
+    String::from("unknown")
 }
 
 pub fn tty() -> Option<String> {

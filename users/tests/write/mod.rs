@@ -24,7 +24,13 @@ use std::thread;
 use std::time::Duration;
 
 /// Mutex to serialize PTY-based tests to avoid timing issues
+/// We use unwrap_or_else to recover from poisoning (if a previous test panicked)
 static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Lock the PTY test mutex, recovering from poisoning if necessary
+fn lock_pty_tests() -> std::sync::MutexGuard<'static, ()> {
+    PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ============================================================================
 // PTY Helper Functions
@@ -454,7 +460,7 @@ fn test_caret_notation_math() {
 
 #[test]
 fn test_pty_header_format() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -491,7 +497,7 @@ fn test_pty_header_format() {
 
 #[test]
 fn test_pty_basic_message() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -533,7 +539,7 @@ fn test_pty_basic_message() {
 
 #[test]
 fn test_pty_multiple_lines() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -570,7 +576,7 @@ fn test_pty_multiple_lines() {
 
 #[test]
 fn test_pty_empty_input() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -591,7 +597,7 @@ fn test_pty_empty_input() {
 
 #[test]
 fn test_pty_sigint_handling() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -626,7 +632,7 @@ fn test_pty_sigint_handling() {
 
 #[test]
 fn test_pty_caret_notation() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -649,7 +655,7 @@ fn test_pty_caret_notation() {
 
 #[test]
 fn test_pty_alert_passthrough() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -673,7 +679,7 @@ fn test_pty_alert_passthrough() {
 
 #[test]
 fn test_pty_special_characters() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -700,7 +706,7 @@ fn test_pty_special_characters() {
 
 #[test]
 fn test_pty_unicode() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -728,7 +734,7 @@ fn test_pty_unicode() {
 
 #[test]
 fn test_pty_invalid_user_exit() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {
@@ -795,7 +801,7 @@ fn test_pty_invalid_user_exit() {
 
 #[test]
 fn test_pty_invalid_terminal_exit() {
-    let _lock = PTY_TEST_LOCK.lock().unwrap();
+    let _lock = lock_pty_tests();
     let write_path = match find_write_binary() {
         Some(p) => p,
         None => {

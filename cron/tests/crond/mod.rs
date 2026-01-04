@@ -250,3 +250,258 @@ fn test_signal() {
 
     let _ = pid::kill("target/debug/crond").unwrap();
 }
+
+// Tests for @-prefix special time specifications
+
+#[test]
+fn test_at_hourly() {
+    let database = "@hourly echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(!job.is_reboot);
+
+    // @hourly means "0 * * * *" - at minute 0 of every hour
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(15, 30, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+    );
+
+    assert_eq!(expected_date, job.next_execution(&start_date).unwrap());
+}
+
+#[test]
+fn test_at_daily() {
+    let database = "@daily echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(!job.is_reboot);
+
+    // @daily means "0 0 * * *" - at midnight every day
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(15, 30, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 2).unwrap(),
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+    );
+
+    assert_eq!(expected_date, job.next_execution(&start_date).unwrap());
+}
+
+#[test]
+fn test_at_weekly() {
+    let database = "@weekly echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(!job.is_reboot);
+
+    // @weekly means "0 0 * * 0" - at midnight on Sunday
+    // 2000-01-01 is Saturday, so next Sunday is 2000-01-02
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(15, 30, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 2).unwrap(),
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+    );
+
+    assert_eq!(expected_date, job.next_execution(&start_date).unwrap());
+}
+
+#[test]
+fn test_at_monthly() {
+    let database = "@monthly echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(!job.is_reboot);
+
+    // @monthly means "0 0 1 * *" - at midnight on the 1st of each month
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 15).unwrap(),
+        NaiveTime::from_hms_opt(15, 30, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 2, 1).unwrap(),
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+    );
+
+    assert_eq!(expected_date, job.next_execution(&start_date).unwrap());
+}
+
+#[test]
+fn test_at_yearly() {
+    let database = "@yearly echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(!job.is_reboot);
+
+    // @yearly means "0 0 1 1 *" - at midnight on Jan 1
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 3, 15).unwrap(),
+        NaiveTime::from_hms_opt(15, 30, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2001, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+    );
+
+    assert_eq!(expected_date, job.next_execution(&start_date).unwrap());
+}
+
+#[test]
+fn test_at_reboot() {
+    let database = "@reboot echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(job.is_reboot);
+    assert_eq!(job.command, "echo test");
+
+    // @reboot jobs should not have a next execution time
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(15, 30, 00).unwrap(),
+    );
+    assert!(job.next_execution(&start_date).is_none());
+}
+
+#[test]
+fn test_reboot_jobs_filtered() {
+    let database = "@reboot echo reboot\n* * * * * echo regular"
+        .parse::<Database>()
+        .unwrap();
+    assert_eq!(database.0.len(), 2);
+
+    // reboot_jobs() should return only @reboot jobs
+    let reboot_jobs = database.reboot_jobs();
+    assert_eq!(reboot_jobs.len(), 1);
+    assert!(reboot_jobs[0].is_reboot);
+    assert_eq!(reboot_jobs[0].command, "echo reboot");
+
+    // nearest_job() should only return non-reboot jobs
+    let nearest = database.nearest_job();
+    assert!(nearest.is_some());
+    assert!(!nearest.unwrap().is_reboot);
+}
+
+// Tests for step parsing
+
+#[test]
+fn test_step_every_15_minutes() {
+    let database = "*/15 * * * * echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+
+    // */15 should trigger at minutes 0, 15, 30, 45
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(12, 16, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(12, 30, 0).unwrap(),
+    );
+
+    assert_eq!(
+        expected_date,
+        database
+            .nearest_job()
+            .unwrap()
+            .next_execution(&start_date)
+            .unwrap()
+    );
+}
+
+#[test]
+fn test_range_with_step() {
+    let database = "0-30/10 * * * * echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+
+    // 0-30/10 should trigger at minutes 0, 10, 20, 30
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(12, 11, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(12, 20, 0).unwrap(),
+    );
+
+    assert_eq!(
+        expected_date,
+        database
+            .nearest_job()
+            .unwrap()
+            .next_execution(&start_date)
+            .unwrap()
+    );
+}
+
+#[test]
+fn test_list_of_values() {
+    let database = "0,15,30,45 * * * * echo test".parse::<Database>().unwrap();
+    assert_eq!(database.0.len(), 1);
+
+    // 0,15,30,45 should trigger at those specific minutes
+    let start_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(12, 16, 00).unwrap(),
+    );
+
+    let expected_date = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(12, 30, 0).unwrap(),
+    );
+
+    assert_eq!(
+        expected_date,
+        database
+            .nearest_job()
+            .unwrap()
+            .next_execution(&start_date)
+            .unwrap()
+    );
+}
+
+// Test system crontab parsing (6-field format)
+
+#[test]
+fn test_system_crontab_format() {
+    let content = "0 * * * * root echo hello";
+    let database = Database::parse_system_crontab(content);
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert_eq!(job.command, "echo hello");
+    // On test systems, root user should exist
+    assert!(job.owner_uid.is_some() || job.owner_name.is_none());
+}
+
+#[test]
+fn test_system_crontab_skips_env_vars() {
+    let content = "SHELL=/bin/bash\nPATH=/usr/bin\n0 * * * * root echo hello";
+    let database = Database::parse_system_crontab(content);
+    // Should only have 1 job, not parse env vars as jobs
+    assert_eq!(database.0.len(), 1);
+    assert_eq!(database.0[0].command, "echo hello");
+}
+
+#[test]
+fn test_system_crontab_at_prefix() {
+    let content = "@hourly root echo hourly";
+    let database = Database::parse_system_crontab(content);
+    assert_eq!(database.0.len(), 1);
+    let job = &database.0[0];
+    assert!(!job.is_reboot);
+    assert_eq!(job.command, "echo hourly");
+}

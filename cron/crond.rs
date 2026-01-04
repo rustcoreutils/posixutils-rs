@@ -8,7 +8,7 @@
 //
 
 use chrono::Local;
-use cron::job::Database;
+use cron::job::{Database, UserInfo};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::cmp::Ordering::{Greater, Less};
@@ -17,12 +17,18 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 static CRONTAB: Mutex<Option<Database>> = Mutex::new(None);
 static LAST_MODIFIED: Mutex<Option<u64>> = Mutex::new(None);
+
+/// Atomic flag set by SIGHUP handler to signal reload needed
+static RELOAD_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Atomic flag set by SIGTERM/SIGINT handlers to signal shutdown
+static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 enum CronError {
@@ -75,22 +81,23 @@ fn sync_cronfile() -> Result<(), Box<dyn Error>> {
         // Load all user crontabs from spool directory
         if let Ok(entries) = fs::read_dir(CRON_SPOOL_DIR) {
             for entry in entries.flatten() {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    let user_db = content
-                        .lines()
-                        .filter_map(|x| Database::from_str(x).ok())
-                        .fold(Database(vec![]), |acc, next| acc.merge(next));
-                    combined_db = combined_db.merge(user_db);
+                // The filename is the username
+                let username = entry.file_name().to_string_lossy().into_owned();
+
+                // Look up user info for privilege dropping
+                if let Some(user_info) = UserInfo::from_username(&username) {
+                    if let Ok(content) = fs::read_to_string(entry.path()) {
+                        let user_db = Database::parse_user_crontab(&content, &user_info);
+                        combined_db = combined_db.merge(user_db);
+                    }
                 }
+                // If user doesn't exist in passwd, skip their crontab
             }
         }
 
-        // Also load system crontab if exists
+        // Also load system crontab if exists (6-field format with username)
         if let Ok(content) = fs::read_to_string(SYSTEM_CRONTAB) {
-            let sys_db = content
-                .lines()
-                .filter_map(|x| Database::from_str(x).ok())
-                .fold(Database(vec![]), |acc, next| acc.merge(next));
+            let sys_db = Database::parse_system_crontab(&content);
             combined_db = combined_db.merge(sys_db);
         }
 
@@ -153,12 +160,16 @@ fn setup() -> i32 {
     }
 }
 
-/// Handles SIGHUP signal to reload crontab
+/// Handles SIGHUP signal to reload crontab.
+/// Sets an atomic flag that the main loop checks - this is async-signal-safe.
 extern "C" fn handle_sighup(_: libc::c_int) {
-    if let Err(err) = sync_cronfile() {
-        eprintln!("{err}");
-        std::process::exit(1);
-    }
+    RELOAD_FLAG.store(true, Ordering::SeqCst);
+}
+
+/// Handles SIGTERM/SIGINT signals for graceful shutdown.
+/// Sets an atomic flag that the main loop checks - this is async-signal-safe.
+extern "C" fn handle_shutdown(_: libc::c_int) {
+    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
 }
 
 /// Handles SIGCHLD signal to reap zombie child processes
@@ -173,6 +184,17 @@ extern "C" fn handle_sigchld(_: libc::c_int) {
 /// Daemon loop
 fn daemon_loop() -> Result<(), Box<dyn Error>> {
     loop {
+        // Check for shutdown signal
+        if SHUTDOWN_FLAG.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Check for reload signal (from SIGHUP)
+        if RELOAD_FLAG.swap(false, Ordering::SeqCst) {
+            // Force reload by clearing last modified time
+            *LAST_MODIFIED.lock().unwrap() = None;
+        }
+
         sync_cronfile()?;
         let Some(db) = CRONTAB.lock().unwrap().clone() else {
             return Err(Box::new(CronError::NoCrontab));
@@ -215,14 +237,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _pid_lock = acquire_lock()?;
 
     // SAFETY: signal() is safe to call with valid signal numbers and
-    // extern "C" function handlers. SIGHUP and SIGCHLD are standard signals.
-    // The handlers are async-signal-safe (only call async-signal-safe functions).
+    // extern "C" function handlers. All handlers are async-signal-safe
+    // (they only perform atomic stores or call async-signal-safe functions).
     unsafe {
         libc::signal(libc::SIGHUP, handle_sighup as usize);
         libc::signal(libc::SIGCHLD, handle_sigchld as usize);
+        libc::signal(libc::SIGTERM, handle_shutdown as usize);
+        libc::signal(libc::SIGINT, handle_shutdown as usize);
     }
 
+    // Run @reboot jobs at startup
+    run_reboot_jobs()?;
+
     daemon_loop()
+}
+
+/// Execute all @reboot jobs once at daemon startup
+fn run_reboot_jobs() -> Result<(), Box<dyn Error>> {
+    sync_cronfile()?;
+
+    let db_guard = CRONTAB.lock().unwrap();
+    if let Some(ref db) = *db_guard {
+        for job in db.reboot_jobs() {
+            let _ = job.run_job();
+        }
+    }
+    drop(db_guard);
+
+    Ok(())
 }
 
 fn sleep(target: u32) {

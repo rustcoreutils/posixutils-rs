@@ -7,6 +7,42 @@
 // SPDX-License-Identifier: MIT
 //
 
+//! Lex file parser for POSIX lex specification files.
+//!
+//! This module parses `.l` lex specification files and extracts definitions,
+//! rules, and user code sections.
+//!
+//! # GNU flex Compatibility Extensions
+//!
+//! In addition to POSIX lex features, this implementation supports the following
+//! GNU flex-compatible extensions:
+//!
+//! ## %option directive
+//!
+//! The `%option` directive allows controlling various aspects of the generated
+//! scanner. Currently supported options:
+//!
+//! - `noinput` - Suppress generation of the `input()` function. Use this when
+//!   your scanner doesn't call `input()` to avoid compiler warnings about
+//!   unused static functions.
+//!
+//! - `nounput` - Suppress generation of the `unput()` function. Use this when
+//!   your scanner doesn't call `unput()` to avoid compiler warnings about
+//!   unused static functions.
+//!
+//! Options can be specified on a single line or multiple lines:
+//!
+//! ```text
+//! %option noinput nounput
+//! ```
+//!
+//! or:
+//!
+//! ```text
+//! %option noinput
+//! %option nounput
+//! ```
+
 use crate::diag;
 use crate::pattern_escape::{expand_posix_bracket_constructs, translate_escape_sequences};
 use crate::pattern_validate::{
@@ -52,6 +88,15 @@ impl LexRule {
     }
 }
 
+/// Options parsed from %option directives (flex compatibility)
+#[derive(Debug, Clone, Default)]
+pub struct LexOptions {
+    /// If true, suppress generation of input() function
+    pub noinput: bool,
+    /// If true, suppress generation of unput() function
+    pub nounput: bool,
+}
+
 #[derive(Debug)]
 pub struct LexInfo {
     pub external_def: Vec<String>,
@@ -69,6 +114,8 @@ pub struct LexInfo {
     /// Key is the single character (p, n, a, e, k, o), value is the declared size
     /// Used in -v statistics output for POSIX compliance
     pub table_sizes: HashMap<char, usize>,
+    /// Options from %option directives
+    pub options: LexOptions,
 }
 
 impl LexInfo {
@@ -83,6 +130,7 @@ impl LexInfo {
             user_subs: state.user_subs.clone(),
             rules: state.rules.clone(),
             table_sizes: state.table_sizes.clone(),
+            options: state.options.clone(),
         }
     }
 }
@@ -115,6 +163,8 @@ struct ParseState {
     table_sizes: HashMap<char, usize>,
     /// Current line number (1-based)
     line_number: usize,
+    /// Options from %option directives
+    options: LexOptions,
 }
 
 impl ParseState {
@@ -136,6 +186,7 @@ impl ParseState {
             tmp_rule: LexRule::new(),
             table_sizes: HashMap::new(),
             line_number: 0,
+            options: LexOptions::default(),
         }
     }
 
@@ -251,6 +302,19 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 if let Some(size_str) = words.first() {
                     if let Ok(size) = size_str.parse::<usize>() {
                         state.table_sizes.insert(table_char, size);
+                    }
+                }
+            }
+            "%option" => {
+                // Parse flex-style %option directives
+                for opt in words {
+                    match opt.as_str() {
+                        "noinput" => state.options.noinput = true,
+                        "nounput" => state.options.nounput = true,
+                        // Future: add more flex options here as needed
+                        _ => {
+                            state.warning(&format!("unknown %option: {}", opt));
+                        }
                     }
                 }
             }
@@ -566,26 +630,51 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
             continue;
         }
 
-        if in_quotes && ch == '"' {
-            in_quotes = false;
-        } else if in_quotes {
-            // Inside quoted strings, escape regex metacharacters that need escaping
-            // Note: ] doesn't need escaping as it's only special inside brackets
-            match ch {
-                '*' => re.push_str(r"\x2a"),
-                '+' => re.push_str(r"\x2b"),
-                '.' => re.push_str(r"\x2e"),
-                '{' => re.push_str(r"\x7b"),
-                '}' => re.push_str(r"\x7d"),
-                '(' => re.push_str(r"\x28"),
-                ')' => re.push_str(r"\x29"),
-                '[' => re.push_str(r"\x5b"),
-                '?' => re.push_str(r"\x3f"),
-                '|' => re.push_str(r"\x7c"),
-                '^' => re.push_str(r"\x5e"),
-                '$' => re.push_str(r"\x24"),
-                '\\' => re.push_str(r"\x5c"),
-                _ => re.push(ch),
+        if in_quotes {
+            // Handle escape sequences inside quoted strings
+            // \" means literal quote, \\ means literal backslash
+            if ch == '\\' {
+                if i + 1 < chars.len() {
+                    let next_ch = chars[i + 1];
+                    if next_ch == '"' || next_ch == '\\' {
+                        // Escaped quote or backslash - output the literal character
+                        if next_ch == '"' {
+                            re.push('"');
+                        } else {
+                            re.push_str(r"\x5c"); // Literal backslash for regex
+                        }
+                        i += 2; // Skip both characters
+                        continue;
+                    }
+                    // Other escapes inside quotes: output backslash literally
+                    re.push_str(r"\x5c");
+                } else {
+                    // Trailing backslash inside quotes: treat as literal backslash
+                    re.push_str(r"\x5c");
+                    i += 1;
+                    continue;
+                }
+            } else if ch == '"' {
+                // Unescaped quote ends the quoted string
+                in_quotes = false;
+            } else {
+                // Inside quoted strings, escape regex metacharacters that need escaping
+                // Note: ] doesn't need escaping as it's only special inside brackets
+                match ch {
+                    '*' => re.push_str(r"\x2a"),
+                    '+' => re.push_str(r"\x2b"),
+                    '.' => re.push_str(r"\x2e"),
+                    '{' => re.push_str(r"\x7b"),
+                    '}' => re.push_str(r"\x7d"),
+                    '(' => re.push_str(r"\x28"),
+                    ')' => re.push_str(r"\x29"),
+                    '[' => re.push_str(r"\x5b"),
+                    '?' => re.push_str(r"\x3f"),
+                    '|' => re.push_str(r"\x7c"),
+                    '^' => re.push_str(r"\x5e"),
+                    '$' => re.push_str(r"\x24"),
+                    _ => re.push(ch),
+                }
             }
         } else if in_brace && ch == '}' {
             // Determine if this is an interval expression or a substitution

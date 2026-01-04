@@ -2422,3 +2422,235 @@ int main() {
         result
     );
 }
+
+#[test]
+fn test_escaped_quote_inside_quoted_string() {
+    // Test escaped quotes inside quoted strings: \" means literal quote
+    // This is the fix for patterns like "\"" to match a literal double-quote character
+    let lex_input = r#"
+%%
+"\""          printf("QUOTE\n");
+"say \"hi\""  printf("PHRASE\n");
+[a-z]+        printf("WORD: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Test matching a single double-quote character
+    let result = compile_and_run(&c_code, "\" hello\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("QUOTE"),
+        "Should match literal quote: {}",
+        output
+    );
+    assert!(
+        output.contains("WORD: hello"),
+        "Should match 'hello': {}",
+        output
+    );
+
+    // Test matching a phrase with embedded quotes
+    let result2 = compile_and_run(&c_code, "say \"hi\"\n");
+    assert!(result2.is_ok(), "Failed to compile/run: {:?}", result2);
+    let output2 = result2.unwrap();
+    assert!(
+        output2.contains("PHRASE"),
+        "Should match phrase with quotes: {}",
+        output2
+    );
+}
+
+// ============================================================================
+// %option noinput nounput Tests (GNU flex compatibility)
+// ============================================================================
+
+#[test]
+fn test_option_noinput_suppresses_input_function() {
+    // Test that %option noinput suppresses generation of input() function
+    let lex_input = r#"
+%option noinput
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Verify that input() function is NOT generated
+    assert!(
+        !c_code.contains("static int input(void)"),
+        "input() function should NOT be generated with %option noinput"
+    );
+
+    // Verify that unput() function IS still generated (noinput doesn't affect it)
+    assert!(
+        c_code.contains("static void unput(int c)"),
+        "unput() function should still be generated"
+    );
+
+    // Code should still compile and run
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(output.contains("WORD: hello"), "Should match 'hello'");
+    assert!(output.contains("WORD: world"), "Should match 'world'");
+}
+
+#[test]
+fn test_option_nounput_suppresses_unput_function() {
+    // Test that %option nounput suppresses generation of unput() function
+    let lex_input = r#"
+%option nounput
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Verify that unput() function is NOT generated
+    assert!(
+        !c_code.contains("static void unput(int c)"),
+        "unput() function should NOT be generated with %option nounput"
+    );
+
+    // Verify that input() function IS still generated (nounput doesn't affect it)
+    assert!(
+        c_code.contains("static int input(void)"),
+        "input() function should still be generated"
+    );
+
+    // Code should still compile and run
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(output.contains("WORD: hello"), "Should match 'hello'");
+    assert!(output.contains("WORD: world"), "Should match 'world'");
+}
+
+#[test]
+fn test_option_noinput_nounput_combined() {
+    // Test that both %option noinput nounput on same line works
+    let lex_input = r#"
+%option noinput nounput
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Verify that NEITHER function is generated
+    assert!(
+        !c_code.contains("static int input(void)"),
+        "input() function should NOT be generated"
+    );
+    assert!(
+        !c_code.contains("static void unput(int c)"),
+        "unput() function should NOT be generated"
+    );
+
+    // Code should still compile and run
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(output.contains("WORD: hello"), "Should match 'hello'");
+    assert!(output.contains("WORD: world"), "Should match 'world'");
+}
+
+#[test]
+fn test_option_noinput_nounput_separate_lines() {
+    // Test that %option on separate lines works
+    let lex_input = r#"
+%option noinput
+%option nounput
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Verify that NEITHER function is generated
+    assert!(
+        !c_code.contains("static int input(void)"),
+        "input() function should NOT be generated"
+    );
+    assert!(
+        !c_code.contains("static void unput(int c)"),
+        "unput() function should NOT be generated"
+    );
+
+    // Code should still compile and run
+    let result = compile_and_run(&c_code, "hello world\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(output.contains("WORD: hello"), "Should match 'hello'");
+}
+
+#[test]
+fn test_option_default_generates_both_functions() {
+    // Test that by default (no %option), both input() and unput() are generated
+    let lex_input = r#"
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Verify that BOTH functions are generated by default
+    assert!(
+        c_code.contains("static int input(void)"),
+        "input() function should be generated by default"
+    );
+    assert!(
+        c_code.contains("static void unput(int c)"),
+        "unput() function should be generated by default"
+    );
+}

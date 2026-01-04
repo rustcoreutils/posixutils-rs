@@ -1221,6 +1221,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "        {}nerrs++;", prefix)?;
     writeln!(w, "        {}error(\"syntax error\");", prefix)?;
     writeln!(w, "    }}")?;
+    writeln!(w, "    goto {}errlab1;", prefix)?;
     writeln!(w)?;
 
     // errlab1: YYERROR jumps here (doesn't call yyerror per POSIX)

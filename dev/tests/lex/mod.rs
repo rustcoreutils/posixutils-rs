@@ -2422,3 +2422,50 @@ int main() {
         result
     );
 }
+
+#[test]
+fn test_escaped_quote_inside_quoted_string() {
+    // Test escaped quotes inside quoted strings: \" means literal quote
+    // This is the fix for patterns like "\"" to match a literal double-quote character
+    let lex_input = r#"
+%%
+"\""          printf("QUOTE\n");
+"say \"hi\""  printf("PHRASE\n");
+[a-z]+        printf("WORD: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code: {}", c_code);
+
+    // Test matching a single double-quote character
+    let result = compile_and_run(&c_code, "\" hello\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("QUOTE"),
+        "Should match literal quote: {}",
+        output
+    );
+    assert!(
+        output.contains("WORD: hello"),
+        "Should match 'hello': {}",
+        output
+    );
+
+    // Test matching a phrase with embedded quotes
+    let result2 = compile_and_run(&c_code, "say \"hi\"\n");
+    assert!(result2.is_ok(), "Failed to compile/run: {:?}", result2);
+    let output2 = result2.unwrap();
+    assert!(
+        output2.contains("PHRASE"),
+        "Should match phrase with quotes: {}",
+        output2
+    );
+}

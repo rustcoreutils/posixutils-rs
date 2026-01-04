@@ -569,20 +569,27 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
         if in_quotes {
             // Handle escape sequences inside quoted strings
             // \" means literal quote, \\ means literal backslash
-            if ch == '\\' && i + 1 < chars.len() {
-                let next_ch = chars[i + 1];
-                if next_ch == '"' || next_ch == '\\' {
-                    // Escaped quote or backslash - output the literal character
-                    if next_ch == '"' {
-                        re.push('"');
-                    } else {
-                        re.push_str(r"\x5c"); // Literal backslash for regex
+            if ch == '\\' {
+                if i + 1 < chars.len() {
+                    let next_ch = chars[i + 1];
+                    if next_ch == '"' || next_ch == '\\' {
+                        // Escaped quote or backslash - output the literal character
+                        if next_ch == '"' {
+                            re.push('"');
+                        } else {
+                            re.push_str(r"\x5c"); // Literal backslash for regex
+                        }
+                        i += 2; // Skip both characters
+                        continue;
                     }
-                    i += 2; // Skip both characters
+                    // Other escapes inside quotes: output backslash literally
+                    re.push_str(r"\x5c");
+                } else {
+                    // Trailing backslash inside quotes: treat as literal backslash
+                    re.push_str(r"\x5c");
+                    i += 1;
                     continue;
                 }
-                // Other escapes inside quotes: output backslash literally
-                re.push_str(r"\x5c");
             } else if ch == '"' {
                 // Unescaped quote ends the quoted string
                 in_quotes = false;

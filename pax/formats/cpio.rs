@@ -24,8 +24,9 @@
 //! - c_mtime:    11 bytes (octal)
 //! - c_namesize:  6 bytes (octal)
 //! - c_filesize: 11 bytes (octal)
-//! Followed by c_namesize bytes of filename (including NUL)
-//! Followed by c_filesize bytes of file data
+//!
+//! Followed by c_namesize bytes of filename (including NUL),
+//! then c_filesize bytes of file data.
 //!
 //! ## newc format (SVR4 new ASCII, magic "070701" or "070702")
 //! Header format (110 bytes):
@@ -43,8 +44,9 @@
 //! - c_rdevminor: 8 bytes (hex)
 //! - c_namesize:  8 bytes (hex)
 //! - c_check:     8 bytes (hex) - always 0 for 070701, CRC for 070702
-//! Followed by filename padded to 4-byte boundary
-//! Followed by file data padded to 4-byte boundary
+//!
+//! Followed by filename padded to 4-byte boundary,
+//! then file data padded to 4-byte boundary.
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{is_eof_error, PaxError, PaxResult};
@@ -60,6 +62,10 @@ const NEWC_HEADER_SIZE: usize = 110;
 const NEWC_MAGIC: &[u8; 6] = b"070701";
 const NEWC_CRC_MAGIC: &[u8; 6] = b"070702";
 
+// Binary cpio format constants
+const BIN_HEADER_SIZE: usize = 26;
+const BIN_MAGIC: u16 = 0o070707; // Binary magic as 16-bit value
+
 const TRAILER: &str = "TRAILER!!!";
 
 /// cpio format variant
@@ -69,6 +75,8 @@ enum CpioFormat {
     Odc,
     /// SVR4 new ASCII format (newc)
     Newc,
+    /// Old binary format
+    Binary,
 }
 
 // c_mode file type bits
@@ -123,41 +131,55 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         // Skip any remaining data from previous entry
         self.skip_data()?;
 
-        // Read magic to determine format
-        let mut magic = [0u8; 6];
-        if let Err(e) = self.read_exact(&mut magic) {
+        // Read first 2 bytes to check for binary format
+        let mut magic2 = [0u8; 2];
+        if let Err(e) = self.read_exact(&mut magic2) {
             if is_eof_error(&e) {
                 return Ok(None);
             }
             return Err(e);
         }
 
-        // Detect format from magic
-        let format = if &magic == ODC_MAGIC {
-            CpioFormat::Odc
-        } else if &magic == NEWC_MAGIC || &magic == NEWC_CRC_MAGIC {
-            CpioFormat::Newc
-        } else {
-            return Err(PaxError::InvalidFormat(format!(
-                "bad cpio magic: {:?}",
-                String::from_utf8_lossy(&magic)
-            )));
-        };
-        self.format = Some(format);
+        // Check for binary cpio format (2-byte magic)
+        let magic16_le = u16::from_le_bytes(magic2);
+        let magic16_be = u16::from_be_bytes(magic2);
+        let is_binary = magic16_le == BIN_MAGIC || magic16_be == BIN_MAGIC;
+        let is_swapped = magic16_be == BIN_MAGIC && magic16_le != BIN_MAGIC;
 
-        // Parse header based on format
-        let (entry, data_padding) = match format {
-            CpioFormat::Odc => {
+        let (format, entry, data_padding) = if is_binary {
+            // Binary format - read remaining 24 bytes of header
+            let mut header = [0u8; BIN_HEADER_SIZE - 2];
+            self.read_exact(&mut header)?;
+            let (entry, padding) = parse_bin_header(&header, is_swapped, &mut self.reader)?;
+            (CpioFormat::Binary, entry, padding)
+        } else {
+            // ASCII format - read remaining 4 bytes to complete 6-byte magic
+            let mut magic_rest = [0u8; 4];
+            self.read_exact(&mut magic_rest)?;
+            let mut magic6 = [0u8; 6];
+            magic6[..2].copy_from_slice(&magic2);
+            magic6[2..].copy_from_slice(&magic_rest);
+
+            if &magic6 == ODC_MAGIC {
+                // ODC format - read remaining 70 bytes of header
                 let mut header = [0u8; ODC_HEADER_SIZE - 6];
                 self.read_exact(&mut header)?;
-                (parse_odc_header(&magic, &header, &mut self.reader)?, 0)
-            }
-            CpioFormat::Newc => {
+                let entry = parse_odc_header(&header, &mut self.reader)?;
+                (CpioFormat::Odc, entry, 0)
+            } else if &magic6 == NEWC_MAGIC || &magic6 == NEWC_CRC_MAGIC {
+                // newc format - read remaining 104 bytes of header
                 let mut header = [0u8; NEWC_HEADER_SIZE - 6];
                 self.read_exact(&mut header)?;
-                parse_newc_header(&header, &mut self.reader)?
+                let (entry, padding) = parse_newc_header(&header, &mut self.reader)?;
+                (CpioFormat::Newc, entry, padding)
+            } else {
+                return Err(PaxError::InvalidFormat(format!(
+                    "bad cpio magic: {:?}",
+                    String::from_utf8_lossy(&magic6)
+                )));
             }
         };
+        self.format = Some(format);
 
         // Check for trailer
         if entry.path.to_string_lossy() == TRAILER {
@@ -274,11 +296,7 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
 
 /// Parse ODC format header (magic already read)
 /// header contains the 70 bytes after the 6-byte magic
-fn parse_odc_header<R: Read>(
-    _magic: &[u8; 6],
-    header: &[u8],
-    reader: &mut R,
-) -> PaxResult<ArchiveEntry> {
+fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<ArchiveEntry> {
     // ODC header layout (after 6-byte magic):
     // c_dev:      6 bytes (octal)  [0..6]
     // c_ino:      6 bytes (octal)  [6..12]
@@ -440,6 +458,117 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
             nlink,
             devmajor: rdevmajor,
             devminor: rdevminor,
+            ..Default::default()
+        },
+        data_padding,
+    ))
+}
+
+/// Parse binary cpio format header (magic already read)
+/// header contains the 24 bytes after the 2-byte magic
+/// Returns (entry, data_padding) where data_padding is bytes to skip after file data
+fn parse_bin_header<R: Read>(
+    header: &[u8],
+    swapped: bool,
+    reader: &mut R,
+) -> PaxResult<(ArchiveEntry, u64)> {
+    // Binary cpio header layout (after 2-byte magic):
+    // c_dev:      2 bytes  [0..2]
+    // c_ino:      2 bytes  [2..4]
+    // c_mode:     2 bytes  [4..6]
+    // c_uid:      2 bytes  [6..8]
+    // c_gid:      2 bytes  [8..10]
+    // c_nlink:    2 bytes  [10..12]
+    // c_rdev:     2 bytes  [12..14]
+    // c_mtime:    4 bytes  [14..18] (2x2 bytes, high then low)
+    // c_namesize: 2 bytes  [18..20]
+    // c_filesize: 4 bytes  [20..24] (2x2 bytes, high then low)
+
+    let read_u16 = |offset: usize| -> u16 {
+        let bytes = [header[offset], header[offset + 1]];
+        if swapped {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        }
+    };
+
+    let read_u32 = |offset: usize| -> u32 {
+        // mtime and filesize are stored as two 16-bit words (high, low)
+        let high = read_u16(offset) as u32;
+        let low = read_u16(offset + 2) as u32;
+        (high << 16) | low
+    };
+
+    let dev = read_u16(0) as u64;
+    let ino = read_u16(2) as u64;
+    let mode = read_u16(4) as u32;
+    let uid = read_u16(6) as u32;
+    let gid = read_u16(8) as u32;
+    let nlink = read_u16(10) as u32;
+    let rdev = read_u16(12) as u64;
+    let mtime = read_u32(14) as u64;
+    let namesize = read_u16(18) as usize;
+    let filesize = read_u32(20) as u64;
+
+    // Read filename (padded to word boundary)
+    let mut name_buf = vec![0u8; namesize];
+    reader.read_exact(&mut name_buf)?;
+
+    // Skip padding after filename (header + name must be word-aligned)
+    // Header is 26 bytes, so total = 26 + namesize, must be even
+    let name_padding = (26 + namesize) % 2;
+    if name_padding > 0 {
+        let mut pad = [0u8; 1];
+        reader.read_exact(&mut pad)?;
+    }
+
+    // Remove trailing NUL
+    let name = parse_name(&name_buf);
+    let path = PathBuf::from(name);
+
+    let entry_type = parse_mode_type(mode);
+
+    // For symlinks, the file data is the link target - read it now
+    let (link_target, size, data_padding) = if entry_type == EntryType::Symlink && filesize > 0 {
+        let mut target_buf = vec![0u8; filesize as usize];
+        reader.read_exact(&mut target_buf)?;
+        // Skip padding after symlink data
+        let symlink_padding = (filesize as usize) % 2;
+        if symlink_padding > 0 {
+            let mut pad = [0u8; 1];
+            reader.read_exact(&mut pad)?;
+        }
+        (Some(PathBuf::from(parse_name(&target_buf))), 0, 0)
+    } else {
+        // Calculate padding after file data (must be word-aligned)
+        let file_padding = if filesize > 0 {
+            ((filesize as usize) % 2) as u64
+        } else {
+            0
+        };
+        (None, filesize, file_padding)
+    };
+
+    // Extract device major/minor from rdev
+    let devmajor = ((rdev >> 8) & 0xff) as u32;
+    let devminor = (rdev & 0xff) as u32;
+
+    Ok((
+        ArchiveEntry {
+            path,
+            mode: mode & C_PERM_MASK,
+            uid,
+            gid,
+            size,
+            mtime,
+            entry_type,
+            link_target,
+            dev,
+            ino,
+            nlink,
+            devmajor,
+            devminor,
             ..Default::default()
         },
         data_padding,

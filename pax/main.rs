@@ -536,12 +536,27 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
     }
 
     // Check for cpio magic at offset 0
-    // 070707 = POSIX octet-oriented (odc)
-    // 070701 = SVR4 newc (no CRC)
-    // 070702 = SVR4 newc with CRC
+    // ASCII formats (6 bytes):
+    //   070707 = POSIX octet-oriented (odc)
+    //   070701 = SVR4 newc (no CRC)
+    //   070702 = SVR4 newc with CRC
+    // Binary format (2 bytes):
+    //   0x71C7 = old binary cpio (little-endian)
+    //   0xC771 = old binary cpio (big-endian)
     if buf.len() >= 6 {
         let magic = &buf[0..6];
         if magic == b"070707" || magic == b"070701" || magic == b"070702" {
+            return Ok(ArchiveFormat::Cpio);
+        }
+    }
+    if buf.len() >= 2 {
+        // Binary cpio magic: octal 070707 = 0x71C7 (little-endian) or 0xC771 (big-endian)
+        let magic16 = u16::from_le_bytes([buf[0], buf[1]]);
+        if magic16 == 0o070707 {
+            return Ok(ArchiveFormat::Cpio);
+        }
+        let magic16_be = u16::from_be_bytes([buf[0], buf[1]]);
+        if magic16_be == 0o070707 {
             return Ok(ArchiveFormat::Cpio);
         }
     }

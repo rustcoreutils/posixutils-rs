@@ -536,8 +536,14 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
     }
 
     // Check for cpio magic at offset 0
-    if buf.len() >= 6 && &buf[0..6] == b"070707" {
-        return Ok(ArchiveFormat::Cpio);
+    // 070707 = POSIX octet-oriented (odc)
+    // 070701 = SVR4 newc (no CRC)
+    // 070702 = SVR4 newc with CRC
+    if buf.len() >= 6 {
+        let magic = &buf[0..6];
+        if magic == b"070707" || magic == b"070701" || magic == b"070702" {
+            return Ok(ArchiveFormat::Cpio);
+        }
     }
 
     // Check for old-style tar by validating checksum

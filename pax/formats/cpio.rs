@@ -7,8 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! POSIX cpio (octet-oriented) format implementation
+//! POSIX cpio format implementation
 //!
+//! Supports two cpio variants:
+//!
+//! ## ODC format (POSIX octet-oriented, magic "070707")
 //! Header format (76 bytes):
 //! - c_magic:     6 bytes "070707"
 //! - c_dev:       6 bytes (octal)
@@ -21,18 +24,52 @@
 //! - c_mtime:    11 bytes (octal)
 //! - c_namesize:  6 bytes (octal)
 //! - c_filesize: 11 bytes (octal)
-//!
 //! Followed by c_namesize bytes of filename (including NUL)
 //! Followed by c_filesize bytes of file data
+//!
+//! ## newc format (SVR4 new ASCII, magic "070701" or "070702")
+//! Header format (110 bytes):
+//! - c_magic:     6 bytes "070701" or "070702"
+//! - c_ino:       8 bytes (hex)
+//! - c_mode:      8 bytes (hex)
+//! - c_uid:       8 bytes (hex)
+//! - c_gid:       8 bytes (hex)
+//! - c_nlink:     8 bytes (hex)
+//! - c_mtime:     8 bytes (hex)
+//! - c_filesize:  8 bytes (hex)
+//! - c_devmajor:  8 bytes (hex)
+//! - c_devminor:  8 bytes (hex)
+//! - c_rdevmajor: 8 bytes (hex)
+//! - c_rdevminor: 8 bytes (hex)
+//! - c_namesize:  8 bytes (hex)
+//! - c_check:     8 bytes (hex) - always 0 for 070701, CRC for 070702
+//! Followed by filename padded to 4-byte boundary
+//! Followed by file data padded to 4-byte boundary
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{is_eof_error, PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-const HEADER_SIZE: usize = 76;
-const MAGIC: &[u8; 6] = b"070707";
+// ODC format constants
+const ODC_HEADER_SIZE: usize = 76;
+const ODC_MAGIC: &[u8; 6] = b"070707";
+
+// newc format constants
+const NEWC_HEADER_SIZE: usize = 110;
+const NEWC_MAGIC: &[u8; 6] = b"070701";
+const NEWC_CRC_MAGIC: &[u8; 6] = b"070702";
+
 const TRAILER: &str = "TRAILER!!!";
+
+/// cpio format variant
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CpioFormat {
+    /// POSIX octet-oriented (odc) format
+    Odc,
+    /// SVR4 new ASCII format (newc)
+    Newc,
+}
 
 // c_mode file type bits
 const C_ISREG: u32 = 0o100000;
@@ -52,6 +89,9 @@ pub struct CpioReader<R: Read> {
     current_size: u64,
     bytes_read: u64,
     finished: bool,
+    format: Option<CpioFormat>,
+    /// Padding bytes remaining after file data (newc format)
+    data_padding: u64,
 }
 
 impl<R: Read> CpioReader<R> {
@@ -62,6 +102,8 @@ impl<R: Read> CpioReader<R> {
             current_size: 0,
             bytes_read: 0,
             finished: false,
+            format: None,
+            data_padding: 0,
         }
     }
 
@@ -81,22 +123,41 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         // Skip any remaining data from previous entry
         self.skip_data()?;
 
-        // Read header
-        let mut header = [0u8; HEADER_SIZE];
-        if let Err(e) = self.read_exact(&mut header) {
+        // Read magic to determine format
+        let mut magic = [0u8; 6];
+        if let Err(e) = self.read_exact(&mut magic) {
             if is_eof_error(&e) {
                 return Ok(None);
             }
             return Err(e);
         }
 
-        // Verify magic
-        if &header[0..6] != MAGIC {
-            return Err(PaxError::InvalidFormat("bad cpio magic".to_string()));
-        }
+        // Detect format from magic
+        let format = if &magic == ODC_MAGIC {
+            CpioFormat::Odc
+        } else if &magic == NEWC_MAGIC || &magic == NEWC_CRC_MAGIC {
+            CpioFormat::Newc
+        } else {
+            return Err(PaxError::InvalidFormat(format!(
+                "bad cpio magic: {:?}",
+                String::from_utf8_lossy(&magic)
+            )));
+        };
+        self.format = Some(format);
 
-        // Parse header fields
-        let entry = parse_header(&header, &mut self.reader)?;
+        // Parse header based on format
+        let (entry, data_padding) = match format {
+            CpioFormat::Odc => {
+                let mut header = [0u8; ODC_HEADER_SIZE - 6];
+                self.read_exact(&mut header)?;
+                (parse_odc_header(&magic, &header, &mut self.reader)?, 0)
+            }
+            CpioFormat::Newc => {
+                let mut header = [0u8; NEWC_HEADER_SIZE - 6];
+                self.read_exact(&mut header)?;
+                parse_newc_header(&header, &mut self.reader)?
+            }
+        };
 
         // Check for trailer
         if entry.path.to_string_lossy() == TRAILER {
@@ -106,6 +167,7 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
 
         self.current_size = entry.size;
         self.bytes_read = 0;
+        self.data_padding = data_padding;
 
         Ok(Some(entry))
     }
@@ -124,12 +186,16 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
 
     fn skip_data(&mut self) -> PaxResult<()> {
         let remaining = self.current_size - self.bytes_read;
-        if remaining == 0 {
-            return Ok(());
+        if remaining > 0 {
+            skip_bytes(&mut self.reader, remaining)?;
+            self.bytes_read = self.current_size;
         }
 
-        skip_bytes(&mut self.reader, remaining)?;
-        self.bytes_read = self.current_size;
+        // Skip padding (newc format pads data to 4-byte boundary)
+        if self.data_padding > 0 {
+            skip_bytes(&mut self.reader, self.data_padding)?;
+            self.data_padding = 0;
+        }
         Ok(())
     }
 }
@@ -206,18 +272,34 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
 // Header parsing functions
 // ============================================================================
 
-/// Parse a cpio header
-fn parse_header<R: Read>(header: &[u8; HEADER_SIZE], reader: &mut R) -> PaxResult<ArchiveEntry> {
-    let dev = parse_octal_field(&header[6..12])?;
-    let ino = parse_octal_field(&header[12..18])?;
-    let mode = parse_octal_field(&header[18..24])? as u32;
-    let uid = parse_octal_field(&header[24..30])? as u32;
-    let gid = parse_octal_field(&header[30..36])? as u32;
-    let nlink = parse_octal_field(&header[36..42])? as u32;
-    let rdev = parse_octal_field(&header[42..48])?;
-    let mtime = parse_octal_field(&header[48..59])?;
-    let namesize = parse_octal_field(&header[59..65])? as usize;
-    let filesize = parse_octal_field(&header[65..76])?;
+/// Parse ODC format header (magic already read)
+/// header contains the 70 bytes after the 6-byte magic
+fn parse_odc_header<R: Read>(
+    _magic: &[u8; 6],
+    header: &[u8],
+    reader: &mut R,
+) -> PaxResult<ArchiveEntry> {
+    // ODC header layout (after 6-byte magic):
+    // c_dev:      6 bytes (octal)  [0..6]
+    // c_ino:      6 bytes (octal)  [6..12]
+    // c_mode:     6 bytes (octal)  [12..18]
+    // c_uid:      6 bytes (octal)  [18..24]
+    // c_gid:      6 bytes (octal)  [24..30]
+    // c_nlink:    6 bytes (octal)  [30..36]
+    // c_rdev:     6 bytes (octal)  [36..42]
+    // c_mtime:   11 bytes (octal)  [42..53]
+    // c_namesize: 6 bytes (octal)  [53..59]
+    // c_filesize:11 bytes (octal)  [59..70]
+    let dev = parse_octal_field(&header[0..6])?;
+    let ino = parse_octal_field(&header[6..12])?;
+    let mode = parse_octal_field(&header[12..18])? as u32;
+    let uid = parse_octal_field(&header[18..24])? as u32;
+    let gid = parse_octal_field(&header[24..30])? as u32;
+    let nlink = parse_octal_field(&header[30..36])? as u32;
+    let rdev = parse_octal_field(&header[36..42])?;
+    let mtime = parse_octal_field(&header[42..53])?;
+    let namesize = parse_octal_field(&header[53..59])? as usize;
+    let filesize = parse_octal_field(&header[59..70])?;
 
     // Read filename
     let mut name_buf = vec![0u8; namesize];
@@ -268,6 +350,102 @@ fn parse_header<R: Read>(header: &[u8; HEADER_SIZE], reader: &mut R) -> PaxResul
     })
 }
 
+/// Parse newc format header (magic already read)
+/// header contains the 104 bytes after the 6-byte magic
+/// Returns (entry, data_padding) where data_padding is bytes to skip after file data
+fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(ArchiveEntry, u64)> {
+    // newc header layout (after 6-byte magic):
+    // c_ino:       8 bytes (hex)  [0..8]
+    // c_mode:      8 bytes (hex)  [8..16]
+    // c_uid:       8 bytes (hex)  [16..24]
+    // c_gid:       8 bytes (hex)  [24..32]
+    // c_nlink:     8 bytes (hex)  [32..40]
+    // c_mtime:     8 bytes (hex)  [40..48]
+    // c_filesize:  8 bytes (hex)  [48..56]
+    // c_devmajor:  8 bytes (hex)  [56..64]
+    // c_devminor:  8 bytes (hex)  [64..72]
+    // c_rdevmajor: 8 bytes (hex)  [72..80]
+    // c_rdevminor: 8 bytes (hex)  [80..88]
+    // c_namesize:  8 bytes (hex)  [88..96]
+    // c_check:     8 bytes (hex)  [96..104]
+    let ino = parse_hex_field(&header[0..8])?;
+    let mode = parse_hex_field(&header[8..16])? as u32;
+    let uid = parse_hex_field(&header[16..24])? as u32;
+    let gid = parse_hex_field(&header[24..32])? as u32;
+    let nlink = parse_hex_field(&header[32..40])? as u32;
+    let mtime = parse_hex_field(&header[40..48])?;
+    let filesize = parse_hex_field(&header[48..56])?;
+    let devmajor = parse_hex_field(&header[56..64])? as u32;
+    let devminor = parse_hex_field(&header[64..72])? as u32;
+    let rdevmajor = parse_hex_field(&header[72..80])? as u32;
+    let rdevminor = parse_hex_field(&header[80..88])? as u32;
+    let namesize = parse_hex_field(&header[88..96])? as usize;
+    // c_check at [96..104] is ignored for reading
+
+    // Read filename
+    let mut name_buf = vec![0u8; namesize];
+    reader.read_exact(&mut name_buf)?;
+
+    // Calculate padding after filename (header + name must be 4-byte aligned)
+    // Header is 110 bytes, so (110 + namesize) must be aligned to 4
+    let header_plus_name = NEWC_HEADER_SIZE + namesize;
+    let name_padding = (4 - (header_plus_name % 4)) % 4;
+    if name_padding > 0 {
+        let mut pad = vec![0u8; name_padding];
+        reader.read_exact(&mut pad)?;
+    }
+
+    // Remove trailing NUL
+    let name = parse_name(&name_buf);
+    let path = PathBuf::from(name);
+
+    let entry_type = parse_mode_type(mode);
+
+    // For symlinks, the file data is the link target - read it now
+    let (link_target, size, data_padding) = if entry_type == EntryType::Symlink && filesize > 0 {
+        let mut target_buf = vec![0u8; filesize as usize];
+        reader.read_exact(&mut target_buf)?;
+        // Calculate padding after symlink data
+        let symlink_padding = (4 - (filesize as usize % 4)) % 4;
+        if symlink_padding > 0 {
+            let mut pad = vec![0u8; symlink_padding];
+            reader.read_exact(&mut pad)?;
+        }
+        (Some(PathBuf::from(parse_name(&target_buf))), 0, 0)
+    } else {
+        // Calculate padding after file data
+        let file_padding = if filesize > 0 {
+            ((4 - (filesize as usize % 4)) % 4) as u64
+        } else {
+            0
+        };
+        (None, filesize, file_padding)
+    };
+
+    // Construct dev from major/minor
+    let dev = ((devmajor as u64) << 8) | (devminor as u64);
+
+    Ok((
+        ArchiveEntry {
+            path,
+            mode: mode & C_PERM_MASK,
+            uid,
+            gid,
+            size,
+            mtime,
+            entry_type,
+            link_target,
+            dev,
+            ino,
+            nlink,
+            devmajor: rdevmajor,
+            devminor: rdevminor,
+            ..Default::default()
+        },
+        data_padding,
+    ))
+}
+
 /// Parse an octal field from bytes
 fn parse_octal_field(bytes: &[u8]) -> PaxResult<u64> {
     let s = std::str::from_utf8(bytes)
@@ -278,6 +456,13 @@ fn parse_octal_field(bytes: &[u8]) -> PaxResult<u64> {
         return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
     }
     u64::from_str_radix(s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
+}
+
+/// Parse a hexadecimal field from bytes (for newc format)
+fn parse_hex_field(bytes: &[u8]) -> PaxResult<u64> {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| PaxError::InvalidHeader("invalid hex field".to_string()))?;
+    u64::from_str_radix(s, 16).map_err(|_| PaxError::InvalidHeader(format!("invalid hex: {}", s)))
 }
 
 /// Parse filename, removing NUL terminator
@@ -305,12 +490,12 @@ fn parse_mode_type(mode: u32) -> EntryType {
 // Header building functions
 // ============================================================================
 
-/// Build a cpio header
+/// Build a cpio header (ODC format for writing)
 fn build_header(entry: &ArchiveEntry, ino: u64) -> PaxResult<Vec<u8>> {
-    let mut header = Vec::with_capacity(HEADER_SIZE);
+    let mut header = Vec::with_capacity(ODC_HEADER_SIZE);
 
     // c_magic
-    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(ODC_MAGIC);
 
     // c_dev
     write_octal_field(&mut header, entry.dev, 6);
@@ -408,6 +593,14 @@ mod tests {
         assert_eq!(parse_octal_field(b"000644").unwrap(), 0o644);
         assert_eq!(parse_octal_field(b"000755").unwrap(), 0o755);
         assert_eq!(parse_octal_field(b"000000").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_hex_field() {
+        assert_eq!(parse_hex_field(b"000001A4").unwrap(), 0x1A4); // 420 decimal = 0644 octal
+        assert_eq!(parse_hex_field(b"000001ED").unwrap(), 0x1ED); // 493 decimal = 0755 octal
+        assert_eq!(parse_hex_field(b"00000000").unwrap(), 0);
+        assert_eq!(parse_hex_field(b"FFFFFFFF").unwrap(), 0xFFFFFFFF);
     }
 
     #[test]

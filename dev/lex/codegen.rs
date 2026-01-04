@@ -158,7 +158,7 @@ pub fn generate<W: Write>(
     write_rule_metadata_tables(output, lexinfo, config)?;
     write_main_pattern_end_table(output, dfa, config)?;
     // Note: internal_defs are written inside yylex(), not here
-    write_helper_functions(output)?;
+    write_helper_functions(output, lexinfo)?;
     write_yylex_function(output, dfa, lexinfo, config, table_format)?;
     write_user_subroutines(output, lexinfo)?;
 
@@ -759,11 +759,12 @@ fn write_main_pattern_end_table<W: Write>(
     Ok(())
 }
 
-fn write_helper_functions<W: Write>(output: &mut W) -> io::Result<()> {
-    // input() and unput() functions
-    writeln!(
-        output,
-        r#"/* input - read one character from input */
+fn write_helper_functions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Result<()> {
+    // input() function - conditionally generated based on %option noinput
+    if !lexinfo.options.noinput {
+        writeln!(
+            output,
+            r#"/* input - read one character from input */
 static int input(void)
 {{
     int c;
@@ -780,8 +781,15 @@ static int input(void)
     c = getc(yyin);
     return c;  /* Returns EOF (-1) on end of file */
 }}
+"#
+        )?;
+    }
 
-/* unput - push character back to input */
+    // unput() function - conditionally generated based on %option nounput
+    if !lexinfo.options.nounput {
+        writeln!(
+            output,
+            r#"/* unput - push character back to input */
 static void unput(int c)
 {{
     if (yy_buffer_pos > 0) {{
@@ -795,7 +803,8 @@ static void unput(int c)
     }}
 }}
 "#
-    )?;
+        )?;
+    }
 
     Ok(())
 }
@@ -1496,6 +1505,7 @@ mod tests {
             user_subs: vec![],
             rules: vec![],
             table_sizes: HashMap::new(),
+            options: crate::lexfile::LexOptions::default(),
         }
     }
 

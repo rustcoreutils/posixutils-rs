@@ -93,7 +93,21 @@ fn detect_format(file: &mut File) -> PaxResult<ArchiveFormat> {
     }
 
     // Check for cpio magic at offset 0
-    if &header[0..6] == b"070707" {
+    // ASCII formats (6 bytes):
+    //   070707 = POSIX octet-oriented (odc)
+    //   070701 = SVR4 newc (no CRC)
+    //   070702 = SVR4 newc with CRC
+    // Binary format (2 bytes):
+    //   0x71C7 = old binary cpio (little-endian)
+    //   0xC771 = old binary cpio (big-endian)
+    let magic = &header[0..6];
+    if magic == b"070707" || magic == b"070701" || magic == b"070702" {
+        return Ok(ArchiveFormat::Cpio);
+    }
+    // Check for binary cpio magic
+    let magic16 = u16::from_le_bytes([header[0], header[1]]);
+    let magic16_be = u16::from_be_bytes([header[0], header[1]]);
+    if magic16 == 0o070707 || magic16_be == 0o070707 {
         return Ok(ArchiveFormat::Cpio);
     }
 

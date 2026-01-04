@@ -13,8 +13,9 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, Extr
 use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::pattern::{matches_any, Pattern};
+use crate::pattern::{find_matching_pattern, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use std::collections::HashSet;
 use std::fs::{self, File, Permissions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -45,6 +46,8 @@ pub struct ReadOptions {
     pub update: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
+    /// Select only first archive member matching each pattern (-n)
+    pub first_match: bool,
 }
 
 impl Default for ReadOptions {
@@ -61,6 +64,7 @@ impl Default for ReadOptions {
             interactive: false,
             update: false,
             substitutions: Vec::new(),
+            first_match: false,
         }
     }
 }
@@ -99,6 +103,9 @@ pub fn extract_archive_from_reader<R: ArchiveReader>(
 fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> PaxResult<()> {
     let mut extracted_links = ExtractedLinks::new();
 
+    // Track which patterns have been matched (for -n first_match option)
+    let mut matched_patterns: HashSet<usize> = HashSet::new();
+
     // Create interactive prompter if needed
     let mut prompter = if options.interactive {
         Some(InteractivePrompter::new()?)
@@ -107,7 +114,12 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
     };
 
     while let Some(mut entry) = archive.read_entry()? {
-        if should_extract(&entry, options) {
+        if let Some(should_output) = should_extract(&entry, options, &mut matched_patterns) {
+            if !should_output {
+                // Entry matched a pattern that's already been matched (first_match mode)
+                archive.skip_data()?;
+                continue;
+            }
             // Apply substitutions first (per POSIX: -s applies before -i)
             if !options.substitutions.is_empty() {
                 let path_str = entry.path.to_string_lossy();
@@ -151,19 +163,60 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
 }
 
 /// Check if entry should be extracted
-fn should_extract(entry: &ArchiveEntry, options: &ReadOptions) -> bool {
+/// Returns:
+/// - None: entry should not be extracted (doesn't match patterns or excluded)
+/// - Some(true): entry should be extracted
+/// - Some(false): entry matches but pattern already matched (first_match mode)
+fn should_extract(
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+    matched_patterns: &mut HashSet<usize>,
+) -> Option<bool> {
     let path = entry.path.to_string_lossy();
 
     // Try matching against both the full path and the path with "./" prefix stripped
     let path_stripped = path.strip_prefix("./").unwrap_or(&path);
 
-    let matches =
-        matches_any(&options.patterns, &path) || matches_any(&options.patterns, path_stripped);
+    if options.patterns.is_empty() {
+        // No patterns means match all
+        if options.exclude {
+            return None; // Exclude all
+        }
+        return Some(true); // Match all
+    }
 
-    if options.exclude {
-        !matches
-    } else {
-        matches
+    // Find which pattern matches (if any)
+    let matching_pattern = find_matching_pattern(&options.patterns, &path)
+        .or_else(|| find_matching_pattern(&options.patterns, path_stripped));
+
+    match matching_pattern {
+        Some(pattern_idx) => {
+            if options.exclude {
+                // Entry matched a pattern, so exclude it
+                None
+            } else {
+                // Entry matched a pattern
+                if options.first_match {
+                    // Check if this pattern was already matched
+                    if matched_patterns.contains(&pattern_idx) {
+                        Some(false) // Skip - pattern already matched
+                    } else {
+                        matched_patterns.insert(pattern_idx);
+                        Some(true) // Extract - first match for this pattern
+                    }
+                } else {
+                    Some(true) // Extract normally
+                }
+            }
+        }
+        None => {
+            // No pattern matched
+            if options.exclude {
+                Some(true) // Exclude mode: extract entries that don't match
+            } else {
+                None // Normal mode: skip entries that don't match
+            }
+        }
     }
 }
 
@@ -457,7 +510,16 @@ fn extract_fifo(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> Pax
     let result = unsafe { libc::mkfifo(path_cstr.as_ptr(), entry.mode as libc::mode_t) };
 
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let err = std::io::Error::last_os_error();
+        // EPERM usually means we're not root or filesystem doesn't support FIFOs
+        if err.raw_os_error() == Some(libc::EPERM) {
+            eprintln!(
+                "pax: cannot create FIFO {}: Operation not permitted",
+                path.display()
+            );
+            return Ok(());
+        }
+        return Err(err.into());
     }
 
     set_owner(path, entry, options)?;
@@ -647,8 +709,23 @@ fn set_times(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> PaxRes
             },
         ];
 
-        unsafe {
-            libc::utimes(path_cstr.as_ptr(), times.as_ptr());
+        let result = unsafe { libc::utimes(path_cstr.as_ptr(), times.as_ptr()) };
+
+        if result != 0 {
+            let err = std::io::Error::last_os_error();
+            // EPERM means we don't have permission - warn but continue
+            if err.raw_os_error() == Some(libc::EPERM) {
+                eprintln!(
+                    "pax: warning: cannot set times on {}: Operation not permitted",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "pax: warning: cannot set times on {}: {}",
+                    path.display(),
+                    err
+                );
+            }
         }
     }
 

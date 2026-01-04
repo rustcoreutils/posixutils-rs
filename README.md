@@ -65,6 +65,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] basename
  - [x] bc
  - [x] c99 (Development)
+ - [x] cal
  - [x] cflow (Development)
  - [x] cksum
  - [x] cmp
@@ -123,6 +124,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pr
  - [x] printf
  - [x] prs (SCCS)
+ - [x] ps
  - [x] readlink
  - [x] realpath
  - [x] rm
@@ -138,6 +140,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strip (Development)
  - [x] stty
  - [x] tabs
+ - [x] talk (with talkd local daemon)
  - [x] tail
  - [x] test
  - [x] time
@@ -145,6 +148,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tput
  - [x] tr
  - [x] true
+ - [x] tsort
+ - [x] tty
+ - [x] uname
  - [x] uncompress (compress cat.)
  - [x] uudecode (uue)
  - [x] uuencode (uue)
@@ -160,9 +166,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] wc
  - [x] what (SCCS)
  - [x] who
+ - [x] write
  - [x] dd
  - [x] xargs
  - [x] id
+ - [x] ipcs (IPC)
+ - [x] kill
+ - [x] lp
  - [x] xgettext (i18n)
  - [x] yacc (Development)
  - [x] zcat (compress cat.)
@@ -188,21 +198,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pwd
  - [x] renice
  - [x] sleep
- - [x] talk
  - [x] tee
  - [x] touch
- - [x] tty
- - [x] uname
- - [x] write
 
 ## Stage 1 - Rough draft
 
- - [x] cal
- - [x] ipcs (IPC)
- - [x] kill
- - [x] lp
- - [x] ps
- - [x] tsort
+(none)
 
 ## Stage 0 - Not started
 

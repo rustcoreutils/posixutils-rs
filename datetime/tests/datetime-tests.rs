@@ -7,4 +7,5 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod cal;
 mod time;

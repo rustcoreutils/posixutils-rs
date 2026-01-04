@@ -33,8 +33,11 @@ struct Args {
     osversion: bool,
 }
 
+/// Number of uname info fields: sysname, nodename, release, version, machine
+const UNAME_FIELD_COUNT: usize = 5;
+
 fn print_info(args: &Args, info: uname::Info) {
-    let mut outs = Vec::new();
+    let mut outs = Vec::with_capacity(UNAME_FIELD_COUNT);
 
     if args.system {
         outs.push(info.sysname);

@@ -11,7 +11,6 @@ rust-version.workspace = true
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-topological-sort = "0.2"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true

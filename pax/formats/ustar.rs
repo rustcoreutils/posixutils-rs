@@ -28,7 +28,7 @@
 //! - prefix:   155 bytes (offset 345)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{PaxError, PaxResult};
+use crate::error::{is_eof_error, PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -102,7 +102,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
 
         let mut header = [0u8; BLOCK_SIZE];
         if let Err(e) = self.read_exact(&mut header) {
-            if e.to_string().contains("unexpected end of file") {
+            if is_eof_error(&e) {
                 return Ok(None);
             }
             return Err(e);
@@ -157,6 +157,8 @@ pub struct UstarWriter<W: Write> {
     writer: W,
     bytes_written: u64,
     current_size: u64,
+    /// Skip data writes for symlinks/hardlinks (they have no data in ustar format)
+    skip_data: bool,
 }
 
 impl<W: Write> UstarWriter<W> {
@@ -166,6 +168,7 @@ impl<W: Write> UstarWriter<W> {
             writer,
             bytes_written: 0,
             current_size: 0,
+            skip_data: false,
         }
     }
 }
@@ -176,10 +179,16 @@ impl<W: Write> ArchiveWriter for UstarWriter<W> {
         self.writer.write_all(&header)?;
         self.bytes_written = 0;
         self.current_size = entry.size;
+        // Per POSIX, symlinks and hardlinks have no data blocks in ustar format
+        self.skip_data = matches!(entry.entry_type, EntryType::Symlink | EntryType::Hardlink);
         Ok(())
     }
 
     fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+        // Symlinks/hardlinks have no data blocks in ustar format
+        if self.skip_data {
+            return Ok(());
+        }
         self.writer.write_all(data)?;
         self.bytes_written += data.len() as u64;
         Ok(())
@@ -191,6 +200,7 @@ impl<W: Write> ArchiveWriter for UstarWriter<W> {
         if padding > 0 {
             self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
+        self.skip_data = false;
         Ok(())
     }
 
@@ -343,7 +353,12 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8);
     write_octal(&mut header[UID_OFF..], entry.uid as u64, 8);
     write_octal(&mut header[GID_OFF..], entry.gid as u64, 8);
-    write_octal(&mut header[SIZE_OFF..], entry.size, 12);
+    // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
+    let header_size = match entry.entry_type {
+        EntryType::Symlink | EntryType::Hardlink => 0,
+        _ => entry.size,
+    };
+    write_octal(&mut header[SIZE_OFF..], header_size, 12);
     write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
 
     // Typeflag

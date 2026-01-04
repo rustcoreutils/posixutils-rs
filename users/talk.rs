@@ -29,6 +29,8 @@ use std::{
         TcpStream, UdpSocket,
     },
     os::fd::AsRawFd,
+    os::unix::net::UnixDatagram,
+    path::{Path, PathBuf},
     process, ptr,
     sync::{Arc, LazyLock, Mutex},
     thread,
@@ -43,7 +45,14 @@ struct Args {
 
     #[arg(help = gettext("Terminal name to use (optional)"))]
     ttyname: Option<String>,
+
+    /// Use local talkd daemon via Unix socket instead of network
+    #[arg(long)]
+    local: bool,
 }
+
+/// Default path for local talkd Unix socket (proper system location)
+const DEFAULT_LOCAL_SOCKET: &str = "/var/run/talkd.sock";
 
 pub struct State {
     pub msg_bytes1: Vec<u8>,
@@ -138,9 +147,7 @@ impl TryFrom<u8> for Answer {
             6 => Ok(Answer::BadVersion),
             7 => Ok(Answer::BadAddr),
             8 => Ok(Answer::BadCtlAddr),
-            _ => Err(TalkError::Other(
-                "Not existingi Answer provided".to_string(),
-            )),
+            _ => Err(TalkError::Other("Not existing Answer provided".to_string())),
         }
     }
 }
@@ -426,6 +433,108 @@ fn talk(args: Args) -> Result<(), TalkError> {
             &mut logger,
             &mut output_buffer,
         )?;
+    }
+
+    Ok(())
+}
+
+/// Main entry point for local mode talk using Unix domain sockets.
+///
+/// This function handles talk sessions using a local talkd daemon
+/// via Unix domain sockets instead of the network UDP protocol.
+fn talk_local(args: Args) -> Result<(), TalkError> {
+    let mut msg = CtlMsg::default();
+    let mut res = CtlRes::default();
+    let mut output_buffer = String::new();
+
+    let socket_path = PathBuf::from(get_local_socket_path());
+
+    // Verify the daemon socket exists
+    if !socket_path.exists() {
+        eprintln!(
+            "Local talkd socket not found at {:?}. Is talkd running?",
+            socket_path
+        );
+        eprintln!("Hint: Start talkd with: talkd --socket {:?}", socket_path);
+        return Err(TalkError::Other("talkd not running".to_string()));
+    }
+
+    // Get local machine info for message setup
+    let my_name = get_current_user_name().map_err(TalkError::IoError)?;
+    let my_machine_name = get_local_machine_name().map_err(TalkError::IoError)?;
+
+    // Parse the address to get the target user
+    let (his_name, _his_machine_name) = parse_address(&args.address, &my_machine_name);
+
+    // Set up the control message
+    msg.vers = TALK_VERSION;
+    msg.addr.sa_family = AF_INET as SaFamily;
+    msg.ctl_addr.sa_family = AF_INET as SaFamily;
+    msg.l_name = string_to_c_string(&my_name);
+    msg.r_name = string_to_c_string(&his_name);
+    msg.r_tty = tty_to_c_string(args.ttyname.as_ref().unwrap_or(&"".to_string()));
+    msg.pid = unsafe { getpid() };
+
+    let (width, height) = get_terminal_size();
+
+    let mut logger = StateLogger::new("No connection yet.");
+
+    check_if_tty()?;
+
+    // For local mode, we still need a TCP listener for peer-to-peer connection
+    let my_machine_addr = Ipv4Addr::LOCALHOST;
+    let (socket_addr, listener) = open_socket(my_machine_addr).map_err(TalkError::IoError)?;
+
+    // Set up the TCP address in the message
+    let tcp_data = Osockaddr::from(&socket_addr).sa_data;
+    msg.addr.sa_data = tcp_data;
+
+    // Also set ctl_addr (for local mode, use loopback)
+    let ctl_socket = UdpSocket::bind((my_machine_addr, 0)).map_err(TalkError::IoError)?;
+    let ctl_addr = ctl_socket.local_addr().map_err(TalkError::IoError)?;
+    let ctl_addr_data = msg.create_ctl_addr(ctl_addr);
+    msg.ctl_addr.sa_data = ctl_addr_data;
+
+    logger.set_state("[Checking for invitation on local daemon]");
+
+    // Look for an existing invitation
+    look_for_invite_local(&socket_path, &mut msg, &mut res)?;
+
+    if res.answer == Answer::Success {
+        // Found an existing invitation - connect to it
+        handle_existing_invitation(width, height, &mut output_buffer, &mut res)?;
+    } else {
+        // No invitation found - create one and wait
+        logger.set_state("[Waiting for your party to respond]");
+
+        // Send announce message
+        announce_local(&socket_path, &mut msg, &mut res)?;
+        let remote_id = res.id_num;
+
+        // Leave an invitation for the other party
+        leave_invite_local(&socket_path, &mut msg, &mut res)?;
+        let local_id = res.id_num;
+
+        logger.set_state("[Ringing your party]");
+
+        // Wait for incoming connection
+        for stream in listener.incoming() {
+            match stream {
+                Ok(client_stream) => {
+                    // Clean up invitations
+                    msg.id_num = local_id;
+                    let _ = send_delete_local(&socket_path, &mut msg, &mut res);
+                    msg.id_num = remote_id;
+                    let _ = send_delete_local(&socket_path, &mut msg, &mut res);
+
+                    if let Err(e) = handle_client(client_stream, &mut output_buffer) {
+                        eprintln!("Failed to handle client: {}", e);
+                    }
+                    break;
+                }
+                Err(e) => eprintln!("Failed to accept connection: {}", e),
+            }
+        }
     }
 
     Ok(())
@@ -924,7 +1033,7 @@ fn handle_new_invitation(
     logger: &mut StateLogger,
     output_buffer: &mut String,
 ) -> Result<(), TalkError> {
-    let (socket_addr, listener) = open_sockt(my_machine_addr).map_err(TalkError::IoError)?;
+    let (socket_addr, listener) = open_socket(my_machine_addr).map_err(TalkError::IoError)?;
 
     logger.set_state("[Service connection established.]");
 
@@ -1348,7 +1457,7 @@ fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'stati
 ///
 /// Returns a tuple containing the `SocketAddr` and the `TcpListener` on success.
 /// Returns an `io::Error` if there is an error in binding the socket.
-fn open_sockt(my_machine_addr: Ipv4Addr) -> Result<(SocketAddr, TcpListener), io::Error> {
+fn open_socket(my_machine_addr: Ipv4Addr) -> Result<(SocketAddr, TcpListener), io::Error> {
     let listener = TcpListener::bind((my_machine_addr, 0))?;
     let addr = listener.local_addr()?;
 
@@ -1506,6 +1615,42 @@ fn send_delete(
     )
 }
 
+// ============================================================================
+// Local Mode Helper Functions (Unix domain socket)
+// ============================================================================
+
+/// Sends a LookUp message to the local talkd daemon via Unix socket.
+fn look_for_invite_local(
+    socket_path: &Path,
+    msg: &mut CtlMsg,
+    res: &mut CtlRes,
+) -> Result<(), TalkError> {
+    request_local(socket_path, msg, MessageType::LookUp, res)
+}
+
+/// Sends a LeaveInvite message to the local talkd daemon via Unix socket.
+fn leave_invite_local(
+    socket_path: &Path,
+    msg: &mut CtlMsg,
+    res: &mut CtlRes,
+) -> Result<(), TalkError> {
+    request_local(socket_path, msg, MessageType::LeaveInvite, res)
+}
+
+/// Sends an Announce message to the local talkd daemon via Unix socket.
+fn announce_local(socket_path: &Path, msg: &mut CtlMsg, res: &mut CtlRes) -> Result<(), TalkError> {
+    request_local(socket_path, msg, MessageType::Announce, res)
+}
+
+/// Sends a Delete message to the local talkd daemon via Unix socket.
+fn send_delete_local(
+    socket_path: &Path,
+    msg: &mut CtlMsg,
+    res: &mut CtlRes,
+) -> Result<(), TalkError> {
+    request_local(socket_path, msg, MessageType::Delete, res)
+}
+
 /// Sends a control message (`CtlMsg`) to the talk daemon over a UDP socket and waits for a response.
 ///
 /// This function retries sending the message if it encounters a `WouldBlock` error and will continue
@@ -1585,6 +1730,82 @@ fn request(
         }
     }
     Ok(())
+}
+
+/// Sends a control message to the local talkd daemon via Unix domain socket.
+///
+/// # Arguments
+///
+/// * `socket_path` - Path to the Unix socket
+/// * `msg` - The control message to send
+/// * `msg_type` - The type of message to send
+/// * `res` - Mutable reference to store the response
+///
+/// # Returns
+///
+/// A `Result` indicating success or a `TalkError`.
+fn request_local(
+    socket_path: &Path,
+    msg: &mut CtlMsg,
+    msg_type: MessageType,
+    res: &mut CtlRes,
+) -> Result<(), TalkError> {
+    let socket = UnixDatagram::unbound().map_err(TalkError::IoError)?;
+
+    msg.r#type = msg_type as u8;
+    let msg_bytes = msg
+        .to_bytes()
+        .map_err(|e| TalkError::Other(e.to_string()))?;
+
+    let start_time = Instant::now();
+    let timeout = Duration::from_secs(5);
+
+    // Set socket timeout
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(TalkError::IoError)?;
+
+    loop {
+        match socket.send_to(&msg_bytes, socket_path) {
+            Ok(_) => {
+                let mut buf = [0; 1024];
+                match socket.recv(&mut buf) {
+                    Ok(amt) => {
+                        let ctl_res = CtlRes::from_bytes(&buf[..amt])
+                            .map_err(|e| TalkError::Other(e.to_string()))?;
+                        *res = ctl_res;
+                        return Ok(());
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if start_time.elapsed() >= timeout {
+                            eprintln!("Local talkd daemon not responding. Is it running?");
+                            process::exit(128);
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(TalkError::IoError(e));
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                eprintln!(
+                    "Cannot connect to local talkd. Is it running at {:?}?",
+                    socket_path
+                );
+                process::exit(128);
+            }
+            Err(e) => {
+                return Err(TalkError::IoError(e));
+            }
+        }
+    }
+}
+
+/// Gets the local talkd socket path from environment or uses default.
+fn get_local_socket_path() -> String {
+    std::env::var("TALKD_SOCKET").unwrap_or_else(|_| DEFAULT_LOCAL_SOCKET.to_string())
 }
 
 /// Registers signal handlers for specific signals (SIGINT, SIGQUIT, SIGPIPE).
@@ -1738,7 +1959,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     register_signals();
 
-    if let Err(err) = talk(args) {
+    let result = if args.local {
+        talk_local(args)
+    } else {
+        talk(args)
+    };
+
+    if let Err(err) = result {
         exit_code = 1;
         eprint!("{}", err);
     }

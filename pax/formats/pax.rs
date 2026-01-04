@@ -24,7 +24,7 @@
 //! - Data format: "%d %s=%s\n" (length, keyword, value)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{PaxError, PaxResult};
+use crate::error::{is_eof_error, PaxError, PaxResult};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -482,7 +482,7 @@ impl<R: Read> PaxReader<R> {
     fn read_header_block(&mut self) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
         let mut header = [0u8; BLOCK_SIZE];
         if let Err(e) = self.read_exact(&mut header) {
-            if e.to_string().contains("unexpected end of file") {
+            if is_eof_error(&e) {
                 return Ok(None);
             }
             return Err(e);
@@ -597,6 +597,8 @@ pub struct PaxWriter<W: Write> {
     sequence: u64,          // For generating unique names for extended header files
     options: FormatOptions, // Format-specific options
     global_header_written: bool, // Track if global header has been written
+    /// Skip data writes for symlinks/hardlinks (they have no data in pax/ustar format)
+    skip_data: bool,
 }
 
 impl<W: Write> PaxWriter<W> {
@@ -614,6 +616,7 @@ impl<W: Write> PaxWriter<W> {
             sequence: 0,
             options,
             global_header_written: false,
+            skip_data: false,
         }
     }
 
@@ -787,10 +790,16 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         self.writer.write_all(&header)?;
         self.bytes_written = 0;
         self.current_size = entry.size;
+        // Per POSIX, symlinks and hardlinks have no data blocks in pax/ustar format
+        self.skip_data = matches!(entry.entry_type, EntryType::Symlink | EntryType::Hardlink);
         Ok(())
     }
 
     fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+        // Symlinks/hardlinks have no data blocks in pax/ustar format
+        if self.skip_data {
+            return Ok(());
+        }
         self.writer.write_all(data)?;
         self.bytes_written += data.len() as u64;
         Ok(())
@@ -802,6 +811,7 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         if padding > 0 {
             self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
+        self.skip_data = false;
         Ok(())
     }
 
@@ -958,11 +968,12 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
         std::cmp::min(entry.gid as u64, 0o7777777),
         8,
     );
-    write_octal(
-        &mut header[SIZE_OFF..],
-        std::cmp::min(entry.size, 0o77777777777),
-        12,
-    );
+    // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
+    let header_size = match entry.entry_type {
+        EntryType::Symlink | EntryType::Hardlink => 0,
+        _ => std::cmp::min(entry.size, 0o77777777777),
+    };
+    write_octal(&mut header[SIZE_OFF..], header_size, 12);
     write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
 
     // Typeflag

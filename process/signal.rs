@@ -10,13 +10,22 @@
 // `kill` and `timeout` bins
 
 pub fn list_signals() {
-    let mut output = String::new();
-    for (name, _) in SIGLIST.iter() {
-        output.push_str(name);
-        output.push(' ');
-    }
+    let names: Vec<&str> = SIGLIST.iter().map(|(name, _)| *name).collect();
+    println!("{}", names.join(" "));
+}
 
-    println!("{}", output);
+/// Returns the signal name for a given signal number.
+/// For exit_status values > 128, subtracts 128 first (shell convention).
+pub fn signum_to_name(signum: i32) -> Option<&'static str> {
+    // Handle shell exit status convention: 128 + signal_number
+    let actual_signum = if signum > 128 { signum - 128 } else { signum };
+
+    for (name, num) in SIGLIST.iter() {
+        if *num == actual_signum {
+            return Some(*name);
+        }
+    }
+    None
 }
 
 /// Parses [str] into [Signal].
@@ -48,7 +57,9 @@ pub fn lookup_signum(signame: &str) -> Result<i32, &'static str> {
     if signame == "0" {
         Ok(0)
     } else {
-        match siglist_get(signame.to_uppercase().as_str()) {
+        let normalized = signame.trim().to_uppercase();
+        let normalized = normalized.strip_prefix("SIG").unwrap_or(&normalized);
+        match siglist_get(normalized) {
             Some(sig_no) => Ok(sig_no),
             None => Err("Unknown signal name"),
         }

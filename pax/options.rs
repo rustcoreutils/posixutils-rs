@@ -160,10 +160,18 @@ impl FormatOptions {
             }
             "delete" => {
                 if let Some(pattern) = value {
-                    self.delete_patterns.push(pattern.to_string());
                     // Pre-compile pattern for efficient matching
-                    if let Ok(compiled) = Pattern::new(pattern) {
-                        self.delete_patterns_compiled.push(compiled);
+                    match Pattern::new(pattern) {
+                        Ok(compiled) => {
+                            self.delete_patterns.push(pattern.to_string());
+                            self.delete_patterns_compiled.push(compiled);
+                        }
+                        Err(e) => {
+                            return Err(PaxError::PatternError(format!(
+                                "invalid delete pattern '{}': {}",
+                                pattern, e
+                            )));
+                        }
                     }
                 }
             }

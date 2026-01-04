@@ -394,7 +394,8 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
         }
     }
     ranges.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut filtered_ranges = Vec::new();
+    // Upper bound: all ranges could be non-overlapping
+    let mut filtered_ranges = Vec::with_capacity(ranges.len());
 
     // Filter the ranges, leaving only those that are not fully included in the others
     for &current in &ranges {
@@ -406,7 +407,8 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
         }
     }
 
-    let mut merged_ranges = Vec::new();
+    // Upper bound: all filtered ranges could be non-overlapping
+    let mut merged_ranges = Vec::with_capacity(filtered_ranges.len());
     let mut current_range = filtered_ranges[0];
 
     for &next_range in &filtered_ranges[1..] {

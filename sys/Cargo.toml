@@ -16,6 +16,12 @@ uname = "0.1"
 libc.workspace = true
 chrono.workspace = true
 
+[dev-dependencies]
+libc = { workspace = true }
+
+[features]
+posixutils_test_all = []
+
 [lints]
 workspace = true
 

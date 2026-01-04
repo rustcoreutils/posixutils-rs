@@ -13,8 +13,9 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::options::{format_list_entry, FormatOptions};
-use crate::pattern::{matches_any, Pattern};
+use crate::pattern::{find_matching_pattern, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -31,6 +32,8 @@ pub struct ListOptions {
     pub format_options: FormatOptions,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
+    /// Select only first archive member matching each pattern (-n)
+    pub first_match: bool,
 }
 
 /// List archive contents
@@ -71,8 +74,16 @@ fn list_entries<R: ArchiveReader, W: Write>(
     writer: &mut W,
     options: &ListOptions,
 ) -> PaxResult<()> {
+    // Track which patterns have been matched (for -n first_match option)
+    let mut matched_patterns: HashSet<usize> = HashSet::new();
+
     while let Some(mut entry) = archive.read_entry()? {
-        if should_list(&entry, options) {
+        if let Some(should_output) = should_list(&entry, options, &mut matched_patterns) {
+            if !should_output {
+                // Entry matched a pattern that's already been matched (first_match mode)
+                archive.skip_data()?;
+                continue;
+            }
             // Apply substitutions
             if !options.substitutions.is_empty() {
                 let path_str = entry.path.to_string_lossy();
@@ -98,14 +109,60 @@ fn list_entries<R: ArchiveReader, W: Write>(
 }
 
 /// Check if entry should be listed
-fn should_list(entry: &ArchiveEntry, options: &ListOptions) -> bool {
+/// Returns:
+/// - None: entry should not be listed (doesn't match patterns or excluded)
+/// - Some(true): entry should be listed
+/// - Some(false): entry matches but pattern already matched (first_match mode)
+fn should_list(
+    entry: &ArchiveEntry,
+    options: &ListOptions,
+    matched_patterns: &mut HashSet<usize>,
+) -> Option<bool> {
     let path = entry.path.to_string_lossy();
-    let matches = matches_any(&options.patterns, &path);
 
-    if options.exclude {
-        !matches
-    } else {
-        matches
+    // Try matching against both the full path and the path with "./" prefix stripped
+    let path_stripped = path.strip_prefix("./").unwrap_or(&path);
+
+    if options.patterns.is_empty() {
+        // No patterns means match all
+        if options.exclude {
+            return None; // Exclude all
+        }
+        return Some(true); // Match all
+    }
+
+    // Find which pattern matches (if any)
+    let matching_pattern = find_matching_pattern(&options.patterns, &path)
+        .or_else(|| find_matching_pattern(&options.patterns, path_stripped));
+
+    match matching_pattern {
+        Some(pattern_idx) => {
+            if options.exclude {
+                // Entry matched a pattern, so exclude it
+                None
+            } else {
+                // Entry matched a pattern
+                if options.first_match {
+                    // Check if this pattern was already matched
+                    if matched_patterns.contains(&pattern_idx) {
+                        Some(false) // Skip - pattern already matched
+                    } else {
+                        matched_patterns.insert(pattern_idx);
+                        Some(true) // Output - first match for this pattern
+                    }
+                } else {
+                    Some(true) // Output normally
+                }
+            }
+        }
+        None => {
+            // No pattern matched
+            if options.exclude {
+                Some(true) // Exclude mode: output entries that don't match
+            } else {
+                None // Normal mode: skip entries that don't match
+            }
+        }
     }
 }
 

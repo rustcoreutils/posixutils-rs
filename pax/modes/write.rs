@@ -662,7 +662,14 @@ fn reset_atime(path: &Path, atime_sec: i64, atime_nsec: i64) {
         },
     ];
 
-    unsafe {
-        libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0);
+    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
+
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!(
+            "pax: warning: cannot reset atime on {}: {}",
+            path.display(),
+            err
+        );
     }
 }

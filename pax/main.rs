@@ -9,6 +9,7 @@
 
 mod archive;
 mod blocked_io;
+mod compression;
 mod error;
 mod formats;
 mod interactive;
@@ -21,6 +22,7 @@ mod subst;
 use archive::{ArchiveFormat, ArchiveWriter};
 use blocked_io::{parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE};
 use clap::{Parser, ValueEnum};
+use compression::{is_gzip, GzipReader, GzipWriter};
 use error::{PaxError, PaxResult};
 use gettextrs::gettext;
 use modes::copy::CopyOptions;
@@ -97,6 +99,9 @@ struct Args {
     #[arg(short = 'n', long, help = gettext("Select only the first archive member that matches each pattern operand"))]
     first_match: bool,
 
+    #[arg(short = 'z', long = "gzip", help = gettext("Compress/decompress archive using gzip"))]
+    gzip: bool,
+
     #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, help = gettext("Format-specific options"))]
     format_options: Vec<String>,
 
@@ -157,6 +162,13 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> PaxResult<()> {
+    // Validate mutually exclusive options
+    if args.gzip && args.append {
+        return Err(PaxError::InvalidFormat(
+            "gzip compression (-z) is incompatible with append mode (-a)".to_string(),
+        ));
+    }
+
     let mode = determine_mode(&args);
 
     match mode {
@@ -212,6 +224,7 @@ fn run_list(args: &Args) -> PaxResult<()> {
         exclude: args.exclude,
         format_options,
         substitutions,
+        first_match: args.first_match,
     };
 
     // Check for multi-volume mode
@@ -262,6 +275,7 @@ fn run_read(args: &Args) -> PaxResult<()> {
         interactive: args.interactive,
         update: args.update,
         substitutions,
+        first_match: args.first_match,
     };
 
     // Check for multi-volume mode
@@ -325,12 +339,24 @@ fn run_write(args: &Args) -> PaxResult<()> {
 
     if let Some(ref path) = args.archive {
         let file = File::create(path)?;
-        let blocked_writer = BlockedWriter::new(file, record_size);
-        modes::create_archive(blocked_writer, &files, format, &options)
+        if args.gzip {
+            let gzip_writer = GzipWriter::new(file)?;
+            let blocked_writer = BlockedWriter::new(gzip_writer, record_size);
+            modes::create_archive(blocked_writer, &files, format, &options)
+        } else {
+            let blocked_writer = BlockedWriter::new(file, record_size);
+            modes::create_archive(blocked_writer, &files, format, &options)
+        }
     } else {
         let stdout = io::stdout().lock();
-        let blocked_writer = BlockedWriter::new(stdout, record_size);
-        modes::create_archive(blocked_writer, &files, format, &options)
+        if args.gzip {
+            let gzip_writer = GzipWriter::new(stdout)?;
+            let blocked_writer = BlockedWriter::new(gzip_writer, record_size);
+            modes::create_archive(blocked_writer, &files, format, &options)
+        } else {
+            let blocked_writer = BlockedWriter::new(stdout, record_size);
+            modes::create_archive(blocked_writer, &files, format, &options)
+        }
     }
 }
 
@@ -465,17 +491,28 @@ fn open_archive_for_read(args: &Args) -> PaxResult<(Box<dyn Read>, ArchiveFormat
         .unwrap_or(DEFAULT_RECORD_SIZE);
 
     // Create the underlying reader
-    let reader: Box<dyn Read> = if let Some(ref path) = args.archive {
+    let raw_reader: Box<dyn Read> = if let Some(ref path) = args.archive {
         Box::new(File::open(path)?)
     } else {
         Box::new(io::stdin())
     };
 
+    // First, peek to detect if this is a gzip archive
+    let mut peek_reader = PeekReader::new(raw_reader, 512);
+    let peek_buf = peek_reader.peek()?;
+    let is_gzip_archive = is_gzip(peek_buf);
+
+    // If gzip detected or -z flag set, wrap in gzip decompressor
+    let reader: Box<dyn Read> = if is_gzip_archive || args.gzip {
+        Box::new(GzipReader::new(peek_reader)?)
+    } else {
+        Box::new(peek_reader)
+    };
+
     // Wrap in blocked reader for proper tape drive support
     let blocked_reader = BlockedReader::new(reader, record_size);
 
-    // For format detection, we need to peek at the beginning
-    // We'll use a wrapper that buffers the detection bytes
+    // For format detection, we need to peek at the (decompressed) archive
     let mut buf_reader = PeekReader::new(Box::new(blocked_reader), 512);
     let peek_buf = buf_reader.peek()?;
 
@@ -499,8 +536,29 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
     }
 
     // Check for cpio magic at offset 0
-    if buf.len() >= 6 && &buf[0..6] == b"070707" {
-        return Ok(ArchiveFormat::Cpio);
+    // ASCII formats (6 bytes):
+    //   070707 = POSIX octet-oriented (odc)
+    //   070701 = SVR4 newc (no CRC)
+    //   070702 = SVR4 newc with CRC
+    // Binary format (2 bytes):
+    //   0x71C7 = old binary cpio (little-endian)
+    //   0xC771 = old binary cpio (big-endian)
+    if buf.len() >= 6 {
+        let magic = &buf[0..6];
+        if magic == b"070707" || magic == b"070701" || magic == b"070702" {
+            return Ok(ArchiveFormat::Cpio);
+        }
+    }
+    if buf.len() >= 2 {
+        // Binary cpio magic: octal 070707 = 0x71C7 (little-endian) or 0xC771 (big-endian)
+        let magic16 = u16::from_le_bytes([buf[0], buf[1]]);
+        if magic16 == 0o070707 {
+            return Ok(ArchiveFormat::Cpio);
+        }
+        let magic16_be = u16::from_be_bytes([buf[0], buf[1]]);
+        if magic16_be == 0o070707 {
+            return Ok(ArchiveFormat::Cpio);
+        }
     }
 
     // Check for old-style tar by validating checksum

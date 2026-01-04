@@ -93,7 +93,7 @@ fn process_files2(
                 matched_keys.insert(key2.clone(), true);
 
                 if let Some(order) = &o {
-                    let mut res: Vec<String> = Vec::new();
+                    let mut res: Vec<String> = Vec::with_capacity(order.len());
                     for num in order {
                         let f_num: Vec<&str> = num.split('.').collect();
                         assert_eq!(f_num.len(), 2);

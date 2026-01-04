@@ -289,13 +289,6 @@ static int yy_saved_buffer_pos = 0; /* Buffer pos before action */
 static int yy_more_flag = 0;
 static int yy_more_len = 0;
 
-/* Variable-length trailing context support */
-static int yy_main_end_pos = 0; /* Position where main pattern ended */
-static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */
-
-/* EOF rule support */
-static int yy_eof_pending = 0; /* Flag to track if EOF rule should be executed */
-
 #ifndef yymore
 #define yymore() (yy_more_flag = 1)
 #endif
@@ -314,6 +307,24 @@ static char yy_unput_buf[YY_BUF_SIZE];
 static int yy_unput_pos = 0;
 "#
     )?;
+
+    // Variable-length trailing context support - only emit if any rule uses it
+    let has_var_tc = config
+        .rule_metadata
+        .iter()
+        .any(|m| m.has_variable_trailing_context);
+    if has_var_tc {
+        writeln!(output, "/* Variable-length trailing context support */")?;
+        writeln!(
+            output,
+            "static int yy_main_end_pos = 0; /* Position where main pattern ended */"
+        )?;
+        writeln!(
+            output,
+            "static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */"
+        )?;
+        writeln!(output)?;
+    }
 
     Ok(())
 }
@@ -809,9 +820,6 @@ fn write_yylex_function<W: Write>(
     writeln!(output, "    int yy_last_accepting_state;")?;
     writeln!(output, "    int yy_last_accepting_cpos;")?;
     writeln!(output, "    int yy_i;")?;
-    if has_start_conditions {
-        writeln!(output, "    int yy_rule_valid;")?;
-    }
     writeln!(output)?;
 
     // Initialize yyin/yyout if needed
@@ -1343,30 +1351,34 @@ fn write_yylex_function<W: Write>(
         )?;
         writeln!(output, "                yyleng = yy_main_len;")?;
         writeln!(output, "                yytext[yyleng] = '\\0';")?;
-        writeln!(output, "            }} else if (yy_main_len == -2) {{")?;
-        writeln!(
-            output,
-            "                /* Variable-length main pattern with trailing context */"
-        )?;
-        writeln!(
-            output,
-            "                /* Use tracked main pattern end position */"
-        )?;
-        writeln!(
-            output,
-            "                if (yy_main_end_rule == yy_act && yy_main_end_pos > yy_buffer_pos) {{"
-        )?;
-        writeln!(
-            output,
-            "                    int yy_actual_main_len = yy_main_end_pos - yy_buffer_pos;"
-        )?;
-        writeln!(
-            output,
-            "                    yy_tc_adjustment = yyleng - yy_actual_main_len;"
-        )?;
-        writeln!(output, "                    yyleng = yy_actual_main_len;")?;
-        writeln!(output, "                    yytext[yyleng] = '\\0';")?;
-        writeln!(output, "                }}")?;
+        // Only emit the variable-length trailing context handling if any rule uses it
+        // The yy_main_end_rule and yy_main_end_pos variables are only declared when has_var_tc is true
+        if has_var_tc {
+            writeln!(output, "            }} else if (yy_main_len == -2) {{")?;
+            writeln!(
+                output,
+                "                /* Variable-length main pattern with trailing context */"
+            )?;
+            writeln!(
+                output,
+                "                /* Use tracked main pattern end position */"
+            )?;
+            writeln!(
+                output,
+                "                if (yy_main_end_rule == yy_act && yy_main_end_pos > yy_buffer_pos) {{"
+            )?;
+            writeln!(
+                output,
+                "                    int yy_actual_main_len = yy_main_end_pos - yy_buffer_pos;"
+            )?;
+            writeln!(
+                output,
+                "                    yy_tc_adjustment = yyleng - yy_actual_main_len;"
+            )?;
+            writeln!(output, "                    yyleng = yy_actual_main_len;")?;
+            writeln!(output, "                    yytext[yyleng] = '\\0';")?;
+            writeln!(output, "                }}")?;
+        }
         writeln!(output, "            }}")?;
         writeln!(output, "        }}")?;
         writeln!(output)?;
@@ -1397,7 +1409,10 @@ fn write_yylex_function<W: Write>(
     writeln!(output)?;
 
     // Execute action based on rule
-    writeln!(output, "    yy_do_action:")?;
+    // Only emit label if we have an EOF rule that jumps here
+    if eof_rule_idx.is_some() {
+        writeln!(output, "    yy_do_action:")?;
+    }
     writeln!(output, "        /* Execute rule action */")?;
     writeln!(output, "        switch (yy_act) {{")?;
 

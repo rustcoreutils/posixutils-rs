@@ -36,8 +36,11 @@ fn lock_pty_tests() -> std::sync::MutexGuard<'static, ()> {
 // PTY Helper Functions
 // ============================================================================
 
-/// Create a PTY pair, returns (master_fd, slave_path)
-fn create_pty() -> Result<(i32, String), String> {
+/// Create a PTY pair, returns (master_fd, slave_fd, slave_path)
+/// The slave_fd is kept open to ensure the PTY connection is established.
+/// On some systems (especially macOS CI), the slave must be opened for
+/// data written to it to be readable from the master.
+fn create_pty() -> Result<(i32, i32, String), String> {
     unsafe {
         let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
         if master_fd < 0 {
@@ -74,7 +77,20 @@ fn create_pty() -> Result<(i32, String), String> {
 
         let slave_path = CStr::from_ptr(slave_name).to_string_lossy().into_owned();
 
-        Ok((master_fd, slave_path))
+        // Open the slave to establish the PTY connection.
+        // This is required on some systems (especially macOS) for data
+        // written to the slave to be readable from the master.
+        let slave_cstr = CString::new(slave_path.clone()).unwrap();
+        let slave_fd = libc::open(slave_cstr.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        if slave_fd < 0 {
+            libc::close(master_fd);
+            return Err(format!(
+                "open slave failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok((master_fd, slave_fd, slave_path))
     }
 }
 
@@ -136,10 +152,11 @@ fn run_write_test(
     target_terminal: Option<&str>,
 ) -> Result<WriteTestResult, String> {
     // Create PTY pair if we need to capture output
-    let (master_fd, slave_path) = if target_terminal.is_none() {
+    // slave_fd is kept open to establish the PTY connection (required on macOS CI)
+    let (master_fd, slave_fd, slave_path) = if target_terminal.is_none() {
         create_pty()?
     } else {
-        (-1, String::new())
+        (-1, -1, String::new())
     };
 
     // Set master to non-blocking if we have one
@@ -154,6 +171,9 @@ fn run_write_test(
             if master_fd >= 0 {
                 libc::close(master_fd);
             }
+            if slave_fd >= 0 {
+                libc::close(slave_fd);
+            }
             return Err("pipe failed".into());
         }
     }
@@ -164,6 +184,9 @@ fn run_write_test(
         unsafe {
             if master_fd >= 0 {
                 libc::close(master_fd);
+            }
+            if slave_fd >= 0 {
+                libc::close(slave_fd);
             }
             libc::close(stdin_pipe[0]);
             libc::close(stdin_pipe[1]);
@@ -176,6 +199,10 @@ fn run_write_test(
         unsafe {
             if master_fd >= 0 {
                 libc::close(master_fd);
+            }
+            // Close slave_fd in child - the write utility will open it fresh
+            if slave_fd >= 0 {
+                libc::close(slave_fd);
             }
             libc::close(stdin_pipe[1]);
 
@@ -344,10 +371,15 @@ fn run_write_test(
         exit_code = -1;
     }
 
-    // Close master
+    // Close master and slave
     if master_fd >= 0 {
         unsafe {
             libc::close(master_fd);
+        }
+    }
+    if slave_fd >= 0 {
+        unsafe {
+            libc::close(slave_fd);
         }
     }
 

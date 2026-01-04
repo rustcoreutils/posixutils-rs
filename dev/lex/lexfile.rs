@@ -566,26 +566,44 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
             continue;
         }
 
-        if in_quotes && ch == '"' {
-            in_quotes = false;
-        } else if in_quotes {
-            // Inside quoted strings, escape regex metacharacters that need escaping
-            // Note: ] doesn't need escaping as it's only special inside brackets
-            match ch {
-                '*' => re.push_str(r"\x2a"),
-                '+' => re.push_str(r"\x2b"),
-                '.' => re.push_str(r"\x2e"),
-                '{' => re.push_str(r"\x7b"),
-                '}' => re.push_str(r"\x7d"),
-                '(' => re.push_str(r"\x28"),
-                ')' => re.push_str(r"\x29"),
-                '[' => re.push_str(r"\x5b"),
-                '?' => re.push_str(r"\x3f"),
-                '|' => re.push_str(r"\x7c"),
-                '^' => re.push_str(r"\x5e"),
-                '$' => re.push_str(r"\x24"),
-                '\\' => re.push_str(r"\x5c"),
-                _ => re.push(ch),
+        if in_quotes {
+            // Handle escape sequences inside quoted strings
+            // \" means literal quote, \\ means literal backslash
+            if ch == '\\' && i + 1 < chars.len() {
+                let next_ch = chars[i + 1];
+                if next_ch == '"' || next_ch == '\\' {
+                    // Escaped quote or backslash - output the literal character
+                    if next_ch == '"' {
+                        re.push('"');
+                    } else {
+                        re.push_str(r"\x5c"); // Literal backslash for regex
+                    }
+                    i += 2; // Skip both characters
+                    continue;
+                }
+                // Other escapes inside quotes: output backslash literally
+                re.push_str(r"\x5c");
+            } else if ch == '"' {
+                // Unescaped quote ends the quoted string
+                in_quotes = false;
+            } else {
+                // Inside quoted strings, escape regex metacharacters that need escaping
+                // Note: ] doesn't need escaping as it's only special inside brackets
+                match ch {
+                    '*' => re.push_str(r"\x2a"),
+                    '+' => re.push_str(r"\x2b"),
+                    '.' => re.push_str(r"\x2e"),
+                    '{' => re.push_str(r"\x7b"),
+                    '}' => re.push_str(r"\x7d"),
+                    '(' => re.push_str(r"\x28"),
+                    ')' => re.push_str(r"\x29"),
+                    '[' => re.push_str(r"\x5b"),
+                    '?' => re.push_str(r"\x3f"),
+                    '|' => re.push_str(r"\x7c"),
+                    '^' => re.push_str(r"\x5e"),
+                    '$' => re.push_str(r"\x24"),
+                    _ => re.push(ch),
+                }
             }
         } else if in_brace && ch == '}' {
             // Determine if this is an interval expression or a substitution

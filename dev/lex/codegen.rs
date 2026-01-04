@@ -1159,7 +1159,7 @@ fn write_yylex_function<W: Write>(
     }
     writeln!(
         output,
-        "                    for (yy_cp = yy_buffer_pos; yy_cp < yy_last_accepting_cpos + 1 && yy_cp < yy_buffer_len; yy_cp++) {{"
+        "                    for (yy_cp = yy_buffer_pos; yy_cp < yy_last_accepting_cpos && yy_cp < yy_buffer_len; yy_cp++) {{"
     )?;
     writeln!(
         output,

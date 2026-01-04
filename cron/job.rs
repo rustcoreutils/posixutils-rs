@@ -608,8 +608,14 @@ impl CronJob {
                     }
 
                     // Set supplementary groups
+                    // Note: initgroups takes c_int on macOS, gid_t on Linux
                     if let Ok(c_name) = CString::new(name.as_str()) {
-                        if libc::initgroups(c_name.as_ptr(), gid as libc::c_int) != 0 {
+                        #[cfg(target_os = "macos")]
+                        let initgroups_gid = gid as libc::c_int;
+                        #[cfg(not(target_os = "macos"))]
+                        let initgroups_gid = gid;
+
+                        if libc::initgroups(c_name.as_ptr(), initgroups_gid) != 0 {
                             eprintln!("Failed to initgroups for {}", name);
                             std::process::exit(1);
                         }

@@ -9,6 +9,7 @@
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use std::collections::BTreeSet;
+use std::ffi::CStr;
 use std::iter::Peekable;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -137,10 +138,55 @@ pub struct CronJob {
     pub month: Month,
     pub weekday: WeekDay,
     pub command: String,
+    /// True for @reboot jobs that run once at daemon startup
+    pub is_reboot: bool,
+    /// Owner info for privilege dropping (None if not set, e.g., in tests)
+    pub owner_uid: Option<u32>,
+    pub owner_gid: Option<u32>,
+    pub owner_name: Option<String>,
+    pub owner_home: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct Database(pub Vec<CronJob>);
+
+/// User info retrieved from passwd database
+#[derive(Clone, Debug)]
+pub struct UserInfo {
+    pub uid: u32,
+    pub gid: u32,
+    pub name: String,
+    pub home: String,
+}
+
+impl UserInfo {
+    /// Look up user info from username using getpwnam
+    pub fn from_username(username: &str) -> Option<Self> {
+        use std::ffi::CString;
+
+        let c_username = CString::new(username).ok()?;
+
+        // SAFETY: getpwnam() is thread-safe for read-only access.
+        // We copy all needed data before returning.
+        unsafe {
+            let pwd = libc::getpwnam(c_username.as_ptr());
+            if pwd.is_null() {
+                return None;
+            }
+
+            let pw = &*pwd;
+            let name = CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned();
+            let home = CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned();
+
+            Some(UserInfo {
+                uid: pw.pw_uid,
+                gid: pw.pw_gid,
+                name,
+                home,
+            })
+        }
+    }
+}
 
 impl Database {
     pub fn merge(mut self, other: Database) -> Database {
@@ -155,6 +201,209 @@ impl Database {
             .filter(|x| x.next_execution(&now).is_some())
             .min_by_key(|x| x.next_execution(&now))
             .cloned()
+    }
+
+    /// Get all @reboot jobs
+    pub fn reboot_jobs(&self) -> Vec<&CronJob> {
+        self.0.iter().filter(|j| j.is_reboot).collect()
+    }
+
+    /// Parse a user crontab (5-field format) with owner info
+    pub fn parse_user_crontab(content: &str, user: &UserInfo) -> Self {
+        let mut db = match content.parse::<Database>() {
+            Ok(d) => d,
+            Err(()) => Database(vec![]),
+        };
+
+        // Set owner info on all jobs
+        for job in &mut db.0 {
+            job.owner_uid = Some(user.uid);
+            job.owner_gid = Some(user.gid);
+            job.owner_name = Some(user.name.clone());
+            job.owner_home = Some(user.home.clone());
+        }
+
+        db
+    }
+
+    /// Parse a system crontab (6-field format with username)
+    pub fn parse_system_crontab(content: &str) -> Self {
+        let mut result = vec![];
+
+        for line in content.lines() {
+            let line = line.trim();
+
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Skip environment variable assignments (NAME=value)
+            if line.contains('=') && !line.starts_with('@') && !line.starts_with('*') {
+                if let Some(first_char) = line.chars().next() {
+                    if first_char.is_alphabetic() {
+                        continue;
+                    }
+                }
+            }
+
+            let mut fields = line.split_ascii_whitespace();
+
+            let Some(first_field) = fields.next() else {
+                continue;
+            };
+
+            // Check for @-prefix special time specifications
+            let (time_spec, username, command) = if first_field.starts_with('@') {
+                let Some(spec) = parse_at_spec(first_field) else {
+                    continue; // Unknown @-spec, skip line
+                };
+                // For system crontab, next field is username
+                let Some(user_field) = fields.next() else {
+                    continue;
+                };
+                let cmd: String = fields.collect::<Vec<_>>().join(" ");
+                (spec, user_field.to_string(), cmd)
+            } else {
+                // Standard 6-field format: min hour dom mon dow user cmd
+                let minutes_field = first_field;
+                let Some(hours_field) = fields.next() else {
+                    continue;
+                };
+                let Some(monthdays_field) = fields.next() else {
+                    continue;
+                };
+                let Some(months_field) = fields.next() else {
+                    continue;
+                };
+                let Some(weekdays_field) = fields.next() else {
+                    continue;
+                };
+                let Some(user_field) = fields.next() else {
+                    continue;
+                };
+
+                let Ok(minute) = Minute::parse(minutes_field) else {
+                    continue;
+                };
+                let Ok(hour) = Hour::parse(hours_field) else {
+                    continue;
+                };
+                let Ok(monthday) = MonthDay::parse(monthdays_field) else {
+                    continue;
+                };
+                let Ok(month) = Month::parse(months_field) else {
+                    continue;
+                };
+                let Ok(weekday) = WeekDay::parse(weekdays_field) else {
+                    continue;
+                };
+
+                let spec = TimeSpec {
+                    minute,
+                    hour,
+                    monthday,
+                    month,
+                    weekday,
+                    is_reboot: false,
+                };
+                let cmd: String = fields.collect::<Vec<_>>().join(" ");
+                (spec, user_field.to_string(), cmd)
+            };
+
+            if command.is_empty() {
+                continue;
+            }
+
+            // Look up user info
+            let user_info = UserInfo::from_username(&username);
+
+            result.push(CronJob {
+                minute: time_spec.minute,
+                hour: time_spec.hour,
+                monthday: time_spec.monthday,
+                month: time_spec.month,
+                weekday: time_spec.weekday,
+                command,
+                is_reboot: time_spec.is_reboot,
+                owner_uid: user_info.as_ref().map(|u| u.uid),
+                owner_gid: user_info.as_ref().map(|u| u.gid),
+                owner_name: user_info.as_ref().map(|u| u.name.clone()),
+                owner_home: user_info.map(|u| u.home),
+            });
+        }
+
+        Database(result)
+    }
+}
+
+/// Represents time specification parsed from @-prefix or 5-field format
+struct TimeSpec {
+    minute: Minute,
+    hour: Hour,
+    monthday: MonthDay,
+    month: Month,
+    weekday: WeekDay,
+    is_reboot: bool,
+}
+
+/// Parse @-prefix special time specifications
+fn parse_at_spec(spec: &str) -> Option<TimeSpec> {
+    match spec.to_lowercase().as_str() {
+        "@reboot" => Some(TimeSpec {
+            minute: Minute(None),
+            hour: Hour(None),
+            monthday: MonthDay(None),
+            month: Month(None),
+            weekday: WeekDay(None),
+            is_reboot: true,
+        }),
+        "@yearly" | "@annually" => Some(TimeSpec {
+            // 0 0 1 1 * - Jan 1, midnight
+            minute: Minute(Some(vec![Value::Number(0)])),
+            hour: Hour(Some(vec![Value::Number(0)])),
+            monthday: MonthDay(Some(vec![Value::Number(1)])),
+            month: Month(Some(vec![Value::Number(1)])),
+            weekday: WeekDay(None),
+            is_reboot: false,
+        }),
+        "@monthly" => Some(TimeSpec {
+            // 0 0 1 * * - 1st of month, midnight
+            minute: Minute(Some(vec![Value::Number(0)])),
+            hour: Hour(Some(vec![Value::Number(0)])),
+            monthday: MonthDay(Some(vec![Value::Number(1)])),
+            month: Month(None),
+            weekday: WeekDay(None),
+            is_reboot: false,
+        }),
+        "@weekly" => Some(TimeSpec {
+            // 0 0 * * 0 - Sunday, midnight
+            minute: Minute(Some(vec![Value::Number(0)])),
+            hour: Hour(Some(vec![Value::Number(0)])),
+            monthday: MonthDay(None),
+            month: Month(None),
+            weekday: WeekDay(Some(vec![Value::Number(0)])),
+            is_reboot: false,
+        }),
+        "@daily" | "@midnight" => Some(TimeSpec {
+            // 0 0 * * * - Every midnight
+            minute: Minute(Some(vec![Value::Number(0)])),
+            hour: Hour(Some(vec![Value::Number(0)])),
+            monthday: MonthDay(None),
+            month: Month(None),
+            weekday: WeekDay(None),
+            is_reboot: false,
+        }),
+        "@hourly" => Some(TimeSpec {
+            // 0 * * * * - Top of every hour
+            minute: Minute(Some(vec![Value::Number(0)])),
+            hour: Hour(None),
+            monthday: MonthDay(None),
+            month: Month(None),
+            weekday: WeekDay(None),
+            is_reboot: false,
+        }),
+        _ => None,
     }
 }
 
@@ -174,51 +423,77 @@ impl FromStr for Database {
 
             let mut fields = line.split_ascii_whitespace();
 
-            let Some(minutes_field) = fields.next() else {
-                continue;
-            };
-            let Some(hours_field) = fields.next() else {
-                continue;
-            };
-            let Some(monthdays_field) = fields.next() else {
-                continue;
-            };
-            let Some(months_field) = fields.next() else {
-                continue;
-            };
-            let Some(weekdays_field) = fields.next() else {
+            let Some(first_field) = fields.next() else {
                 continue;
             };
 
-            // Collect all remaining fields as the command
-            let command: String = fields.collect::<Vec<_>>().join(" ");
+            // Check for @-prefix special time specifications
+            let (time_spec, command) = if first_field.starts_with('@') {
+                let Some(spec) = parse_at_spec(first_field) else {
+                    continue; // Unknown @-spec, skip line
+                };
+                let cmd: String = fields.collect::<Vec<_>>().join(" ");
+                (spec, cmd)
+            } else {
+                // Standard 5-field format
+                let minutes_field = first_field;
+                let Some(hours_field) = fields.next() else {
+                    continue;
+                };
+                let Some(monthdays_field) = fields.next() else {
+                    continue;
+                };
+                let Some(months_field) = fields.next() else {
+                    continue;
+                };
+                let Some(weekdays_field) = fields.next() else {
+                    continue;
+                };
+
+                let Ok(minute) = Minute::parse(minutes_field) else {
+                    return Err(());
+                };
+                let Ok(hour) = Hour::parse(hours_field) else {
+                    return Err(());
+                };
+                let Ok(monthday) = MonthDay::parse(monthdays_field) else {
+                    return Err(());
+                };
+                let Ok(month) = Month::parse(months_field) else {
+                    return Err(());
+                };
+                let Ok(weekday) = WeekDay::parse(weekdays_field) else {
+                    return Err(());
+                };
+
+                let spec = TimeSpec {
+                    minute,
+                    hour,
+                    monthday,
+                    month,
+                    weekday,
+                    is_reboot: false,
+                };
+                let cmd: String = fields.collect::<Vec<_>>().join(" ");
+                (spec, cmd)
+            };
+
             if command.is_empty() {
                 continue;
             }
 
-            let Ok(minute) = Minute::parse(minutes_field) else {
-                return Err(());
-            };
-            let Ok(hour) = Hour::parse(hours_field) else {
-                return Err(());
-            };
-            let Ok(monthday) = MonthDay::parse(monthdays_field) else {
-                return Err(());
-            };
-            let Ok(month) = Month::parse(months_field) else {
-                return Err(());
-            };
-            let Ok(weekday) = WeekDay::parse(weekdays_field) else {
-                return Err(());
-            };
-
             result.push(CronJob {
-                minute,
-                hour,
-                monthday,
-                month,
-                weekday,
-                command: command.to_string(),
+                minute: time_spec.minute,
+                hour: time_spec.hour,
+                monthday: time_spec.monthday,
+                month: time_spec.month,
+                weekday: time_spec.weekday,
+                command,
+                is_reboot: time_spec.is_reboot,
+                owner_uid: None,
+                owner_gid: None,
+                owner_name: None,
+                owner_home: None,
             })
         }
 
@@ -228,6 +503,11 @@ impl FromStr for Database {
 
 impl CronJob {
     pub fn next_execution(&self, now: &NaiveDateTime) -> Option<NaiveDateTime> {
+        // @reboot jobs don't have scheduled executions
+        if self.is_reboot {
+            return None;
+        }
+
         let Self {
             minute: minutes,
             hour: hours,
@@ -235,6 +515,11 @@ impl CronJob {
             monthday: monthdays,
             weekday: weekdays,
             command: _,
+            is_reboot: _,
+            owner_uid: _,
+            owner_gid: _,
+            owner_name: _,
+            owner_home: _,
         } = self;
 
         let months_vec = months.to_vec();
@@ -305,8 +590,51 @@ impl CronJob {
                 return Err(std::io::Error::last_os_error());
             }
             if pid == 0 {
-                // Child process - execute the command
-                // This replaces the child process with sh -c "command"
+                // Child process - drop privileges and execute the command
+
+                // Drop privileges if owner info is available
+                if let (Some(uid), Some(gid), Some(ref name), Some(ref home)) = (
+                    self.owner_uid,
+                    self.owner_gid,
+                    &self.owner_name,
+                    &self.owner_home,
+                ) {
+                    use std::ffi::CString;
+
+                    // Set GID first (must be done before dropping root)
+                    if libc::setgid(gid) != 0 {
+                        eprintln!("Failed to setgid({})", gid);
+                        std::process::exit(1);
+                    }
+
+                    // Set supplementary groups
+                    // Note: initgroups takes c_int on macOS, gid_t on Linux
+                    if let Ok(c_name) = CString::new(name.as_str()) {
+                        #[cfg(target_os = "macos")]
+                        let initgroups_gid = gid as libc::c_int;
+                        #[cfg(not(target_os = "macos"))]
+                        let initgroups_gid = gid;
+
+                        if libc::initgroups(c_name.as_ptr(), initgroups_gid) != 0 {
+                            eprintln!("Failed to initgroups for {}", name);
+                            std::process::exit(1);
+                        }
+                    }
+
+                    // Set UID (drops root privileges)
+                    if libc::setuid(uid) != 0 {
+                        eprintln!("Failed to setuid({})", uid);
+                        std::process::exit(1);
+                    }
+
+                    // Change to user's home directory
+                    if let Ok(c_home) = CString::new(home.as_str()) {
+                        // Ignore chdir errors - job may still run from /
+                        let _ = libc::chdir(c_home.as_ptr());
+                    }
+                }
+
+                // Execute the command via sh -c
                 let err = Command::new("sh").args(["-c", &self.command]).exec();
                 // exec() only returns on error
                 eprintln!("Failed to exec job: {}", err);

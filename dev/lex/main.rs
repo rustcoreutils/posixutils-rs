@@ -91,7 +91,6 @@ pub struct ParsedRule {
 }
 
 /// Parse a regex pattern to HIR with POSIX-compliant settings
-/// In particular, '.' should NOT match newlines per POSIX spec
 fn parse_regex_posix(pattern: &str) -> Result<Hir, String> {
     // Parse to AST
     let ast = ParserBuilder::new()

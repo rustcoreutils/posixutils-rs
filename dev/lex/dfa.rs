@@ -7,10 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! DFA (Deterministic Finite Automaton) construction using subset construction.
+//! DFA construction using subset construction (powerset algorithm).
 //!
-//! This module converts an NFA to a DFA using the subset (powerset) construction
-//! algorithm. The resulting DFA can be used for efficient lexical analysis.
+//! Converts NFA to DFA with Hopcroft minimization and character equivalence classes.
 
 use crate::nfa::{Nfa, Transition};
 use std::collections::{BTreeMap, BTreeSet, HashMap};

@@ -7,10 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! NFA (Non-deterministic Finite Automaton) construction using Thompson's algorithm.
+//! NFA construction using Thompson's algorithm.
 //!
-//! This module implements Thompson's construction to convert regular expressions
-//! into NFAs, which can then be converted to DFAs for efficient lexical analysis.
+//! Converts regex HIR to NFA for subsequent DFA construction.
 
 use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind, Literal, Repetition};
 use std::collections::{BTreeMap, BTreeSet};

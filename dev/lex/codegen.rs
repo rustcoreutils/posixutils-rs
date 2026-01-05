@@ -982,6 +982,10 @@ fn write_dfa_state<W: Write>(
                 writeln!(output, "    /* Main pattern ends here for rule {} */", rule)?;
                 writeln!(
                     output,
+                    "    if (YYCURSOR - YYTOKEN > INT_MAX) {{ YY_FATAL_ERROR(\"lex: main pattern offset overflow\"); }}"
+                )?;
+                writeln!(
+                    output,
                     "    yy_main_end_offset[{}] = (int)(YYCURSOR - YYTOKEN);",
                     rule
                 )?;

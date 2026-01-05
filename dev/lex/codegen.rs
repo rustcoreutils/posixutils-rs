@@ -209,6 +209,8 @@ fn write_includes<W: Write>(output: &mut W) -> io::Result<()> {
         r#"#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <stddef.h>
 
 /* Forward declarations */
 int yywrap(void);
@@ -239,6 +241,15 @@ fn write_macros_and_types<W: Write>(
         r#"/* Lex macros and types */
 #ifndef YY_BUF_SIZE
 #define YY_BUF_SIZE 16384
+#endif
+
+#ifndef YY_EXIT_FAILURE
+#define YY_EXIT_FAILURE 2
+#endif
+
+/* Fatal error handler - user can override to customize error handling */
+#ifndef YY_FATAL_ERROR
+#define YY_FATAL_ERROR(msg) do {{ fprintf(stderr, "%s\n", (msg)); exit(YY_EXIT_FAILURE); }} while (0)
 #endif
 
 #ifndef ECHO
@@ -781,8 +792,7 @@ static void unput(int c)
             size_t marker_off = YYMARKER - yy_buffer;
             unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
             if (new_buf == NULL) {{
-                fprintf(stderr, "lex: out of memory in unput()\\n");
-                return;
+                YY_FATAL_ERROR("lex: out of memory in unput()");
             }}
             yy_buffer = new_buf;
             yy_buffer_size = new_size;
@@ -941,22 +951,24 @@ fn write_dfa_state<W: Write>(
         writeln!(output, "    yy_full_match_state = {};", state_idx)?;
         // Push to REJECT history stack for shorter match fallback
         if flags.has_reject {
-            writeln!(output, "    if (yy_reject_top < YY_REJECT_STACK_SIZE) {{")?;
+            // Fatal error on stack overflow instead of silently dropping history
+            writeln!(output, "    if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{")?;
             writeln!(
                 output,
-                "        yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
+                "        YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
+            )?;
+            writeln!(output, "    }}")?;
+            writeln!(
+                output,
+                "    yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
             )?;
             writeln!(
                 output,
-                "        yy_reject_stack[yy_reject_top].state = {};",
+                "    yy_reject_stack[yy_reject_top].state = {};",
                 state_idx
             )?;
-            writeln!(
-                output,
-                "        yy_reject_stack[yy_reject_top].rule_idx = 0;"
-            )?;
-            writeln!(output, "        yy_reject_top++;")?;
-            writeln!(output, "    }}")?;
+            writeln!(output, "    yy_reject_stack[yy_reject_top].rule_idx = 0;")?;
+            writeln!(output, "    yy_reject_top++;")?;
         }
     }
 
@@ -1110,7 +1122,6 @@ fn write_yylex_direct_coded<W: Write>(
     }
     if has_var_tc {
         // Reset per-rule main pattern end tracking for new token
-        // Use memset to set all bytes to 0xFF, giving -1 for each int (two's complement)
         writeln!(
             output,
             "    memset(yy_main_end_offset, -1, sizeof(yy_main_end_offset));"
@@ -1160,21 +1171,24 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "        /* Save current offsets relative to buffer */"
     )?;
-    writeln!(output, "        int yy_token_offset = YYTOKEN - yy_buffer;")?;
     writeln!(
         output,
-        "        int yy_cursor_offset = YYCURSOR - yy_buffer;"
+        "        ptrdiff_t yy_token_offset = YYTOKEN - yy_buffer;"
     )?;
     writeln!(
         output,
-        "        int yy_marker_offset = YYMARKER - yy_buffer;"
+        "        ptrdiff_t yy_cursor_offset = YYCURSOR - yy_buffer;"
+    )?;
+    writeln!(
+        output,
+        "        ptrdiff_t yy_marker_offset = YYMARKER - yy_buffer;"
     )?;
     // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, so no adjustment needed on buffer shifts
     writeln!(
         output,
         "        /* Shift remaining data to start of buffer */"
     )?;
-    writeln!(output, "        int yy_remain = (int)(YYLIMIT - YYTOKEN);")?;
+    writeln!(output, "        ptrdiff_t yy_remain = YYLIMIT - YYTOKEN;")?;
     // Dynamic buffer growth: if token approaches buffer size, grow the buffer
     writeln!(
         output,
@@ -1230,7 +1244,7 @@ fn write_yylex_direct_coded<W: Write>(
     )?;
     writeln!(
         output,
-        "            memmove(yy_buffer, YYTOKEN, yy_remain);"
+        "            memmove(yy_buffer, YYTOKEN, (size_t)yy_remain);"
     )?;
     writeln!(output, "        }}")?;
     writeln!(
@@ -1433,6 +1447,11 @@ fn write_yylex_direct_coded<W: Write>(
             )?;
         }
         writeln!(output, "                    yyaccept = yy_rule;")?;
+        // Defense in depth: bounds check before re-pushing entry
+        writeln!(
+            output,
+            "                    if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{ YY_FATAL_ERROR(\"lex: REJECT stack overflow\"); }}"
+        )?;
         writeln!(
             output,
             "                    yy_reject_stack[yy_reject_top].rule_idx = yy_i - yy_accept_idx[yy_full_match_state] + 1;"
@@ -1469,13 +1488,19 @@ fn write_yylex_direct_coded<W: Write>(
     // Set yytext and yyleng with yymore support
     writeln!(output, "    /* Set yytext and yyleng (handle yymore) */")?;
     writeln!(output, "    if (yy_more_flag) {{")?;
+    // Use size_t for intermediate calculations to avoid integer overflow
     writeln!(
         output,
-        "        int yy_new_len = (int)(YYCURSOR - YYTOKEN);"
+        "        size_t yy_new_len = (size_t)(YYCURSOR - YYTOKEN);"
     )?;
     writeln!(
         output,
-        "        int yy_total_len = yy_more_len + yy_new_len;"
+        "        size_t yy_total_len = (size_t)yy_more_len + yy_new_len;"
+    )?;
+    // Check for overflow before assigning to int yyleng
+    writeln!(
+        output,
+        "        if (yy_total_len > (size_t)INT_MAX) {{ YY_FATAL_ERROR(\"lex: token too long\"); }}"
     )?;
     // Grow yytext buffer if needed (only for pointer mode)
     if config.yytext_is_pointer {
@@ -1508,7 +1533,7 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "        memcpy(yytext + yy_more_len, YYTOKEN, yy_new_len);"
     )?;
-    writeln!(output, "        yyleng = yy_total_len;")?;
+    writeln!(output, "        yyleng = (int)yy_total_len;")?;
     writeln!(output, "        yytext[yyleng] = '\\0';")?;
     writeln!(output, "        yy_more_flag = 0;")?;
     writeln!(output, "    }} else {{")?;
@@ -1663,9 +1688,10 @@ fn write_yylex_direct_coded<W: Write>(
                 output,
                 "            /* Variable-length main pattern - use per-rule offset */"
             )?;
+            // Defensive bounds check: ensure yyaccept is valid index for yy_main_end_offset array
             writeln!(
                 output,
-                "            if (yy_main_end_offset[yyaccept] >= 0) {{"
+                "            if (yyaccept >= 0 && yyaccept < YY_NUM_VAR_TC_RULES && yy_main_end_offset[yyaccept] >= 0) {{"
             )?;
             writeln!(
                 output,
@@ -1724,13 +1750,43 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "    goto yy_scan;")?;
     writeln!(output, "}}\n")?;
 
-    // Generate yywrap and main if needed
-    write_default_yywrap_main(output, lexinfo)?;
+    // Generate yylex_destroy, yywrap and main if needed
+    write_default_yywrap_main(output, lexinfo, config)?;
 
     Ok(())
 }
 
-fn write_default_yywrap_main<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Result<()> {
+fn write_default_yywrap_main<W: Write>(
+    output: &mut W,
+    lexinfo: &LexInfo,
+    config: &CodeGenConfig,
+) -> io::Result<()> {
+    // Generate yylex_destroy to free allocated buffers (enables valgrind-clean runs)
+    writeln!(output, "/* Cleanup function - free allocated buffers */")?;
+    writeln!(output, "void yylex_destroy(void)")?;
+    writeln!(output, "{{")?;
+    writeln!(output, "    if (yy_buffer != NULL) {{")?;
+    writeln!(output, "        free(yy_buffer);")?;
+    writeln!(output, "        yy_buffer = NULL;")?;
+    writeln!(output, "    }}")?;
+    if config.yytext_is_pointer {
+        writeln!(output, "    if (yy_yytext_buf != NULL) {{")?;
+        writeln!(output, "        free(yy_yytext_buf);")?;
+        writeln!(output, "        yy_yytext_buf = NULL;")?;
+        writeln!(output, "    }}")?;
+        writeln!(output, "    yytext = NULL;")?;
+    }
+    writeln!(output, "    YYCURSOR = NULL;")?;
+    writeln!(output, "    YYLIMIT = NULL;")?;
+    writeln!(output, "    YYTOKEN = NULL;")?;
+    writeln!(output, "    YYMARKER = NULL;")?;
+    writeln!(output, "    yy_buffer_size = 0;")?;
+    if config.yytext_is_pointer {
+        writeln!(output, "    yy_yytext_size = 0;")?;
+    }
+    writeln!(output, "}}")?;
+    writeln!(output)?;
+
     // Generate yywrap if not in user subroutines
     let has_yywrap = lexinfo.user_subs.iter().any(|s| s.contains("yywrap"));
     if !has_yywrap {

@@ -37,6 +37,10 @@ pub enum Token {
     Start,
     /// %prec
     Prec,
+    /// %expect
+    Expect,
+    /// %expect-rr
+    ExpectRr,
     /// %% (mark)
     Mark,
     /// <tag>
@@ -513,6 +517,24 @@ impl<'a> Lexer<'a> {
                                 Token::UnionBody(body)
                             }
                             "prec" => Token::Prec,
+                            "expect" => {
+                                // Check for %expect-rr by looking ahead without consuming
+                                let remaining = &self.input[self.pos..];
+                                if remaining.starts_with("-rr")
+                                    && !remaining[3..]
+                                        .chars()
+                                        .next()
+                                        .is_some_and(|c| c.is_alphanumeric())
+                                {
+                                    // Consume the "-rr" suffix
+                                    self.advance(); // '-'
+                                    self.advance(); // 'r'
+                                    self.advance(); // 'r'
+                                    Token::ExpectRr
+                                } else {
+                                    Token::Expect
+                                }
+                            }
                             _ => {
                                 return Err(self.lexical_error(
                                     line,
@@ -771,5 +793,43 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert!(matches!(tokens[0].token, Token::SymbolDecl));
         assert!(matches!(&tokens[1].token, Token::Identifier(s) if s == "FOO"));
+    }
+
+    #[test]
+    fn test_expect() {
+        let input = "%expect 5";
+        let tokens = lex(input).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0].token, Token::Expect));
+        assert!(matches!(tokens[1].token, Token::Number(5)));
+    }
+
+    #[test]
+    fn test_expect_rr() {
+        let input = "%expect-rr 3";
+        let tokens = lex(input).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0].token, Token::ExpectRr));
+        assert!(matches!(tokens[1].token, Token::Number(3)));
+    }
+
+    #[test]
+    fn test_expect_zero() {
+        let input = "%expect 0";
+        let tokens = lex(input).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0].token, Token::Expect));
+        assert!(matches!(tokens[1].token, Token::Number(0)));
+    }
+
+    #[test]
+    fn test_expect_both() {
+        let input = "%expect 2\n%expect-rr 1";
+        let tokens = lex(input).unwrap();
+        assert_eq!(tokens.len(), 4);
+        assert!(matches!(tokens[0].token, Token::Expect));
+        assert!(matches!(tokens[1].token, Token::Number(2)));
+        assert!(matches!(tokens[2].token, Token::ExpectRr));
+        assert!(matches!(tokens[3].token, Token::Number(1)));
     }
 }

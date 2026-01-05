@@ -40,9 +40,6 @@ struct Args {
     #[arg(short, long, default_value = "lex.yy.c", help = gettext("Write output to this filename (unless superceded by -t)"))]
     outfile: String,
 
-    #[arg(long, help = gettext("Force dense (non-compressed) DFA tables"))]
-    dense: bool,
-
     #[arg(help = gettext("Files to read as input"))]
     files: Vec<String>,
 }
@@ -351,11 +348,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         yytext_is_pointer: lexinfo.yyt_is_ptr,
         start_conditions: start_conditions.clone(),
         rule_metadata,
-        table_format: if args.dense {
-            codegen::TableFormat::Dense
-        } else {
-            codegen::TableFormat::Auto
-        },
         ..Default::default()
     };
     codegen::generate(&mut output, &dfa, &lexinfo, &config)?;
@@ -447,7 +439,8 @@ mod tests {
 
         let code = String::from_utf8(output).expect("Invalid UTF-8");
         assert!(code.contains("int yylex(void)"));
-        assert!(code.contains("yy_nxt"));
+        assert!(code.contains("yy_ec")); // Direct-coded uses equivalence class table
+        assert!(code.contains("yy_state_0:")); // Direct-coded generates state labels
         assert!(code.contains("case 0:")); // Rule 0 action
     }
 }

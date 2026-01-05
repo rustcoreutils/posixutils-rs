@@ -7,38 +7,39 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! C code generation for the lexical analyzer.
+//! Direct-coded C code generation for the lexical analyzer.
 //!
-//! This module generates POSIX-compliant C code from the DFA and rule actions.
+//! This module generates POSIX-compliant C code from the DFA using a direct-coded
+//! approach where each DFA state becomes a C label with switch-based transitions.
+//! This is inspired by re2c's code generation strategy.
 
-use crate::dfa::{CompressedTables, Dfa};
+use crate::dfa::{Dfa, DfaInput, DfaState};
 use crate::lexfile::LexInfo;
-use std::fmt::Display;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-/// Write an array of values inline (comma-separated, single line)
-fn write_array_inline<W: Write, T: Display>(output: &mut W, values: &[T]) -> io::Result<()> {
-    for (i, v) in values.iter().enumerate() {
-        if i > 0 {
-            write!(output, ", ")?;
+/// Check if `text` contains `word` as a standalone C identifier.
+/// This avoids false positives from substrings (e.g., "REJECTED" matching "REJECT").
+fn contains_identifier(text: &str, word: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(word) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0
+            || !text[..abs_pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let after_ok = abs_pos + word.len() >= text.len()
+            || !text[abs_pos + word.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if before_ok && after_ok {
+            return true;
         }
-        write!(output, "{}", v)?;
+        start = abs_pos + 1;
     }
-    Ok(())
-}
-
-/// Write an array of values with formatting (16 per line, right-aligned)
-fn write_array_formatted<W: Write, T: Display>(output: &mut W, values: &[T]) -> io::Result<()> {
-    for (i, v) in values.iter().enumerate() {
-        if i % 16 == 0 {
-            write!(output, "\n    ")?;
-        }
-        write!(output, "{:4}", v)?;
-        if i < values.len() - 1 {
-            write!(output, ",")?;
-        }
-    }
-    Ok(())
+    false
 }
 
 /// Rule metadata for code generation
@@ -56,16 +57,6 @@ pub struct RuleMetadata {
     pub has_variable_trailing_context: bool,
 }
 
-/// Whether to use compressed or dense table format
-#[derive(Clone, Copy, PartialEq, Default)]
-pub enum TableFormat {
-    Dense,
-    Compressed,
-    /// Automatically choose based on compression ratio (default)
-    #[default]
-    Auto,
-}
-
 /// Configuration for code generation
 pub struct CodeGenConfig {
     /// Whether yytext is a pointer (true) or array (false)
@@ -76,8 +67,6 @@ pub struct CodeGenConfig {
     pub start_conditions: Vec<String>,
     /// Metadata for each rule (indexed by rule number)
     pub rule_metadata: Vec<RuleMetadata>,
-    /// Table format: Dense, Compressed, or Auto (default)
-    pub table_format: TableFormat,
 }
 
 impl Default for CodeGenConfig {
@@ -87,79 +76,104 @@ impl Default for CodeGenConfig {
             yytext_size: 8192,
             start_conditions: vec!["INITIAL".to_string()],
             rule_metadata: Vec::new(),
-            table_format: TableFormat::Auto,
         }
     }
 }
 
-/// Generate the complete lex.yy.c output
+/// EOF rule with its start conditions
+struct EofRule {
+    rule_idx: usize,
+    start_conditions: Vec<String>,
+}
+
+/// Pre-computed feature flags to avoid redundant iteration over rules/metadata
+struct FeatureFlags {
+    has_reject: bool,
+    has_start_conditions: bool,
+    has_bol_anchors: bool,
+    has_trailing_context: bool,
+    has_var_tc: bool,
+    /// All EOF rules with their start conditions
+    eof_rules: Vec<EofRule>,
+    needs_accept_lists: bool,
+}
+
+impl FeatureFlags {
+    /// Compute all feature flags in a single pass over rules and metadata
+    fn compute(lexinfo: &LexInfo, config: &CodeGenConfig) -> Self {
+        let has_start_conditions = config.start_conditions.len() > 1;
+
+        // Single pass over rule_metadata
+        let mut has_bol_anchors = false;
+        let mut has_trailing_context = false;
+        let mut has_var_tc = false;
+        for meta in &config.rule_metadata {
+            has_bol_anchors |= meta.bol_anchor;
+            has_trailing_context |= meta.has_trailing_context;
+            has_var_tc |= meta.has_variable_trailing_context;
+        }
+
+        // Single pass over rules
+        let mut has_reject = false;
+        let mut eof_rules = Vec::new();
+        for (idx, rule) in lexinfo.rules.iter().enumerate() {
+            if contains_identifier(&rule.action, "REJECT") {
+                has_reject = true;
+            }
+            if rule.is_eof {
+                eof_rules.push(EofRule {
+                    rule_idx: idx,
+                    start_conditions: rule.start_conditions.clone(),
+                });
+            }
+        }
+
+        let needs_accept_lists = has_reject || has_start_conditions || has_bol_anchors;
+
+        FeatureFlags {
+            has_reject,
+            has_start_conditions,
+            has_bol_anchors,
+            has_trailing_context,
+            has_var_tc,
+            eof_rules,
+            needs_accept_lists,
+        }
+    }
+}
+
+/// Generate the complete lex.yy.c output using direct-coded generation
 pub fn generate<W: Write>(
     output: &mut W,
     dfa: &Dfa,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
 ) -> io::Result<()> {
-    // Try compression and decide which format to use
-    let compressed = dfa.compress();
-
-    // Build-time verification: exhaustively check compressed tables match original
-    if let Err(e) = compressed.verify(dfa) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Table compression verification failed: {}", e),
-        ));
-    }
-
-    let stats = compressed.stats();
-
-    // Determine table format based on config
-    let table_format = match config.table_format {
-        TableFormat::Auto => {
-            // Use compressed tables only if they're actually smaller (ratio > 1.0)
-            if stats.ratio > 1.0 {
-                TableFormat::Compressed
-            } else {
-                TableFormat::Dense
-            }
-        }
-        TableFormat::Dense => TableFormat::Dense,
-        TableFormat::Compressed => TableFormat::Compressed,
-    };
-
-    // Log table format decision
+    // Log generation info
     eprintln!(
-        "lex: {} states, {} classes, dense={}B, compressed={}B (ratio: {:.2}x) -> {}",
-        stats.num_states,
-        stats.num_classes,
-        stats.dense_size,
-        stats.compressed_size,
-        stats.ratio,
-        if table_format == TableFormat::Compressed {
-            "using compressed"
-        } else {
-            "using dense"
-        }
+        "lex: {} states, {} equivalence classes -> direct-coded generation",
+        dfa.states.len(),
+        dfa.char_classes.num_classes
     );
+
+    // Pre-compute all feature flags in a single pass
+    let flags = FeatureFlags::compute(lexinfo, config);
 
     write_header(output)?;
     write_includes(output)?;
     write_external_definitions(output, lexinfo)?;
-    write_macros_and_types(output, config)?;
-
-    match table_format {
-        TableFormat::Compressed => write_compressed_tables(output, dfa, &compressed)?,
-        TableFormat::Dense => write_dense_tables(output, dfa)?,
-        TableFormat::Auto => unreachable!("Auto should have been resolved above"),
-    }
-    write_accepting_table(output, dfa)?;
-    write_accepting_list_table(output, dfa)?;
+    write_macros_and_types(output, config, &flags)?;
     write_char_class_table(output, dfa)?;
-    write_rule_condition_table(output, lexinfo, config)?;
-    write_rule_metadata_tables(output, lexinfo, config)?;
+    write_num_states(output, dfa)?;
+    // Only generate accept lists if needed for REJECT or alternate rule finding
+    if flags.needs_accept_lists {
+        write_accepting_list_table(output, dfa)?;
+    }
+    write_rule_condition_table(output, lexinfo, config, &flags)?;
+    write_rule_metadata_tables(output, lexinfo, config, &flags)?;
     write_main_pattern_end_table(output, dfa, config)?;
-    // Note: internal_defs are written inside yylex(), not here
     write_helper_functions(output, lexinfo)?;
-    write_yylex_function(output, dfa, lexinfo, config, table_format)?;
+    write_yylex_direct_coded(output, dfa, lexinfo, config, &flags)?;
     write_user_subroutines(output, lexinfo)?;
 
     Ok(())
@@ -167,6 +181,7 @@ pub fn generate<W: Write>(
 
 fn write_header<W: Write>(output: &mut W) -> io::Result<()> {
     writeln!(output, "/* Generated by lex-rs - POSIX compatible lex */")?;
+    writeln!(output, "/* Direct-coded scanner (re2c-style) */")?;
     writeln!(
         output,
         "/* DO NOT EDIT - This file was automatically generated */\n"
@@ -199,7 +214,11 @@ fn write_external_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io
     Ok(())
 }
 
-fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> io::Result<()> {
+fn write_macros_and_types<W: Write>(
+    output: &mut W,
+    config: &CodeGenConfig,
+    flags: &FeatureFlags,
+) -> io::Result<()> {
     writeln!(
         output,
         r#"/* Lex macros and types */
@@ -231,9 +250,12 @@ fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> i
     }
     writeln!(output)?;
 
-    writeln!(
-        output,
-        r#"#ifndef BEGIN
+    // BEGIN and YY_START macros - only use yy_start_state if there are multiple conditions
+    let has_start_conditions = flags.has_start_conditions;
+    if has_start_conditions {
+        writeln!(
+            output,
+            r#"#ifndef BEGIN
 #define BEGIN(x) (yy_start_state = (x))
 #endif
 
@@ -241,15 +263,30 @@ fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> i
 #define YY_START yy_start_state
 #endif
 "#
-    )?;
+        )?;
+    } else {
+        // With only INITIAL, BEGIN is a no-op and YY_START is always 0
+        writeln!(
+            output,
+            r#"#ifndef BEGIN
+#define BEGIN(x) ((void)0)
+#endif
 
-    // yytext declaration
+#ifndef YY_START
+#define YY_START INITIAL
+#endif
+"#
+        )?;
+    }
+
+    // yytext declaration - dynamically allocated for long token support
     if config.yytext_is_pointer {
         writeln!(
             output,
-            r#"/* yytext as pointer */
-static char yy_yytext_buf[YY_BUF_SIZE + 1];
-char *yytext = yy_yytext_buf;
+            r#"/* yytext as pointer - dynamically allocated */
+static char *yy_yytext_buf = NULL;
+static size_t yy_yytext_size = 0;
+char *yytext = NULL;
 "#
         )?;
     } else {
@@ -263,26 +300,58 @@ char *yytext = yy_yytext_buf;
         r#"/* Standard lex variables */
 int yyleng;
 FILE *yyin = NULL;
-FILE *yyout = NULL;
-static int yy_start_state = INITIAL;
-
-/* Input buffer */
-static char yy_buffer[YY_BUF_SIZE + 1];
-static int yy_buffer_pos = 0;
-static int yy_buffer_len = 0;
+FILE *yyout = NULL;"#
+    )?;
+    // Only generate yy_start_state when there are multiple start conditions
+    if has_start_conditions {
+        writeln!(output, "static int yy_start_state = INITIAL;")?;
+    }
+    writeln!(
+        output,
+        r#"
+/* Input buffer - dynamically allocated for long token support */
+static unsigned char *yy_buffer = NULL;
+static size_t yy_buffer_size = 0;
+static unsigned char *YYCURSOR = NULL;
+static unsigned char *YYLIMIT = NULL;
+static unsigned char *YYTOKEN = NULL;
+static unsigned char *YYMARKER = NULL;
+static int yyaccept = -1;
 
 /* Beginning of line tracking */
 static int yy_at_bol = 1; /* Start at beginning of line */
 
 /* REJECT support */
 static int yy_reject_flag = 0;
-static int yy_full_match_pos = 0;
-static int yy_full_match_state = 0;
-static int yy_full_match_rule_idx = 0;
-static int yy_saved_buffer_pos = 0; /* Buffer pos before action */
+static int yy_full_match_state = 0;  /* DFA state where match occurred */
+static int yy_full_match_rule_idx = 0;  /* Index within accepting list */
+"#
+    )?;
+
+    // REJECT history stack for shorter match support - only emit if any rule uses REJECT
+    if flags.has_reject {
+        writeln!(
+            output,
+            r#"
+/* REJECT history stack for shorter match fallback */
+#define YY_REJECT_STACK_SIZE 64
+static struct {{
+    unsigned char *marker;  /* Position of this accept */
+    int state;              /* DFA state that accepted */
+    int rule_idx;           /* Current index within accept list */
+}} yy_reject_stack[YY_REJECT_STACK_SIZE];
+static int yy_reject_top = 0;
+"#
+        )?;
+    }
+
+    writeln!(
+        output,
+        r#"/* Buffer refill resume state */
+static int yy_resume_state = 0;  /* DFA state to resume from after refill */
 
 #ifndef REJECT
-#define REJECT {{ yy_reject_flag = 1; yy_buffer_pos = yy_saved_buffer_pos; goto yy_find_next_match; }}
+#define REJECT {{ yy_reject_flag = 1; goto yy_find_next_match; }}
 #endif
 
 /* yymore support */
@@ -296,28 +365,22 @@ static int yy_more_len = 0;
 /* yyless - return characters to input */
 #ifndef yyless
 #define yyless(n) do {{ \
-    yy_buffer_pos = yy_buffer_pos - yyleng + (n); \
+    YYCURSOR = YYTOKEN + (n); \
     yyleng = (n); \
     yytext[yyleng] = '\0'; \
 }} while (0)
 #endif
 
-/* unput support - pushback buffer */
-static char yy_unput_buf[YY_BUF_SIZE];
-static int yy_unput_pos = 0;
+/* unput now always inserts directly into main buffer - no separate pushback buffer */
 "#
     )?;
 
     // Variable-length trailing context support - only emit if any rule uses it
-    let has_var_tc = config
-        .rule_metadata
-        .iter()
-        .any(|m| m.has_variable_trailing_context);
-    if has_var_tc {
+    if flags.has_var_tc {
         writeln!(output, "/* Variable-length trailing context support */")?;
         writeln!(
             output,
-            "static int yy_main_end_pos = 0; /* Position where main pattern ended */"
+            "static unsigned char *yy_main_end_ptr = NULL; /* Position where main pattern ended */"
         )?;
         writeln!(
             output,
@@ -329,138 +392,37 @@ static int yy_unput_pos = 0;
     Ok(())
 }
 
-/// Write compressed DFA tables using row displacement encoding
-fn write_compressed_tables<W: Write>(
-    output: &mut W,
-    dfa: &Dfa,
-    compressed: &CompressedTables,
-) -> io::Result<()> {
-    let num_states = dfa.states.len();
-    let num_classes = dfa.char_classes.num_classes;
-
+fn write_char_class_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
+    writeln!(output, "/* Character to equivalence class mapping */")?;
     writeln!(
         output,
-        "/* Compressed DFA transition tables (row displacement) */"
+        "#define YY_NUM_CLASSES {}",
+        dfa.char_classes.num_classes
     )?;
-    writeln!(output, "#define YY_NUM_STATES {}", num_states)?;
-    writeln!(output, "#define YY_NUM_CLASSES {}", num_classes)?;
-    writeln!(
-        output,
-        "#define YY_NXT_SIZE {}",
-        compressed.nxt.len().max(1)
-    )?;
-    writeln!(output)?;
+    write!(output, "static const unsigned char yy_ec[256] = {{")?;
 
-    // Write base array (offset into nxt/chk for each state)
-    writeln!(
-        output,
-        "/* Base offset for each state into nxt/chk arrays */"
-    )?;
-    write!(output, "static const int yy_base[YY_NUM_STATES] = {{ ")?;
-    write_array_inline(output, &compressed.base)?;
-    writeln!(output, " }};\n")?;
-
-    // Write default transition array
-    writeln!(output, "/* Default transition for each state */")?;
-    write!(output, "static const short yy_default[YY_NUM_STATES] = {{ ")?;
-    write_array_inline(output, &compressed.default)?;
-    writeln!(output, " }};\n")?;
-
-    // Write nxt array (packed next-state transitions)
-    writeln!(output, "/* Packed next-state array */")?;
-    if compressed.nxt.is_empty() {
-        writeln!(output, "static const short yy_nxt[1] = {{ -1 }};\n")?;
-    } else {
-        write!(output, "static const short yy_nxt[YY_NXT_SIZE] = {{")?;
-        write_array_formatted(output, &compressed.nxt)?;
-        writeln!(output, "\n}};\n")?;
+    for (i, &class) in dfa.char_classes.char_to_class.iter().enumerate() {
+        if i % 16 == 0 {
+            write!(output, "\n    ")?;
+        }
+        write!(output, "{:3}", class)?;
+        if i < 255 {
+            write!(output, ",")?;
+        }
     }
 
-    // Write chk array (state ownership verification)
-    writeln!(output, "/* State ownership verification array */")?;
-    if compressed.chk.is_empty() {
-        writeln!(output, "static const short yy_chk[1] = {{ -1 }};\n")?;
-    } else {
-        write!(output, "static const short yy_chk[YY_NXT_SIZE] = {{")?;
-        write_array_formatted(output, &compressed.chk)?;
-        writeln!(output, "\n}};\n")?;
-    }
+    writeln!(output, "\n}};\n")?;
 
     Ok(())
 }
 
-/// Write dense (uncompressed) 2D DFA transition table
-fn write_dense_tables<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
-    let num_states = dfa.states.len();
-    let num_classes = dfa.char_classes.num_classes;
-
-    writeln!(output, "/* Dense DFA state transition table */")?;
-    writeln!(output, "#define YY_NUM_STATES {}", num_states)?;
-    writeln!(output, "#define YY_NUM_CLASSES {}", num_classes)?;
-    writeln!(output, "#define YY_USE_DENSE_TABLES 1")?;
+fn write_num_states<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
+    writeln!(output, "#define YY_NUM_STATES {}", dfa.states.len())?;
     writeln!(output)?;
-
-    // Generate the transition table: yy_nxt[state][char_class] = next_state (-1 for no transition)
-    writeln!(
-        output,
-        "static const short yy_nxt[YY_NUM_STATES][YY_NUM_CLASSES] = {{"
-    )?;
-
-    for (state_idx, state) in dfa.states.iter().enumerate() {
-        write!(output, "    /* state {} */ {{ ", state_idx)?;
-
-        // Build transition array for this state
-        let mut class_transitions: Vec<i16> = vec![-1; num_classes];
-
-        for (input, &target) in &state.transitions {
-            let crate::dfa::DfaInput::Char(ch) = input;
-            let ch_code = *ch as u32;
-            if ch_code < 256 {
-                let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
-                class_transitions[class_idx] = target as i16;
-            }
-        }
-
-        for (i, trans) in class_transitions.iter().enumerate() {
-            if i > 0 {
-                write!(output, ", ")?;
-            }
-            write!(output, "{:3}", trans)?;
-        }
-        writeln!(output, " }},")?;
-    }
-
-    writeln!(output, "}};\n")?;
-
-    Ok(())
-}
-
-fn write_accepting_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
-    writeln!(output, "/* Accepting states table */")?;
-    writeln!(
-        output,
-        "/* -1 = not accepting, >= 0 = rule number (action index) */"
-    )?;
-    write!(output, "static const short yy_accept[YY_NUM_STATES] = {{ ")?;
-
-    for (i, state) in dfa.states.iter().enumerate() {
-        if i > 0 {
-            write!(output, ", ")?;
-        }
-        match state.accepting {
-            Some(rule) => write!(output, "{}", rule)?,
-            None => write!(output, "-1")?,
-        }
-    }
-
-    writeln!(output, " }};\n")?;
-
     Ok(())
 }
 
 /// Write the accepting rules list for REJECT support
-/// yy_accept_list contains all accepting rules per state (for trying next-best matches)
-/// Format: yy_accept_list[yy_accept_idx[state]..yy_accept_idx[state+1]] gives the rules
 fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
     // Build the flattened list and index array
     let mut accept_list: Vec<i16> = Vec::new();
@@ -485,7 +447,12 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
         output,
         "static const unsigned short yy_accept_idx[YY_NUM_STATES + 1] = {{ "
     )?;
-    write_array_inline(output, &accept_idx)?;
+    for (i, idx) in accept_idx.iter().enumerate() {
+        if i > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{}", idx)?;
+    }
     writeln!(output, " }};\n")?;
 
     // Write the rules list
@@ -497,46 +464,32 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
             "static const short yy_accept_list[{}] = {{ ",
             accept_list.len()
         )?;
-        write_array_inline(output, &accept_list)?;
+        for (i, rule) in accept_list.iter().enumerate() {
+            if i > 0 {
+                write!(output, ", ")?;
+            }
+            write!(output, "{}", rule)?;
+        }
         writeln!(output, " }};\n")?;
     }
 
     Ok(())
 }
 
-fn write_char_class_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
-    writeln!(output, "/* Character to equivalence class mapping */")?;
-    write!(output, "static const unsigned char yy_ec[256] = {{")?;
-
-    for (i, &class) in dfa.char_classes.char_to_class.iter().enumerate() {
-        if i % 16 == 0 {
-            write!(output, "\n    ")?;
-        }
-        write!(output, "{:3}", class)?;
-        if i < 255 {
-            write!(output, ",")?;
-        }
-    }
-
-    writeln!(output, "\n}};\n")?;
-
-    Ok(())
-}
-
 /// Write a table indicating which rules are active in which start conditions
-/// yy_rule_cond[rule][condition] = 1 if rule is active in condition, 0 otherwise
 fn write_rule_condition_table<W: Write>(
     output: &mut W,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
-    let num_rules = lexinfo.rules.len();
-    let num_conditions = config.start_conditions.len();
-
     // Only generate the table if we have more than just INITIAL
-    if num_conditions <= 1 {
+    if !flags.has_start_conditions {
         return Ok(());
     }
+
+    let num_rules = lexinfo.rules.len();
+    let num_conditions = config.start_conditions.len();
 
     writeln!(output, "/* Rule active-in-condition table */")?;
     writeln!(
@@ -594,27 +547,21 @@ fn write_rule_metadata_tables<W: Write>(
     output: &mut W,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
     let num_rules = lexinfo.rules.len();
     if num_rules == 0 {
         return Ok(());
     }
 
-    // Check if any rules have BOL anchoring
-    let has_bol_anchors = config.rule_metadata.iter().any(|m| m.bol_anchor);
-
-    // Check if any rules have trailing context
-    let has_trailing_context = config.rule_metadata.iter().any(|m| m.has_trailing_context);
-
     // Define YY_NUM_RULES if needed for BOL or trailing context checks
-    // (Only define if not already defined by write_rule_condition_table)
-    if (has_bol_anchors || has_trailing_context) && config.start_conditions.len() <= 1 {
+    if (flags.has_bol_anchors || flags.has_trailing_context) && !flags.has_start_conditions {
         writeln!(output, "#ifndef YY_NUM_RULES")?;
         writeln!(output, "#define YY_NUM_RULES {}", num_rules)?;
         writeln!(output, "#endif\n")?;
     }
 
-    if has_bol_anchors {
+    if flags.has_bol_anchors {
         // Write BOL anchor table (1 = rule requires BOL, 0 = no requirement)
         writeln!(
             output,
@@ -635,11 +582,7 @@ fn write_rule_metadata_tables<W: Write>(
         writeln!(output, " }};\n")?;
     }
 
-    if has_trailing_context {
-        // Write main pattern length table (for trailing context handling)
-        // -1 = no trailing context (don't adjust yyleng)
-        // >=0 = fixed main pattern length (set yyleng to this value)
-        // -2 = variable main pattern length (complex case, not fully supported)
+    if flags.has_trailing_context {
         writeln!(
             output,
             "/* Main pattern length table (for trailing context) */"
@@ -679,83 +622,101 @@ fn write_rule_metadata_tables<W: Write>(
 }
 
 /// Write table mapping DFA states to main pattern end rules (for variable-length trailing context)
-/// This allows runtime tracking of where the main pattern ends during DFA simulation
 fn write_main_pattern_end_table<W: Write>(
-    output: &mut W,
-    dfa: &Dfa,
-    config: &CodeGenConfig,
+    _output: &mut W,
+    _dfa: &Dfa,
+    _config: &CodeGenConfig,
 ) -> io::Result<()> {
-    // Check if any rules have variable-length trailing context
-    let has_var_tc = config
-        .rule_metadata
-        .iter()
-        .any(|m| m.has_variable_trailing_context);
-    if !has_var_tc {
-        return Ok(());
-    }
+    // Note: yy_state_main_end and yy_rule_var_tc tables were originally generated here
+    // but are unused - the implementation uses yy_main_end_ptr/yy_main_end_rule directly
+    // at runtime instead of static tables. Removed to avoid unused variable warnings.
+    Ok(())
+}
 
-    // Generate the table: yy_state_main_end[state] = rule whose main pattern ends at this state
-    // -1 means no main pattern ends at this state
-    // For simplicity, if multiple rules have main pattern ends at same state, we use the lowest index
-    writeln!(
-        output,
-        "/* Main pattern end table (for variable-length trailing context) */"
-    )?;
-    writeln!(
-        output,
-        "/* yy_state_main_end[state] = rule whose main pattern ends at this state (-1 = none) */"
-    )?;
-    write!(
-        output,
-        "static const short yy_state_main_end[YY_NUM_STATES] = {{ "
-    )?;
-
-    for (state_idx, state) in dfa.states.iter().enumerate() {
-        if state_idx > 0 {
-            write!(output, ", ")?;
-        }
-        // Get the first (lowest) rule that has main pattern end at this state
-        let main_end_rule = state.main_pattern_end_rules.first().copied().unwrap_or(!0);
-        if main_end_rule == !0 {
-            write!(output, "-1")?;
+/// Generate EOF handling code that respects start conditions
+fn write_eof_dispatch<W: Write>(
+    output: &mut W,
+    eof_rules: &[EofRule],
+    config: &CodeGenConfig,
+    indent: &str,
+) -> io::Result<()> {
+    if eof_rules.is_empty() {
+        // No EOF rules - just call yywrap
+        writeln!(output, "{}/* EOF - call yywrap() */", indent)?;
+        writeln!(output, "{}if (yywrap()) return 0;", indent)?;
+        writeln!(output, "{}goto yy_scan;", indent)?;
+    } else if eof_rules.len() == 1 && eof_rules[0].start_conditions.is_empty() {
+        // Single unconditional EOF rule
+        let idx = eof_rules[0].rule_idx;
+        writeln!(output, "{}/* Execute <<EOF>> rule */", indent)?;
+        writeln!(output, "{}yyleng = 0;", indent)?;
+        writeln!(output, "{}yytext[0] = '\\0';", indent)?;
+        writeln!(output, "{}goto yy_action_{};", indent, idx)?;
+    } else if config.start_conditions.len() <= 1 && eof_rules.len() == 1 {
+        // Single start condition (INITIAL only) with single conditional EOF rule
+        // Check if the EOF rule applies to INITIAL
+        let rule = &eof_rules[0];
+        if rule.start_conditions.is_empty()
+            || rule.start_conditions.contains(&"INITIAL".to_string())
+        {
+            writeln!(output, "{}/* Execute <<EOF>> rule */", indent)?;
+            writeln!(output, "{}yyleng = 0;", indent)?;
+            writeln!(output, "{}yytext[0] = '\\0';", indent)?;
+            writeln!(output, "{}goto yy_action_{};", indent, rule.rule_idx)?;
         } else {
-            write!(output, "{}", main_end_rule)?;
+            writeln!(output, "{}/* EOF - call yywrap() */", indent)?;
+            writeln!(output, "{}if (yywrap()) return 0;", indent)?;
+            writeln!(output, "{}goto yy_scan;", indent)?;
         }
-    }
-
-    writeln!(output, " }};\n")?;
-
-    // Also generate table marking which rules have variable-length trailing context
-    writeln!(output, "/* Variable trailing context flag table */")?;
-    writeln!(
-        output,
-        "/* yy_rule_var_tc[rule] = 1 if rule has variable-length trailing context */"
-    )?;
-    let num_rules = config.rule_metadata.len();
-    write!(
-        output,
-        "static const unsigned char yy_rule_var_tc[{}] = {{ ",
-        num_rules.max(1)
-    )?;
-    for (i, meta) in config.rule_metadata.iter().enumerate() {
-        if i > 0 {
-            write!(output, ", ")?;
-        }
-        write!(
+    } else {
+        // Multiple start conditions - need dispatch
+        writeln!(
             output,
-            "{}",
-            if meta.has_variable_trailing_context {
-                1
-            } else {
-                0
-            }
+            "{}/* Handle EOF based on start condition */",
+            indent
         )?;
-    }
-    if num_rules == 0 {
-        write!(output, "0")?;
-    }
-    writeln!(output, " }};\n")?;
+        writeln!(output, "{}{{", indent)?;
+        writeln!(output, "{}    int yy_eof_rule = -1;", indent)?;
+        writeln!(output, "{}    switch (yy_start_state) {{", indent)?;
 
+        for (cond_idx, cond_name) in config.start_conditions.iter().enumerate() {
+            // Find EOF rule for this condition
+            let matching_rule = eof_rules
+                .iter()
+                .find(|r| r.start_conditions.is_empty() || r.start_conditions.contains(cond_name));
+            if let Some(rule) = matching_rule {
+                writeln!(
+                    output,
+                    "{}        case {}: yy_eof_rule = {}; break; /* {} */",
+                    indent, cond_idx, rule.rule_idx, cond_name
+                )?;
+            }
+        }
+        writeln!(output, "{}        default: break;", indent)?;
+        writeln!(output, "{}    }}", indent)?;
+        writeln!(output, "{}    if (yy_eof_rule >= 0) {{", indent)?;
+        writeln!(output, "{}        yyleng = 0;", indent)?;
+        writeln!(output, "{}        yytext[0] = '\\0';", indent)?;
+        writeln!(output, "{}        switch (yy_eof_rule) {{", indent)?;
+        for rule in eof_rules {
+            writeln!(
+                output,
+                "{}            case {}: goto yy_action_{};",
+                indent, rule.rule_idx, rule.rule_idx
+            )?;
+        }
+        writeln!(output, "{}            default: break;", indent)?;
+        writeln!(output, "{}        }}", indent)?;
+        writeln!(output, "{}    }}", indent)?;
+        writeln!(
+            output,
+            "{}    /* No EOF rule for this condition - call yywrap() */",
+            indent
+        )?;
+        writeln!(output, "{}    if (yywrap()) return 0;", indent)?;
+        writeln!(output, "{}    goto yy_scan;", indent)?;
+        writeln!(output, "}}")?;
+    }
     Ok(())
 }
 
@@ -767,19 +728,13 @@ fn write_helper_functions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Re
             r#"/* input - read one character from input */
 static int input(void)
 {{
-    int c;
-    /* First check unput buffer */
-    if (yy_unput_pos > 0) {{
-        return (unsigned char)yy_unput_buf[--yy_unput_pos];
-    }}
-    /* Then check main buffer */
-    if (yy_buffer_pos < yy_buffer_len) {{
-        return (unsigned char)yy_buffer[yy_buffer_pos++];
+    /* Check main buffer - unput() now always inserts directly here */
+    if (YYCURSOR < YYLIMIT) {{
+        return *YYCURSOR++;
     }}
     /* Need to refill buffer */
     if (yyin == NULL) yyin = stdin;
-    c = getc(yyin);
-    return c;  /* Returns EOF (-1) on end of file */
+    return getc(yyin);  /* Returns EOF (-1) on end of file */
 }}
 "#
         )?;
@@ -789,17 +744,45 @@ static int input(void)
     if !lexinfo.options.nounput {
         writeln!(
             output,
-            r#"/* unput - push character back to input */
+            r#"/* unput - push character back to input
+ * Inserts directly into main buffer (not a separate pushback buffer) so the
+ * DFA sees the character immediately on the next scan.
+ * Two paths: (1) if room before YYCURSOR, decrement and store there;
+ *            (2) otherwise, shift buffer contents right to make room at start.
+ */
 static void unput(int c)
 {{
-    if (yy_buffer_pos > 0) {{
-        /* Push back into main buffer if possible */
-        yy_buffer[--yy_buffer_pos] = (char)c;
+    if (YYCURSOR > yy_buffer) {{
+        /* Room before cursor - just back up and insert */
+        *--YYCURSOR = (unsigned char)c;
     }} else {{
-        /* Use pushback buffer */
-        if (yy_unput_pos < YY_BUF_SIZE) {{
-            yy_unput_buf[yy_unput_pos++] = (char)c;
+        /* At start of buffer - need to shift content right to make room */
+        size_t yy_remain = YYLIMIT - yy_buffer;
+        /* Grow buffer if full */
+        if (yy_remain >= yy_buffer_size) {{
+            size_t new_size = yy_buffer_size * 2;
+            size_t cursor_off = YYCURSOR - yy_buffer;
+            size_t limit_off = YYLIMIT - yy_buffer;
+            size_t token_off = YYTOKEN - yy_buffer;
+            size_t marker_off = YYMARKER - yy_buffer;
+            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
+            if (new_buf == NULL) {{
+                fprintf(stderr, "lex: out of memory in unput()\\n");
+                return;
+            }}
+            yy_buffer = new_buf;
+            yy_buffer_size = new_size;
+            YYCURSOR = yy_buffer + cursor_off;
+            YYLIMIT = yy_buffer + limit_off;
+            YYTOKEN = yy_buffer + token_off;
+            YYMARKER = yy_buffer + marker_off;
         }}
+        if (yy_remain > 0) {{
+            memmove(yy_buffer + 1, yy_buffer, yy_remain);
+        }}
+        yy_buffer[0] = (unsigned char)c;
+        YYLIMIT++;
+        /* YYCURSOR stays at yy_buffer, now pointing to inserted char */
     }}
 }}
 "#
@@ -809,642 +792,850 @@ static void unput(int c)
     Ok(())
 }
 
-fn write_yylex_function<W: Write>(
+/// Build a map of equivalence class -> target state for transitions from a DFA state
+fn build_class_transitions(dfa: &Dfa, state: &DfaState) -> BTreeMap<usize, usize> {
+    let mut class_to_target: BTreeMap<usize, usize> = BTreeMap::new();
+
+    for (input, &target) in &state.transitions {
+        let DfaInput::Char(ch) = input;
+        let ch_code = *ch as u32;
+        if ch_code < 256 {
+            let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
+            class_to_target.insert(class_idx, target);
+        }
+    }
+
+    class_to_target
+}
+
+/// Write a single DFA state as a labeled block with switch-based transitions
+fn write_dfa_state<W: Write>(
     output: &mut W,
-    _dfa: &Dfa,
+    dfa: &Dfa,
+    state_idx: usize,
+    state: &DfaState,
+    config: &CodeGenConfig,
+    flags: &FeatureFlags,
+) -> io::Result<()> {
+    writeln!(output, "yy_state_{}:", state_idx)?;
+
+    // If this is an accepting state, save marker position and state info
+    if let Some(rule) = state.accepting {
+        writeln!(output, "    /* Accepting state for rule {} */", rule)?;
+        writeln!(output, "    YYMARKER = YYCURSOR;")?;
+        writeln!(output, "    yyaccept = {};", rule)?;
+        writeln!(output, "    yy_full_match_state = {};", state_idx)?;
+        // Push to REJECT history stack for shorter match fallback
+        if flags.has_reject {
+            writeln!(output, "    if (yy_reject_top < YY_REJECT_STACK_SIZE) {{")?;
+            writeln!(
+                output,
+                "        yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
+            )?;
+            writeln!(
+                output,
+                "        yy_reject_stack[yy_reject_top].state = {};",
+                state_idx
+            )?;
+            writeln!(
+                output,
+                "        yy_reject_stack[yy_reject_top].rule_idx = 0;"
+            )?;
+            writeln!(output, "        yy_reject_top++;")?;
+            writeln!(output, "    }}")?;
+        }
+    }
+
+    // Track main pattern end for variable-length trailing context
+    if flags.has_var_tc && !state.main_pattern_end_rules.is_empty() {
+        let rule = state.main_pattern_end_rules[0];
+        if rule < config.rule_metadata.len()
+            && config.rule_metadata[rule].has_variable_trailing_context
+        {
+            writeln!(output, "    /* Main pattern ends here for rule {} */", rule)?;
+            writeln!(output, "    yy_main_end_ptr = YYCURSOR;")?;
+            writeln!(output, "    yy_main_end_rule = {};", rule)?;
+        }
+    }
+
+    // Check for end of input - save state for resume after refill
+    writeln!(
+        output,
+        "    if (YYCURSOR >= YYLIMIT) {{ yy_resume_state = {}; goto yy_fill_or_eof; }}",
+        state_idx
+    )?;
+
+    // Read next character and switch on equivalence class
+    writeln!(output, "    switch (yy_ec[*YYCURSOR++]) {{")?;
+
+    // Get transitions grouped by equivalence class
+    let transitions = build_class_transitions(dfa, state);
+
+    for (class, target) in &transitions {
+        writeln!(output, "        case {}: goto yy_state_{};", class, target)?;
+    }
+
+    writeln!(output, "        default: goto yy_fail;")?;
+    writeln!(output, "    }}")?;
+    writeln!(output)?;
+
+    Ok(())
+}
+
+/// Write the direct-coded yylex function
+fn write_yylex_direct_coded<W: Write>(
+    output: &mut W,
+    dfa: &Dfa,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
-    table_format: TableFormat,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
-    let has_start_conditions = config.start_conditions.len() > 1;
+    // Use pre-computed flags
+    let has_start_conditions = flags.has_start_conditions;
+    let has_bol_anchors = flags.has_bol_anchors;
+    let has_trailing_context = flags.has_trailing_context;
+    let has_var_tc = flags.has_var_tc;
+    let eof_rules = &flags.eof_rules;
+    let has_reject = flags.has_reject;
 
-    writeln!(output, "/* The main lexer function */")?;
+    writeln!(output, "/* The main lexer function - direct coded */")?;
     writeln!(output, "int yylex(void)")?;
     writeln!(output, "{{")?;
 
-    // Local variables
-    writeln!(output, "    int yy_current_state;")?;
-    writeln!(output, "    int yy_act;")?;
-    writeln!(output, "    int yy_cp;")?;
-    writeln!(output, "    int yy_last_accepting_state;")?;
-    writeln!(output, "    int yy_last_accepting_cpos;")?;
-    writeln!(output, "    int yy_i;")?;
-    writeln!(output)?;
-
-    // Initialize yyin/yyout if needed
+    // Initialize yyin/yyout
     writeln!(output, "    if (yyin == NULL) yyin = stdin;")?;
     writeln!(output, "    if (yyout == NULL) yyout = stdout;")?;
     writeln!(output)?;
 
-    // Main scanning loop
-    writeln!(output, "    while (1) {{")?;
+    // Initialize buffer on first call
+    writeln!(output, "    /* Initialize buffers on first call */")?;
+    writeln!(output, "    if (yy_buffer == NULL) {{")?;
+    writeln!(output, "        yy_buffer_size = YY_BUF_SIZE;")?;
+    writeln!(
+        output,
+        "        yy_buffer = (unsigned char *)malloc(yy_buffer_size + 2);"
+    )?;
+    writeln!(output, "        if (yy_buffer == NULL) {{")?;
+    writeln!(
+        output,
+        "            fprintf(stderr, \"lex: out of memory for input buffer\\n\");"
+    )?;
+    writeln!(output, "            return -1;")?;
+    writeln!(output, "        }}")?;
+    writeln!(output, "        YYCURSOR = yy_buffer;")?;
+    writeln!(output, "        YYLIMIT = yy_buffer;")?;
+    writeln!(output, "        YYTOKEN = yy_buffer;")?;
+    writeln!(output, "        YYMARKER = yy_buffer;")?;
+    if config.yytext_is_pointer {
+        writeln!(output, "        yy_yytext_size = YY_BUF_SIZE;")?;
+        writeln!(
+            output,
+            "        yy_yytext_buf = (char *)malloc(yy_yytext_size + 1);"
+        )?;
+        writeln!(output, "        if (yy_yytext_buf == NULL) {{")?;
+        writeln!(
+            output,
+            "            fprintf(stderr, \"lex: out of memory for yytext buffer\\n\");"
+        )?;
+        writeln!(output, "            free(yy_buffer);")?;
+        writeln!(output, "            yy_buffer = NULL;")?;
+        writeln!(output, "            return -1;")?;
+        writeln!(output, "        }}")?;
+        writeln!(output, "        yytext = yy_yytext_buf;")?;
+    }
+    writeln!(output, "    }}")?;
+    writeln!(output)?;
 
-    // User code from indented lines before first rule (runs at start of each yylex call)
-    // Per POSIX: "Any such input preceding the first rule may be used to specify
-    // user code that is executed upon entry to yylex()"
-    // This must be inside the while(1) loop to run on every call to yylex()
+    // Main scanning loop entry point
+    writeln!(output, "yy_scan:")?;
+
+    // User code from indented lines before first rule
     if !lexinfo.internal_defs.is_empty() {
         writeln!(
             output,
-            "        /* User code from rules section (runs on each yylex call) */"
+            "    /* User code from rules section (runs on each yylex call) */"
         )?;
         for line in &lexinfo.internal_defs {
-            write!(output, "        {}", line)?;
+            write!(output, "    {}", line)?;
         }
         writeln!(output)?;
     }
 
-    // Find the EOF rule index (if any)
-    let eof_rule_idx = lexinfo.rules.iter().position(|r| r.is_eof);
+    // Buffer refill check
+    writeln!(output, "    /* Check if buffer needs refill */")?;
+    writeln!(output, "    if (YYCURSOR >= YYLIMIT) {{")?;
+    writeln!(output, "        int yy_result;")?;
+    writeln!(
+        output,
+        "        /* unput() inserts directly into buffer, no separate drain needed */"
+    )?;
+    writeln!(
+        output,
+        "        YY_INPUT(yy_buffer, yy_result, (int)yy_buffer_size);"
+    )?;
+    writeln!(output, "        YYLIMIT = yy_buffer + yy_result;")?;
+    writeln!(output, "        YYCURSOR = yy_buffer;")?;
+    writeln!(output, "        if (yy_result == 0) {{")?;
 
-    // Read input if buffer is empty or depleted
-    writeln!(output, "        /* Fill buffer if needed */")?;
-    writeln!(output, "        if (yy_buffer_pos >= yy_buffer_len) {{")?;
-    writeln!(output, "            int unput_chars = 0;")?;
-    writeln!(output, "            /* First drain any unput buffer */")?;
-    writeln!(output, "            if (yy_unput_pos > 0) {{")?;
-    writeln!(output, "                int i;")?;
-    writeln!(output, "                unput_chars = yy_unput_pos;")?;
-    writeln!(
-        output,
-        "                for (i = 0; i < yy_unput_pos; i++) {{"
-    )?;
-    writeln!(
-        output,
-        "                    yy_buffer[i] = yy_unput_buf[yy_unput_pos - 1 - i];"
-    )?;
-    writeln!(output, "                }}")?;
-    writeln!(output, "                yy_unput_pos = 0;")?;
-    writeln!(output, "            }}")?;
-    writeln!(
-        output,
-        "            /* Then fill rest of buffer from input */"
-    )?;
-    writeln!(output, "            {{")?;
-    writeln!(output, "                int result;")?;
-    writeln!(
-        output,
-        "                YY_INPUT(yy_buffer + unput_chars, result, YY_BUF_SIZE - unput_chars);"
-    )?;
-    writeln!(
-        output,
-        "                if (result == 0 && unput_chars == 0) {{"
-    )?;
+    // Handle EOF with start condition awareness
+    write_eof_dispatch(output, eof_rules, config, "            ")?;
+    writeln!(output, "        }}")?;
+    writeln!(output, "    }}")?;
+    writeln!(output)?;
 
-    // If there's an EOF rule, execute it every time we hit EOF
-    // The user's <<EOF>> rule is responsible for eventually allowing yywrap to be called
-    // (typically by setting a flag that causes return 0 in internal definitions code)
-    if let Some(idx) = eof_rule_idx {
+    // Initialize for new token
+    writeln!(output, "    /* Initialize for new token */")?;
+    writeln!(output, "    YYTOKEN = YYCURSOR;")?;
+    writeln!(output, "    yyaccept = -1;")?;
+    writeln!(output, "    yy_reject_flag = 0;")?;
+    writeln!(output, "    yy_full_match_state = 0;")?;
+    writeln!(output, "    yy_full_match_rule_idx = 0;")?;
+    if has_reject {
         writeln!(
             output,
-            "                    /* EOF reached - execute <<EOF>> rule */"
+            "    yy_reject_top = 0; /* Reset REJECT history stack */"
         )?;
-        writeln!(output, "                    yyleng = 0;")?;
-        writeln!(output, "                    yytext[0] = '\\0';")?;
-        writeln!(
-            output,
-            "                    yy_act = {}; /* EOF rule */",
-            idx
-        )?;
-        writeln!(output, "                    goto yy_do_action;")?;
+    }
+    if has_var_tc {
+        writeln!(output, "    yy_main_end_ptr = YYCURSOR;")?;
+        writeln!(output, "    yy_main_end_rule = -1;")?;
+    }
+    // Save BOL status at token start (for BOL anchor validation)
+    if has_bol_anchors {
+        writeln!(output, "    int yy_token_started_at_bol = yy_at_bol;")?;
+    }
+    writeln!(output)?;
+
+    // Start condition dispatch
+    if has_start_conditions {
+        writeln!(output, "    /* Dispatch based on start condition */")?;
+        writeln!(output, "    switch (yy_start_state) {{")?;
+        for (idx, name) in config.start_conditions.iter().enumerate() {
+            // For now, all start conditions share state 0
+            // A more sophisticated implementation would have separate start states
+            writeln!(
+                output,
+                "        case {}: /* {} */ goto yy_state_0;",
+                idx, name
+            )?;
+        }
+        writeln!(output, "        default: goto yy_state_0;")?;
+        writeln!(output, "    }}")?;
     } else {
-        writeln!(
-            output,
-            "                    /* EOF - call yywrap() per POSIX */"
-        )?;
-        writeln!(output, "                    if (yywrap()) {{")?;
-        writeln!(
-            output,
-            "                        return 0; /* yywrap returned non-zero, stop */"
-        )?;
-        writeln!(output, "                    }}")?;
-        writeln!(
-            output,
-            "                    /* yywrap returned 0, continue with new input */"
-        )?;
-        writeln!(output, "                    continue;")?;
+        writeln!(output, "    goto yy_state_0;")?;
     }
-    writeln!(output, "                }}")?;
+    writeln!(output)?;
+
+    // Generate all DFA states
+    for (state_idx, state) in dfa.states.iter().enumerate() {
+        write_dfa_state(output, dfa, state_idx, state, config, flags)?;
+    }
+
+    // YYFILL/EOF block
+    writeln!(output, "yy_fill_or_eof:")?;
+    writeln!(output, "    /* End of buffer reached during scan */")?;
     writeln!(
         output,
-        "                yy_buffer_len = unput_chars + result;"
+        "    /* Try to refill buffer - may find longer match */"
     )?;
-    writeln!(output, "                yy_buffer_pos = 0;")?;
-    writeln!(output, "            }}")?;
-    writeln!(output, "        }}")?;
-    writeln!(output)?;
-
-    // Reset REJECT tracking for new match
-    writeln!(output, "        /* Reset REJECT tracking */")?;
-    writeln!(output, "        yy_reject_flag = 0;")?;
-    writeln!(output, "        yy_full_match_rule_idx = 0;")?;
-    writeln!(output)?;
-
-    // Reset variable-length trailing context tracking
-    let has_var_tc = config
-        .rule_metadata
-        .iter()
-        .any(|m| m.has_variable_trailing_context);
+    writeln!(output, "    {{")?;
+    writeln!(output, "        int yy_result;")?;
+    writeln!(
+        output,
+        "        /* Save current offsets relative to buffer */"
+    )?;
+    writeln!(output, "        int yy_token_offset = YYTOKEN - yy_buffer;")?;
+    writeln!(
+        output,
+        "        int yy_cursor_offset = YYCURSOR - yy_buffer;"
+    )?;
+    writeln!(
+        output,
+        "        int yy_marker_offset = YYMARKER - yy_buffer;"
+    )?;
     if has_var_tc {
         writeln!(
             output,
-            "        /* Reset variable-length trailing context tracking */"
+            "        int yy_main_end_offset = yy_main_end_ptr ? (int)(yy_main_end_ptr - yy_buffer) : -1;"
         )?;
-        writeln!(output, "        yy_main_end_pos = yy_buffer_pos;")?;
-        writeln!(output, "        yy_main_end_rule = -1;")?;
-        writeln!(output)?;
     }
-
-    // Start from initial state (DFA state 0)
-    writeln!(output, "        yy_current_state = 0;")?;
-    writeln!(output, "        yy_cp = yy_buffer_pos;")?;
-    writeln!(output, "        yy_last_accepting_state = -1;")?;
-    writeln!(output, "        yy_last_accepting_cpos = yy_buffer_pos;")?;
-    writeln!(output)?;
-
-    // DFA simulation
-    writeln!(output, "        /* Run DFA until no more transitions */")?;
-    writeln!(output, "        while (yy_cp < yy_buffer_len) {{")?;
     writeln!(
         output,
-        "            unsigned char yy_c = (unsigned char)yy_buffer[yy_cp];"
+        "        /* Shift remaining data to start of buffer */"
     )?;
-    writeln!(output, "            int yy_class = yy_ec[yy_c];")?;
-
-    // Generate lookup code based on table format
-    // Note: Auto is resolved to Dense or Compressed in generate() before calling this function
-    match table_format {
-        TableFormat::Dense => {
-            writeln!(
-                output,
-                "            int yy_next = yy_nxt[yy_current_state][yy_class];"
-            )?;
-        }
-        TableFormat::Compressed | TableFormat::Auto => {
-            writeln!(
-                output,
-                "            int yy_idx = yy_base[yy_current_state] + yy_class;"
-            )?;
-            writeln!(output, "            int yy_next;")?;
-            writeln!(
-                output,
-                "            if (yy_idx >= 0 && yy_idx < YY_NXT_SIZE && yy_chk[yy_idx] == yy_current_state)"
-            )?;
-            writeln!(output, "                yy_next = yy_nxt[yy_idx];")?;
-            writeln!(output, "            else")?;
-            writeln!(
-                output,
-                "                yy_next = yy_default[yy_current_state];"
-            )?;
-        }
-    }
-    writeln!(output)?;
-    writeln!(output, "            if (yy_next < 0) {{")?;
+    writeln!(output, "        int yy_remain = (int)(YYLIMIT - YYTOKEN);")?;
+    // Dynamic buffer growth: if token approaches buffer size, grow the buffer
     writeln!(
         output,
-        "                /* No transition - check if current state accepts */"
+        "        /* Grow buffer if token is getting too long */"
     )?;
     writeln!(
         output,
-        "                if (yy_accept[yy_current_state] >= 0) {{"
+        "        if (YYTOKEN == yy_buffer && (size_t)yy_remain >= yy_buffer_size - 256) {{"
+    )?;
+    writeln!(output, "            size_t new_size = yy_buffer_size * 2;")?;
+    writeln!(output, "            /* Save offsets before realloc */")?;
+    writeln!(
+        output,
+        "            size_t cursor_off = YYCURSOR - yy_buffer;"
     )?;
     writeln!(
         output,
-        "                    yy_last_accepting_state = yy_current_state;"
+        "            size_t token_off = YYTOKEN - yy_buffer;"
     )?;
     writeln!(
         output,
-        "                    yy_last_accepting_cpos = yy_cp;"
-    )?;
-    writeln!(output, "                }}")?;
-    writeln!(output, "                break;")?;
-    writeln!(output, "            }}")?;
-    writeln!(output)?;
-    writeln!(output, "            yy_current_state = yy_next;")?;
-    writeln!(output, "            yy_cp++;")?;
-    writeln!(output)?;
-    writeln!(output, "            /* Track accepting states as we go */")?;
-    writeln!(
-        output,
-        "            if (yy_accept[yy_current_state] >= 0) {{"
+        "            size_t marker_off = YYMARKER - yy_buffer;"
     )?;
     writeln!(
         output,
-        "                yy_last_accepting_state = yy_current_state;"
+        "            size_t limit_off = YYLIMIT - yy_buffer;"
     )?;
-    writeln!(output, "                yy_last_accepting_cpos = yy_cp;")?;
-    writeln!(output, "            }}")?;
-
-    // Track main pattern end for variable-length trailing context
     if has_var_tc {
-        writeln!(output)?;
         writeln!(
             output,
-            "            /* Track main pattern end for variable-length trailing context */"
+            "            size_t main_end_off = yy_main_end_ptr ? (size_t)(yy_main_end_ptr - yy_buffer) : 0;"
         )?;
-        writeln!(output, "            {{")?;
-        writeln!(
-            output,
-            "                short yy_me_rule = yy_state_main_end[yy_current_state];"
-        )?;
-        writeln!(
-            output,
-            "                if (yy_me_rule >= 0 && yy_rule_var_tc[yy_me_rule]) {{"
-        )?;
-        writeln!(
-            output,
-            "                    /* This state marks end of main pattern for a var TC rule */"
-        )?;
-        writeln!(output, "                    yy_main_end_pos = yy_cp;")?;
-        writeln!(output, "                    yy_main_end_rule = yy_me_rule;")?;
-        writeln!(output, "                }}")?;
-        writeln!(output, "            }}")?;
     }
-
+    writeln!(
+        output,
+        "            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);"
+    )?;
+    writeln!(output, "            if (new_buf == NULL) {{")?;
+    writeln!(
+        output,
+        "                fprintf(stderr, \"lex: out of memory growing buffer to %zu bytes\\n\", new_size);"
+    )?;
+    writeln!(output, "                return -1;")?;
+    writeln!(output, "            }}")?;
+    writeln!(output, "            yy_buffer = new_buf;")?;
+    writeln!(output, "            yy_buffer_size = new_size;")?;
+    writeln!(output, "            YYCURSOR = yy_buffer + cursor_off;")?;
+    writeln!(output, "            YYTOKEN = yy_buffer + token_off;")?;
+    writeln!(output, "            YYMARKER = yy_buffer + marker_off;")?;
+    writeln!(output, "            YYLIMIT = yy_buffer + limit_off;")?;
+    if has_var_tc {
+        writeln!(
+            output,
+            "            if (main_end_off) yy_main_end_ptr = yy_buffer + main_end_off;"
+        )?;
+    }
     writeln!(output, "        }}")?;
+    writeln!(
+        output,
+        "        /* Move unscanned data to buffer start; skip if yy_remain==0 (nothing to preserve) */"
+    )?;
+    writeln!(
+        output,
+        "        if (yy_remain > 0 && YYTOKEN > yy_buffer) {{"
+    )?;
+    writeln!(
+        output,
+        "            memmove(yy_buffer, YYTOKEN, yy_remain);"
+    )?;
+    writeln!(output, "        }}")?;
+    writeln!(
+        output,
+        "        YY_INPUT(yy_buffer + yy_remain, yy_result, (int)(yy_buffer_size - yy_remain));"
+    )?;
+    writeln!(output, "        if (yy_result == 0) {{")?;
+    writeln!(
+        output,
+        "            /* True EOF - no more input available */"
+    )?;
+    writeln!(output, "            if (yy_remain == 0) {{")?;
+    writeln!(
+        output,
+        "                /* Buffer completely empty - handle EOF */"
+    )?;
+    write_eof_dispatch(output, eof_rules, config, "                ")?;
+    writeln!(output, "            }}")?;
+    writeln!(
+        output,
+        "            /* Have remaining data - finalize with current match */"
+    )?;
+    writeln!(output, "            YYLIMIT = yy_buffer + yy_remain;")?;
+    writeln!(output, "            YYTOKEN = yy_buffer;")?;
+    writeln!(
+        output,
+        "            YYCURSOR = yy_buffer + (yy_cursor_offset - yy_token_offset);"
+    )?;
+    writeln!(
+        output,
+        "            YYMARKER = yy_buffer + (yy_marker_offset - yy_token_offset);"
+    )?;
+    if has_var_tc {
+        writeln!(
+            output,
+            "            yy_main_end_ptr = (yy_main_end_offset >= 0) ? yy_buffer + (yy_main_end_offset - yy_token_offset) : NULL;"
+        )?;
+    }
+    writeln!(output, "            if (yyaccept >= 0) {{")?;
+    writeln!(output, "                goto yy_fail;")?;
+    writeln!(output, "            }}")?;
+    writeln!(
+        output,
+        "            /* No match - default action on remaining */"
+    )?;
+    writeln!(output, "            yy_at_bol = (*YYTOKEN == '\\n');")?;
+    writeln!(output, "            putc(*YYTOKEN++, yyout);")?;
+    writeln!(output, "            YYCURSOR = YYTOKEN;")?;
+    writeln!(output, "            goto yy_scan;")?;
+    writeln!(output, "        }}")?;
+    writeln!(
+        output,
+        "        /* Refill succeeded - adjust pointers and resume scanning */"
+    )?;
+    writeln!(
+        output,
+        "        YYLIMIT = yy_buffer + yy_remain + yy_result;"
+    )?;
+    writeln!(output, "        YYTOKEN = yy_buffer;")?;
+    writeln!(
+        output,
+        "        YYCURSOR = yy_buffer + (yy_cursor_offset - yy_token_offset);"
+    )?;
+    writeln!(
+        output,
+        "        YYMARKER = yy_buffer + (yy_marker_offset - yy_token_offset);"
+    )?;
+    if has_var_tc {
+        writeln!(
+            output,
+            "        yy_main_end_ptr = (yy_main_end_offset >= 0) ? yy_buffer + (yy_main_end_offset - yy_token_offset) : NULL;"
+        )?;
+    }
+    writeln!(
+        output,
+        "        /* Resume scanning from the DFA state that hit buffer end */"
+    )?;
+    writeln!(output, "        switch (yy_resume_state) {{")?;
+    for state_idx in 0..dfa.states.len() {
+        writeln!(
+            output,
+            "            case {}: goto yy_state_{};",
+            state_idx, state_idx
+        )?;
+    }
+    writeln!(output, "            default: goto yy_state_0;")?;
+    writeln!(output, "        }}")?;
+    writeln!(output, "    }}")?;
     writeln!(output)?;
 
-    // Save full match info for REJECT
-    writeln!(output, "        /* Save full match info for REJECT */")?;
+    // YYFAIL block - handle match or default action
+    writeln!(output, "yy_fail:")?;
+    // Only generate yy_find_next_match label if any rule uses REJECT
+    if has_reject {
+        writeln!(output, "yy_find_next_match:")?;
+    }
+    writeln!(output, "    /* Match failed or end of automaton reached */")?;
+    writeln!(output, "    if (yyaccept < 0) {{")?;
     writeln!(
         output,
-        "        yy_full_match_state = yy_last_accepting_state;"
+        "        /* No match - default action (ECHO one char) */"
     )?;
-    writeln!(
-        output,
-        "        yy_full_match_pos = yy_last_accepting_cpos;"
-    )?;
+    writeln!(output, "        if (YYTOKEN < YYLIMIT) {{")?;
+    writeln!(output, "            yy_at_bol = (*YYTOKEN == '\\n');")?;
+    writeln!(output, "            putc(*YYTOKEN++, yyout);")?;
+    writeln!(output, "            YYCURSOR = YYTOKEN;")?;
+    writeln!(output, "            goto yy_scan;")?;
+    writeln!(output, "        }}")?;
+    writeln!(output, "        /* EOF - consult yywrap() */")?;
+    writeln!(output, "        if (yywrap()) return 0;")?;
+    writeln!(output, "        goto yy_scan;")?;
+    writeln!(output, "    }}")?;
     writeln!(output)?;
 
-    // Label for REJECT to jump to
-    writeln!(output, "    yy_find_next_match:")?;
-
-    // Check final state
-    writeln!(output, "        /* Determine action */")?;
-    writeln!(output, "        if (yy_last_accepting_state >= 0) {{")?;
-
-    // Handle REJECT - find next rule at current position or fall back to shorter match
-    writeln!(
-        output,
-        "            /* Find the rule to execute (handling REJECT) */"
-    )?;
-    writeln!(output, "            yy_act = -1;")?;
-    writeln!(
-        output,
-        "            for (yy_i = yy_accept_idx[yy_last_accepting_state]; yy_i < yy_accept_idx[yy_last_accepting_state + 1]; yy_i++) {{"
-    )?;
-    writeln!(
-        output,
-        "                int yy_rule = yy_accept_list[yy_i];"
-    )?;
-    writeln!(
-        output,
-        "                if (yy_rule > yy_full_match_rule_idx || (yy_reject_flag == 0 && yy_rule >= yy_full_match_rule_idx)) {{"
-    )?;
-
-    // Check if any rules have BOL anchors
-    let has_bol_anchors = config.rule_metadata.iter().any(|m| m.bol_anchor);
-
-    if has_start_conditions || has_bol_anchors {
-        writeln!(output, "                    int yy_rule_ok = 1;")?;
+    // REJECT support with shorter match fallback - only generate if any rule uses REJECT
+    if has_reject {
+        writeln!(
+            output,
+            "    /* REJECT support: find next valid rule, trying shorter matches if needed */"
+        )?;
+        writeln!(output, "    if (yy_reject_flag) {{")?;
+        writeln!(output, "        int yy_found = 0;")?;
+        writeln!(
+            output,
+            "        /* First try alternate rules at current position */"
+        )?;
+        writeln!(output, "        {{")?;
+        writeln!(output, "            int yy_i;")?;
+        writeln!(
+            output,
+            "            int yy_start_idx = yy_accept_idx[yy_full_match_state];"
+        )?;
+        writeln!(
+            output,
+            "            int yy_end_idx = yy_accept_idx[yy_full_match_state + 1];"
+        )?;
+        writeln!(output, "            int yy_skip_until_after = yyaccept;")?;
+        writeln!(output, "            int yy_skipping = 1;")?;
+        writeln!(
+            output,
+            "            for (yy_i = yy_start_idx; yy_i < yy_end_idx; yy_i++) {{"
+        )?;
+        writeln!(
+            output,
+            "                int yy_rule = yy_accept_list[yy_i];"
+        )?;
+        writeln!(
+            output,
+            "                if (yy_skipping) {{ if (yy_rule == yy_skip_until_after) yy_skipping = 0; continue; }}"
+        )?;
         if has_start_conditions {
             writeln!(
                 output,
-                "                    /* Check if rule is active in current start condition */"
+                "                if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
             )?;
-            writeln!(
-                output,
-                "                    if (yy_rule >= YY_NUM_RULES || !yy_rule_cond[yy_rule][yy_start_state]) {{"
-            )?;
-            writeln!(output, "                        yy_rule_ok = 0;")?;
-            writeln!(output, "                    }}")?;
         }
         if has_bol_anchors {
             writeln!(
                 output,
-                "                    /* Check if rule requires beginning of line */"
-            )?;
-            writeln!(
-                output,
-                "                    if (yy_rule_ok && yy_rule < YY_NUM_RULES && yy_rule_bol[yy_rule] && !yy_at_bol) {{"
-            )?;
-            writeln!(output, "                        yy_rule_ok = 0;")?;
-            writeln!(output, "                    }}")?;
-        }
-        writeln!(output, "                    if (yy_rule_ok) {{")?;
-        writeln!(output, "                        yy_act = yy_rule;")?;
-        writeln!(output, "                        break;")?;
-        writeln!(output, "                    }}")?;
-    } else {
-        writeln!(output, "                    yy_act = yy_rule;")?;
-        writeln!(output, "                    break;")?;
-    }
-    writeln!(output, "                }}")?;
-    writeln!(output, "            }}")?;
-    writeln!(output)?;
-
-    writeln!(output, "            if (yy_act < 0) {{")?;
-    writeln!(
-        output,
-        "                /* No more rules at this position, try shorter match */"
-    )?;
-    writeln!(
-        output,
-        "                if (yy_last_accepting_cpos > yy_buffer_pos + 1) {{"
-    )?;
-    writeln!(
-        output,
-        "                    /* Try matching a shorter string */"
-    )?;
-    writeln!(output, "                    yy_last_accepting_cpos--;")?;
-    writeln!(output, "                    yy_reject_flag = 0;")?;
-    writeln!(output, "                    yy_full_match_rule_idx = 0;")?;
-    writeln!(output)?;
-    writeln!(
-        output,
-        "                    /* Re-run DFA to find accepting state at new position */"
-    )?;
-    writeln!(output, "                    yy_current_state = 0;")?;
-    writeln!(output, "                    yy_last_accepting_state = -1;")?;
-    // Reset variable-length trailing context tracking for re-run
-    if has_var_tc {
-        writeln!(
-            output,
-            "                    yy_main_end_pos = yy_buffer_pos;"
-        )?;
-        writeln!(output, "                    yy_main_end_rule = -1;")?;
-    }
-    writeln!(
-        output,
-        "                    for (yy_cp = yy_buffer_pos; yy_cp < yy_last_accepting_cpos && yy_cp < yy_buffer_len; yy_cp++) {{"
-    )?;
-    writeln!(
-        output,
-        "                        unsigned char yy_c = (unsigned char)yy_buffer[yy_cp];"
-    )?;
-    writeln!(
-        output,
-        "                        int yy_class = yy_ec[yy_c];"
-    )?;
-
-    // Generate lookup code based on table format (same as main loop)
-    match table_format {
-        TableFormat::Dense => {
-            writeln!(
-                output,
-                "                        int yy_next = yy_nxt[yy_current_state][yy_class];"
+                "                if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
             )?;
         }
-        TableFormat::Compressed | TableFormat::Auto => {
-            writeln!(
-                output,
-                "                        int yy_idx = yy_base[yy_current_state] + yy_class;"
-            )?;
-            writeln!(output, "                        int yy_next;")?;
-            writeln!(
-                output,
-                "                        if (yy_idx >= 0 && yy_idx < YY_NXT_SIZE && yy_chk[yy_idx] == yy_current_state)"
-            )?;
-            writeln!(
-                output,
-                "                            yy_next = yy_nxt[yy_idx];"
-            )?;
-            writeln!(output, "                        else")?;
-            writeln!(
-                output,
-                "                            yy_next = yy_default[yy_current_state];"
-            )?;
-        }
-    }
-    writeln!(output, "                        if (yy_next < 0) break;")?;
-    writeln!(
-        output,
-        "                        yy_current_state = yy_next;"
-    )?;
-    writeln!(
-        output,
-        "                        if (yy_accept[yy_current_state] >= 0) {{"
-    )?;
-    writeln!(
-        output,
-        "                            yy_last_accepting_state = yy_current_state;"
-    )?;
-    writeln!(output, "                        }}")?;
-    // Track main pattern end in re-run loop for variable-length trailing context
-    if has_var_tc {
-        writeln!(output, "                        {{")?;
-        writeln!(
-            output,
-            "                            short yy_me_rule = yy_state_main_end[yy_current_state];"
-        )?;
-        writeln!(
-            output,
-            "                            if (yy_me_rule >= 0 && yy_rule_var_tc[yy_me_rule]) {{"
-        )?;
-        writeln!(
-            output,
-            "                                yy_main_end_pos = yy_cp;"
-        )?;
-        writeln!(
-            output,
-            "                                yy_main_end_rule = yy_me_rule;"
-        )?;
-        writeln!(output, "                            }}")?;
-        writeln!(output, "                        }}")?;
-    }
-    writeln!(output, "                    }}")?;
-    writeln!(
-        output,
-        "                    yy_full_match_state = yy_last_accepting_state;"
-    )?;
-    writeln!(
-        output,
-        "                    yy_full_match_pos = yy_last_accepting_cpos;"
-    )?;
-    writeln!(output, "                    goto yy_find_next_match;")?;
-    writeln!(output, "                }}")?;
-    writeln!(
-        output,
-        "                /* No match found - output one character */"
-    )?;
-    writeln!(
-        output,
-        "                yy_at_bol = (yy_buffer[yy_buffer_pos] == '\\n');"
-    )?;
-    writeln!(
-        output,
-        "                putc(yy_buffer[yy_buffer_pos], yyout);"
-    )?;
-    writeln!(output, "                yy_buffer_pos++;")?;
-    writeln!(output, "                continue;")?;
-    writeln!(output, "            }}")?;
-
-    writeln!(output, "            yy_cp = yy_last_accepting_cpos;")?;
-    writeln!(output, "            yy_full_match_rule_idx = yy_act;")?;
-
-    writeln!(output, "        }} else {{")?;
-    writeln!(
-        output,
-        "            /* No match - output one character (default action) */"
-    )?;
-    writeln!(
-        output,
-        "            yy_at_bol = (yy_buffer[yy_buffer_pos] == '\\n');"
-    )?;
-    writeln!(output, "            putc(yy_buffer[yy_buffer_pos], yyout);")?;
-    writeln!(output, "            yy_buffer_pos++;")?;
-    writeln!(output, "            continue;")?;
-    writeln!(output, "        }}")?;
-    writeln!(output)?;
-
-    // Set yytext and yyleng - copy to yytext buffer and null-terminate
-    // Handle yymore() - if flag is set, append to existing yytext
-    writeln!(
-        output,
-        "        /* Set yytext and yyleng (handle yymore) */"
-    )?;
-    writeln!(output, "        if (yy_more_flag) {{")?;
-    writeln!(
-        output,
-        "            /* Append new match to existing yytext */"
-    )?;
-    writeln!(
-        output,
-        "            int yy_new_len = yy_cp - yy_buffer_pos;"
-    )?;
-    writeln!(
-        output,
-        "            memcpy(yytext + yy_more_len, &yy_buffer[yy_buffer_pos], yy_new_len);"
-    )?;
-    writeln!(output, "            yyleng = yy_more_len + yy_new_len;")?;
-    writeln!(output, "            yytext[yyleng] = '\\0';")?;
-    writeln!(output, "            yy_more_flag = 0;")?;
-    writeln!(output, "        }} else {{")?;
-    writeln!(output, "            yyleng = yy_cp - yy_buffer_pos;")?;
-    writeln!(
-        output,
-        "            memcpy(yytext, &yy_buffer[yy_buffer_pos], yyleng);"
-    )?;
-    writeln!(output, "            yytext[yyleng] = '\\0';")?;
-    writeln!(output, "        }}")?;
-    writeln!(
-        output,
-        "        yy_more_len = yyleng; /* Save for potential yymore() */"
-    )?;
-    writeln!(output)?;
-
-    // Handle trailing context - adjust yyleng and yytext, and track adjustment for buffer position
-    let has_trailing_context = config.rule_metadata.iter().any(|m| m.has_trailing_context);
-    if has_trailing_context {
-        writeln!(
-            output,
-            "        /* Handle trailing context - adjust yyleng and buffer position */"
-        )?;
-        writeln!(output, "        int yy_tc_adjustment = 0;")?;
-        writeln!(
-            output,
-            "        if (yy_act >= 0 && yy_act < YY_NUM_RULES) {{"
-        )?;
-        writeln!(
-            output,
-            "            int yy_main_len = yy_rule_main_len[yy_act];"
-        )?;
-        writeln!(output, "            if (yy_main_len >= 0) {{")?;
-        writeln!(
-            output,
-            "                /* Fixed-length main pattern with trailing context */"
-        )?;
-        writeln!(
-            output,
-            "                yy_tc_adjustment = yyleng - yy_main_len;"
-        )?;
-        writeln!(output, "                yyleng = yy_main_len;")?;
-        writeln!(output, "                yytext[yyleng] = '\\0';")?;
-        // Only emit the variable-length trailing context handling if any rule uses it
-        // The yy_main_end_rule and yy_main_end_pos variables are only declared when has_var_tc is true
-        if has_var_tc {
-            writeln!(output, "            }} else if (yy_main_len == -2) {{")?;
-            writeln!(
-                output,
-                "                /* Variable-length main pattern with trailing context */"
-            )?;
-            writeln!(
-                output,
-                "                /* Use tracked main pattern end position */"
-            )?;
-            writeln!(
-                output,
-                "                if (yy_main_end_rule == yy_act && yy_main_end_pos > yy_buffer_pos) {{"
-            )?;
-            writeln!(
-                output,
-                "                    int yy_actual_main_len = yy_main_end_pos - yy_buffer_pos;"
-            )?;
-            writeln!(
-                output,
-                "                    yy_tc_adjustment = yyleng - yy_actual_main_len;"
-            )?;
-            writeln!(output, "                    yyleng = yy_actual_main_len;")?;
-            writeln!(output, "                    yytext[yyleng] = '\\0';")?;
-            writeln!(output, "                }}")?;
-        }
+        writeln!(output, "                yyaccept = yy_rule;")?;
+        writeln!(output, "                yy_found = 1;")?;
+        writeln!(output, "                break;")?;
         writeln!(output, "            }}")?;
         writeln!(output, "        }}")?;
+        writeln!(
+            output,
+            "        /* If not found, try shorter matches from history stack */"
+        )?;
+        writeln!(output, "        while (!yy_found && yy_reject_top > 0) {{")?;
+        writeln!(output, "            yy_reject_top--;")?;
+        writeln!(
+            output,
+            "            YYMARKER = yy_reject_stack[yy_reject_top].marker;"
+        )?;
+        writeln!(
+            output,
+            "            yy_full_match_state = yy_reject_stack[yy_reject_top].state;"
+        )?;
+        writeln!(output, "            {{")?;
+        writeln!(output, "                int yy_i;")?;
+        writeln!(
+            output,
+            "                int yy_start_idx = yy_accept_idx[yy_full_match_state] + yy_reject_stack[yy_reject_top].rule_idx;"
+        )?;
+        writeln!(
+            output,
+            "                int yy_end_idx = yy_accept_idx[yy_full_match_state + 1];"
+        )?;
+        writeln!(
+            output,
+            "                for (yy_i = yy_start_idx; yy_i < yy_end_idx; yy_i++) {{"
+        )?;
+        writeln!(
+            output,
+            "                    int yy_rule = yy_accept_list[yy_i];"
+        )?;
+        if has_start_conditions {
+            writeln!(
+                output,
+                "                    if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
+            )?;
+        }
+        if has_bol_anchors {
+            writeln!(
+                output,
+                "                    if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
+            )?;
+        }
+        writeln!(output, "                    yyaccept = yy_rule;")?;
+        writeln!(
+            output,
+            "                    yy_reject_stack[yy_reject_top].rule_idx = yy_i - yy_accept_idx[yy_full_match_state] + 1;"
+        )?;
+        writeln!(
+            output,
+            "                    yy_reject_top++; /* Keep this entry for next REJECT */"
+        )?;
+        writeln!(output, "                    yy_found = 1;")?;
+        writeln!(output, "                    break;")?;
+        writeln!(output, "                }}")?;
+        writeln!(output, "            }}")?;
+        writeln!(output, "        }}")?;
+        writeln!(output, "        if (!yy_found) {{")?;
+        writeln!(
+            output,
+            "            /* No alternate rule found - do default action (ECHO one char) */"
+        )?;
+        writeln!(output, "            yy_at_bol = (*YYTOKEN == '\\n');")?;
+        writeln!(output, "            putc(*YYTOKEN++, yyout);")?;
+        writeln!(output, "            YYCURSOR = YYTOKEN;")?;
+        writeln!(output, "            goto yy_scan;")?;
+        writeln!(output, "        }}")?;
+        writeln!(output, "        yy_reject_flag = 0;")?;
+        writeln!(output, "    }}")?;
         writeln!(output)?;
     }
 
-    // Update yy_at_bol based on the last character of the matched text
-    writeln!(output, "        /* Update beginning-of-line status */")?;
-    writeln!(output, "        if (yyleng > 0) {{")?;
-    writeln!(
-        output,
-        "            yy_at_bol = (yytext[yyleng - 1] == '\\n');"
-    )?;
-    writeln!(output, "        }}")?;
+    // Rollback to marker and set yytext/yyleng
+    writeln!(output, "    /* Rollback to accepted position */")?;
+    writeln!(output, "    YYCURSOR = YYMARKER;")?;
     writeln!(output)?;
 
-    // Save buffer position for REJECT, then advance
-    // For trailing context, only advance past the main pattern, not the trailing context
+    // Set yytext and yyleng with yymore support
+    writeln!(output, "    /* Set yytext and yyleng (handle yymore) */")?;
+    writeln!(output, "    if (yy_more_flag) {{")?;
     writeln!(
         output,
-        "        /* Save buffer position for REJECT, then advance past matched text */"
+        "        int yy_new_len = (int)(YYCURSOR - YYTOKEN);"
     )?;
-    writeln!(output, "        yy_saved_buffer_pos = yy_buffer_pos;")?;
+    writeln!(
+        output,
+        "        int yy_total_len = yy_more_len + yy_new_len;"
+    )?;
+    // Grow yytext buffer if needed (only for pointer mode)
+    if config.yytext_is_pointer {
+        writeln!(
+            output,
+            "        if ((size_t)yy_total_len >= yy_yytext_size) {{"
+        )?;
+        writeln!(output, "            size_t new_size = yy_yytext_size * 2;")?;
+        writeln!(
+            output,
+            "            while (new_size <= (size_t)yy_total_len) new_size *= 2;"
+        )?;
+        writeln!(
+            output,
+            "            char *new_buf = (char *)realloc(yy_yytext_buf, new_size + 1);"
+        )?;
+        writeln!(output, "            if (new_buf == NULL) {{")?;
+        writeln!(
+            output,
+            "                fprintf(stderr, \"lex: out of memory growing yytext to %zu bytes\\n\", new_size);"
+        )?;
+        writeln!(output, "                return -1;")?;
+        writeln!(output, "            }}")?;
+        writeln!(output, "            yy_yytext_buf = new_buf;")?;
+        writeln!(output, "            yytext = new_buf;")?;
+        writeln!(output, "            yy_yytext_size = new_size;")?;
+        writeln!(output, "        }}")?;
+    }
+    writeln!(
+        output,
+        "        memcpy(yytext + yy_more_len, YYTOKEN, yy_new_len);"
+    )?;
+    writeln!(output, "        yyleng = yy_total_len;")?;
+    writeln!(output, "        yytext[yyleng] = '\\0';")?;
+    writeln!(output, "        yy_more_flag = 0;")?;
+    writeln!(output, "    }} else {{")?;
+    writeln!(output, "        yyleng = (int)(YYCURSOR - YYTOKEN);")?;
+    // Grow yytext buffer if needed (only for pointer mode)
+    if config.yytext_is_pointer {
+        writeln!(output, "        if ((size_t)yyleng >= yy_yytext_size) {{")?;
+        writeln!(output, "            size_t new_size = yy_yytext_size * 2;")?;
+        writeln!(
+            output,
+            "            while (new_size <= (size_t)yyleng) new_size *= 2;"
+        )?;
+        writeln!(
+            output,
+            "            char *new_buf = (char *)realloc(yy_yytext_buf, new_size + 1);"
+        )?;
+        writeln!(output, "            if (new_buf == NULL) {{")?;
+        writeln!(
+            output,
+            "                fprintf(stderr, \"lex: out of memory growing yytext to %zu bytes\\n\", new_size);"
+        )?;
+        writeln!(output, "                return -1;")?;
+        writeln!(output, "            }}")?;
+        writeln!(output, "            yy_yytext_buf = new_buf;")?;
+        writeln!(output, "            yytext = new_buf;")?;
+        writeln!(output, "            yy_yytext_size = new_size;")?;
+        writeln!(output, "        }}")?;
+    }
+    writeln!(output, "        memcpy(yytext, YYTOKEN, yyleng);")?;
+    writeln!(output, "        yytext[yyleng] = '\\0';")?;
+    writeln!(output, "    }}")?;
+    writeln!(output)?;
+
+    // Note: Trailing context, yy_more_len, and BOL update moved to AFTER rule selection
+    // to ensure they use the finalized yyaccept value (Bug C fix)
+
+    // Start condition and BOL anchor validation
+    if has_start_conditions || has_bol_anchors {
+        writeln!(
+            output,
+            "    /* Validate rule against current start condition and BOL */"
+        )?;
+        // Note: removed yy_validate_rule: label as it was unused (no gotos to it)
+        if has_start_conditions {
+            writeln!(
+                output,
+                "    if (yyaccept >= 0 && !yy_rule_cond[yyaccept][yy_start_state]) {{"
+            )?;
+            writeln!(
+                output,
+                "        /* Rule not valid in current start condition */"
+            )?;
+            writeln!(output, "        goto yy_try_alternate_rule;")?;
+            writeln!(output, "    }}")?;
+        }
+        if has_bol_anchors {
+            writeln!(
+                output,
+                "    if (yyaccept >= 0 && yy_rule_bol[yyaccept] && !yy_token_started_at_bol) {{"
+            )?;
+            writeln!(
+                output,
+                "        /* BOL rule but not at beginning of line */"
+            )?;
+            writeln!(output, "        goto yy_try_alternate_rule;")?;
+            writeln!(output, "    }}")?;
+        }
+        writeln!(output, "    goto yy_execute_action;")?;
+        writeln!(output)?;
+
+        // Try alternate rule (find next rule in accepting list)
+        writeln!(output, "yy_try_alternate_rule:")?;
+        writeln!(output, "    {{")?;
+        writeln!(
+            output,
+            "        /* Find next valid rule at this position */"
+        )?;
+        writeln!(output, "        int yy_found = 0;")?;
+        writeln!(output, "        int yy_i;")?;
+        writeln!(
+            output,
+            "        int yy_start_idx = yy_accept_idx[yy_full_match_state];"
+        )?;
+        writeln!(
+            output,
+            "        int yy_end_idx = yy_accept_idx[yy_full_match_state + 1];"
+        )?;
+        writeln!(output, "        int yy_skip_until_after = yyaccept;")?;
+        writeln!(output, "        int yy_skipping = 1;")?;
+        writeln!(
+            output,
+            "        for (yy_i = yy_start_idx; yy_i < yy_end_idx; yy_i++) {{"
+        )?;
+        writeln!(output, "            int yy_rule = yy_accept_list[yy_i];")?;
+        writeln!(
+            output,
+            "            if (yy_skipping) {{ if (yy_rule == yy_skip_until_after) yy_skipping = 0; continue; }}"
+        )?;
+        if has_start_conditions {
+            writeln!(
+                output,
+                "            if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
+            )?;
+        }
+        if has_bol_anchors {
+            writeln!(
+                output,
+                "            if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
+            )?;
+        }
+        writeln!(output, "            yyaccept = yy_rule;")?;
+        writeln!(output, "            yy_found = 1;")?;
+        writeln!(output, "            break;")?;
+        writeln!(output, "        }}")?;
+        writeln!(output, "        if (yy_found) {{")?;
+        writeln!(output, "            goto yy_execute_action;")?;
+        writeln!(output, "        }}")?;
+        writeln!(
+            output,
+            "        /* No valid rule found - do default action (ECHO one char) */"
+        )?;
+        writeln!(output, "        yy_at_bol = (*YYTOKEN == '\\n');")?;
+        writeln!(output, "        putc(*YYTOKEN++, yyout);")?;
+        writeln!(output, "        YYCURSOR = YYTOKEN;")?;
+        writeln!(output, "        goto yy_scan;")?;
+        writeln!(output, "    }}")?;
+        writeln!(output)?;
+
+        writeln!(output, "yy_execute_action:")?;
+    }
+
+    // Handle trailing context AFTER rule selection is finalized (Bug C fix)
+    // This ensures we use the correct yyaccept value even after alternate rule selection
     if has_trailing_context {
-        writeln!(output, "        yy_buffer_pos = yy_cp - yy_tc_adjustment;")?;
-    } else {
-        writeln!(output, "        yy_buffer_pos = yy_cp;")?;
+        writeln!(output, "    /* Handle trailing context - adjust yyleng */")?;
+        writeln!(
+            output,
+            "    if (yyaccept >= 0 && yyaccept < YY_NUM_RULES) {{"
+        )?;
+        writeln!(
+            output,
+            "        int yy_main_len = yy_rule_main_len[yyaccept];"
+        )?;
+        writeln!(output, "        if (yy_main_len >= 0) {{")?;
+        writeln!(output, "            /* Fixed-length main pattern */")?;
+        writeln!(output, "            YYCURSOR = YYTOKEN + yy_main_len;")?;
+        writeln!(output, "            yyleng = yy_main_len;")?;
+        writeln!(output, "            yytext[yyleng] = '\\0';")?;
+        if has_var_tc {
+            writeln!(output, "        }} else if (yy_main_len == -2) {{")?;
+            writeln!(output, "            /* Variable-length main pattern */")?;
+            writeln!(
+                output,
+                "            if (yy_main_end_rule == yyaccept && yy_main_end_ptr > YYTOKEN) {{"
+            )?;
+            writeln!(output, "                YYCURSOR = yy_main_end_ptr;")?;
+            writeln!(
+                output,
+                "                yyleng = (int)(yy_main_end_ptr - YYTOKEN);"
+            )?;
+            writeln!(output, "                yytext[yyleng] = '\\0';")?;
+            writeln!(output, "            }}")?;
+        }
+        writeln!(output, "        }}")?;
+        writeln!(output, "    }}")?;
+        writeln!(output)?;
     }
+
+    // Save yy_more_len AFTER trailing context adjustment
+    writeln!(output, "    yy_more_len = yyleng;")?;
     writeln!(output)?;
 
-    // Execute action based on rule
-    // Only emit label if we have an EOF rule that jumps here
-    if eof_rule_idx.is_some() {
-        writeln!(output, "    yy_do_action:")?;
-    }
-    writeln!(output, "        /* Execute rule action */")?;
-    writeln!(output, "        switch (yy_act) {{")?;
+    // Update BOL status for NEXT token (based on whether current match ends with newline)
+    writeln!(
+        output,
+        "    /* Update beginning-of-line status for next token */"
+    )?;
+    writeln!(output, "    if (yyleng > 0) {{")?;
+    writeln!(output, "        yy_at_bol = (yytext[yyleng - 1] == '\\n');")?;
+    writeln!(output, "    }}")?;
+    writeln!(output)?;
+
+    // Action dispatch via switch
+    writeln!(output, "    /* Execute rule action */")?;
+    writeln!(output, "    switch (yyaccept) {{")?;
 
     for (rule_idx, rule) in lexinfo.rules.iter().enumerate() {
-        writeln!(output, "        case {}:", rule_idx)?;
-        // Handle the '|' action (fall through to next rule)
+        writeln!(output, "    case {}:", rule_idx)?;
+        // Generate yy_action_N label for <<EOF>> rules (enables direct jump from EOF handling)
+        if eof_rules.iter().any(|r| r.rule_idx == rule_idx) {
+            writeln!(output, "    yy_action_{}:", rule_idx)?;
+        }
         if rule.action.trim() == "|" {
-            writeln!(output, "            /* fall through */")?;
+            writeln!(output, "        /* fall through */")?;
         } else {
-            writeln!(output, "            {}", rule.action)?;
-            writeln!(output, "            break;")?;
+            writeln!(output, "        {}", rule.action)?;
+            writeln!(output, "        break;")?;
         }
     }
 
-    writeln!(output, "        default:")?;
-    writeln!(output, "            ECHO;")?;
-    writeln!(output, "            break;")?;
-    writeln!(output, "        }}")?;
-
+    writeln!(output, "    default:")?;
+    writeln!(output, "        ECHO;")?;
+    writeln!(output, "        break;")?;
     writeln!(output, "    }}")?;
+    writeln!(output)?;
 
+    writeln!(output, "    goto yy_scan;")?;
     writeln!(output, "}}\n")?;
 
+    // Generate yywrap and main if needed
+    write_default_yywrap_main(output, lexinfo)?;
+
+    Ok(())
+}
+
+fn write_default_yywrap_main<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Result<()> {
     // Generate yywrap if not in user subroutines
     let has_yywrap = lexinfo.user_subs.iter().any(|s| s.contains("yywrap"));
     if !has_yywrap {
@@ -1494,6 +1685,25 @@ mod tests {
     use crate::nfa::Nfa;
     use std::collections::HashMap;
 
+    #[test]
+    fn test_contains_identifier() {
+        // Positive cases - should match
+        assert!(contains_identifier("REJECT;", "REJECT"));
+        assert!(contains_identifier("if (x) REJECT;", "REJECT"));
+        assert!(contains_identifier("REJECT", "REJECT"));
+        assert!(contains_identifier("{ REJECT; }", "REJECT"));
+
+        // Negative cases - should NOT match (part of larger identifier)
+        assert!(!contains_identifier("REJECTED", "REJECT"));
+        assert!(!contains_identifier("NOT_REJECT", "REJECT"));
+        assert!(!contains_identifier("REJECT_ALL", "REJECT"));
+        assert!(!contains_identifier("myREJECT", "REJECT"));
+
+        // Edge cases
+        assert!(contains_identifier("x=REJECT+1", "REJECT")); // operators as boundaries
+        assert!(contains_identifier("(REJECT)", "REJECT")); // parens as boundaries
+    }
+
     fn create_test_lexinfo() -> LexInfo {
         LexInfo {
             external_def: vec!["#include <stdio.h>\n".to_string()],
@@ -1515,6 +1725,7 @@ mod tests {
         write_header(&mut output).unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("Generated by lex-rs"));
+        assert!(s.contains("Direct-coded"));
     }
 
     #[test]
@@ -1541,13 +1752,13 @@ mod tests {
 
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("int yylex(void)"));
-        assert!(s.contains("yy_nxt"));
-        assert!(s.contains("yy_accept"));
+        assert!(s.contains("yy_state_0:"));
+        assert!(s.contains("yy_ec"));
+        assert!(s.contains("YY_NUM_STATES"));
     }
 
     #[test]
     fn test_generate_with_bol_anchor() {
-        // Test that BOL anchor rules generate the correct code
         let hir = regex_syntax::parse("foo").unwrap();
         let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
@@ -1558,7 +1769,7 @@ mod tests {
             compiled_ere: "foo".to_string(),
             action: "return BOL_RULE;".to_string(),
             start_conditions: vec![],
-            bol_anchor: true, // BOL-anchored rule
+            bol_anchor: true,
             trailing_context: None,
             compiled_trailing_context: None,
             is_eof: false,
@@ -1579,23 +1790,12 @@ mod tests {
         generate(&mut output, &dfa, &lexinfo, &config).unwrap();
 
         let s = String::from_utf8(output).unwrap();
-
-        // Should contain BOL checking logic in the action switch
-        // The generated code checks yy_at_bol for BOL-anchored rules
-        assert!(
-            s.contains("return BOL_RULE"),
-            "Should include the BOL rule action"
-        );
-        // yylex function should be generated
-        assert!(
-            s.contains("int yylex(void)"),
-            "Should generate yylex function"
-        );
+        assert!(s.contains("return BOL_RULE"));
+        assert!(s.contains("int yylex(void)"));
     }
 
     #[test]
     fn test_generate_with_start_conditions() {
-        // Test that start conditions generate correct code
         let hir = regex_syntax::parse("foo").unwrap();
         let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
@@ -1626,26 +1826,14 @@ mod tests {
         generate(&mut output, &dfa, &lexinfo, &config).unwrap();
 
         let s = String::from_utf8(output).unwrap();
-
-        // Should contain start condition definitions
-        assert!(
-            s.contains("#define INITIAL 0"),
-            "Should define INITIAL start condition"
-        );
-        assert!(
-            s.contains("#define COMMENT 1"),
-            "Should define COMMENT start condition"
-        );
-        assert!(
-            s.contains("#define STRING 2"),
-            "Should define STRING start condition"
-        );
-        assert!(s.contains("BEGIN"), "Should define BEGIN macro");
+        assert!(s.contains("#define INITIAL 0"));
+        assert!(s.contains("#define COMMENT 1"));
+        assert!(s.contains("#define STRING 2"));
+        assert!(s.contains("BEGIN"));
     }
 
     #[test]
     fn test_generate_with_trailing_context() {
-        // Test that trailing context generates correct handling code
         let hir = regex_syntax::parse("foo").unwrap();
         let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
@@ -1664,7 +1852,7 @@ mod tests {
 
         let rule_meta = vec![RuleMetadata {
             bol_anchor: false,
-            main_pattern_len: Some(3), // "foo" is 3 chars
+            main_pattern_len: Some(3),
             has_trailing_context: true,
             has_variable_trailing_context: false,
         }];
@@ -1677,59 +1865,7 @@ mod tests {
         generate(&mut output, &dfa, &lexinfo, &config).unwrap();
 
         let s = String::from_utf8(output).unwrap();
-
-        // Should handle fixed-length trailing context by adjusting yyleng
-        assert!(
-            s.contains("TC_RULE"),
-            "Should include the trailing context rule action"
-        );
-    }
-
-    #[test]
-    fn test_compressed_table_format() {
-        // Test that compressed table format generates correct arrays
-        let hir = regex_syntax::parse("[a-z]+").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
-        let dfa = Dfa::from_nfa(&nfa);
-        let minimized = dfa.minimize();
-
-        let mut lexinfo = create_test_lexinfo();
-        lexinfo.rules.push(crate::lexfile::LexRule {
-            ere: "[a-z]+".to_string(),
-            compiled_ere: "[a-z]+".to_string(),
-            action: "return ID;".to_string(),
-            start_conditions: vec![],
-            bol_anchor: false,
-            trailing_context: None,
-            compiled_trailing_context: None,
-            is_eof: false,
-        });
-
-        let mut output = Vec::new();
-        let config = CodeGenConfig {
-            table_format: TableFormat::Compressed,
-            ..Default::default()
-        };
-        generate(&mut output, &minimized, &lexinfo, &config).unwrap();
-
-        let s = String::from_utf8(output).unwrap();
-
-        // Compressed format should have base, default, nxt, chk arrays
-        assert!(
-            s.contains("yy_base"),
-            "Compressed format should have yy_base array"
-        );
-        assert!(
-            s.contains("yy_def"),
-            "Compressed format should have yy_def array"
-        );
-        assert!(
-            s.contains("yy_nxt"),
-            "Compressed format should have yy_nxt array"
-        );
-        assert!(
-            s.contains("yy_chk"),
-            "Compressed format should have yy_chk array"
-        );
+        assert!(s.contains("TC_RULE"));
+        assert!(s.contains("yy_rule_main_len"));
     }
 }

@@ -113,24 +113,27 @@ struct FeatureFlags {
 }
 
 impl FeatureFlags {
-    /// Compute all feature flags in a single pass over rules and metadata
+    /// Compute all feature flags in a single pass over rules
     fn compute(lexinfo: &LexInfo, config: &CodeGenConfig) -> Self {
         let has_start_conditions = config.start_conditions.len() > 1;
 
-        // Single pass over rule_metadata
+        // Single pass over lexinfo.rules (the authoritative source)
         let mut has_bol_anchors = false;
         let mut has_trailing_context = false;
         let mut has_var_tc = false;
-        for meta in &config.rule_metadata {
-            has_bol_anchors |= meta.bol_anchor;
-            has_trailing_context |= meta.has_trailing_context;
-            has_var_tc |= meta.has_variable_trailing_context;
-        }
-
-        // Single pass over rules
         let mut has_reject = false;
         let mut eof_rules = Vec::new();
+
         for (idx, rule) in lexinfo.rules.iter().enumerate() {
+            // BOL and trailing context come directly from parsed rules
+            has_bol_anchors |= rule.bol_anchor;
+            has_trailing_context |= rule.trailing_context.is_some();
+
+            // Variable TC requires computed info only available in metadata
+            if idx < config.rule_metadata.len() {
+                has_var_tc |= config.rule_metadata[idx].has_variable_trailing_context;
+            }
+
             if contains_identifier(&rule.action, "REJECT") {
                 has_reject = true;
             }
@@ -450,13 +453,17 @@ fn write_num_states<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
 /// Write the accepting rules list for REJECT support
 fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()> {
     // Build the flattened list and index array
-    let mut accept_list: Vec<i16> = Vec::new();
+    // Use i32 to avoid truncation with many rules (i16 max is 32767)
+    let mut accept_list: Vec<i32> = Vec::new();
     let mut accept_idx: Vec<usize> = Vec::new();
 
     for state in &dfa.states {
         accept_idx.push(accept_list.len());
-        for &rule in &state.accepting_rules {
-            accept_list.push(rule as i16);
+        // Sort accepting rules by rule index to ensure deterministic priority order
+        let mut sorted_rules = state.accepting_rules.clone();
+        sorted_rules.sort();
+        for &rule in &sorted_rules {
+            accept_list.push(rule as i32);
         }
     }
     accept_idx.push(accept_list.len()); // Sentinel for last state
@@ -470,7 +477,7 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
     // Write the index array
     write!(
         output,
-        "static const unsigned short yy_accept_idx[YY_NUM_STATES + 1] = {{ "
+        "static const unsigned int yy_accept_idx[YY_NUM_STATES + 1] = {{ "
     )?;
     for (i, idx) in accept_idx.iter().enumerate() {
         if i > 0 {
@@ -482,11 +489,11 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
 
     // Write the rules list
     if accept_list.is_empty() {
-        writeln!(output, "static const short yy_accept_list[1] = {{ -1 }};\n")?;
+        writeln!(output, "static const int yy_accept_list[1] = {{ -1 }};\n")?;
     } else {
         write!(
             output,
-            "static const short yy_accept_list[{}] = {{ ",
+            "static const int yy_accept_list[{}] = {{ ",
             accept_list.len()
         )?;
         for (i, rule) in accept_list.iter().enumerate() {
@@ -825,6 +832,14 @@ fn build_class_transitions(dfa: &Dfa, state: &DfaState) -> BTreeMap<usize, usize
         let ch_code = *ch as u32;
         if ch_code < 256 {
             let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
+            // Assert consistency: if class already mapped, target must match
+            if let Some(&existing) = class_to_target.get(&class_idx) {
+                assert_eq!(
+                    existing, target,
+                    "char-class {} has inconsistent targets: {} vs {}",
+                    class_idx, existing, target
+                );
+            }
             class_to_target.insert(class_idx, target);
         }
     }
@@ -1098,9 +1113,14 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "        /* unput() inserts directly into buffer, no separate drain needed */"
     )?;
+    // Guard buffer size cast to prevent overflow
     writeln!(
         output,
-        "        YY_INPUT(yy_buffer, yy_result, (int)yy_buffer_size);"
+        "        size_t yy_init_size = (yy_buffer_size > INT_MAX) ? INT_MAX : yy_buffer_size;"
+    )?;
+    writeln!(
+        output,
+        "        YY_INPUT(yy_buffer, yy_result, (int)yy_init_size);"
     )?;
     writeln!(output, "        YYLIMIT = yy_buffer + yy_result;")?;
     writeln!(output, "        YYCURSOR = yy_buffer;")?;
@@ -1251,9 +1271,18 @@ fn write_yylex_direct_coded<W: Write>(
         "            memmove(yy_buffer, YYTOKEN, (size_t)yy_remain);"
     )?;
     writeln!(output, "        }}")?;
+    // Guard buffer size cast to prevent overflow
     writeln!(
         output,
-        "        YY_INPUT(yy_buffer + yy_remain, yy_result, (int)(yy_buffer_size - yy_remain));"
+        "        size_t yy_read_size = yy_buffer_size - (size_t)yy_remain;"
+    )?;
+    writeln!(
+        output,
+        "        if (yy_read_size > INT_MAX) yy_read_size = INT_MAX;"
+    )?;
+    writeln!(
+        output,
+        "        YY_INPUT(yy_buffer + yy_remain, yy_result, (int)yy_read_size);"
     )?;
     writeln!(output, "        if (yy_result == 0) {{")?;
     writeln!(
@@ -1492,7 +1521,6 @@ fn write_yylex_direct_coded<W: Write>(
     // Set yytext and yyleng with yymore support
     writeln!(output, "    /* Set yytext and yyleng (handle yymore) */")?;
     writeln!(output, "    if (yy_more_flag) {{")?;
-    // Use size_t for intermediate calculations to avoid integer overflow
     writeln!(
         output,
         "        size_t yy_new_len = (size_t)(YYCURSOR - YYTOKEN);"
@@ -1541,7 +1569,13 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "        yytext[yyleng] = '\\0';")?;
     writeln!(output, "        yy_more_flag = 0;")?;
     writeln!(output, "    }} else {{")?;
-    writeln!(output, "        yyleng = (int)(YYCURSOR - YYTOKEN);")?;
+    // Check for token length overflow before casting to int
+    writeln!(output, "        ptrdiff_t yy_len = YYCURSOR - YYTOKEN;")?;
+    writeln!(
+        output,
+        "        if (yy_len > INT_MAX) {{ YY_FATAL_ERROR(\"lex: token too long\"); }}"
+    )?;
+    writeln!(output, "        yyleng = (int)yy_len;")?;
     // Grow yytext buffer if needed (only for pointer mode)
     if config.yytext_is_pointer {
         writeln!(output, "        if ((size_t)yyleng >= yy_yytext_size) {{")?;

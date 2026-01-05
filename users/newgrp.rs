@@ -764,11 +764,12 @@ fn set_login_environment(user: &str) -> Result<(), io::Error> {
         .unwrap_or("/bin/sh");
 
     // Set the necessary environment variables
-    env::set_var("USER", user);
-    env::set_var("HOME", unsafe {
-        CStr::from_ptr(pwd.pw_dir).to_str().unwrap_or("")
-    });
-    env::set_var("SHELL", user_shell);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        env::set_var("USER", user);
+        env::set_var("HOME", CStr::from_ptr(pwd.pw_dir).to_str().unwrap_or(""));
+        env::set_var("SHELL", user_shell);
+    };
 
     let status = Command::new(user_shell)
         .env("USER", user)

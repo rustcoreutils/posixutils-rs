@@ -61,15 +61,18 @@ fn main() -> io::Result<()> {
 
     for file in &args.files {
         let path = Path::new(file);
-        if let Ok(f) = File::open(path) {
-            // Print the pathname first per POSIX format
-            println!("{}:", file.display());
-            let reader = BufReader::new(f);
-            if process_file(reader, args.single)? {
-                any_found = true;
+        match File::open(path) {
+            Ok(f) => {
+                // Print the pathname first per POSIX format
+                println!("{}:", file.display());
+                let reader = BufReader::new(f);
+                if process_file(reader, args.single)? {
+                    any_found = true;
+                }
             }
-        } else {
-            eprintln!("what: {}: {}", gettext("Cannot open file"), file.display());
+            _ => {
+                eprintln!("what: {}: {}", gettext("Cannot open file"), file.display());
+            }
         }
     }
 

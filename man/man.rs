@@ -338,10 +338,13 @@ where
         })?;
 
     if let Some(stdin) = stdin {
-        if let Some(mut process_stdin) = process.stdin.take() {
-            process_stdin.write_all(stdin)?;
-        } else {
-            Err(io::Error::other(format!("failed to open stdin for {name}")))?;
+        match process.stdin.take() {
+            Some(mut process_stdin) => {
+                process_stdin.write_all(stdin)?;
+            }
+            _ => {
+                Err(io::Error::other(format!("failed to open stdin for {name}")))?;
+            }
         }
     }
 
@@ -779,11 +782,15 @@ impl Man {
                 .collect::<Vec<_>>()
                 .join(":");
 
-            std::env::set_var("MANPATH", OsStr::new(&override_paths));
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("MANPATH", OsStr::new(&override_paths)) };
         }
 
         if man.args.subsection.is_some() {
-            std::env::set_var("MACHINE", OsStr::new(&man.args.subsection.clone().unwrap()));
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe {
+                std::env::set_var("MACHINE", OsStr::new(&man.args.subsection.clone().unwrap()))
+            };
         }
 
         let manpath = std::env::var("MANPATH")

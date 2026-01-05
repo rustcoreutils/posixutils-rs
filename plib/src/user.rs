@@ -32,15 +32,17 @@ impl User {
     /// # Safety
     /// The pointer must be non-null and point to a valid libc::passwd struct.
     unsafe fn from_raw(passwd: *const libc::passwd) -> Self {
-        let passwd_ref = &*passwd;
-        let name = CStr::from_ptr(passwd_ref.pw_name)
-            .to_string_lossy()
-            .to_string();
+        unsafe {
+            let passwd_ref = &*passwd;
+            let name = CStr::from_ptr(passwd_ref.pw_name)
+                .to_string_lossy()
+                .to_string();
 
-        User {
-            name,
-            uid: passwd_ref.pw_uid,
-            gid: passwd_ref.pw_gid,
+            User {
+                name,
+                uid: passwd_ref.pw_uid,
+                gid: passwd_ref.pw_gid,
+            }
         }
     }
 }

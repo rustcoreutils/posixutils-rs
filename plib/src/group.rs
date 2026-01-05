@@ -29,32 +29,34 @@ impl Group {
     /// # Safety
     /// The pointer must be non-null and point to a valid libc::group struct.
     unsafe fn from_raw(group: *const libc::group) -> Self {
-        let group_ref = &*group;
-        let name = CStr::from_ptr(group_ref.gr_name)
-            .to_string_lossy()
-            .to_string();
-        let passwd = CStr::from_ptr(group_ref.gr_passwd)
-            .to_string_lossy()
-            .to_string();
+        unsafe {
+            let group_ref = &*group;
+            let name = CStr::from_ptr(group_ref.gr_name)
+                .to_string_lossy()
+                .to_string();
+            let passwd = CStr::from_ptr(group_ref.gr_passwd)
+                .to_string_lossy()
+                .to_string();
 
-        // Copy group members from null-terminated array of C strings.
-        // read_unaligned is necessary on macOS to avoid alignment issues.
-        let mut members = Vec::new();
-        if !group_ref.gr_mem.is_null() {
-            let mut member_ptr_arr = group_ref.gr_mem;
-            while !ptr::read_unaligned(member_ptr_arr).is_null() {
-                let member_ptr = ptr::read_unaligned(member_ptr_arr);
-                let member = CStr::from_ptr(member_ptr).to_string_lossy().to_string();
-                members.push(member);
-                member_ptr_arr = member_ptr_arr.add(1);
+            // Copy group members from null-terminated array of C strings.
+            // read_unaligned is necessary on macOS to avoid alignment issues.
+            let mut members = Vec::new();
+            if !group_ref.gr_mem.is_null() {
+                let mut member_ptr_arr = group_ref.gr_mem;
+                while !ptr::read_unaligned(member_ptr_arr).is_null() {
+                    let member_ptr = ptr::read_unaligned(member_ptr_arr);
+                    let member = CStr::from_ptr(member_ptr).to_string_lossy().to_string();
+                    members.push(member);
+                    member_ptr_arr = member_ptr_arr.add(1);
+                }
             }
-        }
 
-        Group {
-            name,
-            passwd,
-            gid: group_ref.gr_gid,
-            members,
+            Group {
+                name,
+                passwd,
+                gid: group_ref.gr_gid,
+                members,
+            }
         }
     }
 }

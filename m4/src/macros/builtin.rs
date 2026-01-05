@@ -55,14 +55,15 @@ impl DefineMacro {
     ) -> Result<(State, Option<MacroDefinition>)> {
         let mut args = frame.args.into_iter();
         let name = if let Some(name_bytes) = args.next() {
-            if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
-                name
-            } else {
-                log::warn!(
-                    "Invalid macro name {:?}, skipping definition",
-                    String::from_utf8_lossy(&name_bytes)
-                );
-                return Ok((state, None));
+            match MacroName::try_from_slice(&name_bytes) {
+                Ok(name) => name,
+                _ => {
+                    log::warn!(
+                        "Invalid macro name {:?}, skipping definition",
+                        String::from_utf8_lossy(&name_bytes)
+                    );
+                    return Ok((state, None));
+                }
             }
         } else {
             log::warn!("No macro name specified, skipping definition");

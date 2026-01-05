@@ -89,10 +89,9 @@ impl FromStr for LineNumberingStyle {
             "n" => Ok(LineNumberingStyle::None),
             s => {
                 if let Some(re) = s.strip_prefix('p') {
-                    if let Ok(regexp) = Regex::new(re) {
-                        Ok(LineNumberingStyle::Regex(regexp))
-                    } else {
-                        Err(format!("invalid regular expression: {re}"))
+                    match Regex::new(re) {
+                        Ok(regexp) => Ok(LineNumberingStyle::Regex(regexp)),
+                        _ => Err(format!("invalid regular expression: {re}")),
                     }
                 } else {
                     Err(format!("invalid variant: {s}"))

@@ -420,7 +420,7 @@ fn generate_action_goto_tables<W: Write>(
                 *reduce_counts.entry(-(*prod_id as i16) - 1).or_insert(0) += 1;
             }
         }
-        if let Some((&action, _)) = reduce_counts.iter().max_by_key(|(_, &count)| count) {
+        if let Some((&action, _)) = reduce_counts.iter().max_by_key(|&(_, &count)| count) {
             default_action[state_id] = action;
         }
     }
@@ -682,7 +682,7 @@ fn build_packed_tables(
             }
         }
 
-        if let Some((&target, _)) = goto_counts.iter().max_by_key(|(_, &count)| count) {
+        if let Some((&target, _)) = goto_counts.iter().max_by_key(|&(_, &count)| count) {
             if nt_idx < defgoto.len() {
                 defgoto[nt_idx] = target;
             }

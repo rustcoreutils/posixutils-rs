@@ -2437,7 +2437,7 @@ impl MdocFormatter {
 
                                 continue;
                             }
-                            Macro::In { ref filename } => {
+                            Macro::In { filename } => {
                                 let formatted_node = self.format_in_synopsis(
                                     filename.as_str(),
                                     macro_node.clone(),
@@ -2635,7 +2635,7 @@ impl MdocFormatter {
     fn format_a_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Ac)
             } else {
                 false
@@ -2643,7 +2643,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Ac)
             } else {
                 false
@@ -2663,7 +2663,7 @@ impl MdocFormatter {
     fn format_b_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Bc)
             } else {
                 false
@@ -2671,7 +2671,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Bc)
             } else {
                 false
@@ -2691,7 +2691,7 @@ impl MdocFormatter {
     fn format_br_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Brc)
             } else {
                 false
@@ -2699,7 +2699,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Brc)
             } else {
                 false
@@ -2719,7 +2719,7 @@ impl MdocFormatter {
     fn format_d_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Dc)
             } else {
                 false
@@ -2727,7 +2727,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Dc)
             } else {
                 false
@@ -2752,7 +2752,7 @@ impl MdocFormatter {
     ) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Dc)
             } else {
                 false
@@ -2760,7 +2760,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Dc)
             } else {
                 false
@@ -2824,7 +2824,7 @@ impl MdocFormatter {
     fn format_o_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Oc)
             } else {
                 false
@@ -2832,7 +2832,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Oc)
             } else {
                 false
@@ -2852,7 +2852,7 @@ impl MdocFormatter {
     fn format_p_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Pc)
             } else {
                 false
@@ -2860,7 +2860,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Pc)
             } else {
                 false
@@ -2880,7 +2880,7 @@ impl MdocFormatter {
     fn format_q_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Qc)
             } else {
                 false
@@ -2888,7 +2888,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Qc)
             } else {
                 false
@@ -2908,7 +2908,7 @@ impl MdocFormatter {
     fn format_s_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Sc)
             } else {
                 false
@@ -2916,7 +2916,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Sc)
             } else {
                 false
@@ -2936,7 +2936,7 @@ impl MdocFormatter {
     fn format_x_block(&mut self, macro_node: MacroNode) -> String {
         let iter = macro_node.nodes.into_iter();
         let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Xc)
             } else {
                 false
@@ -2944,7 +2944,7 @@ impl MdocFormatter {
         });
 
         let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
+            if let Element::Macro(macro_node) = p {
                 !matches!(macro_node.mdoc_macro, Macro::Xc)
             } else {
                 false
@@ -3108,14 +3108,14 @@ impl MdocFormatter {
                 }
                 let last_index = node.nodes.len() - 1;
                 match &mut node.nodes[last_index] {
-                    Element::Text(ref text) if is_closing_delimiter(text) => {
+                    &mut Element::Text(ref text) if is_closing_delimiter(text) => {
                         if let Some(Element::Text(delim)) = node.nodes.pop() {
                             delim_sequence = format!("{}{}", delim, delim_sequence);
                         } else {
                             break;
                         }
                     }
-                    Element::Macro(ref mut inner_macro_node) => {
+                    Element::Macro(inner_macro_node) => {
                         let inner_delims = extract_trailing_delims(inner_macro_node);
                         if inner_delims.is_empty() {
                             break;

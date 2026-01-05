@@ -10,7 +10,7 @@
 use std::fs;
 use std::fs::read_to_string;
 use std::io::Error;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct ProcessInfo {
     pub pid: i32,

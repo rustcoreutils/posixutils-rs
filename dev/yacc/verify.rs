@@ -56,7 +56,7 @@ pub fn verify_tables(grammar: &Grammar, lalr: &LALRAutomaton, packed: &PackedTab
             // Check if this is an acceptable mismatch due to default action optimization
             let is_valid = match (&canonical, &decoded) {
                 // Exact match - always valid
-                (Some(ref c), d) if actions_equal(c, d) => true,
+                (Some(c), d) if actions_equal(c, d) => true,
                 // No canonical entry (Error) but decoded uses default reduction
                 // This is the standard yacc "delayed error" optimization
                 (None, Action::Reduce(_)) if packed.defact[state] > 0 => true,

@@ -398,7 +398,7 @@ impl Makefile {
         Ok(parsed.root())
     }
 
-    pub fn rules(&self) -> impl Iterator<Item = Rule> {
+    pub fn rules(&self) -> impl Iterator<Item = Rule> + use<> {
         self.syntax().children().filter_map(Rule::cast)
     }
 
@@ -407,7 +407,7 @@ impl Makefile {
             .filter(move |rule| rule.targets().any(|t| t == target))
     }
 
-    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
+    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> + use<> {
         self.syntax()
             .children()
             .filter_map(VariableDefinition::cast)
@@ -430,14 +430,14 @@ impl Makefile {
 }
 
 impl Rule {
-    pub fn targets(&self) -> impl Iterator<Item = String> {
+    pub fn targets(&self) -> impl Iterator<Item = String> + use<> {
         self.syntax()
             .children_with_tokens()
             .take_while(|it| it.as_token().is_none_or(|t| t.kind() != COLON))
             .filter_map(|it| it.as_token().map(|t| t.text().to_string()))
     }
 
-    pub fn prerequisites(&self) -> impl Iterator<Item = String> {
+    pub fn prerequisites(&self) -> impl Iterator<Item = String> + use<> {
         self.syntax()
             .children()
             .find(|it| it.kind() == EXPR)
@@ -455,7 +455,7 @@ impl Rule {
             })
     }
 
-    pub fn recipes(&self) -> impl Iterator<Item = String> {
+    pub fn recipes(&self) -> impl Iterator<Item = String> + use<> {
         self.syntax()
             .children()
             .filter(|it| it.kind() == RECIPE)

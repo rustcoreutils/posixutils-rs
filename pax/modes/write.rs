@@ -156,7 +156,7 @@ fn write_path<W: ArchiveWriter>(
     };
 
     // Handle interactive rename
-    let archive_path = if let Some(ref mut p) = prompter {
+    let archive_path = if let Some(p) = prompter {
         let path_str = archive_path.to_string_lossy();
         match p.prompt(&path_str)? {
             RenameResult::Skip => return Ok(()),
@@ -265,7 +265,7 @@ fn handle_invalid_filename(
         }
         InvalidAction::Rename => {
             // Use interactive prompt to get new name
-            if let Some(ref mut p) = prompter {
+            if let Some(p) = prompter {
                 let path_str = path.to_string_lossy();
                 eprintln!(
                     "pax: {}: Filename contains invalid characters",

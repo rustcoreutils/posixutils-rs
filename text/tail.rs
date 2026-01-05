@@ -130,8 +130,8 @@ enum FileOrStdin {
 impl FileOrStdin {
     fn get_buf_read(&mut self) -> &mut dyn BufRead {
         match self {
-            Self::File(_, ref mut bu) => bu,
-            Self::Stdin(ref mut st) => st,
+            Self::File(_, bu) => bu,
+            Self::Stdin(st) => st,
         }
     }
 }

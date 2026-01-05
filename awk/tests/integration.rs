@@ -12,7 +12,7 @@ fn test_awk(args: Vec<String>, expected_output: &str) {
 }
 
 macro_rules! test_awk {
-    ($test_name:ident $(,$data_file:expr)*) => {
+    ($test_name:ident $(,$data_file:expr_2021)*) => {
         test_awk(vec![
             "-f".to_string(),
             concat!("tests/awk/", stringify!($test_name), ".awk").to_string(),

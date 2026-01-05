@@ -111,5 +111,5 @@ When working on utilities, be aware of their maturity stage:
 ## References
 
 - POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/
-- Minimum Rust version: 1.84.0
+- Minimum Rust version: 1.85.0
 - License: MIT

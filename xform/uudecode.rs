@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 macro_rules! reduce {
-    ($e : expr) => {
+    ($e : expr_2021) => {
         ($e - 0x20)
     };
 }

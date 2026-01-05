@@ -317,7 +317,7 @@ fn write_path<W: ArchiveWriter>(
     }
 
     // Handle interactive rename
-    let archive_path = if let Some(ref mut p) = prompter {
+    let archive_path = if let Some(p) = prompter {
         let path_str = path.to_string_lossy();
         match p.prompt(&path_str)? {
             RenameResult::Skip => return Ok(()),

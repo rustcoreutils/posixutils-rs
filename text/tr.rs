@@ -1230,8 +1230,7 @@ mod setup {
 
                         match op {
                             Operand::Char(CharOperand {
-                                ref mut char_repetition,
-                                ..
+                                char_repetition, ..
                             }) => {
                                 *char_repetition = CharRepetition::N(leftover);
                             }
@@ -1245,7 +1244,7 @@ mod setup {
 
                         for op in vec.iter_mut().rev() {
                             if let Operand::Char(CharOperand {
-                                char_repetition: CharRepetition::N(ref mut n),
+                                char_repetition: CharRepetition::N(n),
                                 ..
                             }) = op
                             {

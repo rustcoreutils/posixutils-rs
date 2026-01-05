@@ -321,13 +321,16 @@ pub fn parse_address_range(input: &str) -> (AddressRange, &str) {
             None => (None, rest),
         };
 
-        if let (Some(start), Some(end)) = (first_addr.clone(), second_addr) {
-            (AddressRange::range(start, end), rest)
-        } else if let Some(start) = first_addr {
-            // Start, but no end - means from start to current
-            (AddressRange::range(start, Address::Current), rest)
-        } else {
-            (AddressRange::empty(), rest)
+        match (first_addr.clone(), second_addr) {
+            (Some(start), Some(end)) => (AddressRange::range(start, end), rest),
+            _ => {
+                if let Some(start) = first_addr {
+                    // Start, but no end - means from start to current
+                    (AddressRange::range(start, Address::Current), rest)
+                } else {
+                    (AddressRange::empty(), rest)
+                }
+            }
         }
     } else if let Some(addr) = first_addr {
         (AddressRange::single(addr), rest)

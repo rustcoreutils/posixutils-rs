@@ -543,7 +543,7 @@ fn exec_insert_mode(
 
 /// Helper macro to handle exec result
 macro_rules! handle_exec_result {
-    ($result:expr, $any_failed:expr) => {
+    ($result:expr_2021, $any_failed:expr_2021) => {
         match $result {
             ExecResult::Exited(255) => {
                 return Ok(1);

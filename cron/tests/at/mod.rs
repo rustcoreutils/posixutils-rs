@@ -48,8 +48,10 @@ fn test1() {
 
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
     let args = ["05:53amNOV4,2100", "-f", &file];
@@ -72,8 +74,10 @@ fn test2() {
 
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -95,8 +99,10 @@ fn test3() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -118,8 +124,10 @@ fn test4() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -141,8 +149,10 @@ fn test5() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -164,8 +174,10 @@ fn test6() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -187,8 +199,10 @@ fn test7() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -210,8 +224,10 @@ fn test8() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -233,8 +249,10 @@ fn test9() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -255,8 +273,10 @@ fn test10() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -284,8 +304,10 @@ fn test11() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -314,8 +336,10 @@ fn test12() {
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
-    std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("AT_JOB_DIR", &dir_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 

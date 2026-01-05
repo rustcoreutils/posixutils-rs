@@ -66,7 +66,7 @@ impl LocaleSettings {
             LocaleCategory::LcMessages => &self.lc_messages,
         };
 
-        if let Some(ref value) = category_value {
+        if let Some(value) = category_value {
             return value;
         }
 
@@ -97,7 +97,7 @@ impl LocaleSettings {
             LocaleCategory::LcMessages => &self.lc_messages,
         };
 
-        if let Some(ref value) = category_value {
+        if let Some(value) = category_value {
             return value.clone();
         }
 

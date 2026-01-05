@@ -224,7 +224,7 @@ fn copy_path(
     };
 
     // Handle interactive rename
-    let dest_name = if let Some(ref mut p) = prompter {
+    let dest_name = if let Some(p) = prompter {
         let name_str = dest_name.to_string_lossy();
         match p.prompt(&name_str)? {
             RenameResult::Skip => return Ok(()),
@@ -458,7 +458,7 @@ fn copy_path_to_dest(
     }
 
     // Handle interactive rename if enabled
-    let actual_dest = if let Some(ref mut p) = prompter {
+    let actual_dest = if let Some(p) = prompter {
         let path_str = src.to_string_lossy();
         match p.prompt(&path_str)? {
             RenameResult::Skip => return Ok(()),

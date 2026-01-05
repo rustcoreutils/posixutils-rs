@@ -63,11 +63,14 @@ impl Drop for DeepDirCleanup {
             } else {
                 &self.dir_name
             };
-            if let Ok(new_fd) = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY) {
-                fd = new_fd;
-            } else {
-                // Can't descend further - might already be cleaned up
-                return;
+            match ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY) {
+                Ok(new_fd) => {
+                    fd = new_fd;
+                }
+                _ => {
+                    // Can't descend further - might already be cleaned up
+                    return;
+                }
             }
         }
 
@@ -90,10 +93,13 @@ impl Drop for DeepDirCleanup {
 
             // Move fd up one level (except when we just unlinked test_dir)
             if remaining > 1 {
-                if let Ok(parent_fd) = ftw::FileDescriptor::open_at(&fd, c"..", libc::O_RDONLY) {
-                    fd = parent_fd;
-                } else {
-                    break;
+                match ftw::FileDescriptor::open_at(&fd, c"..", libc::O_RDONLY) {
+                    Ok(parent_fd) => {
+                        fd = parent_fd;
+                    }
+                    _ => {
+                        break;
+                    }
                 }
             }
         }

@@ -593,7 +593,7 @@ impl CronJob {
                 // Child process - drop privileges and execute the command
 
                 // Drop privileges if owner info is available
-                if let (Some(uid), Some(gid), Some(ref name), Some(ref home)) = (
+                if let (Some(uid), Some(gid), Some(name), Some(home)) = (
                     self.owner_uid,
                     self.owner_gid,
                     &self.owner_name,

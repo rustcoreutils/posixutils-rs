@@ -134,11 +134,12 @@ fn get_user_home(user: &str) -> Option<String> {
 /// Check if a system name refers to the local system
 pub fn is_local_system(system: &str) -> bool {
     system.is_empty() || system == "localhost" || {
-        if let Ok(hostname) = Command::new("hostname").output() {
-            let local = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
-            system == local
-        } else {
-            false
+        match Command::new("hostname").output() {
+            Ok(hostname) => {
+                let local = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+                system == local
+            }
+            _ => false,
         }
     }
 }

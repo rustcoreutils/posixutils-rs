@@ -140,7 +140,7 @@ impl<'a> DelimiterState<'a> {
         match self {
             DelimiterState::MultipleDelimiters {
                 delimiters,
-                ref mut delimiters_iterator,
+                delimiters_iterator,
                 ..
             } => {
                 *delimiters_iterator = delimiters.iter().cycle();

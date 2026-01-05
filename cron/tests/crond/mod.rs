@@ -67,7 +67,8 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
 
 #[test]
 fn no_args() {
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
     let output = run_test_base("crond", &vec![], b"");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -218,7 +219,8 @@ fn test_month() {
 
 #[test]
 fn test_signal() {
-    std::env::set_var("LOGNAME", "root");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LOGNAME", "root") };
 
     let logname = std::env::var("LOGNAME").unwrap_or("root".to_string());
     #[cfg(target_os = "linux")]

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::sccsfile::{parse_pfile, paths};
 
 /// sact - print current SCCS file-editing activity

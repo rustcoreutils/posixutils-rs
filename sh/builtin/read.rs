@@ -11,8 +11,8 @@ use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::errno::Errno;
 use crate::os::read;
-use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
+use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
 use std::io::IsTerminal;
@@ -292,10 +292,6 @@ impl BuiltinUtility for BuiltinRead {
             }
         }
 
-        if input.reached_eof {
-            Ok(1)
-        } else {
-            Ok(0)
-        }
+        if input.reached_eof { Ok(1) } else { Ok(0) }
     }
 }

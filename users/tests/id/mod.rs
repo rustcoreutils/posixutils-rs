@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use regex::Regex;
 
 fn id_test(args: &[&str], expected_out: &str) {

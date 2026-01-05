@@ -23,7 +23,7 @@ mod token;
 mod types;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
@@ -34,7 +34,7 @@ use strings::StringTable;
 use symbol::SymbolTable;
 use target::Target;
 use token::{
-    preprocess_with_defines, show_token, token_type_name, PreprocessConfig, StreamTable, Tokenizer,
+    PreprocessConfig, StreamTable, Tokenizer, preprocess_with_defines, show_token, token_type_name,
 };
 
 // ============================================================================

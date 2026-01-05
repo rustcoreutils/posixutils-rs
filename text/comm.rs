@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::io::input_reader;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -47,13 +47,7 @@ fn line_out(lead_dup: &'static str, outmask: u32, curtype: u32, s: &str) -> io::
             io::stdout().write_all(s.as_bytes())?;
         }
         NO2 => {
-            let lead_f2 = {
-                if (outmask & NO1) != 0 {
-                    ""
-                } else {
-                    "\t"
-                }
-            };
+            let lead_f2 = { if (outmask & NO1) != 0 { "" } else { "\t" } };
             let newstr = format!("{}{}", lead_f2, s);
             io::stdout().write_all(newstr.as_bytes())?;
         }

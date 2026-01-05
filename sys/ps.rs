@@ -19,8 +19,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDIN_FILENO};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use libc::{STDIN_FILENO, geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname};
 
 #[cfg(target_os = "macos")]
 mod platform {

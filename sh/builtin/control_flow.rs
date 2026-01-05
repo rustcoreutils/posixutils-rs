@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
-use crate::shell::opened_files::OpenedFiles;
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility, skip_option_terminator};
 use crate::shell::ControlFlowState;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 fn loop_control_flow(
     args: &[String],

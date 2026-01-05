@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use posixutils_process::signal::{list_signals, lookup_signum, signum_to_name};
 
 enum ConfigMode {

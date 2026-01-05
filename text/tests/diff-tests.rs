@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 const EXIT_STATUS_NO_DIFFERENCE: i32 = 0;
 const EXIT_STATUS_DIFFERENCE: i32 = 1;

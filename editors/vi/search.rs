@@ -690,9 +690,11 @@ mod tests {
 
         // Pattern at exactly the limit should succeed
         let pattern = "a".repeat(SearchState::MAX_PATTERN_LEN);
-        assert!(search
-            .set_pattern(&pattern, SearchDirection::Forward)
-            .is_ok());
+        assert!(
+            search
+                .set_pattern(&pattern, SearchDirection::Forward)
+                .is_ok()
+        );
 
         // Pattern exceeding the limit should fail
         let pattern = "a".repeat(SearchState::MAX_PATTERN_LEN + 1);

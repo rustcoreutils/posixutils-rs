@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
-use crate::jobs::{parse_job_id, Job, JobState};
-use crate::os::signals::{kill, Signal};
-use crate::shell::opened_files::OpenedFiles;
+use crate::builtin::{BuiltinResult, BuiltinUtility, skip_option_terminator};
+use crate::jobs::{Job, JobState, parse_job_id};
+use crate::os::signals::{Signal, kill};
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 fn run_background_job(
     arg: &str,

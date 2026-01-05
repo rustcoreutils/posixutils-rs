@@ -6,17 +6,17 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use clap::{Parser, error::ErrorKind};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use thiserror::Error;
 
-use binrw::{binrw, BinReaderExt, BinWrite, Endian};
+use binrw::{BinReaderExt, BinWrite, Endian, binrw};
 #[cfg(target_os = "linux")]
 use libc::sa_family_t;
 use libc::{
-    addrinfo, getaddrinfo, gethostname, getpid, getpwuid, getservbyname, getuid, ioctl, signal,
-    sockaddr_in, winsize, AF_INET, AI_CANONNAME, SIGINT, SIGPIPE, SIGQUIT, SOCK_DGRAM,
-    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
+    AF_INET, AI_CANONNAME, SIGINT, SIGPIPE, SIGQUIT, SOCK_DGRAM, STDIN_FILENO, STDOUT_FILENO,
+    TIOCGWINSZ, addrinfo, getaddrinfo, gethostname, getpid, getpwuid, getservbyname, getuid, ioctl,
+    signal, sockaddr_in, winsize,
 };
 
 use std::{

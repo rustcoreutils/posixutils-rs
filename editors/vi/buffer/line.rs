@@ -58,11 +58,7 @@ impl Line {
             while offset > 0 && !self.content.is_char_boundary(offset - 1) {
                 offset -= 1;
             }
-            if offset > 0 {
-                offset - 1
-            } else {
-                0
-            }
+            if offset > 0 { offset - 1 } else { 0 }
         }
     }
 

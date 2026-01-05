@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::{
     error::Error,
     io::{self, Write},
@@ -1031,11 +1031,7 @@ fn format_arg_b(conv: &ConvSpec, arg: &[u8]) -> (Vec<u8>, bool) {
 fn format_arg_string(conv: &ConvSpec, arg: &[u8]) -> Vec<u8> {
     // Apply precision to limit string length
     let arg = if let Some(prec) = conv.precision {
-        if prec < arg.len() {
-            &arg[..prec]
-        } else {
-            arg
-        }
+        if prec < arg.len() { &arg[..prec] } else { arg }
     } else {
         arg
     };

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test_with_checker};
 use std::process::Output;
 
 /// Test locale with no arguments shows current settings

@@ -49,7 +49,7 @@
 //! then file data padded to 4-byte boundary.
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult, is_eof_error};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 

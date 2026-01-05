@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::gettext_lib::mo_file::MoFile;
-use crate::gettext_lib::plural::{parse_plural_forms, PluralExpr};
+use crate::gettext_lib::plural::{PluralExpr, parse_plural_forms};
 
 /// Runtime message catalog for lookups
 #[derive(Debug, Clone)]
@@ -164,11 +164,7 @@ impl MessageCatalog {
             index.min(self.nplurals.saturating_sub(1))
         } else {
             // Default Germanic plural rule: n != 1
-            if n == 1 {
-                0
-            } else {
-                1.min(self.nplurals - 1)
-            }
+            if n == 1 { 0 } else { 1.min(self.nplurals - 1) }
         }
     }
 

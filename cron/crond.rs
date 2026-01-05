@@ -10,15 +10,15 @@
 use chrono::Local;
 use cron::job::{Database, UserInfo};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::cmp::Ordering::{Greater, Less};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 static CRONTAB: Mutex<Option<Database>> = Mutex::new(None);

@@ -8,12 +8,12 @@
 //
 
 use crate::builtin::{
-    get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult, BuiltinUtility,
+    BuiltinError, BuiltinResult, BuiltinUtility, get_builtin_utility, get_special_builtin_utility,
 };
 use crate::option_parser::OptionParser;
 use crate::os::DEFAULT_PATH;
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 #[derive(PartialEq, Eq)]
 enum Action {

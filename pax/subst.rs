@@ -22,7 +22,7 @@
 //! This implementation uses plib::regex for POSIX BRE support.
 
 use crate::error::{PaxError, PaxResult};
-use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
+use plib::regex::{MAX_CAPTURES, Match, Regex, RegexFlags};
 
 /// A compiled substitution expression from -s option
 #[derive(Debug)]
@@ -101,7 +101,7 @@ impl Substitution {
                     return Err(PaxError::PatternError(format!(
                         "unknown substitution flag: {}",
                         c
-                    )))
+                    )));
                 }
             }
         }

@@ -16,17 +16,17 @@ use std::collections::HashMap;
 use std::io::{self, Error};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use osdata::{ParamType, PARG, PNEG};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use osdata::{PARG, PNEG, ParamType};
 #[cfg(target_os = "linux")]
 use termios::os::linux::{TAB0, TAB3, TABDLY};
 #[cfg(target_os = "macos")]
 use termios::os::macos::{TAB0, TAB3, TABDLY};
 use termios::{
-    cc_t, cfgetispeed, cfgetospeed, cfsetispeed, cfsetospeed, speed_t, tcflag_t, tcsetattr,
-    Termios, BRKINT, CREAD, CS5, CS6, CS7, CS8, CSIZE, ECHO, ECHOE, ECHOK, HUPCL, ICANON, ICRNL,
-    IEXTEN, IGNCR, IGNPAR, INLCR, INPCK, ISIG, IXON, OPOST, PARENB, PARODD, TCSANOW, VERASE, VKILL,
-    VMIN, VTIME,
+    BRKINT, CREAD, CS5, CS6, CS7, CS8, CSIZE, ECHO, ECHOE, ECHOK, HUPCL, ICANON, ICRNL, IEXTEN,
+    IGNCR, IGNPAR, INLCR, INPCK, ISIG, IXON, OPOST, PARENB, PARODD, TCSANOW, Termios, VERASE,
+    VKILL, VMIN, VTIME, cc_t, cfgetispeed, cfgetospeed, cfsetispeed, cfsetospeed, speed_t,
+    tcflag_t, tcsetattr,
 };
 
 const HDR_SAVE: &str = "pfmt1";

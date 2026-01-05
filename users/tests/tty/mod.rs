@@ -14,7 +14,7 @@
 //! - Terminal stdin (PTY) - outputs terminal path with exit code 0
 //! - --help and --version options
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

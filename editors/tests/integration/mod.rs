@@ -1596,8 +1596,8 @@ fn test_find_command_struct() {
 
 #[test]
 fn test_last_command_enum() {
-    use vi_rs::mode::InsertKind;
     use vi_rs::LastCommand;
+    use vi_rs::mode::InsertKind;
 
     // Test Insert variant
     let insert_cmd = LastCommand::Insert {
@@ -1635,8 +1635,8 @@ fn test_ex_insert_mode_enum() {
 
 #[test]
 fn test_ex_source_parsing() {
-    use vi_rs::ex::parse_ex_command;
     use vi_rs::ex::ExCommand;
+    use vi_rs::ex::parse_ex_command;
 
     // Test :source command parsing
     let result = parse_ex_command("source test.vim");
@@ -1663,8 +1663,8 @@ fn test_ex_source_parsing() {
 
 #[test]
 fn test_ex_append_parsing() {
-    use vi_rs::ex::parse_ex_command;
     use vi_rs::ex::ExCommand;
+    use vi_rs::ex::parse_ex_command;
 
     // Test :a command parsing
     let result = parse_ex_command("a");
@@ -1688,8 +1688,8 @@ fn test_ex_append_parsing() {
 
 #[test]
 fn test_ex_insert_parsing() {
-    use vi_rs::ex::parse_ex_command;
     use vi_rs::ex::ExCommand;
+    use vi_rs::ex::parse_ex_command;
 
     // Test :i command parsing
     let result = parse_ex_command("i");
@@ -1704,8 +1704,8 @@ fn test_ex_insert_parsing() {
 
 #[test]
 fn test_ex_change_parsing() {
-    use vi_rs::ex::parse_ex_command;
     use vi_rs::ex::ExCommand;
+    use vi_rs::ex::parse_ex_command;
 
     // Test :c command parsing
     let result = parse_ex_command("c");

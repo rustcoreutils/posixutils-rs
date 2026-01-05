@@ -10,8 +10,8 @@
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::{
-    expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
-    ExpansionResult,
+    ExpandedWord, ExpansionResult, expand_word_to_string, simple_word_expansion_into,
+    word_to_pattern,
 };
 
 #[derive(PartialEq, Eq)]
@@ -331,8 +331,8 @@ pub fn expand_parameter_into(
 mod tests {
     use super::*;
     use crate::jobs::JobState;
-    use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
+    use crate::parse::word::test_utils::unquoted_literal;
     use crate::wordexp::expanded_word::ExpandedWordPart;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {

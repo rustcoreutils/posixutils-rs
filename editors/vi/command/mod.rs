@@ -9,14 +9,14 @@ pub mod parser;
 pub mod text_object;
 
 pub use motion::{
-    find_char_backward, find_char_forward, find_matching_bracket, move_bigword_backward,
-    move_bigword_end, move_bigword_forward, move_down, move_left, move_right, move_to_column,
-    move_to_first_non_blank, move_to_line, move_to_line_end, move_to_line_start, move_up,
-    move_word_backward, move_word_end, move_word_forward, till_char_backward, till_char_forward,
-    MotionResult,
+    MotionResult, find_char_backward, find_char_forward, find_matching_bracket,
+    move_bigword_backward, move_bigword_end, move_bigword_forward, move_down, move_left,
+    move_right, move_to_column, move_to_first_non_blank, move_to_line, move_to_line_end,
+    move_to_line_start, move_up, move_word_backward, move_word_end, move_word_forward,
+    till_char_backward, till_char_forward,
 };
 pub use operator::{
-    change, delete, put_after, put_before, shift_left, shift_right, yank, OperatorResult,
+    OperatorResult, change, delete, put_after, put_before, shift_left, shift_right, yank,
 };
 pub use parser::{CommandParser, MotionCommand, ParsedCommand, ParserState};
 pub use text_object::{

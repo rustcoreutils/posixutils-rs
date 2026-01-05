@@ -271,7 +271,7 @@ impl<'a> Lexer<'a> {
                             start_line,
                             start_col,
                             "unterminated character literal".into(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -281,7 +281,7 @@ impl<'a> Lexer<'a> {
                     start_line,
                     start_col,
                     "unterminated character literal".into(),
-                ))
+                ));
             }
         };
 
@@ -311,7 +311,7 @@ impl<'a> Lexer<'a> {
                         start_line,
                         start_col,
                         "unterminated tag".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -413,7 +413,7 @@ impl<'a> Lexer<'a> {
                         start_line,
                         start_col,
                         "unterminated action".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -443,7 +443,7 @@ impl<'a> Lexer<'a> {
                         start_line,
                         start_col,
                         "unterminated %{ %}".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -518,7 +518,7 @@ impl<'a> Lexer<'a> {
                                     line,
                                     self.column,
                                     format!("unknown directive: %{}", word),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -527,7 +527,7 @@ impl<'a> Lexer<'a> {
                             line,
                             self.column,
                             "invalid character after '%'".into(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -583,7 +583,7 @@ impl<'a> Lexer<'a> {
                     line,
                     self.column,
                     format!("unexpected character: '{}'", c),
-                ))
+                ));
             }
         };
 

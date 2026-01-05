@@ -245,11 +245,7 @@ fn decode_goto(
         // Fall through to default goto
         if nt_idx < packed.defgoto.len() {
             let def = packed.defgoto[nt_idx];
-            if def >= 0 {
-                Some(def as usize)
-            } else {
-                None
-            }
+            if def >= 0 { Some(def as usize) } else { None }
         } else {
             None
         }

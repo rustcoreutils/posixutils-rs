@@ -15,7 +15,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
     Opcode, Pseudo, PseudoId,
 };
-use crate::diag::{error, Position};
+use crate::diag::{Position, error};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
     ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
@@ -3600,11 +3600,7 @@ impl<'a> Linearizer<'a> {
             func.add_pseudo(pseudo);
         }
         let opcode = if is_float {
-            if is_inc {
-                Opcode::FAdd
-            } else {
-                Opcode::FSub
-            }
+            if is_inc { Opcode::FAdd } else { Opcode::FSub }
         } else if is_inc {
             Opcode::Add
         } else {
@@ -4408,7 +4404,9 @@ impl<'a> Linearizer<'a> {
             ExprKind::InitList { .. } => {
                 // InitList is handled specially in linearize_local_decl and linearize_global_decl
                 // It shouldn't be reached here during normal expression evaluation
-                panic!("InitList should be handled in declaration context, not as standalone expression")
+                panic!(
+                    "InitList should be handled in declaration context, not as standalone expression"
+                )
             }
 
             ExprKind::CompoundLiteral { typ, elements } => {

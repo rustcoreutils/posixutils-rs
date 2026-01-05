@@ -9,8 +9,8 @@
 
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 fn format_mode(mode: u32) -> String {
     let types = ["", "x", "w", "wx", "r", "rx", "rw", "rwx"];

@@ -17,13 +17,13 @@ use std::{env, fs, io, process};
 
 use clap::Parser;
 use const_format::formatcp;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 use posixutils_make::{
+    Make,
     config::Config,
     error_code::ErrorCode::{self, *},
-    parser::{preprocessor::ENV_MACROS, Makefile},
-    Make,
+    parser::{Makefile, preprocessor::ENV_MACROS},
 };
 
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];

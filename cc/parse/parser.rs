@@ -1573,7 +1573,7 @@ impl<'a> Parser<'a> {
                 }
                 "struct" => {
                     self.advance(); // consume 'struct'
-                                    // For struct tag reference, look up directly in symbol table
+                    // For struct tag reference, look up directly in symbol table
                     if let Some(tag_name) = self.get_ident_id(self.current()) {
                         if !self.is_special(b'{') {
                             // This is a tag reference (e.g., "struct Point*")
@@ -1646,7 +1646,7 @@ impl<'a> Parser<'a> {
                 }
                 "union" => {
                     self.advance(); // consume 'union'
-                                    // For union tag reference, look up directly in symbol table
+                    // For union tag reference, look up directly in symbol table
                     if let Some(tag_name) = self.get_ident_id(self.current()) {
                         if !self.is_special(b'{') {
                             // This is a tag reference
@@ -1795,16 +1795,16 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume '*'
                 if self.is_special(b')') {
                     self.advance(); // consume ')'
-                                    // Now expect parameter list
+                    // Now expect parameter list
                     if self.is_special(b'(') {
                         self.advance(); // consume '('
-                                        // Parse parameter types properly
+                        // Parse parameter types properly
                         if let Ok((params, variadic)) = self.parse_parameter_list() {
                             if !self.is_special(b')') {
                                 return None;
                             }
                             self.advance(); // consume final ')'
-                                            // Create function pointer type with actual parameter types
+                            // Create function pointer type with actual parameter types
                             let param_type_ids: Vec<TypeId> =
                                 params.iter().map(|p| p.typ).collect();
                             let fn_type = Type::function(result_id, param_type_ids, variadic);
@@ -6283,10 +6283,12 @@ mod tests {
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Char);
-                assert!(types
-                    .get(cast_type)
-                    .modifiers
-                    .contains(TypeModifiers::UNSIGNED));
+                assert!(
+                    types
+                        .get(cast_type)
+                        .modifiers
+                        .contains(TypeModifiers::UNSIGNED)
+                );
             }
             _ => panic!("Expected Cast"),
         }
@@ -6298,10 +6300,12 @@ mod tests {
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Int);
-                assert!(types
-                    .get(cast_type)
-                    .modifiers
-                    .contains(TypeModifiers::SIGNED));
+                assert!(
+                    types
+                        .get(cast_type)
+                        .modifiers
+                        .contains(TypeModifiers::SIGNED)
+                );
             }
             _ => panic!("Expected Cast"),
         }
@@ -6313,10 +6317,12 @@ mod tests {
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Long);
-                assert!(types
-                    .get(cast_type)
-                    .modifiers
-                    .contains(TypeModifiers::UNSIGNED));
+                assert!(
+                    types
+                        .get(cast_type)
+                        .modifiers
+                        .contains(TypeModifiers::UNSIGNED)
+                );
             }
             _ => panic!("Expected Cast"),
         }
@@ -6339,10 +6345,12 @@ mod tests {
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::LongLong);
-                assert!(types
-                    .get(cast_type)
-                    .modifiers
-                    .contains(TypeModifiers::UNSIGNED));
+                assert!(
+                    types
+                        .get(cast_type)
+                        .modifiers
+                        .contains(TypeModifiers::UNSIGNED)
+                );
             }
             _ => panic!("Expected Cast"),
         }
@@ -6394,10 +6402,12 @@ mod tests {
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Int);
-                assert!(types
-                    .get(cast_type)
-                    .modifiers
-                    .contains(TypeModifiers::CONST));
+                assert!(
+                    types
+                        .get(cast_type)
+                        .modifiers
+                        .contains(TypeModifiers::CONST)
+                );
             }
             _ => panic!("Expected Cast"),
         }
@@ -6808,19 +6818,23 @@ mod tests {
     #[test]
     fn test_const_decl() {
         let (decl, types, _strings) = parse_decl("const int x = 5;").unwrap();
-        assert!(types
-            .get(decl.declarators[0].typ)
-            .modifiers
-            .contains(TypeModifiers::CONST));
+        assert!(
+            types
+                .get(decl.declarators[0].typ)
+                .modifiers
+                .contains(TypeModifiers::CONST)
+        );
     }
 
     #[test]
     fn test_unsigned_decl() {
         let (decl, types, _strings) = parse_decl("unsigned int x;").unwrap();
-        assert!(types
-            .get(decl.declarators[0].typ)
-            .modifiers
-            .contains(TypeModifiers::UNSIGNED));
+        assert!(
+            types
+                .get(decl.declarators[0].typ)
+                .modifiers
+                .contains(TypeModifiers::UNSIGNED)
+        );
     }
 
     #[test]
@@ -7028,10 +7042,12 @@ mod tests {
                 assert_eq!(decl.declarators.len(), 1);
                 check_name(&strings, decl.declarators[0].name, "myint");
                 // The type includes the TYPEDEF modifier
-                assert!(types
-                    .get(decl.declarators[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::TYPEDEF));
+                assert!(
+                    types
+                        .get(decl.declarators[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::TYPEDEF)
+                );
             }
             _ => panic!("Expected Declaration"),
         }
@@ -7200,15 +7216,19 @@ mod tests {
                 assert_eq!(func.params.len(), 2);
                 // Both params should be restrict-qualified pointers
                 assert_eq!(types.kind(func.params[0].typ), TypeKind::Pointer);
-                assert!(types
-                    .get(func.params[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::RESTRICT));
+                assert!(
+                    types
+                        .get(func.params[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::RESTRICT)
+                );
                 assert_eq!(types.kind(func.params[1].typ), TypeKind::Pointer);
-                assert!(types
-                    .get(func.params[1].typ)
-                    .modifiers
-                    .contains(TypeModifiers::RESTRICT));
+                assert!(
+                    types
+                        .get(func.params[1].typ)
+                        .modifiers
+                        .contains(TypeModifiers::RESTRICT)
+                );
             }
             _ => panic!("Expected FunctionDef"),
         }
@@ -7233,10 +7253,12 @@ mod tests {
             ExternalDecl::Declaration(decl) => {
                 check_name(&strings, decl.declarators[0].name, "global_ptr");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
-                assert!(types
-                    .get(decl.declarators[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::RESTRICT));
+                assert!(
+                    types
+                        .get(decl.declarators[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::RESTRICT)
+                );
             }
             _ => panic!("Expected Declaration"),
         }
@@ -7255,10 +7277,12 @@ mod tests {
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 check_name(&strings, decl.declarators[0].name, "x");
-                assert!(types
-                    .get(decl.declarators[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::VOLATILE));
+                assert!(
+                    types
+                        .get(decl.declarators[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::VOLATILE)
+                );
             }
             _ => panic!("Expected Declaration"),
         }
@@ -7276,10 +7300,12 @@ mod tests {
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 // The base type should be volatile
                 let base_id = types.base_type(decl.declarators[0].typ).unwrap();
-                assert!(types
-                    .get(base_id)
-                    .modifiers
-                    .contains(TypeModifiers::VOLATILE));
+                assert!(
+                    types
+                        .get(base_id)
+                        .modifiers
+                        .contains(TypeModifiers::VOLATILE)
+                );
             }
             _ => panic!("Expected Declaration"),
         }
@@ -7296,10 +7322,12 @@ mod tests {
                 check_name(&strings, decl.declarators[0].name, "p");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 // The pointer type itself should be volatile
-                assert!(types
-                    .get(decl.declarators[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::VOLATILE));
+                assert!(
+                    types
+                        .get(decl.declarators[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::VOLATILE)
+                );
             }
             _ => panic!("Expected Declaration"),
         }
@@ -7314,14 +7342,18 @@ mod tests {
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 check_name(&strings, decl.declarators[0].name, "x");
-                assert!(types
-                    .get(decl.declarators[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::VOLATILE));
-                assert!(types
-                    .get(decl.declarators[0].typ)
-                    .modifiers
-                    .contains(TypeModifiers::CONST));
+                assert!(
+                    types
+                        .get(decl.declarators[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::VOLATILE)
+                );
+                assert!(
+                    types
+                        .get(decl.declarators[0].typ)
+                        .modifiers
+                        .contains(TypeModifiers::CONST)
+                );
             }
             _ => panic!("Expected Declaration"),
         }
@@ -7340,10 +7372,12 @@ mod tests {
                 // Parameter is pointer to volatile int
                 assert_eq!(types.kind(func.params[0].typ), TypeKind::Pointer);
                 let base_id = types.base_type(func.params[0].typ).unwrap();
-                assert!(types
-                    .get(base_id)
-                    .modifiers
-                    .contains(TypeModifiers::VOLATILE));
+                assert!(
+                    types
+                        .get(base_id)
+                        .modifiers
+                        .contains(TypeModifiers::VOLATILE)
+                );
             }
             _ => panic!("Expected FunctionDef"),
         }
@@ -8701,9 +8735,11 @@ mod tests {
         match &tu.items[0] {
             ExternalDecl::FunctionDef(func) => {
                 // The INLINE modifier is stored on the return type
-                assert!(types
-                    .modifiers(func.return_type)
-                    .contains(TypeModifiers::INLINE));
+                assert!(
+                    types
+                        .modifiers(func.return_type)
+                        .contains(TypeModifiers::INLINE)
+                );
             }
             _ => panic!("Expected FunctionDef"),
         }

@@ -17,7 +17,7 @@ use object::{
 };
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::collections::HashMap;
 use std::fs;
 

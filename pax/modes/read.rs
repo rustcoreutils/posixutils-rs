@@ -13,8 +13,8 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, Extr
 use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::pattern::{find_matching_pattern, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::pattern::{Pattern, find_matching_pattern};
+use crate::subst::{SubstResult, Substitution, apply_substitutions};
 use std::collections::HashSet;
 use std::fs::{self, File, Permissions};
 use std::io::{Read, Write};

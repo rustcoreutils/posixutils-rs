@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 #[derive(Parser)]
 #[command(version, about = gettext("env - set the environment for command invocation"))]

@@ -500,11 +500,7 @@ fn format_mode_symbolic(mode: u32) -> String {
     s.push(if mode & 0o400 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o200 != 0 { 'w' } else { '-' });
     s.push(if mode & 0o4000 != 0 {
-        if mode & 0o100 != 0 {
-            's'
-        } else {
-            'S'
-        }
+        if mode & 0o100 != 0 { 's' } else { 'S' }
     } else if mode & 0o100 != 0 {
         'x'
     } else {
@@ -515,11 +511,7 @@ fn format_mode_symbolic(mode: u32) -> String {
     s.push(if mode & 0o040 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o020 != 0 { 'w' } else { '-' });
     s.push(if mode & 0o2000 != 0 {
-        if mode & 0o010 != 0 {
-            's'
-        } else {
-            'S'
-        }
+        if mode & 0o010 != 0 { 's' } else { 'S' }
     } else if mode & 0o010 != 0 {
         'x'
     } else {
@@ -530,11 +522,7 @@ fn format_mode_symbolic(mode: u32) -> String {
     s.push(if mode & 0o004 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o002 != 0 { 'w' } else { '-' });
     s.push(if mode & 0o1000 != 0 {
-        if mode & 0o001 != 0 {
-            't'
-        } else {
-            'T'
-        }
+        if mode & 0o001 != 0 { 't' } else { 'T' }
     } else if mode & 0o001 != 0 {
         'x'
     } else {

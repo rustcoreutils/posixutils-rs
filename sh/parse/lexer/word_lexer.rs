@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::Lexer;
 use crate::parse::ParseResult;
+use crate::parse::lexer::Lexer;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::str::CharIndices;

@@ -9,8 +9,8 @@
 // Architecture-independent code generation interface
 //
 
-use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
+use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
 use crate::target::Target;
 use crate::types::{TypeModifiers, TypeTable};

@@ -14,7 +14,7 @@
 mod patch_util;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use patch_util::{
     applier::PatchApplier,
     file_ops::{determine_target_file, read_file_lines, write_output, write_rejects},

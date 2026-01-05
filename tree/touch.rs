@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, Datelike, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 /// touch - change file access and modification times
 #[derive(Parser)]

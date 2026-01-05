@@ -20,22 +20,22 @@ pub mod undo;
 
 pub use buffer::{Buffer, BufferMode, Line, Position, Range};
 pub use command::{
-    change, delete, put_after, put_before, shift_left, shift_right, yank, CommandParser,
-    MotionCommand, MotionResult, OperatorResult, ParsedCommand, ParserState,
+    CommandParser, MotionCommand, MotionResult, OperatorResult, ParsedCommand, ParserState, change,
+    delete, put_after, put_before, shift_left, shift_right, yank,
 };
 pub use editor::{Editor, ExInsertMode, FindCommand, LastCommand};
 pub use error::{Result, ViError};
-pub use ex::{parse_ex_command, Address, AddressRange, ExCommand, ExResult};
-pub use file::{read_file, write_file, FileInfo, FileManager, WriteStats};
+pub use ex::{Address, AddressRange, ExCommand, ExResult, parse_ex_command};
+pub use file::{FileInfo, FileManager, WriteStats, read_file, write_file};
 pub use input::{InputReader, Key};
-pub use mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
+pub use mode::{InsertKind, InsertState, Mode, enter_insert_mode, process_insert_key};
 pub use options::Options;
 pub use register::{RegisterContent, Registers};
 pub use search::{SearchDirection, SearchState, Substitutor};
 pub use shell::{ShellExecutor, ShellOutput};
 pub use ui::{
-    byte_offset_to_display_col, char_width, display_col_to_byte_offset, expand_for_display,
-    string_width, truncate_to_width, Screen, StatusLine, Terminal, TerminalSize,
+    Screen, StatusLine, Terminal, TerminalSize, byte_offset_to_display_col, char_width,
+    display_col_to_byte_offset, expand_for_display, string_width, truncate_to_width,
 };
 pub use undo::{Change, ChangeKind, UndoManager};
 

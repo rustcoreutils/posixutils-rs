@@ -357,11 +357,7 @@ impl CommandParser {
 
     /// Get the effective count (for commands without motion).
     pub fn get_count(&self) -> usize {
-        if self.has_count1 {
-            self.count1
-        } else {
-            1
-        }
+        if self.has_count1 { self.count1 } else { 1 }
     }
 }
 

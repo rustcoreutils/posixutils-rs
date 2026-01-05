@@ -10,7 +10,7 @@
 use std::io::{self, BufRead, Error, Read};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::path::PathBuf;
 
 /// cut - cut out selected fields of each line of a file

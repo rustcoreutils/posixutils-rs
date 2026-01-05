@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use object::{Object, ObjectSection};
 
 #[derive(Clone, Copy, ValueEnum)]

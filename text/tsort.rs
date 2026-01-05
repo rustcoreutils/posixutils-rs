@@ -12,7 +12,7 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::io::input_stream_opt;
 
 /// tsort - topological sort

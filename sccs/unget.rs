@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{parse_pfile, paths, PfileEntry, Sid};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use plib::sccsfile::{PfileEntry, Sid, parse_pfile, paths};
 
 /// unget - undo a previous get of an SCCS file
 #[derive(Parser)]

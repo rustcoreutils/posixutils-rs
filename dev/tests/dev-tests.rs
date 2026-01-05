@@ -2,7 +2,7 @@ mod lex;
 mod yacc;
 
 use object::{Object, ObjectSection, ObjectSymbol};
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::fs;
 
 fn ar_compare_test(

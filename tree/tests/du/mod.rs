@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::{fs, io::Write, os::unix::fs::MetadataExt, process::Output};
 
 fn du_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {

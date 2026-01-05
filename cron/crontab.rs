@@ -9,12 +9,12 @@
 
 use clap::Parser;
 use cron::{CRON_ALLOW, CRON_DENY, CRON_SPOOL_DIR};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Result, Write};
-use std::process::{exit, ExitStatus};
+use std::process::{ExitStatus, exit};
 
 #[derive(Parser)]
 struct CronArgs {

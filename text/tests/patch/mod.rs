@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

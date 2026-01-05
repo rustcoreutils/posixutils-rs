@@ -8,8 +8,8 @@
 //
 
 use crate::builtin::trap::TrapAction;
-use crate::os::errno::{get_current_errno_value, Errno};
-use crate::os::{pipe, read, write, OsError, OsResult, Pid};
+use crate::os::errno::{Errno, get_current_errno_value};
+use crate::os::{OsError, OsResult, Pid, pipe, read, write};
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::str::FromStr;

@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
-use crate::os::errno::Errno;
+use crate::builtin::{BuiltinResult, BuiltinUtility, parse_pid, skip_option_terminator};
 use crate::os::Pid;
-use crate::shell::opened_files::OpenedFiles;
+use crate::os::errno::Errno;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 fn wait_for_pid(pid: Pid, shell: &mut Shell) -> i32 {
     match shell.wait_child_process(pid) {

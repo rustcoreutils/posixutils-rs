@@ -12,7 +12,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::io::{self, Error, IsTerminal};
 use std::mem;
 

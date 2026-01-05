@@ -2,7 +2,7 @@
 //! Handles the various message specification formats defined by POSIX
 
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, MessageState};
+use crate::message::{MessageState, extract_login};
 
 /// Parse a message list specification and return matching message numbers
 /// If allnet is true, address matching compares only the login part (before @)

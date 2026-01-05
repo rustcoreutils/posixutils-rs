@@ -9,7 +9,7 @@
 
 use chrono::{Local, TimeZone};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::ffi::CStr;
 
 #[cfg(target_os = "linux")]
@@ -339,11 +339,7 @@ fn get_sysctl_int(name: &str) -> Option<i32> {
         )
     };
 
-    if result == 0 {
-        Some(value)
-    } else {
-        None
-    }
+    if result == 0 { Some(value) } else { None }
 }
 
 /// Iterate through macOS IPC IDs efficiently.
@@ -363,7 +359,7 @@ fn iter_macos_ipc_ids(max_slots: i32, seqs_per_slot: i32) -> impl Iterator<Item 
 
 #[cfg(target_os = "macos")]
 fn read_macos_shm() -> Vec<ShmInfo> {
-    use libc::{shmctl, shmid_ds, IPC_STAT};
+    use libc::{IPC_STAT, shmctl, shmid_ds};
 
     let mut entries = Vec::new();
     let mut shmbuf: shmid_ds = unsafe { std::mem::zeroed() };
@@ -398,7 +394,7 @@ fn read_macos_shm() -> Vec<ShmInfo> {
 
 #[cfg(target_os = "macos")]
 fn read_macos_sem() -> Vec<SemInfo> {
-    use libc::{semctl, semid_ds, IPC_STAT};
+    use libc::{IPC_STAT, semctl, semid_ds};
 
     let mut entries = Vec::new();
     let mut sembuf: semid_ds = unsafe { std::mem::zeroed() };

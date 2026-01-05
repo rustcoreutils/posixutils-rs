@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, HereDocument, Lexer};
 use crate::parse::ParseResult;
+use crate::parse::lexer::{HereDocument, Lexer, is_blank, remove_delimiter_from_here_document};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 

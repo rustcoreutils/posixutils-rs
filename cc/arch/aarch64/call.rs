@@ -12,7 +12,7 @@
 use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
-use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, FpSize, OperandSize, Symbol, complex_fp_info};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::TypeTable;
 

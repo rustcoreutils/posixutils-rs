@@ -204,11 +204,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                         code_point
                     );
                 }
-                if omit_invalid {
-                    None
-                } else {
-                    Some(vec![])
-                }
+                if omit_invalid { None } else { Some(vec![]) }
             } else {
                 Some(vec![
                     0xE0 | ((code_point >> 12) as u8),

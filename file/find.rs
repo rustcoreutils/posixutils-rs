@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use plib::modestr;
 use regex::Regex;
 
@@ -1155,11 +1155,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
     // Execute any pending batched commands
     execute_batches(&mut state);
 
-    if state.had_error {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
+    if state.had_error { Ok(1) } else { Ok(0) }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

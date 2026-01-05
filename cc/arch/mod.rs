@@ -19,7 +19,7 @@ pub mod regalloc;
 pub mod x86_64;
 
 // Re-export inline asm support traits and functions
-pub use codegen::{substitute_asm_operands, AsmOperandFormatter};
+pub use codegen::{AsmOperandFormatter, substitute_asm_operands};
 
 use crate::target::{Arch, Target};
 

@@ -54,7 +54,7 @@ pub mod control {
     pub const FLAG: u8 = b'f'; // ^Af - flag
     pub const DESC_BEGIN: u8 = b't'; // ^At - begin descriptive text
     pub const DESC_END: u8 = b'T'; // ^AT - end descriptive text
-                                   // Body control records (uppercase)
+    // Body control records (uppercase)
     pub const BODY_INSERT: u8 = b'I'; // ^AI - begin insert block
     pub const BODY_DELETE: u8 = b'D'; // ^AD - begin delete block
     pub const BODY_END: u8 = b'E'; // ^AE - end block

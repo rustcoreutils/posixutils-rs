@@ -13,8 +13,8 @@ static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 use std::{fs, path::Path};
 
-use plib::testing::{run_test, TestPlan};
-use tempfile::{tempdir, TempDir};
+use plib::testing::{TestPlan, run_test};
+use tempfile::{TempDir, tempdir};
 
 fn setup_test_env() -> (TempDir, String) {
     let temp_dir = tempdir().expect("Unable to create temporary directory");

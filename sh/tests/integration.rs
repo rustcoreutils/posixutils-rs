@@ -1,4 +1,4 @@
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -705,9 +705,16 @@ mod word_expansion {
         );
     }
     #[test]
-    fn command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion(
-    ) {
-        test_script(include_str!("sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.sh"), include_str!("sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.out"));
+    fn command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion()
+     {
+        test_script(
+            include_str!(
+                "sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.sh"
+            ),
+            include_str!(
+                "sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.out"
+            ),
+        );
     }
     #[test]
     fn nested_command_substitution() {
@@ -735,9 +742,16 @@ mod word_expansion {
         );
     }
     #[test]
-    fn parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting(
-    ) {
-        test_script(include_str!("sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.sh"), include_str!("sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.out"));
+    fn parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting()
+     {
+        test_script(
+            include_str!(
+                "sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.sh"
+            ),
+            include_str!(
+                "sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.out"
+            ),
+        );
     }
     #[test]
     fn parameter_expansion_string_operations() {
@@ -863,7 +877,14 @@ mod redirection {
 
     #[test]
     fn contents_of_here_document_are_not_expanded_if_delimiter_is_quoted() {
-        test_script(include_str!("sh/redirection/contents_of_here_document_are_not_expanded_if_delimiter_is_quoted.sh"), include_str!("sh/redirection/contents_of_here_document_are_not_expanded_if_delimiter_is_quoted.out"));
+        test_script(
+            include_str!(
+                "sh/redirection/contents_of_here_document_are_not_expanded_if_delimiter_is_quoted.sh"
+            ),
+            include_str!(
+                "sh/redirection/contents_of_here_document_are_not_expanded_if_delimiter_is_quoted.out"
+            ),
+        );
     }
 
     #[test]
@@ -1041,7 +1062,14 @@ mod commands {
     }
     #[test]
     fn exit_status_of_if_construct_is_the_exit_status_of_last_executed_command() {
-        test_script(include_str!("sh/commands/exit_status_of_if_construct_is_the_exit_status_of_last_executed_command.sh"), include_str!("sh/commands/exit_status_of_if_construct_is_the_exit_status_of_last_executed_command.out"));
+        test_script(
+            include_str!(
+                "sh/commands/exit_status_of_if_construct_is_the_exit_status_of_last_executed_command.sh"
+            ),
+            include_str!(
+                "sh/commands/exit_status_of_if_construct_is_the_exit_status_of_last_executed_command.out"
+            ),
+        );
     }
     #[test]
     fn for_loop() {

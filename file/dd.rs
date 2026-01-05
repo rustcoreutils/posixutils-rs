@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

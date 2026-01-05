@@ -12,7 +12,7 @@
 //! delivery infrastructure. Tests use debug mode via MAILRC environment
 //! variable or expect controlled failures when sendmail is unavailable.
 
-use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use plib::testing::{TestPlan, run_test_with_checker, run_test_with_checker_and_env};
 use std::io::Write;
 use tempfile::NamedTempFile;
 

@@ -121,11 +121,7 @@ pub struct SimpleCommand {
 }
 
 fn tail<T>(items: &[T]) -> &[T] {
-    if items.is_empty() {
-        items
-    } else {
-        &items[1..]
-    }
+    if items.is_empty() { items } else { &items[1..] }
 }
 
 fn write_command_parts<P: Display>(

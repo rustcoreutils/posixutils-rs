@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 
 fn usage() -> ! {
     eprintln!("usage: sccs [-r] [-d path] [-p path] command [options...] [operands...]");

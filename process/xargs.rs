@@ -15,7 +15,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::BUFSZ;
 
 const FALLBACK_ARG_MAX: usize = 131072;

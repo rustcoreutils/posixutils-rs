@@ -8,10 +8,10 @@
 //
 
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
-use crate::jobs::{parse_job_id, Job};
+use crate::jobs::{Job, parse_job_id};
 use crate::option_parser::OptionParser;
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum PrintOptions {

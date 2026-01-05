@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::env::current_dir;
 use std::ffi::OsStr;
-use std::fs::{read_to_string, File};
+use std::fs::{File, read_to_string};
 use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::exit;
@@ -18,17 +18,17 @@ use std::process::exit;
 use clap::Parser;
 #[cfg(debug_assertions)]
 use gettextrs::bindtextdomain;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use posixutils_cc::parse::ast::{BlockItem, ExprKind, ExternalDecl, ForInit, Stmt};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use posixutils_cc::parse::Parser as CParser;
+use posixutils_cc::parse::ast::{BlockItem, ExprKind, ExternalDecl, ForInit, Stmt};
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{PreprocessConfig, StreamTable, Tokenizer, preprocess_with_defines};
 use posixutils_cc::types::TypeTable;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
-use syn::{parse_file, parse_str, LitStr};
+use syn::{LitStr, parse_file, parse_str};
 
 #[derive(Parser)]
 #[command(

@@ -10,7 +10,7 @@
 use crate::parse::word::Word;
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expanded_word::ExpandedWord;
-use crate::wordexp::{expand_word_to_string, ExpansionResult};
+use crate::wordexp::{ExpansionResult, expand_word_to_string};
 use std::fmt::{Display, Formatter};
 use std::iter::Peekable;
 use std::str::CharIndices;
@@ -574,14 +574,14 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
                         Ok((interpret_expression(rhs, shell)? != 0) as i64)
                     } else {
                         Ok(0)
-                    }
+                    };
                 }
                 BinaryOperator::LogicalOr => {
                     return if lhs_value == 0 {
                         Ok((interpret_expression(rhs, shell)? != 0) as i64)
                     } else {
                         Ok(1)
-                    }
+                    };
                 }
                 _ => {}
             }

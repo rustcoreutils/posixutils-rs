@@ -1188,9 +1188,11 @@ DIGIT [0-9]
         // Invalid: ^ in middle
         let result = validate_pattern_restrictions("abc^def");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("'^' operator only valid at beginning"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("'^' operator only valid at beginning")
+        );
     }
 
     #[test]
@@ -1209,9 +1211,11 @@ DIGIT [0-9]
         // Invalid: $ in middle
         let result = validate_pattern_restrictions("abc$def");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("'$' operator only valid at end"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("'$' operator only valid at end")
+        );
     }
 
     #[test]
@@ -1221,16 +1225,20 @@ DIGIT [0-9]
         // So we test abc/def$ where $ is at end but trailing context exists
         let result = validate_pattern_restrictions("abc/def$");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("'$' cannot be used with trailing context"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("'$' cannot be used with trailing context")
+        );
 
         // Also test $ in middle with trailing context - hits "$ not at end" first
         let result2 = validate_pattern_restrictions("abc$/def");
         assert!(result2.is_err());
-        assert!(result2
-            .unwrap_err()
-            .contains("'$' operator only valid at end"));
+        assert!(
+            result2
+                .unwrap_err()
+                .contains("'$' operator only valid at end")
+        );
     }
 
     #[test]
@@ -1241,9 +1249,11 @@ DIGIT [0-9]
         // Invalid: multiple trailing context operators
         let result = validate_pattern_restrictions("abc/def/ghi");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Only one trailing context operator"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Only one trailing context operator")
+        );
     }
 
     #[test]

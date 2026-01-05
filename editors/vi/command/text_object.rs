@@ -384,11 +384,7 @@ pub fn prev_bigword_start(buffer: &Buffer, pos: Position) -> Option<Position> {
                     break;
                 }
             }
-            if idx > 0 {
-                idx - 1
-            } else {
-                0
-            }
+            if idx > 0 { idx - 1 } else { 0 }
         } else {
             chars.len() - 1
         };

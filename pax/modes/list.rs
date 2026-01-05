@@ -12,9 +12,9 @@
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
-use crate::options::{format_list_entry, FormatOptions};
-use crate::pattern::{find_matching_pattern, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::options::{FormatOptions, format_list_entry};
+use crate::pattern::{Pattern, find_matching_pattern};
+use crate::subst::{SubstResult, Substitution, apply_substitutions};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;

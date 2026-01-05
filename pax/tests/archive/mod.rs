@@ -409,11 +409,13 @@ fn test_pax_symlink() {
 
     // Verify symlink
     let extracted_link = dst_dir.join("link.txt");
-    assert!(extracted_link
-        .symlink_metadata()
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        extracted_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         fs::read_link(&extracted_link).unwrap().to_str().unwrap(),
         "target.txt"

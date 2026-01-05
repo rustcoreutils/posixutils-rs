@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::os::errno::{get_current_errno_value, Errno};
+use crate::os::errno::{Errno, get_current_errno_value};
 use crate::os::signals::Signal;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};

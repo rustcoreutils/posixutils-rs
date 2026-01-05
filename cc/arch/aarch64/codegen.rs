@@ -19,8 +19,8 @@
 
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
-use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp, is_variadic_function};
+use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol, complex_fp_info};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};

@@ -3,9 +3,9 @@
 //! These tests exercise the full editor functionality without requiring
 //! a real terminal, allowing us to test complete command sequences.
 
+use vi_rs::Editor;
 use vi_rs::buffer::Position;
 use vi_rs::mode::Mode;
-use vi_rs::Editor;
 
 // ============================================================================
 // Basic Insert Mode Tests

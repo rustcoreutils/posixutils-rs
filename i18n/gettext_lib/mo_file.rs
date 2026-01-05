@@ -366,18 +366,10 @@ impl MoFile {
         if let Some(ref info) = self.plural_info {
             // The plural expression will be evaluated by plural.rs
             // For now, use the simple Germanic plural rule as fallback
-            if n == 1 {
-                0
-            } else {
-                1.min(info.nplurals - 1)
-            }
+            if n == 1 { 0 } else { 1.min(info.nplurals - 1) }
         } else {
             // Default Germanic plural rule: n != 1
-            if n == 1 {
-                0
-            } else {
-                1
-            }
+            if n == 1 { 0 } else { 1 }
         }
     }
 
@@ -507,8 +499,7 @@ mod tests {
 
     #[test]
     fn test_parse_header_entry() {
-        let header =
-            "Content-Type: text/plain; charset=UTF-8\nPlural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 ? 1 : 2);\n";
+        let header = "Content-Type: text/plain; charset=UTF-8\nPlural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 ? 1 : 2);\n";
 
         let (plural_info, charset) = MoFile::parse_header_entry(header);
 

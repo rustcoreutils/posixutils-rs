@@ -14,7 +14,7 @@ mod mntent;
 use crate::mntent::MountTable;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::{cmp, ffi::CString, fmt::Display, io};

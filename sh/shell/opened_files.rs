@@ -117,7 +117,7 @@ impl OpenedFiles {
                         None => {
                             return Err(CommandExecutionError::RedirectionError(format!(
                                 "sh: cannot duplicate unopened file descriptor '{source_fd}'"
-                            )))
+                            )));
                         }
                         Some(other) => {
                             self.opened_files.insert(dest_fd, other.clone());

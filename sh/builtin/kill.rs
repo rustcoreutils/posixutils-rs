@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
-use crate::os::signals::{kill, Signal, SIGNALS};
-use crate::shell::opened_files::OpenedFiles;
+use crate::builtin::{BuiltinResult, BuiltinUtility, parse_pid, skip_option_terminator};
+use crate::os::signals::{SIGNALS, Signal, kill};
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 use std::str::FromStr;
 
 enum KillArgs<'a> {

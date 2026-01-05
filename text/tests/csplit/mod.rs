@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 
 fn csplit_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

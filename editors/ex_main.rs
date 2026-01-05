@@ -5,7 +5,7 @@
 
 use std::env;
 use std::process;
-use vi_rs::{run_editor, InvokedAs};
+use vi_rs::{InvokedAs, run_editor};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

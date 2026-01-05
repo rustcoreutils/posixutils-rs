@@ -3,7 +3,7 @@
 //! These tests verify the ed binary works correctly as a POSIX ed editor,
 //! testing commands via stdin/stdout.
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 use std::fs;
 use tempfile::NamedTempFile;
 

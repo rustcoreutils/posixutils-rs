@@ -25,7 +25,7 @@ use parser::{Makefile, VariableDefinition};
 use crate::special_target::InferenceTarget;
 use config::Config;
 use error_code::ErrorCode::{self, *};
-use rule::{prerequisite::Prerequisite, target::Target, Rule};
+use rule::{Rule, prerequisite::Prerequisite, target::Target};
 use special_target::SpecialTarget;
 
 /// The default shell variable name.
@@ -76,7 +76,7 @@ impl Make {
                 None => {
                     return Err(NoTarget {
                         target: Some(name.as_ref().to_string()),
-                    })
+                    });
                 }
             },
         };

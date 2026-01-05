@@ -14,8 +14,8 @@
 //! choosing the appropriate plural form based on a count value.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use posixutils_i18n::gettext_lib::lookup::{expand_escapes, MessageLookup};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use posixutils_i18n::gettext_lib::lookup::{MessageLookup, expand_escapes};
 use std::process::exit;
 
 /// ngettext - translate message and choose plural form

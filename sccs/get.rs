@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use plib::sccsfile::{DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid, paths};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]

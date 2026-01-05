@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::os::signals::{signal_to_exit_status, Signal};
-use crate::os::{waitpid, OsResult, Pid, WaitStatus};
+use crate::os::signals::{Signal, signal_to_exit_status};
+use crate::os::{OsResult, Pid, WaitStatus, waitpid};
 use std::fmt::{Display, Formatter, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

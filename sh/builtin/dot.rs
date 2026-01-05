@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility, skip_option_terminator};
 use crate::os::find_command;
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::{execute_file_as_script, ScriptExecutionError, Shell};
+use crate::shell::{ScriptExecutionError, Shell, execute_file_as_script};
 use std::path::Path;
 
 pub struct Dot;

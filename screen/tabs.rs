@@ -11,8 +11,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use terminfo::{capability as cap, Database};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use terminfo::{Database, capability as cap};
 
 // POSIX doesn't specify a maximum, but terminals have practical limits.
 // 160 columns is a reasonable upper bound for most terminals.

@@ -8,8 +8,8 @@
 //
 
 use crate::builtin::{BuiltinResult, BuiltinUtility};
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 pub struct AliasBuiltin;
 

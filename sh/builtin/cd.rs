@@ -10,8 +10,8 @@
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::chdir;
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

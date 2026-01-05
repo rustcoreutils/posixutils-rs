@@ -9,9 +9,9 @@
 
 mod common;
 
-use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
+use self::common::{ChangeOwnershipArgs, chown_traverse, error_string};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::{ffi::CString, io};
 
 /// chown - change the file ownership

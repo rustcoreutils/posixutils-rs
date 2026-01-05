@@ -9,7 +9,7 @@
 
 use crate::parse::word::{Word, WordPart};
 use crate::shell::environment::Environment;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 
 fn is_portable_filename_character(c: char) -> bool {
     // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282

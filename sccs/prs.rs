@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use plib::sccsfile::{DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid, paths};
 
 /// prs - print SCCS file information
 #[derive(Parser)]
@@ -53,11 +53,7 @@ fn format_sid(sid: &Sid) -> String {
 }
 
 fn flag_yes_no(val: bool) -> &'static str {
-    if val {
-        "yes"
-    } else {
-        "no"
-    }
+    if val { "yes" } else { "no" }
 }
 
 /// Expand data keywords in format string for a specific delta

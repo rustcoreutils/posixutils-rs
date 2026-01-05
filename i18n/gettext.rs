@@ -13,8 +13,8 @@
 //! to a given msgid from a message catalog for the current locale.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use posixutils_i18n::gettext_lib::lookup::{expand_escapes, MessageLookup};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use posixutils_i18n::gettext_lib::lookup::{MessageLookup, expand_escapes};
 use std::process::exit;
 
 /// gettext - retrieve text string from message database

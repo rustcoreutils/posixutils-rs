@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
-use crate::os::errno::get_current_errno_value;
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility, skip_option_terminator};
 use crate::os::LibcResult;
-use crate::shell::opened_files::OpenedFiles;
+use crate::os::errno::get_current_errno_value;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 fn seconds_to_minutes(seconds: f32) -> i32 {
     seconds as i32 / 60

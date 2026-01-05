@@ -13,5 +13,5 @@ pub mod lexer;
 pub mod preprocess;
 
 // Re-export items used by main.rs
-pub use lexer::{show_token, token_type_name, StreamTable, Tokenizer};
-pub use preprocess::{preprocess_with_defines, PreprocessConfig};
+pub use lexer::{StreamTable, Tokenizer, show_token, token_type_name};
+pub use preprocess::{PreprocessConfig, preprocess_with_defines};

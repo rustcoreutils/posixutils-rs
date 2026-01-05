@@ -7,9 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
-use crate::shell::opened_files::OpenedFiles;
+use crate::builtin::{BuiltinResult, BuiltinUtility, skip_option_terminator};
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 pub struct Unalias;
 

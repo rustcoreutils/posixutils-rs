@@ -15,8 +15,8 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::pattern::{matches_any, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::pattern::{Pattern, matches_any};
+use crate::subst::{SubstResult, Substitution, apply_substitutions};
 use std::collections::HashMap;
 use std::fs::{self, File, Permissions};
 use std::io::{Read, Write};

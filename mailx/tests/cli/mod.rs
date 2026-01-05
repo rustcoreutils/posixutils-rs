@@ -21,7 +21,7 @@
 //!
 //! Tests use static test data files for reproducible results.
 
-use plib::testing::{run_test, run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker, run_test_with_checker_and_env};
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;

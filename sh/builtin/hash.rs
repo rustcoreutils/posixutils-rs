@@ -8,11 +8,11 @@
 //
 
 use crate::builtin::{
-    get_builtin_utility, get_special_builtin_utility, skip_option_terminator, BuiltinResult,
-    BuiltinUtility,
+    BuiltinResult, BuiltinUtility, get_builtin_utility, get_special_builtin_utility,
+    skip_option_terminator,
 };
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 
 pub struct Hash;
 

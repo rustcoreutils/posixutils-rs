@@ -11,7 +11,7 @@ use std::{fs::remove_file, process};
 
 use crate::rule::INTERRUPT_FLAG;
 use gettextrs::gettext;
-use libc::{signal, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, signal};
 
 /// Handles incoming signals by setting the interrupt flag and exiting the process.
 pub fn handle_signals(signal_code: libc::c_int) {

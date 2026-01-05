@@ -27,7 +27,7 @@
 //! assert!(re.is_match("HELLOOO"));
 //! ```
 
-use libc::{regcomp, regex_t, regexec, regfree, regmatch_t, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
+use libc::{REG_EXTENDED, REG_ICASE, REG_NOMATCH, regcomp, regex_t, regexec, regfree, regmatch_t};
 use std::ffi::CString;
 use std::io::{Error, ErrorKind};
 use std::ptr;

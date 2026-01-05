@@ -16,10 +16,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::{DateTime, Local};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::io::input_stream;
 
-use self::pr_util::{line_transform, Args, PageIterator, Parameters};
+use self::pr_util::{Args, PageIterator, Parameters, line_transform};
 
 const FORM_FEED: char = 12 as char;
 const TAB: char = '\t';

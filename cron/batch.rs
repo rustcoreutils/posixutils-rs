@@ -8,7 +8,7 @@
 //
 
 use chrono::{DateTime, Local, TimeZone, Utc};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use libc::{getlogin, getpwnam, passwd};
 
 use std::{
@@ -229,7 +229,7 @@ impl Job {
 
         format!(
             "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask 22\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
-            if mail {1} else {0},
+            if mail { 1 } else { 0 },
             call_place.to_string_lossy()
         )
     }

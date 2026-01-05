@@ -15,8 +15,8 @@ use bc_util::{
 };
 use clap::Parser;
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use rustyline::{error::ReadlineError, DefaultEditor, Result};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use rustyline::{DefaultEditor, Result, error::ReadlineError};
 
 mod bc_util;
 

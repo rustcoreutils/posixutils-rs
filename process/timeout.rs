@@ -12,12 +12,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use posixutils_process::signal::parse_signal;
 
 static FOREGROUND: AtomicBool = AtomicBool::new(false);

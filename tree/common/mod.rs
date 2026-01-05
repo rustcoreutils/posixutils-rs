@@ -20,10 +20,10 @@ use gettextrs::gettext;
 use std::{ffi::CStr, io};
 
 // cp and mv
-pub use copy::{copy_file, copy_files, CopyConfig};
+pub use copy::{CopyConfig, copy_file, copy_files};
 
 // chgrp and chown
-pub use change_ownership::{chown_traverse, ChangeOwnershipArgs};
+pub use change_ownership::{ChangeOwnershipArgs, chown_traverse};
 
 /// Return the error message.
 ///

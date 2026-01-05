@@ -15,7 +15,7 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     fmt::Write,
-    fs::{read_to_string, File},
+    fs::{File, read_to_string},
     io::{self, BufReader, Read},
     os::unix::fs::MetadataExt,
     path::PathBuf,

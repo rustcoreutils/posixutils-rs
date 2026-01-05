@@ -10,16 +10,16 @@
 use crate::builtin::set::SetOptions;
 use crate::builtin::trap::TrapAction;
 use crate::builtin::{
-    get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
+    BuiltinUtility, SpecialBuiltinUtility, get_builtin_utility, get_special_builtin_utility,
 };
 use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{kill, signal_to_exit_status, Signal, SignalManager};
+use crate::os::signals::{Signal, SignalManager, kill, signal_to_exit_status};
 use crate::os::{
-    close, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
-    setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus, close, dup2, exec, find_command,
+    fork, getpgid, getpgrp, is_process_in_foreground, pipe, setpgid, tcsetpgrp, waitpid,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -30,14 +30,14 @@ use crate::parse::word::WordPair;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
-use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
+use crate::shell::history::{History, initialize_history_from_system, write_history_to_file};
 use crate::shell::opened_files::OpenedFiles;
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::{read_to_string, Read};
+use std::io::{Read, read_to_string};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;

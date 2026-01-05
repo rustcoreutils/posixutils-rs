@@ -2282,11 +2282,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 diag::error(pos, "expected ':' in conditional expression");
             }
             let false_val = self.expr_ternary();
-            if cond != 0 {
-                true_val
-            } else {
-                false_val
-            }
+            if cond != 0 { true_val } else { false_val }
         } else {
             cond
         }
@@ -2610,11 +2606,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
         let result = if let Some(name) = self.get_ident() {
             self.advance();
-            if self.pp.is_defined(&name) {
-                1
-            } else {
-                0
-            }
+            if self.pp.is_defined(&name) { 1 } else { 0 }
         } else {
             0
         };
@@ -2654,11 +2646,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
         // Return 1 for attributes we actually implement
         let supported = matches!(name.as_str(), "noreturn" | "__noreturn__");
-        if supported {
-            1
-        } else {
-            0
-        }
+        if supported { 1 } else { 0 }
     }
 
     /// Evaluate __has_builtin(X)
@@ -2696,11 +2684,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 | "offsetof"
         );
 
-        if supported {
-            1
-        } else {
-            0
-        }
+        if supported { 1 } else { 0 }
     }
 
     /// Evaluate __has_feature(X) and __has_extension(X)
@@ -2716,11 +2700,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             "statement_expressions" // GNU ({ }) extension
         );
 
-        if supported {
-            1
-        } else {
-            0
-        }
+        if supported { 1 } else { 0 }
     }
 
     fn parse_number(&self, s: &str) -> i64 {

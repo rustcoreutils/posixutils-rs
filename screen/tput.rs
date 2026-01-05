@@ -11,8 +11,8 @@ use std::io;
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use terminfo::{capability as cap, Database};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use terminfo::{Database, capability as cap};
 
 // POSIX exit codes for tput
 const EXIT_SUCCESS: u8 = 0;

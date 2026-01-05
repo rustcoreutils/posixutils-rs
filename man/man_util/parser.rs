@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use pest::{iterators::Pair, Parser};
+use pest::{Parser, iterators::Pair};
 use pest_derive::Parser;
 use text_production::{AtType, BsxType};
 use thiserror::Error;

@@ -17,7 +17,7 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 /// sort - sort, merge, or sequence check text files
 #[derive(Parser)]
@@ -297,11 +297,7 @@ fn numeric_sort_filter(input: &str) -> Option<String> {
         }
     }
 
-    if found_number {
-        Some(result)
-    } else {
-        None
-    }
+    if found_number { Some(result) } else { None }
 }
 
 /// Compares two strings numerically, extracting numbers and performing a numeric comparison.

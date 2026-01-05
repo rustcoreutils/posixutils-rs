@@ -16,7 +16,7 @@
 //! - testdata-single.mbox: 1 message (alice)
 //! - testdata-5msg.mbox: 5 messages (alice, bob, charlie, alice@different, dave)
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;

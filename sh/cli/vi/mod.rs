@@ -11,11 +11,11 @@ mod cursor;
 mod word;
 
 use crate::cli::vi::cursor::{Cursor, MotionCommand, MotionError};
-use crate::cli::vi::word::{current_bigword, BigWordIter};
+use crate::cli::vi::word::{BigWordIter, current_bigword};
 use crate::parse::word_parser::parse_word;
 use crate::pattern::{FilenamePattern, HistoryPattern};
-use crate::shell::history::History;
 use crate::shell::Shell;
+use crate::shell::history::History;
 use crate::wordexp::expand_word;
 use crate::wordexp::pathname::glob;
 use std::borrow::Cow;

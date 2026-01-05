@@ -13,9 +13,9 @@ use std::io::{self, BufRead, Error, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::{input_reader, input_stream};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::BUFSZ;
+use plib::io::{input_reader, input_stream};
 
 #[derive(Parser)]
 #[command(version, about = gettext("split - split a file into pieces"))]

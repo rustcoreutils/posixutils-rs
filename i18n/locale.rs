@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use gettextrs::{
-    bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory as GettextCategory,
+    LocaleCategory as GettextCategory, bind_textdomain_codeset, gettext, setlocale, textdomain,
 };
 use posixutils_i18n::locale_lib::env::LocaleSettings;
 use posixutils_i18n::locale_lib::platform;

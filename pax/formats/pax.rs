@@ -24,7 +24,7 @@
 //! - Data format: "%d %s=%s\n" (length, keyword, value)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult, is_eof_error};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::io::{Read, Write};

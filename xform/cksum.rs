@@ -18,9 +18,9 @@
 mod crc32;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::BUFSZ;
+use plib::io::input_stream;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
@@ -49,13 +49,7 @@ fn cksum_file(filename: &PathBuf) -> io::Result<()> {
         crc = crc32::update(crc, &buffer[0..n_read]);
     }
 
-    let filename_prefix = {
-        if filename.as_os_str() == "" {
-            ""
-        } else {
-            " "
-        }
-    };
+    let filename_prefix = { if filename.as_os_str() == "" { "" } else { " " } };
     println!(
         "{} {}{}{}",
         crc32::finalize(crc, n_bytes),

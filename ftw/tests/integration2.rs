@@ -1,4 +1,4 @@
-use rand::{distributions::Standard, rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, distributions::Standard, rngs::StdRng};
 use std::{ffi::CString, fs, io, os::fd::AsRawFd, path::Path, path::PathBuf, sync::Mutex};
 use tempfile::TempDir;
 

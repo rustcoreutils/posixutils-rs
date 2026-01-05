@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{paths, SccsFile, Sid};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use plib::sccsfile::{SccsFile, Sid, paths};
 
 // Exit status bit masks per POSIX
 const ERR_MISSING_FILE: u8 = 0x80;

@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 use rand::{seq::SliceRandom, thread_rng};
 
 /* #region Normal tests */

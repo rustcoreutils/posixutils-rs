@@ -15,7 +15,7 @@ use std::slice::Chunks;
 use std::str::FromStr;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 #[derive(Parser)]
 #[command(version, about = gettext("od - dump files in octal and other formats"))]

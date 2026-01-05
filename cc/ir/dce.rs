@@ -239,7 +239,7 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
                 insn.bb_true = Some(false_target);
                 insn.bb_false = None;
                 insn.src.clear(); // Remove condition operand
-                                  // Update children: remove true_target from successors
+                // Update children: remove true_target from successors
                 bb.children.retain(|c| *c != true_target);
                 changed = true;
             } else if false_unreachable && !true_unreachable {
@@ -249,7 +249,7 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
                 insn.bb_true = Some(true_target);
                 insn.bb_false = None;
                 insn.src.clear(); // Remove condition operand
-                                  // Update children: remove false_target from successors
+                // Update children: remove false_target from successors
                 bb.children.retain(|c| *c != false_target);
                 changed = true;
             }

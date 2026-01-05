@@ -39,8 +39,8 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    compute_live_intervals, expire_intervals, find_call_positions, find_conflicting_registers,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval,
+    ConstraintPoint, LiveInterval, compute_live_intervals, expire_intervals, find_call_positions,
+    find_conflicting_registers, identify_fp_pseudos, interval_crosses_call,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;

@@ -123,18 +123,10 @@ pub fn tokenize(input: &str) -> EdResult<Vec<Token>> {
                 }
 
                 let n: isize = if offset_str.is_empty() {
-                    if sign == '+' {
-                        1
-                    } else {
-                        -1
-                    }
+                    if sign == '+' { 1 } else { -1 }
                 } else {
                     let unsigned: isize = offset_str.parse().unwrap();
-                    if sign == '-' {
-                        -unsigned
-                    } else {
-                        unsigned
-                    }
+                    if sign == '-' { -unsigned } else { unsigned }
                 };
 
                 tokens.push(Token::Offset(n));

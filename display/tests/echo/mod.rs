@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_u8, TestPlan, TestPlanU8};
+use plib::testing::{TestPlan, TestPlanU8, run_test, run_test_u8};
 
 fn echo_test(args: &[&str], expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -137,7 +137,7 @@ fn test_echo_octal_escape_three_digits() {
     // \0 followed by 3 octal digits
     echo_test(&["\\0101"], "A\n"); // \0101 = 'A' (65 decimal)
     echo_test(&["\\0141"], "a\n"); // \0141 = 'a' (97 decimal)
-                                   // \0377 = 255 (max byte) - use byte comparison since 0xFF is not valid UTF-8
+    // \0377 = 255 (max byte) - use byte comparison since 0xFF is not valid UTF-8
     echo_test_bytes(&["\\0377"], &[0xff, b'\n']);
 }
 

@@ -33,7 +33,7 @@
 //! - Volume scripts are executed synchronously
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult, is_eof_error};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;

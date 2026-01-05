@@ -8,8 +8,8 @@
 //
 
 use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
-use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shell::opened_files::OpenedFiles;
 use crate::utils::strcoll;
 use std::ffi::CString;
 

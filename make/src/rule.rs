@@ -13,16 +13,17 @@ pub mod recipe;
 pub mod target;
 
 use crate::{
+    DEFAULT_SHELL, DEFAULT_SHELL_VAR,
     config::Config as GlobalConfig,
     error_code::ErrorCode::{self, *},
     parser::{Rule as ParsedRule, VariableDefinition},
-    signal_handler, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
+    signal_handler,
 };
 use config::Config;
 use gettextrs::gettext;
 use prerequisite::Prerequisite;
-use recipe::config::Config as RecipeConfig;
 use recipe::Recipe;
+use recipe::config::Config as RecipeConfig;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::PathBuf;

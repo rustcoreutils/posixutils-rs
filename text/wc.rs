@@ -15,9 +15,9 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::BUFSZ;
+use plib::io::input_stream;
 
 /// wc - word, line, and byte or character count
 #[derive(Parser)]

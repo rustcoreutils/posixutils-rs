@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use terminfo::Database;
 
 use super::{
-    mdoc_macro::{text_production::*, types::*, Macro},
-    parser::{trim_quotes, Element, MacroNode, MdocDocument},
+    mdoc_macro::{Macro, text_production::*, types::*},
+    parser::{Element, MacroNode, MdocDocument, trim_quotes},
 };
 
 /// Max Bl -width parameter value
@@ -56,7 +56,7 @@ fn substitutions() -> &'static HashMap<&'static str, &'static str> {
         m.insert(r"\&", ""); // zero-width space
         m.insert(r"\)", ""); // zero-width space (transparent to end-of-sentence detection)
         m.insert(r"\%", ""); // zero-width space allowing hyphenation
-                             //m.insert(r"\:", "");  // zero-width space allowing line break
+        //m.insert(r"\:", "");  // zero-width space allowing line break
 
         // Lines:
         m.insert(r"\(ba", "|"); // bar
@@ -67,7 +67,7 @@ fn substitutions() -> &'static HashMap<&'static str, &'static str> {
         m.insert(r"\(bb", "¦"); // broken bar
         m.insert(r"\(sl", "/"); // forward slash
         m.insert(r"\(rs", "\\"); // backward slash
-                                 // Text markers:
+        // Text markers:
         m.insert(r"\(ci", "○"); // circle
         m.insert(r"\(bu", "•"); // bullet
         m.insert(r"\(dd", "‡"); // double dagger
@@ -86,18 +86,18 @@ fn substitutions() -> &'static HashMap<&'static str, &'static str> {
         m.insert(r"\(SP", "♠"); // spade suit
         m.insert(r"\(HE", "♥"); // heart suit
         m.insert(r"\(DI", "♦"); // diamond suit
-                                // Legal symbols:
+        // Legal symbols:
         m.insert(r"\(co", "©"); // copyright
         m.insert(r"\(rg", "®"); // registered
         m.insert(r"\(tm", "™"); // trademarked
-                                // Punctuation:
+        // Punctuation:
         m.insert(r"\(em", "—"); // em-dash
         m.insert(r"\(en", "–"); // en-dash
         m.insert(r"\(hy", "‐"); // hyphen
         m.insert(r"\e", "\\"); // back-slash
         m.insert(r"\(r!", "¡"); // upside-down exclamation
         m.insert(r"\(r?", "¿"); // upside-down question
-                                // Quotes:
+        // Quotes:
         m.insert(r"\(Bq", "„"); // right low double-quote
         m.insert(r"\(bq", "‚"); // right low single-quote
         m.insert(r"\(lq", "“"); // left double-quote
@@ -110,7 +110,7 @@ fn substitutions() -> &'static HashMap<&'static str, &'static str> {
         m.insert(r"\(Fc", "»"); // right guillemet
         m.insert(r"\(fo", "‹"); // left single guillemet
         m.insert(r"\(fc", "›"); // right single guillemet
-                                // Brackets:
+        // Brackets:
         m.insert(r"\(lB", "[");
         m.insert(r"\(rB", "]");
         m.insert(r"\(lC", "{");
@@ -3899,7 +3899,9 @@ impl MdocFormatter {
 
         let ending_2 = if macro_node.nodes.len() <= 1 { "s" } else { "" };
 
-        format!("The {content} function{ending_1} return{ending_2} the value 0 if successful; otherwise the value -1 is returned and the global variable errno is set to indicate the error.")
+        format!(
+            "The {content} function{ending_1} return{ending_2} the value 0 if successful; otherwise the value -1 is returned and the global variable errno is set to indicate the error."
+        )
     }
 
     fn format_sm(&mut self, sm_mode: Option<SmMode>, macro_node: MacroNode) -> String {
@@ -4004,7 +4006,7 @@ fn is_first_word_delimiter(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{man_util::formatter::MdocDocument, FormattingSettings, MdocFormatter, MdocParser};
+    use crate::{FormattingSettings, MdocFormatter, MdocParser, man_util::formatter::MdocDocument};
 
     /// Test settings
     const FORMATTING_SETTINGS: FormattingSettings = FormattingSettings {

@@ -214,11 +214,7 @@ fn class_matches(class: &CharClass, c: char) -> bool {
         }
     }
 
-    if class.negated {
-        !matched
-    } else {
-        matched
-    }
+    if class.negated { !matched } else { matched }
 }
 
 /// Check if any pattern matches the given path

@@ -3,7 +3,7 @@
 //! These tests verify the ex binary works correctly in line-oriented mode,
 //! testing POSIX ex commands via stdin/stdout.
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 use std::fs;
 use tempfile::NamedTempFile;
 

@@ -3,7 +3,7 @@
 use crate::error::{Result, ViError};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use termios::{tcsetattr, Termios, ECHO, ICANON, ICRNL, ISIG, IXON, OPOST, TCSAFLUSH, VMIN, VTIME};
+use termios::{ECHO, ICANON, ICRNL, ISIG, IXON, OPOST, TCSAFLUSH, Termios, VMIN, VTIME, tcsetattr};
 
 /// Terminal size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

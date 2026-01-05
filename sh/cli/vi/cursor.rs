@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::cli::vi::CommandParseError;
 use crate::cli::vi::word::{
     current_bigword_end, current_word_end, next_bigword_start, next_word_start,
 };
-use crate::cli::vi::CommandParseError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionCommand {
@@ -419,9 +419,11 @@ mod tests {
         assert_eq!(moved.position, 13);
 
         let cursor = cursor_at_position(0);
-        assert!(cursor
-            .moved(line, MotionCommand::MoveToBeforeFirstChar(b'Q'), None)
-            .is_err());
+        assert!(
+            cursor
+                .moved(line, MotionCommand::MoveToBeforeFirstChar(b'Q'), None)
+                .is_err()
+        );
     }
 
     #[test]

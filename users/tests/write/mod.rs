@@ -16,7 +16,7 @@
 //! running in parallel. The tests are sensitive to timing due to the
 //! fork/exec/read pattern used to capture output from the write utility.
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test_with_checker};
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

@@ -11,7 +11,7 @@
 
 use crate::ed::buffer::Buffer;
 use crate::ed::error::{EdError, EdResult};
-use crate::ed::parser::{parse, Address, AddressInfo, Command, PrintMode};
+use crate::ed::parser::{Address, AddressInfo, Command, PrintMode, parse};
 use regex::Regex;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::Ordering;

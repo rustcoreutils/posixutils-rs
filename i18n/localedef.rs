@@ -14,7 +14,7 @@
 //! whose operational behavior is determined by locale settings.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;

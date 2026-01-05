@@ -7,10 +7,10 @@ use std::process::Command;
 
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, MessageState};
+use crate::message::{MessageState, extract_login};
 use crate::msglist::{parse_message, parse_msglist};
-use crate::send::{compose_reply, send_message, ComposedMessage};
-use crate::variables::{parse_set_arg, Variables};
+use crate::send::{ComposedMessage, compose_reply, send_message};
+use crate::variables::{Variables, parse_set_arg};
 
 /// Result of executing a command
 pub enum CommandResult {

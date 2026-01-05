@@ -6,7 +6,7 @@ use std::path::Path;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 fn xgettext_test<P: AsRef<Path>, P2: AsRef<Path>>(
     args: &[&str],

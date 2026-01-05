@@ -9,11 +9,11 @@
 
 //! C code generation for the yacc parser
 
+use crate::Options;
 use crate::diag;
 use crate::error::YaccError;
-use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL};
+use crate::grammar::{EOF_SYMBOL, ERROR_SYMBOL, Grammar};
 use crate::lalr::{Action, LALRAutomaton};
-use crate::Options;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -1057,8 +1057,20 @@ fn generate_parser<W: Write>(
         prefix,
         prefix
     )?;
-    writeln!(w, "    if ({}n < 0 || {}n >= (int)(sizeof({}table)/sizeof({}table[0])) || {}check[{}n] != ({}char < {} ? {}translate[{}char] : 2))",
-        prefix, prefix, prefix, prefix, prefix, prefix, prefix, get_translate_table_size(grammar), prefix, prefix)?;
+    writeln!(
+        w,
+        "    if ({}n < 0 || {}n >= (int)(sizeof({}table)/sizeof({}table[0])) || {}check[{}n] != ({}char < {} ? {}translate[{}char] : 2))",
+        prefix,
+        prefix,
+        prefix,
+        prefix,
+        prefix,
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix
+    )?;
     writeln!(w, "        goto {}default_action;", prefix)?;
     writeln!(w)?;
     writeln!(w, "    {}n = {}table[{}n];", prefix, prefix, prefix)?;
@@ -1191,8 +1203,11 @@ fn generate_parser<W: Write>(
         "        int {}gidx = {}pgoto[{}idx] + {}ss[{}ssp_offset];",
         prefix, prefix, prefix, prefix, prefix
     )?;
-    writeln!(w, "        if ({}gidx >= 0 && {}gidx < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}gidx] == {}ss[{}ssp_offset])",
-        prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix)?;
+    writeln!(
+        w,
+        "        if ({}gidx >= 0 && {}gidx < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}gidx] == {}ss[{}ssp_offset])",
+        prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix
+    )?;
     writeln!(
         w,
         "            {}state = {}table[{}gidx];",
@@ -1272,12 +1287,19 @@ fn generate_parser<W: Write>(
         "            {}n += {};  /* error token */",
         prefix, ERROR_SYMBOL
     )?;
-    writeln!(w, "            if ({}n >= 0 && {}n < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}n] == {}) {{",
-        prefix, prefix, prefix, prefix, prefix, prefix, ERROR_SYMBOL)?;
+    writeln!(
+        w,
+        "            if ({}n >= 0 && {}n < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}n] == {}) {{",
+        prefix, prefix, prefix, prefix, prefix, prefix, ERROR_SYMBOL
+    )?;
     if opts.debug_enabled {
         writeln!(w, "#if YYDEBUG")?;
         writeln!(w, "                if ({}debug)", prefix)?;
-        writeln!(w, "                    fprintf(stderr, \"Shifting error token, entering state %d\\n\", {}table[{}n]);", prefix, prefix)?;
+        writeln!(
+            w,
+            "                    fprintf(stderr, \"Shifting error token, entering state %d\\n\", {}table[{}n]);",
+            prefix, prefix
+        )?;
         writeln!(w, "#endif")?;
     }
     writeln!(w, "                /* Shift the error token */")?;

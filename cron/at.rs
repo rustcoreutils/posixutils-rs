@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use libc::{getlogin, getpwnam, passwd};
 use timespec::Timespec;
 
@@ -519,7 +519,7 @@ impl Job {
 
         format!(
             "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask 22\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
-            if mail {1} else {0},
+            if mail { 1 } else { 0 },
             call_place.to_string_lossy()
         )
     }
@@ -686,7 +686,7 @@ fn user_info_by_name(name: &str) -> Option<passwd> {
 }
 
 mod time {
-    use chrono::{offset::LocalResult, DateTime, Datelike, TimeZone, Utc};
+    use chrono::{DateTime, Datelike, TimeZone, Utc, offset::LocalResult};
 
     // Copy from `touch`
     pub fn parse_time_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {

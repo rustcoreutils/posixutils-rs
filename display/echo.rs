@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::io::{self, Write};
 
 fn translate_str(skip_nl: bool, s: &str) -> Vec<u8> {

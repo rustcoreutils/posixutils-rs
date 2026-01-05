@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsFile, SccsFlag,
-    SccsHeader, Sid,
+    BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsFile, SccsFlag, SccsHeader,
+    Sid, paths,
 };
 
 /// admin - create and administer SCCS files

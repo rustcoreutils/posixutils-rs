@@ -775,10 +775,10 @@ impl<'src> CommandParser<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::word::SpecialParameter;
     use crate::parse::word::test_utils::{
         quoted_literal, special_parameter, unquoted_literal, unquoted_literal_pair,
     };
-    use crate::parse::word::SpecialParameter;
 
     fn parse_complete_command(
         text: &str,
@@ -1647,12 +1647,18 @@ mod tests {
 
     #[test]
     fn invalid_parameter_is_error() {
-        assert!(parse_complete_command("$.", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse_complete_command("$\n0", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse_complete_command("$", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input))
+        assert!(
+            parse_complete_command("$.", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
+        assert!(
+            parse_complete_command("$\n0", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
+        assert!(
+            parse_complete_command("$", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        )
     }
 
     #[test]
@@ -1661,17 +1667,23 @@ mod tests {
             parse_complete_command("${word:.other_word}", AliasTable::default())
                 .is_err_and(|err| !err.could_be_resolved_with_more_input)
         );
-        assert!(parse_complete_command("${word:\n-}", AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse_complete_command("${word:", AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(
+            parse_complete_command("${word:\n-}", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
+        assert!(
+            parse_complete_command("${word:", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
 
         assert!(
             parse_complete_command("${word;word}", AliasTable::default())
                 .is_err_and(|err| !err.could_be_resolved_with_more_input)
         );
-        assert!(parse_complete_command("${word", AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(
+            parse_complete_command("${word", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
     }
 
     #[test]
@@ -1696,16 +1708,22 @@ mod tests {
 
     #[test]
     fn pipe_with_no_following_command_is_error() {
-        assert!(parse_complete_command("command |", AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(
+            parse_complete_command("command |", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
     }
 
     #[test]
     fn logical_op_with_no_following_command_is_error() {
-        assert!(parse_complete_command("command &&", AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
-        assert!(parse_complete_command("command ||", AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(
+            parse_complete_command("command &&", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
+        assert!(
+            parse_complete_command("command ||", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
     }
 
     #[test]

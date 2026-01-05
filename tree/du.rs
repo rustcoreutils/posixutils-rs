@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::{
     cell::RefCell,
     collections::{HashSet, LinkedList},
@@ -42,11 +42,7 @@ struct Args {
 }
 
 fn calc_size(kilo: bool, size: u64) -> u64 {
-    if kilo {
-        size / 2
-    } else {
-        size
-    }
+    if kilo { size / 2 } else { size }
 }
 
 struct Node {

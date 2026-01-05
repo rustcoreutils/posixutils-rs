@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_env, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_env};
 
 /// Test gettext with no catalog - should echo the original message
 #[test]

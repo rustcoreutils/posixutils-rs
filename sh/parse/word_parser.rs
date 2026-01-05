@@ -113,7 +113,7 @@ impl<'src> WordParser<'src> {
                             self.line_no,
                             "length of '*' or '@' is unspecified",
                             false,
-                        ))
+                        ));
                     }
                     other => ParameterExpansion::StrLen(other),
                 };
@@ -258,7 +258,7 @@ impl<'src> WordParser<'src> {
                                         self.line_no,
                                         "unclosed single quotes",
                                         false,
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -430,10 +430,12 @@ mod tests {
     fn parse_unquoted_parameter_expansion(word: &str) -> ParameterExpansion {
         let word = parse_word(word);
         match word.parts.as_slice() {
-            [WordPart::ParameterExpansion {
-                expansion,
-                inside_double_quotes,
-            }] => {
+            [
+                WordPart::ParameterExpansion {
+                    expansion,
+                    inside_double_quotes,
+                },
+            ] => {
                 assert!(!inside_double_quotes);
                 expansion.clone()
             }
@@ -444,10 +446,12 @@ mod tests {
     fn parse_unquoted_command_substitution(word: &str) -> String {
         let word = parse_word(word);
         match word.parts.as_slice() {
-            [WordPart::CommandSubstitution {
-                commands,
-                inside_double_quotes,
-            }] => {
+            [
+                WordPart::CommandSubstitution {
+                    commands,
+                    inside_double_quotes,
+                },
+            ] => {
                 assert!(!inside_double_quotes);
                 commands.clone()
             }

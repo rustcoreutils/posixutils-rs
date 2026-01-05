@@ -11,7 +11,7 @@
 //! POSIX-compliant implementation using SSH for transport.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use posixutils_uucp::common::{
     expand_remote_path, generate_job_id, is_local_system, parse_path_spec, send_mail, shell_escape,
     ssh_exec, ssh_fetch_file, ssh_send_file,

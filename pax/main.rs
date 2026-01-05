@@ -20,9 +20,9 @@ mod pattern;
 mod subst;
 
 use archive::{ArchiveFormat, ArchiveWriter};
-use blocked_io::{parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE};
+use blocked_io::{BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE, parse_blocksize};
 use clap::{Parser, ValueEnum};
-use compression::{is_gzip, GzipReader, GzipWriter};
+use compression::{GzipReader, GzipWriter, is_gzip};
 use error::{PaxError, PaxResult};
 use gettextrs::gettext;
 use modes::copy::CopyOptions;

@@ -689,8 +689,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     /// Skip a block comment (/* ... */)
     fn skip_block_comment(&mut self) {
         let pos = self.pos(); // Save position for warning
-                              // Track both current and next character to properly detect */
-                              // This handles cases like /***/ or /**/
+        // Track both current and next character to properly detect */
+        // This handles cases like /***/ or /**/
         let mut next = self.nextchar();
         loop {
             let curr = next;
@@ -1109,7 +1109,9 @@ mod tests {
             .collect();
         assert_eq!(
             ops,
-            vec!["&", "&=", "|", "|=", "^", "^=", "~", "<<", ">>", "<<=", ">>="]
+            vec![
+                "&", "&=", "|", "|=", "^", "^=", "~", "<<", ">>", "<<=", ">>="
+            ]
         );
     }
 
@@ -1221,7 +1223,9 @@ mod tests {
             .collect();
         assert_eq!(
             toks,
-            vec!["int", "main", "(", "void", ")", "{", "return", "0", ";", "}"]
+            vec![
+                "int", "main", "(", "void", ")", "{", "return", "0", ";", "}"
+            ]
         );
     }
 

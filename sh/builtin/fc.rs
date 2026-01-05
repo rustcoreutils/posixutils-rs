@@ -10,9 +10,9 @@
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::{mkstemp, write};
+use crate::shell::Shell;
 use crate::shell::history::EndPoint;
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::FromRawFd;

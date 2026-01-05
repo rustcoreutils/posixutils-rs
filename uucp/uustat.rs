@@ -11,7 +11,7 @@
 //! POSIX-compliant implementation.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use posixutils_uucp::common::{find_job, list_jobs, spool_dir};
 use std::collections::HashMap;
 use std::env;

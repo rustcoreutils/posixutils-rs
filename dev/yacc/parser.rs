@@ -258,7 +258,7 @@ impl<'a> Parser<'a> {
                 None => {
                     return Err(
                         self.syntax_error(0, "unexpected end of input in declarations".into())
-                    )
+                    );
                 }
                 _ => {
                     return Err(self.syntax_error(
@@ -267,7 +267,7 @@ impl<'a> Parser<'a> {
                             "unexpected token in declarations: {:?}",
                             self.current_token()
                         ),
-                    ))
+                    ));
                 }
             }
         }

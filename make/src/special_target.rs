@@ -11,9 +11,9 @@ use core::fmt;
 use std::collections::BTreeSet;
 
 use crate::{
-    error_code::ErrorCode,
-    rule::{target::Target, Rule},
     Make,
+    error_code::ErrorCode,
+    rule::{Rule, target::Target},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,8 +28,8 @@ pub enum SpecialTarget {
     Suffixes,
 }
 use crate::config::Config;
-use gettextrs::gettext;
 use SpecialTarget::*;
+use gettextrs::gettext;
 
 impl SpecialTarget {
     // could be automated with `strum`

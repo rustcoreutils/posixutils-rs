@@ -8,8 +8,8 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{ioctl, winsize, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, ioctl, winsize};
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::sync::Mutex;
 use std::{
@@ -220,7 +220,7 @@ impl AddressRange {
                 return Err(SedError::ScriptParse(
                     "address isn't empty, position or range".to_string(),
                     None,
-                ))
+                ));
             }
             2 => Some((false, false)),
             0 => return Ok(None),

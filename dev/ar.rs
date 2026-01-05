@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use gettextrs::gettext;
 use object::{Object, ObjectSymbol, SymbolKind};
 use std::ffi::{OsStr, OsString};
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;

@@ -13,13 +13,13 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use posixutils_cc::parse::ast::ExternalDecl;
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use posixutils_cc::parse::Parser as CParser;
+use posixutils_cc::parse::ast::ExternalDecl;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::{Namespace, SymbolTable};
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{PreprocessConfig, StreamTable, Tokenizer, preprocess_with_defines};
 use posixutils_cc::types::TypeTable;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};

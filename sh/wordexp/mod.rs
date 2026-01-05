@@ -239,7 +239,7 @@ pub fn expand_word(
                             return Err(CommandExecutionError::ExpansionError(format!(
                                 "{} contains invalid utf8",
                                 os_string.to_string_lossy()
-                            )))
+                            )));
                         }
                     }
                 }

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test_with_checker};
 use std::process::Output;
 
 fn run_ps_test(args: Vec<&str>, expected_exit_code: i32, check_fn: fn(&TestPlan, &Output)) {

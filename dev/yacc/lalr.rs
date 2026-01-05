@@ -10,7 +10,7 @@
 //! LALR(1) lookahead computation and parse table construction
 
 use crate::first_follow::FirstFollow;
-use crate::grammar::{Grammar, ProductionId, SymbolId, AUGMENTED_START, EOF_SYMBOL};
+use crate::grammar::{AUGMENTED_START, EOF_SYMBOL, Grammar, ProductionId, SymbolId};
 use crate::lr0::{Item, LR0Automaton, StateId};
 use crate::parser::Associativity;
 use std::collections::{BTreeMap, HashMap, HashSet};

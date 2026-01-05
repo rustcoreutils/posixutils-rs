@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker_and_env, run_test_with_env, TestPlan};
+use plib::testing::{TestPlan, run_test_with_checker_and_env, run_test_with_env};
 
 /// Test that lp fails when no destination is specified
 #[test]

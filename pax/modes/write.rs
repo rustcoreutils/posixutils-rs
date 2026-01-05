@@ -14,7 +14,7 @@ use crate::error::PaxResult;
 use crate::formats::{CpioWriter, PaxWriter, UstarWriter};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::options::{FormatOptions, InvalidAction};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::subst::{SubstResult, Substitution, apply_substitutions};
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Write};
 #[cfg(unix)]

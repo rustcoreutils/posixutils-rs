@@ -20,7 +20,7 @@ use dfa::Dfa;
 use gettextrs::gettext;
 use nfa::Nfa;
 use regex_syntax::ast::parse::ParserBuilder;
-use regex_syntax::hir::{translate::TranslatorBuilder, Hir};
+use regex_syntax::hir::{Hir, translate::TranslatorBuilder};
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 

@@ -12,7 +12,7 @@
 use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
-use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, FpSize, OperandSize, Symbol, complex_fp_info};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::TypeTable;
 use std::collections::HashMap;

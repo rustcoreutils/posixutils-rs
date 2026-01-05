@@ -111,29 +111,31 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     let mut buf = [0u8; 4];
     let mut idx = 4;
 
-    let iter = iter::from_fn(move || loop {
-        if idx < 4 {
-            let byte = buf[idx];
-            idx += 1;
-            return Some(byte);
-        }
-
-        match code_point.next() {
-            Some(cp) => {
-                if cp > 0x10FFFF {
-                    if omit_invalid {
-                        continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid Unicode code point U+{:X}", cp);
-                        }
-                        exit(1);
-                    }
-                }
-                write_u32(&mut buf, cp, variant); // Write code point to buffer
-                idx = 0;
+    let iter = iter::from_fn(move || {
+        loop {
+            if idx < 4 {
+                let byte = buf[idx];
+                idx += 1;
+                return Some(byte);
             }
-            None => return None,
+
+            match code_point.next() {
+                Some(cp) => {
+                    if cp > 0x10FFFF {
+                        if omit_invalid {
+                            continue;
+                        } else {
+                            if !suppress_error {
+                                eprintln!("Error: Invalid Unicode code point U+{:X}", cp);
+                            }
+                            exit(1);
+                        }
+                    }
+                    write_u32(&mut buf, cp, variant); // Write code point to buffer
+                    idx = 0;
+                }
+                None => return None,
+            }
         }
     });
 

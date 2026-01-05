@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::utmpx::Utmpx;
 use plib::{curuser, platform, utmpx};
 
@@ -85,11 +85,7 @@ fn get_terminal_state(line: &str) -> char {
         Ok(meta) => {
             let mode = meta.mode();
             // Check group write permission (o+w would be 0o002, g+w is 0o020)
-            if mode & 0o020 != 0 {
-                '+'
-            } else {
-                '-'
-            }
+            if mode & 0o020 != 0 { '+' } else { '-' }
         }
         Err(_) => '?',
     }

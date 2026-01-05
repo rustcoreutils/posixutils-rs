@@ -8,8 +8,8 @@
 //
 
 use clap::{ArgAction, Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use man_util::config::{parse_config_file, ManConfig};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use man_util::config::{ManConfig, parse_config_file};
 use man_util::formatter::MdocFormatter;
 use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;

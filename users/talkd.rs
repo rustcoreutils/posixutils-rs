@@ -13,9 +13,9 @@
 //! domain sockets instead of the network UDP protocol. It maintains an
 //! invitation registry and facilitates connections between talk clients.
 
-use binrw::{binrw, BinReaderExt, BinWrite, Endian};
+use binrw::{BinReaderExt, BinWrite, Endian, binrw};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Cursor};

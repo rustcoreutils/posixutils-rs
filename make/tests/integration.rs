@@ -8,11 +8,11 @@
 //
 
 use std::env;
-use std::fs::{remove_file, File};
+use std::fs::{File, remove_file};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
-use plib::testing::{run_test, run_test_base, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_base};
 
 use posixutils_make::error_code::ErrorCode;
 
@@ -379,7 +379,7 @@ mod macros {
 
 mod target_behavior {
     use super::*;
-    use libc::{kill, SIGINT};
+    use libc::{SIGINT, kill};
     use posixutils_make::parser::parse::ParseError;
     use std::{thread, time::Duration};
 
@@ -584,7 +584,7 @@ mod recipes {
 
 mod special_targets {
     use super::*;
-    use libc::{kill, SIGINT};
+    use libc::{SIGINT, kill};
     use posixutils_make::special_target;
     use std::fs::remove_dir;
     use std::{fs, thread, time::Duration};
@@ -735,7 +735,10 @@ mod special_targets {
         #[test]
         fn without_prerequisites() {
             run_test_helper(
-                &["-f", "tests/makefiles/special_targets/validations/without_prerequisites.mk"],
+                &[
+                    "-f",
+                    "tests/makefiles/special_targets/validations/without_prerequisites.mk",
+                ],
                 "",
                 "make: '.DEFAULT' special target constraint is not fulfilled: the special target must not have prerequisites\n",
                 ErrorCode::SpecialTargetConstraintNotFulfilled {
@@ -749,7 +752,10 @@ mod special_targets {
         #[test]
         fn without_recipes() {
             run_test_helper(
-                &["-f", "tests/makefiles/special_targets/validations/without_recipes.mk"],
+                &[
+                    "-f",
+                    "tests/makefiles/special_targets/validations/without_recipes.mk",
+                ],
                 "",
                 "make: '.SILENT' special target constraint is not fulfilled: the special target must not have recipes\n",
                 ErrorCode::SpecialTargetConstraintNotFulfilled {

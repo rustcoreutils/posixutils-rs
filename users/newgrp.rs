@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use clap::{Parser, error::ErrorKind};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use libc::{
     getgid, getgrnam, getgroups, getlogin, getpwnam, getpwuid, getuid, gid_t, passwd, setegid,
     setgid, setgroups, setuid, uid_t,

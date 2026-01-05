@@ -13,7 +13,7 @@ use std::os::fd::BorrowedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 /// Unary operators
 #[allow(clippy::upper_case_acronyms)]
@@ -235,7 +235,7 @@ fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> EvalResult {
                 "{}: {}",
                 gettext("integer expression expected"),
                 s1
-            ))
+            ));
         }
     };
     let i2: i64 = match s2.parse() {
@@ -245,7 +245,7 @@ fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> EvalResult {
                 "{}: {}",
                 gettext("integer expression expected"),
                 s2
-            ))
+            ));
         }
     };
 

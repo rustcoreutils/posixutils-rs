@@ -1,6 +1,6 @@
 //! Ex command parser.
 
-use super::address::{parse_address_range, Address, AddressRange};
+use super::address::{Address, AddressRange, parse_address_range};
 use super::command::{ExCommand, MapMode, SubstituteFlags};
 use crate::error::{Result, ViError};
 

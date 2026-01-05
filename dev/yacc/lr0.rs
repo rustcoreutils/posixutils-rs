@@ -9,7 +9,7 @@
 
 //! LR(0) automaton construction
 
-use crate::grammar::{Grammar, ProductionId, SymbolId, AUGMENTED_START};
+use crate::grammar::{AUGMENTED_START, Grammar, ProductionId, SymbolId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// An LR(0) item: a production with a dot position

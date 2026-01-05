@@ -9,7 +9,7 @@
 
 use chrono::Local;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::{curuser, platform, utmpx};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};

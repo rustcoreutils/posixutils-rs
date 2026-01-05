@@ -7,16 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::cli::args::{parse_args, ExecutionMode};
+use crate::cli::args::{ExecutionMode, parse_args};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
 use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp};
 use crate::shell::Shell;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use os::signals::{
-    handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
+    Signal, handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling,
 };
 use std::error::Error;
 use std::io;

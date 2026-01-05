@@ -162,7 +162,7 @@ pub fn generate<W: Write>(
     write_header(output)?;
     write_includes(output)?;
     write_external_definitions(output, lexinfo)?;
-    write_macros_and_types(output, config, &flags)?;
+    write_macros_and_types(output, lexinfo, config, &flags)?;
     write_char_class_table(output, dfa)?;
     write_num_states(output, dfa)?;
     // Only generate accept lists if needed for REJECT or alternate rule finding
@@ -216,6 +216,7 @@ fn write_external_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io
 
 fn write_macros_and_types<W: Write>(
     output: &mut W,
+    lexinfo: &LexInfo,
     config: &CodeGenConfig,
     flags: &FeatureFlags,
 ) -> io::Result<()> {
@@ -324,7 +325,6 @@ static int yy_at_bol = 1; /* Start at beginning of line */
 /* REJECT support */
 static int yy_reject_flag = 0;
 static int yy_full_match_state = 0;  /* DFA state where match occurred */
-static int yy_full_match_rule_idx = 0;  /* Index within accepting list */
 "#
     )?;
 
@@ -376,15 +376,15 @@ static int yy_more_len = 0;
     )?;
 
     // Variable-length trailing context support - only emit if any rule uses it
+    // Use per-rule array to correctly handle multiple rules with var-TC at the same DFA state
+    // Track as offsets from YYTOKEN to avoid needing adjustment on buffer shifts
     if flags.has_var_tc {
+        let num_rules = lexinfo.rules.len();
         writeln!(output, "/* Variable-length trailing context support */")?;
+        writeln!(output, "#define YY_NUM_VAR_TC_RULES {}", num_rules)?;
         writeln!(
             output,
-            "static unsigned char *yy_main_end_ptr = NULL; /* Position where main pattern ended */"
-        )?;
-        writeln!(
-            output,
-            "static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */"
+            "static int yy_main_end_offset[YY_NUM_VAR_TC_RULES]; /* Per-rule: offset from YYTOKEN where main pattern ends, or -1 */"
         )?;
         writeln!(output)?;
     }
@@ -628,8 +628,8 @@ fn write_main_pattern_end_table<W: Write>(
     _config: &CodeGenConfig,
 ) -> io::Result<()> {
     // Note: yy_state_main_end and yy_rule_var_tc tables were originally generated here
-    // but are unused - the implementation uses yy_main_end_ptr/yy_main_end_rule directly
-    // at runtime instead of static tables. Removed to avoid unused variable warnings.
+    // but are unused - the implementation uses yy_main_end_offset[] (per-rule offset from
+    // YYTOKEN) at runtime instead of static tables. Removed to avoid unused variable warnings.
     Ok(())
 }
 
@@ -847,14 +847,19 @@ fn write_dfa_state<W: Write>(
     }
 
     // Track main pattern end for variable-length trailing context
+    // Track ALL rules that have their main pattern end at this state, using offset from YYTOKEN
     if flags.has_var_tc && !state.main_pattern_end_rules.is_empty() {
-        let rule = state.main_pattern_end_rules[0];
-        if rule < config.rule_metadata.len()
-            && config.rule_metadata[rule].has_variable_trailing_context
-        {
-            writeln!(output, "    /* Main pattern ends here for rule {} */", rule)?;
-            writeln!(output, "    yy_main_end_ptr = YYCURSOR;")?;
-            writeln!(output, "    yy_main_end_rule = {};", rule)?;
+        for &rule in &state.main_pattern_end_rules {
+            if rule < config.rule_metadata.len()
+                && config.rule_metadata[rule].has_variable_trailing_context
+            {
+                writeln!(output, "    /* Main pattern ends here for rule {} */", rule)?;
+                writeln!(
+                    output,
+                    "    yy_main_end_offset[{}] = (int)(YYCURSOR - YYTOKEN);",
+                    rule
+                )?;
+            }
         }
     }
 
@@ -989,7 +994,6 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "    yyaccept = -1;")?;
     writeln!(output, "    yy_reject_flag = 0;")?;
     writeln!(output, "    yy_full_match_state = 0;")?;
-    writeln!(output, "    yy_full_match_rule_idx = 0;")?;
     if has_reject {
         writeln!(
             output,
@@ -997,8 +1001,12 @@ fn write_yylex_direct_coded<W: Write>(
         )?;
     }
     if has_var_tc {
-        writeln!(output, "    yy_main_end_ptr = YYCURSOR;")?;
-        writeln!(output, "    yy_main_end_rule = -1;")?;
+        // Reset per-rule main pattern end tracking for new token
+        // Use memset to set all bytes to 0xFF, giving -1 for each int (two's complement)
+        writeln!(
+            output,
+            "    memset(yy_main_end_offset, -1, sizeof(yy_main_end_offset));"
+        )?;
     }
     // Save BOL status at token start (for BOL anchor validation)
     if has_bol_anchors {
@@ -1053,12 +1061,7 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "        int yy_marker_offset = YYMARKER - yy_buffer;"
     )?;
-    if has_var_tc {
-        writeln!(
-            output,
-            "        int yy_main_end_offset = yy_main_end_ptr ? (int)(yy_main_end_ptr - yy_buffer) : -1;"
-        )?;
-    }
+    // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, so no adjustment needed on buffer shifts
     writeln!(
         output,
         "        /* Shift remaining data to start of buffer */"
@@ -1091,12 +1094,6 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "            size_t limit_off = YYLIMIT - yy_buffer;"
     )?;
-    if has_var_tc {
-        writeln!(
-            output,
-            "            size_t main_end_off = yy_main_end_ptr ? (size_t)(yy_main_end_ptr - yy_buffer) : 0;"
-        )?;
-    }
     writeln!(
         output,
         "            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);"
@@ -1114,12 +1111,6 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "            YYTOKEN = yy_buffer + token_off;")?;
     writeln!(output, "            YYMARKER = yy_buffer + marker_off;")?;
     writeln!(output, "            YYLIMIT = yy_buffer + limit_off;")?;
-    if has_var_tc {
-        writeln!(
-            output,
-            "            if (main_end_off) yy_main_end_ptr = yy_buffer + main_end_off;"
-        )?;
-    }
     writeln!(output, "        }}")?;
     writeln!(
         output,
@@ -1164,12 +1155,7 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "            YYMARKER = yy_buffer + (yy_marker_offset - yy_token_offset);"
     )?;
-    if has_var_tc {
-        writeln!(
-            output,
-            "            yy_main_end_ptr = (yy_main_end_offset >= 0) ? yy_buffer + (yy_main_end_offset - yy_token_offset) : NULL;"
-        )?;
-    }
+    // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, no adjustment needed on shift
     writeln!(output, "            if (yyaccept >= 0) {{")?;
     writeln!(output, "                goto yy_fail;")?;
     writeln!(output, "            }}")?;
@@ -1199,12 +1185,7 @@ fn write_yylex_direct_coded<W: Write>(
         output,
         "        YYMARKER = yy_buffer + (yy_marker_offset - yy_token_offset);"
     )?;
-    if has_var_tc {
-        writeln!(
-            output,
-            "        yy_main_end_ptr = (yy_main_end_offset >= 0) ? yy_buffer + (yy_main_end_offset - yy_token_offset) : NULL;"
-        )?;
-    }
+    // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, no adjustment needed on refill
     writeln!(
         output,
         "        /* Resume scanning from the DFA state that hit buffer end */"
@@ -1570,15 +1551,21 @@ fn write_yylex_direct_coded<W: Write>(
         writeln!(output, "            yytext[yyleng] = '\\0';")?;
         if has_var_tc {
             writeln!(output, "        }} else if (yy_main_len == -2) {{")?;
-            writeln!(output, "            /* Variable-length main pattern */")?;
             writeln!(
                 output,
-                "            if (yy_main_end_rule == yyaccept && yy_main_end_ptr > YYTOKEN) {{"
+                "            /* Variable-length main pattern - use per-rule offset */"
             )?;
-            writeln!(output, "                YYCURSOR = yy_main_end_ptr;")?;
             writeln!(
                 output,
-                "                yyleng = (int)(yy_main_end_ptr - YYTOKEN);"
+                "            if (yy_main_end_offset[yyaccept] >= 0) {{"
+            )?;
+            writeln!(
+                output,
+                "                YYCURSOR = YYTOKEN + yy_main_end_offset[yyaccept];"
+            )?;
+            writeln!(
+                output,
+                "                yyleng = yy_main_end_offset[yyaccept];"
             )?;
             writeln!(output, "                yytext[yyleng] = '\\0';")?;
             writeln!(output, "            }}")?;

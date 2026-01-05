@@ -512,7 +512,6 @@ a         printf("A\n");
     // Check for REJECT support variables (direct-coded uses different tracking)
     assert!(c_code.contains("yy_reject_flag"));
     assert!(c_code.contains("yy_full_match_state"));
-    assert!(c_code.contains("yy_full_match_rule_idx"));
 
     // Check for accepting rules list (for REJECT to find next-best match)
     assert!(c_code.contains("yy_accept_idx"));
@@ -1184,6 +1183,64 @@ int main() {
     assert!(
         output.contains("CD: 'cdd'"),
         "Trailing context should be re-matched, got: {}",
+        output
+    );
+}
+
+#[test]
+fn test_multiple_variable_trailing_context_rules() {
+    // Test multiple rules with variable-length trailing context
+    // This verifies that each rule correctly tracks its own main pattern end position
+    // (regression test for bug where only the first rule's position was tracked)
+    let lex_input = r#"
+%option noinput nounput
+%%
+ab+/cd+     printf("RULE0_AB: '%s' len=%d\n", yytext, yyleng);
+xy+/z+      printf("RULE1_XY: '%s' len=%d\n", yytext, yyleng);
+cd+         printf("CD: '%s'\n", yytext);
+z+          printf("Z: '%s'\n", yytext);
+[ \t\n]+    /* skip */
+.           printf("OTHER: '%c'\n", *yytext);
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test both rules with their respective inputs
+    // Input: "abbcdd xyyzz" - tests both var-TC rules in sequence
+    let result = compile_and_run(&c_code, "abbcdd xyyzz\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // Rule 0: "abb" should be matched (main pattern ab+), followed by "cdd" (trailing context cd+)
+    assert!(
+        output.contains("RULE0_AB: 'abb' len=3"),
+        "Rule 0 should match 'abb' with len=3, got: {}",
+        output
+    );
+    // The trailing context "cdd" should then be matched by the cd+ rule
+    assert!(
+        output.contains("CD: 'cdd'"),
+        "Trailing context 'cdd' should be re-matched by cd+ rule, got: {}",
+        output
+    );
+
+    // Rule 1: "xyy" should be matched (main pattern xy+), followed by "zz" (trailing context z+)
+    assert!(
+        output.contains("RULE1_XY: 'xyy' len=3"),
+        "Rule 1 should match 'xyy' with len=3, got: {}",
+        output
+    );
+    // The trailing context "zz" should then be matched by the z+ rule
+    assert!(
+        output.contains("Z: 'zz'"),
+        "Trailing context 'zz' should be re-matched by z+ rule, got: {}",
         output
     );
 }

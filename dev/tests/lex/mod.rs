@@ -511,6 +511,7 @@ a         printf("A\n");
 
     // Check for REJECT support variables (direct-coded uses different tracking)
     assert!(c_code.contains("yy_reject_flag"));
+    assert!(c_code.contains("yy_full_match_state"));
     assert!(c_code.contains("yy_full_match_rule_idx"));
 
     // Check for accepting rules list (for REJECT to find next-best match)

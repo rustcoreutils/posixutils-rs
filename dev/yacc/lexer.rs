@@ -518,33 +518,19 @@ impl<'a> Lexer<'a> {
                             }
                             "prec" => Token::Prec,
                             "expect" => {
-                                // Check for %expect-rr
-                                if self.peek() == Some('-') {
-                                    let saved_pos = self.pos;
-                                    let saved_line = self.line;
-                                    let saved_col = self.column;
-                                    self.advance(); // consume '-'
-                                    if self.peek() == Some('r') {
-                                        self.advance();
-                                        if self.peek() == Some('r') {
-                                            self.advance();
-                                            Token::ExpectRr
-                                        } else {
-                                            // Not -rr, restore and return Expect
-                                            self.pos = saved_pos;
-                                            self.line = saved_line;
-                                            self.column = saved_col;
-                                            self.chars = self.input[saved_pos..].chars().peekable();
-                                            Token::Expect
-                                        }
-                                    } else {
-                                        // Not -rr, restore and return Expect
-                                        self.pos = saved_pos;
-                                        self.line = saved_line;
-                                        self.column = saved_col;
-                                        self.chars = self.input[saved_pos..].chars().peekable();
-                                        Token::Expect
-                                    }
+                                // Check for %expect-rr by looking ahead without consuming
+                                let remaining = &self.input[self.pos..];
+                                if remaining.starts_with("-rr")
+                                    && !remaining[3..]
+                                        .chars()
+                                        .next()
+                                        .is_some_and(|c| c.is_alphanumeric())
+                                {
+                                    // Consume the "-rr" suffix
+                                    self.advance(); // '-'
+                                    self.advance(); // 'r'
+                                    self.advance(); // 'r'
+                                    Token::ExpectRr
                                 } else {
                                     Token::Expect
                                 }

@@ -3437,3 +3437,62 @@ expr : expr '+' expr
         stderr
     );
 }
+
+#[test]
+fn test_expect_rr_suppresses_warning_when_correct() {
+    // This grammar has a reduce/reduce conflict (both A and B can reduce to empty)
+    let grammar = r#"
+%token X
+%expect-rr 1
+%%
+start : A X | B X ;
+A : /* empty */ ;
+B : /* empty */ ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed
+    assert!(
+        output.status.success(),
+        "yacc should succeed with correct %expect-rr: {}",
+        stderr
+    );
+
+    // Should NOT report the conflict warning (it's suppressed)
+    assert!(
+        !stderr.contains("reduce/reduce conflict"),
+        "conflict warning should be suppressed with correct %expect-rr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_rr_fails_when_mismatch() {
+    // This grammar has 1 reduce/reduce conflict, but we claim 0
+    let grammar = r#"
+%token X
+%expect-rr 0
+%%
+start : A X | B X ;
+A : /* empty */ ;
+B : /* empty */ ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should fail due to mismatch
+    assert!(
+        !output.status.success(),
+        "yacc should fail when %expect-rr doesn't match actual conflicts"
+    );
+
+    // Should report the mismatch
+    assert!(
+        stderr.contains("reduce/reduce conflict"),
+        "should report expected vs actual mismatch, got: {}",
+        stderr
+    );
+}

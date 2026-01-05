@@ -18,6 +18,30 @@ use crate::lexfile::LexInfo;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
+/// Check if `text` contains `word` as a standalone C identifier.
+/// This avoids false positives from substrings (e.g., "REJECTED" matching "REJECT").
+fn contains_identifier(text: &str, word: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(word) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0
+            || !text[..abs_pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let after_ok = abs_pos + word.len() >= text.len()
+            || !text[abs_pos + word.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
+}
+
 /// Rule metadata for code generation
 #[derive(Clone, Default)]
 pub struct RuleMetadata {
@@ -93,7 +117,7 @@ impl FeatureFlags {
         let mut has_reject = false;
         let mut eof_rules = Vec::new();
         for (idx, rule) in lexinfo.rules.iter().enumerate() {
-            if rule.action.contains("REJECT") {
+            if contains_identifier(&rule.action, "REJECT") {
                 has_reject = true;
             }
             if rule.is_eof {
@@ -628,13 +652,13 @@ fn write_eof_dispatch<W: Write>(
         writeln!(output, "{}yyleng = 0;", indent)?;
         writeln!(output, "{}yytext[0] = '\\0';", indent)?;
         writeln!(output, "{}goto yy_action_{};", indent, idx)?;
-    } else if config.start_conditions.len() <= 1 {
-        // Single start condition (INITIAL only), but EOF rule has conditions
-        // Check if any EOF rule applies to INITIAL
-        let initial_eof = eof_rules.iter().find(|r| {
-            r.start_conditions.is_empty() || r.start_conditions.contains(&"INITIAL".to_string())
-        });
-        if let Some(rule) = initial_eof {
+    } else if config.start_conditions.len() <= 1 && eof_rules.len() == 1 {
+        // Single start condition (INITIAL only) with single conditional EOF rule
+        // Check if the EOF rule applies to INITIAL
+        let rule = &eof_rules[0];
+        if rule.start_conditions.is_empty()
+            || rule.start_conditions.contains(&"INITIAL".to_string())
+        {
             writeln!(output, "{}/* Execute <<EOF>> rule */", indent)?;
             writeln!(output, "{}yyleng = 0;", indent)?;
             writeln!(output, "{}yytext[0] = '\\0';", indent)?;
@@ -720,17 +744,36 @@ static int input(void)
     if !lexinfo.options.nounput {
         writeln!(
             output,
-            r#"/* unput - push character back to input */
-/* Always inserts directly into main buffer so DFA sees it immediately */
+            r#"/* unput - push character back to input
+ * Inserts directly into main buffer (not a separate pushback buffer) so the
+ * DFA sees the character immediately on the next scan.
+ * Two paths: (1) if room before YYCURSOR, decrement and store there;
+ *            (2) otherwise, shift buffer contents right to make room at start.
+ */
 static void unput(int c)
 {{
     if (YYCURSOR > yy_buffer) {{
-        /* Simple case: push back into main buffer */
+        /* Room before cursor - just back up and insert */
         *--YYCURSOR = (unsigned char)c;
     }} else {{
         /* At start of buffer - need to shift content right to make room */
-        int yy_remain = YYLIMIT - yy_buffer;
-        if (yy_remain > 0 && yy_remain < YY_BUF_SIZE) {{
+        size_t yy_remain = YYLIMIT - yy_buffer;
+        /* Grow buffer if full */
+        if (yy_remain >= yy_buffer_size) {{
+            size_t new_size = yy_buffer_size * 2;
+            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
+            if (new_buf == NULL) {{
+                fprintf(stderr, "lex: out of memory in unput()\\n");
+                return;
+            }}
+            YYCURSOR = new_buf + (YYCURSOR - yy_buffer);
+            YYLIMIT = new_buf + (YYLIMIT - yy_buffer);
+            YYTOKEN = new_buf + (YYTOKEN - yy_buffer);
+            YYMARKER = new_buf + (YYMARKER - yy_buffer);
+            yy_buffer = new_buf;
+            yy_buffer_size = new_size;
+        }}
+        if (yy_remain > 0) {{
             memmove(yy_buffer + 1, yy_buffer, yy_remain);
         }}
         yy_buffer[0] = (unsigned char)c;
@@ -955,7 +998,7 @@ fn write_yylex_direct_coded<W: Write>(
     }
     // Save BOL status at token start (for BOL anchor validation)
     if has_bol_anchors {
-        writeln!(output, "    int yy_token_at_bol = yy_at_bol;")?;
+        writeln!(output, "    int yy_token_started_at_bol = yy_at_bol;")?;
     }
     writeln!(output)?;
 
@@ -1067,6 +1110,10 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "            yy_buffer = new_buf;")?;
     writeln!(output, "            yy_buffer_size = new_size;")?;
     writeln!(output, "        }}")?;
+    writeln!(
+        output,
+        "        /* Move unscanned data to buffer start; skip if yy_remain==0 (nothing to preserve) */"
+    )?;
     writeln!(
         output,
         "        if (yy_remain > 0 && YYTOKEN > yy_buffer) {{"
@@ -1233,7 +1280,7 @@ fn write_yylex_direct_coded<W: Write>(
         if has_bol_anchors {
             writeln!(
                 output,
-                "                if (yy_rule_bol[yy_rule] && !yy_token_at_bol) continue;"
+                "                if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
             )?;
         }
         writeln!(output, "                yyaccept = yy_rule;")?;
@@ -1282,7 +1329,7 @@ fn write_yylex_direct_coded<W: Write>(
         if has_bol_anchors {
             writeln!(
                 output,
-                "                    if (yy_rule_bol[yy_rule] && !yy_token_at_bol) continue;"
+                "                    if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
             )?;
         }
         writeln!(output, "                    yyaccept = yy_rule;")?;
@@ -1420,7 +1467,7 @@ fn write_yylex_direct_coded<W: Write>(
         if has_bol_anchors {
             writeln!(
                 output,
-                "    if (yyaccept >= 0 && yy_rule_bol[yyaccept] && !yy_token_at_bol) {{"
+                "    if (yyaccept >= 0 && yy_rule_bol[yyaccept] && !yy_token_started_at_bol) {{"
             )?;
             writeln!(
                 output,
@@ -1469,7 +1516,7 @@ fn write_yylex_direct_coded<W: Write>(
         if has_bol_anchors {
             writeln!(
                 output,
-                "            if (yy_rule_bol[yy_rule] && !yy_token_at_bol) continue;"
+                "            if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
             )?;
         }
         writeln!(output, "            yyaccept = yy_rule;")?;
@@ -1550,7 +1597,7 @@ fn write_yylex_direct_coded<W: Write>(
 
     for (rule_idx, rule) in lexinfo.rules.iter().enumerate() {
         writeln!(output, "    case {}:", rule_idx)?;
-        // Only generate yy_action_N label for <<EOF>> rules that actually use it
+        // Generate yy_action_N label for <<EOF>> rules (enables direct jump from EOF handling)
         if eof_rules.iter().any(|r| r.rule_idx == rule_idx) {
             writeln!(output, "    yy_action_{}:", rule_idx)?;
         }
@@ -1626,6 +1673,25 @@ mod tests {
     use crate::lexfile::LexInfo;
     use crate::nfa::Nfa;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_contains_identifier() {
+        // Positive cases - should match
+        assert!(contains_identifier("REJECT;", "REJECT"));
+        assert!(contains_identifier("if (x) REJECT;", "REJECT"));
+        assert!(contains_identifier("REJECT", "REJECT"));
+        assert!(contains_identifier("{ REJECT; }", "REJECT"));
+
+        // Negative cases - should NOT match (part of larger identifier)
+        assert!(!contains_identifier("REJECTED", "REJECT"));
+        assert!(!contains_identifier("NOT_REJECT", "REJECT"));
+        assert!(!contains_identifier("REJECT_ALL", "REJECT"));
+        assert!(!contains_identifier("myREJECT", "REJECT"));
+
+        // Edge cases
+        assert!(contains_identifier("x=REJECT+1", "REJECT")); // operators as boundaries
+        assert!(contains_identifier("(REJECT)", "REJECT")); // parens as boundaries
+    }
 
     fn create_test_lexinfo() -> LexInfo {
         LexInfo {

@@ -1074,14 +1074,23 @@ fn write_yylex_direct_coded<W: Write>(
         "        if (YYTOKEN == yy_buffer && (size_t)yy_remain >= yy_buffer_size - 256) {{"
     )?;
     writeln!(output, "            size_t new_size = yy_buffer_size * 2;")?;
+    writeln!(output, "            /* Save offsets before realloc */")?;
     writeln!(
         output,
-        "            /* Save offsets before realloc */"
+        "            size_t cursor_off = YYCURSOR - yy_buffer;"
     )?;
-    writeln!(output, "            size_t cursor_off = YYCURSOR - yy_buffer;")?;
-    writeln!(output, "            size_t token_off = YYTOKEN - yy_buffer;")?;
-    writeln!(output, "            size_t marker_off = YYMARKER - yy_buffer;")?;
-    writeln!(output, "            size_t limit_off = YYLIMIT - yy_buffer;")?;
+    writeln!(
+        output,
+        "            size_t token_off = YYTOKEN - yy_buffer;"
+    )?;
+    writeln!(
+        output,
+        "            size_t marker_off = YYMARKER - yy_buffer;"
+    )?;
+    writeln!(
+        output,
+        "            size_t limit_off = YYLIMIT - yy_buffer;"
+    )?;
     if has_var_tc {
         writeln!(
             output,

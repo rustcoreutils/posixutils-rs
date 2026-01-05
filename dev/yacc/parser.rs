@@ -92,6 +92,10 @@ pub struct ParsedGrammar {
     pub rules: Vec<Rule>,
     /// Programs section (after second %%) with line information
     pub epilogue: Option<CodeBlock>,
+    /// Expected number of shift/reduce conflicts (%expect)
+    pub expect_sr: Option<usize>,
+    /// Expected number of reduce/reduce conflicts (%expect-rr)
+    pub expect_rr: Option<usize>,
 }
 
 impl ParsedGrammar {
@@ -104,6 +108,8 @@ impl ParsedGrammar {
             start: None,
             rules: Vec::new(),
             epilogue: None,
+            expect_sr: None,
+            expect_rr: None,
         }
     }
 }
@@ -252,6 +258,42 @@ impl<'a> Parser<'a> {
                         return Err(self.syntax_error(
                             self.current_line(),
                             "expected identifier after %start".into(),
+                        ));
+                    }
+                }
+                Some(Token::Expect) => {
+                    self.advance();
+                    if let Some(Token::Number(n)) = self.current_token() {
+                        if *n < 0 {
+                            return Err(self.syntax_error(
+                                self.current_line(),
+                                "expected non-negative number after %expect".into(),
+                            ));
+                        }
+                        grammar.expect_sr = Some(*n as usize);
+                        self.advance();
+                    } else {
+                        return Err(self.syntax_error(
+                            self.current_line(),
+                            "expected number after %expect".into(),
+                        ));
+                    }
+                }
+                Some(Token::ExpectRr) => {
+                    self.advance();
+                    if let Some(Token::Number(n)) = self.current_token() {
+                        if *n < 0 {
+                            return Err(self.syntax_error(
+                                self.current_line(),
+                                "expected non-negative number after %expect-rr".into(),
+                            ));
+                        }
+                        grammar.expect_rr = Some(*n as usize);
+                        self.advance();
+                    } else {
+                        return Err(self.syntax_error(
+                            self.current_line(),
+                            "expected number after %expect-rr".into(),
                         ));
                     }
                 }
@@ -688,5 +730,67 @@ expr : NUM
         let grammar = parse(&tokens).unwrap();
         assert_eq!(grammar.prologue.len(), 1);
         assert!(grammar.prologue[0].code.contains("stdio.h"));
+    }
+
+    #[test]
+    fn test_expect() {
+        let input = r#"
+%token NUM
+%expect 5
+%%
+expr : NUM
+     ;
+"#;
+        let tokens = lex(input).unwrap();
+        let grammar = parse(&tokens).unwrap();
+        assert_eq!(grammar.expect_sr, Some(5));
+        assert_eq!(grammar.expect_rr, None);
+    }
+
+    #[test]
+    fn test_expect_rr() {
+        let input = r#"
+%token NUM
+%expect-rr 3
+%%
+expr : NUM
+     ;
+"#;
+        let tokens = lex(input).unwrap();
+        let grammar = parse(&tokens).unwrap();
+        assert_eq!(grammar.expect_sr, None);
+        assert_eq!(grammar.expect_rr, Some(3));
+    }
+
+    #[test]
+    fn test_expect_both() {
+        let input = r#"
+%token NUM
+%expect 2
+%expect-rr 1
+%%
+expr : NUM
+     ;
+"#;
+        let tokens = lex(input).unwrap();
+        let grammar = parse(&tokens).unwrap();
+        assert_eq!(grammar.expect_sr, Some(2));
+        assert_eq!(grammar.expect_rr, Some(1));
+    }
+
+    #[test]
+    fn test_expect_zero() {
+        let input = r#"
+%token NUM
+%expect 0
+%expect-rr 0
+%%
+expr : NUM
+     ;
+"#;
+        let tokens = lex(input).unwrap();
+        let grammar = parse(&tokens).unwrap();
+        assert_eq!(grammar.expect_sr, Some(0));
+        assert_eq!(grammar.expect_rr, Some(0));
     }
 }

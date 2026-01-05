@@ -168,6 +168,10 @@ fn run(opts: &Options) -> Result<(), YaccError> {
     // Parse the grammar
     let parsed = parser::parse(&tokens)?;
 
+    // Extract expect values before consuming parsed grammar
+    let expect_sr = parsed.expect_sr;
+    let expect_rr = parsed.expect_rr;
+
     // Build grammar representation
     let grammar = grammar::Grammar::from_parsed(parsed)?;
 
@@ -185,8 +189,28 @@ fn run(opts: &Options) -> Result<(), YaccError> {
 
     // Report conflicts to stderr
     let (sr_conflicts, rr_conflicts) = lalr_automaton.count_conflicts();
-    if sr_conflicts > 0 || rr_conflicts > 0 {
-        if sr_conflicts > 0 {
+
+    // Check %expect and %expect-rr directives
+    let mut conflict_error = false;
+
+    // Handle shift/reduce conflicts
+    match expect_sr {
+        Some(expected) if sr_conflicts != expected => {
+            // Mismatch: report error
+            eprintln!(
+                "{}: expected {} shift/reduce conflict{}, found {}",
+                opts.grammar_file,
+                expected,
+                if expected == 1 { "" } else { "s" },
+                sr_conflicts
+            );
+            conflict_error = true;
+        }
+        Some(_) => {
+            // Matches expected: suppress warning
+        }
+        None if sr_conflicts > 0 => {
+            // No %expect: report warning
             eprintln!(
                 "{}: {} shift/reduce conflict{}",
                 opts.grammar_file,
@@ -194,7 +218,27 @@ fn run(opts: &Options) -> Result<(), YaccError> {
                 if sr_conflicts == 1 { "" } else { "s" }
             );
         }
-        if rr_conflicts > 0 {
+        None => {}
+    }
+
+    // Handle reduce/reduce conflicts
+    match expect_rr {
+        Some(expected) if rr_conflicts != expected => {
+            // Mismatch: report error
+            eprintln!(
+                "{}: expected {} reduce/reduce conflict{}, found {}",
+                opts.grammar_file,
+                expected,
+                if expected == 1 { "" } else { "s" },
+                rr_conflicts
+            );
+            conflict_error = true;
+        }
+        Some(_) => {
+            // Matches expected: suppress warning
+        }
+        None if rr_conflicts > 0 => {
+            // No %expect-rr: report warning
             eprintln!(
                 "{}: {} reduce/reduce conflict{}",
                 opts.grammar_file,
@@ -202,6 +246,13 @@ fn run(opts: &Options) -> Result<(), YaccError> {
                 if rr_conflicts == 1 { "" } else { "s" }
             );
         }
+        None => {}
+    }
+
+    if conflict_error {
+        return Err(YaccError::Grammar(
+            "conflict count does not match expected".into(),
+        ));
     }
 
     Ok(())

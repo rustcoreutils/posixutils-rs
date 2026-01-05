@@ -3270,3 +3270,172 @@ def value():
         run_python_parser_test(source, should_pass, desc);
     }
 }
+
+// =============================================================================
+// %expect and %expect-rr directive tests
+// =============================================================================
+
+#[test]
+fn test_expect_suppresses_warning_when_correct() {
+    // This grammar has exactly 1 shift/reduce conflict (dangling else style)
+    let grammar = r#"
+%token NUM
+%expect 1
+%%
+expr : expr '+' expr
+     | NUM
+     ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed
+    assert!(
+        output.status.success(),
+        "yacc should succeed with correct %expect: {}",
+        stderr
+    );
+
+    // Should NOT report the conflict warning (it's suppressed)
+    assert!(
+        !stderr.contains("shift/reduce conflict"),
+        "conflict warning should be suppressed with correct %expect, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_fails_when_mismatch() {
+    // This grammar has 1 shift/reduce conflict, but we claim 0
+    let grammar = r#"
+%token NUM
+%expect 0
+%%
+expr : expr '+' expr
+     | NUM
+     ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should fail due to mismatch
+    assert!(
+        !output.status.success(),
+        "yacc should fail when %expect doesn't match actual conflicts"
+    );
+
+    // Should report the mismatch
+    assert!(
+        stderr.contains("expected 0 shift/reduce conflict"),
+        "should report expected vs actual mismatch, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_fails_when_too_high() {
+    // This grammar has 1 shift/reduce conflict, but we claim 5
+    let grammar = r#"
+%token NUM
+%expect 5
+%%
+expr : expr '+' expr
+     | NUM
+     ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should fail due to mismatch
+    assert!(
+        !output.status.success(),
+        "yacc should fail when %expect is higher than actual conflicts"
+    );
+
+    // Should report the mismatch
+    assert!(
+        stderr.contains("expected 5 shift/reduce conflict"),
+        "should report expected vs actual mismatch, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_zero_on_conflict_free_grammar() {
+    // This grammar has no conflicts
+    let grammar = r#"
+%token NUM
+%expect 0
+%%
+expr : NUM
+     ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed
+    assert!(
+        output.status.success(),
+        "yacc should succeed with %expect 0 on conflict-free grammar: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_no_expect_still_warns() {
+    // Without %expect, conflicts should be warned but not error
+    let grammar = r#"
+%token NUM
+%%
+expr : expr '+' expr
+     | NUM
+     ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed (warnings don't cause failure)
+    assert!(
+        output.status.success(),
+        "yacc should succeed without %expect (just warn): {}",
+        stderr
+    );
+
+    // Should report the conflict as a warning
+    assert!(
+        stderr.contains("shift/reduce conflict"),
+        "should warn about conflicts without %expect, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_with_precedence_resolved_conflicts() {
+    // This grammar would have conflicts but precedence resolves them
+    let grammar = r#"
+%token NUM
+%left '+'
+%left '*'
+%expect 0
+%%
+expr : expr '+' expr
+     | expr '*' expr
+     | NUM
+     ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed - precedence resolves all conflicts
+    assert!(
+        output.status.success(),
+        "yacc should succeed when precedence resolves conflicts: {}",
+        stderr
+    );
+}

@@ -761,17 +761,21 @@ static void unput(int c)
         /* Grow buffer if full */
         if (yy_remain >= yy_buffer_size) {{
             size_t new_size = yy_buffer_size * 2;
+            size_t cursor_off = YYCURSOR - yy_buffer;
+            size_t limit_off = YYLIMIT - yy_buffer;
+            size_t token_off = YYTOKEN - yy_buffer;
+            size_t marker_off = YYMARKER - yy_buffer;
             unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
             if (new_buf == NULL) {{
                 fprintf(stderr, "lex: out of memory in unput()\\n");
                 return;
             }}
-            YYCURSOR = new_buf + (YYCURSOR - yy_buffer);
-            YYLIMIT = new_buf + (YYLIMIT - yy_buffer);
-            YYTOKEN = new_buf + (YYTOKEN - yy_buffer);
-            YYMARKER = new_buf + (YYMARKER - yy_buffer);
             yy_buffer = new_buf;
             yy_buffer_size = new_size;
+            YYCURSOR = yy_buffer + cursor_off;
+            YYLIMIT = yy_buffer + limit_off;
+            YYTOKEN = yy_buffer + token_off;
+            YYMARKER = yy_buffer + marker_off;
         }}
         if (yy_remain > 0) {{
             memmove(yy_buffer + 1, yy_buffer, yy_remain);
@@ -1072,6 +1076,20 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "            size_t new_size = yy_buffer_size * 2;")?;
     writeln!(
         output,
+        "            /* Save offsets before realloc */"
+    )?;
+    writeln!(output, "            size_t cursor_off = YYCURSOR - yy_buffer;")?;
+    writeln!(output, "            size_t token_off = YYTOKEN - yy_buffer;")?;
+    writeln!(output, "            size_t marker_off = YYMARKER - yy_buffer;")?;
+    writeln!(output, "            size_t limit_off = YYLIMIT - yy_buffer;")?;
+    if has_var_tc {
+        writeln!(
+            output,
+            "            size_t main_end_off = yy_main_end_ptr ? (size_t)(yy_main_end_ptr - yy_buffer) : 0;"
+        )?;
+    }
+    writeln!(
+        output,
         "            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);"
     )?;
     writeln!(output, "            if (new_buf == NULL) {{")?;
@@ -1081,34 +1099,18 @@ fn write_yylex_direct_coded<W: Write>(
     )?;
     writeln!(output, "                return -1;")?;
     writeln!(output, "            }}")?;
-    writeln!(
-        output,
-        "            /* Adjust all pointers to new buffer */"
-    )?;
-    writeln!(
-        output,
-        "            YYCURSOR = new_buf + (YYCURSOR - yy_buffer);"
-    )?;
-    writeln!(
-        output,
-        "            YYTOKEN = new_buf + (YYTOKEN - yy_buffer);"
-    )?;
-    writeln!(
-        output,
-        "            YYMARKER = new_buf + (YYMARKER - yy_buffer);"
-    )?;
-    writeln!(
-        output,
-        "            YYLIMIT = new_buf + (YYLIMIT - yy_buffer);"
-    )?;
+    writeln!(output, "            yy_buffer = new_buf;")?;
+    writeln!(output, "            yy_buffer_size = new_size;")?;
+    writeln!(output, "            YYCURSOR = yy_buffer + cursor_off;")?;
+    writeln!(output, "            YYTOKEN = yy_buffer + token_off;")?;
+    writeln!(output, "            YYMARKER = yy_buffer + marker_off;")?;
+    writeln!(output, "            YYLIMIT = yy_buffer + limit_off;")?;
     if has_var_tc {
         writeln!(
             output,
-            "            if (yy_main_end_ptr) yy_main_end_ptr = new_buf + (yy_main_end_ptr - yy_buffer);"
+            "            if (main_end_off) yy_main_end_ptr = yy_buffer + main_end_off;"
         )?;
     }
-    writeln!(output, "            yy_buffer = new_buf;")?;
-    writeln!(output, "            yy_buffer_size = new_size;")?;
     writeln!(output, "        }}")?;
     writeln!(
         output,

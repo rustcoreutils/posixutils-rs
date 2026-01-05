@@ -91,8 +91,8 @@ fn run_end_to_end_with_mode(grammar: &str, test_name: &str, strict: bool) {
         .current_dir(temp_dir.path())
         .args(&[
             "-Wall",
-            "-Wno-unused-variable",
-            "-Wno-unused-but-set-variable",
+            "-O2",
+            "-Werror",
             "-o",
             exe_path.to_str().unwrap(),
             code_path.to_str().unwrap(),
@@ -1023,6 +1023,9 @@ int yylex(void) {
         let compile_output = Command::new("cc")
             .current_dir(temp_dir.path())
             .args(&[
+                "-Wall",
+                "-O2",
+                "-Werror",
                 "-o",
                 exe_path.to_str().unwrap(),
                 code_path.to_str().unwrap(),
@@ -2211,6 +2214,8 @@ int main(void) {
         .current_dir(temp_dir.path())
         .args(&[
             "-Wall",
+            "-O2",
+            "-Werror",
             "-o",
             exe_path.to_str().unwrap(),
             code_path.to_str().unwrap(),
@@ -2576,14 +2581,7 @@ fn build_python39_parser() -> Result<(), String> {
     let compile = Command::new("cc")
         .current_dir(&build_dir)
         .args([
-            "-Wall",
-            "-Wno-unused-variable",
-            "-Wno-unused-but-set-variable",
-            "-Wno-unused-function",
-            "-o",
-            "parser",
-            "y.tab.c",
-            "lex.yy.c",
+            "-Wall", "-O2", "-Werror", "-o", "parser", "y.tab.c", "lex.yy.c",
         ])
         .output()
         .map_err(|e| format!("cc exec: {}", e))?;

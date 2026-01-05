@@ -56,6 +56,58 @@ impl Default for CodeGenConfig {
     }
 }
 
+/// Pre-computed feature flags to avoid redundant iteration over rules/metadata
+struct FeatureFlags {
+    has_reject: bool,
+    has_start_conditions: bool,
+    has_bol_anchors: bool,
+    has_trailing_context: bool,
+    has_var_tc: bool,
+    eof_rule_idx: Option<usize>,
+    needs_accept_lists: bool,
+}
+
+impl FeatureFlags {
+    /// Compute all feature flags in a single pass over rules and metadata
+    fn compute(lexinfo: &LexInfo, config: &CodeGenConfig) -> Self {
+        let has_start_conditions = config.start_conditions.len() > 1;
+
+        // Single pass over rule_metadata
+        let mut has_bol_anchors = false;
+        let mut has_trailing_context = false;
+        let mut has_var_tc = false;
+        for meta in &config.rule_metadata {
+            has_bol_anchors |= meta.bol_anchor;
+            has_trailing_context |= meta.has_trailing_context;
+            has_var_tc |= meta.has_variable_trailing_context;
+        }
+
+        // Single pass over rules
+        let mut has_reject = false;
+        let mut eof_rule_idx = None;
+        for (idx, rule) in lexinfo.rules.iter().enumerate() {
+            if rule.action.contains("REJECT") {
+                has_reject = true;
+            }
+            if rule.is_eof {
+                eof_rule_idx = Some(idx);
+            }
+        }
+
+        let needs_accept_lists = has_reject || has_start_conditions || has_bol_anchors;
+
+        FeatureFlags {
+            has_reject,
+            has_start_conditions,
+            has_bol_anchors,
+            has_trailing_context,
+            has_var_tc,
+            eof_rule_idx,
+            needs_accept_lists,
+        }
+    }
+}
+
 /// Generate the complete lex.yy.c output using direct-coded generation
 pub fn generate<W: Write>(
     output: &mut W,
@@ -70,27 +122,24 @@ pub fn generate<W: Write>(
         dfa.char_classes.num_classes
     );
 
-    // Determine if we need accept lists for alternate rule finding
-    let has_reject = lexinfo.rules.iter().any(|r| r.action.contains("REJECT"));
-    let has_start_conditions = config.start_conditions.len() > 1;
-    let has_bol_anchors = config.rule_metadata.iter().any(|m| m.bol_anchor);
-    let needs_accept_lists = has_reject || has_start_conditions || has_bol_anchors;
+    // Pre-compute all feature flags in a single pass
+    let flags = FeatureFlags::compute(lexinfo, config);
 
     write_header(output)?;
     write_includes(output)?;
     write_external_definitions(output, lexinfo)?;
-    write_macros_and_types(output, config)?;
+    write_macros_and_types(output, config, &flags)?;
     write_char_class_table(output, dfa)?;
     write_num_states(output, dfa)?;
     // Only generate accept lists if needed for REJECT or alternate rule finding
-    if needs_accept_lists {
+    if flags.needs_accept_lists {
         write_accepting_list_table(output, dfa)?;
     }
-    write_rule_condition_table(output, lexinfo, config)?;
-    write_rule_metadata_tables(output, lexinfo, config)?;
+    write_rule_condition_table(output, lexinfo, config, &flags)?;
+    write_rule_metadata_tables(output, lexinfo, config, &flags)?;
     write_main_pattern_end_table(output, dfa, config)?;
     write_helper_functions(output, lexinfo)?;
-    write_yylex_direct_coded(output, dfa, lexinfo, config)?;
+    write_yylex_direct_coded(output, dfa, lexinfo, config, &flags)?;
     write_user_subroutines(output, lexinfo)?;
 
     Ok(())
@@ -131,7 +180,11 @@ fn write_external_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io
     Ok(())
 }
 
-fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> io::Result<()> {
+fn write_macros_and_types<W: Write>(
+    output: &mut W,
+    config: &CodeGenConfig,
+    flags: &FeatureFlags,
+) -> io::Result<()> {
     writeln!(
         output,
         r#"/* Lex macros and types */
@@ -164,7 +217,7 @@ fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> i
     writeln!(output)?;
 
     // BEGIN and YY_START macros - only use yy_start_state if there are multiple conditions
-    let has_start_conditions = config.start_conditions.len() > 1;
+    let has_start_conditions = flags.has_start_conditions;
     if has_start_conditions {
         writeln!(
             output,
@@ -266,11 +319,7 @@ static int yy_more_len = 0;
     )?;
 
     // Variable-length trailing context support - only emit if any rule uses it
-    let has_var_tc = config
-        .rule_metadata
-        .iter()
-        .any(|m| m.has_variable_trailing_context);
-    if has_var_tc {
+    if flags.has_var_tc {
         writeln!(output, "/* Variable-length trailing context support */")?;
         writeln!(
             output,
@@ -375,14 +424,15 @@ fn write_rule_condition_table<W: Write>(
     output: &mut W,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
-    let num_rules = lexinfo.rules.len();
-    let num_conditions = config.start_conditions.len();
-
     // Only generate the table if we have more than just INITIAL
-    if num_conditions <= 1 {
+    if !flags.has_start_conditions {
         return Ok(());
     }
+
+    let num_rules = lexinfo.rules.len();
+    let num_conditions = config.start_conditions.len();
 
     writeln!(output, "/* Rule active-in-condition table */")?;
     writeln!(
@@ -440,26 +490,21 @@ fn write_rule_metadata_tables<W: Write>(
     output: &mut W,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
     let num_rules = lexinfo.rules.len();
     if num_rules == 0 {
         return Ok(());
     }
 
-    // Check if any rules have BOL anchoring
-    let has_bol_anchors = config.rule_metadata.iter().any(|m| m.bol_anchor);
-
-    // Check if any rules have trailing context
-    let has_trailing_context = config.rule_metadata.iter().any(|m| m.has_trailing_context);
-
     // Define YY_NUM_RULES if needed for BOL or trailing context checks
-    if (has_bol_anchors || has_trailing_context) && config.start_conditions.len() <= 1 {
+    if (flags.has_bol_anchors || flags.has_trailing_context) && !flags.has_start_conditions {
         writeln!(output, "#ifndef YY_NUM_RULES")?;
         writeln!(output, "#define YY_NUM_RULES {}", num_rules)?;
         writeln!(output, "#endif\n")?;
     }
 
-    if has_bol_anchors {
+    if flags.has_bol_anchors {
         // Write BOL anchor table (1 = rule requires BOL, 0 = no requirement)
         writeln!(
             output,
@@ -480,7 +525,7 @@ fn write_rule_metadata_tables<W: Write>(
         writeln!(output, " }};\n")?;
     }
 
-    if has_trailing_context {
+    if flags.has_trailing_context {
         writeln!(
             output,
             "/* Main pattern length table (for trailing context) */"
@@ -603,6 +648,7 @@ fn write_dfa_state<W: Write>(
     state_idx: usize,
     state: &DfaState,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
     writeln!(output, "yy_state_{}:", state_idx)?;
 
@@ -615,11 +661,7 @@ fn write_dfa_state<W: Write>(
     }
 
     // Track main pattern end for variable-length trailing context
-    let has_var_tc = config
-        .rule_metadata
-        .iter()
-        .any(|m| m.has_variable_trailing_context);
-    if has_var_tc && !state.main_pattern_end_rules.is_empty() {
+    if flags.has_var_tc && !state.main_pattern_end_rules.is_empty() {
         let rule = state.main_pattern_end_rules[0];
         if rule < config.rule_metadata.len()
             && config.rule_metadata[rule].has_variable_trailing_context
@@ -660,17 +702,15 @@ fn write_yylex_direct_coded<W: Write>(
     dfa: &Dfa,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
-    let has_start_conditions = config.start_conditions.len() > 1;
-    let has_bol_anchors = config.rule_metadata.iter().any(|m| m.bol_anchor);
-    let has_trailing_context = config.rule_metadata.iter().any(|m| m.has_trailing_context);
-    let has_var_tc = config
-        .rule_metadata
-        .iter()
-        .any(|m| m.has_variable_trailing_context);
-    let eof_rule_idx = lexinfo.rules.iter().position(|r| r.is_eof);
-    // Check if any rule uses REJECT macro
-    let has_reject = lexinfo.rules.iter().any(|r| r.action.contains("REJECT"));
+    // Use pre-computed flags
+    let has_start_conditions = flags.has_start_conditions;
+    let has_bol_anchors = flags.has_bol_anchors;
+    let has_trailing_context = flags.has_trailing_context;
+    let has_var_tc = flags.has_var_tc;
+    let eof_rule_idx = flags.eof_rule_idx;
+    let has_reject = flags.has_reject;
 
     writeln!(output, "/* The main lexer function - direct coded */")?;
     writeln!(output, "int yylex(void)")?;
@@ -766,7 +806,7 @@ fn write_yylex_direct_coded<W: Write>(
 
     // Generate all DFA states
     for (state_idx, state) in dfa.states.iter().enumerate() {
-        write_dfa_state(output, dfa, state_idx, state, config)?;
+        write_dfa_state(output, dfa, state_idx, state, config, flags)?;
     }
 
     // YYFILL/EOF block

@@ -883,6 +883,22 @@ fn generate_parser<W: Write>(
 #ifndef YYMAXDEPTH
 #define YYMAXDEPTH 10000
 #endif
+
+/* Table size constant for bounds checking */
+#define YYTABLESIZE ((int)(sizeof(yytable)/sizeof(yytable[0])))
+
+/* Branch prediction hints for performance */
+#if defined(__has_builtin) && __has_builtin(__builtin_expect)
+#define YYLIKELY(x)   __builtin_expect(!!(x), 1)
+#define YYUNLIKELY(x) __builtin_expect(!!(x), 0)
+#elif defined(__GNUC__) && !defined(__clang__)
+/* Older GCC without __has_builtin still has __builtin_expect */
+#define YYLIKELY(x)   __builtin_expect(!!(x), 1)
+#define YYUNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define YYLIKELY(x)   (x)
+#define YYUNLIKELY(x) (x)
+#endif
 "#
     )?;
 
@@ -1103,8 +1119,8 @@ fn generate_parser<W: Write>(
         prefix,
         ERROR_SYMBOL
     )?;
-    writeln!(w, "    if ({}n < 0 || {}n >= (int)(sizeof({}table)/sizeof({}table[0])) || {}check[{}n] != ({}char < {} ? {}translate[{}char] : {}))",
-        prefix, prefix, prefix, prefix, prefix, prefix, prefix, get_translate_table_size(grammar), prefix, prefix, ERROR_SYMBOL)?;
+    writeln!(w, "    if (YYUNLIKELY({}n < 0 || {}n >= YYTABLESIZE || {}check[{}n] != ({}char < {} ? {}translate[{}char] : {})))",
+        prefix, prefix, prefix, prefix, prefix, get_translate_table_size(grammar), prefix, prefix, ERROR_SYMBOL)?;
     writeln!(w, "        goto {}default_action;", prefix)?;
     writeln!(w)?;
     writeln!(w, "    {}n = {}table[{}n];", prefix, prefix, prefix)?;
@@ -1151,7 +1167,7 @@ fn generate_parser<W: Write>(
     // Check for error: 0 = no action, YYTABLE_NINF = explicit error (%nonassoc conflict)
     writeln!(
         w,
-        "    if ({}n == 0 || {}n == YYTABLE_NINF) goto {}errlab;",
+        "    if (YYUNLIKELY({}n == 0 || {}n == YYTABLE_NINF)) goto {}errlab;",
         prefix, prefix, prefix
     )?;
     writeln!(w)?;
@@ -1166,7 +1182,11 @@ fn generate_parser<W: Write>(
     writeln!(w, "{}default_action:", prefix)?;
     // defact stores production_id + 1, so 0 means no default action
     writeln!(w, "    {}n = {}defact[{}state];", prefix, prefix, prefix)?;
-    writeln!(w, "    if ({}n == 0) goto {}errlab;", prefix, prefix)?;
+    writeln!(
+        w,
+        "    if (YYUNLIKELY({}n == 0)) goto {}errlab;",
+        prefix, prefix
+    )?;
     writeln!(w, "    {}n--;  /* defact stores prod+1 */", prefix)?;
     writeln!(w)?;
 
@@ -1243,8 +1263,11 @@ fn generate_parser<W: Write>(
         "        int {}gidx = {}pgoto[{}idx] + {}ss[{}ssp_offset];",
         prefix, prefix, prefix, prefix, prefix
     )?;
-    writeln!(w, "        if ({}gidx >= 0 && {}gidx < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}gidx] == {}ss[{}ssp_offset])",
-        prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix)?;
+    writeln!(
+        w,
+        "        if ({}gidx >= 0 && {}gidx < YYTABLESIZE && {}check[{}gidx] == {}ss[{}ssp_offset])",
+        prefix, prefix, prefix, prefix, prefix, prefix
+    )?;
     writeln!(
         w,
         "            {}state = {}table[{}gidx];",
@@ -1327,8 +1350,8 @@ fn generate_parser<W: Write>(
     )?;
     // Check: valid index, yycheck matches, AND yytable is positive (shift action, not reduce)
     // Per Bison: only shift if yytable[yyn] > 0 (positive = shift, negative = reduce)
-    writeln!(w, "            if ({}n >= 0 && {}n < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}n] == {} && {}table[{}n] > 0) {{",
-        prefix, prefix, prefix, prefix, prefix, prefix, ERROR_SYMBOL, prefix, prefix)?;
+    writeln!(w, "            if ({}n >= 0 && {}n < YYTABLESIZE && {}check[{}n] == {} && {}table[{}n] > 0) {{",
+        prefix, prefix, prefix, prefix, ERROR_SYMBOL, prefix, prefix)?;
     if opts.debug_enabled {
         writeln!(w, "#if YYDEBUG")?;
         writeln!(w, "                if ({}debug)", prefix)?;

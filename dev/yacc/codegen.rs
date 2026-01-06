@@ -264,6 +264,10 @@ fn generate_tables<W: Write>(
     writeln!(w, "#define YYNSTATES {}", num_states)?;
     writeln!(w)?;
 
+    // YYTABLE_NINF - sentinel value for explicit error actions (%nonassoc conflicts)
+    writeln!(w, "#define YYTABLE_NINF (-32768)")?;
+    writeln!(w)?;
+
     // Token translation table
     generate_token_translate_table(w, grammar, prefix)?;
 
@@ -307,18 +311,20 @@ fn generate_token_translate_table<W: Write>(
         .unwrap_or(256);
 
     writeln!(w, "/* Token number translation table */")?;
-    writeln!(w, "static const unsigned char {}translate[] =", prefix)?;
+    writeln!(w, "static const unsigned short {}translate[] =", prefix)?;
     writeln!(w, "{{")?;
 
     // Create translation: external token number -> internal symbol ID
-    let mut translate = vec![2u8; (max_token + 1) as usize]; // 2 = undefined/error
+    // Use u16 to support grammars with > 255 symbols.
+    // Unknown tokens map to ERROR_SYMBOL (1), the error token
+    let mut translate = vec![ERROR_SYMBOL as u16; (max_token + 1) as usize];
     translate[0] = 0; // EOF
 
     for (id, sym) in grammar.symbols.iter().enumerate() {
         if sym.is_terminal {
             if let Some(num) = sym.token_number {
                 if num >= 0 && (num as usize) < translate.len() {
-                    translate[num as usize] = id as u8;
+                    translate[num as usize] = id as u16;
                 }
             }
         }
@@ -1016,12 +1022,13 @@ fn generate_parser<W: Write>(
         writeln!(w, "        if ({}debug) {{", prefix)?;
         writeln!(
             w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : 2;",
+            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
             prefix,
             prefix,
             get_translate_table_size(grammar),
             prefix,
-            prefix
+            prefix,
+            ERROR_SYMBOL
         )?;
         writeln!(
             w,
@@ -1050,15 +1057,16 @@ fn generate_parser<W: Write>(
     writeln!(w)?;
     writeln!(
         w,
-        "    {}n += {}char < {} ? {}translate[{}char] : 2;",
+        "    {}n += {}char < {} ? {}translate[{}char] : {};",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix
+        prefix,
+        ERROR_SYMBOL
     )?;
-    writeln!(w, "    if ({}n < 0 || {}n >= (int)(sizeof({}table)/sizeof({}table[0])) || {}check[{}n] != ({}char < {} ? {}translate[{}char] : 2))",
-        prefix, prefix, prefix, prefix, prefix, prefix, prefix, get_translate_table_size(grammar), prefix, prefix)?;
+    writeln!(w, "    if ({}n < 0 || {}n >= (int)(sizeof({}table)/sizeof({}table[0])) || {}check[{}n] != ({}char < {} ? {}translate[{}char] : {}))",
+        prefix, prefix, prefix, prefix, prefix, prefix, prefix, get_translate_table_size(grammar), prefix, prefix, ERROR_SYMBOL)?;
     writeln!(w, "        goto {}default_action;", prefix)?;
     writeln!(w)?;
     writeln!(w, "    {}n = {}table[{}n];", prefix, prefix, prefix)?;
@@ -1072,12 +1080,13 @@ fn generate_parser<W: Write>(
         writeln!(w, "        if ({}debug) {{", prefix)?;
         writeln!(
             w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : 2;",
+            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
             prefix,
             prefix,
             get_translate_table_size(grammar),
             prefix,
-            prefix
+            prefix,
+            ERROR_SYMBOL
         )?;
         writeln!(
             w,
@@ -1101,7 +1110,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "    }}")?;
     writeln!(w)?;
 
-    writeln!(w, "    if ({}n == 0) goto {}errlab;", prefix, prefix)?;
+    // Check for error: 0 = no action, YYTABLE_NINF = explicit error (%nonassoc conflict)
+    writeln!(
+        w,
+        "    if ({}n == 0 || {}n == YYTABLE_NINF) goto {}errlab;",
+        prefix, prefix, prefix
+    )?;
     writeln!(w)?;
 
     writeln!(w, "    /* Reduce */")?;
@@ -1241,12 +1255,13 @@ fn generate_parser<W: Write>(
         writeln!(w, "        if ({}debug) {{", prefix)?;
         writeln!(
             w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : 2;",
+            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
             prefix,
             prefix,
             get_translate_table_size(grammar),
             prefix,
-            prefix
+            prefix,
+            ERROR_SYMBOL
         )?;
         writeln!(
             w,

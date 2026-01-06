@@ -9,9 +9,9 @@
 
 //! Formal verification of optimized parse tables.
 //!
-//! This module verifies that packed/optimized tables produce the same parse
-//! decisions as the canonical LALR(1) tables. Verification runs on every
-//! yacc invocation and panics on failure (indicating a yacc internal bug).
+//! Verifies packed tables produce identical parse decisions to canonical
+//! LALR(1) tables. Runs on every invocation; panics on mismatch (internal bug).
+//! Accepts default-action optimization where Error in canonical becomes Reduce.
 
 use crate::codegen::PackedTables;
 use crate::grammar::Grammar;
@@ -62,10 +62,9 @@ pub fn verify_tables(grammar: &Grammar, lalr: &LALRAutomaton, packed: &PackedTab
                 (None, Action::Reduce(_)) if packed.defact[state] > 0 => true,
                 // No canonical entry and no default - both should be Error
                 (None, Action::Error) => true,
-                // Accept is intentionally NOT stored in the action table (following Bison).
-                // It's handled by YYFINAL special case in generated parser:
-                // `if (yystate == YYFINAL && yychar == 0) goto yyacceptlab;`
-                // So canonical Accept decodes to Error (default 0 value) - this is correct.
+                // Accept is handled via YYFINAL special case, not stored in action table.
+                // Parser checks: `if (yystate == YYFINAL && yychar == 0) goto yyacceptlab;`
+                // Canonical Accept decodes to Error (default 0 value) - this is correct.
                 (Some(Action::Accept), Action::Error) => true,
                 // Any other case is a mismatch
                 _ => false,

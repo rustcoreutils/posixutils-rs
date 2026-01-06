@@ -7,7 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! LALR(1) lookahead computation and parse table construction
+//! LALR(1) lookahead computation and parse table construction.
+//!
+//! Converts an LR(0) automaton to LALR(1) by computing lookahead sets for
+//! reduce actions. Uses a two-phase approach:
+//! 1. Lookahead propagation: tracks how lookaheads flow between states
+//! 2. Table construction: builds ACTION/GOTO tables with conflict resolution
 
 use crate::first_follow::FirstFollow;
 use crate::grammar::{Grammar, ProductionId, SymbolId, AUGMENTED_START, EOF_SYMBOL};
@@ -94,26 +99,27 @@ pub fn compute(lr0: &LR0Automaton, grammar: &Grammar, ff: &FirstFollow) -> LALRA
     let (action_table, goto_table, conflicts) = build_tables(lr0, grammar, &lookaheads);
 
     LALRAutomaton {
-        lr0: clone_lr0(lr0),
+        lr0: lr0.clone(),
         action_table,
         goto_table,
         conflicts,
     }
 }
 
-/// Clone LR0 automaton (needed because we store it in LALR)
-fn clone_lr0(lr0: &LR0Automaton) -> LR0Automaton {
-    lr0.clone()
-}
-
-/// Compute LALR(1) lookahead sets
+/// Compute LALR(1) lookahead sets using propagation algorithm.
+///
+/// For each kernel item in each state, determines which terminals can follow
+/// a reduction. Uses a marker symbol to distinguish:
+/// - Spontaneous generation: lookahead derived from FIRST(suffix)
+/// - Propagation: lookahead inherited from another item
+///
+/// Fixed-point iteration propagates lookaheads until stable.
 fn compute_lookaheads(
     lr0: &LR0Automaton,
     grammar: &Grammar,
     ff: &FirstFollow,
 ) -> HashMap<(StateId, Item), HashSet<SymbolId>> {
-    // This implements a simplified version of the DeRemer-Pennello algorithm
-    // We compute lookaheads by tracking propagation and spontaneous generation
+    // Phase 1: Determine propagation edges and spontaneous lookaheads
 
     let mut lookaheads: HashMap<(StateId, Item), HashSet<SymbolId>> = HashMap::new();
     let mut propagates: Vec<((StateId, Item), (StateId, Item))> = Vec::new();
@@ -209,7 +215,7 @@ fn compute_lookaheads(
         }
     }
 
-    // Propagate lookaheads until fixed point
+    // Phase 2: Fixed-point propagation of lookaheads
     let mut changed = true;
     while changed {
         changed = false;
@@ -227,7 +233,7 @@ fn compute_lookaheads(
         }
     }
 
-    // Extend lookaheads to all items in each state (not just kernel)
+    // Phase 3: Extend kernel lookaheads to closure items via FIRST computation
     let mut full_lookaheads: HashMap<(StateId, Item), HashSet<SymbolId>> = HashMap::new();
 
     for state in &lr0.states {
@@ -284,7 +290,10 @@ fn compute_lookaheads(
     full_lookaheads
 }
 
-/// Build ACTION and GOTO tables
+/// Build ACTION and GOTO tables from LR(0) states and lookahead sets.
+///
+/// ACTION table: maps (state, terminal) to shift/reduce/accept/error.
+/// GOTO table: maps (state, nonterminal) to next state after reduction.
 fn build_tables(
     lr0: &LR0Automaton,
     grammar: &Grammar,
@@ -351,7 +360,10 @@ fn build_tables(
     (action_table, goto_table, conflicts)
 }
 
-/// Add an action to the table, handling conflicts
+/// Add action to table, handling conflicts via precedence/associativity.
+///
+/// On conflict: attempts resolution using operator precedence. If unresolved,
+/// records conflict and applies default (shift > reduce, earlier rule wins).
 fn add_action(
     table: &mut BTreeMap<SymbolId, Action>,
     symbol: SymbolId,
@@ -402,7 +414,13 @@ fn add_action(
     }
 }
 
-/// Try to resolve a conflict using precedence and associativity
+/// Resolve shift/reduce conflict using precedence and associativity.
+///
+/// Compares rule precedence vs terminal precedence:
+/// - Higher precedence wins
+/// - Equal precedence: left-assoc reduces, right-assoc shifts, nonassoc errors
+///
+/// Returns None for reduce/reduce conflicts (no precedence-based resolution).
 fn resolve_conflict(
     existing: &Action,
     new: &Action,

@@ -7,7 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! LR(0) automaton construction
+//! LR(0) automaton construction.
+//!
+//! Builds an LR(0) automaton (DFA) from a grammar. Each state is a set of
+//! LR(0) items, where an item is a production with a dot marking parse progress.
+//! States are connected by transitions on grammar symbols (both terminals and
+//! nonterminals). The automaton is built using a worklist algorithm starting
+//! from the initial item for the augmented start production.
 
 use crate::grammar::{Grammar, ProductionId, SymbolId, AUGMENTED_START};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -79,7 +85,12 @@ impl LR0Automaton {
     }
 }
 
-/// Build the LR(0) automaton for a grammar
+/// Build the LR(0) automaton for a grammar using worklist algorithm.
+///
+/// Starting from the augmented start item (S' -> . S $), iteratively:
+/// 1. Compute closure of current state's kernel items
+/// 2. For each symbol X after a dot, compute GOTO(state, X)
+/// 3. Add new states to worklist until no more states are discovered
 pub fn build(grammar: &Grammar) -> LR0Automaton {
     let mut automaton = LR0Automaton {
         states: Vec::new(),
@@ -160,7 +171,10 @@ pub fn build(grammar: &Grammar) -> LR0Automaton {
     automaton
 }
 
-/// Compute closure of a set of items
+/// Compute closure of a set of items.
+///
+/// For each item A -> α . B β where B is a nonterminal, adds all items
+/// B -> . γ for every production B -> γ. Repeats until no new items added.
 fn closure(items: &BTreeSet<Item>, grammar: &Grammar) -> BTreeSet<Item> {
     let mut result = items.clone();
     let mut worklist: Vec<Item> = items.iter().copied().collect();
@@ -184,7 +198,10 @@ fn closure(items: &BTreeSet<Item>, grammar: &Grammar) -> BTreeSet<Item> {
     result
 }
 
-/// Compute kernel of GOTO(items, symbol)
+/// Compute kernel of GOTO(items, symbol).
+///
+/// Returns set of items formed by advancing the dot past the given symbol
+/// in all items where that symbol appears immediately after the dot.
 fn compute_goto_kernel(
     items: &BTreeSet<Item>,
     symbol: SymbolId,

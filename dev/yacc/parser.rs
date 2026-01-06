@@ -7,7 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Parser for yacc grammar files
+//! Parser for yacc grammar files.
+//!
+//! Parses token stream into grammar AST: declarations section (%token, %type,
+//! %left/%right/%nonassoc, %union, %start), rules section (productions with
+//! semantic actions), and optional programs section (C code epilogue).
 
 use crate::diag;
 use crate::error::YaccError;

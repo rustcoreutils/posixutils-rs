@@ -7,7 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Grammar representation and symbol table
+//! Grammar representation and symbol table.
+//!
+//! Core data structures: symbols (terminals/nonterminals with precedence and
+//! type tags), productions (rules with semantic actions), and the complete
+//! grammar with augmented start symbol and dense symbol indexing for tables.
 
 use crate::diag;
 use crate::error::YaccError;

@@ -7,7 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! C code generation for the yacc parser
+//! C code generation for the yacc parser.
+//!
+//! Generates a complete C parser from LALR(1) tables. Output includes:
+//! - Token defines and YYSTYPE union
+//! - Dense parse tables (action/goto indexed by state × symbol)
+//! - Stack-based parser with error recovery per POSIX
 
 use crate::diag;
 use crate::error::YaccError;
@@ -237,7 +242,7 @@ fn is_valid_c_identifier(name: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// Generate parsing tables
+/// Generate parsing tables: token translation, rule info, action/goto, debug.
 fn generate_tables<W: Write>(
     w: &mut W,
     grammar: &Grammar,
@@ -463,99 +468,60 @@ fn generate_action_goto_tables<W: Write>(
     // This runs on every invocation and panics on any mismatch (internal bug)
     crate::verify::verify_tables(grammar, lalr, &packed);
 
-    // yydefact - default reduction for each state
-    writeln!(w, "/* Default reduction for each state */")?;
-    writeln!(w, "static const unsigned short {}defact[] =", prefix)?;
-    writeln!(w, "{{")?;
-    for chunk in packed.defact.chunks(10) {
-        write!(w, "    ")?;
-        for (i, &val) in chunk.iter().enumerate() {
-            if i > 0 {
-                write!(w, ",")?;
-            }
-            write!(w, "{:3}", val)?;
-        }
-        writeln!(w, ",")?;
-    }
-    writeln!(w, "}};")?;
-    writeln!(w)?;
-
-    // yyconsistent - per POSIX: states where only reduce by single rule exists
-    // Parser can skip yylex() in these states
-    writeln!(
+    write_c_table(
         w,
-        "/* Consistent states (skip lookahead) - POSIX optimization */"
+        "Default reduction for each state",
+        "unsigned short",
+        "defact",
+        prefix,
+        &packed.defact,
+        3,
+        |v| format!("{}", v),
     )?;
-    writeln!(w, "static const unsigned char {}consistent[] =", prefix)?;
-    writeln!(w, "{{")?;
-    for chunk in packed.consistent.chunks(10) {
-        write!(w, "    ")?;
-        for (i, &val) in chunk.iter().enumerate() {
-            if i > 0 {
-                write!(w, ",")?;
-            }
-            write!(w, "{:3}", if val { 1 } else { 0 })?;
-        }
-        writeln!(w, ",")?;
-    }
-    writeln!(w, "}};")?;
-    writeln!(w)?;
 
-    // yydefgoto - default goto for each non-terminal
-    writeln!(w, "/* Default goto for each non-terminal */")?;
-    writeln!(w, "static const short {}defgoto[] =", prefix)?;
-    writeln!(w, "{{")?;
-    for chunk in packed.defgoto.chunks(10) {
-        write!(w, "    ")?;
-        for (i, &val) in chunk.iter().enumerate() {
-            if i > 0 {
-                write!(w, ",")?;
-            }
-            write!(w, "{:5}", val)?;
-        }
-        writeln!(w, ",")?;
-    }
-    writeln!(w, "}};")?;
-    writeln!(w)?;
-
-    // yyaction - dense action table: action[state * YYNTOKENS + term_idx]
-    // Values: >0 = shift, <0 = reduce (-(prod+1)), 0 = use defact or accept, MIN = explicit error
-    writeln!(
+    write_c_table(
         w,
-        "/* Dense action table: action[state * YYNTOKENS + term_idx] */"
+        "Consistent states (skip lookahead) - POSIX optimization",
+        "unsigned char",
+        "consistent",
+        prefix,
+        &packed.consistent,
+        3,
+        |v| format!("{}", if *v { 1 } else { 0 }),
     )?;
-    writeln!(w, "static const short {}action[] =", prefix)?;
-    writeln!(w, "{{")?;
-    for chunk in packed.action.chunks(10) {
-        write!(w, "    ")?;
-        for (i, &val) in chunk.iter().enumerate() {
-            if i > 0 {
-                write!(w, ",")?;
-            }
-            write!(w, "{:5}", val)?;
-        }
-        writeln!(w, ",")?;
-    }
-    writeln!(w, "}};")?;
-    writeln!(w)?;
 
-    // yygoto - dense goto table: goto[state * YYNNTS + nt_idx]
-    // Values: >=0 = target state, -1 = use defgoto
-    writeln!(w, "/* Dense goto table: goto[state * YYNNTS + nt_idx] */")?;
-    writeln!(w, "static const short {}goto[] =", prefix)?;
-    writeln!(w, "{{")?;
-    for chunk in packed.goto.chunks(10) {
-        write!(w, "    ")?;
-        for (i, &val) in chunk.iter().enumerate() {
-            if i > 0 {
-                write!(w, ",")?;
-            }
-            write!(w, "{:5}", val)?;
-        }
-        writeln!(w, ",")?;
-    }
-    writeln!(w, "}};")?;
-    writeln!(w)?;
+    write_c_table(
+        w,
+        "Default goto for each non-terminal",
+        "short",
+        "defgoto",
+        prefix,
+        &packed.defgoto,
+        5,
+        |v| format!("{}", v),
+    )?;
+
+    write_c_table(
+        w,
+        "Dense action table: action[state * YYNTOKENS + term_idx]",
+        "short",
+        "action",
+        prefix,
+        &packed.action,
+        5,
+        |v| format!("{}", v),
+    )?;
+
+    write_c_table(
+        w,
+        "Dense goto table: goto[state * YYNNTS + nt_idx]",
+        "short",
+        "goto",
+        prefix,
+        &packed.goto,
+        5,
+        |v| format!("{}", v),
+    )?;
 
     Ok(())
 }
@@ -688,7 +654,7 @@ fn build_packed_tables(
     }
 }
 
-/// Convert action to table value
+/// Convert action to table value: >0=shift, <0=reduce, 0=accept/default, MIN=error.
 fn action_to_value(action: &Action) -> i16 {
     match action {
         Action::Shift(state) => *state as i16,
@@ -696,6 +662,38 @@ fn action_to_value(action: &Action) -> i16 {
         Action::Accept => 0,
         Action::Error => i16::MIN,
     }
+}
+
+/// Write a C array table with consistent formatting.
+fn write_c_table<W: Write, T, F>(
+    w: &mut W,
+    comment: &str,
+    c_type: &str,
+    name: &str,
+    prefix: &str,
+    data: &[T],
+    width: usize,
+    format_val: F,
+) -> Result<(), YaccError>
+where
+    F: Fn(&T) -> String,
+{
+    writeln!(w, "/* {} */", comment)?;
+    writeln!(w, "static const {} {}{}[] =", c_type, prefix, name)?;
+    writeln!(w, "{{")?;
+    for chunk in data.chunks(10) {
+        write!(w, "    ")?;
+        for (i, val) in chunk.iter().enumerate() {
+            if i > 0 {
+                write!(w, ",")?;
+            }
+            write!(w, "{:>width$}", format_val(val), width = width)?;
+        }
+        writeln!(w, ",")?;
+    }
+    writeln!(w, "}};")?;
+    writeln!(w)?;
+    Ok(())
 }
 
 /// Generate debugging tables (token names and rule descriptions)
@@ -791,7 +789,12 @@ fn escape_c_string(s: &str) -> String {
     result
 }
 
-/// Generate parser implementation
+/// Generate parser implementation (yyparse function).
+///
+/// Emits a shift-reduce parser with:
+/// - Hybrid stack allocation (C stack initially, heap on overflow)
+/// - POSIX consistent-state optimization (skip yylex when only reduce possible)
+/// - Three-phase error recovery (per POSIX errflag protocol)
 fn generate_parser<W: Write>(
     w: &mut W,
     grammar: &Grammar,

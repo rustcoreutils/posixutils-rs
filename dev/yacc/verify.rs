@@ -51,7 +51,7 @@ pub fn verify_tables(grammar: &Grammar, lalr: &LALRAutomaton, packed: &PackedTab
                 .and_then(|m| m.get(&terminal_id))
                 .cloned();
 
-            let decoded = decode_action(packed, state, terminal_id);
+            let decoded = decode_action(grammar, packed, state, terminal_id);
 
             // Check if this is an acceptable mismatch due to default action optimization
             let is_valid = match (&canonical, &decoded) {
@@ -62,6 +62,11 @@ pub fn verify_tables(grammar: &Grammar, lalr: &LALRAutomaton, packed: &PackedTab
                 (None, Action::Reduce(_)) if packed.defact[state] > 0 => true,
                 // No canonical entry and no default - both should be Error
                 (None, Action::Error) => true,
+                // Accept is intentionally NOT stored in the action table (following Bison).
+                // It's handled by YYFINAL special case in generated parser:
+                // `if (yystate == YYFINAL && yychar == 0) goto yyacceptlab;`
+                // So canonical Accept decodes to Error (default 0 value) - this is correct.
+                (Some(Action::Accept), Action::Error) => true,
                 // Any other case is a mismatch
                 _ => false,
             };
@@ -90,12 +95,8 @@ pub fn verify_tables(grammar: &Grammar, lalr: &LALRAutomaton, packed: &PackedTab
 
             let decoded = decode_goto(grammar, packed, state, nt_id);
 
-            // Get the nonterminal index for checking defgoto
-            let nt_idx = grammar
-                .nonterminals()
-                .enumerate()
-                .find(|(_, id)| *id == nt_id)
-                .map(|(idx, _)| idx);
+            // Get the dense nonterminal index for checking defgoto
+            let nt_idx = grammar.nonterminal_index(nt_id);
 
             // Check if this is an acceptable mismatch due to default goto optimization
             let is_valid = match (&canonical, &decoded) {
@@ -161,13 +162,18 @@ fn actions_equal(a: &Action, b: &Action) -> bool {
     }
 }
 
-/// Decode an ACTION from the packed tables.
+/// Decode an ACTION from the dense packed tables.
 ///
-/// This mirrors the lookup logic in the generated parser:
+/// This mirrors the lookup logic in the generated parser using dense indexing:
 /// 1. Check if state is consistent (skip lookahead optimization)
-/// 2. Look up in pact/table/check
-/// 3. Fall back to defact (default action)
-fn decode_action(packed: &PackedTables, state: usize, terminal: usize) -> Action {
+/// 2. Look up action[state * num_terminals + term_idx]
+/// 3. Fall back to defact (default action) if action is 0
+fn decode_action(
+    grammar: &Grammar,
+    packed: &PackedTables,
+    state: usize,
+    terminal: usize,
+) -> Action {
     // Check consistent state optimization
     // In consistent states, we always reduce by the default action without lookahead
     if packed.consistent[state] && packed.defact[state] > 0 {
@@ -175,85 +181,69 @@ fn decode_action(packed: &PackedTables, state: usize, terminal: usize) -> Action
         return Action::Reduce(prod_id);
     }
 
-    // Check for YYPACT_NINF sentinel (state has no explicit actions)
-    // These states can only use default reductions; skip table lookup.
-    if packed.pact[state] == packed.pact_ninf {
-        if packed.defact[state] > 0 {
-            let prod_id = (packed.defact[state] - 1) as usize;
-            return Action::Reduce(prod_id);
-        } else {
+    // Get dense terminal index
+    let term_idx = match grammar.terminal_index(terminal) {
+        Some(idx) => idx,
+        None => {
+            // Not a terminal - should never happen
             return Action::Error;
         }
-    }
+    };
 
-    // Normal lookup: pact[state] + terminal
-    let base = packed.pact[state] as usize;
-    let idx = base + terminal;
+    // Dense lookup: action[state * num_terminals + term_idx]
+    let idx = state * packed.num_terminals + term_idx;
+    let value = packed.action[idx];
 
-    // Check bounds and verify with check array
-    if idx < packed.table.len() && idx < packed.check.len() && packed.check[idx] == terminal as i16
-    {
-        let value = packed.table[idx];
-        if value > 0 {
-            Action::Shift(value as usize)
-        } else if value < 0 && value != i16::MIN {
-            let prod_id = ((-value) - 1) as usize;
+    if value > 0 {
+        // Shift to state value
+        Action::Shift(value as usize)
+    } else if value < 0 && value != i16::MIN {
+        // Reduce by production (-(value) - 1)
+        let prod_id = ((-value) - 1) as usize;
+        Action::Reduce(prod_id)
+    } else if value == 0 {
+        // 0 means consult defact - may be Reduce or Error
+        // Note: Accept is handled separately in the generated parser
+        // by checking (state == YYFINAL && yychar == 0) before table lookup
+        if packed.defact[state] > 0 {
+            let prod_id = (packed.defact[state] - 1) as usize;
             Action::Reduce(prod_id)
-        } else if value == 0 {
-            // 0 can be Accept or Error depending on context
-            // In our encoding, Accept is only for EOF in the accept state
-            Action::Accept
         } else {
-            // i16::MIN indicates explicit error
+            // No default action - this is an error
             Action::Error
         }
     } else {
-        // Fall through to default action
-        if packed.defact[state] > 0 {
-            let prod_id = (packed.defact[state] - 1) as usize;
-            Action::Reduce(prod_id)
-        } else {
-            Action::Error
-        }
+        // i16::MIN indicates explicit error (%nonassoc conflict)
+        Action::Error
     }
 }
 
-/// Decode a GOTO from the packed tables.
+/// Decode a GOTO from the dense packed tables.
 ///
-/// This mirrors the lookup logic in the generated parser:
-/// 1. Look up in pgoto/table/check
-/// 2. Fall back to defgoto (default goto)
+/// This mirrors the lookup logic in the generated parser using dense indexing:
+/// 1. Look up goto[state * num_nonterminals + nt_idx]
+/// 2. Fall back to defgoto (default goto) if goto is -1
 fn decode_goto(
     grammar: &Grammar,
     packed: &PackedTables,
     state: usize,
     nonterminal: usize,
 ) -> Option<usize> {
-    // Get the nonterminal index (0-based index among nonterminals)
-    let nt_idx = grammar
-        .nonterminals()
-        .enumerate()
-        .find(|(_, id)| *id == nonterminal)
-        .map(|(idx, _)| idx)?;
+    // Get dense non-terminal index
+    let nt_idx = grammar.nonterminal_index(nonterminal)?;
 
-    if nt_idx >= packed.pgoto.len() {
+    if nt_idx >= packed.num_nonterminals {
         return None;
     }
 
-    // pgoto gives us the base index for this nonterminal
-    let base = packed.pgoto[nt_idx] as usize;
-    let idx = base + state;
+    // Dense lookup: goto[state * num_nonterminals + nt_idx]
+    let idx = state * packed.num_nonterminals + nt_idx;
+    let value = packed.goto[idx];
 
-    // Check bounds and verify with check array
-    if idx < packed.table.len() && idx < packed.check.len() && packed.check[idx] == state as i16 {
-        let value = packed.table[idx];
-        if value >= 0 {
-            Some(value as usize)
-        } else {
-            None
-        }
+    if value >= 0 {
+        Some(value as usize)
     } else {
-        // Fall through to default goto
+        // -1 means consult defgoto
         if nt_idx < packed.defgoto.len() {
             let def = packed.defgoto[nt_idx];
             if def >= 0 {

@@ -1164,11 +1164,14 @@ fn generate_parser<W: Write>(
     writeln!(w, "    }}")?;
     writeln!(w)?;
 
-    // Check for error: 0 = no action, YYTABLE_NINF = explicit error (%nonassoc conflict)
+    // Handle Accept: table value 0 means successful parse
+    writeln!(w, "    if ({}n == 0) goto {}acceptlab;", prefix, prefix)?;
+
+    // Handle explicit error from %nonassoc conflicts
     writeln!(
         w,
-        "    if (YYUNLIKELY({}n == 0 || {}n == YYTABLE_NINF)) goto {}errlab;",
-        prefix, prefix, prefix
+        "    if (YYUNLIKELY({}n == YYTABLE_NINF)) goto {}errlab;",
+        prefix, prefix
     )?;
     writeln!(w)?;
 

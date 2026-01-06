@@ -35,8 +35,9 @@ use std::io::{BufWriter, Write};
 #[derive(Debug)]
 pub struct PackedTables {
     /// Dense action table indexed by: state * num_terminals + term_idx
-    /// Values: >0 = shift to state, <0 = reduce by (-(value+1)), 0 = accept/error,
-    /// i16::MIN = explicit error (%nonassoc)
+    /// Values: >0 = shift to state, <0 = reduce by (-(value+1)),
+    /// 0 = consult defact (reduce if defact > 0, else error),
+    /// i16::MIN = explicit error (%nonassoc). Accept handled via YYFINAL.
     pub action: Vec<i16>,
     /// Dense goto table indexed by: state * num_nonterminals + nt_idx
     /// Values: >=0 = target state, -1 = use defgoto
@@ -470,56 +471,66 @@ fn generate_action_goto_tables<W: Write>(
 
     write_c_table(
         w,
-        "Default reduction for each state",
-        "unsigned short",
-        "defact",
         prefix,
+        TableSpec {
+            comment: "Default reduction for each state",
+            c_type: "unsigned short",
+            name: "defact",
+            width: 3,
+        },
         &packed.defact,
-        3,
         |v| format!("{}", v),
     )?;
 
     write_c_table(
         w,
-        "Consistent states (skip lookahead) - POSIX optimization",
-        "unsigned char",
-        "consistent",
         prefix,
+        TableSpec {
+            comment: "Consistent states (skip lookahead) - POSIX optimization",
+            c_type: "unsigned char",
+            name: "consistent",
+            width: 3,
+        },
         &packed.consistent,
-        3,
         |v| format!("{}", if *v { 1 } else { 0 }),
     )?;
 
     write_c_table(
         w,
-        "Default goto for each non-terminal",
-        "short",
-        "defgoto",
         prefix,
+        TableSpec {
+            comment: "Default goto for each non-terminal",
+            c_type: "short",
+            name: "defgoto",
+            width: 5,
+        },
         &packed.defgoto,
-        5,
         |v| format!("{}", v),
     )?;
 
     write_c_table(
         w,
-        "Dense action table: action[state * YYNTOKENS + term_idx]",
-        "short",
-        "action",
         prefix,
+        TableSpec {
+            comment: "Dense action table: action[state * YYNTOKENS + term_idx]",
+            c_type: "short",
+            name: "action",
+            width: 5,
+        },
         &packed.action,
-        5,
         |v| format!("{}", v),
     )?;
 
     write_c_table(
         w,
-        "Dense goto table: goto[state * YYNNTS + nt_idx]",
-        "short",
-        "goto",
         prefix,
+        TableSpec {
+            comment: "Dense goto table: goto[state * YYNNTS + nt_idx]",
+            c_type: "short",
+            name: "goto",
+            width: 5,
+        },
         &packed.goto,
-        5,
         |v| format!("{}", v),
     )?;
 
@@ -654,7 +665,7 @@ fn build_packed_tables(
     }
 }
 
-/// Convert action to table value: >0=shift, <0=reduce, 0=accept/default, MIN=error.
+/// Convert action to table value: >0=shift, <0=reduce, 0=default, MIN=error.
 fn action_to_value(action: &Action) -> i16 {
     match action {
         Action::Shift(state) => *state as i16,
@@ -664,22 +675,31 @@ fn action_to_value(action: &Action) -> i16 {
     }
 }
 
+/// Specification for a C array table.
+struct TableSpec<'a> {
+    comment: &'a str,
+    c_type: &'a str,
+    name: &'a str,
+    width: usize,
+}
+
 /// Write a C array table with consistent formatting.
 fn write_c_table<W: Write, T, F>(
     w: &mut W,
-    comment: &str,
-    c_type: &str,
-    name: &str,
     prefix: &str,
+    spec: TableSpec<'_>,
     data: &[T],
-    width: usize,
     format_val: F,
 ) -> Result<(), YaccError>
 where
     F: Fn(&T) -> String,
 {
-    writeln!(w, "/* {} */", comment)?;
-    writeln!(w, "static const {} {}{}[] =", c_type, prefix, name)?;
+    writeln!(w, "/* {} */", spec.comment)?;
+    writeln!(
+        w,
+        "static const {} {}{}[] =",
+        spec.c_type, prefix, spec.name
+    )?;
     writeln!(w, "{{")?;
     for chunk in data.chunks(10) {
         write!(w, "    ")?;
@@ -687,7 +707,7 @@ where
             if i > 0 {
                 write!(w, ",")?;
             }
-            write!(w, "{:>width$}", format_val(val), width = width)?;
+            write!(w, "{:>width$}", format_val(val), width = spec.width)?;
         }
         writeln!(w, ",")?;
     }
@@ -972,6 +992,7 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w, "            if (!new_ss || !new_vs) {{")?;
     writeln!(w, "                free(new_ss);")?;
+    writeln!(w, "                free(new_vs);")?;
     writeln!(w, "                goto {}exhausted;", prefix)?;
     writeln!(w, "            }}")?;
     writeln!(
@@ -987,23 +1008,23 @@ fn generate_parser<W: Write>(
     writeln!(w, "            {}ss = new_ss;", prefix)?;
     writeln!(w, "            {}vs = new_vs;", prefix)?;
     writeln!(w, "        }} else {{")?;
-    writeln!(w, "            /* Already on heap: realloc */")?;
+    writeln!(
+        w,
+        "            /* Already on heap: realloc (check each to avoid leak) */"
+    )?;
     writeln!(
         w,
         "            int *new_ss = (int *) realloc({}ss, new_size * sizeof(int));",
         prefix
     )?;
+    writeln!(w, "            if (!new_ss) goto {}exhausted;", prefix)?;
+    writeln!(w, "            {}ss = new_ss;", prefix)?;
     writeln!(
         w,
         "            YYSTYPE *new_vs = (YYSTYPE *) realloc({}vs, new_size * sizeof(YYSTYPE));",
         prefix
     )?;
-    writeln!(
-        w,
-        "            if (!new_ss || !new_vs) goto {}exhausted;",
-        prefix
-    )?;
-    writeln!(w, "            {}ss = new_ss;", prefix)?;
+    writeln!(w, "            if (!new_vs) goto {}exhausted;", prefix)?;
     writeln!(w, "            {}vs = new_vs;", prefix)?;
     writeln!(w, "        }}")?;
     writeln!(
@@ -1090,7 +1111,7 @@ fn generate_parser<W: Write>(
     writeln!(w)?;
     writeln!(
         w,
-        "    /* Action value 0 means consult defact (or accept) */"
+        "    /* Action value 0 means consult defact (reduce or error) */"
     )?;
     writeln!(
         w,

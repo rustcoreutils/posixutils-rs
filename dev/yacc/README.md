@@ -117,7 +117,7 @@ PackedTables:
 ## Generated Parser
 
 **Shift-reduce parser** with:
-- Hybrid stack allocation (C stack initially, heap on overflow via realloc)
+- Hybrid stack allocation (C stack initially, malloc+memcpy to heap on first overflow, realloc thereafter)
 - POSIX consistent-state optimization (skip yylex in single-reduce states)
 - Three-phase error recovery per POSIX errflag protocol (0→3→discard→pop)
 

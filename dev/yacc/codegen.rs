@@ -41,6 +41,9 @@ pub struct PackedTables {
     pub consistent: Vec<bool>,
     /// Number of parser states (used for verification)
     pub num_states: usize,
+    /// YYPACT_NINF sentinel: states with this pact value have no explicit actions
+    /// (they only use default reductions and cannot shift the error token)
+    pub pact_ninf: i32,
 }
 
 /// Generate output files
@@ -438,6 +441,12 @@ fn generate_action_goto_tables<W: Write>(
     // This runs on every invocation and panics on any mismatch (internal bug)
     crate::verify::verify_tables(grammar, lalr, &packed);
 
+    // YYPACT_NINF - sentinel value for states with no explicit actions
+    // These states only use default reductions and cannot shift the error token.
+    // Following Bison's pattern: value is (min_real_pact - 1) to ensure distinctness.
+    writeln!(w, "#define YYPACT_NINF ({})", packed.pact_ninf)?;
+    writeln!(w)?;
+
     // yypact - index into yytable for each state's actions
     writeln!(w, "/* Index into yytable for actions */")?;
     writeln!(w, "static const int {}pact[] =", prefix)?;
@@ -606,9 +615,20 @@ fn build_packed_tables(
     // In strict mode, disable this optimization to preserve exact yylex timing
     let mut consistent = vec![false; num_states];
 
+    // Temporary sentinel for states with no explicit actions.
+    // Will be remapped to actual YYPACT_NINF after table building.
+    const PACT_NINF_TEMP: i32 = i32::MIN;
+
     // Fill action table
     for (state_id, actions) in lalr.action_table.iter().enumerate() {
-        pact[state_id] = (state_id * max_terminal_id) as i32;
+        // States with no explicit actions use sentinel (they only have defaults).
+        // Such states cannot shift the error token, so we skip them in error recovery.
+        // This follows Bison's YYPACT_NINF semantics.
+        if actions.is_empty() {
+            pact[state_id] = PACT_NINF_TEMP;
+        } else {
+            pact[state_id] = (state_id * max_terminal_id) as i32;
+        }
 
         // Find default reduction and check if state is "consistent"
         // A state is consistent if:
@@ -695,6 +715,23 @@ fn build_packed_tables(
         }
     }
 
+    // Calculate actual YYPACT_NINF value following Bison's table_ninf_remap approach:
+    // Use (min_real_pact_value - 1) to ensure the sentinel is distinct from all valid offsets.
+    let min_real_pact = pact
+        .iter()
+        .filter(|&&v| v != PACT_NINF_TEMP)
+        .min()
+        .copied()
+        .unwrap_or(0);
+    let pact_ninf = min_real_pact.saturating_sub(1);
+
+    // Remap temporary sentinel values to actual YYPACT_NINF
+    for p in pact.iter_mut() {
+        if *p == PACT_NINF_TEMP {
+            *p = pact_ninf;
+        }
+    }
+
     PackedTables {
         table,
         check,
@@ -704,6 +741,7 @@ fn build_packed_tables(
         defgoto,
         consistent,
         num_states,
+        pact_ninf,
     }
 }
 
@@ -1281,14 +1319,16 @@ fn generate_parser<W: Write>(
     writeln!(w, "    {}errflag = 3;", prefix)?;
     writeln!(w, "    for (;;) {{")?;
     writeln!(w, "        {}n = {}pact[{}state];", prefix, prefix, prefix)?;
-    writeln!(w, "        if ({}n != 0) {{", prefix)?;
+    writeln!(w, "        if ({}n != YYPACT_NINF) {{", prefix)?;
     writeln!(
         w,
         "            {}n += {};  /* error token */",
         prefix, ERROR_SYMBOL
     )?;
-    writeln!(w, "            if ({}n >= 0 && {}n < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}n] == {}) {{",
-        prefix, prefix, prefix, prefix, prefix, prefix, ERROR_SYMBOL)?;
+    // Check: valid index, yycheck matches, AND yytable is positive (shift action, not reduce)
+    // Per Bison: only shift if yytable[yyn] > 0 (positive = shift, negative = reduce)
+    writeln!(w, "            if ({}n >= 0 && {}n < (int)(sizeof({}table)/sizeof({}table[0])) && {}check[{}n] == {} && {}table[{}n] > 0) {{",
+        prefix, prefix, prefix, prefix, prefix, prefix, ERROR_SYMBOL, prefix, prefix)?;
     if opts.debug_enabled {
         writeln!(w, "#if YYDEBUG")?;
         writeln!(w, "                if ({}debug)", prefix)?;

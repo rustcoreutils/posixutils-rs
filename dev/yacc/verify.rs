@@ -175,6 +175,17 @@ fn decode_action(packed: &PackedTables, state: usize, terminal: usize) -> Action
         return Action::Reduce(prod_id);
     }
 
+    // Check for YYPACT_NINF sentinel (state has no explicit actions)
+    // These states can only use default reductions; skip table lookup.
+    if packed.pact[state] == packed.pact_ninf {
+        if packed.defact[state] > 0 {
+            let prod_id = (packed.defact[state] - 1) as usize;
+            return Action::Reduce(prod_id);
+        } else {
+            return Action::Error;
+        }
+    }
+
     // Normal lookup: pact[state] + terminal
     let base = packed.pact[state] as usize;
     let idx = base + terminal;

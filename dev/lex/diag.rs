@@ -6,18 +6,15 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Diagnostic module for lex - provides source position tracking and
-// GCC-compatible error/warning output.
-//
+
+//! Diagnostic module for lex.
+//!
+//! Provides source position tracking and GCC-compatible error/warning output.
 
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-
-// ============================================================================
-// Source Position
-// ============================================================================
 
 /// Source position tracking for tokens and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -53,20 +50,12 @@ impl fmt::Display for Position {
     }
 }
 
-// ============================================================================
-// Global State
-// ============================================================================
-
 thread_local! {
     static FILENAME: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 static WARNING_COUNT: AtomicU32 = AtomicU32::new(0);
-
-// ============================================================================
-// Public API
-// ============================================================================
 
 /// Initialize the diagnostic system with the source filename.
 pub fn init(filename: &str) {
@@ -99,17 +88,9 @@ pub fn error(pos: Position, msg: &str) {
     do_diag("error", pos, msg);
 }
 
-// ============================================================================
-// Internal Implementation
-// ============================================================================
-
 fn do_diag(level: &str, pos: Position, msg: &str) {
     let _ = writeln!(io::stderr(), "{}: {}: {}", pos, level, msg);
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

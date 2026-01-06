@@ -9,39 +9,11 @@
 
 //! Lex file parser for POSIX lex specification files.
 //!
-//! This module parses `.l` lex specification files and extracts definitions,
-//! rules, and user code sections.
+//! Parses .l files into definitions, rules, and user code sections.
 //!
-//! # GNU flex Compatibility Extensions
-//!
-//! In addition to POSIX lex features, this implementation supports the following
-//! GNU flex-compatible extensions:
-//!
-//! ## %option directive
-//!
-//! The `%option` directive allows controlling various aspects of the generated
-//! scanner. Currently supported options:
-//!
-//! - `noinput` - Suppress generation of the `input()` function. Use this when
-//!   your scanner doesn't call `input()` to avoid compiler warnings about
-//!   unused static functions.
-//!
-//! - `nounput` - Suppress generation of the `unput()` function. Use this when
-//!   your scanner doesn't call `unput()` to avoid compiler warnings about
-//!   unused static functions.
-//!
-//! Options can be specified on a single line or multiple lines:
-//!
-//! ```text
-//! %option noinput nounput
-//! ```
-//!
-//! or:
-//!
-//! ```text
-//! %option noinput
-//! %option nounput
-//! ```
+//! ## Extensions
+//! - `%option noinput` - suppress `input()` function generation
+//! - `%option nounput` - suppress `unput()` function generation
 
 use crate::diag;
 use crate::pattern_escape::{expand_posix_bracket_constructs, translate_escape_sequences};
@@ -88,7 +60,7 @@ impl LexRule {
     }
 }
 
-/// Options parsed from %option directives (flex compatibility)
+/// Options from %option directives
 #[derive(Debug, Clone, Default)]
 pub struct LexOptions {
     /// If true, suppress generation of input() function
@@ -238,7 +210,7 @@ fn strip_comments(line: &str, in_comment: &mut bool) -> String {
     result
 }
 
-// parse line from Definitions section
+/// Parse line from Definitions section.
 fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     // Check for %} to end a %{ block first (before early return)
     let trimmed = line.trim();
@@ -338,8 +310,8 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Parse continued action line, counting braces while properly handling
-// character literals, string literals, and comments.
+/// Parse continued action line, counting braces while handling
+/// character literals, string literals, and comments.
 fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
     let mut open_braces = open_braces;
     let chars: Vec<char> = line.chars().collect();
@@ -435,8 +407,8 @@ fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Opt
     None
 }
 
-// find the end of the regex in a rule line, by matching [ and ( and { and } and "
-// This version properly handles POSIX bracket expression constructs: [:class:], [=equiv=], [.collating.]
+/// Find end of regex in rule line by matching brackets, parens, braces, quotes.
+/// Handles POSIX bracket constructs: [:class:], [=equiv=], [.collating.].
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
@@ -761,7 +733,7 @@ struct ParsedRuleInfo {
     is_eof: bool,
 }
 
-// parse a lex rule line, returning all rule components
+/// Parse a lex rule line, returning all rule components.
 fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, String> {
     // Check for <<EOF>> pattern BEFORE extracting start conditions
     // (since <<EOF>> looks like a start condition but isn't)
@@ -840,7 +812,7 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     })
 }
 
-// parse line from Rules section
+/// Parse line from Rules section.
 fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     if line.is_empty() {
         return Ok(());
@@ -910,13 +882,13 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-// parse line from UserCode section
+/// Parse line from UserCode section.
 fn parse_user_line(state: &mut ParseState, line: &str) -> Result<(), &'static str> {
     state.user_subs.push(String::from(line));
     Ok(())
 }
 
-// parse lex input, returning a LexInfo struct
+/// Parse lex input into LexInfo struct.
 pub fn parse(input: &[String]) -> Result<LexInfo, String> {
     let mut state = ParseState::new();
 

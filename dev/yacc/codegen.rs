@@ -944,36 +944,23 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w)?;
 
-    // Stacks
+    // Stacks - use hybrid allocation: start on C stack, migrate to heap if needed
+    writeln!(w, "    /* Initial stack arrays (on C stack for speed) */")?;
+    writeln!(w, "    int {}ssa[YYINITDEPTH];", prefix)?;
+    writeln!(w, "    YYSTYPE {}vsa[YYINITDEPTH];", prefix)?;
+    writeln!(w)?;
+
     writeln!(w, "    /* State stack */")?;
     writeln!(w, "    int {}ssp_offset;", prefix)?;
-    writeln!(w, "    int *{}ss = NULL;", prefix)?;
+    writeln!(w, "    int *{}ss = {}ssa;", prefix, prefix)?;
     writeln!(w, "    int *{}sslim;", prefix)?;
     writeln!(w, "    int {}stacksize = YYINITDEPTH;", prefix)?;
     writeln!(w)?;
 
     writeln!(w, "    /* Value stack */")?;
-    writeln!(w, "    YYSTYPE *{}vs = NULL;", prefix)?;
+    writeln!(w, "    YYSTYPE *{}vs = {}vsa;", prefix, prefix)?;
     writeln!(w, "    YYSTYPE *{}vsp;", prefix)?;
     writeln!(w, "    YYSTYPE {}val = {{0}};", prefix)?;
-    writeln!(w)?;
-
-    // Allocate stacks
-    writeln!(
-        w,
-        "    {}ss = (int *) malloc({}stacksize * sizeof(int));",
-        prefix, prefix
-    )?;
-    writeln!(
-        w,
-        "    {}vs = (YYSTYPE *) malloc({}stacksize * sizeof(YYSTYPE));",
-        prefix, prefix
-    )?;
-    writeln!(
-        w,
-        "    if (!{}ss || !{}vs) goto {}exhausted;",
-        prefix, prefix, prefix
-    )?;
     writeln!(w)?;
 
     writeln!(w, "    {}ssp_offset = 0;", prefix)?;
@@ -1009,7 +996,7 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w)?;
 
-    // Check for stack overflow
+    // Check for stack overflow - use hybrid allocation strategy
     writeln!(
         w,
         "    if ({}ss + {}ssp_offset >= {}sslim) {{",
@@ -1025,21 +1012,57 @@ fn generate_parser<W: Write>(
         "        if (new_size <= {}stacksize) goto {}exhausted;",
         prefix, prefix
     )?;
+    writeln!(w)?;
+    // Check if we're still using the stack-allocated arrays
+    writeln!(w, "        if ({}ss == {}ssa) {{", prefix, prefix)?;
     writeln!(
         w,
-        "        {}ss = (int *) realloc({}ss, new_size * sizeof(int));",
+        "            /* First overflow: migrate from C stack to heap */"
+    )?;
+    writeln!(
+        w,
+        "            int *new_ss = (int *) malloc(new_size * sizeof(int));"
+    )?;
+    writeln!(
+        w,
+        "            YYSTYPE *new_vs = (YYSTYPE *) malloc(new_size * sizeof(YYSTYPE));"
+    )?;
+    writeln!(w, "            if (!new_ss || !new_vs) {{")?;
+    writeln!(w, "                free(new_ss);")?;
+    writeln!(w, "                goto {}exhausted;", prefix)?;
+    writeln!(w, "            }}")?;
+    writeln!(
+        w,
+        "            memcpy(new_ss, {}ss, {}stacksize * sizeof(int));",
         prefix, prefix
     )?;
     writeln!(
         w,
-        "        {}vs = (YYSTYPE *) realloc({}vs, new_size * sizeof(YYSTYPE));",
+        "            memcpy(new_vs, {}vs, {}stacksize * sizeof(YYSTYPE));",
         prefix, prefix
+    )?;
+    writeln!(w, "            {}ss = new_ss;", prefix)?;
+    writeln!(w, "            {}vs = new_vs;", prefix)?;
+    writeln!(w, "        }} else {{")?;
+    writeln!(w, "            /* Already on heap: realloc */")?;
+    writeln!(
+        w,
+        "            int *new_ss = (int *) realloc({}ss, new_size * sizeof(int));",
+        prefix
     )?;
     writeln!(
         w,
-        "        if (!{}ss || !{}vs) goto {}exhausted;",
-        prefix, prefix, prefix
+        "            YYSTYPE *new_vs = (YYSTYPE *) realloc({}vs, new_size * sizeof(YYSTYPE));",
+        prefix
     )?;
+    writeln!(
+        w,
+        "            if (!new_ss || !new_vs) goto {}exhausted;",
+        prefix
+    )?;
+    writeln!(w, "            {}ss = new_ss;", prefix)?;
+    writeln!(w, "            {}vs = new_vs;", prefix)?;
+    writeln!(w, "        }}")?;
     writeln!(
         w,
         "        {}vsp = {}vs + {}ssp_offset;",
@@ -1417,8 +1440,11 @@ fn generate_parser<W: Write>(
 
     // Cleanup
     writeln!(w, "{}cleanup:", prefix)?;
-    writeln!(w, "    free({}ss);", prefix)?;
-    writeln!(w, "    free({}vs);", prefix)?;
+    // Only free if we migrated to heap (hybrid stack allocation)
+    writeln!(w, "    if ({}ss != {}ssa) {{", prefix, prefix)?;
+    writeln!(w, "        free({}ss);", prefix)?;
+    writeln!(w, "        free({}vs);", prefix)?;
+    writeln!(w, "    }}")?;
     writeln!(w, "    return {}result;", prefix)?;
     writeln!(w, "}}")?;
     writeln!(w)?;

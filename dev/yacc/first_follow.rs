@@ -7,7 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! FIRST and FOLLOW set computation for grammar analysis
+//! FIRST and FOLLOW set computation for grammar analysis.
+//!
+//! FIRST(X) = set of terminals that can begin strings derived from X.
+//! FOLLOW(A) = set of terminals that can appear after nonterminal A.
+//! Nullable = symbols that can derive the empty string.
+//!
+//! All sets computed via fixed-point iteration until stable.
 
 #[cfg(test)]
 use crate::grammar::EOF_SYMBOL;
@@ -71,7 +77,10 @@ pub fn compute(grammar: &Grammar) -> FirstFollow {
     }
 }
 
-/// Compute nullable symbols (symbols that can derive epsilon)
+/// Compute nullable symbols (symbols that can derive empty string).
+///
+/// A symbol is nullable if it has a production where all RHS symbols are
+/// nullable (including empty productions). Uses fixed-point iteration.
 fn compute_nullable(grammar: &Grammar) -> HashSet<SymbolId> {
     let mut nullable = HashSet::new();
     let mut changed = true;
@@ -98,7 +107,11 @@ fn compute_nullable(grammar: &Grammar) -> HashSet<SymbolId> {
     nullable
 }
 
-/// Compute FIRST sets for all symbols
+/// Compute FIRST sets for all symbols.
+///
+/// FIRST(terminal) = {terminal}. For nonterminals, iteratively adds
+/// FIRST(X1) to FIRST(A) for each production A -> X1 X2 ... Xn.
+/// If X1 is nullable, also adds FIRST(X2), and so on.
 fn compute_first(
     grammar: &Grammar,
     nullable: &HashSet<SymbolId>,
@@ -144,7 +157,11 @@ fn compute_first(
     first
 }
 
-/// Compute FOLLOW sets for all non-terminals
+/// Compute FOLLOW sets for all nonterminals.
+///
+/// FOLLOW(start) includes EOF. For each production A -> α B β:
+/// - Add FIRST(β) to FOLLOW(B)
+/// - If β is nullable, add FOLLOW(A) to FOLLOW(B)
 #[cfg(test)]
 fn compute_follow(
     grammar: &Grammar,

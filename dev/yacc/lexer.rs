@@ -7,7 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Lexer for yacc grammar files
+//! Lexer for yacc grammar files.
+//!
+//! Tokenizes yacc input into: directives (%token, %left, etc.), identifiers,
+//! character literals, actions ({...}), and markers (%%). Handles C-style
+//! comments and escape sequences per ISO C.
 
 use crate::diag;
 use crate::error::YaccError;

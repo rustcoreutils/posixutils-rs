@@ -7,7 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Grammar representation and symbol table
+//! Grammar representation and symbol table.
+//!
+//! Core data structures: symbols (terminals/nonterminals with precedence and
+//! type tags), productions (rules with semantic actions), and the complete
+//! grammar with augmented start symbol and dense symbol indexing for tables.
 
 use crate::diag;
 use crate::error::YaccError;
@@ -108,6 +112,16 @@ pub struct Grammar {
     mid_action_counter: usize,
     /// Map of token numbers to symbol names (for duplicate detection)
     token_number_map: HashMap<i32, String>,
+
+    // Dense terminal/non-terminal indexing for optimized table generation
+    /// Dense terminal index mapping: symbol_id -> term_idx (0..num_terminals-1)
+    term_idx: HashMap<SymbolId, usize>,
+    /// Dense non-terminal index mapping: symbol_id -> nt_idx (0..num_nonterminals-1)
+    nt_idx: HashMap<SymbolId, usize>,
+    /// Reverse mapping: term_idx -> symbol_id
+    pub term_idx_to_symbol: Vec<SymbolId>,
+    /// Reverse mapping: nt_idx -> symbol_id
+    pub nt_idx_to_symbol: Vec<SymbolId>,
 }
 
 impl Grammar {
@@ -129,6 +143,10 @@ impl Grammar {
             next_token_number: 257, // Start after 256 (reserved for error)
             mid_action_counter: 0,
             token_number_map: HashMap::new(),
+            term_idx: HashMap::new(),
+            nt_idx: HashMap::new(),
+            term_idx_to_symbol: Vec::new(),
+            nt_idx_to_symbol: Vec::new(),
         };
 
         // Add special symbols (these cannot fail - they are the first symbols added)
@@ -292,6 +310,26 @@ impl Grammar {
                 if i < grammar.first_nonterminal {
                     grammar.first_nonterminal = i;
                 }
+            }
+        }
+
+        // Compute dense terminal indices (0..num_terminals-1)
+        // Iterates in symbol ID order, so term_idx 0 = EOF_SYMBOL, term_idx 1 = ERROR_SYMBOL
+        for (sym_id, sym) in grammar.symbols.iter().enumerate() {
+            if sym.is_terminal {
+                let idx = grammar.term_idx_to_symbol.len();
+                grammar.term_idx.insert(sym_id, idx);
+                grammar.term_idx_to_symbol.push(sym_id);
+            }
+        }
+
+        // Compute dense non-terminal indices (0..num_nonterminals-1)
+        // Iterates in symbol ID order, so nt_idx 0 = AUGMENTED_START
+        for (sym_id, sym) in grammar.symbols.iter().enumerate() {
+            if !sym.is_terminal {
+                let idx = grammar.nt_idx_to_symbol.len();
+                grammar.nt_idx.insert(sym_id, idx);
+                grammar.nt_idx_to_symbol.push(sym_id);
             }
         }
 
@@ -543,6 +581,18 @@ impl Grammar {
             .get(&sym)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Get dense terminal index for a terminal symbol.
+    /// Returns None if the symbol is not a terminal.
+    pub fn terminal_index(&self, sym_id: SymbolId) -> Option<usize> {
+        self.term_idx.get(&sym_id).copied()
+    }
+
+    /// Get dense non-terminal index for a non-terminal symbol.
+    /// Returns None if the symbol is not a non-terminal.
+    pub fn nonterminal_index(&self, sym_id: SymbolId) -> Option<usize> {
+        self.nt_idx.get(&sym_id).copied()
     }
 
     /// Get the augmented start production (should be the last one added)

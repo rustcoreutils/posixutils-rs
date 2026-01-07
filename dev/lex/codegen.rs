@@ -959,31 +959,88 @@ fn write_dfa_state<W: Write>(
     writeln!(output, "yy_state_{}:", state_idx)?;
 
     // If this is an accepting state, save marker position and state info
-    if let Some(rule) = state.accepting {
-        writeln!(output, "    /* Accepting state for rule {} */", rule)?;
-        writeln!(output, "    YYMARKER = YYCURSOR;")?;
-        writeln!(output, "    yyaccept = {};", rule)?;
-        writeln!(output, "    yy_full_match_state = {};", state_idx)?;
-        // Push to REJECT history stack for shorter match fallback
-        if flags.has_reject {
-            // Fatal error on stack overflow instead of silently dropping history
-            writeln!(output, "    if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{")?;
+    // When start conditions are in use, only update YYMARKER if the rule is valid
+    // for the current start condition. This prevents incorrect backtracking.
+    if state.accepting.is_some() {
+        if flags.has_start_conditions {
+            // Generate runtime check for valid accepting rules
             writeln!(
                 output,
-                "        YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
+                "    /* Accepting state - checking start condition validity */"
             )?;
+            writeln!(output, "    {{")?;
+            writeln!(output, "        int yy_valid_rule = -1;")?;
+
+            // Check each accepting rule by priority (accepting_rules is sorted by rule index)
+            for &r in &state.accepting_rules {
+                writeln!(
+                    output,
+                    "        if (yy_valid_rule < 0 && yy_rule_cond[{}][yy_start_state]) yy_valid_rule = {};",
+                    r, r
+                )?;
+            }
+
+            writeln!(output, "        if (yy_valid_rule >= 0) {{")?;
+            writeln!(output, "            YYMARKER = YYCURSOR;")?;
+            writeln!(output, "            yyaccept = yy_valid_rule;")?;
+            writeln!(output, "            yy_full_match_state = {};", state_idx)?;
+
+            // Push to REJECT history stack for shorter match fallback (inside conditional)
+            if flags.has_reject {
+                writeln!(
+                    output,
+                    "            if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{"
+                )?;
+                writeln!(
+                    output,
+                    "                YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
+                )?;
+                writeln!(output, "            }}")?;
+                writeln!(
+                    output,
+                    "            yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
+                )?;
+                writeln!(
+                    output,
+                    "            yy_reject_stack[yy_reject_top].state = {};",
+                    state_idx
+                )?;
+                writeln!(
+                    output,
+                    "            yy_reject_stack[yy_reject_top].rule_idx = 0;"
+                )?;
+                writeln!(output, "            yy_reject_top++;")?;
+            }
+
+            writeln!(output, "        }}")?;
             writeln!(output, "    }}")?;
-            writeln!(
-                output,
-                "    yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
-            )?;
-            writeln!(
-                output,
-                "    yy_reject_stack[yy_reject_top].state = {};",
-                state_idx
-            )?;
-            writeln!(output, "    yy_reject_stack[yy_reject_top].rule_idx = 0;")?;
-            writeln!(output, "    yy_reject_top++;")?;
+        } else {
+            // No start conditions - use original unconditional behavior
+            let rule = state.accepting.unwrap();
+            writeln!(output, "    /* Accepting state for rule {} */", rule)?;
+            writeln!(output, "    YYMARKER = YYCURSOR;")?;
+            writeln!(output, "    yyaccept = {};", rule)?;
+            writeln!(output, "    yy_full_match_state = {};", state_idx)?;
+            // Push to REJECT history stack for shorter match fallback
+            if flags.has_reject {
+                writeln!(output, "    if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{")?;
+                writeln!(
+                    output,
+                    "        YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
+                )?;
+                writeln!(output, "    }}")?;
+                writeln!(
+                    output,
+                    "    yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
+                )?;
+                writeln!(
+                    output,
+                    "    yy_reject_stack[yy_reject_top].state = {};",
+                    state_idx
+                )?;
+                writeln!(output, "    yy_reject_stack[yy_reject_top].rule_idx = 0;")?;
+                writeln!(output, "    yy_reject_top++;")?;
+            }
         }
     }
 

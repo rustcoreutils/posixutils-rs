@@ -482,6 +482,26 @@ fn generate_action_goto_tables<W: Write>(
     strict_mode: bool,
 ) -> Result<(), YaccError> {
     let num_states = lalr.action_table.len();
+    let num_productions = grammar.productions.len();
+
+    // Maximum states/productions that fit in i16 table encoding:
+    // - Shift values stored as positive i16 (max i16::MAX)
+    // - Reduce values encoded as -(prod_id + 1), must not overflow or collide with i16::MIN
+    const MAX_STATES: usize = i16::MAX as usize;
+    const MAX_PRODUCTIONS: usize = i16::MAX as usize;
+
+    if num_states > MAX_STATES {
+        return Err(YaccError::Grammar(format!(
+            "grammar has {} states, exceeds maximum of {}",
+            num_states, MAX_STATES
+        )));
+    }
+    if num_productions > MAX_PRODUCTIONS {
+        return Err(YaccError::Grammar(format!(
+            "grammar has {} productions, exceeds maximum of {}",
+            num_productions, MAX_PRODUCTIONS
+        )));
+    }
 
     // Compute default actions (most common action per state)
     let mut default_action: Vec<i16> = vec![0; num_states];

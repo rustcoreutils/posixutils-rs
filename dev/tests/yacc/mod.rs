@@ -2271,9 +2271,9 @@ expr : NUM
     let code_path = temp_dir.path().join("y.tab.c");
     let code_content = fs::read_to_string(&code_path).unwrap();
 
-    // Should have the consistent table
+    // Should have the consistent table (may have size constant in brackets)
     assert!(
-        code_content.contains("yyconsistent[]") || code_content.contains("consistent[]"),
+        code_content.contains("yyconsistent["),
         "Should have consistent state table for POSIX optimization"
     );
 
@@ -2340,20 +2340,23 @@ s : A B { $$ = 1; }
     let code_path = temp_dir.path().join("y.tab.c");
     let code_content = fs::read_to_string(&code_path).unwrap();
 
-    // Extract consistent table values
-    if let Some(start) = code_content.find("yyconsistent[] =") {
+    // Extract consistent table values (table may have size constant in brackets)
+    if let Some(start) = code_content.find("yyconsistent[") {
         let subset = &code_content[start..];
-        if let Some(end) = subset.find("};") {
-            let table_def = &subset[..end];
-            // In strict mode, all values should be 0
-            let has_nonzero = table_def
-                .chars()
-                .filter(|c| c.is_ascii_digit())
-                .any(|c| c != '0');
-            assert!(
-                !has_nonzero,
-                "In strict mode, yyconsistent[] should contain all zeros"
-            );
+        if let Some(eq_pos) = subset.find('=') {
+            let after_eq = &subset[eq_pos..];
+            if let Some(end) = after_eq.find("};") {
+                let table_def = &after_eq[..end];
+                // In strict mode, all values should be 0
+                let has_nonzero = table_def
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .any(|c| c != '0');
+                assert!(
+                    !has_nonzero,
+                    "In strict mode, yyconsistent[] should contain all zeros"
+                );
+            }
         }
     }
 }
@@ -2392,9 +2395,9 @@ term : NUM
     let code_path = temp_dir.path().join("y.tab.c");
     let code_content = fs::read_to_string(&code_path).unwrap();
 
-    // Look for the consistent table
+    // Look for the consistent table (may have size constant in brackets)
     assert!(
-        code_content.contains("yyconsistent[]") || code_content.contains("consistent[]"),
+        code_content.contains("yyconsistent["),
         "Should have consistent state table"
     );
 }

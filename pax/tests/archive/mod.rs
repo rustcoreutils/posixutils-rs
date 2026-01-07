@@ -137,14 +137,14 @@ fn test_pax_format_always_has_extended_headers() {
 
     // Read the archive and check for pax extended header marker
     let archive_contents = fs::read(&archive).unwrap();
-    
+
     // Look for typeflag 'x' (0x78) at offset 156 in the first header
     // This indicates a pax extended header block
     assert!(
         archive_contents.len() >= 512,
         "Archive is too small to contain headers"
     );
-    
+
     // The first block should be a pax extended header (typeflag 'x')
     let typeflag = archive_contents[156];
     assert_eq!(

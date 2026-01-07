@@ -785,7 +785,8 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
 
         // Check if we need extended headers (respecting -o times option)
         // force_pax=true ensures pax format is always distinguishable from ustar
-        let ext_header = ExtendedHeader::from_entry_with_options(entry, self.options.include_times, true);
+        let ext_header =
+            ExtendedHeader::from_entry_with_options(entry, self.options.include_times, true);
 
         if !ext_header.is_empty() {
             self.write_extended_header(&ext_header, entry)?;

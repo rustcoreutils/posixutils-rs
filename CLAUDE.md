@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## CRITICAL: Git Restrictions
 
-**NEVER `git commit` or `git add`.** without asking.
+**NEVER `git commit` or `git add`** without asking.
 
 ## Project Overview
 
@@ -73,7 +73,7 @@ Other crates: `calc/` (bc), `cc/` (c99), `cron/`, `datetime/`, `dev/` (developme
 For Claude Code Bash tool debugging, diagnostics and testing, use our DEBUG PROTOCOL:
 (1) Update EXISTING /tmp/*.sh script, with the test logic
 (2) Bash runs /tmp/$YOUR_SCRIPT.sh to see debug output
-This is intentionally minimizes prompting the user for input during debugging.
+This intentionally minimizes prompting the user for input during debugging.
 
 Integration tests use plib's TestPlan framework:
 ```rust

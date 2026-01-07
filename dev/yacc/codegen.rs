@@ -1253,6 +1253,9 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}char != 0) {}char = -1;", prefix, prefix)?;
     writeln!(w, "        if ({}errflag > 0) {}errflag--;", prefix, prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
+    writeln!(w, "    }} else if ({}n == INT16_MIN) {{", prefix)?;
+    writeln!(w, "        /* Explicit error (%nonassoc conflict) */")?;
+    writeln!(w, "        goto {}errlab;", prefix)?;
     writeln!(w, "    }} else {{")?;
     writeln!(w, "        /* Reduce */")?;
     // Decode production number: table stores -(prod + 1), so prod = -n - 1

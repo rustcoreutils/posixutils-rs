@@ -118,7 +118,8 @@ fn generate_code_file(
     // Standard includes
     writeln!(
         w,
-        r#"#include <stdio.h>
+        r#"#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 "#
@@ -284,8 +285,14 @@ fn generate_tables<W: Write>(
     writeln!(w, "#define YYNSTATES {}", num_states)?;
     writeln!(w)?;
 
-    // YYTABLE_NINF - sentinel value for explicit error actions (%nonassoc conflicts)
-    writeln!(w, "#define YYTABLE_NINF (-32768)")?;
+    // Table size constants (derived from above for self-documentation)
+    writeln!(w, "/* Table size constants */")?;
+    writeln!(w, "#define YYR_SIZE YYNRULES")?;
+    writeln!(w, "#define YYDEFACT_SIZE YYNSTATES")?;
+    writeln!(w, "#define YYCONSISTENT_SIZE YYNSTATES")?;
+    writeln!(w, "#define YYDEFGOTO_SIZE YYNNTS")?;
+    writeln!(w, "#define YYACTION_SIZE (YYNSTATES * YYNTOKENS)")?;
+    writeln!(w, "#define YYGOTO_SIZE (YYNSTATES * YYNNTS)")?;
     writeln!(w)?;
 
     // Token translation table
@@ -341,10 +348,6 @@ fn generate_token_translate_table<W: Write>(
         .terminal_index(ERROR_SYMBOL)
         .expect("error must have term_idx");
 
-    writeln!(w, "/* Token number -> dense terminal index */")?;
-    writeln!(w, "static const unsigned short {}translate[] =", prefix)?;
-    writeln!(w, "{{")?;
-
     // Create translation: external token number -> dense terminal index
     // Unknown tokens map to error_term_idx (the error token's dense index)
     let mut translate = vec![error_term_idx as u16; (max_token + 1) as usize];
@@ -361,6 +364,21 @@ fn generate_token_translate_table<W: Write>(
             }
         }
     }
+
+    // Select smallest type that fits all values (all values are non-negative)
+    let max_val = translate.iter().copied().max().unwrap_or(0) as i64;
+    let c_type = select_c_type(0, max_val);
+    let table_size = translate.len();
+
+    writeln!(w, "#define YYTRANSLATE_SIZE {}", table_size)?;
+    writeln!(w)?;
+    writeln!(w, "/* Token number -> dense terminal index */")?;
+    writeln!(
+        w,
+        "static const {} {}translate[YYTRANSLATE_SIZE] =",
+        c_type, prefix
+    )?;
+    writeln!(w, "{{")?;
 
     // Write table in rows of 16
     for (i, chunk) in translate.chunks(16).enumerate() {
@@ -395,20 +413,29 @@ fn generate_rule_tables<W: Write>(
         symbol_to_internal.insert(nt_id, grammar.num_terminals + nt_idx);
     }
 
+    // Collect r1 values and find max for type selection
+    let r1_values: Vec<usize> = grammar
+        .productions
+        .iter()
+        .map(|prod| {
+            symbol_to_internal
+                .get(&prod.lhs)
+                .copied()
+                .unwrap_or(prod.lhs)
+        })
+        .collect();
+    let r1_max = r1_values.iter().copied().max().unwrap_or(0) as i64;
+    let r1_type = select_c_type(0, r1_max);
+
     // yyr1 - LHS symbol of each rule (using internal symbol numbers)
     writeln!(w, "/* LHS symbol of each rule */")?;
-    writeln!(w, "static const unsigned short {}r1[] =", prefix)?;
+    writeln!(w, "static const {} {}r1[YYR_SIZE] =", r1_type, prefix)?;
     writeln!(w, "{{")?;
     write!(w, "    ")?;
-    for (i, prod) in grammar.productions.iter().enumerate() {
+    for (i, &internal_sym) in r1_values.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
         }
-        // Convert raw symbol ID to internal symbol number
-        let internal_sym = symbol_to_internal
-            .get(&prod.lhs)
-            .copied()
-            .unwrap_or(prod.lhs);
         write!(w, "{:3}", internal_sym)?;
     }
     writeln!(w)?;
@@ -416,15 +443,24 @@ fn generate_rule_tables<W: Write>(
     writeln!(w)?;
 
     // yyr2 - Number of symbols on RHS of each rule
+    // Collect values and find max for type selection
+    let r2_values: Vec<usize> = grammar
+        .productions
+        .iter()
+        .map(|prod| prod.rhs.len())
+        .collect();
+    let r2_max = r2_values.iter().copied().max().unwrap_or(0) as i64;
+    let r2_type = select_c_type(0, r2_max);
+
     writeln!(w, "/* Number of symbols on RHS of each rule */")?;
-    writeln!(w, "static const unsigned char {}r2[] =", prefix)?;
+    writeln!(w, "static const {} {}r2[YYR_SIZE] =", r2_type, prefix)?;
     writeln!(w, "{{")?;
     write!(w, "    ")?;
-    for (i, prod) in grammar.productions.iter().enumerate() {
+    for (i, &rhs_len) in r2_values.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
         }
-        write!(w, "{:3}", prod.rhs.len())?;
+        write!(w, "{:3}", rhs_len)?;
     }
     writeln!(w)?;
     writeln!(w, "}};")?;
@@ -446,6 +482,26 @@ fn generate_action_goto_tables<W: Write>(
     strict_mode: bool,
 ) -> Result<(), YaccError> {
     let num_states = lalr.action_table.len();
+    let num_productions = grammar.productions.len();
+
+    // Maximum states/productions that fit in i16 table encoding:
+    // - Shift values stored as positive i16 (max i16::MAX)
+    // - Reduce values encoded as -(prod_id + 1), must not overflow or collide with i16::MIN
+    const MAX_STATES: usize = i16::MAX as usize;
+    const MAX_PRODUCTIONS: usize = i16::MAX as usize;
+
+    if num_states > MAX_STATES {
+        return Err(YaccError::Grammar(format!(
+            "grammar has {} states, exceeds maximum of {}",
+            num_states, MAX_STATES
+        )));
+    }
+    if num_productions > MAX_PRODUCTIONS {
+        return Err(YaccError::Grammar(format!(
+            "grammar has {} productions, exceeds maximum of {}",
+            num_productions, MAX_PRODUCTIONS
+        )));
+    }
 
     // Compute default actions (most common action per state)
     let mut default_action: Vec<i16> = vec![0; num_states];
@@ -469,13 +525,35 @@ fn generate_action_goto_tables<W: Write>(
     // This runs on every invocation and panics on any mismatch (internal bug)
     crate::verify::verify_tables(grammar, lalr, &packed);
 
+    // Compute optimal types for each table based on actual value ranges
+    let defact_max = packed.defact.iter().copied().max().unwrap_or(0) as i64;
+    let defact_type = select_c_type(0, defact_max);
+
+    let defgoto_min = packed.defgoto.iter().copied().min().unwrap_or(0) as i64;
+    let defgoto_max = packed.defgoto.iter().copied().max().unwrap_or(0) as i64;
+    let defgoto_type = select_c_type(defgoto_min, defgoto_max);
+
+    let action_min = packed.action.iter().copied().min().unwrap_or(0) as i64;
+    let action_max = packed.action.iter().copied().max().unwrap_or(0) as i64;
+    let action_type = select_c_type(action_min, action_max);
+
+    let goto_min = packed.goto.iter().copied().min().unwrap_or(0) as i64;
+    let goto_max = packed.goto.iter().copied().max().unwrap_or(0) as i64;
+    let goto_type = select_c_type(goto_min, goto_max);
+
+    // Emit typedef for action table element type (used by parser for row pointer)
+    writeln!(w, "/* Type for action table elements */")?;
+    writeln!(w, "typedef {} {}action_t;", action_type, prefix)?;
+    writeln!(w)?;
+
     write_c_table(
         w,
         prefix,
         TableSpec {
             comment: "Default reduction for each state",
-            c_type: "unsigned short",
+            c_type: defact_type,
             name: "defact",
+            size_const: "YYDEFACT_SIZE",
             width: 3,
         },
         &packed.defact,
@@ -487,8 +565,9 @@ fn generate_action_goto_tables<W: Write>(
         prefix,
         TableSpec {
             comment: "Consistent states (skip lookahead) - POSIX optimization",
-            c_type: "unsigned char",
+            c_type: "uint8_t",
             name: "consistent",
+            size_const: "YYCONSISTENT_SIZE",
             width: 3,
         },
         &packed.consistent,
@@ -500,8 +579,9 @@ fn generate_action_goto_tables<W: Write>(
         prefix,
         TableSpec {
             comment: "Default goto for each non-terminal",
-            c_type: "short",
+            c_type: defgoto_type,
             name: "defgoto",
+            size_const: "YYDEFGOTO_SIZE",
             width: 5,
         },
         &packed.defgoto,
@@ -513,8 +593,9 @@ fn generate_action_goto_tables<W: Write>(
         prefix,
         TableSpec {
             comment: "Dense action table: action[state * YYNTOKENS + term_idx]",
-            c_type: "short",
+            c_type: action_type,
             name: "action",
+            size_const: "YYACTION_SIZE",
             width: 5,
         },
         &packed.action,
@@ -526,8 +607,9 @@ fn generate_action_goto_tables<W: Write>(
         prefix,
         TableSpec {
             comment: "Dense goto table: goto[state * YYNNTS + nt_idx]",
-            c_type: "short",
+            c_type: goto_type,
             name: "goto",
+            size_const: "YYGOTO_SIZE",
             width: 5,
         },
         &packed.goto,
@@ -680,7 +762,25 @@ struct TableSpec<'a> {
     comment: &'a str,
     c_type: &'a str,
     name: &'a str,
+    size_const: &'a str,
     width: usize,
+}
+
+/// Select the smallest C99 fixed-width integer type that can hold values in [min_val, max_val].
+fn select_c_type(min_val: i64, max_val: i64) -> &'static str {
+    if min_val >= 0 && max_val <= 255 {
+        "uint8_t"
+    } else if min_val >= -128 && max_val <= 127 {
+        "int8_t"
+    } else if min_val >= 0 && max_val <= 65535 {
+        "uint16_t"
+    } else if min_val >= -32768 && max_val <= 32767 {
+        "int16_t"
+    } else if min_val >= 0 {
+        "uint32_t"
+    } else {
+        "int32_t"
+    }
 }
 
 /// Write a C array table with consistent formatting.
@@ -697,8 +797,8 @@ where
     writeln!(w, "/* {} */", spec.comment)?;
     writeln!(
         w,
-        "static const {} {}{}[] =",
-        spec.c_type, prefix, spec.name
+        "static const {} {}{}[{}] =",
+        spec.c_type, prefix, spec.name, spec.size_const
     )?;
     writeln!(w, "{{")?;
     for chunk in data.chunks(10) {
@@ -959,10 +1059,10 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w)?;
 
-    // Check for stack overflow - use hybrid allocation strategy
+    // Check for stack overflow - use hybrid allocation strategy (rare path)
     writeln!(
         w,
-        "    if ({}ss + {}ssp_offset >= {}sslim) {{",
+        "    if (YYUNLIKELY({}ss + {}ssp_offset >= {}sslim)) {{",
         prefix, prefix, prefix
     )?;
     writeln!(w, "        int new_size = {}stacksize * 2;", prefix)?;
@@ -1091,7 +1191,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "        goto {}acceptlab;", prefix)?;
     writeln!(w)?;
 
-    // Lookup action using dense table: action[state * YYNTOKENS + term_idx]
+    // Lookup action using dense table with row pointer caching
     writeln!(w, "    {{")?;
     writeln!(
         w,
@@ -1104,24 +1204,20 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(
         w,
-        "        {}n = {}action[{}state * YYNTOKENS + {}tok];",
+        "        const {}action_t *{}row = {}action + {}state * YYNTOKENS;",
         prefix, prefix, prefix, prefix
     )?;
+    writeln!(w, "        {}n = {}row[{}tok];", prefix, prefix, prefix)?;
     writeln!(w, "    }}")?;
     writeln!(w)?;
+    // Action dispatch using if-else chain to skip redundant checks after match
     writeln!(
         w,
-        "    /* Action value 0 means consult defact (reduce or error) */"
+        "    /* Action dispatch: 0=default, >0=shift, <0=reduce */"
     )?;
-    writeln!(
-        w,
-        "    if ({}n == 0) goto {}default_action;",
-        prefix, prefix
-    )?;
-    writeln!(w)?;
-
-    // Handle action
-    writeln!(w, "    if ({}n > 0) {{", prefix)?;
+    writeln!(w, "    if ({}n == 0) {{", prefix)?;
+    writeln!(w, "        goto {}default_action;", prefix)?;
+    writeln!(w, "    }} else if ({}n > 0) {{", prefix)?;
     writeln!(w, "        /* Shift */")?;
     if opts.debug_enabled {
         writeln!(w, "#if YYDEBUG")?;
@@ -1157,24 +1253,15 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}char != 0) {}char = -1;", prefix, prefix)?;
     writeln!(w, "        if ({}errflag > 0) {}errflag--;", prefix, prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
-    writeln!(w, "    }}")?;
-    writeln!(w)?;
-
-    // Note: Accept is handled by YYFINAL check at top of loop, not here.
-    // Action table value 0 means "consult defact", not Accept.
-
-    // Handle explicit error from %nonassoc conflicts
-    writeln!(
-        w,
-        "    if (YYUNLIKELY({}n == YYTABLE_NINF)) goto {}errlab;",
-        prefix, prefix
-    )?;
-    writeln!(w)?;
-
-    writeln!(w, "    /* Reduce */")?;
+    writeln!(w, "    }} else if ({}n == INT16_MIN) {{", prefix)?;
+    writeln!(w, "        /* Explicit error (%nonassoc conflict) */")?;
+    writeln!(w, "        goto {}errlab;", prefix)?;
+    writeln!(w, "    }} else {{")?;
+    writeln!(w, "        /* Reduce */")?;
     // Decode production number: table stores -(prod + 1), so prod = -n - 1
-    writeln!(w, "    {}n = -{}n - 1;", prefix, prefix)?;
-    writeln!(w, "    goto {}reduce;", prefix)?;
+    writeln!(w, "        {}n = -{}n - 1;", prefix, prefix)?;
+    writeln!(w, "        goto {}reduce;", prefix)?;
+    writeln!(w, "    }}")?;
     writeln!(w)?;
 
     // Default action

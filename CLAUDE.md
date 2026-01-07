@@ -70,6 +70,11 @@ Other crates: `calc/` (bc), `cc/` (c99), `cron/`, `datetime/`, `dev/` (developme
 
 ## Testing Pattern
 
+For Claude Code Bash tool debugging, diagnostics and testing, use our DEBUG PROTOCOL:
+(1) Update EXISTING /tmp/*.sh script, with the test logic
+(2) Bash runs /tmp/$YOUR_SCRIPT.sh to see debug output
+This is intentionally minimizes prompting the user for input during debugging.
+
 Integration tests use plib's TestPlan framework:
 ```rust
 use plib::testing::{TestPlan, run_test};

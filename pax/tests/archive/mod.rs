@@ -15,6 +15,10 @@ use std::io::Write;
 use std::process::Command;
 use tempfile::TempDir;
 
+// TAR/PAX header constants
+const TAR_BLOCK_SIZE: usize = 512;
+const TAR_TYPEFLAG_OFFSET: usize = 156;
+
 #[test]
 fn test_ustar_roundtrip() {
     let temp = TempDir::new().unwrap();
@@ -138,15 +142,15 @@ fn test_pax_format_always_has_extended_headers() {
     // Read the archive and check for pax extended header marker
     let archive_contents = fs::read(&archive).unwrap();
 
-    // Look for typeflag 'x' (0x78) at offset 156 in the first header
+    // Look for typeflag 'x' (0x78) at TAR_TYPEFLAG_OFFSET in the first header
     // This indicates a pax extended header block
     assert!(
-        archive_contents.len() >= 512,
+        archive_contents.len() >= TAR_BLOCK_SIZE,
         "Archive is too small to contain headers"
     );
 
     // The first block should be a pax extended header (typeflag 'x')
-    let typeflag = archive_contents[156];
+    let typeflag = archive_contents[TAR_TYPEFLAG_OFFSET];
     assert_eq!(
         typeflag, b'x',
         "Expected pax extended header (typeflag 'x'), found {:?}",

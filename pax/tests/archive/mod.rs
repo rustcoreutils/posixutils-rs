@@ -108,6 +108,64 @@ fn test_pax_roundtrip() {
     verify_files_match(&src_dir, &dst_dir);
 }
 
+#[test]
+fn test_pax_format_always_has_extended_headers() {
+    // Test that pax format always generates extended headers, even for simple files
+    // This ensures the archive is identifiable as pax format, not just ustar
+    let temp = TempDir::new().unwrap();
+    let test_file = temp.path().join("simple.txt");
+    let archive = temp.path().join("test.pax");
+
+    // Create a simple test file
+    let mut f = File::create(&test_file).unwrap();
+    writeln!(f, "test content").unwrap();
+    drop(f);
+
+    // Create pax archive
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-f",
+            archive.to_str().unwrap(),
+            "simple.txt",
+        ],
+        temp.path(),
+    );
+    assert_success(&output, "pax write");
+
+    // Read the archive and check for pax extended header marker
+    let archive_contents = fs::read(&archive).unwrap();
+    
+    // Look for typeflag 'x' (0x78) at offset 156 in the first header
+    // This indicates a pax extended header block
+    assert!(
+        archive_contents.len() >= 512,
+        "Archive is too small to contain headers"
+    );
+    
+    // The first block should be a pax extended header (typeflag 'x')
+    let typeflag = archive_contents[156];
+    assert_eq!(
+        typeflag, b'x',
+        "Expected pax extended header (typeflag 'x'), found {:?}",
+        typeflag as char
+    );
+
+    // Verify archive can still be read correctly
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read");
+
+    // Verify the extracted file is correct
+    let extracted = dst_dir.join("simple.txt");
+    assert!(extracted.exists(), "File was not extracted");
+    let content = fs::read_to_string(extracted).unwrap();
+    assert_eq!(content.trim(), "test content");
+}
+
 #[cfg(unix)]
 #[test]
 fn test_hardlink_roundtrip() {

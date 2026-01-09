@@ -343,14 +343,13 @@ impl ExtendedHeader {
         }
     }
 
-    /// Create extended header with options controlling what to include
+    /// Create extended header for pax format
     ///
-    /// Always includes mtime to ensure pax archives are distinguishable from ustar.
+    /// Always includes mtime and atime to ensure pax archives are distinguishable from ustar.
     ///
     /// # Arguments
     /// * `entry` - The archive entry to generate extended headers for
-    /// * `include_times` - If true, also include atime in extended headers
-    pub fn from_entry_with_options(entry: &ArchiveEntry, include_times: bool) -> Self {
+    pub fn from_entry_with_options(entry: &ArchiveEntry) -> Self {
         let mut header = ExtendedHeader::new();
 
         // Path needs extended header if too long for ustar
@@ -381,25 +380,18 @@ impl ExtendedHeader {
         }
 
         // Always include mtime to ensure pax format is distinguishable from ustar
-        // This is the pax module, so we always want extended headers
         let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
         header.mtime = Some(mtime_float);
 
-        // Include atime: always if include_times, or if present
-        if include_times {
-            // When -o times is set, include atime even if not in entry (use mtime as fallback)
-            let atime = entry.atime.unwrap_or(entry.mtime);
-            let atime_nsec = if entry.atime.is_some() {
-                entry.atime_nsec
-            } else {
-                entry.mtime_nsec
-            };
-            let atime_float = atime as f64 + (atime_nsec as f64 / 1_000_000_000.0);
-            header.atime = Some(atime_float);
-        } else if let Some(atime) = entry.atime {
-            let atime_float = atime as f64 + (entry.atime_nsec as f64 / 1_000_000_000.0);
-            header.atime = Some(atime_float);
-        }
+        // Always include atime for pax format
+        let atime = entry.atime.unwrap_or(entry.mtime);
+        let atime_nsec = if entry.atime.is_some() {
+            entry.atime_nsec
+        } else {
+            entry.mtime_nsec
+        };
+        let atime_float = atime as f64 + (atime_nsec as f64 / 1_000_000_000.0);
+        header.atime = Some(atime_float);
 
         // uname/gname with non-ASCII characters
         if let Some(ref uname) = entry.uname {
@@ -779,8 +771,8 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // Write global header if this is the first entry and we have global options
         self.write_global_header()?;
 
-        // Check if we need extended headers (respecting -o times option)
-        let ext_header = ExtendedHeader::from_entry_with_options(entry, self.options.include_times);
+        // Generate extended headers (always includes mtime and atime for pax format)
+        let ext_header = ExtendedHeader::from_entry_with_options(entry);
 
         if !ext_header.is_empty() {
             self.write_extended_header(&ext_header, entry)?;
@@ -1166,8 +1158,9 @@ mod tests {
         entry.uid = 3000000; // > 2097151
         entry.mtime_nsec = 500000000; // 0.5 seconds
 
-        let ext = ExtendedHeader::from_entry_with_options(&entry, false);
+        let ext = ExtendedHeader::from_entry_with_options(&entry);
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
+        assert!(ext.atime.is_some()); // Now always included for pax format
     }
 }

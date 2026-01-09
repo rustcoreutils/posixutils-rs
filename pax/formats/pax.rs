@@ -345,15 +345,12 @@ impl ExtendedHeader {
 
     /// Create extended header with options controlling what to include
     ///
+    /// Always includes mtime to ensure pax archives are distinguishable from ustar.
+    ///
     /// # Arguments
     /// * `entry` - The archive entry to generate extended headers for
-    /// * `include_times` - If true, always include atime and mtime in extended headers
-    /// * `force_pax` - If true, always include at least mtime to ensure pax format is distinguishable
-    pub fn from_entry_with_options(
-        entry: &ArchiveEntry,
-        include_times: bool,
-        force_pax: bool,
-    ) -> Self {
+    /// * `include_times` - If true, also include atime in extended headers
+    pub fn from_entry_with_options(entry: &ArchiveEntry, include_times: bool) -> Self {
         let mut header = ExtendedHeader::new();
 
         // Path needs extended header if too long for ustar
@@ -383,11 +380,10 @@ impl ExtendedHeader {
             header.gid = Some(entry.gid);
         }
 
-        // Include mtime: always if include_times, force_pax, or if subsecond precision needed
-        if include_times || force_pax || entry.mtime_nsec > 0 {
-            let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
-            header.mtime = Some(mtime_float);
-        }
+        // Always include mtime to ensure pax format is distinguishable from ustar
+        // This is the pax module, so we always want extended headers
+        let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
+        header.mtime = Some(mtime_float);
 
         // Include atime: always if include_times, or if present
         if include_times {
@@ -784,9 +780,7 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         self.write_global_header()?;
 
         // Check if we need extended headers (respecting -o times option)
-        // force_pax=true ensures pax format is always distinguishable from ustar
-        let ext_header =
-            ExtendedHeader::from_entry_with_options(entry, self.options.include_times, true);
+        let ext_header = ExtendedHeader::from_entry_with_options(entry, self.options.include_times);
 
         if !ext_header.is_empty() {
             self.write_extended_header(&ext_header, entry)?;
@@ -1172,7 +1166,7 @@ mod tests {
         entry.uid = 3000000; // > 2097151
         entry.mtime_nsec = 500000000; // 0.5 seconds
 
-        let ext = ExtendedHeader::from_entry_with_options(&entry, false, false);
+        let ext = ExtendedHeader::from_entry_with_options(&entry, false);
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
     }

@@ -2644,10 +2644,17 @@ impl CodeGenerator for X86_64CodeGen {
         self.emit_header();
 
         // Emit .file directives unconditionally (useful for diagnostics/profiling)
+        // Use "." as placeholder for empty paths (synthetic files like <paste>)
+        // to keep file numbers sequential for .loc directives
         for (i, path) in module.source_files.iter().enumerate() {
+            let file_path = if path.is_empty() {
+                ".".to_string()
+            } else {
+                path.clone()
+            };
             // File indices in DWARF start at 1
             self.base
-                .push_directive(Directive::file((i + 1) as u32, path.clone()));
+                .push_directive(Directive::file((i + 1) as u32, file_path));
         }
 
         // Emit globals
@@ -2660,9 +2667,46 @@ impl CodeGenerator for X86_64CodeGen {
             self.base.emit_strings(&module.strings);
         }
 
+        // Emit text start label for DWARF debug info (before first function)
+        if module.debug && !module.functions.is_empty() {
+            self.base.push_directive(Directive::local_label(".Ltext0"));
+        }
+
         // Emit functions
         for func in &module.functions {
             self.emit_function(func, types);
+        }
+
+        // Emit text end label for DWARF debug info (after last function)
+        if module.debug && !module.functions.is_empty() {
+            self.base
+                .push_directive(Directive::local_label(".Ltext_end"));
+        }
+
+        // Generate DWARF debug sections if debug mode is enabled
+        if module.debug {
+            let producer = format!("pcc {}", env!("CARGO_PKG_VERSION"));
+            let source_name = module.source_name.as_deref().unwrap_or("unknown");
+            let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
+
+            super::super::dwarf::generate_abbrev_table(&mut self.base);
+            super::super::dwarf::generate_debug_info(
+                &mut self.base,
+                &producer,
+                source_name,
+                comp_dir,
+                ".Ltext0",
+                ".Ltext_end",
+            );
+        }
+
+        // Emit .note.GNU-stack section to mark stack as non-executable (ELF only)
+        // This prevents the "missing .note.GNU-stack section" linker warning
+        // Used on Linux, FreeBSD, and other ELF platforms (not macOS which uses Mach-O)
+        if !matches!(self.base.target.os, Os::MacOS) {
+            self.base.push_directive(Directive::Raw(
+                ".section .note.GNU-stack,\"\",@progbits".into(),
+            ));
         }
 
         // Emit all buffered LIR instructions to output string

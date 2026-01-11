@@ -6112,7 +6112,19 @@ pub fn linearize_with_debug(
     module.debug = debug;
     // Get all source files from the stream registry (includes all #included files)
     // The stream IDs in Position map directly to indices in this vector
-    module.source_files = get_all_stream_names();
+    // Filter out synthetic file names (like "<paste>", "<built-in>") which start with '<'
+    module.source_files = get_all_stream_names()
+        .into_iter()
+        .map(|name| {
+            if name.starts_with('<') {
+                // Replace synthetic names with empty string - still need placeholder
+                // to keep stream ID indices aligned with .file directive numbers
+                String::new()
+            } else {
+                name
+            }
+        })
+        .collect();
     module
 }
 

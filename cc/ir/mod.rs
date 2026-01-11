@@ -1302,6 +1302,10 @@ pub struct Module {
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// Compilation directory (for DW_AT_comp_dir in DWARF)
+    pub comp_dir: Option<String>,
+    /// Primary source filename (for DW_AT_name in DWARF)
+    pub source_name: Option<String>,
 }
 
 impl Module {
@@ -1314,6 +1318,8 @@ impl Module {
             debug: false,
             source_files: Vec::new(),
             extern_symbols: HashSet::new(),
+            comp_dir: None,
+            source_name: None,
         }
     }
 

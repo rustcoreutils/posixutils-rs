@@ -268,6 +268,12 @@ fn process_file(
     let mut module =
         ir::linearize::linearize_with_debug(&ast, &symbols, &types, &strings, target, args.debug);
 
+    // Set DWARF metadata
+    module.source_name = Some(path.to_string());
+    module.comp_dir = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+
     // Optimize IR (if enabled)
     if args.opt_level > 0 {
         opt::optimize_module(&mut module, args.opt_level);

@@ -1,3 +1,4 @@
+external-sparse
 target/
 locale/posixutils-rs.pot
 locale/*/LC_MESSAGES/posixutils-rs.mo

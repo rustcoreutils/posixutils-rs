@@ -308,6 +308,39 @@ impl<'a> Parser<'a> {
         self.idents.get(id)
     }
 
+    /// Check if current position (after consuming '(') indicates a grouped declarator.
+    ///
+    /// Grouped declarators include:
+    /// - Pointer declarators: `(*name)` or `(*)`
+    /// - Function type typedefs: `(name)` where name is not a type
+    ///
+    /// Must be called after advancing past '('. Saves/restores position internally
+    /// for the function-type check.
+    fn is_grouped_declarator(&mut self) -> bool {
+        // Check for pointer: (*name)
+        if self.is_special(b'*') {
+            return true;
+        }
+
+        // Check for function type typedef: (name) where name is NOT a type
+        if self.peek() == TokenType::Ident {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                let is_type = self.symbols.lookup_typedef(name_id).is_some()
+                    || Self::is_type_keyword(self.str(name_id));
+                if !is_type {
+                    // Save position, advance past identifier, check for ')'
+                    let check_pos = self.pos;
+                    self.advance();
+                    let followed_by_paren = self.is_special(b')');
+                    self.pos = check_pos; // restore
+                    return followed_by_paren;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Resolve an incomplete struct/union type to its complete definition.
     ///
     /// When a struct is forward-declared (e.g., `struct foo;`) and later
@@ -2616,7 +2649,17 @@ impl<'a> Parser<'a> {
                 let token_pos = token.pos;
                 if let TokenValue::String(s) = &token.value {
                     // Parse string literal - convert escape sequences
-                    let parsed = Self::parse_string_literal(s);
+                    let mut parsed = Self::parse_string_literal(s);
+
+                    // Handle adjacent string literal concatenation (C99 6.4.5)
+                    // "hello" "world" -> "helloworld"
+                    while self.peek() == TokenType::String {
+                        let next_token = self.consume();
+                        if let TokenValue::String(next_s) = &next_token.value {
+                            parsed.push_str(&Self::parse_string_literal(next_s));
+                        }
+                    }
+
                     // String literal type is char*
                     Ok(Self::typed_expr(
                         ExprKind::StringLit(parsed),
@@ -4000,6 +4043,9 @@ impl Parser<'_> {
                         None
                     };
 
+                    // Skip any __attribute__ after member declaration
+                    self.skip_extensions();
+
                     members.push(StructMember {
                         name,
                         typ,
@@ -4587,6 +4633,9 @@ impl Parser<'_> {
             let (param_name, mut typ_id, _vla_sizes, _func_params) =
                 self.parse_declarator(base_type_id)?;
 
+            // Skip any __attribute__ after parameter declarator
+            self.skip_extensions();
+
             // C99 6.7.5.3: Array parameters are adjusted to pointers
             // parse_declarator already gives us the array type, we need to convert
             // the outermost array dimension to a pointer
@@ -4661,13 +4710,11 @@ impl Parser<'_> {
             }));
         }
 
-        // Check for grouped declarator: void (*fp)(int) or int (*arr)[10]
-        // These are detected by '(' followed by '*'
+        // Check for grouped declarator: void (*fp)(int), int (*arr)[10], or typedef int (name)(params)
         if self.is_special(b'(') {
-            // Look ahead to see if this is a grouped declarator
             let saved_pos = self.pos;
             self.advance(); // consume '('
-            if self.is_special(b'*') {
+            if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, typ, vla_sizes, decl_func_params) =
@@ -4823,11 +4870,11 @@ impl Parser<'_> {
         }
 
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
-        // At this point typ_id is char*, and we see (*fp)(int)
+        // Also handles: char *(name)(params) for function type
         if self.is_special(b'(') {
             let saved_pos = self.pos;
             self.advance(); // consume '('
-            if self.is_special(b'*') {
+            if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, full_typ, vla_sizes, decl_func_params) =
@@ -4988,10 +5035,16 @@ impl Parser<'_> {
                 let func_type =
                     Type::function_with_attrs(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
-                // Add function declaration to symbol table so the variadic flag
-                // is available when the function is called
-                let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
-                let _ = self.symbols.declare(func_sym);
+                // Add to symbol table
+                if is_typedef {
+                    // Function type typedef: typedef void my_func(void);
+                    let sym = Symbol::typedef(name, func_type_id, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                } else {
+                    // Function declaration: add so the variadic flag is available when called
+                    let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
+                    let _ = self.symbols.declare(func_sym);
+                }
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         name,

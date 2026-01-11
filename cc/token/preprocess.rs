@@ -824,6 +824,131 @@ impl<'a> Preprocessor<'a> {
         tokens
     }
 
+    /// Expand macros in #if/#elif condition tokens.
+    /// This follows the C standard: macros are expanded, except for arguments to `defined`.
+    /// Undefined identifiers are replaced with 0.
+    fn expand_if_tokens(&mut self, tokens: &[Token], idents: &mut IdentTable) -> Vec<Token> {
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < tokens.len() {
+            let token = &tokens[i];
+
+            // Check for `defined` operator
+            if let TokenValue::Ident(id) = &token.value {
+                if let Some(name) = idents.get_opt(*id) {
+                    if name == "defined" {
+                        // Handle defined(X) or defined X
+                        let pos = token.pos;
+                        i += 1;
+
+                        // Skip optional whitespace and check for paren
+                        let has_paren = if i < tokens.len() {
+                            if let TokenValue::Special(code) = &tokens[i].value {
+                                *code == b'(' as u32
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if has_paren {
+                            i += 1; // skip '('
+                        }
+
+                        // Get the identifier to check
+                        let is_defined = if i < tokens.len() {
+                            if let TokenValue::Ident(check_id) = &tokens[i].value {
+                                if let Some(check_name) = idents.get_opt(*check_id) {
+                                    i += 1;
+                                    self.is_defined(check_name)
+                                } else {
+                                    i += 1;
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if has_paren {
+                            // Skip closing ')'
+                            if i < tokens.len() {
+                                if let TokenValue::Special(code) = &tokens[i].value {
+                                    if *code == b')' as u32 {
+                                        i += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Replace with 0 or 1
+                        result.push(Token {
+                            typ: TokenType::Number,
+                            value: TokenValue::Number(if is_defined {
+                                "1".to_string()
+                            } else {
+                                "0".to_string()
+                            }),
+                            pos,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Not `defined` - collect this token for expansion
+            result.push(token.clone());
+            i += 1;
+        }
+
+        // Now expand macros in the result (except `defined` which we already handled)
+        // We need to temporarily disable skipping because we're evaluating an expression
+        // that will determine whether to skip. Push a dummy "Active" conditional.
+        self.cond_stack.push(Conditional {
+            state: CondState::Active,
+            had_true: true,
+            pos: Position::default(),
+        });
+        let expanded = self.preprocess(result, idents);
+        self.cond_stack.pop();
+
+        // Replace any remaining undefined identifiers with 0
+        let mut final_result = Vec::new();
+        for token in expanded {
+            if let TokenValue::Ident(id) = &token.value {
+                if let Some(name) = idents.get_opt(*id) {
+                    // Check if it's a defined macro
+                    if self.get_macro(name).is_some() {
+                        // This shouldn't happen after expansion, but keep it
+                        final_result.push(token);
+                    } else {
+                        // Undefined identifier -> 0
+                        final_result.push(Token {
+                            typ: TokenType::Number,
+                            value: TokenValue::Number("0".to_string()),
+                            pos: token.pos,
+                        });
+                    }
+                } else {
+                    // Unknown identifier -> 0
+                    final_result.push(Token {
+                        typ: TokenType::Number,
+                        value: TokenValue::Number("0".to_string()),
+                        pos: token.pos,
+                    });
+                }
+            } else {
+                final_result.push(token);
+            }
+        }
+
+        final_result
+    }
+
     /// Handle #define
     fn handle_define<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
     where
@@ -1164,7 +1289,7 @@ impl<'a> Preprocessor<'a> {
     fn handle_if<I>(
         &mut self,
         iter: &mut std::iter::Peekable<I>,
-        idents: &IdentTable,
+        idents: &mut IdentTable,
         pos: Position,
     ) where
         I: Iterator<Item = Token>,
@@ -1173,14 +1298,16 @@ impl<'a> Preprocessor<'a> {
         let value = if self.is_skipping() {
             false
         } else {
-            self.evaluate_expression(&tokens, idents)
+            // Expand macros before evaluation (per C standard)
+            let expanded = self.expand_if_tokens(&tokens, idents);
+            self.evaluate_expression(&expanded, idents)
         };
 
         self.push_conditional(value, pos);
     }
 
     /// Handle #elif
-    fn handle_elif<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
+    fn handle_elif<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &mut IdentTable)
     where
         I: Iterator<Item = Token>,
     {
@@ -1194,7 +1321,9 @@ impl<'a> Preprocessor<'a> {
         };
 
         let expr_value = if should_eval {
-            self.evaluate_expression(&tokens, idents)
+            // Expand macros before evaluation (per C standard)
+            let expanded = self.expand_if_tokens(&tokens, idents);
+            self.evaluate_expression(&expanded, idents)
         } else {
             false
         };
@@ -2578,22 +2707,12 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
-        // Handle identifier (undefined macro = 0)
+        // Handle identifier - after macro expansion, any remaining identifier
+        // is undefined and should evaluate to 0 (per C standard)
         if let Some(tok) = self.current() {
-            if let TokenValue::Ident(id) = &tok.value {
-                let ident_id = *id;
+            if matches!(&tok.value, TokenValue::Ident(_)) {
                 self.advance();
-                // Check if it's a defined macro with a value
-                if let Some(name) = self.idents.get_opt(ident_id) {
-                    if let Some(mac) = self.pp.get_macro(name) {
-                        if let Some(mt) = mac.body.first() {
-                            if let MacroTokenValue::Number(n) = &mt.value {
-                                return self.parse_number(n);
-                            }
-                        }
-                    }
-                }
-                return 0; // Undefined identifier = 0
+                return 0;
             }
         }
 

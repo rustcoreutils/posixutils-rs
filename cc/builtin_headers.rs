@@ -19,6 +19,9 @@ pub const STDARG_H: &str = include_str!("include/stdarg.h");
 /// Builtin stddef.h - standard type definitions
 pub const STDDEF_H: &str = include_str!("include/stddef.h");
 
+/// Builtin stdbool.h - C99 boolean type support
+pub const STDBOOL_H: &str = include_str!("include/stdbool.h");
+
 /// Look up a builtin header by name
 ///
 /// Returns the header content if found, None otherwise.
@@ -26,6 +29,7 @@ pub const STDDEF_H: &str = include_str!("include/stddef.h");
 pub fn get_builtin_header(name: &str) -> Option<&'static str> {
     match name {
         "stdarg.h" => Some(STDARG_H),
+        "stdbool.h" => Some(STDBOOL_H),
         "stddef.h" => Some(STDDEF_H),
         _ => None,
     }
@@ -49,6 +53,15 @@ mod tests {
         assert!(header.is_some());
         assert!(header.unwrap().contains("size_t"));
         assert!(header.unwrap().contains("NULL"));
+    }
+
+    #[test]
+    fn test_stdbool_exists() {
+        let header = get_builtin_header("stdbool.h");
+        assert!(header.is_some());
+        assert!(header.unwrap().contains("bool"));
+        assert!(header.unwrap().contains("true"));
+        assert!(header.unwrap().contains("false"));
     }
 
     #[test]

@@ -32,11 +32,19 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
     ]
 }
 
+use crate::target::{Arch, Target};
+
 /// Get standard include paths for Linux
-pub fn get_include_paths() -> Vec<&'static str> {
-    vec![
-        "/usr/local/include",
-        "/usr/include",
-        // Architecture-specific paths will be added based on target
-    ]
+pub fn get_include_paths(target: &Target) -> Vec<&'static str> {
+    let mut paths = vec!["/usr/local/include"];
+
+    // Add architecture-specific multiarch path (Debian/Ubuntu convention)
+    // This must come BEFORE /usr/include so bits/*.h files are found
+    match target.arch {
+        Arch::X86_64 => paths.push("/usr/include/x86_64-linux-gnu"),
+        Arch::Aarch64 => paths.push("/usr/include/aarch64-linux-gnu"),
+    }
+
+    paths.push("/usr/include");
+    paths
 }

@@ -46,7 +46,7 @@ pub fn get_os_macros(target: &Target) -> Vec<(&'static str, Option<&'static str>
 /// Get standard include paths for the OS
 pub fn get_include_paths(target: &Target) -> Vec<&'static str> {
     match target.os {
-        Os::Linux => linux::get_include_paths(),
+        Os::Linux => linux::get_include_paths(target),
         Os::MacOS => macos::get_include_paths(),
         Os::FreeBSD => freebsd::get_include_paths(),
     }

@@ -265,15 +265,8 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module = ir::linearize::linearize_with_debug(
-        &ast,
-        &symbols,
-        &types,
-        &strings,
-        target,
-        args.debug,
-        Some(display_path),
-    );
+    let mut module =
+        ir::linearize::linearize_with_debug(&ast, &symbols, &types, &strings, target, args.debug);
 
     // Optimize IR (if enabled)
     if args.opt_level > 0 {

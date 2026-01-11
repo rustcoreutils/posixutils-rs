@@ -1464,6 +1464,9 @@ impl<'a> Parser<'a> {
                 | "union"
                 | "enum"
                 | "__builtin_va_list"
+                | "typeof"
+                | "__typeof__"
+                | "__typeof"
         )
     }
 
@@ -1603,6 +1606,49 @@ impl<'a> Parser<'a> {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                     parsed_something = true;
+                }
+                "typeof" | "__typeof__" | "__typeof" => {
+                    self.advance(); // consume typeof
+                    if !self.is_special(b'(') {
+                        return None;
+                    }
+                    self.advance(); // consume '('
+
+                    // typeof can take either a type name or an expression
+                    // Try type name first
+                    if let Some(typ) = self.try_parse_type_name() {
+                        if !self.is_special(b')') {
+                            return None;
+                        }
+                        self.advance(); // consume ')'
+                                        // Handle pointers after typeof(...)
+                        let mut result_id = typ;
+                        while self.is_special(b'*') {
+                            self.advance();
+                            result_id = self.types.intern(Type::pointer(result_id));
+                        }
+                        return Some(result_id);
+                    }
+
+                    // Not a type name, try expression
+                    let expr = match self.parse_expression() {
+                        Ok(e) => e,
+                        Err(_) => return None,
+                    };
+                    if !self.is_special(b')') {
+                        return None;
+                    }
+                    self.advance(); // consume ')'
+
+                    // Get the type of the expression
+                    let expr_type = expr.typ.unwrap_or(self.types.int_id);
+                    // Handle pointers after typeof(...)
+                    let mut result_id = expr_type;
+                    while self.is_special(b'*') {
+                        self.advance();
+                        result_id = self.types.intern(Type::pointer(result_id));
+                    }
+                    return Some(result_id);
                 }
                 "struct" => {
                     self.advance(); // consume 'struct'
@@ -3370,9 +3416,10 @@ impl Parser<'_> {
         // The result of a statement expression is the last expression statement.
         // If there are no statements or the last isn't an expression, result is void.
         let (stmts, result, result_type) = if items.is_empty() {
+            // Empty statement expression: ({ }) has type void
             (
                 Vec::new(),
-                Expr::new(ExprKind::IntLit(0), paren_pos),
+                Expr::typed(ExprKind::IntLit(0), self.types.void_id, paren_pos),
                 self.types.void_id,
             )
         } else {
@@ -3384,11 +3431,13 @@ impl Parser<'_> {
                     (items, expr, typ)
                 }
                 _ => {
-                    // Last item is not an expression, push it back
+                    // Last item is not an expression statement (e.g. if, while, for)
+                    // Following sparse: the type becomes void (evaluate.c handles this
+                    // by returning NULL which becomes void_ctype)
                     items.push(last);
                     (
                         items,
-                        Expr::new(ExprKind::IntLit(0), paren_pos),
+                        Expr::typed(ExprKind::IntLit(0), self.types.void_id, paren_pos),
                         self.types.void_id,
                     )
                 }
@@ -3782,6 +3831,34 @@ impl Parser<'_> {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
+                "typeof" | "__typeof__" | "__typeof" => {
+                    self.advance(); // consume typeof
+                    self.expect_special(b'(')?;
+
+                    // typeof can take either a type name or an expression
+                    // Try type name first
+                    if let Some(typ) = self.try_parse_type_name() {
+                        self.expect_special(b')')?;
+                        // Return the type with any modifiers
+                        let result_type = self.types.get(typ).clone();
+                        return Ok(Type {
+                            modifiers: modifiers | result_type.modifiers,
+                            ..result_type
+                        });
+                    }
+
+                    // Not a type name, try expression
+                    let expr = self.parse_expression()?;
+                    self.expect_special(b')')?;
+
+                    // Get the type of the expression
+                    let expr_type_id = expr.typ.unwrap_or(self.types.int_id);
+                    let result_type = self.types.get(expr_type_id).clone();
+                    return Ok(Type {
+                        modifiers: modifiers | result_type.modifiers,
+                        ..result_type
+                    });
+                }
                 "enum" => {
                     let enum_type = self.parse_enum_specifier()?;
                     // Apply any modifiers we collected
@@ -3973,7 +4050,27 @@ impl Parser<'_> {
             while !self.is_special(b'}') && !self.is_eof() {
                 // Parse member declaration
                 let member_base_type = self.parse_type_specifier()?;
+                let is_struct_or_union =
+                    matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
                 let member_base_type_id = self.types.intern(member_base_type);
+
+                // Skip any __attribute__ after type specifier (before member name)
+                self.skip_extensions();
+
+                // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
+                // These have no declarator name, just end with ';'
+                if is_struct_or_union && self.is_special(b';') {
+                    members.push(StructMember {
+                        name: StringId::EMPTY,
+                        typ: member_base_type_id,
+                        offset: 0,
+                        bit_offset: None,
+                        bit_width: None,
+                        storage_unit_size: None,
+                    });
+                    self.advance(); // consume ';'
+                    continue;
+                }
 
                 // Check for unnamed bitfield (starts with ':')
                 if self.is_special(b':') {
@@ -9078,6 +9175,112 @@ mod tests {
             );
         } else {
             panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // typeof operator tests (GCC extension)
+    // ========================================================================
+
+    #[test]
+    fn test_typeof_with_type() {
+        // typeof(int) should be int
+        let (tu, types, _) = parse_tu("typeof(int) x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Int);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_typeof_with_expression() {
+        // typeof(42) should be int (type of the expression)
+        let (tu, types, _) = parse_tu("int n = 42; typeof(n) x;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+        if let ExternalDecl::Declaration(decl) = &tu.items[1] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Int);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_typeof_pointer() {
+        // typeof(int) * should be pointer to int
+        let (tu, types, _) = parse_tu("typeof(int) *p;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Pointer);
+            let pointee = types.get(typ).base.unwrap();
+            assert_eq!(types.kind(pointee), TypeKind::Int);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_dunder_typeof() {
+        // __typeof__ is an alias for typeof
+        let (tu, types, _) = parse_tu("__typeof__(long) x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Long);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // Anonymous struct/union member tests (C11)
+    // ========================================================================
+
+    #[test]
+    fn test_anonymous_union_in_struct() {
+        // Anonymous union inside struct - this should parse without error
+        // The key test is that "union { ... };" without a name is accepted
+        let result = parse_tu("struct foo { int x; union { int a; float b; }; int y; } s;");
+        assert!(result.is_ok(), "Anonymous union in struct should parse");
+    }
+
+    #[test]
+    fn test_anonymous_struct_in_union() {
+        // Anonymous struct inside union - this should parse without error
+        let result = parse_tu("union bar { int i; struct { short x; short y; }; } u;");
+        assert!(result.is_ok(), "Anonymous struct in union should parse");
+    }
+
+    // ========================================================================
+    // Statement expression void type tests
+    // ========================================================================
+
+    #[test]
+    fn test_stmt_expr_void_when_last_is_if() {
+        // When last statement is if (not expression), result is void
+        let (expr, types, _) = parse_expr("({ if (1) ; })").unwrap();
+        match expr.kind {
+            ExprKind::StmtExpr { .. } => {
+                // The expression should have void type
+                assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Void);
+            }
+            _ => panic!("Expected StmtExpr"),
+        }
+    }
+
+    #[test]
+    fn test_stmt_expr_empty_is_void() {
+        // Empty statement expression ({ }) has void type
+        let (expr, types, _) = parse_expr("({ })").unwrap();
+        match expr.kind {
+            ExprKind::StmtExpr { .. } => {
+                assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Void);
+            }
+            _ => panic!("Expected StmtExpr"),
         }
     }
 }

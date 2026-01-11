@@ -22,6 +22,9 @@ pub const STDDEF_H: &str = include_str!("include/stddef.h");
 /// Builtin stdbool.h - C99 boolean type support
 pub const STDBOOL_H: &str = include_str!("include/stdbool.h");
 
+/// Builtin limits.h - implementation limits
+pub const LIMITS_H: &str = include_str!("include/limits.h");
+
 /// Look up a builtin header by name
 ///
 /// Returns the header content if found, None otherwise.
@@ -31,6 +34,7 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "stdarg.h" => Some(STDARG_H),
         "stdbool.h" => Some(STDBOOL_H),
         "stddef.h" => Some(STDDEF_H),
+        "limits.h" => Some(LIMITS_H),
         _ => None,
     }
 }

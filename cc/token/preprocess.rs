@@ -327,6 +327,10 @@ pub struct Preprocessor<'a> {
 
     /// Whether to use system include paths (disabled by -nostdinc)
     use_system_headers: bool,
+
+    /// Index of current file's system include path (for #include_next)
+    /// None if current file is not from a system include path
+    current_include_path_index: Option<usize>,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -426,6 +430,7 @@ impl<'a> Preprocessor<'a> {
             preprocess_depth: 0,
             use_builtin_headers: true,
             use_system_headers: true,
+            current_include_path_index: None,
         };
 
         // Initialize predefined macros
@@ -452,7 +457,11 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("1")));
         self.define_macro(Macro::predefined(
             "__VERSION__",
-            Some("\"4.2.1 Compatible pcc\""),
+            Some(concat!(
+                "\"pcc ",
+                env!("CARGO_PKG_VERSION"),
+                " (gcc compatible 4.2.1)\""
+            )),
         ));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
 
@@ -633,6 +642,15 @@ impl<'a> Preprocessor<'a> {
                     if let TokenValue::Ident(id) = &token.value {
                         if let Some(name) = idents.get_opt(*id) {
                             let name = name.to_string();
+
+                            // Handle _Pragma operator (C99)
+                            // _Pragma("string") is equivalent to #pragma string
+                            // We silently consume it since we ignore #pragma anyway
+                            if name == "_Pragma" {
+                                self.handle_pragma_operator(&mut iter);
+                                continue;
+                            }
+
                             if let Some(expanded) =
                                 self.try_expand_macro(&name, &token.pos, &mut iter, idents)
                             {
@@ -1443,10 +1461,12 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Find and include the file
-        if let Some(source) = self.find_include_file(&filename, is_system, is_include_next) {
+        if let Some((source, path_index)) =
+            self.find_include_file(&filename, is_system, is_include_next)
+        {
             match source {
                 IncludeSource::File(path) => {
-                    self.include_file(&path, output, idents, hash_token);
+                    self.include_file(&path, output, idents, hash_token, path_index);
                 }
                 IncludeSource::Builtin(content) => {
                     self.include_builtin(&filename, content, output, idents, hash_token);
@@ -1513,17 +1533,21 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Find an include file
+    /// Returns (IncludeSource, Option<system_include_path_index>)
     fn find_include_file(
         &self,
         filename: &str,
         is_system: bool,
-        _is_include_next: bool,
-    ) -> Option<IncludeSource> {
-        // Check builtin headers first (before any filesystem search)
-        // Builtin headers take precedence for standard names like stdarg.h
-        if self.use_builtin_headers {
-            if let Some(content) = builtin_headers::get_builtin_header(filename) {
-                return Some(IncludeSource::Builtin(content));
+        is_include_next: bool,
+    ) -> Option<(IncludeSource, Option<usize>)> {
+        // For #include_next, skip builtin headers entirely
+        if !is_include_next {
+            // Check builtin headers first (before any filesystem search)
+            // Builtin headers take precedence for standard names like stdarg.h
+            if self.use_builtin_headers {
+                if let Some(content) = builtin_headers::get_builtin_header(filename) {
+                    return Some((IncludeSource::Builtin(content), None));
+                }
             }
         }
 
@@ -1531,33 +1555,45 @@ impl<'a> Preprocessor<'a> {
         if filename.starts_with('/') {
             let path = PathBuf::from(filename);
             if path.exists() {
-                return Some(IncludeSource::File(path));
+                return Some((IncludeSource::File(path), None));
             }
             return None;
         }
 
-        // For quoted includes, first check relative to current file
-        if !is_system {
+        // For quoted includes (not #include_next), first check relative to current file
+        if !is_system && !is_include_next {
             let relative_path = Path::new(&self.current_dir).join(filename);
             if relative_path.exists() {
-                return Some(IncludeSource::File(relative_path));
+                return Some((IncludeSource::File(relative_path), None));
             }
 
             // Check quote include paths
             for dir in &self.quote_include_paths {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {
-                    return Some(IncludeSource::File(path));
+                    return Some((IncludeSource::File(path), None));
                 }
             }
         }
 
         // Check system include paths (unless -nostdinc)
         if self.use_system_headers {
-            for dir in &self.system_include_paths {
+            // For #include_next, start from the path AFTER the current file's path
+            let start_index = if is_include_next {
+                self.current_include_path_index.map(|i| i + 1).unwrap_or(0)
+            } else {
+                0
+            };
+
+            for (idx, dir) in self
+                .system_include_paths
+                .iter()
+                .enumerate()
+                .skip(start_index)
+            {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {
-                    return Some(IncludeSource::File(path));
+                    return Some((IncludeSource::File(path), Some(idx)));
                 }
             }
         }
@@ -1572,6 +1608,7 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
+        include_path_index: Option<usize>,
     ) {
         // Canonicalize path for cycle detection
         let canonical = match path.canonicalize() {
@@ -1628,6 +1665,9 @@ impl<'a> Preprocessor<'a> {
         );
         // Save cond_stack - included files have isolated conditional state
         let saved_cond_stack = std::mem::take(&mut self.cond_stack);
+        // Save include path index for #include_next support
+        let saved_include_path_index =
+            std::mem::replace(&mut self.current_include_path_index, include_path_index);
 
         self.include_stack.insert(canonical.clone());
         self.include_depth += 1;
@@ -1660,6 +1700,7 @@ impl<'a> Preprocessor<'a> {
         self.current_file = saved_file;
         self.current_dir = saved_dir;
         self.cond_stack = saved_cond_stack;
+        self.current_include_path_index = saved_include_path_index;
     }
 
     /// Include a builtin (embedded) header
@@ -1779,6 +1820,45 @@ impl<'a> Preprocessor<'a> {
         }
 
         self.skip_to_eol(iter);
+    }
+
+    /// Handle _Pragma operator (C99)
+    /// _Pragma("string") is equivalent to #pragma string
+    /// Since we ignore most pragmas anyway, this just consumes the tokens
+    fn handle_pragma_operator<I>(&mut self, iter: &mut std::iter::Peekable<I>)
+    where
+        I: Iterator<Item = Token>,
+    {
+        // Expect '('
+        if let Some(token) = iter.next() {
+            if !matches!(&token.value, TokenValue::Special(code) if *code == b'(' as u32) {
+                // Not a valid _Pragma - just silently ignore
+                return;
+            }
+        } else {
+            return;
+        }
+
+        // Expect a string literal
+        if let Some(token) = iter.next() {
+            if !matches!(token.typ, TokenType::String) {
+                // Not a valid _Pragma - just silently ignore
+                return;
+            }
+            // We could parse the pragma string here if needed
+            // For now, we just ignore all pragmas
+        } else {
+            return;
+        }
+
+        // Expect ')' - if not found or malformed, silently ignore
+        // (we've already consumed the tokens, so just return either way)
+        if let Some(token) = iter.next() {
+            if !matches!(&token.value, TokenValue::Special(code) if *code == b')' as u32) {
+                // Not a valid _Pragma - silently ignored
+            }
+        }
+        // Successfully consumed _Pragma("...")
     }
 
     /// Handle #line directive
@@ -3901,5 +3981,47 @@ PASTE(foo, bar)
         assert!(strs.contains(&"+".to_string()));
         // Should NOT contain ADD_func as unexpanded identifier
         assert!(!strs.contains(&"ADD_func".to_string()));
+    }
+
+    // ========================================================================
+    // _Pragma operator tests (C99)
+    // ========================================================================
+
+    #[test]
+    fn test_pragma_operator_basic() {
+        // _Pragma("...") should be silently consumed
+        let (tokens, idents) = preprocess_str("_Pragma(\"GCC diagnostic ignored\") int x;");
+        let strs = get_token_strings(&tokens, &idents);
+        // _Pragma should be consumed, only "int x ;" should remain
+        assert!(strs.contains(&"int".to_string()));
+        assert!(strs.contains(&"x".to_string()));
+        assert!(!strs.contains(&"_Pragma".to_string()));
+    }
+
+    #[test]
+    fn test_pragma_operator_from_macro() {
+        // _Pragma from macro expansion
+        let (tokens, idents) = preprocess_str(
+            "#define PRAGMA(x) _Pragma(#x)\n\
+             #define DISABLE_WARNING(w) PRAGMA(GCC diagnostic ignored #w)\n\
+             DISABLE_WARNING(-Wsign-compare)\n\
+             int y;",
+        );
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"int".to_string()));
+        assert!(strs.contains(&"y".to_string()));
+        // _Pragma should be consumed
+        assert!(!strs.contains(&"_Pragma".to_string()));
+    }
+
+    #[test]
+    fn test_pragma_operator_multiple() {
+        // Multiple _Pragma operators
+        let (tokens, idents) =
+            preprocess_str("_Pragma(\"once\") _Pragma(\"GCC diagnostic push\") int z;");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"int".to_string()));
+        assert!(strs.contains(&"z".to_string()));
+        assert!(!strs.contains(&"_Pragma".to_string()));
     }
 }

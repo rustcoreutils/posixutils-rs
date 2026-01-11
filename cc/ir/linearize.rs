@@ -15,7 +15,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
     Opcode, Pseudo, PseudoId,
 };
-use crate::diag::{error, Position};
+use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
     ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
@@ -6095,7 +6095,7 @@ pub fn linearize(
     strings: &StringTable,
     target: &Target,
 ) -> Module {
-    linearize_with_debug(tu, symbols, types, strings, target, false, None)
+    linearize_with_debug(tu, symbols, types, strings, target, false)
 }
 
 /// Linearize an AST to IR with debug info support
@@ -6106,14 +6106,13 @@ pub fn linearize_with_debug(
     strings: &StringTable,
     target: &Target,
     debug: bool,
-    source_file: Option<&str>,
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
-    if let Some(path) = source_file {
-        module.source_files.push(path.to_string());
-    }
+    // Get all source files from the stream registry (includes all #included files)
+    // The stream IDs in Position map directly to indices in this vector
+    module.source_files = get_all_stream_names();
     module
 }
 

@@ -65,7 +65,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("struct_basic", code), 0);
+    assert_eq!(compile_and_run("struct_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -109,7 +109,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("struct_arr_ptr", code), 0);
+    assert_eq!(compile_and_run("struct_arr_ptr", code, &[]), 0);
 }
 
 // ============================================================================
@@ -151,7 +151,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("struct_funcs", code), 0);
+    assert_eq!(compile_and_run("struct_funcs", code, &[]), 0);
 }
 
 // ============================================================================
@@ -250,7 +250,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("struct_return_large", code), 0);
+    assert_eq!(compile_and_run("struct_return_large", code, &[]), 0);
 }
 
 // ============================================================================
@@ -310,5 +310,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("struct_compound_lit", code), 0);
+    assert_eq!(compile_and_run("struct_compound_lit", code, &[]), 0);
 }

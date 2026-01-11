@@ -60,7 +60,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("setjmp_basic", code), 0);
+    assert_eq!(compile_and_run("setjmp_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -112,7 +112,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("setjmp_functions", code), 0);
+    assert_eq!(compile_and_run("setjmp_functions", code, &[]), 0);
 }
 
 // ============================================================================
@@ -152,5 +152,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("setjmp_variants", code), 0);
+    assert_eq!(compile_and_run("setjmp_variants", code, &[]), 0);
 }

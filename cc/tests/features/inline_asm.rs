@@ -27,7 +27,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("asm_nop", code), 0);
+    assert_eq!(compile_and_run("asm_nop", code, &[]), 0);
 }
 
 // ============================================================================
@@ -47,7 +47,7 @@ int main(void) {
     return result == 42 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_output_x86", code), 0);
+        assert_eq!(compile_and_run("asm_output_x86", code, &[]), 0);
     }
 
     #[test]
@@ -59,7 +59,7 @@ int main(void) {
     return x == 15 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_inout_x86", code), 0);
+        assert_eq!(compile_and_run("asm_inout_x86", code, &[]), 0);
     }
 
     #[test]
@@ -75,7 +75,7 @@ int main(void) {
     return result == 30 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_two_ops_x86", code), 0);
+        assert_eq!(compile_and_run("asm_two_ops_x86", code, &[]), 0);
     }
 
     #[test]
@@ -91,7 +91,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_multiline_x86", code), 0);
+        assert_eq!(compile_and_run("asm_multiline_x86", code, &[]), 0);
     }
 
     #[test]
@@ -103,7 +103,7 @@ int main(void) {
     return result == 1 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_clobbers_x86", code), 0);
+        assert_eq!(compile_and_run("asm_clobbers_x86", code, &[]), 0);
     }
 
     #[test]
@@ -115,7 +115,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_spelling1_x86", code1), 0);
+        assert_eq!(compile_and_run("asm_spelling1_x86", code1, &[]), 0);
 
         // Test asm spelling
         let code2 = r#"
@@ -124,7 +124,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_spelling2_x86", code2), 0);
+        assert_eq!(compile_and_run("asm_spelling2_x86", code2, &[]), 0);
 
         // Test __asm spelling
         let code3 = r#"
@@ -133,7 +133,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_spelling3_x86", code3), 0);
+        assert_eq!(compile_and_run("asm_spelling3_x86", code3, &[]), 0);
     }
 
     // ========================================================================
@@ -150,7 +150,7 @@ int main(void) {
     return x == 15 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_match_x86", code), 0);
+        assert_eq!(compile_and_run("asm_match_x86", code, &[]), 0);
     }
 
     #[test]
@@ -163,7 +163,7 @@ int main(void) {
     return result == 42 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_named_x86", code), 0);
+        assert_eq!(compile_and_run("asm_named_x86", code, &[]), 0);
     }
 
     #[test]
@@ -180,7 +180,7 @@ int main(void) {
     return result == 30 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_named_inout_x86", code), 0);
+        assert_eq!(compile_and_run("asm_named_inout_x86", code, &[]), 0);
     }
 
     #[test]
@@ -193,7 +193,7 @@ int main(void) {
     return x == 10 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_memclob_x86", code), 0);
+        assert_eq!(compile_and_run("asm_memclob_x86", code, &[]), 0);
     }
 
     #[test]
@@ -206,7 +206,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_ccclob_x86", code), 0);
+        assert_eq!(compile_and_run("asm_ccclob_x86", code, &[]), 0);
     }
 
     #[test]
@@ -224,7 +224,7 @@ int main(void) {
     return result == 30 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_earlyclob_x86", code), 0);
+        assert_eq!(compile_and_run("asm_earlyclob_x86", code, &[]), 0);
     }
 
     // ========================================================================
@@ -241,7 +241,7 @@ int main(void) {
     return result == 42 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_reg_a", code), 0);
+        assert_eq!(compile_and_run("asm_reg_a", code, &[]), 0);
     }
 
     #[test]
@@ -255,7 +255,7 @@ int main(void) {
     return value == 16 ? 0 : 1;  // 4 << 2 = 16
 }
 "#;
-        assert_eq!(compile_and_run("asm_reg_c", code), 0);
+        assert_eq!(compile_and_run("asm_reg_c", code, &[]), 0);
     }
 
     #[test]
@@ -268,7 +268,7 @@ int main(void) {
     return result == 99 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_reg_d", code), 0);
+        assert_eq!(compile_and_run("asm_reg_d", code, &[]), 0);
     }
 
     #[test]
@@ -283,7 +283,7 @@ int main(void) {
     return (lo == 100 && hi == 200) ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_reg_ad", code), 0);
+        assert_eq!(compile_and_run("asm_reg_ad", code, &[]), 0);
     }
 
     // ========================================================================
@@ -307,7 +307,7 @@ match:
     return 0;  // Should jump here
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_basic", code), 0);
+        assert_eq!(compile_and_run("asm_goto_basic", code, &[]), 0);
     }
 
     #[test]
@@ -327,7 +327,7 @@ match:
     return 1;  // Should not jump here
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_fallthrough", code), 0);
+        assert_eq!(compile_and_run("asm_goto_fallthrough", code, &[]), 0);
     }
 
     #[test]
@@ -347,7 +347,7 @@ target:
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_named", code), 0);
+        assert_eq!(compile_and_run("asm_goto_named", code, &[]), 0);
     }
 
     #[test]
@@ -374,7 +374,7 @@ other:
     return 3;
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_multi", code), 0);
+        assert_eq!(compile_and_run("asm_goto_multi", code, &[]), 0);
     }
 }
 
@@ -395,7 +395,7 @@ int main(void) {
     return result == 42 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_output_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_output_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -407,7 +407,7 @@ int main(void) {
     return x == 15 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_inout_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_inout_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -422,7 +422,7 @@ int main(void) {
     return result == 30 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_two_ops_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_two_ops_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -437,7 +437,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_multiline_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_multiline_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -449,7 +449,7 @@ int main(void) {
     return result == 1 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_clobbers_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_clobbers_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -461,7 +461,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_spelling1_aarch64", code1), 0);
+        assert_eq!(compile_and_run("asm_spelling1_aarch64", code1, &[]), 0);
 
         // Test asm spelling
         let code2 = r#"
@@ -470,7 +470,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_spelling2_aarch64", code2), 0);
+        assert_eq!(compile_and_run("asm_spelling2_aarch64", code2, &[]), 0);
 
         // Test __asm spelling
         let code3 = r#"
@@ -479,7 +479,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_spelling3_aarch64", code3), 0);
+        assert_eq!(compile_and_run("asm_spelling3_aarch64", code3, &[]), 0);
     }
 
     // ========================================================================
@@ -496,7 +496,7 @@ int main(void) {
     return x == 15 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_match_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_match_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -509,7 +509,7 @@ int main(void) {
     return result == 42 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_named_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_named_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -525,7 +525,7 @@ int main(void) {
     return result == 30 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_named_inout_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_named_inout_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -538,7 +538,7 @@ int main(void) {
     return x == 10 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_memclob_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_memclob_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -551,7 +551,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_ccclob_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_ccclob_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -568,7 +568,7 @@ int main(void) {
     return result == 30 ? 0 : 1;
 }
 "#;
-        assert_eq!(compile_and_run("asm_earlyclob_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_earlyclob_aarch64", code, &[]), 0);
     }
 
     // ========================================================================
@@ -592,7 +592,7 @@ match:
     return 0;  // Should jump here
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_basic_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_goto_basic_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -612,7 +612,10 @@ match:
     return 1;  // Should not jump here
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_fallthrough_aarch64", code), 0);
+        assert_eq!(
+            compile_and_run("asm_goto_fallthrough_aarch64", code, &[]),
+            0
+        );
     }
 
     #[test]
@@ -632,7 +635,7 @@ target:
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_named_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_goto_named_aarch64", code, &[]), 0);
     }
 
     #[test]
@@ -659,6 +662,6 @@ other:
     return 3;
 }
 "#;
-        assert_eq!(compile_and_run("asm_goto_multi_aarch64", code), 0);
+        assert_eq!(compile_and_run("asm_goto_multi_aarch64", code, &[]), 0);
     }
 }

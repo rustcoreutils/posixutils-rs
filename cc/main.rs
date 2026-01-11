@@ -265,8 +265,7 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module =
-        ir::linearize::linearize_with_debug(&ast, &symbols, &types, &strings, target, args.debug);
+    let mut module = ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug);
 
     // Set DWARF metadata
     module.source_name = Some(path.to_string());
@@ -289,8 +288,7 @@ fn process_file(
 
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;
-    let mut codegen =
-        arch::codegen::create_codegen_with_options(target.clone(), emit_unwind_tables, args.fpic);
+    let mut codegen = arch::codegen::create_codegen(target.clone(), emit_unwind_tables, args.fpic);
     let asm = codegen.generate(&module, &types);
 
     // Determine output file names

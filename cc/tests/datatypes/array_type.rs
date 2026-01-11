@@ -61,7 +61,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_basic_types", code), 0);
+    assert_eq!(compile_and_run("arr_basic_types", code, &[]), 0);
 }
 
 // ============================================================================
@@ -96,7 +96,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_init", code), 0);
+    assert_eq!(compile_and_run("arr_init", code, &[]), 0);
 }
 
 // ============================================================================
@@ -122,7 +122,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_sizeof", code), 0);
+    assert_eq!(compile_and_run("arr_sizeof", code, &[]), 0);
 }
 
 // ============================================================================
@@ -163,7 +163,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_decay", code), 0);
+    assert_eq!(compile_and_run("arr_decay", code, &[]), 0);
 }
 
 // ============================================================================
@@ -217,7 +217,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_multidim", code), 0);
+    assert_eq!(compile_and_run("arr_multidim", code, &[]), 0);
 }
 
 // ============================================================================
@@ -261,7 +261,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_of_ptrs", code), 0);
+    assert_eq!(compile_and_run("arr_of_ptrs", code, &[]), 0);
 }
 
 // ============================================================================
@@ -316,7 +316,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_func_params", code), 0);
+    assert_eq!(compile_and_run("arr_func_params", code, &[]), 0);
 }
 
 // ============================================================================
@@ -393,7 +393,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_struct", code), 0);
+    assert_eq!(compile_and_run("arr_struct", code, &[]), 0);
 }
 
 // ============================================================================
@@ -423,7 +423,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_idx_expr", code), 0);
+    assert_eq!(compile_and_run("arr_idx_expr", code, &[]), 0);
 }
 
 // ============================================================================
@@ -450,7 +450,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_ptr_equiv", code), 0);
+    assert_eq!(compile_and_run("arr_ptr_equiv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -477,7 +477,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_layout", code), 0);
+    assert_eq!(compile_and_run("arr_layout", code, &[]), 0);
 }
 
 // ============================================================================
@@ -499,7 +499,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_void_ptr", code), 0);
+    assert_eq!(compile_and_run("arr_void_ptr", code, &[]), 0);
 }
 
 // ============================================================================
@@ -525,5 +525,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("arr_edge", code), 0);
+    assert_eq!(compile_and_run("arr_edge", code, &[]), 0);
 }

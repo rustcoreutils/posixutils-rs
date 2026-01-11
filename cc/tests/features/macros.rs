@@ -58,7 +58,7 @@ CALL(ADD, 10, 20);
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("nested_macro", code), 0);
+    assert_eq!(compile_and_run("nested_macro", code, &[]), 0);
 }
 
 // ============================================================================
@@ -96,7 +96,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stringify_paste", code), 0);
+    assert_eq!(compile_and_run("stringify_paste", code, &[]), 0);
 }
 
 // ============================================================================
@@ -138,7 +138,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("string_concat", code), 0);
+    assert_eq!(compile_and_run("string_concat", code, &[]), 0);
 }
 
 // ============================================================================
@@ -240,5 +240,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("macro_if", code), 0);
+    assert_eq!(compile_and_run("macro_if", code, &[]), 0);
 }

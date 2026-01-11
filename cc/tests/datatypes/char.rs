@@ -65,7 +65,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_basic", code), 0);
+    assert_eq!(compile_and_run("char_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -125,7 +125,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_escape", code), 0);
+    assert_eq!(compile_and_run("char_escape", code, &[]), 0);
 }
 
 // ============================================================================
@@ -161,7 +161,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_hex_oct", code), 0);
+    assert_eq!(compile_and_run("char_hex_oct", code, &[]), 0);
 }
 
 // ============================================================================
@@ -212,7 +212,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_arith", code), 0);
+    assert_eq!(compile_and_run("char_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -276,7 +276,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_cmp", code), 0);
+    assert_eq!(compile_and_run("char_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -320,7 +320,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_bitwise", code), 0);
+    assert_eq!(compile_and_run("char_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -380,7 +380,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_assign", code), 0);
+    assert_eq!(compile_and_run("char_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -418,7 +418,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_incdec", code), 0);
+    assert_eq!(compile_and_run("char_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -455,7 +455,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_signed", code), 0);
+    assert_eq!(compile_and_run("char_signed", code, &[]), 0);
 }
 
 // ############################################################################
@@ -508,7 +508,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("schar_arith", code), 0);
+    assert_eq!(compile_and_run("schar_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -544,7 +544,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("schar_cmp", code), 0);
+    assert_eq!(compile_and_run("schar_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -584,7 +584,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("schar_assign", code), 0);
+    assert_eq!(compile_and_run("schar_assign", code, &[]), 0);
 }
 
 // ############################################################################
@@ -638,7 +638,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uchar_arith", code), 0);
+    assert_eq!(compile_and_run("uchar_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -674,7 +674,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uchar_cmp", code), 0);
+    assert_eq!(compile_and_run("uchar_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -715,7 +715,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uchar_bitwise", code), 0);
+    assert_eq!(compile_and_run("uchar_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -765,7 +765,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uchar_assign", code), 0);
+    assert_eq!(compile_and_run("uchar_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -801,7 +801,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uchar_incdec", code), 0);
+    assert_eq!(compile_and_run("uchar_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -845,7 +845,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_conv", code), 0);
+    assert_eq!(compile_and_run("char_conv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -881,7 +881,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_class", code), 0);
+    assert_eq!(compile_and_run("char_class", code, &[]), 0);
 }
 
 // ============================================================================
@@ -988,7 +988,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_advanced", code), 0);
+    assert_eq!(compile_and_run("char_advanced", code, &[]), 0);
 }
 
 // ============================================================================
@@ -1059,5 +1059,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_stack_spill", code), 0);
+    assert_eq!(compile_and_run("char_stack_spill", code, &[]), 0);
 }

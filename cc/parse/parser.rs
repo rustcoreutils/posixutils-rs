@@ -1886,7 +1886,8 @@ impl<'a> Parser<'a> {
                                             // Create function pointer type with actual parameter types
                             let param_type_ids: Vec<TypeId> =
                                 params.iter().map(|p| p.typ).collect();
-                            let fn_type = Type::function(result_id, param_type_ids, variadic);
+                            let fn_type =
+                                Type::function(result_id, param_type_ids, variadic, false);
                             let fn_type_id = self.types.intern(fn_type);
                             result_id = self.types.intern(Type::pointer(fn_type_id));
                             return Some(result_id);
@@ -4418,7 +4419,7 @@ impl Parser<'_> {
             // For struct node *(*fp)(int): result is Pointer(struct node)
             //   -> Function(Pointer(struct node), [int])
             if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                let func_type = Type::function(result_type_id, param_type_ids, variadic, false);
                 result_type_id = self.types.intern(func_type);
             }
 
@@ -4484,7 +4485,7 @@ impl Parser<'_> {
             // For int get_op(int which): base is int, suffix (int) -> Function(int, [int])
             // This is needed for nested declarators like int (*get_op(int))(int, int)
             if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                let func_type = Type::function(result_type_id, param_type_ids, variadic, false);
                 result_type_id = self.types.intern(func_type);
             }
         }
@@ -4645,7 +4646,7 @@ impl Parser<'_> {
 
         // Build the function type
         let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-        let func_type = Type::function(ret_type_id, param_type_ids, variadic);
+        let func_type = Type::function(ret_type_id, param_type_ids, variadic, false);
         let func_type_id = self.types.intern(func_type);
 
         // Bind function to symbol table at current (global) scope
@@ -5088,12 +5089,8 @@ impl Parser<'_> {
                 // Function definition
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function_with_attrs(
-                    typ_id,
-                    param_type_ids.clone(),
-                    variadic,
-                    is_noreturn,
-                );
+                let func_type =
+                    Type::function(typ_id, param_type_ids.clone(), variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
@@ -5129,8 +5126,7 @@ impl Parser<'_> {
                 self.skip_extensions();
                 self.expect_special(b';')?;
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type =
-                    Type::function_with_attrs(typ_id, param_type_ids, variadic, is_noreturn);
+                let func_type = Type::function(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 // Add to symbol table
                 if is_typedef {

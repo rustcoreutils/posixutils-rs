@@ -82,7 +82,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_basic", code), 0);
+    assert_eq!(compile_and_run("ops_struct_basic", code, &[]), 0);
 }
 
 /// Test ops struct with mixed int/float/pointer arguments
@@ -127,7 +127,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_mixed", code), 0);
+    assert_eq!(compile_and_run("ops_struct_mixed", code, &[]), 0);
 }
 
 /// Test nested ops struct pattern (ops->sub_ops->func)
@@ -172,7 +172,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_nested", code), 0);
+    assert_eq!(compile_and_run("ops_struct_nested", code, &[]), 0);
 }
 
 /// Test ops struct with many arguments (forcing stack usage)
@@ -207,7 +207,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_many_args", code), 0);
+    assert_eq!(compile_and_run("ops_struct_many_args", code, &[]), 0);
 }
 
 /// Test ops struct with function pointers returning pointers
@@ -277,7 +277,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_ret_ptr", code), 0);
+    assert_eq!(compile_and_run("ops_struct_ret_ptr", code, &[]), 0);
 }
 
 /// Test ops struct with function pointers returning small structs (fits in registers)
@@ -348,7 +348,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_ret_small", code), 0);
+    assert_eq!(compile_and_run("ops_struct_ret_small", code, &[]), 0);
 }
 
 /// Test ops struct with function pointers returning large structs (sret ABI)
@@ -433,7 +433,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_ret_large", code), 0);
+    assert_eq!(compile_and_run("ops_struct_ret_large", code, &[]), 0);
 }
 
 /// Test ops struct with mixed return types in same struct
@@ -535,5 +535,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ops_struct_mixed_ret", code), 0);
+    assert_eq!(compile_and_run("ops_struct_mixed_ret", code, &[]), 0);
 }

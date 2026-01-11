@@ -69,7 +69,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_inline", code), 0);
+    assert_eq!(compile_and_run("static_inline", code, &[]), 0);
 }
 
 // ============================================================================
@@ -108,7 +108,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("inline_extern", code), 0);
+    assert_eq!(compile_and_run("inline_extern", code, &[]), 0);
 }
 
 // ============================================================================
@@ -148,7 +148,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("inline_multiple", code), 0);
+    assert_eq!(compile_and_run("inline_multiple", code, &[]), 0);
 }
 
 // ============================================================================
@@ -187,5 +187,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("inline_types", code), 0);
+    assert_eq!(compile_and_run("inline_types", code, &[]), 0);
 }

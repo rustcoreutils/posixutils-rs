@@ -90,7 +90,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_local_vars", code), 0);
+    assert_eq!(compile_and_run("static_local_vars", code, &[]), 0);
 }
 
 // ============================================================================
@@ -138,7 +138,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_functions", code), 0);
+    assert_eq!(compile_and_run("static_functions", code, &[]), 0);
 }
 
 // ============================================================================
@@ -180,5 +180,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_global_extern", code), 0);
+    assert_eq!(compile_and_run("static_global_extern", code, &[]), 0);
 }

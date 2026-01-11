@@ -15,7 +15,7 @@
 // - All data references use RIP-relative addressing on x86-64
 //
 
-use crate::common::compile_and_run_with_opts;
+use crate::common::compile_and_run;
 
 /// Basic test: compile with -fPIC flag (uppercase)
 #[test]
@@ -26,7 +26,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_uppercase", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_uppercase", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -40,7 +40,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_lowercase", code, &["-fpic".to_string()]),
+        compile_and_run("pic_lowercase", code, &["-fpic".to_string()]),
         0
     );
 }
@@ -59,7 +59,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_global_var", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_global_var", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -81,7 +81,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_static_local", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_static_local", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -104,7 +104,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_func_ptr", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_func_ptr", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -131,7 +131,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_global_array", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_global_array", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -158,7 +158,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_strings", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_strings", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -185,7 +185,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_struct_func_ptr", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_struct_func_ptr", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -206,7 +206,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_recursion", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_recursion", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -226,7 +226,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_external", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_external", code, &["-fPIC".to_string()]),
         0
     );
 }
@@ -257,7 +257,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        compile_and_run_with_opts("pic_complex", code, &["-fPIC".to_string()]),
+        compile_and_run("pic_complex", code, &["-fPIC".to_string()]),
         0
     );
 }

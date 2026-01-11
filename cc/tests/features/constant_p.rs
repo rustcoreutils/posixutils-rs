@@ -64,5 +64,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("constant_p_comprehensive", code), 0);
+    assert_eq!(compile_and_run("constant_p_comprehensive", code, &[]), 0);
 }

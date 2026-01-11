@@ -43,7 +43,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_basic", code), 0);
+    assert_eq!(compile_and_run("loop_basic", code, &[]), 0);
 }
 
 /// Multiple loop-carried values
@@ -68,7 +68,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_multiple", code), 0);
+    assert_eq!(compile_and_run("loop_multiple", code, &[]), 0);
 }
 
 /// Loop with nested conditionals (no function calls)
@@ -99,7 +99,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_nested_cond", code), 0);
+    assert_eq!(compile_and_run("loop_nested_cond", code, &[]), 0);
 }
 
 /// Complex loop with high register pressure (zlib-like)
@@ -187,7 +187,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_pressure", code), 0);
+    assert_eq!(compile_and_run("loop_pressure", code, &[]), 0);
 }
 
 /// Do-while loop (like zlib's compress_block uses)
@@ -217,7 +217,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_do_while", code), 0);
+    assert_eq!(compile_and_run("loop_do_while", code, &[]), 0);
 }
 
 /// Loop with bit manipulation (common in compression code)
@@ -265,7 +265,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_bits", code), 0);
+    assert_eq!(compile_and_run("loop_bits", code, &[]), 0);
 }
 
 /// Nested loops with multiple loop-carried values
@@ -302,5 +302,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("loop_nested", code), 0);
+    assert_eq!(compile_and_run("loop_nested", code, &[]), 0);
 }

@@ -315,12 +315,7 @@ impl Type {
     }
 
     /// Create a function type (return type and param types are TypeIds)
-    pub fn function(return_type: TypeId, params: Vec<TypeId>, variadic: bool) -> Self {
-        Self::function_with_attrs(return_type, params, variadic, false)
-    }
-
-    /// Create a function type with noreturn attribute
-    pub fn function_with_attrs(
+    pub fn function(
         return_type: TypeId,
         params: Vec<TypeId>,
         variadic: bool,
@@ -1203,6 +1198,7 @@ mod tests {
         let func_id = types.intern(Type::function(
             types.int_id,
             vec![types.int_id, types.char_id],
+            false,
             false,
         ));
         assert_eq!(types.kind(func_id), TypeKind::Function);

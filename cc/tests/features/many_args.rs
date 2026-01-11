@@ -39,7 +39,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("many_mixed_args", code), 0);
+    assert_eq!(compile_and_run("many_mixed_args", code, &[]), 0);
 }
 
 #[test]
@@ -61,7 +61,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("many_int_args", code), 0);
+    assert_eq!(compile_and_run("many_int_args", code, &[]), 0);
 }
 
 #[test]
@@ -85,5 +85,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("many_fp_args", code), 0);
+    assert_eq!(compile_and_run("many_fp_args", code, &[]), 0);
 }

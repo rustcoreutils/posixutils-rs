@@ -49,7 +49,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_basic", code), 0);
+    assert_eq!(compile_and_run("typedef_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -79,7 +79,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_ptr", code), 0);
+    assert_eq!(compile_and_run("typedef_ptr", code, &[]), 0);
 }
 
 // ============================================================================
@@ -132,7 +132,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_struct", code), 0);
+    assert_eq!(compile_and_run("typedef_struct", code, &[]), 0);
 }
 
 // ============================================================================
@@ -190,7 +190,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_adv", code), 0);
+    assert_eq!(compile_and_run("typedef_adv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -252,5 +252,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_func", code), 0);
+    assert_eq!(compile_and_run("typedef_func", code, &[]), 0);
 }

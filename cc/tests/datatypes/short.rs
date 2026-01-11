@@ -62,7 +62,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_arith", code), 0);
+    assert_eq!(compile_and_run("short_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -134,7 +134,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_cmp", code), 0);
+    assert_eq!(compile_and_run("short_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -182,7 +182,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_logical", code), 0);
+    assert_eq!(compile_and_run("short_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -222,7 +222,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_bitwise", code), 0);
+    assert_eq!(compile_and_run("short_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -292,7 +292,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_assign", code), 0);
+    assert_eq!(compile_and_run("short_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -336,7 +336,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_incdec", code), 0);
+    assert_eq!(compile_and_run("short_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -365,7 +365,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("short_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -395,7 +395,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_complex", code), 0);
+    assert_eq!(compile_and_run("short_complex", code, &[]), 0);
 }
 
 // ############################################################################
@@ -445,7 +445,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_arith", code), 0);
+    assert_eq!(compile_and_run("ushort_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -517,7 +517,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_cmp", code), 0);
+    assert_eq!(compile_and_run("ushort_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -565,7 +565,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_logical", code), 0);
+    assert_eq!(compile_and_run("ushort_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -605,7 +605,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_bitwise", code), 0);
+    assert_eq!(compile_and_run("ushort_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -675,7 +675,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_assign", code), 0);
+    assert_eq!(compile_and_run("ushort_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -719,7 +719,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_incdec", code), 0);
+    assert_eq!(compile_and_run("ushort_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -748,7 +748,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("ushort_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -778,7 +778,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ushort_complex", code), 0);
+    assert_eq!(compile_and_run("ushort_complex", code, &[]), 0);
 }
 
 // ============================================================================
@@ -883,7 +883,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_advanced", code), 0);
+    assert_eq!(compile_and_run("short_advanced", code, &[]), 0);
 }
 
 // ============================================================================
@@ -960,5 +960,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("short_stack_spill", code), 0);
+    assert_eq!(compile_and_run("short_stack_spill", code, &[]), 0);
 }

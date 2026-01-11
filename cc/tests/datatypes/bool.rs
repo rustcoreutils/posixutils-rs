@@ -49,7 +49,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_basic", code), 0);
+    assert_eq!(compile_and_run("bool_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -96,7 +96,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_conv_int", code), 0);
+    assert_eq!(compile_and_run("bool_conv_int", code, &[]), 0);
 }
 
 #[test]
@@ -130,7 +130,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_conv_char", code), 0);
+    assert_eq!(compile_and_run("bool_conv_char", code, &[]), 0);
 }
 
 #[test]
@@ -170,7 +170,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_conv_lit", code), 0);
+    assert_eq!(compile_and_run("bool_conv_lit", code, &[]), 0);
 }
 
 // ============================================================================
@@ -236,7 +236,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_logical", code), 0);
+    assert_eq!(compile_and_run("bool_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -292,7 +292,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_compare", code), 0);
+    assert_eq!(compile_and_run("bool_compare", code, &[]), 0);
 }
 
 // ============================================================================
@@ -327,7 +327,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_arith", code), 0);
+    assert_eq!(compile_and_run("bool_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -376,7 +376,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_bitwise", code), 0);
+    assert_eq!(compile_and_run("bool_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -403,7 +403,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_assign", code), 0);
+    assert_eq!(compile_and_run("bool_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -439,7 +439,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_incdec", code), 0);
+    assert_eq!(compile_and_run("bool_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -489,7 +489,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_flow", code), 0);
+    assert_eq!(compile_and_run("bool_flow", code, &[]), 0);
 }
 
 // ============================================================================
@@ -521,7 +521,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_ptr", code), 0);
+    assert_eq!(compile_and_run("bool_ptr", code, &[]), 0);
 }
 
 // ============================================================================
@@ -557,7 +557,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_array", code), 0);
+    assert_eq!(compile_and_run("bool_array", code, &[]), 0);
 }
 
 // ============================================================================
@@ -608,7 +608,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_typeconv", code), 0);
+    assert_eq!(compile_and_run("bool_typeconv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -697,5 +697,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bool_advanced", code), 0);
+    assert_eq!(compile_and_run("bool_advanced", code, &[]), 0);
 }

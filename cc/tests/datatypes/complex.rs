@@ -64,7 +64,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("double_complex_arith", code), 0);
+    assert_eq!(compile_and_run("double_complex_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -149,7 +149,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_complex_ops", code), 0);
+    assert_eq!(compile_and_run("float_complex_ops", code, &[]), 0);
 }
 
 // ============================================================================
@@ -218,5 +218,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("complex_types", code), 0);
+    assert_eq!(compile_and_run("complex_types", code, &[]), 0);
 }

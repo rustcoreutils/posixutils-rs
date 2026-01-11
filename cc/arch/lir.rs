@@ -488,9 +488,6 @@ pub enum Directive {
     /// .uleb128 value - unsigned LEB128 encoding for DWARF
     Uleb128(u64),
 
-    /// .sleb128 value - signed LEB128 encoding for DWARF
-    Sleb128(i64),
-
     /// .2byte value - 16-bit value (for DWARF version)
     TwoBytes(u16),
 
@@ -742,9 +739,6 @@ impl EmitAsm for Directive {
             },
             Directive::Uleb128(v) => {
                 let _ = writeln!(out, "    .uleb128 {}", v);
-            }
-            Directive::Sleb128(v) => {
-                let _ = writeln!(out, "    .sleb128 {}", v);
             }
             Directive::TwoBytes(v) => {
                 let _ = writeln!(out, "    .2byte {}", v);

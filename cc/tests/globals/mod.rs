@@ -27,7 +27,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -48,7 +48,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -70,7 +70,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -91,7 +91,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -119,7 +119,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -143,7 +143,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -169,7 +169,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -192,7 +192,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -217,7 +217,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -238,7 +238,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -263,7 +263,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -286,7 +286,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -311,7 +311,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -333,7 +333,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -355,7 +355,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -384,7 +384,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -410,7 +410,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -436,7 +436,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -461,7 +461,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -487,7 +487,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -512,7 +512,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -546,7 +546,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -575,7 +575,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -604,7 +604,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -645,7 +645,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -697,7 +697,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf());
+    let exe = compile(&c_file.path().to_path_buf(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());

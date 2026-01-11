@@ -34,7 +34,7 @@ fn test_pos() -> Position {
 fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
-    linearize(tu, &symbols, types, strings, &target)
+    linearize(tu, &symbols, types, strings, &target, false)
 }
 
 fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
@@ -2549,7 +2549,7 @@ fn test_linearize_with_symbols(
     strings: &StringTable,
 ) -> Module {
     let target = Target::host();
-    linearize(tu, symbols, types, strings, &target)
+    linearize(tu, symbols, types, strings, &target, false)
 }
 
 #[test]

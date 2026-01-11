@@ -39,7 +39,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_4th_left", code), 0);
+        assert_eq!(compile_and_run("shift_4th_left", code, &[]), 0);
     }
 
     /// 4th param with variable right shift
@@ -60,7 +60,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_4th_right", code), 0);
+        assert_eq!(compile_and_run("shift_4th_right", code, &[]), 0);
     }
 
     /// 4th param used BEFORE and AFTER shift - verifies spill/reload
@@ -82,7 +82,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_4th_before_after", code), 0);
+        assert_eq!(compile_and_run("shift_4th_before_after", code, &[]), 0);
     }
 
     /// Multiple shifts in same function
@@ -103,7 +103,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_multiple", code), 0);
+        assert_eq!(compile_and_run("shift_multiple", code, &[]), 0);
     }
 
     /// All register args (1-6) with shifts - stress test
@@ -125,7 +125,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_all_regs", code), 0);
+        assert_eq!(compile_and_run("shift_all_regs", code, &[]), 0);
     }
 
     /// Unsigned right shift (logical vs arithmetic)
@@ -145,7 +145,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_unsigned", code), 0);
+        assert_eq!(compile_and_run("shift_unsigned", code, &[]), 0);
     }
 
     /// Shift with expression as count (not just variable)
@@ -164,7 +164,7 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_expr_count", code), 0);
+        assert_eq!(compile_and_run("shift_expr_count", code, &[]), 0);
     }
 
     /// Shift in loop - multiple iterations using 4th param
@@ -187,6 +187,6 @@ int main(void) {
     return 0;
 }
 "#;
-        assert_eq!(compile_and_run("shift_loop", code), 0);
+        assert_eq!(compile_and_run("shift_loop", code, &[]), 0);
     }
 }

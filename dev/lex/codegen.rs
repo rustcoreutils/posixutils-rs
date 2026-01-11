@@ -2032,7 +2032,7 @@ mod tests {
     #[test]
     fn test_generate_simple_lexer() {
         let hir = regex_syntax::parse("a").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2061,7 +2061,7 @@ mod tests {
     #[test]
     fn test_generate_with_bol_anchor() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2098,7 +2098,7 @@ mod tests {
     #[test]
     fn test_generate_with_start_conditions() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2136,7 +2136,7 @@ mod tests {
     #[test]
     fn test_generate_with_trailing_context() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();

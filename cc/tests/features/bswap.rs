@@ -42,7 +42,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bswap16_comprehensive", code), 0);
+    assert_eq!(compile_and_run("bswap16_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -79,7 +79,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bswap32_comprehensive", code), 0);
+    assert_eq!(compile_and_run("bswap32_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -111,5 +111,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bswap64_comprehensive", code), 0);
+    assert_eq!(compile_and_run("bswap64_comprehensive", code, &[]), 0);
 }

@@ -522,7 +522,12 @@ mod tests {
         let foo_id = strings.intern("foo");
 
         // Declare a function
-        let func_type = types.intern(Type::function(types.int_id, vec![types.int_id], false));
+        let func_type = types.intern(Type::function(
+            types.int_id,
+            vec![types.int_id],
+            false,
+            false,
+        ));
         let func = Symbol::function(foo_id, func_type, 0);
         table.declare(func).unwrap();
 

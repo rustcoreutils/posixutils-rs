@@ -6086,20 +6086,8 @@ impl<'a> Linearizer<'a> {
 // Public API
 // ============================================================================
 
-/// Linearize an AST to IR (convenience wrapper for tests)
-#[cfg(test)]
+/// Linearize an AST to IR
 pub fn linearize(
-    tu: &TranslationUnit,
-    symbols: &SymbolTable,
-    types: &TypeTable,
-    strings: &StringTable,
-    target: &Target,
-) -> Module {
-    linearize_with_debug(tu, symbols, types, strings, target, false)
-}
-
-/// Linearize an AST to IR with debug info support
-pub fn linearize_with_debug(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,

@@ -611,8 +611,8 @@ pub trait CodeGenerator {
     fn set_pic_mode(&mut self, pic: bool);
 }
 
-/// Create a code generator for the given target with options
-pub fn create_codegen_with_options(
+/// Create a code generator for the given target
+pub fn create_codegen(
     target: Target,
     emit_unwind_tables: bool,
     pic_mode: bool,

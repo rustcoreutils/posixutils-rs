@@ -62,7 +62,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_arith", code), 0);
+    assert_eq!(compile_and_run("int_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -134,7 +134,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_cmp", code), 0);
+    assert_eq!(compile_and_run("int_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -182,7 +182,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_logical", code), 0);
+    assert_eq!(compile_and_run("int_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -222,7 +222,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_bitwise", code), 0);
+    assert_eq!(compile_and_run("int_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -292,7 +292,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_assign", code), 0);
+    assert_eq!(compile_and_run("int_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -336,7 +336,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_incdec", code), 0);
+    assert_eq!(compile_and_run("int_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -365,7 +365,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("int_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -395,7 +395,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_complex", code), 0);
+    assert_eq!(compile_and_run("int_complex", code, &[]), 0);
 }
 
 // ############################################################################
@@ -448,7 +448,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_arith", code), 0);
+    assert_eq!(compile_and_run("uint_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -520,7 +520,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_cmp", code), 0);
+    assert_eq!(compile_and_run("uint_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -568,7 +568,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_logical", code), 0);
+    assert_eq!(compile_and_run("uint_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -608,7 +608,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_bitwise", code), 0);
+    assert_eq!(compile_and_run("uint_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -678,7 +678,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_assign", code), 0);
+    assert_eq!(compile_and_run("uint_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -722,7 +722,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_incdec", code), 0);
+    assert_eq!(compile_and_run("uint_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -751,7 +751,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("uint_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -781,7 +781,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uint_complex", code), 0);
+    assert_eq!(compile_and_run("uint_complex", code, &[]), 0);
 }
 
 // ============================================================================
@@ -874,5 +874,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_advanced", code), 0);
+    assert_eq!(compile_and_run("int_advanced", code, &[]), 0);
 }

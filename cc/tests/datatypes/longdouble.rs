@@ -59,7 +59,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_arith", code), 0);
+    assert_eq!(compile_and_run("longdouble_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -115,7 +115,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_cmp", code), 0);
+    assert_eq!(compile_and_run("longdouble_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -155,7 +155,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_assign", code), 0);
+    assert_eq!(compile_and_run("longdouble_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -201,7 +201,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_incdec", code), 0);
+    assert_eq!(compile_and_run("longdouble_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -239,7 +239,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_int_conv", code), 0);
+    assert_eq!(compile_and_run("longdouble_int_conv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -289,7 +289,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_float_conv", code), 0);
+    assert_eq!(compile_and_run("longdouble_float_conv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -325,7 +325,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_literals", code), 0);
+    assert_eq!(compile_and_run("longdouble_literals", code, &[]), 0);
 }
 
 // ============================================================================
@@ -355,7 +355,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_complex", code), 0);
+    assert_eq!(compile_and_run("longdouble_complex", code, &[]), 0);
 }
 
 // ============================================================================
@@ -433,5 +433,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("longdouble_advanced", code), 0);
+    assert_eq!(compile_and_run("longdouble_advanced", code, &[]), 0);
 }

@@ -60,18 +60,12 @@ pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
 }
 
 // ============================================================================
-// Low-level Compile/Run Utilities (for backward compatibility)
+// Low-level Compile/Run Utilities
 // ============================================================================
 
 /// Compile a C file using pcc and return the path to the executable
 /// The executable is placed in temp dir and must be cleaned up by caller
-#[allow(dead_code)]
-pub fn compile(c_file: &PathBuf) -> Option<PathBuf> {
-    compile_with_opts(c_file, &[])
-}
-
-/// Compile a C file with extra options
-pub fn compile_with_opts(c_file: &PathBuf, extra_opts: &[&str]) -> Option<PathBuf> {
+pub fn compile(c_file: &PathBuf, extra_opts: &[&str]) -> Option<PathBuf> {
     let thread_id = format!("{:?}", std::thread::current().id());
     let exe_path = std::env::temp_dir().join(format!(
         "pcc_exe_{}_{}",
@@ -97,7 +91,7 @@ pub fn compile_with_opts(c_file: &PathBuf, extra_opts: &[&str]) -> Option<PathBu
 #[allow(dead_code)]
 pub fn compile_test_file(test_dir: &str, filename: &str) -> Option<PathBuf> {
     let c_file = get_test_file_path(test_dir, filename);
-    compile(&c_file)
+    compile(&c_file, &[])
 }
 
 /// Run an executable and return its exit code
@@ -178,9 +172,9 @@ fn compile_and_run_single(
     exit_code
 }
 
-/// Compile inline C code with extra options and run with all matrix configurations.
+/// Compile inline C code and run with all matrix configurations.
 /// Returns 0 if all configurations pass, or the first non-zero exit code on failure.
-pub fn compile_and_run_with_opts(name: &str, content: &str, extra_opts: &[String]) -> i32 {
+pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 {
     for (config_name, matrix_flags) in COMPILE_MATRIX {
         // Combine matrix flags with caller's extra options
         let mut combined: Vec<String> = matrix_flags.iter().map(|s| s.to_string()).collect();
@@ -196,12 +190,6 @@ pub fn compile_and_run_with_opts(name: &str, content: &str, extra_opts: &[String
         }
     }
     0
-}
-
-/// Compile inline C code and run with all matrix configurations.
-/// Returns 0 if all configurations pass, or the first non-zero exit code on failure.
-pub fn compile_and_run(name: &str, content: &str) -> i32 {
-    compile_and_run_with_opts(name, content, &[])
 }
 
 /// Compile inline C code with optimization and run (single config, skips matrix).

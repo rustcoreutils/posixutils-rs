@@ -53,7 +53,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ctz_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ctz_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -91,7 +91,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ctzl_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ctzl_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -134,5 +134,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ctzll_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ctzll_comprehensive", code, &[]), 0);
 }

@@ -356,6 +356,7 @@ impl SymbolTable {
     }
 
     /// Get the number of symbols declared
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.symbols.len()
     }

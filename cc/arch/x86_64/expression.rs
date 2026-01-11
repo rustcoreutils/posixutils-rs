@@ -206,8 +206,19 @@ impl X86_64CodeGen {
         };
         self.emit_move(src1, dst_reg, size);
         let src2_loc = self.get_location(src2);
+
+        // Check if src2 is a large immediate that doesn't fit in 32-bit signed
+        // x86-64 imul with immediate only accepts 32-bit immediates
+        let src2_gp = match &src2_loc {
+            Loc::Imm(v) if *v > i32::MAX as i64 || *v < i32::MIN as i64 => {
+                // Large immediate - must load into register first
+                self.emit_move(src2, Reg::R11, size);
+                GpOperand::Reg(Reg::R11)
+            }
+            _ => self.loc_to_gp_operand(&src2_loc),
+        };
+
         // LIR: 2-operand imul instruction
-        let src2_gp = self.loc_to_gp_operand(&src2_loc);
         self.push_lir(X86Inst::IMul2 {
             size: op_size,
             src: src2_gp,

@@ -1476,6 +1476,66 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// Consume type qualifiers (const, volatile, restrict)
+    /// Used for qualifiers after '*' in pointers or after struct/union/enum types
+    /// Returns the modifiers that were consumed
+    fn consume_type_qualifiers(&mut self) -> TypeModifiers {
+        let mut mods = TypeModifiers::empty();
+        while self.peek() == TokenType::Ident {
+            let name_id = match self.get_ident_id(self.current()) {
+                Some(id) => id,
+                None => break,
+            };
+            let name = self.str(name_id);
+            match name {
+                "const" | "__const" | "__const__" => {
+                    self.advance();
+                    mods |= TypeModifiers::CONST;
+                }
+                "volatile" | "__volatile" | "__volatile__" => {
+                    self.advance();
+                    mods |= TypeModifiers::VOLATILE;
+                }
+                "restrict" | "__restrict" | "__restrict__" => {
+                    self.advance();
+                    mods |= TypeModifiers::RESTRICT;
+                }
+                "_Atomic" => {
+                    self.advance();
+                    // Atomic qualifier - consume but don't track for now
+                }
+                _ => break,
+            }
+        }
+        mods
+    }
+
+    /// Parse a chain of pointer declarators with optional qualifiers
+    /// e.g., `* const * volatile *` returns the final pointer type
+    fn parse_pointer_chain(&mut self, mut base_type: TypeId) -> TypeId {
+        while self.is_special(b'*') {
+            self.advance();
+            let ptr_mods = self.consume_type_qualifiers();
+            let mut ptr_type = Type::pointer(base_type);
+            ptr_type.modifiers |= ptr_mods;
+            base_type = self.types.intern(ptr_type);
+        }
+        base_type
+    }
+
+    /// Apply trailing qualifiers to a type and return the qualified type id
+    /// Used for patterns like "struct foo const *" where const comes after the struct
+    fn apply_trailing_qualifiers(&mut self, base_type: TypeId) -> TypeId {
+        let trailing_mods = self.consume_type_qualifiers();
+        if trailing_mods.is_empty() {
+            base_type
+        } else {
+            let mut qualified_type = self.types.get(base_type).clone();
+            qualified_type.modifiers |= trailing_mods;
+            self.types.intern(qualified_type)
+        }
+    }
+
     /// Parse a type name (required, returns error if not a type)
     fn parse_type_name(&mut self) -> ParseResult<TypeId> {
         self.try_parse_type_name()
@@ -1627,13 +1687,7 @@ impl<'a> Parser<'a> {
                             return None;
                         }
                         self.advance(); // consume ')'
-                                        // Handle pointers after typeof(...)
-                        let mut result_id = typ;
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
-                        return Some(result_id);
+                        return Some(self.parse_pointer_chain(typ));
                     }
 
                     // Not a type name, try expression
@@ -1646,15 +1700,8 @@ impl<'a> Parser<'a> {
                     }
                     self.advance(); // consume ')'
 
-                    // Get the type of the expression
                     let expr_type = expr.typ.unwrap_or(self.types.int_id);
-                    // Handle pointers after typeof(...)
-                    let mut result_id = expr_type;
-                    while self.is_special(b'*') {
-                        self.advance();
-                        result_id = self.types.intern(Type::pointer(result_id));
-                    }
-                    return Some(result_id);
+                    return Some(self.parse_pointer_chain(expr_type));
                 }
                 "struct" => {
                     self.advance(); // consume 'struct'
@@ -1662,15 +1709,10 @@ impl<'a> Parser<'a> {
                     if let Some(tag_name) = self.get_ident_id(self.current()) {
                         if !self.is_special(b'{') {
                             // This is a tag reference (e.g., "struct Point*")
-                            // Look up the existing tag to get its TypeId directly
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let mut result_id = existing.typ;
-                                // Handle pointer
-                                while self.is_special(b'*') {
-                                    self.advance();
-                                    result_id = self.types.intern(Type::pointer(result_id));
-                                }
+                                let result_id = self.apply_trailing_qualifiers(existing.typ);
+                                let mut result_id = self.parse_pointer_chain(result_id);
                                 // Handle array declarators
                                 while self.is_special(b'[') {
                                     self.advance();
@@ -1689,28 +1731,19 @@ impl<'a> Parser<'a> {
                                 return Some(result_id);
                             }
                             // Tag not found - return incomplete struct type
-                            let incomplete = Type::incomplete_struct(tag_name);
-                            let mut result_id = self.types.intern(incomplete);
-                            while self.is_special(b'*') {
-                                self.advance();
-                                result_id = self.types.intern(Type::pointer(result_id));
-                            }
-                            return Some(result_id);
+                            let mut incomplete = Type::incomplete_struct(tag_name);
+                            incomplete.modifiers |= self.consume_type_qualifiers();
+                            let result_id = self.types.intern(incomplete);
+                            return Some(self.parse_pointer_chain(result_id));
                         }
                     }
                     // Fall back to full struct parsing for definitions
-                    // (rewind position first since we consumed 'struct')
                     self.pos -= 1;
                     if let Ok(struct_type) = self.parse_struct_or_union_specifier(false) {
-                        // Intern base struct type with modifiers
                         let mut typ = struct_type;
-                        typ.modifiers |= modifiers;
+                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
                         let mut result_id = self.types.intern(typ);
-                        // Handle pointer
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
+                        result_id = self.parse_pointer_chain(result_id);
                         // Handle array declarators
                         while self.is_special(b'[') {
                             self.advance();
@@ -1737,11 +1770,9 @@ impl<'a> Parser<'a> {
                             // This is a tag reference
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let mut result_id = existing.typ;
-                                while self.is_special(b'*') {
-                                    self.advance();
-                                    result_id = self.types.intern(Type::pointer(result_id));
-                                }
+                                let result_id = self.apply_trailing_qualifiers(existing.typ);
+                                let mut result_id = self.parse_pointer_chain(result_id);
+                                // Handle array declarators
                                 while self.is_special(b'[') {
                                     self.advance();
                                     if let Ok(size_expr) = self.parse_conditional_expr() {
@@ -1759,25 +1790,19 @@ impl<'a> Parser<'a> {
                                 return Some(result_id);
                             }
                             // Tag not found - return incomplete union type
-                            let incomplete = Type::incomplete_union(tag_name);
-                            let mut result_id = self.types.intern(incomplete);
-                            while self.is_special(b'*') {
-                                self.advance();
-                                result_id = self.types.intern(Type::pointer(result_id));
-                            }
-                            return Some(result_id);
+                            let mut incomplete = Type::incomplete_union(tag_name);
+                            incomplete.modifiers |= self.consume_type_qualifiers();
+                            let result_id = self.types.intern(incomplete);
+                            return Some(self.parse_pointer_chain(result_id));
                         }
                     }
                     // Fall back to full union parsing for definitions
                     self.pos -= 1;
                     if let Ok(union_type) = self.parse_struct_or_union_specifier(true) {
                         let mut typ = union_type;
-                        typ.modifiers |= modifiers;
+                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
                         let mut result_id = self.types.intern(typ);
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
+                        result_id = self.parse_pointer_chain(result_id);
                         // Handle array declarators
                         while self.is_special(b'[') {
                             self.advance();
@@ -1799,12 +1824,9 @@ impl<'a> Parser<'a> {
                 "enum" => {
                     if let Ok(enum_type) = self.parse_enum_specifier() {
                         let mut typ = enum_type;
-                        typ.modifiers |= modifiers;
+                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
                         let mut result_id = self.types.intern(typ);
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
+                        result_id = self.parse_pointer_chain(result_id);
                         // Handle array declarators
                         while self.is_special(b'[') {
                             self.advance();
@@ -1865,10 +1887,7 @@ impl<'a> Parser<'a> {
         };
 
         // Handle pointer declarators
-        while self.is_special(b'*') {
-            self.advance();
-            result_id = self.types.intern(Type::pointer(result_id));
-        }
+        result_id = self.parse_pointer_chain(result_id);
 
         // Handle function pointer declarators: void (*)(int), int (*)(void), etc.
         // Syntax: return_type (*)(param_types)
@@ -3867,26 +3886,26 @@ impl Parser<'_> {
                     });
                 }
                 "enum" => {
-                    let enum_type = self.parse_enum_specifier()?;
+                    let mut enum_type = self.parse_enum_specifier()?;
+                    // Consume trailing qualifiers (e.g., "enum foo const")
+                    let trailing_mods = self.consume_type_qualifiers();
                     // Apply any modifiers we collected
-                    return Ok(Type {
-                        modifiers,
-                        ..enum_type
-                    });
+                    enum_type.modifiers |= modifiers | trailing_mods;
+                    return Ok(enum_type);
                 }
                 "struct" => {
-                    let struct_type = self.parse_struct_or_union_specifier(false)?;
-                    return Ok(Type {
-                        modifiers,
-                        ..struct_type
-                    });
+                    let mut struct_type = self.parse_struct_or_union_specifier(false)?;
+                    // Consume trailing qualifiers (e.g., "struct foo const")
+                    let trailing_mods = self.consume_type_qualifiers();
+                    struct_type.modifiers |= modifiers | trailing_mods;
+                    return Ok(struct_type);
                 }
                 "union" => {
-                    let union_type = self.parse_struct_or_union_specifier(true)?;
-                    return Ok(Type {
-                        modifiers,
-                        ..union_type
-                    });
+                    let mut union_type = self.parse_struct_or_union_specifier(true)?;
+                    // Consume trailing qualifiers (e.g., "union foo const")
+                    let trailing_mods = self.consume_type_qualifiers();
+                    union_type.modifiers |= modifiers | trailing_mods;
+                    return Ok(union_type);
                 }
                 _ => {
                     // Check if it's a typedef name
@@ -6565,6 +6584,78 @@ mod tests {
                 assert_eq!(types.kind(base), TypeKind::Pointer);
                 let innermost = types.base_type(base).unwrap();
                 assert_eq!(types.kind(innermost), TypeKind::Int);
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_const_pointer() {
+        // Test pointer qualifiers: (const int *)x
+        let (expr, types, _strings) = parse_expr("(const int *)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+                let base = types.base_type(cast_type).unwrap();
+                assert_eq!(types.kind(base), TypeKind::Int);
+                // const applies to the pointed-to int
+                assert!(types.get(base).modifiers.contains(TypeModifiers::CONST));
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_pointer_to_const() {
+        // Test pointer qualifiers after *: (int * const)x - const pointer to int
+        let (expr, types, _strings) = parse_expr("(int * const)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+                // const applies to the pointer itself
+                assert!(types
+                    .get(cast_type)
+                    .modifiers
+                    .contains(TypeModifiers::CONST));
+                let base = types.base_type(cast_type).unwrap();
+                assert_eq!(types.kind(base), TypeKind::Int);
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_double_pointer_with_qualifiers() {
+        // Test: (const int * const *)x - pointer to const pointer to const int
+        let (expr, types, _strings) = parse_expr("(const int * const *)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                // Outer is pointer (to const pointer to const int)
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+
+                // Middle is const pointer
+                let middle = types.base_type(cast_type).unwrap();
+                assert_eq!(types.kind(middle), TypeKind::Pointer);
+                assert!(types.get(middle).modifiers.contains(TypeModifiers::CONST));
+
+                // Inner is const int
+                let inner = types.base_type(middle).unwrap();
+                assert_eq!(types.kind(inner), TypeKind::Int);
+                assert!(types.get(inner).modifiers.contains(TypeModifiers::CONST));
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_volatile_pointer() {
+        // Test volatile qualifier: (volatile int *)x
+        let (expr, types, _strings) = parse_expr("(volatile int *)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+                let base = types.base_type(cast_type).unwrap();
+                assert!(types.get(base).modifiers.contains(TypeModifiers::VOLATILE));
             }
             _ => panic!("Expected Cast"),
         }

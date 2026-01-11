@@ -129,6 +129,7 @@ impl StringTable {
     }
 
     /// Get the number of interned strings
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.strings.len()
     }

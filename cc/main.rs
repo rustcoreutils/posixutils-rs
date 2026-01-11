@@ -138,11 +138,54 @@ struct Args {
     #[arg(long = "pedantic", hide = true, help = gettext("Pedantic mode (compatibility)"))]
     pedantic: bool,
 
+    /// Print compilation statistics (for capacity tuning)
+    #[arg(long = "stats", help = gettext("Print compilation statistics"))]
+    stats: bool,
+
     #[arg(short = 'L', action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add library search path (passed to linker)"))]
     lib_paths: Vec<String>,
 
     #[arg(short = 'l', action = clap::ArgAction::Append, value_name = "library", help = gettext("Link library (passed to linker)"))]
     libraries: Vec<String>,
+}
+
+/// Print compilation statistics for capacity tuning
+fn print_stats(
+    path: &str,
+    strings: &StringTable,
+    types: &types::TypeTable,
+    symbols: &SymbolTable,
+    module: &ir::Module,
+) {
+    // Calculate function statistics
+    let num_functions = module.functions.len();
+    let (max_pseudos, max_blocks, max_locals, max_insns) =
+        module
+            .functions
+            .iter()
+            .fold((0, 0, 0, 0), |(max_p, max_b, max_l, max_i), func| {
+                let max_insns_in_func =
+                    func.blocks.iter().map(|b| b.insns.len()).max().unwrap_or(0);
+                (
+                    max_p.max(func.pseudos.len()),
+                    max_b.max(func.blocks.len()),
+                    max_l.max(func.locals.len()),
+                    max_i.max(max_insns_in_func),
+                )
+            });
+
+    eprintln!("=== Compilation Statistics: {} ===", path);
+    eprintln!("StringTable: {} strings", strings.len());
+    eprintln!("TypeTable: {} types", types.len());
+    eprintln!("SymbolTable: {} symbols", symbols.len());
+    eprintln!("String literals: {}", module.strings.len());
+    eprintln!("Globals: {}", module.globals.len());
+    eprintln!(
+        "Functions: {} (max_pseudos={}, max_blocks={}, max_locals={})",
+        num_functions, max_pseudos, max_blocks, max_locals
+    );
+    eprintln!("Max instructions/block: {}", max_insns);
+    eprintln!();
 }
 
 fn process_file(
@@ -266,6 +309,11 @@ fn process_file(
 
     // Linearize to IR
     let mut module = ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug);
+
+    // Print compilation statistics if requested
+    if args.stats {
+        print_stats(path, &strings, &types, &symbols, &module);
+    }
 
     // Set DWARF metadata
     module.source_name = Some(path.to_string());

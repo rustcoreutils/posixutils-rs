@@ -14,8 +14,7 @@ use crate::strings::StringId;
 use crate::types::TypeId;
 use std::collections::HashMap;
 
-/// Default capacity for symbol table name lookup HashMap
-const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 256;
+const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 16384;
 
 // ============================================================================
 // Symbol ID
@@ -354,6 +353,11 @@ impl SymbolTable {
     pub fn lookup_enum_constant(&self, name: StringId) -> Option<&Symbol> {
         self.lookup(name, Namespace::Ordinary)
             .filter(|s| s.is_enum_constant())
+    }
+
+    /// Get the number of symbols declared
+    pub fn len(&self) -> usize {
+        self.symbols.len()
     }
 }
 

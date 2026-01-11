@@ -18,11 +18,8 @@
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use std::collections::{HashSet, VecDeque};
 
-/// Default capacity for instruction use tracking (typical instruction has 2-4 sources)
 const DEFAULT_USE_CAPACITY: usize = 4;
-/// Default capacity for live pseudo sets
 const DEFAULT_LIVE_CAPACITY: usize = 64;
-/// Default capacity for reachable block sets
 const DEFAULT_REACHABLE_CAPACITY: usize = 16;
 
 // ============================================================================

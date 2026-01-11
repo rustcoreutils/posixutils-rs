@@ -44,11 +44,8 @@ const MAX_INLINE_SIZE: usize = 100;
 /// Maximum growth in caller size before we stop inlining
 const MAX_CALLER_GROWTH: usize = 1000;
 
-/// Default capacity for inline candidate HashMap
 const DEFAULT_CANDIDATE_CAPACITY: usize = 16;
-/// Default capacity for pseudo/block remapping HashMaps
 const DEFAULT_REMAP_CAPACITY: usize = 64;
-/// Default capacity for block ordering during inlining
 const DEFAULT_ORDER_CAPACITY: usize = 16;
 
 // ============================================================================

@@ -16,9 +16,7 @@
 use super::{BasicBlockId, Function};
 use std::collections::{HashMap, HashSet};
 
-/// Default capacity for postorder/block-indexed collections
 const DEFAULT_POSTORDER_CAPACITY: usize = 16;
-/// Default capacity for IDF tracking sets
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
 // ============================================================================

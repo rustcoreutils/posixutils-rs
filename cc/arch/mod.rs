@@ -9,7 +9,6 @@
 // Architecture-specific predefined macros and code generators
 //
 
-/// Default capacity for LIR instruction buffers (reduces reallocation overhead)
 pub const DEFAULT_LIR_BUFFER_CAPACITY: usize = 5000;
 
 pub mod aarch64;

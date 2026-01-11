@@ -18,9 +18,7 @@ use super::{BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, Pseudo
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
-/// Default capacity for SSA variable rename tracking
 const DEFAULT_SSA_RENAME_CAPACITY: usize = 32;
-/// Default capacity for SSA phi tracking vectors
 const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
 
 // ============================================================================

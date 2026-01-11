@@ -49,8 +49,7 @@ impl fmt::Display for StringId {
 // StringTable - Interned string storage
 // ============================================================================
 
-/// Default capacity for string table allocations (reduces reallocation overhead)
-const DEFAULT_STRING_TABLE_CAPACITY: usize = 2048;
+const DEFAULT_STRING_TABLE_CAPACITY: usize = 65536;
 
 /// String interner - stores all strings and provides ID-based lookup
 ///
@@ -127,6 +126,11 @@ impl StringTable {
     /// Get the string for an ID, returning None for invalid IDs
     pub fn get_opt(&self, id: StringId) -> Option<&str> {
         self.strings.get(id.0 as usize).map(|s| s.as_str())
+    }
+
+    /// Get the number of interned strings
+    pub fn len(&self) -> usize {
+        self.strings.len()
     }
 }
 

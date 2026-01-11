@@ -24,13 +24,9 @@ use crate::diag;
 use crate::os;
 use crate::target::Target;
 
-/// Default capacity for macro HashMap (covers predefined macros + typical program macros)
 const DEFAULT_MACRO_CAPACITY: usize = 32;
-/// Default capacity for #if/#ifdef condition stack (typical nesting depth)
 const DEFAULT_COND_STACK_CAPACITY: usize = 8;
-/// Default capacity for include path lists
 const DEFAULT_INCLUDE_PATH_CAPACITY: usize = 8;
-/// Default capacity for include tracking sets (once files, expanding)
 const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 
 /// Source of an included file

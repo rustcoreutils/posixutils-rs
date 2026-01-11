@@ -24,15 +24,10 @@ use crate::types::{
 };
 use std::fmt;
 
-/// Default capacity for argument lists in function calls
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
-/// Default capacity for struct/union member lists
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
-/// Default capacity for enum constant lists
 const DEFAULT_ENUM_CAPACITY: usize = 16;
-/// Default capacity for initializer element lists
 const DEFAULT_INIT_CAPACITY: usize = 8;
-/// Default capacity for function parameter lists
 const DEFAULT_PARAM_CAPACITY: usize = 8;
 
 // ============================================================================

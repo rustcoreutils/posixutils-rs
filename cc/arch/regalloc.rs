@@ -13,15 +13,10 @@ use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKin
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Default capacity for live interval maps
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
-/// Default capacity for constraint point vectors
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
-/// Default capacity for phi source/target tracking
 const DEFAULT_PHI_TRACKING_CAPACITY: usize = 16;
-/// Default capacity for call position vectors
 const DEFAULT_CALL_POS_CAPACITY: usize = 16;
-/// Default capacity for small vectors (expired intervals, conflicts)
 const DEFAULT_SMALL_VEC_CAPACITY: usize = 8;
 
 // ============================================================================

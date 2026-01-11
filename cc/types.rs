@@ -561,8 +561,7 @@ enum TypeKey {
     },
 }
 
-/// Default capacity for type table allocations (reduces reallocation overhead)
-const DEFAULT_TYPE_TABLE_CAPACITY: usize = 2048;
+const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
 
 /// Type table - stores all types and provides ID-based lookup
 /// Pattern follows IdentTable in token/lexer.rs
@@ -1129,6 +1128,11 @@ impl TypeTable {
             offset
         };
         (size, max_align)
+    }
+
+    /// Get the number of interned types
+    pub fn len(&self) -> usize {
+        self.types.len()
     }
 
     /// Compute union layout (all members at offset 0)

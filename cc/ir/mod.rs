@@ -27,27 +27,14 @@ use crate::types::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-// ============================================================================
-// Capacity Constants for Collection Pre-allocation
-// ============================================================================
-
-/// Default capacity for basic block instruction vectors
-const DEFAULT_INSN_CAPACITY: usize = 16;
-/// Default capacity for basic block parent/children vectors (CFG edges)
+const DEFAULT_INSN_CAPACITY: usize = 32;
 const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
-/// Default capacity for dominator tree children/frontier vectors
 const DEFAULT_DOM_CAPACITY: usize = 4;
-/// Default capacity for instruction source operands
 const DEFAULT_SRC_CAPACITY: usize = 4;
-/// Default capacity for phi node source lists
 const DEFAULT_PHI_CAPACITY: usize = 4;
-/// Default capacity for function parameter vectors
 const DEFAULT_PARAM_CAPACITY: usize = 8;
-/// Default capacity for basic block vectors in a function
-const DEFAULT_BLOCK_CAPACITY: usize = 16;
-/// Default capacity for pseudo vectors in a function
-const DEFAULT_PSEUDO_CAPACITY: usize = 128;
-/// Default capacity for local variable HashMaps
+const DEFAULT_BLOCK_CAPACITY: usize = 512;
+const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
 const DEFAULT_LOCAL_CAPACITY: usize = 64;
 
 // ============================================================================

@@ -26,13 +26,9 @@ use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
-/// Default capacity for variable mapping HashMaps during IR linearization
 const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
-/// Default capacity for label/static HashMaps (typically smaller)
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
-/// Default capacity for loop break/continue target stacks (loop nesting depth)
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
-/// Default capacity for file scope static variable tracking
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
 
 /// Information about a local variable

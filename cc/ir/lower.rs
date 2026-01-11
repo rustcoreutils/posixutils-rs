@@ -18,7 +18,6 @@
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
 use std::collections::HashMap;
 
-/// Default capacity for phi elimination copy tracking
 const DEFAULT_COPY_CAPACITY: usize = 8;
 
 // ============================================================================

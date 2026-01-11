@@ -30,6 +30,10 @@ use std::collections::HashMap;
 const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
 /// Default capacity for label/static HashMaps (typically smaller)
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
+/// Default capacity for loop break/continue target stacks (loop nesting depth)
+const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
+/// Default capacity for file scope static variable tracking
+const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
 
 /// Information about a local variable
 #[derive(Clone)]
@@ -135,8 +139,8 @@ impl<'a> Linearizer<'a> {
             var_map: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
             locals: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
-            break_targets: Vec::new(),
-            continue_targets: Vec::new(),
+            break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
+            continue_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
             run_ssa: true, // Enable SSA conversion by default
             symbols,
             types,
@@ -151,7 +155,9 @@ impl<'a> Linearizer<'a> {
             current_pos: None,
             target,
             current_func_is_non_static_inline: false,
-            file_scope_statics: std::collections::HashSet::new(),
+            file_scope_statics: std::collections::HashSet::with_capacity(
+                DEFAULT_FILE_SCOPE_CAPACITY,
+            ),
         }
     }
 

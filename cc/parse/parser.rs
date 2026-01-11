@@ -24,6 +24,17 @@ use crate::types::{
 };
 use std::fmt;
 
+/// Default capacity for argument lists in function calls
+const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
+/// Default capacity for struct/union member lists
+const DEFAULT_MEMBER_CAPACITY: usize = 16;
+/// Default capacity for enum constant lists
+const DEFAULT_ENUM_CAPACITY: usize = 16;
+/// Default capacity for initializer element lists
+const DEFAULT_INIT_CAPACITY: usize = 8;
+/// Default capacity for function parameter lists
+const DEFAULT_PARAM_CAPACITY: usize = 8;
+
 // ============================================================================
 // Parse Error
 // ============================================================================
@@ -953,7 +964,7 @@ impl<'a> Parser<'a> {
         let list_pos = self.current_pos();
         self.expect_special(b'{')?;
 
-        let mut elements = Vec::new();
+        let mut elements = Vec::with_capacity(DEFAULT_INIT_CAPACITY);
 
         // Handle empty initializer list: {}
         if self.is_special(b'}') {
@@ -2056,7 +2067,7 @@ impl<'a> Parser<'a> {
 
     /// Parse function argument list
     fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
-        let mut args = Vec::new();
+        let mut args = Vec::with_capacity(DEFAULT_ARG_LIST_CAPACITY);
 
         if self.is_special(b')') {
             return Ok(args);
@@ -3929,7 +3940,7 @@ impl Parser<'_> {
         if self.is_special(b'{') {
             self.advance(); // consume '{'
 
-            let mut constants = Vec::new();
+            let mut constants = Vec::with_capacity(DEFAULT_ENUM_CAPACITY);
             let mut next_value = 0i64;
 
             while !self.is_special(b'}') && !self.is_eof() {
@@ -4046,7 +4057,7 @@ impl Parser<'_> {
         if self.is_special(b'{') {
             self.advance(); // consume '{'
 
-            let mut members = Vec::new();
+            let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
 
             while !self.is_special(b'}') && !self.is_eof() {
                 // Parse member declaration
@@ -4681,7 +4692,7 @@ impl Parser<'_> {
 
     /// Parse a parameter list
     fn parse_parameter_list(&mut self) -> ParseResult<(Vec<Parameter>, bool)> {
-        let mut params = Vec::new();
+        let mut params = Vec::with_capacity(DEFAULT_PARAM_CAPACITY);
         let mut variadic = false;
 
         if self.is_special(b')') {

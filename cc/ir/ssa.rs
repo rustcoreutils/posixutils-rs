@@ -18,6 +18,11 @@ use super::{BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, Pseudo
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
+/// Default capacity for SSA variable rename tracking
+const DEFAULT_SSA_RENAME_CAPACITY: usize = 32;
+/// Default capacity for SSA phi tracking vectors
+const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
+
 // ============================================================================
 // SSA Conversion State
 // ============================================================================
@@ -79,9 +84,9 @@ impl<'a> SsaConverter<'a> {
 
         Self {
             func,
-            to_rename: HashSet::new(),
-            all_phis: Vec::new(),
-            dead_stores: Vec::new(),
+            to_rename: HashSet::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
+            all_phis: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
+            dead_stores: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
             next_pseudo_id: max_pseudo_id + 1,
             next_reg_nr: max_reg_nr + 1,
         }
@@ -284,7 +289,7 @@ struct DefStack {
 impl DefStack {
     fn new() -> Self {
         Self {
-            stacks: HashMap::new(),
+            stacks: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
         }
     }
 

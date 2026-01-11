@@ -28,6 +28,29 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // ============================================================================
+// Capacity Constants for Collection Pre-allocation
+// ============================================================================
+
+/// Default capacity for basic block instruction vectors
+const DEFAULT_INSN_CAPACITY: usize = 16;
+/// Default capacity for basic block parent/children vectors (CFG edges)
+const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
+/// Default capacity for dominator tree children/frontier vectors
+const DEFAULT_DOM_CAPACITY: usize = 4;
+/// Default capacity for instruction source operands
+const DEFAULT_SRC_CAPACITY: usize = 4;
+/// Default capacity for phi node source lists
+const DEFAULT_PHI_CAPACITY: usize = 4;
+/// Default capacity for function parameter vectors
+const DEFAULT_PARAM_CAPACITY: usize = 8;
+/// Default capacity for basic block vectors in a function
+const DEFAULT_BLOCK_CAPACITY: usize = 16;
+/// Default capacity for pseudo vectors in a function
+const DEFAULT_PSEUDO_CAPACITY: usize = 128;
+/// Default capacity for local variable HashMaps
+const DEFAULT_LOCAL_CAPACITY: usize = 64;
+
+// ============================================================================
 // Instruction Reference - for def-use chains
 // ============================================================================
 
@@ -548,18 +571,18 @@ impl Default for Instruction {
         Self {
             op: Opcode::Nop,
             target: None,
-            src: Vec::new(),
+            src: Vec::with_capacity(DEFAULT_SRC_CAPACITY),
             typ: None,
             bb_true: None,
             bb_false: None,
             offset: 0,
-            phi_list: Vec::new(),
+            phi_list: Vec::with_capacity(DEFAULT_PHI_CAPACITY),
             func_name: None,
             size: 0,
             src_size: 0,
             switch_cases: Vec::new(),
             switch_default: None,
-            arg_types: Vec::new(),
+            arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             variadic_arg_start: None,
             is_sret_call: false,
             is_noreturn_call: false,
@@ -943,15 +966,15 @@ impl Default for BasicBlock {
     fn default() -> Self {
         Self {
             id: BasicBlockId(0),
-            insns: Vec::new(),
-            parents: Vec::new(),
-            children: Vec::new(),
+            insns: Vec::with_capacity(DEFAULT_INSN_CAPACITY),
+            parents: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
+            children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
             label: None,
             idom: None,
             dom_level: 0,
-            dom_children: Vec::new(),
-            dom_frontier: Vec::new(),
-            phi_map: HashMap::new(),
+            dom_children: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
+            dom_frontier: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
+            phi_map: HashMap::with_capacity(DEFAULT_PHI_CAPACITY),
         }
     }
 }
@@ -1073,12 +1096,12 @@ impl Default for Function {
         Self {
             name: String::new(),
             return_type: TypeId::INVALID,
-            params: Vec::new(),
-            blocks: Vec::new(),
+            params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
+            blocks: Vec::with_capacity(DEFAULT_BLOCK_CAPACITY),
             entry: BasicBlockId(0),
-            pseudos: Vec::new(),
+            pseudos: Vec::with_capacity(DEFAULT_PSEUDO_CAPACITY),
             next_pseudo: 0,
-            locals: HashMap::new(),
+            locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
             max_dom_level: 0,
             is_static: false,
             is_noreturn: false,

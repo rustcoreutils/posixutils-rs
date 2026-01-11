@@ -13,6 +13,17 @@ use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKin
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
+/// Default capacity for live interval maps
+const DEFAULT_INTERVAL_CAPACITY: usize = 64;
+/// Default capacity for constraint point vectors
+const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
+/// Default capacity for phi source/target tracking
+const DEFAULT_PHI_TRACKING_CAPACITY: usize = 16;
+/// Default capacity for call position vectors
+const DEFAULT_CALL_POS_CAPACITY: usize = 16;
+/// Default capacity for small vectors (expired intervals, conflicts)
+const DEFAULT_SMALL_VEC_CAPACITY: usize = 8;
+
 // ============================================================================
 // Common Types
 // ============================================================================
@@ -53,7 +64,7 @@ pub fn expire_intervals<R: Copy>(
     free_regs: &mut Vec<R>,
     point: usize,
 ) {
-    let mut to_remove = Vec::new();
+    let mut to_remove = Vec::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
     for (i, (interval, reg)) in active.iter().enumerate() {
         if interval.end < point {
             free_regs.push(*reg);
@@ -70,7 +81,7 @@ pub fn expire_intervals<R: Copy>(
 /// Includes Call, Longjmp, and Setjmp opcodes since they all invoke external functions
 /// and clobber caller-saved registers.
 pub fn find_call_positions(func: &Function) -> Vec<usize> {
-    let mut call_positions = Vec::new();
+    let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
     let mut pos = 0usize;
     for block in &func.blocks {
         for insn in &block.insns {
@@ -101,7 +112,7 @@ pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
     interval: &LiveInterval,
     constraint_points: &[ConstraintPoint<R>],
 ) -> HashSet<R> {
-    let mut conflicts = HashSet::new();
+    let mut conflicts = HashSet::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
 
     for cp in constraint_points {
         // If interval is live at this constraint point...
@@ -148,13 +159,16 @@ where
         in_loop: bool,
     }
 
-    let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
-    let mut constraint_points: Vec<ConstraintPoint<R>> = Vec::new();
+    let mut intervals: HashMap<PseudoId, IntervalInfo> =
+        HashMap::with_capacity(DEFAULT_INTERVAL_CAPACITY);
+    let mut constraint_points: Vec<ConstraintPoint<R>> =
+        Vec::with_capacity(DEFAULT_CONSTRAINT_CAPACITY);
     let mut pos = 0usize;
 
     // First pass: compute block start and end positions
-    let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
-    let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::new();
+    let mut block_start_pos: HashMap<BasicBlockId, usize> =
+        HashMap::with_capacity(func.blocks.len());
+    let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::with_capacity(func.blocks.len());
     let mut temp_pos = 0usize;
     for block in &func.blocks {
         block_start_pos.insert(block.id, temp_pos);
@@ -180,8 +194,10 @@ where
     }
 
     // Collect phi sources and targets
-    let mut phi_sources: Vec<(BasicBlockId, PseudoId)> = Vec::new();
-    let mut phi_targets: Vec<(BasicBlockId, PseudoId)> = Vec::new();
+    let mut phi_sources: Vec<(BasicBlockId, PseudoId)> =
+        Vec::with_capacity(DEFAULT_PHI_TRACKING_CAPACITY);
+    let mut phi_targets: Vec<(BasicBlockId, PseudoId)> =
+        Vec::with_capacity(DEFAULT_PHI_TRACKING_CAPACITY);
 
     for block in &func.blocks {
         for insn in &block.insns {
@@ -297,10 +313,11 @@ where
     }
 
     // Handle loop back edges
-    let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> = Vec::new();
+    let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> =
+        Vec::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
     for block in &func.blocks {
         if let Some(last_insn) = block.insns.last() {
-            let mut targets = Vec::new();
+            let mut targets = Vec::with_capacity(2);
             if let Some(target) = last_insn.bb_true {
                 targets.push(target);
             }
@@ -381,7 +398,7 @@ where
 {
     use crate::ir::Opcode;
 
-    let mut fp_pseudos = HashSet::new();
+    let mut fp_pseudos = HashSet::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
 
     // Mark FVal constants as FP
     for pseudo in &func.pseudos {

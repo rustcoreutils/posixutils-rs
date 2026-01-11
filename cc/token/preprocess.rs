@@ -26,6 +26,12 @@ use crate::target::Target;
 
 /// Default capacity for macro HashMap (covers predefined macros + typical program macros)
 const DEFAULT_MACRO_CAPACITY: usize = 32;
+/// Default capacity for #if/#ifdef condition stack (typical nesting depth)
+const DEFAULT_COND_STACK_CAPACITY: usize = 8;
+/// Default capacity for include path lists
+const DEFAULT_INCLUDE_PATH_CAPACITY: usize = 8;
+/// Default capacity for include tracking sets (once files, expanding)
+const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 
 /// Source of an included file
 pub enum IncludeSource {
@@ -413,18 +419,18 @@ impl<'a> Preprocessor<'a> {
         let mut pp = Self {
             target,
             macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
-            cond_stack: Vec::new(),
-            system_include_paths: Vec::new(),
-            quote_include_paths: Vec::new(),
+            cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
+            system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
+            quote_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             current_file: filename.to_string(),
             base_file: filename.to_string(),
             current_dir,
             counter: 0,
             include_depth: 0,
             max_include_depth: 200,
-            include_stack: HashSet::new(),
-            once_files: HashSet::new(),
-            expanding: HashSet::new(),
+            include_stack: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
+            once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
+            expanding: HashSet::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             compile_date,
             compile_time,
             preprocess_depth: 0,

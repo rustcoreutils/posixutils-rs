@@ -44,6 +44,13 @@ const MAX_INLINE_SIZE: usize = 100;
 /// Maximum growth in caller size before we stop inlining
 const MAX_CALLER_GROWTH: usize = 1000;
 
+/// Default capacity for inline candidate HashMap
+const DEFAULT_CANDIDATE_CAPACITY: usize = 16;
+/// Default capacity for pseudo/block remapping HashMaps
+const DEFAULT_REMAP_CAPACITY: usize = 64;
+/// Default capacity for block ordering during inlining
+const DEFAULT_ORDER_CAPACITY: usize = 16;
+
 // ============================================================================
 // Inline Candidate Analysis
 // ============================================================================
@@ -67,7 +74,7 @@ pub struct InlineCandidate {
 
 /// Analyze all functions in a module for inlineability
 pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate> {
-    let mut candidates = HashMap::new();
+    let mut candidates = HashMap::with_capacity(module.functions.len());
 
     for func in &module.functions {
         let candidate = analyze_function(func, module);
@@ -250,9 +257,9 @@ impl InlineContext {
         let callee_locals: HashSet<String> = callee.locals.keys().cloned().collect();
 
         Self {
-            pseudo_map: HashMap::new(),
-            bb_map: HashMap::new(),
-            global_sym_map: HashMap::new(),
+            pseudo_map: HashMap::with_capacity(DEFAULT_REMAP_CAPACITY),
+            bb_map: HashMap::with_capacity(DEFAULT_ORDER_CAPACITY),
+            global_sym_map: HashMap::with_capacity(DEFAULT_ORDER_CAPACITY),
             next_pseudo_id: caller.next_pseudo,
             next_bb_id: max_bb + 1,
             call_args,
@@ -556,8 +563,8 @@ fn inline_call_site(
     ctx.return_continuation_bb = continuation_bb_id;
 
     // Clone all basic blocks from callee
-    let mut inlined_blocks: Vec<BasicBlock> = Vec::new();
-    let mut inlined_pseudos: Vec<Pseudo> = Vec::new();
+    let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
+    let mut inlined_pseudos: Vec<Pseudo> = Vec::with_capacity(callee.pseudos.len());
 
     for callee_bb in &callee.blocks {
         let new_bb_id = ctx.bb_map[&callee_bb.id];
@@ -749,9 +756,10 @@ fn reorder_blocks_topologically(func: &mut Function) {
         .collect();
 
     // BFS from entry to get reachable blocks in control flow order
-    let mut visited: HashSet<BasicBlockId> = HashSet::new();
-    let mut order: Vec<BasicBlockId> = Vec::new();
-    let mut queue: std::collections::VecDeque<BasicBlockId> = std::collections::VecDeque::new();
+    let mut visited: HashSet<BasicBlockId> = HashSet::with_capacity(func.blocks.len());
+    let mut order: Vec<BasicBlockId> = Vec::with_capacity(func.blocks.len());
+    let mut queue: std::collections::VecDeque<BasicBlockId> =
+        std::collections::VecDeque::with_capacity(DEFAULT_ORDER_CAPACITY);
 
     queue.push_back(func.entry);
 
@@ -917,8 +925,8 @@ fn remove_dead_functions(module: &mut Module) {
     let func_names: HashSet<String> = module.functions.iter().map(|f| f.name.clone()).collect();
 
     // Count calls to each function and track address-taken functions
-    let mut call_counts: HashMap<String, usize> = HashMap::new();
-    let mut address_taken: HashSet<String> = HashSet::new();
+    let mut call_counts: HashMap<String, usize> = HashMap::with_capacity(module.functions.len());
+    let mut address_taken: HashSet<String> = HashSet::with_capacity(DEFAULT_CANDIDATE_CAPACITY);
 
     // Check function code for calls and address-taken via SymAddr instructions
     for func in &module.functions {

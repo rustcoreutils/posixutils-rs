@@ -113,7 +113,7 @@ fn test_rm_cycle() {
     fs::create_dir_all(a_b).unwrap();
     fs::File::create(a_b_file).unwrap();
 
-    let ug_w = (libc::S_IWUSR | libc::S_IWGRP) as u32;
+    let ug_w = libc::S_IWUSR | libc::S_IWGRP;
     let mode = fs::metadata(a_b).unwrap().mode();
     fs::set_permissions(a_b, fs::Permissions::from_mode(mode & !ug_w)).unwrap();
 
@@ -160,7 +160,7 @@ fn test_rm_deep_2() {
     let x200: &str = &["x"; 200].join("");
 
     fs::create_dir(test_dir).unwrap();
-    fs::create_dir(&x).unwrap();
+    fs::create_dir(x).unwrap();
 
     // The final filename is too long to use for `fs::create_dir_all`. It also
     // cannot be created via `std::env::set_current_dir` because changing the
@@ -273,7 +273,7 @@ fn test_rm_empty_inacc() {
 
     fs::create_dir(test_dir).unwrap();
 
-    fs::DirBuilder::new().mode(0).create(inacc).unwrap();
+    fs::DirBuilder::new().mode(0o0).create(inacc).unwrap();
     rm_test(&["-rf", inacc], "", "", 0);
     assert!(!Path::new(inacc).exists());
 
@@ -445,7 +445,7 @@ fn test_rm_isatty() {
 
     fs::create_dir(test_dir).unwrap();
     fs::File::create(f).unwrap();
-    fs::set_permissions(f, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(f, fs::Permissions::from_mode(0o0)).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_rm");
 
@@ -869,7 +869,7 @@ fn test_rm_rm3() {
     }
     for path in [fu, du, empty_u] {
         let mode = fs::metadata(path).unwrap().mode();
-        let write = libc::S_IWUSR as u32;
+        let write = libc::S_IWUSR;
         fs::set_permissions(path, fs::Permissions::from_mode(mode & !write)).unwrap();
     }
 
@@ -958,7 +958,7 @@ fn test_rm_sunos_1() {
     rm_test(
         &[""],
         "",
-        &format!("rm: cannot remove '': No such file or directory\n"),
+        "rm: cannot remove '': No such file or directory\n",
         1,
     );
 }

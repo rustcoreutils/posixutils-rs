@@ -1133,8 +1133,8 @@ mod tests {
     fn test_parse_pax_time() {
         assert_eq!(parse_pax_time("1234567890").unwrap(), 1234567890.0);
         assert_eq!(
-            parse_pax_time("1234567890.123456789").unwrap(),
-            1234567890.123456789
+            parse_pax_time("1234567890.1234567").unwrap(),
+            1234567890.1234567
         );
     }
 
@@ -1149,7 +1149,7 @@ mod tests {
         let mut ext = ExtendedHeader::new();
         ext.path = Some("/very/long/path/that/exceeds/ustar/limits".to_string());
         ext.size = Some(10000000000);
-        ext.mtime = Some(1234567890.123456789);
+        ext.mtime = Some(1234567890.1234567);
 
         let data = ext.serialize(&FormatOptions::default());
         let parsed = ExtendedHeader::parse(&data).unwrap();

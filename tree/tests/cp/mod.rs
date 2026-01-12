@@ -303,8 +303,8 @@ fn test_cp_fail_perm() {
     let symlink = &format!("{test_dir}/symlink");
     let f = &format!("{test_dir}/f");
 
-    let setgid = libc::S_ISGID as u32;
-    let setuid = libc::S_ISUID as u32;
+    let setgid = libc::S_ISGID;
+    let setuid = libc::S_ISUID;
 
     fs::create_dir(test_dir).unwrap();
 
@@ -317,7 +317,7 @@ fn test_cp_fail_perm() {
     fs::File::create(d_a).unwrap();
 
     // chmod 0 D/a
-    fs::set_permissions(d_a, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(d_a, fs::Permissions::from_mode(0o0)).unwrap();
 
     // chmod u=rx,go=,-st D
     let nonperm_bits = fs::symlink_metadata(d).unwrap().mode() & !(setgid | setuid) & !0o777;
@@ -331,7 +331,7 @@ fn test_cp_fail_perm() {
     );
 
     // chmod 0 D
-    fs::set_permissions(d, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(d, fs::Permissions::from_mode(0o0)).unwrap();
     unix::fs::symlink(d_d, symlink).unwrap();
     fs::File::create(f).unwrap();
 
@@ -391,7 +391,7 @@ fn test_cp_i_2() {
 
         if var == f || var == h {
             // chmod 0
-            let perm = fs::Permissions::from_mode(0);
+            let perm = fs::Permissions::from_mode(0o0);
             fs::set_permissions(var, perm).unwrap();
         }
     }
@@ -868,17 +868,17 @@ fn test_cp_special_bits() {
     let a_mode = fs::metadata(a).unwrap().mode();
     fs::set_permissions(
         a,
-        fs::Permissions::from_mode(a_mode | libc::S_IXUSR as u32 | libc::S_ISUID as u32),
+        fs::Permissions::from_mode(a_mode | libc::S_IXUSR | libc::S_ISUID),
     )
     .unwrap();
 
     // chmod u=rwx,g=sx,o= b
-    fs::set_permissions(b, fs::Permissions::from_mode(0o710 | libc::S_ISGID as u32)).unwrap();
+    fs::set_permissions(b, fs::Permissions::from_mode(0o710 | libc::S_ISGID)).unwrap();
 
     // chmod a=r,ug+sx c
     fs::set_permissions(
         c,
-        fs::Permissions::from_mode(0o554 | libc::S_ISUID as u32 | libc::S_ISGID as u32),
+        fs::Permissions::from_mode(0o554 | libc::S_ISUID | libc::S_ISGID),
     )
     .unwrap();
 
@@ -949,8 +949,8 @@ fn test_cp_issue199() {
     let dd = &format!("{test_dir}/DD");
     let d_d = &format!("{test_dir}/D/D");
 
-    let setgid = libc::S_ISGID as u32;
-    let setuid = libc::S_ISUID as u32;
+    let setgid = libc::S_ISGID;
+    let setuid = libc::S_ISUID;
 
     fs::create_dir(test_dir).unwrap();
 

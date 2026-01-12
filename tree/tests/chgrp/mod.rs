@@ -288,7 +288,7 @@ fn test_chgrp_basic() {
         fs::set_permissions(f, fs::Permissions::from_mode(new_mode)).unwrap();
     }
     chown_from(f, gid2, gid1);
-    fs::set_permissions(f, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(f, fs::Permissions::from_mode(0o0)).unwrap();
     chown_from(f, gid1, gid2);
 
     {

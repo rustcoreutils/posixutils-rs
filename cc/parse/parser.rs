@@ -5631,7 +5631,6 @@ mod tests {
         let mut strings = StringTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
@@ -6903,7 +6902,6 @@ mod tests {
         let mut strings = StringTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
@@ -7142,7 +7140,6 @@ mod tests {
         let mut strings = StringTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
@@ -7271,7 +7268,6 @@ mod tests {
         let mut strings = StringTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
@@ -7325,7 +7321,6 @@ mod tests {
         let mut strings = StringTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new(64);
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);

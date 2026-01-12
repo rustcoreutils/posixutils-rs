@@ -68,7 +68,7 @@ fn test_xgettext_pathname() {
     xgettext_test(
         &[
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_gettext.rs",
         ],
         temp_dir.path().join("messages.pot"),
@@ -84,7 +84,7 @@ fn test_xgettext_domain_pathname() {
             "-d",
             "domain",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_gettext.rs",
         ],
         temp_dir.path().join("domain.pot"),
@@ -99,7 +99,7 @@ fn test_xgettext_pathname_lines() {
         &[
             "-n",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_gettext.rs",
         ],
         temp_dir.path().join("messages.pot"),
@@ -114,7 +114,7 @@ fn test_clap() {
         &[
             "-n",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_clap.rs",
         ],
         temp_dir.path().join("messages.pot"),
@@ -129,7 +129,7 @@ fn test_xgettext_ngettext() {
         &[
             "-n",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_ngettext.rs",
         ],
         temp_dir.path().join("messages.pot"),
@@ -144,7 +144,7 @@ fn test_xgettext_pgettext() {
         &[
             "-n",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_pgettext.rs",
         ],
         temp_dir.path().join("messages.pot"),
@@ -159,7 +159,7 @@ fn test_xgettext_npgettext() {
         &[
             "-n",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_npgettext.rs",
         ],
         temp_dir.path().join("messages.pot"),
@@ -174,7 +174,7 @@ fn test_xgettext_c_file() {
         &[
             "-n",
             "-p",
-            &temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_str().unwrap(),
             "tests/xgettext/test_c.c",
         ],
         temp_dir.path().join("messages.pot"),

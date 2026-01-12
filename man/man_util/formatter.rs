@@ -7294,7 +7294,7 @@ footer text                     January 1, 1970                    footer text";
         #[test]
         fn delimiters_inline_common() {
             fn test(macro_str: &str) {
-                let input = vec![
+                let input = [
                     format!(".Dd January 1, 1970\n.Dt PROGNAME section\n.Os footer text"),
                     format!(".{} {} text {}", macro_str, "(", ")"),
                     format!(".{} {} text {}", macro_str, "[", "]"),
@@ -7314,7 +7314,7 @@ footer text                     January 1, 1970                    footer text";
 
 footer text                     January 1, 1970                    footer text";
 
-                test_formatting(&input, &output);
+                test_formatting(&input, output);
             }
 
             let inline_macros = vec![
@@ -7342,7 +7342,7 @@ footer text                     January 1, 1970                    footer text";
                     _ => unreachable!(),
                 };
 
-                let input = vec![
+                let input = [
                     format!(".Dd January 1, 1970\n.Dt PROGNAME section\n.Os footer text"),
                     format!(".{} {} text {}", macro_str, "(", ")"),
                     format!(".{} {} text {}", macro_str, "[", "]"),

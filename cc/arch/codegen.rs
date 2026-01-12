@@ -293,6 +293,20 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     self.push_directive(Directive::Byte(0));
                 }
             }
+            Initializer::WideString(s) => {
+                // Emit wide string as sequence of 4-byte values (wchar_t = int)
+                let char_count = s.chars().count();
+                for ch in s.chars() {
+                    self.push_directive(Directive::Long(ch as i64));
+                }
+                // Null terminator
+                self.push_directive(Directive::Long(0));
+                // Zero-fill remaining bytes if array is larger than string
+                let wide_string_bytes = (char_count + 1) * 4; // +1 for null terminator, 4 bytes each
+                if size > wide_string_bytes {
+                    self.push_directive(Directive::Zero((size - wide_string_bytes) as u32));
+                }
+            }
             Initializer::Array {
                 elem_size,
                 total_size,
@@ -359,6 +373,29 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         for (label, content) in strings {
             self.push_directive(Directive::local_label(label));
             self.push_directive(Directive::Asciz(escape_string(content)));
+        }
+
+        self.push_directive(Directive::Text);
+    }
+
+    /// Emit wide string literals to the rodata section
+    /// Each character is output as a 4-byte value (wchar_t = int = 4 bytes)
+    pub fn emit_wide_strings(&mut self, wide_strings: &[(String, String)]) {
+        if wide_strings.is_empty() {
+            return;
+        }
+
+        self.push_directive(Directive::Rodata);
+        self.push_directive(Directive::Align(4)); // 4-byte alignment for int
+
+        for (label, content) in wide_strings {
+            self.push_directive(Directive::local_label(label));
+            // Emit each character as a 4-byte value
+            for ch in content.chars() {
+                self.push_directive(Directive::Long(ch as i64));
+            }
+            // Null terminator
+            self.push_directive(Directive::Long(0));
         }
 
         self.push_directive(Directive::Text);

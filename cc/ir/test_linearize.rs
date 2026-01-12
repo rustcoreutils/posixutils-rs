@@ -10,6 +10,9 @@
 // These tests cover bug fixes and regression prevention
 //
 
+// Allow approximate float constants in tests - we're testing literal parsing, not using PI
+#![allow(clippy::approx_constant)]
+
 use super::*;
 use crate::parse::ast::{
     AssignOp, BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator,
@@ -44,6 +47,8 @@ fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDe
         params: vec![],
         body,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     }
 }
 
@@ -72,6 +77,8 @@ fn test_parameter_stored_to_local() {
         }],
         body: Stmt::Return(Some(Expr::var_typed(x_id, int_type))),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -123,6 +130,8 @@ fn test_function_with_many_params() {
             &types,
         ))),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -182,6 +191,8 @@ fn test_compound_assignment_deref() {
         }],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -253,6 +264,8 @@ fn test_compound_assignment_index() {
         ],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -318,6 +331,8 @@ fn test_simple_array_element_store() {
         }],
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -410,6 +425,8 @@ fn test_nested_if_cfg_linking() {
         ],
         body: outer_if,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -477,6 +494,8 @@ fn test_switch_basic() {
         }],
         body: switch_stmt,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -548,6 +567,8 @@ fn test_switch_with_break() {
         }],
         body: switch_stmt,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -620,6 +641,8 @@ fn test_do_while_basic() {
         }],
         body: do_while,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -702,6 +725,8 @@ fn test_do_while_with_break() {
         ],
         body: do_while,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -774,6 +799,8 @@ fn test_goto_forward() {
         }],
         body,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -847,6 +874,8 @@ fn test_goto_backward() {
         }],
         body,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -921,6 +950,8 @@ fn test_nested_loop_break() {
         }],
         body: outer_loop,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1005,6 +1036,8 @@ fn test_nested_loop_continue() {
         ],
         body: outer_loop,
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1062,6 +1095,8 @@ fn test_unary_logical_not() {
         }],
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1105,6 +1140,8 @@ fn test_unary_bitwise_not() {
         }],
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1148,6 +1185,8 @@ fn test_unary_negate() {
         }],
         body: Stmt::Return(Some(neg_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1191,6 +1230,8 @@ fn test_pre_increment() {
         }],
         body: Stmt::Return(Some(inc_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1246,6 +1287,8 @@ fn test_pointer_add_int() {
         }],
         body: Stmt::Return(Some(add_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1307,6 +1350,8 @@ fn test_pointer_difference() {
         ],
         body: Stmt::Return(Some(diff_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1367,6 +1412,8 @@ fn test_float_add() {
         ],
         body: Stmt::Return(Some(add_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1417,6 +1464,8 @@ fn test_float_comparison() {
         ],
         body: Stmt::Return(Some(cmp_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1461,6 +1510,8 @@ fn test_float_to_int_cast() {
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1505,6 +1556,8 @@ fn test_int_to_float_cast() {
         }],
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1702,6 +1755,8 @@ fn test_linearize_function_with_params() {
             &types,
         ))),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1889,6 +1944,8 @@ fn test_local_var_emits_load_store() {
             BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1954,6 +2011,8 @@ fn test_ssa_converts_local_to_phi() {
             BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2013,6 +2072,8 @@ fn test_ssa_loop_variable() {
             BlockItem::Statement(Stmt::Return(Some(i_var()))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2059,6 +2120,8 @@ fn test_short_circuit_and() {
             &types,
         ))),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2115,6 +2178,8 @@ fn test_short_circuit_or() {
             &types,
         ))),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2182,6 +2247,8 @@ fn test_ternary_pure_uses_select() {
         ],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2254,6 +2321,8 @@ fn test_ternary_impure_uses_phi() {
         }],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2338,6 +2407,8 @@ fn test_ternary_with_assignment_uses_phi() {
         ],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2407,6 +2478,8 @@ fn test_ternary_with_post_increment_uses_phi() {
         ],
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2465,6 +2538,8 @@ fn test_string_literal_char_array_init() {
             BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &types)))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2512,6 +2587,8 @@ fn test_string_literal_char_pointer_init() {
             BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &types)))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2662,6 +2739,8 @@ fn test_incomplete_struct_type_resolution() {
             }],
         })]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2743,6 +2822,8 @@ fn test_static_local_pre_increment() {
             BlockItem::Statement(Stmt::Return(Some(inc_expr))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
 
     let tu = TranslationUnit {
@@ -2814,6 +2895,8 @@ fn test_static_local_pre_decrement() {
             BlockItem::Statement(Stmt::Return(Some(dec_expr))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
 
     let tu = TranslationUnit {
@@ -2878,6 +2961,8 @@ fn test_static_local_post_increment() {
             BlockItem::Statement(Stmt::Return(Some(inc_expr))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
 
     let tu = TranslationUnit {
@@ -2942,6 +3027,8 @@ fn test_static_local_post_decrement() {
             BlockItem::Statement(Stmt::Return(Some(dec_expr))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
 
     let tu = TranslationUnit {
@@ -3011,6 +3098,8 @@ fn test_static_local_compound_assignment() {
             BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(sum_id, static_int_type)))),
         ]),
         pos: test_pos(),
+        is_static: false,
+        is_inline: false,
     };
 
     let tu = TranslationUnit {
@@ -3033,6 +3122,380 @@ fn test_static_local_compound_assignment() {
     assert!(
         ir.contains("test.sum"),
         "Static local should use global name 'test.sum'. IR:\n{}",
+        ir
+    );
+}
+
+// ============================================================================
+// Wide string literal tests
+// ============================================================================
+
+#[test]
+fn test_wide_string_literal_expression() {
+    // Test: return L"hello";
+    // Wide string literal should create a .LWC label and emit wide string data
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+
+    // wchar_t* is int* on this platform
+    let wchar_ptr_type = types.intern(Type::pointer(types.int_id));
+
+    // Function: wchar_t* test() { return L"hello"; }
+    let func = FunctionDef {
+        return_type: wchar_ptr_type,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Return(Some(Expr::typed_unpositioned(
+            ExprKind::WideStringLit("hello".to_string()),
+            wchar_ptr_type,
+        ))),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+
+    // Check that wide string was added to the module
+    assert!(
+        !module.wide_strings.is_empty(),
+        "Wide string literal should be added to module.wide_strings"
+    );
+
+    // Check label format
+    let (label, content) = &module.wide_strings[0];
+    assert!(
+        label.starts_with(".LWC"),
+        "Wide string label should start with .LWC, got: {}",
+        label
+    );
+    assert_eq!(content, "hello", "Wide string content should match");
+}
+
+#[test]
+fn test_wide_string_literal_is_pure() {
+    // Test that WideStringLit is considered a pure expression
+    // This is important for ternary optimization
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let cond_id = strings.intern("cond");
+
+    let wchar_ptr_type = types.intern(Type::pointer(types.int_id));
+
+    // Function: wchar_t* test(int cond) { return cond ? L"yes" : L"no"; }
+    // Both branches are pure, so this should use select instead of phi
+    let ternary = Expr::typed_unpositioned(
+        ExprKind::Conditional {
+            cond: Box::new(Expr::var_typed(cond_id, types.int_id)),
+            then_expr: Box::new(Expr::typed_unpositioned(
+                ExprKind::WideStringLit("yes".to_string()),
+                wchar_ptr_type,
+            )),
+            else_expr: Box::new(Expr::typed_unpositioned(
+                ExprKind::WideStringLit("no".to_string()),
+                wchar_ptr_type,
+            )),
+        },
+        wchar_ptr_type,
+    );
+
+    let func = FunctionDef {
+        return_type: wchar_ptr_type,
+        name: test_id,
+        params: vec![Parameter {
+            name: Some(cond_id),
+            typ: types.int_id,
+        }],
+        body: Stmt::Return(Some(ternary)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // Wide strings are pure, so ternary should use select (sel in IR)
+    assert!(
+        ir.contains("sel."),
+        "Ternary with pure wide string branches should use select. IR:\n{}",
+        ir
+    );
+}
+
+// ============================================================================
+// __FUNCTION__ and __PRETTY_FUNCTION__ tests
+// ============================================================================
+
+#[test]
+fn test_gcc_function_identifier() {
+    // Test: __FUNCTION__ should behave like __func__
+    // Returns the current function name as a string
+    let mut strings = StringTable::new();
+    let types = TypeTable::new(64);
+    let my_func_id = strings.intern("my_func");
+    let function_id = strings.intern("__FUNCTION__");
+
+    // Function: const char* my_func() { return __FUNCTION__; }
+    let func = FunctionDef {
+        return_type: types.char_ptr_id,
+        name: my_func_id,
+        params: vec![],
+        body: Stmt::Return(Some(Expr::typed_unpositioned(
+            ExprKind::Ident { name: function_id },
+            types.char_ptr_id,
+        ))),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+
+    // Check that a string containing the function name was added
+    let has_func_name = module
+        .strings
+        .iter()
+        .any(|(_, content)| content == "my_func");
+    assert!(
+        has_func_name,
+        "__FUNCTION__ should add function name as string literal. strings: {:?}",
+        module.strings
+    );
+}
+
+#[test]
+fn test_gcc_pretty_function_identifier() {
+    // Test: __PRETTY_FUNCTION__ should behave like __func__
+    let mut strings = StringTable::new();
+    let types = TypeTable::new(64);
+    let another_func_id = strings.intern("another_func");
+    let pretty_function_id = strings.intern("__PRETTY_FUNCTION__");
+
+    // Function: const char* another_func() { return __PRETTY_FUNCTION__; }
+    let func = FunctionDef {
+        return_type: types.char_ptr_id,
+        name: another_func_id,
+        params: vec![],
+        body: Stmt::Return(Some(Expr::typed_unpositioned(
+            ExprKind::Ident {
+                name: pretty_function_id,
+            },
+            types.char_ptr_id,
+        ))),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+
+    // Check that a string containing the function name was added
+    let has_func_name = module
+        .strings
+        .iter()
+        .any(|(_, content)| content == "another_func");
+    assert!(
+        has_func_name,
+        "__PRETTY_FUNCTION__ should add function name as string literal. strings: {:?}",
+        module.strings
+    );
+}
+
+// ============================================================================
+// Static local address in initializer tests
+// ============================================================================
+
+#[test]
+fn test_static_local_address_in_initializer() {
+    // Test: static int x = 0; static int *p = &x;
+    // The address of a static local should use the mangled global name
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let x_id = strings.intern("x");
+    let p_id = strings.intern("p");
+
+    let static_int_type = types.intern(Type::with_modifiers(
+        crate::types::TypeKind::Int,
+        TypeModifiers::STATIC,
+    ));
+
+    let static_int_ptr_type = types.intern(Type {
+        kind: crate::types::TypeKind::Pointer,
+        modifiers: TypeModifiers::STATIC,
+        base: Some(types.int_id),
+        array_size: None,
+        params: None,
+        variadic: false,
+        noreturn: false,
+        composite: None,
+    });
+
+    // static int x = 0;
+    let x_decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: x_id,
+            typ: static_int_type,
+            init: Some(Expr::int(0, &types)),
+            vla_sizes: vec![],
+        }],
+    };
+
+    // static int *p = &x;
+    let addr_of_x = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::AddrOf,
+            operand: Box::new(Expr::var_typed(x_id, static_int_type)),
+        },
+        static_int_ptr_type,
+    );
+
+    let p_decl = Declaration {
+        declarators: vec![InitDeclarator {
+            name: p_id,
+            typ: static_int_ptr_type,
+            init: Some(addr_of_x),
+            vla_sizes: vec![],
+        }],
+    };
+
+    // Function body with both declarations
+    let func = FunctionDef {
+        return_type: types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(x_decl),
+            BlockItem::Declaration(p_decl),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+
+    // Check that p's initializer references the mangled name of x
+    let p_global = module
+        .globals
+        .iter()
+        .find(|(name, _, _)| name.contains("test.p"));
+    assert!(
+        p_global.is_some(),
+        "Should have a global for static local 'p'. globals: {:?}",
+        module.globals
+    );
+
+    // The initializer for p should be a SymAddr pointing to the mangled x name
+    if let Some((_, _, init)) = p_global {
+        if let Initializer::SymAddr(sym_name) = init {
+            assert!(
+                sym_name.contains("test.x"),
+                "Address of static local x should use mangled name 'test.x', got: {}",
+                sym_name
+            );
+        } else {
+            panic!(
+                "Static pointer initializer should be SymAddr, got: {:?}",
+                init
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Struct/union dereference tests
+// ============================================================================
+
+#[test]
+fn test_struct_deref_returns_address() {
+    // Test: struct S *p; return *p;
+    // Dereferencing a pointer to struct should return the address (for struct copy)
+    let mut strings = StringTable::new();
+    let mut types = TypeTable::new(64);
+    let test_id = strings.intern("test");
+    let p_id = strings.intern("p");
+    let s_tag = strings.intern("S");
+
+    // Define struct S { int x; }
+    let struct_type = Type::struct_type(CompositeType {
+        tag: Some(s_tag),
+        members: vec![StructMember {
+            name: strings.intern("x"),
+            typ: types.int_id,
+            offset: 0,
+            bit_width: None,
+            bit_offset: None,
+            storage_unit_size: None,
+        }],
+        enum_constants: vec![],
+        size: 4,
+        align: 4,
+        is_complete: true,
+    });
+    let struct_type_id = types.intern(struct_type);
+    let struct_ptr_type_id = types.intern(Type::pointer(struct_type_id));
+
+    // Function: struct S test(struct S *p) { return *p; }
+    let deref_p = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::Deref,
+            operand: Box::new(Expr::var_typed(p_id, struct_ptr_type_id)),
+        },
+        struct_type_id,
+    );
+
+    let func = FunctionDef {
+        return_type: struct_type_id,
+        name: test_id,
+        params: vec![Parameter {
+            name: Some(p_id),
+            typ: struct_ptr_type_id,
+        }],
+        body: Stmt::Return(Some(deref_p)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = test_linearize(&tu, &types, &strings);
+    let ir = format!("{}", module);
+
+    // The struct dereference should NOT generate a load instruction
+    // Instead, it returns the address for struct copying
+    // The return statement will handle the struct return ABI
+    // We should see memcpy or struct_store, not a simple load followed by ret
+    assert!(
+        !ir.contains("load i32"),
+        "Struct dereference should not generate scalar load. IR:\n{}",
         ir
     );
 }

@@ -87,8 +87,12 @@ impl Aarch64CodeGen {
     #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
         let is_extern = self.extern_symbols.contains(name);
-        // PIC mode or macOS: external symbols need GOT
-        (self.pic_mode || self.base.target.os == Os::MacOS) && is_extern
+        // External symbols always need GOT access:
+        // - On macOS: required for dynamic linking
+        // - On Linux: required for PIE (default) and when linking with shared libs
+        // - In PIC mode: always required
+        // Using GOT unconditionally for external symbols is safe and matches GCC/Clang behavior
+        is_extern
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -2355,6 +2359,11 @@ impl CodeGenerator for Aarch64CodeGen {
             self.base.emit_strings(&module.strings);
         }
 
+        // Emit wide string literals
+        if !module.wide_strings.is_empty() {
+            self.base.emit_wide_strings(&module.wide_strings);
+        }
+
         // Emit text start label for DWARF debug info (before first function)
         if module.debug && !module.functions.is_empty() {
             self.base.push_directive(Directive::local_label(".Ltext0"));
@@ -2377,14 +2386,22 @@ impl CodeGenerator for Aarch64CodeGen {
             let source_name = module.source_name.as_deref().unwrap_or("unknown");
             let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
 
+            // Only reference text labels if we have code (functions)
+            // Data-only files use 0 for low_pc/high_pc
+            let (low_pc, high_pc) = if module.functions.is_empty() {
+                (None, None)
+            } else {
+                (Some(".Ltext0"), Some(".Ltext_end"))
+            };
+
             super::super::dwarf::generate_abbrev_table(&mut self.base);
             super::super::dwarf::generate_debug_info(
                 &mut self.base,
                 &producer,
                 source_name,
                 comp_dir,
-                ".Ltext0",
-                ".Ltext_end",
+                low_pc,
+                high_pc,
             );
         }
 

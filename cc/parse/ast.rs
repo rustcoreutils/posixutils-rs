@@ -178,6 +178,9 @@ pub enum ExprKind {
     /// String literal
     StringLit(String),
 
+    /// Wide string literal (L"...")
+    WideStringLit(String),
+
     /// Identifier (variable reference)
     Ident {
         name: StringId,
@@ -774,6 +777,10 @@ pub struct FunctionDef {
     pub body: Stmt,
     /// Source position of function definition (for debug info)
     pub pos: Position,
+    /// Whether function has static linkage
+    pub is_static: bool,
+    /// Whether function is inline
+    pub is_inline: bool,
 }
 
 // ============================================================================

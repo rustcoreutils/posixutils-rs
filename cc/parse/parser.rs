@@ -323,24 +323,23 @@ impl<'a> Parser<'a> {
     /// Must be called after advancing past '('. Saves/restores position internally
     /// for the function-type check.
     fn is_grouped_declarator(&mut self) -> bool {
-        // Check for pointer: (*name)
+        // Check for pointer: (*name) or (*name[...]) etc
         if self.is_special(b'*') {
             return true;
         }
 
-        // Check for function type typedef: (name) where name is NOT a type
+        // Check for grouped declarator: (name...) where name is NOT a type
+        // This handles cases like:
+        //   (name)     - function type typedef
+        //   (name[N])  - parenthesized array declarator
+        //   (name(...)) - parenthesized function declarator
+        // Following sparse's is_nested() logic: if identifier is not a type, it's grouped
         if self.peek() == TokenType::Ident {
             if let Some(name_id) = self.get_ident_id(self.current()) {
                 let is_type = self.symbols.lookup_typedef(name_id).is_some()
                     || Self::is_type_keyword(self.str(name_id));
-                if !is_type {
-                    // Save position, advance past identifier, check for ')'
-                    let check_pos = self.pos;
-                    self.advance();
-                    let followed_by_paren = self.is_special(b')');
-                    self.pos = check_pos; // restore
-                    return followed_by_paren;
-                }
+                // If not a type, this is a grouped declarator
+                return !is_type;
             }
         }
 
@@ -381,6 +380,40 @@ impl<'a> Parser<'a> {
 
         // Couldn't resolve, return original
         type_id
+    }
+
+    /// Intern a type, but for struct/union types with tags, check the symbol table
+    /// first to reuse the existing TypeId. This ensures forward-declared types
+    /// are properly linked when the type is later completed.
+    ///
+    /// Important: Storage class modifiers (static, extern, etc.) are preserved from
+    /// the input type even when reusing an existing struct TypeId.
+    fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
+        // For struct/union types with a tag, use the existing TypeId from symbol table
+        if matches!(typ.kind, TypeKind::Struct | TypeKind::Union) {
+            if let Some(ref composite) = typ.composite {
+                if let Some(tag) = composite.tag {
+                    if let Some(existing) = self.symbols.lookup_tag(tag) {
+                        // Check if we need to preserve storage class modifiers
+                        let storage_class_mask = TypeModifiers::EXTERN
+                            | TypeModifiers::STATIC
+                            | TypeModifiers::TYPEDEF
+                            | TypeModifiers::REGISTER
+                            | TypeModifiers::AUTO;
+                        let new_storage_class = typ.modifiers & storage_class_mask;
+                        if !new_storage_class.is_empty() {
+                            // Create a new type with the existing struct's data but new modifiers
+                            let mut existing_type = self.types.get(existing.typ).clone();
+                            existing_type.modifiers |= new_storage_class;
+                            return self.types.intern(existing_type);
+                        }
+                        return existing.typ;
+                    }
+                }
+            }
+        }
+        // For other types, just intern normally
+        self.types.intern(typ.clone())
     }
 
     /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
@@ -2664,8 +2697,13 @@ impl<'a> Parser<'a> {
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
                     // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
-                    if name_str == "__func__" {
-                        // __func__ behaves like a string literal (const char[])
+                    // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave similarly
+                    if name_str == "__func__"
+                        || name_str == "__FUNCTION__"
+                        || name_str == "__PRETTY_FUNCTION__"
+                    {
+                        // These behave like a string literal (const char[])
+                        // Linearization handles mapping to __func__ behavior
                         return Ok(Self::typed_expr(
                             ExprKind::Ident { name: name_id },
                             self.types.char_ptr_id,
@@ -2740,6 +2778,33 @@ impl<'a> Parser<'a> {
                     ))
                 } else {
                     Err(ParseError::new("invalid string token", token.pos))
+                }
+            }
+
+            TokenType::WideString => {
+                let token = self.consume();
+                let token_pos = token.pos;
+                if let TokenValue::WideString(s) = &token.value {
+                    // Parse wide string literal - convert escape sequences
+                    let mut parsed = Self::parse_string_literal(s);
+
+                    // Handle adjacent wide string literal concatenation
+                    while self.peek() == TokenType::WideString {
+                        let next_token = self.consume();
+                        if let TokenValue::WideString(next_s) = &next_token.value {
+                            parsed.push_str(&Self::parse_string_literal(next_s));
+                        }
+                    }
+
+                    // Wide string literal type is wchar_t* (wchar_t is int on this platform)
+                    let wchar_ptr_id = self.types.intern(Type::pointer(self.types.int_id));
+                    Ok(Self::typed_expr(
+                        ExprKind::WideStringLit(parsed),
+                        wchar_ptr_id,
+                        token_pos,
+                    ))
+                } else {
+                    Err(ParseError::new("invalid wide string token", token.pos))
                 }
             }
 
@@ -3611,6 +3676,11 @@ impl Parser<'_> {
                 // size is string length + 1 for null terminator
                 Some(s.len() + 1)
             }
+            ExprKind::WideStringLit(s) => {
+                // For wchar_t array initialized with wide string literal,
+                // size is number of chars + 1 for null terminator
+                Some(s.chars().count() + 1)
+            }
             _ => None,
         };
 
@@ -3660,8 +3730,8 @@ impl Parser<'_> {
 
         // Check modifiers from the specifier before interning (storage class is not part of type)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        // Intern the base type (without storage class specifiers for the actual type)
-        let base_type_id = self.types.intern(base_type);
+        // For struct/union types with tags, use existing TypeId to preserve forward declarations
+        let base_type_id = self.intern_type_with_tag(&base_type);
 
         // Parse declarators
         let mut declarators = Vec::new();
@@ -3674,6 +3744,18 @@ impl Parser<'_> {
                     self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
+
+                // Check if we have a name (needed for symbol binding)
+                let has_name = !self.str(name).is_empty();
+
+                // Bind variable to symbol table BEFORE parsing initializer.
+                // This ensures the variable is in scope for sizeof(*var) in initializers.
+                // Per C99 6.2.1p7: "Any other identifier has scope that begins just
+                // after the completion of its declarator."
+                if has_name && !is_typedef {
+                    let sym = Symbol::variable(name, typ, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                }
 
                 let init = if self.is_special(b'=') {
                     if is_typedef {
@@ -3693,18 +3775,11 @@ impl Parser<'_> {
                     typ = self.infer_array_size_from_init(typ, init_expr);
                 }
 
-                // Bind to symbol table
-                // Note: StringId is Copy, check for empty by comparing to empty string
-                let name_str = self.str(name);
-                if !name_str.is_empty() {
-                    if is_typedef {
-                        // For typedef, the type being aliased is the declarator type
-                        let sym = Symbol::typedef(name, typ, self.symbols.depth());
-                        let _ = self.symbols.declare(sym);
-                    } else {
-                        let sym = Symbol::variable(name, typ, self.symbols.depth());
-                        let _ = self.symbols.declare(sym);
-                    }
+                // Bind typedef to symbol table (after parsing initializer, which
+                // is forbidden for typedefs anyway)
+                if has_name && is_typedef {
+                    let sym = Symbol::typedef(name, typ, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
                 }
 
                 declarators.push(InitDeclarator {
@@ -4078,7 +4153,9 @@ impl Parser<'_> {
                 let member_base_type = self.parse_type_specifier()?;
                 let is_struct_or_union =
                     matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
-                let member_base_type_id = self.types.intern(member_base_type);
+                // For struct/union types with tags, use the existing TypeId from symbol table
+                // to ensure forward-declared types are properly linked
+                let member_base_type_id = self.intern_type_with_tag(&member_base_type);
 
                 // Skip any __attribute__ after type specifier (before member name)
                 self.skip_extensions();
@@ -4209,6 +4286,25 @@ impl Parser<'_> {
                 is_complete: true,
             };
 
+            // Check if there's an existing forward declaration that we should complete
+            if let Some(tag_name) = tag {
+                if let Some(existing) = self.symbols.lookup_tag(tag_name) {
+                    // Complete the existing forward-declared type in place
+                    // This ensures all pointers to the incomplete type now see the complete type
+                    let existing_typ = existing.typ;
+                    let existing_type = self.types.get(existing_typ);
+                    if existing_type
+                        .composite
+                        .as_ref()
+                        .is_some_and(|c| !c.is_complete)
+                    {
+                        self.types.complete_struct(existing_typ, composite);
+                        return Ok(self.types.get(existing_typ).clone());
+                    }
+                }
+            }
+
+            // No existing forward declaration - create new type
             let struct_type = if is_union {
                 Type::union_type(composite)
             } else {
@@ -4229,10 +4325,19 @@ impl Parser<'_> {
                 // Look up existing tag
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                     Ok(self.types.get(existing.typ).clone())
-                } else if is_union {
-                    Ok(Type::incomplete_union(tag_name))
                 } else {
-                    Ok(Type::incomplete_struct(tag_name))
+                    // Create new incomplete type and register it in symbol table
+                    // This ensures that when the type is completed later, we can update
+                    // this same TypeId rather than creating a new one
+                    let incomplete_type = if is_union {
+                        Type::incomplete_union(tag_name)
+                    } else {
+                        Type::incomplete_struct(tag_name)
+                    };
+                    let typ_id = self.types.intern(incomplete_type.clone());
+                    let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                    Ok(incomplete_type)
                 }
             } else {
                 Err(ParseError::new(
@@ -4426,7 +4531,8 @@ impl Parser<'_> {
             // Apply any outer pointers (before the parens) to base type FIRST
             // For struct node *(*fp)(int): base is struct node, outer * -> Pointer(struct node)
             // For int *(*q)[3]: base is int, outer * -> Pointer(int)
-            for modifiers in pointer_modifiers.into_iter().rev() {
+            // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
+            for modifiers in pointer_modifiers.into_iter() {
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
                     modifiers,
@@ -4476,7 +4582,8 @@ impl Parser<'_> {
             // Pointers bind tighter than arrays: *arr[3] = array of pointers
 
             // Apply pointer modifiers to base type first
-            for modifiers in pointer_modifiers.into_iter().rev() {
+            // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
+            for modifiers in pointer_modifiers.into_iter() {
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
                     modifiers,
@@ -4701,6 +4808,8 @@ impl Parser<'_> {
             params,
             body,
             pos: func_pos,
+            is_static: false, // Test function, storage class not parsed
+            is_inline: false,
         })
     }
 
@@ -4746,7 +4855,8 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_type = self.parse_type_specifier()?;
-            let base_type_id = self.types.intern(param_type);
+            // For struct/union types with tags, use existing TypeId to preserve forward declarations
+            let base_type_id = self.intern_type_with_tag(&param_type);
 
             // Use parse_declarator to handle all declarator forms including:
             // - Simple pointers: void *, int *
@@ -4759,9 +4869,9 @@ impl Parser<'_> {
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
 
-            // C99 6.7.5.3: Array parameters are adjusted to pointers
-            // parse_declarator already gives us the array type, we need to convert
-            // the outermost array dimension to a pointer
+            // C99 6.7.5.3: Array and function parameters are adjusted to pointers
+            // - Array T[] becomes pointer to T
+            // - Function type becomes pointer to function type
             let typ = self.types.get(typ_id);
             if typ.kind == TypeKind::Array {
                 // Convert array to pointer to element type
@@ -4770,6 +4880,20 @@ impl Parser<'_> {
                     kind: TypeKind::Pointer,
                     modifiers: TypeModifiers::empty(),
                     base: Some(element_type),
+                    array_size: None,
+                    params: None,
+                    variadic: false,
+                    noreturn: false,
+                    composite: None,
+                };
+                typ_id = self.types.intern(ptr_type);
+            } else if typ.kind == TypeKind::Function {
+                // Convert function type to pointer to function type
+                // e.g., `int fn(int)` becomes `int (*)(int)`
+                let ptr_type = Type {
+                    kind: TypeKind::Pointer,
+                    modifiers: TypeModifiers::empty(),
+                    base: Some(typ_id),
                     array_size: None,
                     params: None,
                     variadic: false,
@@ -4821,7 +4945,8 @@ impl Parser<'_> {
         let base_type = self.parse_type_specifier()?;
         // Check modifiers before interning (storage class specifiers)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        let base_type_id = self.types.intern(base_type);
+        // For struct/union types with tags, use existing TypeId to preserve forward declarations
+        let base_type_id = self.intern_type_with_tag(&base_type);
 
         // Check for standalone type definition (e.g., "enum Color { ... };")
         // This happens when a composite type is defined but no variables are declared
@@ -4857,10 +4982,12 @@ impl Parser<'_> {
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
                 if self.types.kind(typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type
+                    // Get the function's return type and storage class
                     let func_type = self.types.get(typ);
                     let return_type = func_type.base.unwrap();
                     let _is_variadic = func_type.variadic;
+                    let is_static = func_type.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = func_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
@@ -4893,6 +5020,8 @@ impl Parser<'_> {
                         params,
                         body,
                         pos: decl_pos,
+                        is_static,
+                        is_inline,
                     }));
                 }
 
@@ -5017,9 +5146,11 @@ impl Parser<'_> {
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
                 if self.types.kind(full_typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type
+                    // Get the function's return type and storage class
                     let func_type = self.types.get(full_typ);
                     let return_type = func_type.base.unwrap();
+                    let is_static = func_type.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = func_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
@@ -5052,6 +5183,8 @@ impl Parser<'_> {
                         params,
                         body,
                         pos: decl_pos,
+                        is_static,
+                        is_inline,
                     }));
                 }
 
@@ -5112,6 +5245,10 @@ impl Parser<'_> {
 
             if self.is_special(b'{') {
                 // Function definition
+                // Extract storage class from base type
+                let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
+                let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
+
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type =
@@ -5144,6 +5281,8 @@ impl Parser<'_> {
                     params,
                     body,
                     pos: decl_pos,
+                    is_static,
+                    is_inline,
                 }));
             } else {
                 // Function declaration
@@ -5481,6 +5620,7 @@ impl Parser<'_> {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::strings::StringTable;
@@ -9375,5 +9515,144 @@ mod tests {
             }
             _ => panic!("Expected StmtExpr"),
         }
+    }
+
+    // ========================================================================
+    // Wide string literal tests
+    // ========================================================================
+
+    #[test]
+    fn test_wide_string_literal_basic() {
+        // L"hello" should parse as WideStringLit
+        let (expr, types, _) = parse_expr("L\"hello\"").unwrap();
+        match &expr.kind {
+            ExprKind::WideStringLit(s) => {
+                assert_eq!(s, "hello");
+            }
+            _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
+        }
+        // Type should be wchar_t* (int* on this platform)
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+        let pointee = types.get(typ).base.unwrap();
+        assert_eq!(types.kind(pointee), TypeKind::Int);
+    }
+
+    #[test]
+    fn test_wide_string_literal_concatenation() {
+        // Adjacent wide string literals should concatenate
+        let (expr, _, _) = parse_expr("L\"hello\" L\" world\"").unwrap();
+        match &expr.kind {
+            ExprKind::WideStringLit(s) => {
+                assert_eq!(s, "hello world");
+            }
+            _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_wide_string_array_size_inference() {
+        // int arr[] = L"abc"; should infer size 4 (3 chars + null)
+        let (tu, types, _) = parse_tu("int arr[] = L\"abc\";").unwrap();
+        assert_eq!(tu.items.len(), 1);
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Array);
+            assert_eq!(
+                types.get(typ).array_size,
+                Some(4),
+                "Wide string array size should be 4 (3 chars + null terminator)"
+            );
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // Function parameter adjustment tests
+    // ========================================================================
+
+    #[test]
+    fn test_function_param_adjusted_to_pointer() {
+        // Function parameters with function type should be adjusted to pointers
+        // void foo(int fn(int)) should become void foo(int (*fn)(int))
+        let (tu, types, _) = parse_tu("void foo(int fn(int));").unwrap();
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let func_typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(func_typ), TypeKind::Function);
+
+            // Get function parameters
+            if let Some(params) = &types.get(func_typ).params {
+                assert_eq!(params.len(), 1);
+                let param_typ = params[0];
+                // The parameter should be a pointer to function, not function itself
+                assert_eq!(
+                    types.kind(param_typ),
+                    TypeKind::Pointer,
+                    "Function parameter should be adjusted to pointer"
+                );
+                // The pointee should be a function type
+                let pointee = types.get(param_typ).base.unwrap();
+                assert_eq!(types.kind(pointee), TypeKind::Function);
+            } else {
+                panic!("Expected function type with params");
+            }
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_function_param_array_adjusted_to_pointer() {
+        // Array parameters are adjusted to pointers (existing behavior, ensure not broken)
+        let (tu, types, _) = parse_tu("void foo(int arr[]);").unwrap();
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let func_typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(func_typ), TypeKind::Function);
+
+            if let Some(params) = &types.get(func_typ).params {
+                let param_typ = params[0];
+                assert_eq!(
+                    types.kind(param_typ),
+                    TypeKind::Pointer,
+                    "Array parameter should be adjusted to pointer"
+                );
+            }
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // __FUNCTION__ and __PRETTY_FUNCTION__ parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_gcc_function_identifier_parsing() {
+        // __FUNCTION__ should parse as an identifier with char* type
+        let (expr, types, _) = parse_expr("__FUNCTION__").unwrap();
+        match &expr.kind {
+            ExprKind::Ident { .. } => {}
+            _ => panic!("Expected Ident, got {:?}", expr.kind),
+        }
+        // Type should be char*
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+    }
+
+    #[test]
+    fn test_gcc_pretty_function_identifier_parsing() {
+        // __PRETTY_FUNCTION__ should parse as an identifier with char* type
+        let (expr, types, _) = parse_expr("__PRETTY_FUNCTION__").unwrap();
+        match &expr.kind {
+            ExprKind::Ident { .. } => {}
+            _ => panic!("Expected Ident, got {:?}", expr.kind),
+        }
+        // Type should be char*
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
     }
 }

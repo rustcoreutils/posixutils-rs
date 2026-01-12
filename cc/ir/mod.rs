@@ -1238,6 +1238,8 @@ pub enum Initializer {
     Float(f64),
     /// String literal initializer (for char arrays)
     String(String),
+    /// Wide string literal initializer (for wchar_t arrays)
+    WideString(String),
     /// Array initializer: element size in bytes, list of (offset, initializer) pairs
     /// Elements not listed are zero-initialized
     Array {
@@ -1263,6 +1265,7 @@ impl fmt::Display for Initializer {
             Initializer::Int(v) => write!(f, "{}", v),
             Initializer::Float(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
+            Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
             Initializer::Array {
                 total_size,
                 elements,
@@ -1305,6 +1308,8 @@ pub struct Module {
     pub globals: Vec<(String, TypeId, Initializer)>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
+    /// Wide string literals (label, content)
+    pub wide_strings: Vec<(String, String)>,
     /// Generate debug info
     pub debug: bool,
     /// Source file paths (stream id -> path) for .file directives
@@ -1325,6 +1330,7 @@ impl Module {
             functions: Vec::new(),
             globals: Vec::new(),
             strings: Vec::new(),
+            wide_strings: Vec::new(),
             debug: false,
             source_files: Vec::new(),
             extern_symbols: HashSet::new(),
@@ -1347,6 +1353,13 @@ impl Module {
     pub fn add_string(&mut self, content: String) -> String {
         let label = format!(".LC{}", self.strings.len());
         self.strings.push((label.clone(), content));
+        label
+    }
+
+    /// Add a wide string literal and return its label
+    pub fn add_wide_string(&mut self, content: String) -> String {
+        let label = format!(".LWC{}", self.wide_strings.len());
+        self.wide_strings.push((label.clone(), content));
         label
     }
 }

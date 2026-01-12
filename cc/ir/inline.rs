@@ -912,7 +912,8 @@ fn collect_func_refs_from_initializer(
         Initializer::None
         | Initializer::Int(_)
         | Initializer::Float(_)
-        | Initializer::String(_) => {}
+        | Initializer::String(_)
+        | Initializer::WideString(_) => {}
     }
 }
 

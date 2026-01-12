@@ -98,15 +98,15 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
 /// * `producer` - Compiler identification string (e.g., "pcc 0.7.0")
 /// * `source_name` - Primary source filename
 /// * `comp_dir` - Compilation directory
-/// * `low_pc_label` - Label for start of code (e.g., ".Ltext0")
-/// * `high_pc_label` - Label for end of code (e.g., ".Ltext_end")
+/// * `low_pc_label` - Label for start of code (e.g., ".Ltext0"), or None if no code
+/// * `high_pc_label` - Label for end of code (e.g., ".Ltext_end"), or None if no code
 pub fn generate_debug_info<I: LirInst + EmitAsm>(
     base: &mut CodeGenBase<I>,
     producer: &str,
     source_name: &str,
     comp_dir: &str,
-    low_pc_label: &str,
-    high_pc_label: &str,
+    low_pc_label: Option<&str>,
+    high_pc_label: Option<&str>,
 ) {
     // Switch to .debug_info section
     base.push_directive(Directive::DebugInfo);
@@ -147,10 +147,20 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
     base.push_directive(Directive::Long(0));
 
     // DW_AT_low_pc (start of code)
-    base.push_directive(Directive::QuadSym(Symbol::local(low_pc_label)));
+    // Use 0 for data-only files with no code section
+    if let Some(label) = low_pc_label {
+        base.push_directive(Directive::QuadSym(Symbol::local(label)));
+    } else {
+        base.push_directive(Directive::Quad(0));
+    }
 
     // DW_AT_high_pc (end of code)
-    base.push_directive(Directive::QuadSym(Symbol::local(high_pc_label)));
+    // Use 0 for data-only files with no code section
+    if let Some(label) = high_pc_label {
+        base.push_directive(Directive::QuadSym(Symbol::local(label)));
+    } else {
+        base.push_directive(Directive::Quad(0));
+    }
 
     // End label for unit length computation
     base.push_directive(Directive::local_label(".Ldebug_info_end"));

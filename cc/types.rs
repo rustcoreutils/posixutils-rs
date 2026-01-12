@@ -558,6 +558,7 @@ enum TypeKey {
         params: Vec<TypeId>,
         variadic: bool,
         noreturn: bool,
+        modifiers: u32,
     },
 }
 
@@ -722,6 +723,7 @@ impl TypeTable {
                     params,
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
+                    modifiers: typ.modifiers.bits(),
                 })
             }
             _ => Some(TypeKey::Basic(typ.kind, typ.modifiers.bits())),
@@ -732,6 +734,18 @@ impl TypeTable {
     #[inline]
     pub fn get(&self, id: TypeId) -> &Type {
         &self.types[id.0 as usize]
+    }
+
+    /// Complete an incomplete struct/union type with its full definition.
+    /// This updates the type in place so that all existing pointers to
+    /// the incomplete type will now see the complete type.
+    pub fn complete_struct(&mut self, id: TypeId, composite: CompositeType) {
+        let typ = &mut self.types[id.0 as usize];
+        debug_assert!(
+            matches!(typ.kind, TypeKind::Struct | TypeKind::Union),
+            "complete_struct called on non-struct/union type"
+        );
+        typ.composite = Some(Box::new(composite));
     }
 
     // =========================================================================

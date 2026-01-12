@@ -1454,8 +1454,31 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
+        // Check if we need macro expansion (C99 6.10.2)
+        // If the first token is not < or ", expand macros first
+        let needs_expansion = match &path_tokens[0].value {
+            TokenValue::Special(code) => *code != b'<' as u32,
+            TokenValue::String(_) => false, // Already a string literal
+            _ => true,                      // Identifier or other - needs expansion
+        };
+
+        let expanded_tokens = if needs_expansion {
+            // Expand macros in the include path
+            // Push temporary conditional to enable preprocessing
+            self.cond_stack.push(Conditional {
+                state: CondState::Active,
+                had_true: true,
+                pos: Position::default(),
+            });
+            let expanded = self.preprocess(path_tokens, idents);
+            self.cond_stack.pop();
+            expanded
+        } else {
+            path_tokens
+        };
+
         // Determine if system include (<...>) or quoted ("...")
-        let (filename, is_system) = self.parse_include_path(&path_tokens, idents);
+        let (filename, is_system) = self.parse_include_path(&expanded_tokens, idents);
 
         if filename.is_empty() {
             diag::error(hash_token.pos, "empty filename in #include");
@@ -1568,8 +1591,11 @@ impl<'a> Preprocessor<'a> {
             if relative_path.exists() {
                 return Some((IncludeSource::File(relative_path), None));
             }
+        }
 
-            // Check quote include paths
+        // Check -I include paths (for both quoted and angle bracket includes)
+        // Per C standard, -I paths are searched for all includes
+        if !is_include_next {
             for dir in &self.quote_include_paths {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {

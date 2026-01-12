@@ -101,6 +101,7 @@ fn optimize_function(func: &mut Function) {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Opcode};

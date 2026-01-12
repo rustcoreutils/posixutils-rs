@@ -628,12 +628,12 @@ impl Walker {
         for item in &ast.items {
             match item {
                 ExternalDecl::FunctionDef(func) => {
-                    self.extract_from_c_stmt(&func.body, &strings, streams, &path);
+                    self.extract_from_c_stmt(&func.body, &strings, &symbols, streams, &path);
                 }
                 ExternalDecl::Declaration(decl) => {
                     for d in &decl.declarators {
                         if let Some(init) = &d.init {
-                            self.extract_from_c_expr(init, &strings, streams, &path);
+                            self.extract_from_c_expr(init, &strings, &symbols, streams, &path);
                         }
                     }
                 }
@@ -648,14 +648,15 @@ impl Walker {
         &mut self,
         expr: &posixutils_cc::parse::ast::Expr,
         strings: &StringTable,
+        symbols: &SymbolTable,
         streams: &StreamTable,
         path: &str,
     ) {
         match &expr.kind {
             ExprKind::Call { func, args } => {
                 // Check if this is a gettext-family function call
-                if let ExprKind::Ident { name } = &func.kind {
-                    let func_name = strings.get(*name).to_string();
+                if let ExprKind::Ident(symbol_id) = &func.kind {
+                    let func_name = strings.get(symbols.get(*symbol_id).name).to_string();
                     if let Some(spec) = self.keywords.get(&func_name).cloned() {
                         // Extract message based on keyword spec
                         if let Some(msg) = self.extract_c_message(
@@ -672,7 +673,7 @@ impl Walker {
                 }
                 // Recurse into arguments
                 for arg in args {
-                    self.extract_from_c_expr(arg, strings, streams, path);
+                    self.extract_from_c_expr(arg, strings, symbols, streams, path);
                 }
             }
             ExprKind::StringLit(s) => {
@@ -695,54 +696,54 @@ impl Walker {
                 }
             }
             ExprKind::Unary { operand, .. } => {
-                self.extract_from_c_expr(operand, strings, streams, path);
+                self.extract_from_c_expr(operand, strings, symbols, streams, path);
             }
             ExprKind::Binary { left, right, .. } => {
-                self.extract_from_c_expr(left, strings, streams, path);
-                self.extract_from_c_expr(right, strings, streams, path);
+                self.extract_from_c_expr(left, strings, symbols, streams, path);
+                self.extract_from_c_expr(right, strings, symbols, streams, path);
             }
             ExprKind::Assign { target, value, .. } => {
-                self.extract_from_c_expr(target, strings, streams, path);
-                self.extract_from_c_expr(value, strings, streams, path);
+                self.extract_from_c_expr(target, strings, symbols, streams, path);
+                self.extract_from_c_expr(value, strings, symbols, streams, path);
             }
             ExprKind::PostInc(e) | ExprKind::PostDec(e) => {
-                self.extract_from_c_expr(e, strings, streams, path);
+                self.extract_from_c_expr(e, strings, symbols, streams, path);
             }
             ExprKind::Conditional {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                self.extract_from_c_expr(cond, strings, streams, path);
-                self.extract_from_c_expr(then_expr, strings, streams, path);
-                self.extract_from_c_expr(else_expr, strings, streams, path);
+                self.extract_from_c_expr(cond, strings, symbols, streams, path);
+                self.extract_from_c_expr(then_expr, strings, symbols, streams, path);
+                self.extract_from_c_expr(else_expr, strings, symbols, streams, path);
             }
             ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
-                self.extract_from_c_expr(expr, strings, streams, path);
+                self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }
             ExprKind::Index { array, index } => {
-                self.extract_from_c_expr(array, strings, streams, path);
-                self.extract_from_c_expr(index, strings, streams, path);
+                self.extract_from_c_expr(array, strings, symbols, streams, path);
+                self.extract_from_c_expr(index, strings, symbols, streams, path);
             }
             ExprKind::Cast { expr, .. } => {
-                self.extract_from_c_expr(expr, strings, streams, path);
+                self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }
             ExprKind::SizeofExpr(e) => {
-                self.extract_from_c_expr(e, strings, streams, path);
+                self.extract_from_c_expr(e, strings, symbols, streams, path);
             }
             ExprKind::Comma(exprs) => {
                 for e in exprs {
-                    self.extract_from_c_expr(e, strings, streams, path);
+                    self.extract_from_c_expr(e, strings, symbols, streams, path);
                 }
             }
             ExprKind::InitList { elements } => {
                 for elem in elements {
-                    self.extract_from_c_expr(&elem.value, strings, streams, path);
+                    self.extract_from_c_expr(&elem.value, strings, symbols, streams, path);
                 }
             }
             ExprKind::CompoundLiteral { elements, .. } => {
                 for elem in elements {
-                    self.extract_from_c_expr(&elem.value, strings, streams, path);
+                    self.extract_from_c_expr(&elem.value, strings, symbols, streams, path);
                 }
             }
             _ => {}
@@ -754,24 +755,25 @@ impl Walker {
         &mut self,
         stmt: &Stmt,
         strings: &StringTable,
+        symbols: &SymbolTable,
         streams: &StreamTable,
         path: &str,
     ) {
         match stmt {
             Stmt::Empty => {}
             Stmt::Expr(expr) => {
-                self.extract_from_c_expr(expr, strings, streams, path);
+                self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }
             Stmt::Block(items) => {
                 for item in items {
                     match item {
                         BlockItem::Statement(s) => {
-                            self.extract_from_c_stmt(s, strings, streams, path);
+                            self.extract_from_c_stmt(s, strings, symbols, streams, path);
                         }
                         BlockItem::Declaration(decl) => {
                             for d in &decl.declarators {
                                 if let Some(init) = &d.init {
-                                    self.extract_from_c_expr(init, strings, streams, path);
+                                    self.extract_from_c_expr(init, strings, symbols, streams, path);
                                 }
                             }
                         }
@@ -783,19 +785,19 @@ impl Walker {
                 then_stmt,
                 else_stmt,
             } => {
-                self.extract_from_c_expr(cond, strings, streams, path);
-                self.extract_from_c_stmt(then_stmt, strings, streams, path);
+                self.extract_from_c_expr(cond, strings, symbols, streams, path);
+                self.extract_from_c_stmt(then_stmt, strings, symbols, streams, path);
                 if let Some(else_s) = else_stmt {
-                    self.extract_from_c_stmt(else_s, strings, streams, path);
+                    self.extract_from_c_stmt(else_s, strings, symbols, streams, path);
                 }
             }
             Stmt::While { cond, body } => {
-                self.extract_from_c_expr(cond, strings, streams, path);
-                self.extract_from_c_stmt(body, strings, streams, path);
+                self.extract_from_c_expr(cond, strings, symbols, streams, path);
+                self.extract_from_c_stmt(body, strings, symbols, streams, path);
             }
             Stmt::DoWhile { body, cond } => {
-                self.extract_from_c_stmt(body, strings, streams, path);
-                self.extract_from_c_expr(cond, strings, streams, path);
+                self.extract_from_c_stmt(body, strings, symbols, streams, path);
+                self.extract_from_c_expr(cond, strings, symbols, streams, path);
             }
             Stmt::For {
                 init,
@@ -806,38 +808,40 @@ impl Walker {
                 if let Some(i) = init {
                     match i {
                         ForInit::Expression(e) => {
-                            self.extract_from_c_expr(e, strings, streams, path);
+                            self.extract_from_c_expr(e, strings, symbols, streams, path);
                         }
                         ForInit::Declaration(d) => {
                             for decl in &d.declarators {
                                 if let Some(init_expr) = &decl.init {
-                                    self.extract_from_c_expr(init_expr, strings, streams, path);
+                                    self.extract_from_c_expr(
+                                        init_expr, strings, symbols, streams, path,
+                                    );
                                 }
                             }
                         }
                     }
                 }
                 if let Some(c) = cond {
-                    self.extract_from_c_expr(c, strings, streams, path);
+                    self.extract_from_c_expr(c, strings, symbols, streams, path);
                 }
                 if let Some(p) = post {
-                    self.extract_from_c_expr(p, strings, streams, path);
+                    self.extract_from_c_expr(p, strings, symbols, streams, path);
                 }
-                self.extract_from_c_stmt(body, strings, streams, path);
+                self.extract_from_c_stmt(body, strings, symbols, streams, path);
             }
             Stmt::Switch { expr, body } => {
-                self.extract_from_c_expr(expr, strings, streams, path);
-                self.extract_from_c_stmt(body, strings, streams, path);
+                self.extract_from_c_expr(expr, strings, symbols, streams, path);
+                self.extract_from_c_stmt(body, strings, symbols, streams, path);
             }
             Stmt::Case(expr) => {
-                self.extract_from_c_expr(expr, strings, streams, path);
+                self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }
             Stmt::Default => {}
             Stmt::Return(Some(expr)) => {
-                self.extract_from_c_expr(expr, strings, streams, path);
+                self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }
             Stmt::Label { stmt, .. } => {
-                self.extract_from_c_stmt(stmt, strings, streams, path);
+                self.extract_from_c_stmt(stmt, strings, symbols, streams, path);
             }
             _ => {}
         }

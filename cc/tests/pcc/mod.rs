@@ -26,7 +26,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -49,7 +49,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -75,7 +75,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -98,7 +98,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -121,7 +121,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -144,7 +144,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -175,7 +175,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -199,7 +199,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
 
     let exit_code = run(exe.as_ref().unwrap());
@@ -303,7 +303,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(
@@ -353,7 +353,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(
@@ -406,7 +406,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(
@@ -435,7 +435,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 9, "nested for (2 levels): expected 9");
@@ -463,7 +463,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 24, "nested for (3 levels): expected 24");
@@ -493,7 +493,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 9, "nested while: expected 9");
@@ -523,7 +523,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 6, "nested do-while: expected 6");
@@ -563,7 +563,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "switch_basic: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 0, "switch_basic: case 2 should set result to 20");
@@ -595,7 +595,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(
         exe.is_some(),
         "switch_fallthrough: compilation should succeed"
@@ -634,7 +634,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "switch_default: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(
@@ -667,7 +667,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(
         exe.is_some(),
         "switch_no_default: compilation should succeed"
@@ -709,7 +709,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "switch_negative: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 0, "switch_negative: case -1 should match");
@@ -739,7 +739,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "switch_zero: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 0, "switch_zero: case 0 should match");
@@ -767,7 +767,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "enum_basic: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(
@@ -793,7 +793,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "enum_explicit: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 0, "enum_explicit: explicit values should work");
@@ -816,7 +816,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "enum_negative: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 0, "enum_negative: negative values should work");
@@ -844,7 +844,7 @@ int main(void) {
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "enum_switch: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 0, "enum_switch: switch on enum should work");
@@ -871,7 +871,7 @@ skip:
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "goto_forward: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(
@@ -900,7 +900,7 @@ loop:
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "goto_backward: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(exit_code, 15, "goto_backward: loop via goto should sum 1-5");
@@ -928,7 +928,7 @@ done:
 "#,
     );
 
-    let exe = compile(&c_file.path().to_path_buf(), &[]);
+    let exe = compile(c_file.path(), &[]);
     assert!(exe.is_some(), "goto_multi: compilation should succeed");
     let exit_code = run(exe.as_ref().unwrap());
     assert_eq!(

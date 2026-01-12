@@ -21,7 +21,7 @@ use crate::parse::ast::{
     ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
-use crate::symbol::SymbolTable;
+use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
@@ -77,7 +77,8 @@ pub struct Linearizer<'a> {
     /// Parameter -> pseudo mapping (parameters are already SSA values)
     var_map: HashMap<String, PseudoId>,
     /// Local variables (use Load/Store, converted to SSA later)
-    locals: HashMap<String, LocalVarInfo>,
+    /// Keyed by SymbolId for proper scope handling
+    locals: HashMap<SymbolId, LocalVarInfo>,
     /// Label -> basic block mapping
     label_map: HashMap<String, BasicBlockId>,
     /// Break target stack (for loops)
@@ -175,6 +176,12 @@ impl<'a> Linearizer<'a> {
     #[inline]
     fn str(&self, id: StringId) -> &str {
         self.strings.get(id)
+    }
+
+    /// Get the name of a symbol as a String
+    #[inline]
+    fn symbol_name(&self, id: SymbolId) -> String {
+        self.str(self.symbols.get(id).name).to_string()
     }
 
     /// Linearize a translation unit
@@ -518,7 +525,7 @@ impl<'a> Linearizer<'a> {
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
             let modifiers = self.types.modifiers(declarator.typ);
-            let name = self.str(declarator.name).to_string();
+            let name = self.symbol_name(declarator.symbol);
 
             // Skip typedef declarations - they don't define storage
             if modifiers.contains(TypeModifiers::TYPEDEF) {
@@ -631,8 +638,8 @@ impl<'a> Linearizer<'a> {
                 op: UnaryOp::AddrOf,
                 operand,
             } => {
-                if let ExprKind::Ident { name } = &operand.kind {
-                    let name_str = self.str(*name).to_string();
+                if let ExprKind::Ident(symbol_id) = &operand.kind {
+                    let name_str = self.symbol_name(*symbol_id);
                     // Check if this is a static local variable
                     // Static locals have mangled names like "func_name.var_name.N"
                     let key = format!("{}.{}", self.current_func_name, name_str);
@@ -681,11 +688,11 @@ impl<'a> Linearizer<'a> {
 
             // Identifier - for constant addresses (function pointers, array decay, etc.)
             // or enum constants
-            ExprKind::Ident { name } => {
+            ExprKind::Ident(symbol_id) => {
                 let type_kind = self.types.kind(typ);
                 // For pointer types, this is likely a function address or array decay
                 if type_kind == TypeKind::Pointer {
-                    let name_str = self.str(*name).to_string();
+                    let name_str = self.symbol_name(*symbol_id);
                     // Check if this is a static local variable
                     // Static locals have mangled names like "func_name.var_name.N"
                     let key = format!("{}.{}", self.current_func_name, name_str);
@@ -696,7 +703,8 @@ impl<'a> Linearizer<'a> {
                     }
                 } else {
                     // Check if it's an enum constant
-                    if let Some(val) = self.symbols.get_enum_value(*name) {
+                    let sym = self.symbols.get(*symbol_id);
+                    if let Some(val) = sym.enum_value {
                         Initializer::Int(val)
                     } else {
                         Initializer::None
@@ -907,19 +915,20 @@ impl<'a> Linearizer<'a> {
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
         // so member access works properly
-        let mut struct_params: Vec<(String, TypeId, PseudoId)> =
+        // Tuple: (name_string, symbol_id_option, type, pseudo_id)
+        let mut struct_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
         // Complex parameters also need local storage for real/imag access
-        let mut complex_params: Vec<(String, TypeId, PseudoId)> =
+        let mut complex_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
         // Scalar parameters need local storage for SSA-correct reassignment handling
-        let mut scalar_params: Vec<(String, TypeId, PseudoId)> =
+        let mut scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param
-                .name
-                .map(|id| self.str(id).to_string())
+                .symbol
+                .map(|id| self.symbol_name(id))
                 .unwrap_or_else(|| format!("arg{}", i));
             ir_func.add_param(&name, param.typ);
 
@@ -932,17 +941,17 @@ impl<'a> Linearizer<'a> {
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
             if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
-                struct_params.push((name, param.typ, pseudo_id));
+                struct_params.push((name, param.symbol, param.typ, pseudo_id));
             } else if self.types.is_complex(param.typ) {
                 // Complex parameters: copy to local storage so real/imag access works
                 // Unlike structs, complex types are passed in FP registers per ABI,
                 // so we create local storage and the codegen handles the register split
-                complex_params.push((name, param.typ, pseudo_id));
+                complex_params.push((name, param.symbol, param.typ, pseudo_id));
             } else {
                 // Store all scalar parameters to locals so SSA conversion can properly
                 // handle reassignment with phi nodes. If the parameter is never modified,
                 // SSA will optimize away the redundant load/store.
-                scalar_params.push((name, param.typ, pseudo_id));
+                scalar_params.push((name, param.symbol, param.typ, pseudo_id));
             }
         }
 
@@ -956,7 +965,7 @@ impl<'a> Linearizer<'a> {
         self.emit(Instruction::new(Opcode::Entry));
 
         // Copy struct parameters to local storage so member access works
-        for (name, typ, arg_pseudo) in struct_params {
+        for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -1004,23 +1013,25 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
             }
 
-            // Register as a local variable
-            self.locals.insert(
-                name,
-                LocalVarInfo {
-                    sym: local_sym,
-                    typ,
-                    vla_size_sym: None,
-                    vla_elem_type: None,
-                    vla_dim_syms: vec![],
-                },
-            );
+            // Register as a local variable (only if named parameter)
+            if let Some(symbol_id) = symbol_id_opt {
+                self.locals.insert(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ,
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vla_dim_syms: vec![],
+                    },
+                );
+            }
         }
 
         // Setup local storage for complex parameters
         // Complex types are passed in FP registers per ABI - the prologue codegen
         // handles storing from XMM registers to local storage
-        for (name, typ, _arg_pseudo) in complex_params {
+        for (name, symbol_id_opt, typ, _arg_pseudo) in complex_params {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -1033,23 +1044,25 @@ impl<'a> Linearizer<'a> {
             // Don't emit a store here - the prologue codegen handles storing
             // from XMM0+XMM1/XMM2+XMM3/etc to local storage
 
-            // Register as a local variable for name lookup
-            self.locals.insert(
-                name,
-                LocalVarInfo {
-                    sym: local_sym,
-                    typ,
-                    vla_size_sym: None,
-                    vla_elem_type: None,
-                    vla_dim_syms: vec![],
-                },
-            );
+            // Register as a local variable for name lookup (only if named parameter)
+            if let Some(symbol_id) = symbol_id_opt {
+                self.locals.insert(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ,
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vla_dim_syms: vec![],
+                    },
+                );
+            }
         }
 
         // Store scalar parameters to local storage for SSA-correct reassignment handling
         // This ensures that if a parameter is reassigned inside a branch, phi nodes
         // are properly inserted at merge points.
-        for (name, typ, arg_pseudo) in scalar_params {
+        for (name, symbol_id_opt, typ, arg_pseudo) in scalar_params {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -1063,17 +1076,19 @@ impl<'a> Linearizer<'a> {
             let typ_size = self.types.size_bits(typ);
             self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
 
-            // Register as a local variable for name lookup
-            self.locals.insert(
-                name,
-                LocalVarInfo {
-                    sym: local_sym,
-                    typ,
-                    vla_size_sym: None,
-                    vla_elem_type: None,
-                    vla_dim_syms: vec![],
-                },
-            );
+            // Register as a local variable for name lookup (only if named parameter)
+            if let Some(symbol_id) = symbol_id_opt {
+                self.locals.insert(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ,
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vla_dim_syms: vec![],
+                    },
+                );
+            }
         }
 
         // Linearize body
@@ -1199,12 +1214,21 @@ impl<'a> Linearizer<'a> {
             }
 
             Stmt::Block(items) => {
+                // Save current locals state for scope restoration
+                // This handles variable shadowing: inner blocks can declare variables
+                // that shadow outer ones, but the outer variables must be restored
+                // when the block exits.
+                let saved_locals = self.locals.clone();
+
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
+
+                // Restore locals to remove any shadowing declarations
+                self.locals = saved_locals;
             }
 
             Stmt::If {
@@ -1353,7 +1377,8 @@ impl<'a> Linearizer<'a> {
             // Create a symbol pseudo for this local variable (its address)
             // Use unique name (name.id) to distinguish shadowed variables
             let sym_id = self.alloc_pseudo();
-            let unique_name = format!("{}.{}", declarator.name, sym_id.0);
+            let name_str = self.symbol_name(declarator.symbol);
+            let unique_name = format!("{}.{}", name_str, sym_id.0);
             let sym = Pseudo::sym(sym_id, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
@@ -1363,10 +1388,9 @@ impl<'a> Linearizer<'a> {
                 func.add_local(&unique_name, sym_id, typ, is_volatile, self.current_bb);
             }
 
-            // Track in linearizer's locals map
-            let name_str = self.str(declarator.name).to_string();
+            // Track in linearizer's locals map using SymbolId as key
             self.locals.insert(
-                name_str,
+                declarator.symbol,
                 LocalVarInfo {
                     sym: sym_id,
                     typ,
@@ -1534,7 +1558,8 @@ impl<'a> Linearizer<'a> {
             // Create a hidden local to store this dimension's size
             // This is needed for runtime stride computation in multi-dimensional VLAs
             let dim_sym_id = self.alloc_pseudo();
-            let dim_var_name = format!("__vla_dim{}_{}.{}", dim_idx, declarator.name, dim_sym_id.0);
+            let decl_name = self.symbol_name(declarator.symbol);
+            let dim_var_name = format!("__vla_dim{}_{}.{}", dim_idx, decl_name, dim_sym_id.0);
             let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
 
             if let Some(func) = &mut self.current_func {
@@ -1574,7 +1599,8 @@ impl<'a> Linearizer<'a> {
         // Create a hidden local variable to store the total number of elements
         // This is needed for sizeof(vla) to work at runtime
         let size_sym_id = self.alloc_pseudo();
-        let size_var_name = format!("__vla_size_{}.{}", declarator.name, size_sym_id.0);
+        let vla_name = self.symbol_name(declarator.symbol);
+        let size_var_name = format!("__vla_size_{}.{}", vla_name, size_sym_id.0);
         let size_sym = Pseudo::sym(size_sym_id, size_var_name.clone());
 
         if let Some(func) = &mut self.current_func {
@@ -1613,7 +1639,8 @@ impl<'a> Linearizer<'a> {
         // Create a symbol pseudo for the VLA pointer variable
         // This symbol stores the pointer to the VLA memory (like a pointer variable)
         let sym_id = self.alloc_pseudo();
-        let unique_name = format!("{}.{}", declarator.name, sym_id.0);
+        let sym_name = self.symbol_name(declarator.symbol);
+        let unique_name = format!("{}.{}", sym_name, sym_id.0);
         let sym = Pseudo::sym(sym_id, unique_name.clone());
 
         // Create a pointer type for the VLA (pointer to element type)
@@ -1632,9 +1659,8 @@ impl<'a> Linearizer<'a> {
 
         // Track in linearizer's locals map with pointer type and VLA size info
         // This makes arr[i] behave like ptr[i] - load ptr, then offset
-        let name_str = self.str(declarator.name).to_string();
         self.locals.insert(
-            name_str,
+            declarator.symbol,
             LocalVarInfo {
                 sym: sym_id,
                 typ: ptr_type,
@@ -1651,7 +1677,7 @@ impl<'a> Linearizer<'a> {
     /// They are implemented as globals with unique names like `funcname.varname.N`.
     /// Initialization happens once at program start (compile-time).
     fn linearize_static_local(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
-        let name_str = self.str(declarator.name).to_string();
+        let name_str = self.symbol_name(declarator.symbol);
 
         // C99 6.7.4p3: A non-static inline function cannot define a non-const
         // function-local static variable
@@ -1691,10 +1717,10 @@ impl<'a> Linearizer<'a> {
             },
         );
 
-        // Also insert with just the local name for the current function scope
+        // Also insert with the SymbolId for the current function scope
         // This is used during expression linearization
         self.locals.insert(
-            name_str,
+            declarator.symbol,
             LocalVarInfo {
                 // Use a sentinel value - we'll handle static locals specially
                 sym: PseudoId(u32::MAX),
@@ -2034,6 +2060,10 @@ impl<'a> Linearizer<'a> {
         post: Option<&Expr>,
         body: &Stmt,
     ) {
+        // Save locals state for scope restoration.
+        // C99 for-loop declarations (e.g., for (int i = 0; ...)) are scoped to the loop.
+        let saved_locals = self.locals.clone();
+
         // Init
         if let Some(init) = init {
             match init {
@@ -2103,6 +2133,9 @@ impl<'a> Linearizer<'a> {
 
         // Exit block
         self.switch_bb(exit_bb);
+
+        // Restore locals to remove for-loop-scoped declarations
+        self.locals = saved_locals;
     }
 
     fn linearize_switch(&mut self, expr: &Expr, body: &Stmt) {
@@ -2221,9 +2254,14 @@ impl<'a> Linearizer<'a> {
             ExprKind::IntLit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i64),
 
-            ExprKind::Ident { name, .. } => {
+            ExprKind::Ident(symbol_id) => {
                 // Check if it's an enum constant
-                self.symbols.get_enum_value(*name)
+                let sym = self.symbols.get(*symbol_id);
+                if sym.is_enum_constant() {
+                    sym.enum_value
+                } else {
+                    None
+                }
             }
 
             ExprKind::Unary { op, operand } => {
@@ -2404,8 +2442,8 @@ impl<'a> Linearizer<'a> {
     /// Check if an expression is a simple identifier that's a parameter (in var_map)
     /// Returns Some((name, pseudo)) if it is, None otherwise
     fn get_param_if_ident(&self, expr: &Expr) -> Option<(String, PseudoId)> {
-        if let ExprKind::Ident { name, .. } = &expr.kind {
-            let name_str = self.str(*name).to_string();
+        if let ExprKind::Ident(symbol_id) = &expr.kind {
+            let name_str = self.symbol_name(*symbol_id);
             if let Some(&pseudo) = self.var_map.get(&name_str) {
                 return Some((name_str, pseudo));
             }
@@ -2660,13 +2698,16 @@ impl<'a> Linearizer<'a> {
             | ExprKind::WideStringLit(_) => true,
 
             // Identifiers are pure unless volatile
-            ExprKind::Ident { .. } => {
+            ExprKind::Ident(_) => {
                 if let Some(typ) = expr.typ {
                     !self.types.modifiers(typ).contains(TypeModifiers::VOLATILE)
                 } else {
                     true
                 }
             }
+
+            // __func__ is a pure string-like value
+            ExprKind::FuncName => true,
 
             // Binary ops are pure if both operands are pure
             ExprKind::Binary { left, right, .. } => {
@@ -2798,10 +2839,10 @@ impl<'a> Linearizer<'a> {
     /// Linearize an expression as an lvalue (get its address)
     fn linearize_lvalue(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            ExprKind::Ident { name, .. } => {
-                let name_str = self.str(*name).to_string();
+            ExprKind::Ident(symbol_id) => {
+                let name_str = self.symbol_name(*symbol_id);
                 // For local variables, emit SymAddr to get the stack address
-                if let Some(local) = self.locals.get(&name_str).cloned() {
+                if let Some(local) = self.locals.get(symbol_id).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
                         // Static local - look up the global name
@@ -2864,7 +2905,7 @@ impl<'a> Linearizer<'a> {
 
                     // Update locals map so future accesses use the spilled location
                     self.locals.insert(
-                        name_str.clone(),
+                        *symbol_id,
                         LocalVarInfo {
                             sym: local_sym,
                             typ: param_type,
@@ -3299,9 +3340,8 @@ impl<'a> Linearizer<'a> {
         // Check if we're indexing a VLA's outer dimension
         // This requires runtime stride computation.
         // For int arr[n][m], accessing arr[i] needs stride = m * sizeof(int)
-        let elem_size_val = if let ExprKind::Ident { name } = &ptr_expr.kind {
-            let name_str = self.str(*name).to_string();
-            if let Some(info) = self.locals.get(&name_str).cloned() {
+        let elem_size_val = if let ExprKind::Ident(symbol_id) = &ptr_expr.kind {
+            if let Some(info) = self.locals.get(symbol_id).cloned() {
                 // Check if this is a multi-dimensional VLA AND elem_type is an array
                 // (meaning we're accessing an outer dimension, not the innermost)
                 if info.vla_dim_syms.len() > 1 && self.types.kind(elem_type) == TypeKind::Array {
@@ -3425,9 +3465,9 @@ impl<'a> Linearizer<'a> {
         });
 
         let (func_name, indirect_target) = match &func_expr.kind {
-            ExprKind::Ident { name, .. } if !is_function_pointer => {
+            ExprKind::Ident(symbol_id) if !is_function_pointer => {
                 // Direct call to named function (not a function pointer variable)
-                (self.str(*name).to_string(), None)
+                (self.symbol_name(*symbol_id), None)
             }
             ExprKind::Unary {
                 op: UnaryOp::Deref,
@@ -3675,8 +3715,8 @@ impl<'a> Linearizer<'a> {
 
         // For locals, we need to save the old value before updating
         // because the pseudo will be reloaded from stack which gets overwritten
-        let is_local = if let ExprKind::Ident { name, .. } = &operand.kind {
-            self.locals.contains_key(self.str(*name))
+        let is_local = if let ExprKind::Ident(symbol_id) = &operand.kind {
+            self.locals.contains_key(symbol_id)
         } else {
             false
         };
@@ -3741,9 +3781,9 @@ impl<'a> Linearizer<'a> {
         // Store to local, update parameter mapping, or store through pointer
         let store_size = self.types.size_bits(typ);
         match &operand.kind {
-            ExprKind::Ident { name, .. } => {
-                let name_str = self.str(*name).to_string();
-                if let Some(local) = self.locals.get(&name_str).cloned() {
+            ExprKind::Ident(symbol_id) => {
+                let name_str = self.symbol_name(*symbol_id);
+                if let Some(local) = self.locals.get(symbol_id).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
                         self.emit_static_local_store(&name_str, final_result, typ, store_size);
@@ -4050,9 +4090,9 @@ impl<'a> Linearizer<'a> {
             // Store back to the lvalue
             let store_size = self.types.size_bits(typ);
             match &operand.kind {
-                ExprKind::Ident { name, .. } => {
-                    let name_str = self.str(*name).to_string();
-                    if let Some(local) = self.locals.get(&name_str).cloned() {
+                ExprKind::Ident(symbol_id) => {
+                    let name_str = self.symbol_name(*symbol_id);
+                    if let Some(local) = self.locals.get(symbol_id).cloned() {
                         // Check if this is a static local (sentinel value)
                         if local.sym.0 == u32::MAX {
                             self.emit_static_local_store(&name_str, final_result, typ, store_size);
@@ -4179,44 +4219,49 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Linearize an identifier expression (variable reference)
-    fn linearize_ident(&mut self, expr: &Expr, name: StringId) -> PseudoId {
-        let name_str = self.str(name).to_string();
-
-        // Handle C99 __func__ predefined identifier (6.4.2.2)
-        // __func__ behaves as if declared: static const char __func__[] = "function-name";
+    /// Handle __func__, __FUNCTION__, __PRETTY_FUNCTION__ builtins
+    fn linearize_func_name(&mut self) -> PseudoId {
+        // C99 6.4.2.2: __func__ behaves as if declared:
+        // static const char __func__[] = "function-name";
         // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave the same way
-        if name_str == "__func__" || name_str == "__FUNCTION__" || name_str == "__PRETTY_FUNCTION__"
-        {
-            // Add function name as a string literal to the module
-            let label = self.module.add_string(self.current_func_name.clone());
 
-            // Create symbol pseudo for the string label
-            let sym_id = self.alloc_pseudo();
-            let sym_pseudo = Pseudo::sym(sym_id, label);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym_pseudo);
-            }
+        // Add function name as a string literal to the module
+        let label = self.module.add_string(self.current_func_name.clone());
 
-            // Create result pseudo for the address
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
-
-            // Type: const char* (pointer to char)
-            let char_type = self.types.char_id;
-            let ptr_type = self.types.pointer_to(char_type);
-            self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-            return result;
+        // Create symbol pseudo for the string label
+        let sym_id = self.alloc_pseudo();
+        let sym_pseudo = Pseudo::sym(sym_id, label);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(sym_pseudo);
         }
+
+        // Create result pseudo for the address
+        let result = self.alloc_pseudo();
+        let pseudo = Pseudo::reg(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+
+        // Type: const char* (pointer to char)
+        let char_type = self.types.char_id;
+        let ptr_type = self.types.pointer_to(char_type);
+        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+        result
+    }
+
+    fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
+        let sym = self.symbols.get(symbol_id);
+        let name_str = self.str(sym.name).to_string();
 
         // First check if it's an enum constant
-        if let Some(value) = self.symbols.get_enum_value(name) {
-            self.emit_const(value, self.types.int_id)
+        if sym.is_enum_constant() {
+            if let Some(value) = sym.enum_value {
+                return self.emit_const(value, self.types.int_id);
+            }
         }
+
         // Check if it's a local variable
-        else if let Some(local) = self.locals.get(&name_str).cloned() {
+        if let Some(local) = self.locals.get(&symbol_id).cloned() {
             // Check if this is a static local (sentinel value)
             if local.sym.0 == u32::MAX {
                 // Static local - look up the global name and treat as global
@@ -4380,7 +4425,9 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Ident { name, .. } => self.linearize_ident(expr, *name),
+            ExprKind::Ident(symbol_id) => self.linearize_ident(expr, *symbol_id),
+
+            ExprKind::FuncName => self.linearize_func_name(),
 
             ExprKind::Unary { op, operand } => self.linearize_unary(expr, *op, operand),
 
@@ -4500,9 +4547,8 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::SizeofExpr(inner_expr) => {
                 // Check if this is a VLA variable - need runtime sizeof
-                if let ExprKind::Ident { name } = &inner_expr.kind {
-                    let name_str = self.str(*name).to_string();
-                    if let Some(info) = self.locals.get(&name_str).cloned() {
+                if let ExprKind::Ident(symbol_id) = &inner_expr.kind {
+                    if let Some(info) = self.locals.get(symbol_id).cloned() {
                         if let (Some(size_sym), Some(elem_type)) =
                             (info.vla_size_sym, info.vla_elem_type)
                         {
@@ -6034,9 +6080,9 @@ impl<'a> Linearizer<'a> {
         // Store based on target expression type
         let target_size = self.types.size_bits(target_typ);
         match &target.kind {
-            ExprKind::Ident { name, .. } => {
-                let name_str = self.str(*name).to_string();
-                if let Some(local) = self.locals.get(&name_str).cloned() {
+            ExprKind::Ident(symbol_id) => {
+                let name_str = self.symbol_name(*symbol_id);
+                if let Some(local) = self.locals.get(symbol_id).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
                         self.emit_static_local_store(&name_str, final_val, target_typ, target_size);

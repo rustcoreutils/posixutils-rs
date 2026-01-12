@@ -17,7 +17,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use posixutils_cc::parse::ast::ExternalDecl;
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
-use posixutils_cc::symbol::{Namespace, SymbolTable};
+use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
 use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
@@ -176,22 +176,21 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
             ExternalDecl::Declaration(decl) => {
                 // Check symbol table for typedefs
                 for declarator in &decl.declarators {
-                    let name = strings.get(declarator.name).to_string();
+                    let sym = symbols.get(declarator.symbol);
+                    let name = strings.get(sym.name).to_string();
 
-                    // Look up in symbol table to determine if it's a typedef
-                    if let Some(sym) = symbols.lookup(declarator.name, Namespace::Ordinary) {
-                        if sym.is_typedef() {
-                            // Get line number from type or use default
-                            // Since declarations don't have position, we scan for it
-                            if let Some(line_num) = find_typedef_line(&lines, &name) {
-                                let line_content = get_line_content(&lines, line_num);
-                                tags.push(TagEntry {
-                                    name,
-                                    file: path.to_string(),
-                                    line: line_num,
-                                    line_content,
-                                });
-                            }
+                    // Check if it's a typedef
+                    if sym.is_typedef() {
+                        // Get line number from type or use default
+                        // Since declarations don't have position, we scan for it
+                        if let Some(line_num) = find_typedef_line(&lines, &name) {
+                            let line_content = get_line_content(&lines, line_num);
+                            tags.push(TagEntry {
+                                name,
+                                file: path.to_string(),
+                                line: line_num,
+                                line_content,
+                            });
                         }
                     }
                 }

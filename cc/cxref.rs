@@ -154,77 +154,82 @@ impl CrossRef {
 fn extract_refs_from_expr(
     expr: &posixutils_cc::parse::ast::Expr,
     strings: &StringTable,
+    symbols: &SymbolTable,
     xref: &mut CrossRef,
 ) {
     match &expr.kind {
-        ExprKind::Ident { name } => {
-            let sym_name = strings.get(*name).to_string();
+        ExprKind::Ident(symbol_id) => {
+            let name_id = symbols.get(*symbol_id).name;
+            let sym_name = strings.get(name_id).to_string();
             xref.add_reference(&sym_name, expr.pos.line);
         }
+        ExprKind::FuncName => {
+            // __func__ is a special identifier, not a user-defined symbol
+        }
         ExprKind::Call { func, args } => {
-            extract_refs_from_expr(func, strings, xref);
+            extract_refs_from_expr(func, strings, symbols, xref);
             for arg in args {
-                extract_refs_from_expr(arg, strings, xref);
+                extract_refs_from_expr(arg, strings, symbols, xref);
             }
         }
         ExprKind::Unary { operand, .. } => {
-            extract_refs_from_expr(operand, strings, xref);
+            extract_refs_from_expr(operand, strings, symbols, xref);
         }
         ExprKind::Binary { left, right, .. } => {
-            extract_refs_from_expr(left, strings, xref);
-            extract_refs_from_expr(right, strings, xref);
+            extract_refs_from_expr(left, strings, symbols, xref);
+            extract_refs_from_expr(right, strings, symbols, xref);
         }
         ExprKind::Assign { target, value, .. } => {
-            extract_refs_from_expr(target, strings, xref);
-            extract_refs_from_expr(value, strings, xref);
+            extract_refs_from_expr(target, strings, symbols, xref);
+            extract_refs_from_expr(value, strings, symbols, xref);
         }
         ExprKind::PostInc(e) | ExprKind::PostDec(e) => {
-            extract_refs_from_expr(e, strings, xref);
+            extract_refs_from_expr(e, strings, symbols, xref);
         }
         ExprKind::Conditional {
             cond,
             then_expr,
             else_expr,
         } => {
-            extract_refs_from_expr(cond, strings, xref);
-            extract_refs_from_expr(then_expr, strings, xref);
-            extract_refs_from_expr(else_expr, strings, xref);
+            extract_refs_from_expr(cond, strings, symbols, xref);
+            extract_refs_from_expr(then_expr, strings, symbols, xref);
+            extract_refs_from_expr(else_expr, strings, symbols, xref);
         }
         ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
-            extract_refs_from_expr(expr, strings, xref);
+            extract_refs_from_expr(expr, strings, symbols, xref);
         }
         ExprKind::Index { array, index } => {
-            extract_refs_from_expr(array, strings, xref);
-            extract_refs_from_expr(index, strings, xref);
+            extract_refs_from_expr(array, strings, symbols, xref);
+            extract_refs_from_expr(index, strings, symbols, xref);
         }
         ExprKind::Cast { expr, .. } => {
-            extract_refs_from_expr(expr, strings, xref);
+            extract_refs_from_expr(expr, strings, symbols, xref);
         }
         ExprKind::SizeofExpr(e) => {
-            extract_refs_from_expr(e, strings, xref);
+            extract_refs_from_expr(e, strings, symbols, xref);
         }
         ExprKind::Comma(exprs) => {
             for e in exprs {
-                extract_refs_from_expr(e, strings, xref);
+                extract_refs_from_expr(e, strings, symbols, xref);
             }
         }
         ExprKind::InitList { elements } | ExprKind::CompoundLiteral { elements, .. } => {
             for elem in elements {
-                extract_refs_from_expr(&elem.value, strings, xref);
+                extract_refs_from_expr(&elem.value, strings, symbols, xref);
             }
         }
         ExprKind::VaStart { ap, .. } => {
-            extract_refs_from_expr(ap, strings, xref);
+            extract_refs_from_expr(ap, strings, symbols, xref);
         }
         ExprKind::VaArg { ap, .. } => {
-            extract_refs_from_expr(ap, strings, xref);
+            extract_refs_from_expr(ap, strings, symbols, xref);
         }
         ExprKind::VaEnd { ap } => {
-            extract_refs_from_expr(ap, strings, xref);
+            extract_refs_from_expr(ap, strings, symbols, xref);
         }
         ExprKind::VaCopy { dest, src } => {
-            extract_refs_from_expr(dest, strings, xref);
-            extract_refs_from_expr(src, strings, xref);
+            extract_refs_from_expr(dest, strings, symbols, xref);
+            extract_refs_from_expr(src, strings, symbols, xref);
         }
         ExprKind::Bswap16 { arg }
         | ExprKind::Bswap32 { arg }
@@ -239,33 +244,38 @@ fn extract_refs_from_expr(
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
         | ExprKind::Alloca { size: arg } => {
-            extract_refs_from_expr(arg, strings, xref);
+            extract_refs_from_expr(arg, strings, symbols, xref);
         }
         _ => {}
     }
 }
 
 /// Walk a statement to find symbol references
-fn extract_refs_from_stmt(stmt: &Stmt, strings: &StringTable, xref: &mut CrossRef) {
+fn extract_refs_from_stmt(
+    stmt: &Stmt,
+    strings: &StringTable,
+    symbols: &SymbolTable,
+    xref: &mut CrossRef,
+) {
     match stmt {
         Stmt::Empty => {}
         Stmt::Expr(expr) => {
-            extract_refs_from_expr(expr, strings, xref);
+            extract_refs_from_expr(expr, strings, symbols, xref);
         }
         Stmt::Block(items) => {
             for item in items {
                 match item {
                     posixutils_cc::parse::ast::BlockItem::Statement(s) => {
-                        extract_refs_from_stmt(s, strings, xref);
+                        extract_refs_from_stmt(s, strings, symbols, xref);
                     }
                     posixutils_cc::parse::ast::BlockItem::Declaration(decl) => {
                         for d in &decl.declarators {
-                            let name = strings.get(d.name).to_string();
+                            let name = strings.get(symbols.get(d.symbol).name).to_string();
                             // Local variable definition
                             // Note: we don't have position for declarations, use 0
                             if let Some(init) = &d.init {
                                 xref.add_definition(&name, init.pos.line);
-                                extract_refs_from_expr(init, strings, xref);
+                                extract_refs_from_expr(init, strings, symbols, xref);
                             }
                         }
                     }
@@ -277,19 +287,19 @@ fn extract_refs_from_stmt(stmt: &Stmt, strings: &StringTable, xref: &mut CrossRe
             then_stmt,
             else_stmt,
         } => {
-            extract_refs_from_expr(cond, strings, xref);
-            extract_refs_from_stmt(then_stmt, strings, xref);
+            extract_refs_from_expr(cond, strings, symbols, xref);
+            extract_refs_from_stmt(then_stmt, strings, symbols, xref);
             if let Some(else_s) = else_stmt {
-                extract_refs_from_stmt(else_s, strings, xref);
+                extract_refs_from_stmt(else_s, strings, symbols, xref);
             }
         }
         Stmt::While { cond, body } => {
-            extract_refs_from_expr(cond, strings, xref);
-            extract_refs_from_stmt(body, strings, xref);
+            extract_refs_from_expr(cond, strings, symbols, xref);
+            extract_refs_from_stmt(body, strings, symbols, xref);
         }
         Stmt::DoWhile { body, cond } => {
-            extract_refs_from_stmt(body, strings, xref);
-            extract_refs_from_expr(cond, strings, xref);
+            extract_refs_from_stmt(body, strings, symbols, xref);
+            extract_refs_from_expr(cond, strings, symbols, xref);
         }
         Stmt::For {
             init,
@@ -300,39 +310,39 @@ fn extract_refs_from_stmt(stmt: &Stmt, strings: &StringTable, xref: &mut CrossRe
             if let Some(i) = init {
                 match i {
                     posixutils_cc::parse::ast::ForInit::Expression(e) => {
-                        extract_refs_from_expr(e, strings, xref);
+                        extract_refs_from_expr(e, strings, symbols, xref);
                     }
                     posixutils_cc::parse::ast::ForInit::Declaration(d) => {
                         for decl in &d.declarators {
-                            let name = strings.get(decl.name).to_string();
+                            let name = strings.get(symbols.get(decl.symbol).name).to_string();
                             if let Some(init_expr) = &decl.init {
                                 xref.add_definition(&name, init_expr.pos.line);
-                                extract_refs_from_expr(init_expr, strings, xref);
+                                extract_refs_from_expr(init_expr, strings, symbols, xref);
                             }
                         }
                     }
                 }
             }
             if let Some(c) = cond {
-                extract_refs_from_expr(c, strings, xref);
+                extract_refs_from_expr(c, strings, symbols, xref);
             }
             if let Some(p) = post {
-                extract_refs_from_expr(p, strings, xref);
+                extract_refs_from_expr(p, strings, symbols, xref);
             }
-            extract_refs_from_stmt(body, strings, xref);
+            extract_refs_from_stmt(body, strings, symbols, xref);
         }
         Stmt::Return(Some(expr)) => {
-            extract_refs_from_expr(expr, strings, xref);
+            extract_refs_from_expr(expr, strings, symbols, xref);
         }
         Stmt::Switch { expr, body } => {
-            extract_refs_from_expr(expr, strings, xref);
-            extract_refs_from_stmt(body, strings, xref);
+            extract_refs_from_expr(expr, strings, symbols, xref);
+            extract_refs_from_stmt(body, strings, symbols, xref);
         }
         Stmt::Case(expr) => {
-            extract_refs_from_expr(expr, strings, xref);
+            extract_refs_from_expr(expr, strings, symbols, xref);
         }
         Stmt::Label { stmt, .. } => {
-            extract_refs_from_stmt(stmt, strings, xref);
+            extract_refs_from_stmt(stmt, strings, symbols, xref);
         }
         _ => {}
     }
@@ -410,26 +420,26 @@ fn process_file(
 
                 // Add parameter references
                 for param in &func.params {
-                    if let Some(param_name) = param.name {
-                        let pname = strings.get(param_name).to_string();
+                    if let Some(symbol_id) = param.symbol {
+                        let pname = strings.get(symbols.get(symbol_id).name).to_string();
                         xref.add_definition(&pname, func.pos.line);
                     }
                 }
 
                 // Process function body
-                extract_refs_from_stmt(&func.body, &strings, xref);
+                extract_refs_from_stmt(&func.body, &strings, &symbols, xref);
                 xref.set_function("");
             }
             ExternalDecl::Declaration(decl) => {
                 xref.set_function("");
                 for d in &decl.declarators {
-                    let name = strings.get(d.name).to_string();
+                    let name = strings.get(symbols.get(d.symbol).name).to_string();
                     // Use initializer position if available, otherwise 0
                     // (Declaration/InitDeclarator don't carry position info)
                     let line = d.init.as_ref().map(|e| e.pos.line).unwrap_or(0);
                     xref.add_definition(&name, line);
                     if let Some(init) = &d.init {
-                        extract_refs_from_expr(init, &strings, xref);
+                        extract_refs_from_expr(init, &strings, &symbols, xref);
                     }
                 }
             }

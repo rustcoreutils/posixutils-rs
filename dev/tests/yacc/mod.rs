@@ -89,7 +89,7 @@ fn run_end_to_end_with_mode(grammar: &str, test_name: &str, strict: bool) {
 
     let compile = Command::new("cc")
         .current_dir(temp_dir.path())
-        .args(&[
+        .args([
             "-Wall",
             "-O2",
             "-Werror",
@@ -185,7 +185,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-d", grammar_path.to_str().unwrap()])
+        .args(["-d", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -214,7 +214,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-v", grammar_path.to_str().unwrap()])
+        .args(["-v", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -243,7 +243,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-b", "myparser", grammar_path.to_str().unwrap()])
+        .args(["-b", "myparser", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -400,7 +400,7 @@ expr : NUM { if ($1 < 0) YYERROR; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -435,7 +435,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -476,7 +476,7 @@ stmt : NUM ';'
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -513,7 +513,7 @@ stmt : NUM { if (YYRECOVERING()) printf("recovering\n"); }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -566,7 +566,7 @@ void yyerror(const char *s) {
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -604,7 +604,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-p", "my", grammar_path.to_str().unwrap()])
+        .args(["-p", "my", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -657,7 +657,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-t", grammar_path.to_str().unwrap()])
+        .args(["-t", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -710,7 +710,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -749,7 +749,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-t", grammar_path.to_str().unwrap()])
+        .args(["-t", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -789,7 +789,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-t", grammar_path.to_str().unwrap()])
+        .args(["-t", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -834,7 +834,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -879,7 +879,7 @@ char : '\n'    { printf("newline\n"); }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -916,7 +916,7 @@ expr : '\1'   { $$ = 1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -949,7 +949,7 @@ expr : '\x01' { $$ = 1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1007,7 +1007,7 @@ int yylex(void) {
     // Run yacc
     let yacc_output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-d", grammar_path.to_str().unwrap()])
+        .args(["-d", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1022,7 +1022,7 @@ int yylex(void) {
         let exe_path = temp_dir.path().join("parser");
         let compile_output = Command::new("cc")
             .current_dir(temp_dir.path())
-            .args(&[
+            .args([
                 "-Wall",
                 "-O2",
                 "-Werror",
@@ -1072,7 +1072,7 @@ item : A    { $$ = 1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1118,7 +1118,7 @@ term : NUM           { $$ = $1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1172,7 +1172,7 @@ expr : NUM            { $$ = $1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1227,7 +1227,7 @@ item : INT    { $$ = $1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1272,7 +1272,7 @@ int main() { return yyparse(); }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1319,7 +1319,7 @@ int main() { return yyparse(); }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-l", grammar_path.to_str().unwrap()])
+        .args(["-l", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1354,7 +1354,7 @@ expr : NUM { /* action on line 3 */ $$ = $1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1395,7 +1395,7 @@ expr : NUM { $$ = $1; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-d", grammar_path.to_str().unwrap()])
+        .args(["-d", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1442,7 +1442,7 @@ expr : FOO
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1476,7 +1476,7 @@ expr : FOO
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1510,7 +1510,7 @@ expr : '\0'
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&[grammar_path.to_str().unwrap()])
+        .args([grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1545,7 +1545,7 @@ expr : expr '+' expr { $$ = $1 + $3; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-p", "foo", grammar_path.to_str().unwrap()])
+        .args(["-p", "foo", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1601,7 +1601,7 @@ expr : expr '+' expr
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-v", grammar_path.to_str().unwrap()])
+        .args(["-v", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -1658,7 +1658,7 @@ expr : expr '+' expr { $<ival>$ = $<ival>1 + $<ival>3; }
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-p", "bar", grammar_path.to_str().unwrap()])
+        .args(["-p", "bar", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc-rs");
 
@@ -2105,7 +2105,7 @@ expr : NUM
 
     let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
         .current_dir(temp_dir.path())
-        .args(&["-d", grammar_path.to_str().unwrap()])
+        .args(["-d", grammar_path.to_str().unwrap()])
         .output()
         .expect("failed to execute yacc");
 
@@ -2212,7 +2212,7 @@ int main(void) {
     let exe_path = temp_dir.path().join("default_val_test");
     let compile = Command::new("cc")
         .current_dir(temp_dir.path())
-        .args(&[
+        .args([
             "-Wall",
             "-O2",
             "-Werror",
@@ -2538,7 +2538,7 @@ static PYTHON39_PARSER_BUILT: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn ensure_python39_parser_built() -> Result<(), String> {
     PYTHON39_PARSER_BUILT
-        .get_or_init(|| build_python39_parser())
+        .get_or_init(build_python39_parser)
         .clone()
 }
 

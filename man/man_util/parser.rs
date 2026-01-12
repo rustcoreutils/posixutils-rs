@@ -2880,7 +2880,7 @@ mod tests {
                 nodes: vec![],
             })];
 
-            let mdoc = MdocParser::parse_mdoc(&input).unwrap();
+            let mdoc = MdocParser::parse_mdoc(input).unwrap();
             assert_eq!(mdoc.elements, elements);
         }
 
@@ -3245,7 +3245,7 @@ mod tests {
 
         #[test]
         fn bl_compact() {
-            let content = format!(".Bl -bullet -compact\n.El");
+            let content = ".Bl -bullet -compact\n.El";
             let elements = vec![Element::Macro(MacroNode {
                 mdoc_macro: Macro::Bl {
                     list_type: BlType::Bullet,
@@ -3257,13 +3257,13 @@ mod tests {
                 nodes: vec![],
             })];
 
-            let mdoc = MdocParser::parse_mdoc(&content).unwrap();
+            let mdoc = MdocParser::parse_mdoc(content).unwrap();
             assert_eq!(mdoc.elements, elements);
         }
 
         #[test]
         fn bl_columns() {
-            let content = format!(".Bl -bullet col1 col2 col3\n.El");
+            let content = ".Bl -bullet col1 col2 col3\n.El";
             let elements = vec![Element::Macro(MacroNode {
                 mdoc_macro: Macro::Bl {
                     list_type: BlType::Bullet,
@@ -3275,11 +3275,12 @@ mod tests {
                 nodes: vec![],
             })];
 
-            let mdoc = MdocParser::parse_mdoc(&content).unwrap();
+            let mdoc = MdocParser::parse_mdoc(content).unwrap();
             assert_eq!(mdoc.elements, elements);
         }
 
         #[test]
+        #[allow(clippy::type_complexity)]
         fn bl_parameters() {
             let mut parameters_cases: HashMap<
                 &str,
@@ -3442,6 +3443,7 @@ mod tests {
         }
 
         #[test]
+        #[allow(clippy::type_complexity)]
         fn bl_invalid_parameters() {
             let mut parameters_cases: HashMap<
                 &str,

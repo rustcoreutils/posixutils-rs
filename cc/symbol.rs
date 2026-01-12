@@ -321,6 +321,19 @@ impl SymbolTable {
             .and_then(|ids| ids.first().map(|id| &self.symbols[id.0 as usize]))
     }
 
+    /// Look up a symbol by name and namespace, returning its ID
+    ///
+    /// Useful when you need to store the symbol reference in the AST
+    pub fn lookup_id(&self, name: StringId, ns: Namespace) -> Option<SymbolId> {
+        let key = (name, ns);
+        self.name_map.get(&key).and_then(|ids| ids.first().copied())
+    }
+
+    /// Get a symbol by its ID
+    pub fn get(&self, id: SymbolId) -> &Symbol {
+        &self.symbols[id.0 as usize]
+    }
+
     /// Look up a tag (struct/union/enum) by name
     pub fn lookup_tag(&self, name: StringId) -> Option<&Symbol> {
         self.lookup(name, Namespace::Tag)
@@ -332,17 +345,6 @@ impl SymbolTable {
         self.lookup(name, Namespace::Ordinary).and_then(|s| {
             if s.is_typedef() {
                 Some(s.typ) // TypeId is Copy
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Get the value of an enum constant
-    pub fn get_enum_value(&self, name: StringId) -> Option<i64> {
-        self.lookup(name, Namespace::Ordinary).and_then(|s| {
-            if s.is_enum_constant() {
-                s.enum_value
             } else {
                 None
             }

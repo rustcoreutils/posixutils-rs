@@ -425,7 +425,7 @@ fn test_mv_i_2() {
 
         if var == b || var == d {
             // chmod 0
-            let perm = fs::Permissions::from_mode(0);
+            let perm = fs::Permissions::from_mode(0o0);
             fs::set_permissions(var, perm).unwrap();
         }
     }
@@ -613,9 +613,11 @@ fn test_mv_perm_1() {
     fs::create_dir(no_write_dir).unwrap();
 
     // chmod ug-w no-write
-    let ug_write = (libc::S_IWUSR | libc::S_IWGRP) as u32;
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
+    let ug_write = libc::S_IWUSR as u32 | libc::S_IWGRP as u32;
     let mode = Path::new(no_write).metadata().unwrap().mode();
-    fs::set_permissions(no_write, Permissions::from_mode(mode & !ug_write as u32)).unwrap();
+    fs::set_permissions(no_write, Permissions::from_mode(mode & !ug_write)).unwrap();
 
     mv_test(
         &[no_write_dir, test_dir],
@@ -862,6 +864,8 @@ fn test_mv_part_fail() {
     fs::File::create(other_dir_k).unwrap();
 
     // chmod u-w
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
     let u_write = libc::S_IWUSR as u32;
     let mode = Path::new(other_dir).metadata().unwrap().mode();
     fs::set_permissions(other_dir, Permissions::from_mode(mode & !u_write)).unwrap();
@@ -1045,7 +1049,7 @@ fn test_mv_part_symlink() {
             format!("{dir}/{loc_reg}"),
             rem_sl.to_string(),
             [loc_reg, rem_sl.as_str()],
-            format!(""),
+            String::new(),
             0,
         ),
         // mv rem_sl loc_reg
@@ -1069,7 +1073,7 @@ fn test_mv_part_symlink() {
             rem_reg.to_string(),
             format!("{dir}/{loc_sl}"),
             [rem_reg.as_str(), loc_sl],
-            format!(""),
+            String::new(),
             0,
         ),
     ] {
@@ -1107,7 +1111,9 @@ fn test_mv_partition_perm() {
     fs::create_dir(other_dir).unwrap();
 
     // chmod a=rwx
-    let write_all = (libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO) as u32;
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
+    let write_all = libc::S_IRWXU as u32 | libc::S_IRWXG as u32 | libc::S_IRWXO as u32;
     fs::set_permissions(file, Permissions::from_mode(write_all)).unwrap();
     let mode = Path::new(file).metadata().unwrap().mode();
 
@@ -1327,7 +1333,9 @@ fn test_mv_i_link_no() {
     fs::hard_link(b_fubar, b_bar).unwrap();
 
     // chmod a-w b/bar
-    let write_all = (libc::S_IWUSR | libc::S_IWGRP | libc::S_IWOTH) as u32;
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
+    let write_all = libc::S_IWUSR as u32 | libc::S_IWGRP as u32 | libc::S_IWOTH as u32;
     let mode = Path::new(b_bar).metadata().unwrap().mode();
     // Zeros the write permission bits
     fs::set_permissions(b_bar, Permissions::from_mode(mode & !write_all)).unwrap();

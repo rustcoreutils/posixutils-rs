@@ -1008,7 +1008,6 @@ mod tests {
         let mut strings = StringTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         (tokens, strings)
     }
 
@@ -1385,8 +1384,8 @@ mod tests {
     fn test_number_suffixes() {
         // Integer suffixes
         let (tokens, _) = tokenize_str("123L 456UL 789LL 0xFFu 42lu");
-        for i in 1..=5 {
-            assert_eq!(tokens[i].typ, TokenType::Number);
+        for token in tokens.iter().skip(1).take(5) {
+            assert_eq!(token.typ, TokenType::Number);
         }
         if let TokenValue::Number(n) = &tokens[1].value {
             assert_eq!(n, "123L");
@@ -1400,8 +1399,8 @@ mod tests {
     fn test_float_suffixes() {
         // Float suffixes
         let (tokens, _) = tokenize_str("3.14f 2.71F 1.0l 9.8L");
-        for i in 1..=4 {
-            assert_eq!(tokens[i].typ, TokenType::Number);
+        for token in tokens.iter().skip(1).take(4) {
+            assert_eq!(token.typ, TokenType::Number);
         }
     }
 

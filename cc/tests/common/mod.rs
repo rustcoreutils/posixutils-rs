@@ -11,7 +11,7 @@
 
 use plib::testing::run_test_base;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::NamedTempFile;
 
@@ -65,7 +65,7 @@ pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
 
 /// Compile a C file using pcc and return the path to the executable
 /// The executable is placed in temp dir and must be cleaned up by caller
-pub fn compile(c_file: &PathBuf, extra_opts: &[&str]) -> Option<PathBuf> {
+pub fn compile(c_file: &Path, extra_opts: &[&str]) -> Option<PathBuf> {
     let thread_id = format!("{:?}", std::thread::current().id());
     let exe_path = std::env::temp_dir().join(format!(
         "pcc_exe_{}_{}",

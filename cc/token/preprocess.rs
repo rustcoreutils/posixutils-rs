@@ -3055,7 +3055,6 @@ mod tests {
         let mut strings = IdentTable::new();
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        drop(tokenizer);
         let result = preprocess_with_defines(
             tokens,
             &target,

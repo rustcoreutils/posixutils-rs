@@ -137,11 +137,11 @@ fn timeout_test_extended(
     });
 }
 
-const TRUE: &'static str = "true";
-const SLEEP: &'static str = "sleep";
-const NON_EXECUTABLE: &'static str = "tests/timeout/non_executable.sh";
-const WITH_ARGUMENT: &'static str = "tests/timeout/with_argument.sh";
-const SPAWN_CHILD: &'static str = "tests/timeout/spawn_child.sh";
+const TRUE: &str = "true";
+const SLEEP: &str = "sleep";
+const NON_EXECUTABLE: &str = "tests/timeout/non_executable.sh";
+const WITH_ARGUMENT: &str = "tests/timeout/with_argument.sh";
+const SPAWN_CHILD: &str = "tests/timeout/spawn_child.sh";
 
 #[test]
 fn test_absent_duration() {

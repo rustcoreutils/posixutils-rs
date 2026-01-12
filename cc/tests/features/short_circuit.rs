@@ -61,7 +61,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("sc_and_basic", code), 0);
+    assert_eq!(compile_and_run("sc_and_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -108,7 +108,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("sc_or_basic", code), 0);
+    assert_eq!(compile_and_run("sc_or_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -153,7 +153,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("sc_chained", code), 0);
+    assert_eq!(compile_and_run("sc_chained", code, &[]), 0);
 }
 
 // ============================================================================
@@ -214,7 +214,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ternary_side_effects", code), 0);
+    assert_eq!(compile_and_run("ternary_side_effects", code, &[]), 0);
 }
 
 // ============================================================================
@@ -257,7 +257,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ternary_pure", code), 0);
+    assert_eq!(compile_and_run("ternary_pure", code, &[]), 0);
 }
 
 // ============================================================================
@@ -297,7 +297,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("sc_with_ternary", code), 0);
+    assert_eq!(compile_and_run("sc_with_ternary", code, &[]), 0);
 }
 
 // ============================================================================
@@ -336,7 +336,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ternary_types", code), 0);
+    assert_eq!(compile_and_run("ternary_types", code, &[]), 0);
 }
 
 // ============================================================================
@@ -410,7 +410,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ternary_pre_inc_dec", code), 0);
+    assert_eq!(compile_and_run("ternary_pre_inc_dec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -464,5 +464,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("sc_edge_cases", code), 0);
+    assert_eq!(compile_and_run("sc_edge_cases", code, &[]), 0);
 }

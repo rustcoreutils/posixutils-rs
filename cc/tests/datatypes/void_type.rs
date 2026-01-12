@@ -94,7 +94,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_functions", code), 0);
+    assert_eq!(compile_and_run("void_functions", code, &[]), 0);
 }
 
 // ============================================================================
@@ -144,7 +144,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_ptr_ops", code), 0);
+    assert_eq!(compile_and_run("void_ptr_ops", code, &[]), 0);
 }
 
 // ============================================================================
@@ -187,7 +187,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_ptr_funcs", code), 0);
+    assert_eq!(compile_and_run("void_ptr_funcs", code, &[]), 0);
 }
 
 // ============================================================================
@@ -224,7 +224,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_cast", code), 0);
+    assert_eq!(compile_and_run("void_cast", code, &[]), 0);
 }
 
 // ============================================================================
@@ -271,7 +271,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_ptr_structs", code), 0);
+    assert_eq!(compile_and_run("void_ptr_structs", code, &[]), 0);
 }
 
 // ============================================================================
@@ -367,5 +367,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_control_flow", code), 0);
+    assert_eq!(compile_and_run("void_control_flow", code, &[]), 0);
 }

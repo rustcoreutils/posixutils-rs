@@ -1191,10 +1191,8 @@ mod tests {
         // Token after newline should have newline=true
         let (tokens, _) = tokenize_str("a\n#define");
         // tokens[0] is STREAM_BEGIN, tokens[1] is 'a', tokens[2] is '#'
-        assert!(
-            !tokens[1].pos.newline || tokens[1].pos.newline,
-            "First token can have newline=true"
-        );
+        // First token's newline flag isn't constrained - just verify we can access it
+        let _ = tokens[1].pos.newline;
         assert!(
             tokens[2].pos.newline,
             "Token after newline should have newline=true"

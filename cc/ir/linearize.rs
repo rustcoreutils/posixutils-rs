@@ -15,7 +15,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
     Opcode, Pseudo, PseudoId,
 };
-use crate::diag::{error, Position};
+use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
     ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
@@ -26,10 +26,10 @@ use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
-/// Default capacity for variable mapping HashMaps during IR linearization
 const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
-/// Default capacity for label/static HashMaps (typically smaller)
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
+const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
+const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
 
 /// Information about a local variable
 #[derive(Clone)]
@@ -135,8 +135,8 @@ impl<'a> Linearizer<'a> {
             var_map: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
             locals: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
-            break_targets: Vec::new(),
-            continue_targets: Vec::new(),
+            break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
+            continue_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
             run_ssa: true, // Enable SSA conversion by default
             symbols,
             types,
@@ -151,7 +151,9 @@ impl<'a> Linearizer<'a> {
             current_pos: None,
             target,
             current_func_is_non_static_inline: false,
-            file_scope_statics: std::collections::HashSet::new(),
+            file_scope_statics: std::collections::HashSet::with_capacity(
+                DEFAULT_FILE_SCOPE_CAPACITY,
+            ),
         }
     }
 
@@ -523,8 +525,13 @@ impl<'a> Linearizer<'a> {
                 continue;
             }
 
-            // Skip function declarations (they're just forward declarations for external functions)
+            // Function declarations without bodies are external functions
+            // Track them in extern_symbols so codegen uses GOT access
             if self.types.kind(declarator.typ) == TypeKind::Function {
+                // Check if not defined in this module (forward refs will be cleaned up later)
+                if !self.module.functions.iter().any(|f| f.name == name) {
+                    self.module.extern_symbols.insert(name);
+                }
                 continue;
             }
 
@@ -588,6 +595,20 @@ impl<'a> Linearizer<'a> {
                 }
             }
 
+            // Wide string literal - for arrays, store as WideString; for pointers, create label reference
+            ExprKind::WideStringLit(s) => {
+                let type_kind = self.types.kind(typ);
+                if type_kind == TypeKind::Array {
+                    // wchar_t array - embed the wide string directly
+                    Initializer::WideString(s.clone())
+                } else {
+                    // Pointer - create a wide string constant and reference it
+                    let label = format!(".LC{}", self.module.wide_strings.len());
+                    self.module.wide_strings.push((label.clone(), s.clone()));
+                    Initializer::SymAddr(label)
+                }
+            }
+
             // Negative literal (fast path for simple cases)
             ExprKind::Unary {
                 op: UnaryOp::Neg,
@@ -611,7 +632,15 @@ impl<'a> Linearizer<'a> {
                 operand,
             } => {
                 if let ExprKind::Ident { name } = &operand.kind {
-                    Initializer::SymAddr(self.str(*name).to_string())
+                    let name_str = self.str(*name).to_string();
+                    // Check if this is a static local variable
+                    // Static locals have mangled names like "func_name.var_name.N"
+                    let key = format!("{}.{}", self.current_func_name, name_str);
+                    if let Some(static_info) = self.static_locals.get(&key) {
+                        Initializer::SymAddr(static_info.global_name.clone())
+                    } else {
+                        Initializer::SymAddr(name_str)
+                    }
                 } else {
                     Initializer::None
                 }
@@ -656,7 +685,15 @@ impl<'a> Linearizer<'a> {
                 let type_kind = self.types.kind(typ);
                 // For pointer types, this is likely a function address or array decay
                 if type_kind == TypeKind::Pointer {
-                    Initializer::SymAddr(self.str(*name).to_string())
+                    let name_str = self.str(*name).to_string();
+                    // Check if this is a static local variable
+                    // Static locals have mangled names like "func_name.var_name.N"
+                    let key = format!("{}.{}", self.current_func_name, name_str);
+                    if let Some(static_info) = self.static_locals.get(&key) {
+                        Initializer::SymAddr(static_info.global_name.clone())
+                    } else {
+                        Initializer::SymAddr(name_str)
+                    }
                 } else {
                     // Check if it's an enum constant
                     if let Some(val) = self.symbols.get_enum_value(*name) {
@@ -809,12 +846,14 @@ impl<'a> Linearizer<'a> {
         self.struct_return_size = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.str(func.name).to_string();
+        // Remove from extern_symbols since we're defining this function
+        self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
 
-        // Create function
+        // Create function - use storage class from FunctionDef
         let modifiers = self.types.modifiers(func.return_type);
-        let is_static = modifiers.contains(TypeModifiers::STATIC);
-        let is_inline = modifiers.contains(TypeModifiers::INLINE);
+        let is_static = func.is_static;
+        let is_inline = func.is_inline;
         let _is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
@@ -1382,6 +1421,42 @@ impl<'a> Linearizer<'a> {
                         let size = self.types.size_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
+                } else if let ExprKind::WideStringLit(s) = &init.kind {
+                    // Wide string literal initialization of wchar_t array
+                    // Copy the wide string chars to the local array (4 bytes each)
+                    if self.types.kind(typ) == TypeKind::Array {
+                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                        let elem_size = self.types.size_bits(elem_type);
+                        let elem_bytes = (elem_size / 8) as i64;
+
+                        // Copy each wchar_t from wide string literal to local array
+                        for (i, ch) in s.chars().enumerate() {
+                            let ch_val = self.emit_const(ch as i64, elem_type);
+                            self.emit(Instruction::store(
+                                ch_val,
+                                sym_id,
+                                (i as i64) * elem_bytes,
+                                elem_type,
+                                elem_size,
+                            ));
+                        }
+                        // Store null terminator
+                        let null_val = self.emit_const(0, elem_type);
+                        self.emit(Instruction::store(
+                            null_val,
+                            sym_id,
+                            (s.chars().count() as i64) * elem_bytes,
+                            elem_type,
+                            elem_size,
+                        ));
+                    } else {
+                        // Pointer initialized with wide string literal - store the address
+                        let val = self.linearize_expr(init);
+                        let init_type = self.expr_type(init);
+                        let converted = self.emit_convert(val, init_type, typ);
+                        let size = self.types.size_bits(typ);
+                        self.emit(Instruction::store(converted, sym_id, 0, typ, size));
+                    }
                 } else if self.types.is_complex(typ) {
                     // Complex type initialization - linearize_expr returns an address
                     // to a temp containing the complex value. Copy from temp to local.
@@ -1737,6 +1812,45 @@ impl<'a> Linearizer<'a> {
                                 field_type,
                                 nested_elems,
                             );
+                        } else if let ExprKind::StringLit(s) = &element.value.kind {
+                            // String literal initializing a char array field
+                            if self.types.kind(field_type) == TypeKind::Array {
+                                let elem_type = self
+                                    .types
+                                    .base_type(field_type)
+                                    .unwrap_or(self.types.char_id);
+                                let elem_size = self.types.size_bits(elem_type);
+
+                                // Copy each byte from string literal to the array field
+                                for (i, byte) in s.bytes().enumerate() {
+                                    let byte_val = self.emit_const(byte as i64, elem_type);
+                                    self.emit(Instruction::store(
+                                        byte_val,
+                                        base_sym,
+                                        offset + i as i64,
+                                        elem_type,
+                                        elem_size,
+                                    ));
+                                }
+                                // Store null terminator
+                                let null_val = self.emit_const(0, elem_type);
+                                self.emit(Instruction::store(
+                                    null_val,
+                                    base_sym,
+                                    offset + s.len() as i64,
+                                    elem_type,
+                                    elem_size,
+                                ));
+                            } else {
+                                // Pointer initialized with string literal - store the address
+                                let val = self.linearize_expr(&element.value);
+                                let val_type = self.expr_type(&element.value);
+                                let converted = self.emit_convert(val, val_type, field_type);
+                                let size = self.types.size_bits(field_type);
+                                self.emit(Instruction::store(
+                                    converted, base_sym, offset, field_type, size,
+                                ));
+                            }
                         } else {
                             // Scalar value
                             // If the field is an array and we're initializing with a scalar,
@@ -2542,7 +2656,8 @@ impl<'a> Linearizer<'a> {
             ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::CharLit(_)
-            | ExprKind::StringLit(_) => true,
+            | ExprKind::StringLit(_)
+            | ExprKind::WideStringLit(_) => true,
 
             // Identifiers are pure unless volatile
             ExprKind::Ident { .. } => {
@@ -4069,7 +4184,9 @@ impl<'a> Linearizer<'a> {
 
         // Handle C99 __func__ predefined identifier (6.4.2.2)
         // __func__ behaves as if declared: static const char __func__[] = "function-name";
-        if name_str == "__func__" {
+        // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave the same way
+        if name_str == "__func__" || name_str == "__FUNCTION__" || name_str == "__PRETTY_FUNCTION__"
+        {
             // Add function name as a string literal to the module
             let label = self.module.add_string(self.current_func_name.clone());
 
@@ -4235,6 +4352,30 @@ impl<'a> Linearizer<'a> {
                 }
 
                 // Emit SymAddr to load the address of the string
+                self.emit(Instruction::sym_addr(result, sym_id, typ));
+                result
+            }
+
+            ExprKind::WideStringLit(s) => {
+                // Add wide string to module and get its label
+                let label = self.module.add_wide_string(s.clone());
+
+                // Create a symbol pseudo for the wide string label
+                let sym_id = self.alloc_pseudo();
+                let sym_pseudo = Pseudo::sym(sym_id, label.clone());
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(sym_pseudo);
+                }
+
+                // Create result pseudo for the address
+                let result = self.alloc_pseudo();
+                let typ = self.expr_type(expr);
+                let pseudo = Pseudo::reg(result, result.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+
+                // Emit SymAddr to load the address of the wide string
                 self.emit(Instruction::sym_addr(result, sym_id, typ));
                 result
             }
@@ -5101,7 +5242,13 @@ impl<'a> Linearizer<'a> {
             UnaryOp::Deref => {
                 // Dereferencing a pointer-to-array gives an array, which is just an address
                 // (arrays decay to their first element's address)
-                if self.types.kind(typ) == TypeKind::Array {
+                // For struct/union types, return the address since structs can't be loaded
+                // into registers - the Store instruction handles struct copies via emit_struct_store
+                let type_kind = self.types.kind(typ);
+                if type_kind == TypeKind::Array
+                    || type_kind == TypeKind::Struct
+                    || type_kind == TypeKind::Union
+                {
                     return src;
                 }
                 self.emit(Instruction::load(result, src, 0, typ, size));
@@ -6086,34 +6233,33 @@ impl<'a> Linearizer<'a> {
 // Public API
 // ============================================================================
 
-/// Linearize an AST to IR (convenience wrapper for tests)
-#[cfg(test)]
+/// Linearize an AST to IR
 pub fn linearize(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,
     strings: &StringTable,
     target: &Target,
-) -> Module {
-    linearize_with_debug(tu, symbols, types, strings, target, false, None)
-}
-
-/// Linearize an AST to IR with debug info support
-pub fn linearize_with_debug(
-    tu: &TranslationUnit,
-    symbols: &SymbolTable,
-    types: &TypeTable,
-    strings: &StringTable,
-    target: &Target,
     debug: bool,
-    source_file: Option<&str>,
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
-    if let Some(path) = source_file {
-        module.source_files.push(path.to_string());
-    }
+    // Get all source files from the stream registry (includes all #included files)
+    // The stream IDs in Position map directly to indices in this vector
+    // Filter out synthetic file names (like "<paste>", "<built-in>") which start with '<'
+    module.source_files = get_all_stream_names()
+        .into_iter()
+        .map(|name| {
+            if name.starts_with('<') {
+                // Replace synthetic names with empty string - still need placeholder
+                // to keep stream ID indices aligned with .file directive numbers
+                String::new()
+            } else {
+                name
+            }
+        })
+        .collect();
     module
 }
 

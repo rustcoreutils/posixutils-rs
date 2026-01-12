@@ -80,34 +80,10 @@ impl Nfa {
         self.states[from].transitions.push((trans, to));
     }
 
-    /// Build an NFA from a list of rules (patterns with rule indices)
-    /// Note: Kept for backward compatibility and testing. Use from_rules_with_trailing_context
-    /// for rules that may have trailing context.
-    #[cfg(test)]
-    pub fn from_rules(rules: &[(Hir, usize)]) -> Result<Self, String> {
-        let mut nfa = Nfa::new();
-        let start = nfa.start;
-
-        for (hir, rule_idx) in rules {
-            // Build sub-NFA for this rule
-            let (rule_start, rule_end) = nfa.build_hir(hir)?;
-
-            // Connect start state to rule's start via epsilon
-            nfa.add_transition(start, Transition::Epsilon, rule_start);
-
-            // Mark rule's end as accepting with rule index
-            nfa.states[rule_end].accepting = Some(*rule_idx);
-        }
-
-        Ok(nfa)
-    }
-
-    /// Build an NFA from rules with explicit trailing context support
+    /// Build an NFA from rules with optional trailing context support
     /// Each rule is (main_pattern, optional_trailing_context, rule_index)
     /// For rules with trailing context, tracks the main pattern end state
-    pub fn from_rules_with_trailing_context(
-        rules: &[(Hir, Option<Hir>, usize)],
-    ) -> Result<Self, String> {
+    pub fn from_rules(rules: &[(Hir, Option<Hir>, usize)]) -> Result<Self, String> {
         let mut nfa = Nfa::new();
         let start = nfa.start;
 
@@ -441,7 +417,7 @@ mod tests {
     #[test]
     fn test_single_char() {
         let hir = parse_regex("a");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         // Should have start state, plus states for the pattern
         assert!(nfa.states.len() >= 2);
@@ -450,7 +426,7 @@ mod tests {
     #[test]
     fn test_concatenation() {
         let hir = parse_regex("abc");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         // Verify we can reach accepting state
         let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
@@ -460,7 +436,7 @@ mod tests {
     #[test]
     fn test_alternation() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
 
@@ -478,7 +454,7 @@ mod tests {
     #[test]
     fn test_kleene_star() {
         let hir = parse_regex("a*");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
 
@@ -494,7 +470,7 @@ mod tests {
     #[test]
     fn test_plus() {
         let hir = parse_regex("a+");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
 
@@ -510,7 +486,7 @@ mod tests {
     #[test]
     fn test_char_class() {
         let hir = parse_regex("[a-z]");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
 
@@ -534,7 +510,7 @@ mod tests {
     fn test_multiple_rules() {
         let hir1 = parse_regex("if");
         let hir2 = parse_regex("[a-z]+");
-        let nfa = Nfa::from_rules(&[(hir1, 0), (hir2, 1)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir1, None, 0), (hir2, None, 1)]).unwrap();
 
         let start_closure = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
 
@@ -553,8 +529,7 @@ mod tests {
         // Pattern: "foo/bar" - match "foo" when followed by "bar"
         let main_hir = parse_regex("foo");
         let trailing_hir = parse_regex("bar");
-        let nfa =
-            Nfa::from_rules_with_trailing_context(&[(main_hir, Some(trailing_hir), 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(main_hir, Some(trailing_hir), 0)]).unwrap();
 
         // Verify main_pattern_end is populated
         assert!(
@@ -604,11 +579,8 @@ mod tests {
         let trailing_hir = parse_regex("c");
         let simple_hir = parse_regex("xyz");
 
-        let nfa = Nfa::from_rules_with_trailing_context(&[
-            (main_hir, Some(trailing_hir), 0),
-            (simple_hir, None, 1),
-        ])
-        .unwrap();
+        let nfa =
+            Nfa::from_rules(&[(main_hir, Some(trailing_hir), 0), (simple_hir, None, 1)]).unwrap();
 
         // Rule 0 should be in main_pattern_end
         let has_rule_0 = nfa
@@ -645,7 +617,7 @@ mod tests {
     fn test_trailing_context_no_context() {
         // When trailing context is None, should behave like from_rules
         let hir = parse_regex("abc");
-        let nfa = Nfa::from_rules_with_trailing_context(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
 
         // main_pattern_end should be empty (no trailing context)
         assert!(

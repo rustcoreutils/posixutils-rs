@@ -64,7 +64,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bitfield_basic", code), 0);
+    assert_eq!(compile_and_run("bitfield_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -131,7 +131,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bitfield_special", code), 0);
+    assert_eq!(compile_and_run("bitfield_special", code, &[]), 0);
 }
 
 // ============================================================================
@@ -184,5 +184,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("bitfield_operations", code), 0);
+    assert_eq!(compile_and_run("bitfield_operations", code, &[]), 0);
 }

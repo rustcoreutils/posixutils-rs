@@ -74,7 +74,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("unreachable_basic", code), 0);
+    assert_eq!(compile_and_run("unreachable_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -121,7 +121,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("unreachable_switch", code), 0);
+    assert_eq!(compile_and_run("unreachable_switch", code, &[]), 0);
 }
 
 // ============================================================================
@@ -190,5 +190,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("unreachable_control_flow", code), 0);
+    assert_eq!(compile_and_run("unreachable_control_flow", code, &[]), 0);
 }

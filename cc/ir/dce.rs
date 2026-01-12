@@ -18,6 +18,10 @@
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use std::collections::{HashSet, VecDeque};
 
+const DEFAULT_USE_CAPACITY: usize = 4;
+const DEFAULT_LIVE_CAPACITY: usize = 64;
+const DEFAULT_REACHABLE_CAPACITY: usize = 16;
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -70,7 +74,7 @@ fn is_root(op: Opcode) -> bool {
 
 /// Get all pseudo IDs used by an instruction (operands).
 fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
-    let mut uses = Vec::new();
+    let mut uses = Vec::with_capacity(DEFAULT_USE_CAPACITY);
 
     // Source operands
     uses.extend(insn.src.iter().copied());
@@ -120,8 +124,8 @@ fn find_all_defs(func: &Function, id: PseudoId) -> Vec<(usize, usize)> {
 
 /// Eliminate dead code using mark-sweep algorithm.
 fn eliminate_dead_code(func: &mut Function) -> bool {
-    let mut live: HashSet<PseudoId> = HashSet::new();
-    let mut worklist: VecDeque<PseudoId> = VecDeque::new();
+    let mut live: HashSet<PseudoId> = HashSet::with_capacity(DEFAULT_LIVE_CAPACITY);
+    let mut worklist: VecDeque<PseudoId> = VecDeque::with_capacity(DEFAULT_LIVE_CAPACITY);
 
     // Phase 1: Mark roots and their operands as live
     for bb in &func.blocks {
@@ -266,8 +270,8 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
 
 /// Compute the set of reachable block IDs starting from entry.
 fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
-    let mut reachable = HashSet::new();
-    let mut worklist = VecDeque::new();
+    let mut reachable = HashSet::with_capacity(DEFAULT_REACHABLE_CAPACITY);
+    let mut worklist = VecDeque::with_capacity(DEFAULT_REACHABLE_CAPACITY);
 
     worklist.push_back(func.entry);
 

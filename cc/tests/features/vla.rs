@@ -129,7 +129,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("vla_basic_ops", code), 0);
+    assert_eq!(compile_and_run("vla_basic_ops", code, &[]), 0);
 }
 
 // ============================================================================
@@ -170,7 +170,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("vla_sizeof", code), 0);
+    assert_eq!(compile_and_run("vla_sizeof", code, &[]), 0);
 }
 
 // ============================================================================
@@ -210,7 +210,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("vla_func_params", code), 0);
+    assert_eq!(compile_and_run("vla_func_params", code, &[]), 0);
 }
 
 // ============================================================================
@@ -250,7 +250,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("vla_multidim", code), 0);
+    assert_eq!(compile_and_run("vla_multidim", code, &[]), 0);
 }
 
 // ============================================================================
@@ -348,5 +348,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("vla_star_syntax", code), 0);
+    assert_eq!(compile_and_run("vla_star_syntax", code, &[]), 0);
 }

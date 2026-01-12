@@ -61,7 +61,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_basic_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_basic_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -139,7 +139,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_arith_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_arith_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -197,7 +197,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_cmp_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_cmp_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -242,7 +242,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("void_ptr_comprehensive", code), 0);
+    assert_eq!(compile_and_run("void_ptr_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -289,7 +289,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_double_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_double_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -338,7 +338,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_ptr_comprehensive", code), 0);
+    assert_eq!(compile_and_run("char_ptr_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -406,7 +406,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_array_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_array_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -498,7 +498,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_param_ret_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_param_ret_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -569,7 +569,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_cast_struct_comprehensive", code), 0);
+    assert_eq!(
+        compile_and_run("ptr_cast_struct_comprehensive", code, &[]),
+        0
+    );
 }
 
 // ============================================================================
@@ -646,7 +649,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_expr_comprehensive", code), 0);
+    assert_eq!(compile_and_run("ptr_expr_comprehensive", code, &[]), 0);
 }
 
 // ============================================================================
@@ -687,5 +690,8 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ptr_alias_const_comprehensive", code), 0);
+    assert_eq!(
+        compile_and_run("ptr_alias_const_comprehensive", code, &[]),
+        0
+    );
 }

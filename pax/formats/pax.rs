@@ -230,7 +230,7 @@ impl ExtendedHeader {
     ///
     /// This method filters out keywords that match delete patterns and applies
     /// per-file overrides from the options (keyword:=value).
-    pub fn serialize_with_options(&self, options: &FormatOptions) -> Vec<u8> {
+    pub fn serialize(&self, options: &FormatOptions) -> Vec<u8> {
         let mut data = Vec::new();
         let per_file = options.per_file_options();
 
@@ -348,7 +348,7 @@ impl ExtendedHeader {
     /// # Arguments
     /// * `entry` - The archive entry to generate extended headers for
     /// * `include_times` - If true, always include atime and mtime in extended headers
-    pub fn from_entry_with_options(entry: &ArchiveEntry, include_times: bool) -> Self {
+    pub fn from_entry(entry: &ArchiveEntry, include_times: bool) -> Self {
         let mut header = ExtendedHeader::new();
 
         // Path needs extended header if too long for ustar
@@ -716,7 +716,7 @@ impl<W: Write> PaxWriter<W> {
         entry: &ArchiveEntry,
     ) -> PaxResult<()> {
         // Serialize with options to respect delete patterns
-        let data = ext_header.serialize_with_options(&self.options);
+        let data = ext_header.serialize(&self.options);
         if data.is_empty() {
             return Ok(());
         }
@@ -779,7 +779,7 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         self.write_global_header()?;
 
         // Check if we need extended headers (respecting -o times option)
-        let ext_header = ExtendedHeader::from_entry_with_options(entry, self.options.include_times);
+        let ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
 
         if !ext_header.is_empty() {
             self.write_extended_header(&ext_header, entry)?;
@@ -1151,7 +1151,7 @@ mod tests {
         ext.size = Some(10000000000);
         ext.mtime = Some(1234567890.123456789);
 
-        let data = ext.serialize_with_options(&FormatOptions::default());
+        let data = ext.serialize(&FormatOptions::default());
         let parsed = ExtendedHeader::parse(&data).unwrap();
 
         assert_eq!(parsed.path, ext.path);
@@ -1165,7 +1165,7 @@ mod tests {
         entry.uid = 3000000; // > 2097151
         entry.mtime_nsec = 500000000; // 0.5 seconds
 
-        let ext = ExtendedHeader::from_entry_with_options(&entry, false);
+        let ext = ExtendedHeader::from_entry(&entry, false);
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
     }

@@ -117,7 +117,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("varargs_callee_comprehensive", code), 0);
+    assert_eq!(
+        compile_and_run("varargs_callee_comprehensive", code, &[]),
+        0
+    );
 }
 
 // ============================================================================
@@ -149,7 +152,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("varargs_caller_comprehensive", code), 0);
+    assert_eq!(
+        compile_and_run("varargs_caller_comprehensive", code, &[]),
+        0
+    );
 }
 
 // ============================================================================
@@ -186,7 +192,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("varargs_float_args", code), 0);
+    assert_eq!(compile_and_run("varargs_float_args", code, &[]), 0);
 }
 
 // ============================================================================
@@ -249,5 +255,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("varargs_user_defined_float", code), 0);
+    assert_eq!(compile_and_run("varargs_user_defined_float", code, &[]), 0);
 }

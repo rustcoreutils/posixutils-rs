@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_simple_dfa() {
         let hir = parse_regex("ab");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Should have states for: start, after-a, after-ab (accepting)
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn test_alternation_dfa() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Both 'a' and 'b' should lead to accepting states
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn test_kleene_star_dfa() {
         let hir = parse_regex("a*");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Start state should be accepting (matches empty string)
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn test_minimization() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
         let minimized = dfa.minimize();
 
@@ -474,7 +474,7 @@ mod tests {
     fn test_multiple_rules_priority() {
         let hir1 = parse_regex("if");
         let hir2 = parse_regex("[a-z]+");
-        let nfa = Nfa::from_rules(&[(hir1, 0), (hir2, 1)]).unwrap();
+        let nfa = Nfa::from_rules(&[(hir1, None, 0), (hir2, None, 1)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Navigate through "if"

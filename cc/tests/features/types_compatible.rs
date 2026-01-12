@@ -87,5 +87,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("types_compatible", code), 0);
+    assert_eq!(compile_and_run("types_compatible", code, &[]), 0);
 }

@@ -238,6 +238,18 @@ pub fn clear_streams() {
     STREAMS.with(|s| s.borrow_mut().clear());
 }
 
+/// Get all stream names (for DWARF .file directives)
+/// Returns a vector of file paths, indexed by stream ID
+pub fn get_all_stream_names() -> Vec<String> {
+    STREAMS.with(|s| {
+        s.borrow()
+            .streams
+            .iter()
+            .map(|stream| stream.name.clone())
+            .collect()
+    })
+}
+
 // ============================================================================
 // Error Tracking
 // ============================================================================

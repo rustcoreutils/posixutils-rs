@@ -101,7 +101,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("mixed_cmp_promo", code), 0);
+    assert_eq!(compile_and_run("mixed_cmp_promo", code, &[]), 0);
 }
 
 // ============================================================================
@@ -187,7 +187,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("mixed_cmp_ranks_float", code), 0);
+    assert_eq!(compile_and_run("mixed_cmp_ranks_float", code, &[]), 0);
 }
 
 // ============================================================================
@@ -284,5 +284,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("mixed_cmp_edge", code), 0);
+    assert_eq!(compile_and_run("mixed_cmp_edge", code, &[]), 0);
 }

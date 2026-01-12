@@ -44,7 +44,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("fp_basics", code), 0);
+    assert_eq!(compile_and_run("fp_basics", code, &[]), 0);
 }
 
 // ============================================================================
@@ -85,7 +85,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("fp_structs", code), 0);
+    assert_eq!(compile_and_run("fp_structs", code, &[]), 0);
 }
 
 // ============================================================================
@@ -129,7 +129,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("fp_advanced", code), 0);
+    assert_eq!(compile_and_run("fp_advanced", code, &[]), 0);
 }
 
 // ============================================================================
@@ -169,7 +169,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("fp_param", code), 0);
+    assert_eq!(compile_and_run("fp_param", code, &[]), 0);
 }
 
 // ============================================================================
@@ -230,5 +230,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("fp_variations", code), 0);
+    assert_eq!(compile_and_run("fp_variations", code, &[]), 0);
 }

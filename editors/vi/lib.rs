@@ -75,7 +75,7 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     };
 
     // Create editor with appropriate mode
-    let mut editor = match Editor::new_with_mode(opts.start_in_ex_mode, opts.silent_mode) {
+    let mut editor = match Editor::new(opts.start_in_ex_mode, opts.silent_mode) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("{}: failed to initialize: {}", prog_name, e);

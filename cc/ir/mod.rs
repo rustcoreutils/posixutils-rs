@@ -27,6 +27,16 @@ use crate::types::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+const DEFAULT_INSN_CAPACITY: usize = 32;
+const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
+const DEFAULT_DOM_CAPACITY: usize = 4;
+const DEFAULT_SRC_CAPACITY: usize = 4;
+const DEFAULT_PHI_CAPACITY: usize = 4;
+const DEFAULT_PARAM_CAPACITY: usize = 8;
+const DEFAULT_BLOCK_CAPACITY: usize = 512;
+const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
+const DEFAULT_LOCAL_CAPACITY: usize = 64;
+
 // ============================================================================
 // Instruction Reference - for def-use chains
 // ============================================================================
@@ -548,18 +558,18 @@ impl Default for Instruction {
         Self {
             op: Opcode::Nop,
             target: None,
-            src: Vec::new(),
+            src: Vec::with_capacity(DEFAULT_SRC_CAPACITY),
             typ: None,
             bb_true: None,
             bb_false: None,
             offset: 0,
-            phi_list: Vec::new(),
+            phi_list: Vec::with_capacity(DEFAULT_PHI_CAPACITY),
             func_name: None,
             size: 0,
             src_size: 0,
             switch_cases: Vec::new(),
             switch_default: None,
-            arg_types: Vec::new(),
+            arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             variadic_arg_start: None,
             is_sret_call: false,
             is_noreturn_call: false,
@@ -943,15 +953,15 @@ impl Default for BasicBlock {
     fn default() -> Self {
         Self {
             id: BasicBlockId(0),
-            insns: Vec::new(),
-            parents: Vec::new(),
-            children: Vec::new(),
+            insns: Vec::with_capacity(DEFAULT_INSN_CAPACITY),
+            parents: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
+            children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
             label: None,
             idom: None,
             dom_level: 0,
-            dom_children: Vec::new(),
-            dom_frontier: Vec::new(),
-            phi_map: HashMap::new(),
+            dom_children: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
+            dom_frontier: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
+            phi_map: HashMap::with_capacity(DEFAULT_PHI_CAPACITY),
         }
     }
 }
@@ -1073,12 +1083,12 @@ impl Default for Function {
         Self {
             name: String::new(),
             return_type: TypeId::INVALID,
-            params: Vec::new(),
-            blocks: Vec::new(),
+            params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
+            blocks: Vec::with_capacity(DEFAULT_BLOCK_CAPACITY),
             entry: BasicBlockId(0),
-            pseudos: Vec::new(),
+            pseudos: Vec::with_capacity(DEFAULT_PSEUDO_CAPACITY),
             next_pseudo: 0,
-            locals: HashMap::new(),
+            locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
             max_dom_level: 0,
             is_static: false,
             is_noreturn: false,
@@ -1228,6 +1238,8 @@ pub enum Initializer {
     Float(f64),
     /// String literal initializer (for char arrays)
     String(String),
+    /// Wide string literal initializer (for wchar_t arrays)
+    WideString(String),
     /// Array initializer: element size in bytes, list of (offset, initializer) pairs
     /// Elements not listed are zero-initialized
     Array {
@@ -1253,6 +1265,7 @@ impl fmt::Display for Initializer {
             Initializer::Int(v) => write!(f, "{}", v),
             Initializer::Float(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
+            Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
             Initializer::Array {
                 total_size,
                 elements,
@@ -1295,6 +1308,8 @@ pub struct Module {
     pub globals: Vec<(String, TypeId, Initializer)>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
+    /// Wide string literals (label, content)
+    pub wide_strings: Vec<(String, String)>,
     /// Generate debug info
     pub debug: bool,
     /// Source file paths (stream id -> path) for .file directives
@@ -1302,6 +1317,10 @@ pub struct Module {
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// Compilation directory (for DW_AT_comp_dir in DWARF)
+    pub comp_dir: Option<String>,
+    /// Primary source filename (for DW_AT_name in DWARF)
+    pub source_name: Option<String>,
 }
 
 impl Module {
@@ -1311,9 +1330,12 @@ impl Module {
             functions: Vec::new(),
             globals: Vec::new(),
             strings: Vec::new(),
+            wide_strings: Vec::new(),
             debug: false,
             source_files: Vec::new(),
             extern_symbols: HashSet::new(),
+            comp_dir: None,
+            source_name: None,
         }
     }
 
@@ -1331,6 +1353,13 @@ impl Module {
     pub fn add_string(&mut self, content: String) -> String {
         let label = format!(".LC{}", self.strings.len());
         self.strings.push((label.clone(), content));
+        label
+    }
+
+    /// Add a wide string literal and return its label
+    pub fn add_wide_string(&mut self, content: String) -> String {
+        let label = format!(".LWC{}", self.wide_strings.len());
+        self.wide_strings.push((label.clone(), content));
         label
     }
 }

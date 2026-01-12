@@ -69,7 +69,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("array_param_basic", code), 0);
+    assert_eq!(compile_and_run("array_param_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -118,7 +118,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("array_param_combined", code), 0);
+    assert_eq!(compile_and_run("array_param_combined", code, &[]), 0);
 }
 
 // ============================================================================
@@ -156,5 +156,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("array_param_vla", code), 0);
+    assert_eq!(compile_and_run("array_param_vla", code, &[]), 0);
 }

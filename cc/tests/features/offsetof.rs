@@ -30,7 +30,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("offsetof_basic", code), 0);
+    assert_eq!(compile_and_run("offsetof_basic", code, &[]), 0);
 }
 
 #[test]
@@ -47,7 +47,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("offsetof_nested", code), 0);
+    assert_eq!(compile_and_run("offsetof_nested", code, &[]), 0);
 }
 
 #[test]
@@ -62,7 +62,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("offsetof_array", code), 0);
+    assert_eq!(compile_and_run("offsetof_array", code, &[]), 0);
 }
 
 #[test]
@@ -77,5 +77,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("offsetof_macro_style", code), 0);
+    assert_eq!(compile_and_run("offsetof_macro_style", code, &[]), 0);
 }

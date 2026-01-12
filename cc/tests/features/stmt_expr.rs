@@ -21,7 +21,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stmt_expr_basic", code), 0);
+    assert_eq!(compile_and_run("stmt_expr_basic", code, &[]), 0);
 }
 
 #[test]
@@ -39,7 +39,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stmt_expr_with_declarations", code), 0);
+    assert_eq!(compile_and_run("stmt_expr_with_declarations", code, &[]), 0);
 }
 
 #[test]
@@ -55,7 +55,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stmt_expr_nested", code), 0);
+    assert_eq!(compile_and_run("stmt_expr_nested", code, &[]), 0);
 }
 
 #[test]
@@ -72,7 +72,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stmt_expr_as_function_arg", code), 0);
+    assert_eq!(compile_and_run("stmt_expr_as_function_arg", code, &[]), 0);
 }
 
 #[test]
@@ -93,5 +93,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stmt_expr_with_control_flow", code), 0);
+    assert_eq!(compile_and_run("stmt_expr_with_control_flow", code, &[]), 0);
 }

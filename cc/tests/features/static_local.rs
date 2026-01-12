@@ -30,7 +30,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_preincr", code), 0);
+    assert_eq!(compile_and_run("static_preincr", code, &[]), 0);
 }
 
 /// Test: pre-decrement with static local variable
@@ -49,7 +49,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_predec", code), 0);
+    assert_eq!(compile_and_run("static_predec", code, &[]), 0);
 }
 
 /// Test: post-increment with static local variable
@@ -68,7 +68,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_postinc", code), 0);
+    assert_eq!(compile_and_run("static_postinc", code, &[]), 0);
 }
 
 /// Test: post-decrement with static local variable
@@ -87,7 +87,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_postdec", code), 0);
+    assert_eq!(compile_and_run("static_postdec", code, &[]), 0);
 }
 
 /// Test: compound assignment with static local variable
@@ -107,7 +107,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_compound", code), 0);
+    assert_eq!(compile_and_run("static_compound", code, &[]), 0);
 }
 
 /// Test: multiple static locals in same function
@@ -132,7 +132,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_multiple", code), 0);
+    assert_eq!(compile_and_run("static_multiple", code, &[]), 0);
 }
 
 /// Test: static local with different types
@@ -157,7 +157,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_types", code), 0);
+    assert_eq!(compile_and_run("static_types", code, &[]), 0);
 }
 
 /// Test: static local in multiple functions
@@ -182,7 +182,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_separate", code), 0);
+    assert_eq!(compile_and_run("static_separate", code, &[]), 0);
 }
 
 /// Test: static local pointer increment
@@ -203,5 +203,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("static_pointer", code), 0);
+    assert_eq!(compile_and_run("static_pointer", code, &[]), 0);
 }

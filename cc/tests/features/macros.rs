@@ -58,7 +58,7 @@ CALL(ADD, 10, 20);
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("nested_macro", code), 0);
+    assert_eq!(compile_and_run("nested_macro", code, &[]), 0);
 }
 
 // ============================================================================
@@ -96,5 +96,149 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("stringify_paste", code), 0);
+    assert_eq!(compile_and_run("stringify_paste", code, &[]), 0);
+}
+
+// ============================================================================
+// String Literal Concatenation (C99 6.4.5)
+// ============================================================================
+
+#[test]
+fn string_literal_concatenation() {
+    let code = r#"
+int main(void) {
+    // Test 1-2: Basic adjacent string literal concatenation
+    const char *s1 = "hello" "world";
+    if (s1[0] != 'h') return 1;
+    if (s1[5] != 'w') return 2;  // "hello" is 5 chars, then "world" starts
+
+    // Test 3-4: Three adjacent strings
+    const char *s2 = "a" "b" "c";
+    if (s2[0] != 'a') return 3;
+    if (s2[2] != 'c') return 4;
+
+    // Test 5-6: With whitespace and newlines between strings
+    const char *s3 = "foo"
+                     "bar";
+    if (s3[0] != 'f') return 5;
+    if (s3[3] != 'b') return 6;
+
+    // Test 7-8: Macro expansion producing adjacent strings
+#define STR1 "hello"
+#define STR2 "world"
+    const char *s4 = STR1 STR2;
+    if (s4[0] != 'h') return 7;
+    if (s4[5] != 'w') return 8;
+
+    // Test 9-10: String with escape sequences
+    const char *s5 = "line1\n" "line2";
+    if (s5[5] != '\n') return 9;
+    if (s5[6] != 'l') return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("string_concat", code, &[]), 0);
+}
+
+// ============================================================================
+// Macro Expansion in #if/#elif Conditions (C99 6.10.1)
+// ============================================================================
+
+#[test]
+fn macro_expansion_in_if() {
+    let code = r#"
+#define VALUE 42
+#define ZERO 0
+#define ONE 1
+#define ADD(a, b) ((a) + (b))
+
+// Test 1: Simple macro in #if
+#if VALUE == 42
+int test1_passed = 1;
+#else
+int test1_passed = 0;
+#endif
+
+// Test 2: Macro that expands to zero
+#if ZERO
+int test2_passed = 0;
+#else
+int test2_passed = 1;
+#endif
+
+// Test 3: Macro that expands to one
+#if ONE
+int test3_passed = 1;
+#else
+int test3_passed = 0;
+#endif
+
+// Test 4: Macro in complex expression
+#if VALUE > 40 && VALUE < 50
+int test4_passed = 1;
+#else
+int test4_passed = 0;
+#endif
+
+// Test 5: Function-like macro in #if
+#if ADD(1, 1) == 2
+int test5_passed = 1;
+#else
+int test5_passed = 0;
+#endif
+
+// Test 6: Undefined identifier in #if (should be 0)
+#if UNDEFINED_MACRO
+int test6_passed = 0;
+#else
+int test6_passed = 1;
+#endif
+
+// Test 7: defined() with macro
+#if defined(VALUE)
+int test7_passed = 1;
+#else
+int test7_passed = 0;
+#endif
+
+// Test 8: defined() without parens
+#if defined VALUE
+int test8_passed = 1;
+#else
+int test8_passed = 0;
+#endif
+
+// Test 9: !defined()
+#if !defined(NONEXISTENT)
+int test9_passed = 1;
+#else
+int test9_passed = 0;
+#endif
+
+// Test 10: Macro in #elif
+#define OPTION 2
+#if OPTION == 1
+int test10_passed = 0;
+#elif OPTION == 2
+int test10_passed = 1;
+#else
+int test10_passed = 0;
+#endif
+
+int main(void) {
+    if (!test1_passed) return 1;
+    if (!test2_passed) return 2;
+    if (!test3_passed) return 3;
+    if (!test4_passed) return 4;
+    if (!test5_passed) return 5;
+    if (!test6_passed) return 6;
+    if (!test7_passed) return 7;
+    if (!test8_passed) return 8;
+    if (!test9_passed) return 9;
+    if (!test10_passed) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("macro_if", code, &[]), 0);
 }

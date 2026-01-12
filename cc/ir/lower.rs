@@ -18,6 +18,8 @@
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
 use std::collections::HashMap;
 
+const DEFAULT_COPY_CAPACITY: usize = 8;
+
 // ============================================================================
 // Phi Elimination
 // ============================================================================
@@ -38,8 +40,9 @@ use std::collections::HashMap;
 pub fn eliminate_phi_nodes(func: &mut Function) {
     // Collect all phi information first to avoid borrowing issues
     // Map: predecessor_bb -> Vec<(target, source, size)>
-    let mut copies_to_insert: HashMap<BasicBlockId, Vec<CopyInfo>> = HashMap::new();
-    let mut phi_positions: Vec<(BasicBlockId, usize)> = Vec::new();
+    let mut copies_to_insert: HashMap<BasicBlockId, Vec<CopyInfo>> =
+        HashMap::with_capacity(DEFAULT_COPY_CAPACITY);
+    let mut phi_positions: Vec<(BasicBlockId, usize)> = Vec::with_capacity(DEFAULT_COPY_CAPACITY);
 
     // Scan all blocks for phi nodes
     for bb in &func.blocks {
@@ -87,7 +90,8 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
     // Use parallel copy sequentialization to handle the "lost copy" problem
     //
     // First sequentialize all copies (may create temporaries), then insert
-    let mut sequenced_copies: HashMap<BasicBlockId, Vec<CopyInfo>> = HashMap::new();
+    let mut sequenced_copies: HashMap<BasicBlockId, Vec<CopyInfo>> =
+        HashMap::with_capacity(DEFAULT_COPY_CAPACITY);
     for (pred_bb_id, copies) in copies_to_insert {
         let sequenced = sequentialize_copies(&copies, func);
         sequenced_copies.insert(pred_bb_id, sequenced);
@@ -168,7 +172,7 @@ fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInf
     }
 
     // There are overlapping targets and sources - need to sequentialize
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(copies.len() + 1); // +1 for possible temp
     let mut pending: Vec<CopyInfo> = copies.to_vec();
 
     // Keep processing until all copies are emitted

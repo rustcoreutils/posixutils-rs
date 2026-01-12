@@ -477,6 +477,21 @@ pub enum Directive {
     Loc { file: u32, line: u32, col: u32 },
 
     // ========================================================================
+    // DWARF Debug Sections
+    // ========================================================================
+    /// .section .debug_info (ELF) or __DWARF,__debug_info (Mach-O)
+    DebugInfo,
+
+    /// .section .debug_abbrev (ELF) or __DWARF,__debug_abbrev (Mach-O)
+    DebugAbbrev,
+
+    /// .uleb128 value - unsigned LEB128 encoding for DWARF
+    Uleb128(u64),
+
+    /// .2byte value - 16-bit value (for DWARF version)
+    TwoBytes(u16),
+
+    // ========================================================================
     // Misc
     // ========================================================================
     /// Assembly comment (prefixed with #)
@@ -701,6 +716,32 @@ impl EmitAsm for Directive {
             }
             Directive::Loc { file, line, col } => {
                 let _ = writeln!(out, "    .loc {} {} {}", file, line, col);
+            }
+
+            // DWARF debug sections
+            Directive::DebugInfo => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __DWARF,__debug_info,regular,debug");
+                }
+                _ => {
+                    // ELF format (Linux, FreeBSD, OpenBSD, NetBSD, etc.)
+                    let _ = writeln!(out, ".section .debug_info,\"\",@progbits");
+                }
+            },
+            Directive::DebugAbbrev => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __DWARF,__debug_abbrev,regular,debug");
+                }
+                _ => {
+                    // ELF format
+                    let _ = writeln!(out, ".section .debug_abbrev,\"\",@progbits");
+                }
+            },
+            Directive::Uleb128(v) => {
+                let _ = writeln!(out, "    .uleb128 {}", v);
+            }
+            Directive::TwoBytes(v) => {
+                let _ = writeln!(out, "    .2byte {}", v);
             }
 
             // Misc

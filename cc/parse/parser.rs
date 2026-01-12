@@ -24,6 +24,12 @@ use crate::types::{
 };
 use std::fmt;
 
+const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
+const DEFAULT_MEMBER_CAPACITY: usize = 16;
+const DEFAULT_ENUM_CAPACITY: usize = 16;
+const DEFAULT_INIT_CAPACITY: usize = 8;
+const DEFAULT_PARAM_CAPACITY: usize = 8;
+
 // ============================================================================
 // Parse Error
 // ============================================================================
@@ -308,6 +314,38 @@ impl<'a> Parser<'a> {
         self.idents.get(id)
     }
 
+    /// Check if current position (after consuming '(') indicates a grouped declarator.
+    ///
+    /// Grouped declarators include:
+    /// - Pointer declarators: `(*name)` or `(*)`
+    /// - Function type typedefs: `(name)` where name is not a type
+    ///
+    /// Must be called after advancing past '('. Saves/restores position internally
+    /// for the function-type check.
+    fn is_grouped_declarator(&mut self) -> bool {
+        // Check for pointer: (*name) or (*name[...]) etc
+        if self.is_special(b'*') {
+            return true;
+        }
+
+        // Check for grouped declarator: (name...) where name is NOT a type
+        // This handles cases like:
+        //   (name)     - function type typedef
+        //   (name[N])  - parenthesized array declarator
+        //   (name(...)) - parenthesized function declarator
+        // Following sparse's is_nested() logic: if identifier is not a type, it's grouped
+        if self.peek() == TokenType::Ident {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                let is_type = self.symbols.lookup_typedef(name_id).is_some()
+                    || Self::is_type_keyword(self.str(name_id));
+                // If not a type, this is a grouped declarator
+                return !is_type;
+            }
+        }
+
+        false
+    }
+
     /// Resolve an incomplete struct/union type to its complete definition.
     ///
     /// When a struct is forward-declared (e.g., `struct foo;`) and later
@@ -342,6 +380,40 @@ impl<'a> Parser<'a> {
 
         // Couldn't resolve, return original
         type_id
+    }
+
+    /// Intern a type, but for struct/union types with tags, check the symbol table
+    /// first to reuse the existing TypeId. This ensures forward-declared types
+    /// are properly linked when the type is later completed.
+    ///
+    /// Important: Storage class modifiers (static, extern, etc.) are preserved from
+    /// the input type even when reusing an existing struct TypeId.
+    fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
+        // For struct/union types with a tag, use the existing TypeId from symbol table
+        if matches!(typ.kind, TypeKind::Struct | TypeKind::Union) {
+            if let Some(ref composite) = typ.composite {
+                if let Some(tag) = composite.tag {
+                    if let Some(existing) = self.symbols.lookup_tag(tag) {
+                        // Check if we need to preserve storage class modifiers
+                        let storage_class_mask = TypeModifiers::EXTERN
+                            | TypeModifiers::STATIC
+                            | TypeModifiers::TYPEDEF
+                            | TypeModifiers::REGISTER
+                            | TypeModifiers::AUTO;
+                        let new_storage_class = typ.modifiers & storage_class_mask;
+                        if !new_storage_class.is_empty() {
+                            // Create a new type with the existing struct's data but new modifiers
+                            let mut existing_type = self.types.get(existing.typ).clone();
+                            existing_type.modifiers |= new_storage_class;
+                            return self.types.intern(existing_type);
+                        }
+                        return existing.typ;
+                    }
+                }
+            }
+        }
+        // For other types, just intern normally
+        self.types.intern(typ.clone())
     }
 
     /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
@@ -920,7 +992,7 @@ impl<'a> Parser<'a> {
         let list_pos = self.current_pos();
         self.expect_special(b'{')?;
 
-        let mut elements = Vec::new();
+        let mut elements = Vec::with_capacity(DEFAULT_INIT_CAPACITY);
 
         // Handle empty initializer list: {}
         if self.is_special(b'}') {
@@ -1431,7 +1503,70 @@ impl<'a> Parser<'a> {
                 | "union"
                 | "enum"
                 | "__builtin_va_list"
+                | "typeof"
+                | "__typeof__"
+                | "__typeof"
         )
+    }
+
+    /// Consume type qualifiers (const, volatile, restrict)
+    /// Used for qualifiers after '*' in pointers or after struct/union/enum types
+    /// Returns the modifiers that were consumed
+    fn consume_type_qualifiers(&mut self) -> TypeModifiers {
+        let mut mods = TypeModifiers::empty();
+        while self.peek() == TokenType::Ident {
+            let name_id = match self.get_ident_id(self.current()) {
+                Some(id) => id,
+                None => break,
+            };
+            let name = self.str(name_id);
+            match name {
+                "const" | "__const" | "__const__" => {
+                    self.advance();
+                    mods |= TypeModifiers::CONST;
+                }
+                "volatile" | "__volatile" | "__volatile__" => {
+                    self.advance();
+                    mods |= TypeModifiers::VOLATILE;
+                }
+                "restrict" | "__restrict" | "__restrict__" => {
+                    self.advance();
+                    mods |= TypeModifiers::RESTRICT;
+                }
+                "_Atomic" => {
+                    self.advance();
+                    // Atomic qualifier - consume but don't track for now
+                }
+                _ => break,
+            }
+        }
+        mods
+    }
+
+    /// Parse a chain of pointer declarators with optional qualifiers
+    /// e.g., `* const * volatile *` returns the final pointer type
+    fn parse_pointer_chain(&mut self, mut base_type: TypeId) -> TypeId {
+        while self.is_special(b'*') {
+            self.advance();
+            let ptr_mods = self.consume_type_qualifiers();
+            let mut ptr_type = Type::pointer(base_type);
+            ptr_type.modifiers |= ptr_mods;
+            base_type = self.types.intern(ptr_type);
+        }
+        base_type
+    }
+
+    /// Apply trailing qualifiers to a type and return the qualified type id
+    /// Used for patterns like "struct foo const *" where const comes after the struct
+    fn apply_trailing_qualifiers(&mut self, base_type: TypeId) -> TypeId {
+        let trailing_mods = self.consume_type_qualifiers();
+        if trailing_mods.is_empty() {
+            base_type
+        } else {
+            let mut qualified_type = self.types.get(base_type).clone();
+            qualified_type.modifiers |= trailing_mods;
+            self.types.intern(qualified_type)
+        }
     }
 
     /// Parse a type name (required, returns error if not a type)
@@ -1571,21 +1706,46 @@ impl<'a> Parser<'a> {
                     base_kind = Some(TypeKind::VaList);
                     parsed_something = true;
                 }
+                "typeof" | "__typeof__" | "__typeof" => {
+                    self.advance(); // consume typeof
+                    if !self.is_special(b'(') {
+                        return None;
+                    }
+                    self.advance(); // consume '('
+
+                    // typeof can take either a type name or an expression
+                    // Try type name first
+                    if let Some(typ) = self.try_parse_type_name() {
+                        if !self.is_special(b')') {
+                            return None;
+                        }
+                        self.advance(); // consume ')'
+                        return Some(self.parse_pointer_chain(typ));
+                    }
+
+                    // Not a type name, try expression
+                    let expr = match self.parse_expression() {
+                        Ok(e) => e,
+                        Err(_) => return None,
+                    };
+                    if !self.is_special(b')') {
+                        return None;
+                    }
+                    self.advance(); // consume ')'
+
+                    let expr_type = expr.typ.unwrap_or(self.types.int_id);
+                    return Some(self.parse_pointer_chain(expr_type));
+                }
                 "struct" => {
                     self.advance(); // consume 'struct'
                                     // For struct tag reference, look up directly in symbol table
                     if let Some(tag_name) = self.get_ident_id(self.current()) {
                         if !self.is_special(b'{') {
                             // This is a tag reference (e.g., "struct Point*")
-                            // Look up the existing tag to get its TypeId directly
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let mut result_id = existing.typ;
-                                // Handle pointer
-                                while self.is_special(b'*') {
-                                    self.advance();
-                                    result_id = self.types.intern(Type::pointer(result_id));
-                                }
+                                let result_id = self.apply_trailing_qualifiers(existing.typ);
+                                let mut result_id = self.parse_pointer_chain(result_id);
                                 // Handle array declarators
                                 while self.is_special(b'[') {
                                     self.advance();
@@ -1604,28 +1764,19 @@ impl<'a> Parser<'a> {
                                 return Some(result_id);
                             }
                             // Tag not found - return incomplete struct type
-                            let incomplete = Type::incomplete_struct(tag_name);
-                            let mut result_id = self.types.intern(incomplete);
-                            while self.is_special(b'*') {
-                                self.advance();
-                                result_id = self.types.intern(Type::pointer(result_id));
-                            }
-                            return Some(result_id);
+                            let mut incomplete = Type::incomplete_struct(tag_name);
+                            incomplete.modifiers |= self.consume_type_qualifiers();
+                            let result_id = self.types.intern(incomplete);
+                            return Some(self.parse_pointer_chain(result_id));
                         }
                     }
                     // Fall back to full struct parsing for definitions
-                    // (rewind position first since we consumed 'struct')
                     self.pos -= 1;
                     if let Ok(struct_type) = self.parse_struct_or_union_specifier(false) {
-                        // Intern base struct type with modifiers
                         let mut typ = struct_type;
-                        typ.modifiers |= modifiers;
+                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
                         let mut result_id = self.types.intern(typ);
-                        // Handle pointer
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
+                        result_id = self.parse_pointer_chain(result_id);
                         // Handle array declarators
                         while self.is_special(b'[') {
                             self.advance();
@@ -1652,11 +1803,9 @@ impl<'a> Parser<'a> {
                             // This is a tag reference
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                let mut result_id = existing.typ;
-                                while self.is_special(b'*') {
-                                    self.advance();
-                                    result_id = self.types.intern(Type::pointer(result_id));
-                                }
+                                let result_id = self.apply_trailing_qualifiers(existing.typ);
+                                let mut result_id = self.parse_pointer_chain(result_id);
+                                // Handle array declarators
                                 while self.is_special(b'[') {
                                     self.advance();
                                     if let Ok(size_expr) = self.parse_conditional_expr() {
@@ -1674,25 +1823,19 @@ impl<'a> Parser<'a> {
                                 return Some(result_id);
                             }
                             // Tag not found - return incomplete union type
-                            let incomplete = Type::incomplete_union(tag_name);
-                            let mut result_id = self.types.intern(incomplete);
-                            while self.is_special(b'*') {
-                                self.advance();
-                                result_id = self.types.intern(Type::pointer(result_id));
-                            }
-                            return Some(result_id);
+                            let mut incomplete = Type::incomplete_union(tag_name);
+                            incomplete.modifiers |= self.consume_type_qualifiers();
+                            let result_id = self.types.intern(incomplete);
+                            return Some(self.parse_pointer_chain(result_id));
                         }
                     }
                     // Fall back to full union parsing for definitions
                     self.pos -= 1;
                     if let Ok(union_type) = self.parse_struct_or_union_specifier(true) {
                         let mut typ = union_type;
-                        typ.modifiers |= modifiers;
+                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
                         let mut result_id = self.types.intern(typ);
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
+                        result_id = self.parse_pointer_chain(result_id);
                         // Handle array declarators
                         while self.is_special(b'[') {
                             self.advance();
@@ -1714,12 +1857,9 @@ impl<'a> Parser<'a> {
                 "enum" => {
                     if let Ok(enum_type) = self.parse_enum_specifier() {
                         let mut typ = enum_type;
-                        typ.modifiers |= modifiers;
+                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
                         let mut result_id = self.types.intern(typ);
-                        while self.is_special(b'*') {
-                            self.advance();
-                            result_id = self.types.intern(Type::pointer(result_id));
-                        }
+                        result_id = self.parse_pointer_chain(result_id);
                         // Handle array declarators
                         while self.is_special(b'[') {
                             self.advance();
@@ -1780,10 +1920,7 @@ impl<'a> Parser<'a> {
         };
 
         // Handle pointer declarators
-        while self.is_special(b'*') {
-            self.advance();
-            result_id = self.types.intern(Type::pointer(result_id));
-        }
+        result_id = self.parse_pointer_chain(result_id);
 
         // Handle function pointer declarators: void (*)(int), int (*)(void), etc.
         // Syntax: return_type (*)(param_types)
@@ -1807,7 +1944,8 @@ impl<'a> Parser<'a> {
                                             // Create function pointer type with actual parameter types
                             let param_type_ids: Vec<TypeId> =
                                 params.iter().map(|p| p.typ).collect();
-                            let fn_type = Type::function(result_id, param_type_ids, variadic);
+                            let fn_type =
+                                Type::function(result_id, param_type_ids, variadic, false);
                             let fn_type_id = self.types.intern(fn_type);
                             result_id = self.types.intern(Type::pointer(fn_type_id));
                             return Some(result_id);
@@ -1976,7 +2114,7 @@ impl<'a> Parser<'a> {
 
     /// Parse function argument list
     fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
-        let mut args = Vec::new();
+        let mut args = Vec::with_capacity(DEFAULT_ARG_LIST_CAPACITY);
 
         if self.is_special(b')') {
             return Ok(args);
@@ -2559,8 +2697,13 @@ impl<'a> Parser<'a> {
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
                     // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
-                    if name_str == "__func__" {
-                        // __func__ behaves like a string literal (const char[])
+                    // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave similarly
+                    if name_str == "__func__"
+                        || name_str == "__FUNCTION__"
+                        || name_str == "__PRETTY_FUNCTION__"
+                    {
+                        // These behave like a string literal (const char[])
+                        // Linearization handles mapping to __func__ behavior
                         return Ok(Self::typed_expr(
                             ExprKind::Ident { name: name_id },
                             self.types.char_ptr_id,
@@ -2616,7 +2759,17 @@ impl<'a> Parser<'a> {
                 let token_pos = token.pos;
                 if let TokenValue::String(s) = &token.value {
                     // Parse string literal - convert escape sequences
-                    let parsed = Self::parse_string_literal(s);
+                    let mut parsed = Self::parse_string_literal(s);
+
+                    // Handle adjacent string literal concatenation (C99 6.4.5)
+                    // "hello" "world" -> "helloworld"
+                    while self.peek() == TokenType::String {
+                        let next_token = self.consume();
+                        if let TokenValue::String(next_s) = &next_token.value {
+                            parsed.push_str(&Self::parse_string_literal(next_s));
+                        }
+                    }
+
                     // String literal type is char*
                     Ok(Self::typed_expr(
                         ExprKind::StringLit(parsed),
@@ -2625,6 +2778,33 @@ impl<'a> Parser<'a> {
                     ))
                 } else {
                     Err(ParseError::new("invalid string token", token.pos))
+                }
+            }
+
+            TokenType::WideString => {
+                let token = self.consume();
+                let token_pos = token.pos;
+                if let TokenValue::WideString(s) = &token.value {
+                    // Parse wide string literal - convert escape sequences
+                    let mut parsed = Self::parse_string_literal(s);
+
+                    // Handle adjacent wide string literal concatenation
+                    while self.peek() == TokenType::WideString {
+                        let next_token = self.consume();
+                        if let TokenValue::WideString(next_s) = &next_token.value {
+                            parsed.push_str(&Self::parse_string_literal(next_s));
+                        }
+                    }
+
+                    // Wide string literal type is wchar_t* (wchar_t is int on this platform)
+                    let wchar_ptr_id = self.types.intern(Type::pointer(self.types.int_id));
+                    Ok(Self::typed_expr(
+                        ExprKind::WideStringLit(parsed),
+                        wchar_ptr_id,
+                        token_pos,
+                    ))
+                } else {
+                    Err(ParseError::new("invalid wide string token", token.pos))
                 }
             }
 
@@ -3327,9 +3507,10 @@ impl Parser<'_> {
         // The result of a statement expression is the last expression statement.
         // If there are no statements or the last isn't an expression, result is void.
         let (stmts, result, result_type) = if items.is_empty() {
+            // Empty statement expression: ({ }) has type void
             (
                 Vec::new(),
-                Expr::new(ExprKind::IntLit(0), paren_pos),
+                Expr::typed(ExprKind::IntLit(0), self.types.void_id, paren_pos),
                 self.types.void_id,
             )
         } else {
@@ -3341,11 +3522,13 @@ impl Parser<'_> {
                     (items, expr, typ)
                 }
                 _ => {
-                    // Last item is not an expression, push it back
+                    // Last item is not an expression statement (e.g. if, while, for)
+                    // Following sparse: the type becomes void (evaluate.c handles this
+                    // by returning NULL which becomes void_ctype)
                     items.push(last);
                     (
                         items,
-                        Expr::new(ExprKind::IntLit(0), paren_pos),
+                        Expr::typed(ExprKind::IntLit(0), self.types.void_id, paren_pos),
                         self.types.void_id,
                     )
                 }
@@ -3493,6 +3676,11 @@ impl Parser<'_> {
                 // size is string length + 1 for null terminator
                 Some(s.len() + 1)
             }
+            ExprKind::WideStringLit(s) => {
+                // For wchar_t array initialized with wide string literal,
+                // size is number of chars + 1 for null terminator
+                Some(s.chars().count() + 1)
+            }
             _ => None,
         };
 
@@ -3542,8 +3730,8 @@ impl Parser<'_> {
 
         // Check modifiers from the specifier before interning (storage class is not part of type)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        // Intern the base type (without storage class specifiers for the actual type)
-        let base_type_id = self.types.intern(base_type);
+        // For struct/union types with tags, use existing TypeId to preserve forward declarations
+        let base_type_id = self.intern_type_with_tag(&base_type);
 
         // Parse declarators
         let mut declarators = Vec::new();
@@ -3556,6 +3744,18 @@ impl Parser<'_> {
                     self.parse_declarator(base_type_id)?;
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions();
+
+                // Check if we have a name (needed for symbol binding)
+                let has_name = !self.str(name).is_empty();
+
+                // Bind variable to symbol table BEFORE parsing initializer.
+                // This ensures the variable is in scope for sizeof(*var) in initializers.
+                // Per C99 6.2.1p7: "Any other identifier has scope that begins just
+                // after the completion of its declarator."
+                if has_name && !is_typedef {
+                    let sym = Symbol::variable(name, typ, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                }
 
                 let init = if self.is_special(b'=') {
                     if is_typedef {
@@ -3575,18 +3775,11 @@ impl Parser<'_> {
                     typ = self.infer_array_size_from_init(typ, init_expr);
                 }
 
-                // Bind to symbol table
-                // Note: StringId is Copy, check for empty by comparing to empty string
-                let name_str = self.str(name);
-                if !name_str.is_empty() {
-                    if is_typedef {
-                        // For typedef, the type being aliased is the declarator type
-                        let sym = Symbol::typedef(name, typ, self.symbols.depth());
-                        let _ = self.symbols.declare(sym);
-                    } else {
-                        let sym = Symbol::variable(name, typ, self.symbols.depth());
-                        let _ = self.symbols.declare(sym);
-                    }
+                // Bind typedef to symbol table (after parsing initializer, which
+                // is forbidden for typedefs anyway)
+                if has_name && is_typedef {
+                    let sym = Symbol::typedef(name, typ, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
                 }
 
                 declarators.push(InitDeclarator {
@@ -3739,27 +3932,55 @@ impl Parser<'_> {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
-                "enum" => {
-                    let enum_type = self.parse_enum_specifier()?;
-                    // Apply any modifiers we collected
+                "typeof" | "__typeof__" | "__typeof" => {
+                    self.advance(); // consume typeof
+                    self.expect_special(b'(')?;
+
+                    // typeof can take either a type name or an expression
+                    // Try type name first
+                    if let Some(typ) = self.try_parse_type_name() {
+                        self.expect_special(b')')?;
+                        // Return the type with any modifiers
+                        let result_type = self.types.get(typ).clone();
+                        return Ok(Type {
+                            modifiers: modifiers | result_type.modifiers,
+                            ..result_type
+                        });
+                    }
+
+                    // Not a type name, try expression
+                    let expr = self.parse_expression()?;
+                    self.expect_special(b')')?;
+
+                    // Get the type of the expression
+                    let expr_type_id = expr.typ.unwrap_or(self.types.int_id);
+                    let result_type = self.types.get(expr_type_id).clone();
                     return Ok(Type {
-                        modifiers,
-                        ..enum_type
+                        modifiers: modifiers | result_type.modifiers,
+                        ..result_type
                     });
+                }
+                "enum" => {
+                    let mut enum_type = self.parse_enum_specifier()?;
+                    // Consume trailing qualifiers (e.g., "enum foo const")
+                    let trailing_mods = self.consume_type_qualifiers();
+                    // Apply any modifiers we collected
+                    enum_type.modifiers |= modifiers | trailing_mods;
+                    return Ok(enum_type);
                 }
                 "struct" => {
-                    let struct_type = self.parse_struct_or_union_specifier(false)?;
-                    return Ok(Type {
-                        modifiers,
-                        ..struct_type
-                    });
+                    let mut struct_type = self.parse_struct_or_union_specifier(false)?;
+                    // Consume trailing qualifiers (e.g., "struct foo const")
+                    let trailing_mods = self.consume_type_qualifiers();
+                    struct_type.modifiers |= modifiers | trailing_mods;
+                    return Ok(struct_type);
                 }
                 "union" => {
-                    let union_type = self.parse_struct_or_union_specifier(true)?;
-                    return Ok(Type {
-                        modifiers,
-                        ..union_type
-                    });
+                    let mut union_type = self.parse_struct_or_union_specifier(true)?;
+                    // Consume trailing qualifiers (e.g., "union foo const")
+                    let trailing_mods = self.consume_type_qualifiers();
+                    union_type.modifiers |= modifiers | trailing_mods;
+                    return Ok(union_type);
                 }
                 _ => {
                     // Check if it's a typedef name
@@ -3808,7 +4029,7 @@ impl Parser<'_> {
         if self.is_special(b'{') {
             self.advance(); // consume '{'
 
-            let mut constants = Vec::new();
+            let mut constants = Vec::with_capacity(DEFAULT_ENUM_CAPACITY);
             let mut next_value = 0i64;
 
             while !self.is_special(b'}') && !self.is_eof() {
@@ -3925,12 +4146,34 @@ impl Parser<'_> {
         if self.is_special(b'{') {
             self.advance(); // consume '{'
 
-            let mut members = Vec::new();
+            let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
 
             while !self.is_special(b'}') && !self.is_eof() {
                 // Parse member declaration
                 let member_base_type = self.parse_type_specifier()?;
-                let member_base_type_id = self.types.intern(member_base_type);
+                let is_struct_or_union =
+                    matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
+                // For struct/union types with tags, use the existing TypeId from symbol table
+                // to ensure forward-declared types are properly linked
+                let member_base_type_id = self.intern_type_with_tag(&member_base_type);
+
+                // Skip any __attribute__ after type specifier (before member name)
+                self.skip_extensions();
+
+                // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
+                // These have no declarator name, just end with ';'
+                if is_struct_or_union && self.is_special(b';') {
+                    members.push(StructMember {
+                        name: StringId::EMPTY,
+                        typ: member_base_type_id,
+                        offset: 0,
+                        bit_offset: None,
+                        bit_width: None,
+                        storage_unit_size: None,
+                    });
+                    self.advance(); // consume ';'
+                    continue;
+                }
 
                 // Check for unnamed bitfield (starts with ':')
                 if self.is_special(b':') {
@@ -4000,6 +4243,9 @@ impl Parser<'_> {
                         None
                     };
 
+                    // Skip any __attribute__ after member declaration
+                    self.skip_extensions();
+
                     members.push(StructMember {
                         name,
                         typ,
@@ -4040,6 +4286,25 @@ impl Parser<'_> {
                 is_complete: true,
             };
 
+            // Check if there's an existing forward declaration that we should complete
+            if let Some(tag_name) = tag {
+                if let Some(existing) = self.symbols.lookup_tag(tag_name) {
+                    // Complete the existing forward-declared type in place
+                    // This ensures all pointers to the incomplete type now see the complete type
+                    let existing_typ = existing.typ;
+                    let existing_type = self.types.get(existing_typ);
+                    if existing_type
+                        .composite
+                        .as_ref()
+                        .is_some_and(|c| !c.is_complete)
+                    {
+                        self.types.complete_struct(existing_typ, composite);
+                        return Ok(self.types.get(existing_typ).clone());
+                    }
+                }
+            }
+
+            // No existing forward declaration - create new type
             let struct_type = if is_union {
                 Type::union_type(composite)
             } else {
@@ -4060,10 +4325,19 @@ impl Parser<'_> {
                 // Look up existing tag
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                     Ok(self.types.get(existing.typ).clone())
-                } else if is_union {
-                    Ok(Type::incomplete_union(tag_name))
                 } else {
-                    Ok(Type::incomplete_struct(tag_name))
+                    // Create new incomplete type and register it in symbol table
+                    // This ensures that when the type is completed later, we can update
+                    // this same TypeId rather than creating a new one
+                    let incomplete_type = if is_union {
+                        Type::incomplete_union(tag_name)
+                    } else {
+                        Type::incomplete_struct(tag_name)
+                    };
+                    let typ_id = self.types.intern(incomplete_type.clone());
+                    let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                    Ok(incomplete_type)
                 }
             } else {
                 Err(ParseError::new(
@@ -4257,7 +4531,8 @@ impl Parser<'_> {
             // Apply any outer pointers (before the parens) to base type FIRST
             // For struct node *(*fp)(int): base is struct node, outer * -> Pointer(struct node)
             // For int *(*q)[3]: base is int, outer * -> Pointer(int)
-            for modifiers in pointer_modifiers.into_iter().rev() {
+            // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
+            for modifiers in pointer_modifiers.into_iter() {
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
                     modifiers,
@@ -4275,7 +4550,7 @@ impl Parser<'_> {
             // For struct node *(*fp)(int): result is Pointer(struct node)
             //   -> Function(Pointer(struct node), [int])
             if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                let func_type = Type::function(result_type_id, param_type_ids, variadic, false);
                 result_type_id = self.types.intern(func_type);
             }
 
@@ -4307,7 +4582,8 @@ impl Parser<'_> {
             // Pointers bind tighter than arrays: *arr[3] = array of pointers
 
             // Apply pointer modifiers to base type first
-            for modifiers in pointer_modifiers.into_iter().rev() {
+            // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
+            for modifiers in pointer_modifiers.into_iter() {
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
                     modifiers,
@@ -4341,7 +4617,7 @@ impl Parser<'_> {
             // For int get_op(int which): base is int, suffix (int) -> Function(int, [int])
             // This is needed for nested declarators like int (*get_op(int))(int, int)
             if let Some((param_type_ids, variadic)) = func_params {
-                let func_type = Type::function(result_type_id, param_type_ids, variadic);
+                let func_type = Type::function(result_type_id, param_type_ids, variadic, false);
                 result_type_id = self.types.intern(func_type);
             }
         }
@@ -4502,7 +4778,7 @@ impl Parser<'_> {
 
         // Build the function type
         let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-        let func_type = Type::function(ret_type_id, param_type_ids, variadic);
+        let func_type = Type::function(ret_type_id, param_type_ids, variadic, false);
         let func_type_id = self.types.intern(func_type);
 
         // Bind function to symbol table at current (global) scope
@@ -4532,12 +4808,14 @@ impl Parser<'_> {
             params,
             body,
             pos: func_pos,
+            is_static: false, // Test function, storage class not parsed
+            is_inline: false,
         })
     }
 
     /// Parse a parameter list
     fn parse_parameter_list(&mut self) -> ParseResult<(Vec<Parameter>, bool)> {
-        let mut params = Vec::new();
+        let mut params = Vec::with_capacity(DEFAULT_PARAM_CAPACITY);
         let mut variadic = false;
 
         if self.is_special(b')') {
@@ -4577,7 +4855,8 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_type = self.parse_type_specifier()?;
-            let base_type_id = self.types.intern(param_type);
+            // For struct/union types with tags, use existing TypeId to preserve forward declarations
+            let base_type_id = self.intern_type_with_tag(&param_type);
 
             // Use parse_declarator to handle all declarator forms including:
             // - Simple pointers: void *, int *
@@ -4587,9 +4866,12 @@ impl Parser<'_> {
             let (param_name, mut typ_id, _vla_sizes, _func_params) =
                 self.parse_declarator(base_type_id)?;
 
-            // C99 6.7.5.3: Array parameters are adjusted to pointers
-            // parse_declarator already gives us the array type, we need to convert
-            // the outermost array dimension to a pointer
+            // Skip any __attribute__ after parameter declarator
+            self.skip_extensions();
+
+            // C99 6.7.5.3: Array and function parameters are adjusted to pointers
+            // - Array T[] becomes pointer to T
+            // - Function type becomes pointer to function type
             let typ = self.types.get(typ_id);
             if typ.kind == TypeKind::Array {
                 // Convert array to pointer to element type
@@ -4598,6 +4880,20 @@ impl Parser<'_> {
                     kind: TypeKind::Pointer,
                     modifiers: TypeModifiers::empty(),
                     base: Some(element_type),
+                    array_size: None,
+                    params: None,
+                    variadic: false,
+                    noreturn: false,
+                    composite: None,
+                };
+                typ_id = self.types.intern(ptr_type);
+            } else if typ.kind == TypeKind::Function {
+                // Convert function type to pointer to function type
+                // e.g., `int fn(int)` becomes `int (*)(int)`
+                let ptr_type = Type {
+                    kind: TypeKind::Pointer,
+                    modifiers: TypeModifiers::empty(),
+                    base: Some(typ_id),
                     array_size: None,
                     params: None,
                     variadic: false,
@@ -4649,7 +4945,8 @@ impl Parser<'_> {
         let base_type = self.parse_type_specifier()?;
         // Check modifiers before interning (storage class specifiers)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        let base_type_id = self.types.intern(base_type);
+        // For struct/union types with tags, use existing TypeId to preserve forward declarations
+        let base_type_id = self.intern_type_with_tag(&base_type);
 
         // Check for standalone type definition (e.g., "enum Color { ... };")
         // This happens when a composite type is defined but no variables are declared
@@ -4661,13 +4958,11 @@ impl Parser<'_> {
             }));
         }
 
-        // Check for grouped declarator: void (*fp)(int) or int (*arr)[10]
-        // These are detected by '(' followed by '*'
+        // Check for grouped declarator: void (*fp)(int), int (*arr)[10], or typedef int (name)(params)
         if self.is_special(b'(') {
-            // Look ahead to see if this is a grouped declarator
             let saved_pos = self.pos;
             self.advance(); // consume '('
-            if self.is_special(b'*') {
+            if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, typ, vla_sizes, decl_func_params) =
@@ -4687,10 +4982,12 @@ impl Parser<'_> {
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
                 if self.types.kind(typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type
+                    // Get the function's return type and storage class
                     let func_type = self.types.get(typ);
                     let return_type = func_type.base.unwrap();
                     let _is_variadic = func_type.variadic;
+                    let is_static = func_type.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = func_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
@@ -4723,6 +5020,8 @@ impl Parser<'_> {
                         params,
                         body,
                         pos: decl_pos,
+                        is_static,
+                        is_inline,
                     }));
                 }
 
@@ -4823,11 +5122,11 @@ impl Parser<'_> {
         }
 
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
-        // At this point typ_id is char*, and we see (*fp)(int)
+        // Also handles: char *(name)(params) for function type
         if self.is_special(b'(') {
             let saved_pos = self.pos;
             self.advance(); // consume '('
-            if self.is_special(b'*') {
+            if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, full_typ, vla_sizes, decl_func_params) =
@@ -4847,9 +5146,11 @@ impl Parser<'_> {
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
                 if self.types.kind(full_typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type
+                    // Get the function's return type and storage class
                     let func_type = self.types.get(full_typ);
                     let return_type = func_type.base.unwrap();
+                    let is_static = func_type.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = func_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
@@ -4882,6 +5183,8 @@ impl Parser<'_> {
                         params,
                         body,
                         pos: decl_pos,
+                        is_static,
+                        is_inline,
                     }));
                 }
 
@@ -4942,14 +5245,14 @@ impl Parser<'_> {
 
             if self.is_special(b'{') {
                 // Function definition
+                // Extract storage class from base type
+                let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
+                let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
+
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function_with_attrs(
-                    typ_id,
-                    param_type_ids.clone(),
-                    variadic,
-                    is_noreturn,
-                );
+                let func_type =
+                    Type::function(typ_id, param_type_ids.clone(), variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
@@ -4978,6 +5281,8 @@ impl Parser<'_> {
                     params,
                     body,
                     pos: decl_pos,
+                    is_static,
+                    is_inline,
                 }));
             } else {
                 // Function declaration
@@ -4985,13 +5290,18 @@ impl Parser<'_> {
                 self.skip_extensions();
                 self.expect_special(b';')?;
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type =
-                    Type::function_with_attrs(typ_id, param_type_ids, variadic, is_noreturn);
+                let func_type = Type::function(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
-                // Add function declaration to symbol table so the variadic flag
-                // is available when the function is called
-                let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
-                let _ = self.symbols.declare(func_sym);
+                // Add to symbol table
+                if is_typedef {
+                    // Function type typedef: typedef void my_func(void);
+                    let sym = Symbol::typedef(name, func_type_id, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                } else {
+                    // Function declaration: add so the variadic flag is available when called
+                    let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
+                    let _ = self.symbols.declare(func_sym);
+                }
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         name,
@@ -5310,6 +5620,7 @@ impl Parser<'_> {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::strings::StringTable;
@@ -6413,6 +6724,78 @@ mod tests {
                 assert_eq!(types.kind(base), TypeKind::Pointer);
                 let innermost = types.base_type(base).unwrap();
                 assert_eq!(types.kind(innermost), TypeKind::Int);
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_const_pointer() {
+        // Test pointer qualifiers: (const int *)x
+        let (expr, types, _strings) = parse_expr("(const int *)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+                let base = types.base_type(cast_type).unwrap();
+                assert_eq!(types.kind(base), TypeKind::Int);
+                // const applies to the pointed-to int
+                assert!(types.get(base).modifiers.contains(TypeModifiers::CONST));
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_pointer_to_const() {
+        // Test pointer qualifiers after *: (int * const)x - const pointer to int
+        let (expr, types, _strings) = parse_expr("(int * const)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+                // const applies to the pointer itself
+                assert!(types
+                    .get(cast_type)
+                    .modifiers
+                    .contains(TypeModifiers::CONST));
+                let base = types.base_type(cast_type).unwrap();
+                assert_eq!(types.kind(base), TypeKind::Int);
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_double_pointer_with_qualifiers() {
+        // Test: (const int * const *)x - pointer to const pointer to const int
+        let (expr, types, _strings) = parse_expr("(const int * const *)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                // Outer is pointer (to const pointer to const int)
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+
+                // Middle is const pointer
+                let middle = types.base_type(cast_type).unwrap();
+                assert_eq!(types.kind(middle), TypeKind::Pointer);
+                assert!(types.get(middle).modifiers.contains(TypeModifiers::CONST));
+
+                // Inner is const int
+                let inner = types.base_type(middle).unwrap();
+                assert_eq!(types.kind(inner), TypeKind::Int);
+                assert!(types.get(inner).modifiers.contains(TypeModifiers::CONST));
+            }
+            _ => panic!("Expected Cast"),
+        }
+    }
+
+    #[test]
+    fn test_cast_volatile_pointer() {
+        // Test volatile qualifier: (volatile int *)x
+        let (expr, types, _strings) = parse_expr("(volatile int *)x").unwrap();
+        match expr.kind {
+            ExprKind::Cast { cast_type, .. } => {
+                assert_eq!(types.kind(cast_type), TypeKind::Pointer);
+                let base = types.base_type(cast_type).unwrap();
+                assert!(types.get(base).modifiers.contains(TypeModifiers::VOLATILE));
             }
             _ => panic!("Expected Cast"),
         }
@@ -9026,5 +9409,250 @@ mod tests {
         } else {
             panic!("Expected Declaration");
         }
+    }
+
+    // ========================================================================
+    // typeof operator tests (GCC extension)
+    // ========================================================================
+
+    #[test]
+    fn test_typeof_with_type() {
+        // typeof(int) should be int
+        let (tu, types, _) = parse_tu("typeof(int) x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Int);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_typeof_with_expression() {
+        // typeof(42) should be int (type of the expression)
+        let (tu, types, _) = parse_tu("int n = 42; typeof(n) x;").unwrap();
+        assert_eq!(tu.items.len(), 2);
+        if let ExternalDecl::Declaration(decl) = &tu.items[1] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Int);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_typeof_pointer() {
+        // typeof(int) * should be pointer to int
+        let (tu, types, _) = parse_tu("typeof(int) *p;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Pointer);
+            let pointee = types.get(typ).base.unwrap();
+            assert_eq!(types.kind(pointee), TypeKind::Int);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_dunder_typeof() {
+        // __typeof__ is an alias for typeof
+        let (tu, types, _) = parse_tu("__typeof__(long) x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Long);
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // Anonymous struct/union member tests (C11)
+    // ========================================================================
+
+    #[test]
+    fn test_anonymous_union_in_struct() {
+        // Anonymous union inside struct - this should parse without error
+        // The key test is that "union { ... };" without a name is accepted
+        let result = parse_tu("struct foo { int x; union { int a; float b; }; int y; } s;");
+        assert!(result.is_ok(), "Anonymous union in struct should parse");
+    }
+
+    #[test]
+    fn test_anonymous_struct_in_union() {
+        // Anonymous struct inside union - this should parse without error
+        let result = parse_tu("union bar { int i; struct { short x; short y; }; } u;");
+        assert!(result.is_ok(), "Anonymous struct in union should parse");
+    }
+
+    // ========================================================================
+    // Statement expression void type tests
+    // ========================================================================
+
+    #[test]
+    fn test_stmt_expr_void_when_last_is_if() {
+        // When last statement is if (not expression), result is void
+        let (expr, types, _) = parse_expr("({ if (1) ; })").unwrap();
+        match expr.kind {
+            ExprKind::StmtExpr { .. } => {
+                // The expression should have void type
+                assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Void);
+            }
+            _ => panic!("Expected StmtExpr"),
+        }
+    }
+
+    #[test]
+    fn test_stmt_expr_empty_is_void() {
+        // Empty statement expression ({ }) has void type
+        let (expr, types, _) = parse_expr("({ })").unwrap();
+        match expr.kind {
+            ExprKind::StmtExpr { .. } => {
+                assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Void);
+            }
+            _ => panic!("Expected StmtExpr"),
+        }
+    }
+
+    // ========================================================================
+    // Wide string literal tests
+    // ========================================================================
+
+    #[test]
+    fn test_wide_string_literal_basic() {
+        // L"hello" should parse as WideStringLit
+        let (expr, types, _) = parse_expr("L\"hello\"").unwrap();
+        match &expr.kind {
+            ExprKind::WideStringLit(s) => {
+                assert_eq!(s, "hello");
+            }
+            _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
+        }
+        // Type should be wchar_t* (int* on this platform)
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+        let pointee = types.get(typ).base.unwrap();
+        assert_eq!(types.kind(pointee), TypeKind::Int);
+    }
+
+    #[test]
+    fn test_wide_string_literal_concatenation() {
+        // Adjacent wide string literals should concatenate
+        let (expr, _, _) = parse_expr("L\"hello\" L\" world\"").unwrap();
+        match &expr.kind {
+            ExprKind::WideStringLit(s) => {
+                assert_eq!(s, "hello world");
+            }
+            _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_wide_string_array_size_inference() {
+        // int arr[] = L"abc"; should infer size 4 (3 chars + null)
+        let (tu, types, _) = parse_tu("int arr[] = L\"abc\";").unwrap();
+        assert_eq!(tu.items.len(), 1);
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(typ), TypeKind::Array);
+            assert_eq!(
+                types.get(typ).array_size,
+                Some(4),
+                "Wide string array size should be 4 (3 chars + null terminator)"
+            );
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // Function parameter adjustment tests
+    // ========================================================================
+
+    #[test]
+    fn test_function_param_adjusted_to_pointer() {
+        // Function parameters with function type should be adjusted to pointers
+        // void foo(int fn(int)) should become void foo(int (*fn)(int))
+        let (tu, types, _) = parse_tu("void foo(int fn(int));").unwrap();
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let func_typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(func_typ), TypeKind::Function);
+
+            // Get function parameters
+            if let Some(params) = &types.get(func_typ).params {
+                assert_eq!(params.len(), 1);
+                let param_typ = params[0];
+                // The parameter should be a pointer to function, not function itself
+                assert_eq!(
+                    types.kind(param_typ),
+                    TypeKind::Pointer,
+                    "Function parameter should be adjusted to pointer"
+                );
+                // The pointee should be a function type
+                let pointee = types.get(param_typ).base.unwrap();
+                assert_eq!(types.kind(pointee), TypeKind::Function);
+            } else {
+                panic!("Expected function type with params");
+            }
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    #[test]
+    fn test_function_param_array_adjusted_to_pointer() {
+        // Array parameters are adjusted to pointers (existing behavior, ensure not broken)
+        let (tu, types, _) = parse_tu("void foo(int arr[]);").unwrap();
+
+        if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+            let func_typ = decl.declarators[0].typ;
+            assert_eq!(types.kind(func_typ), TypeKind::Function);
+
+            if let Some(params) = &types.get(func_typ).params {
+                let param_typ = params[0];
+                assert_eq!(
+                    types.kind(param_typ),
+                    TypeKind::Pointer,
+                    "Array parameter should be adjusted to pointer"
+                );
+            }
+        } else {
+            panic!("Expected Declaration");
+        }
+    }
+
+    // ========================================================================
+    // __FUNCTION__ and __PRETTY_FUNCTION__ parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_gcc_function_identifier_parsing() {
+        // __FUNCTION__ should parse as an identifier with char* type
+        let (expr, types, _) = parse_expr("__FUNCTION__").unwrap();
+        match &expr.kind {
+            ExprKind::Ident { .. } => {}
+            _ => panic!("Expected Ident, got {:?}", expr.kind),
+        }
+        // Type should be char*
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+    }
+
+    #[test]
+    fn test_gcc_pretty_function_identifier_parsing() {
+        // __PRETTY_FUNCTION__ should parse as an identifier with char* type
+        let (expr, types, _) = parse_expr("__PRETTY_FUNCTION__").unwrap();
+        match &expr.kind {
+            ExprKind::Ident { .. } => {}
+            _ => panic!("Expected Ident, got {:?}", expr.kind),
+        }
+        // Type should be char*
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
     }
 }

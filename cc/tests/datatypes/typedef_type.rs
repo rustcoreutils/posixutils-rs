@@ -49,7 +49,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_basic", code), 0);
+    assert_eq!(compile_and_run("typedef_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -79,7 +79,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_ptr", code), 0);
+    assert_eq!(compile_and_run("typedef_ptr", code, &[]), 0);
 }
 
 // ============================================================================
@@ -132,7 +132,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_struct", code), 0);
+    assert_eq!(compile_and_run("typedef_struct", code, &[]), 0);
 }
 
 // ============================================================================
@@ -190,5 +190,67 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("typedef_adv", code), 0);
+    assert_eq!(compile_and_run("typedef_adv", code, &[]), 0);
+}
+
+// ============================================================================
+// Typedef for Function Types (C99 function type typedefs)
+// ============================================================================
+
+#[test]
+fn typedef_function_types() {
+    let code = r#"
+// Function type typedef with parenthesized name: typedef return_type (name)(params);
+typedef int (int_func)(void);
+typedef int (int_int_func)(int);
+typedef void (void_func)(void);
+
+// Function pointer typedef using function type
+typedef int_func *int_func_ptr;
+typedef int_int_func *int_int_func_ptr;
+
+// Regular function pointer typedef for comparison
+typedef int (*regular_func_ptr)(int);
+
+int get_value(void) {
+    return 42;
+}
+
+int double_it(int x) {
+    return x * 2;
+}
+
+void do_nothing(void) {
+    // Empty
+}
+
+int main(void) {
+    // Test 1: Function type typedef can be used as pointer base
+    int_func *fp1 = get_value;
+    if (fp1() != 42) return 1;
+
+    // Test 2: Function pointer typedef from function type
+    int_func_ptr fp2 = get_value;
+    if (fp2() != 42) return 2;
+
+    // Test 3: Function type with parameter
+    int_int_func *fp3 = double_it;
+    if (fp3(21) != 42) return 3;
+
+    // Test 4: Function pointer typedef with parameter
+    int_int_func_ptr fp4 = double_it;
+    if (fp4(10) != 20) return 4;
+
+    // Test 5: Regular function pointer typedef for sanity
+    regular_func_ptr fp5 = double_it;
+    if (fp5(5) != 10) return 5;
+
+    // Test 6: Void function type
+    void_func *fp6 = do_nothing;
+    fp6();  // Should not crash
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("typedef_func", code, &[]), 0);
 }

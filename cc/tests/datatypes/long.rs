@@ -66,7 +66,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_arith", code), 0);
+    assert_eq!(compile_and_run("long_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -138,7 +138,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_cmp", code), 0);
+    assert_eq!(compile_and_run("long_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -186,7 +186,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_logical", code), 0);
+    assert_eq!(compile_and_run("long_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -226,7 +226,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_bitwise", code), 0);
+    assert_eq!(compile_and_run("long_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -296,7 +296,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_assign", code), 0);
+    assert_eq!(compile_and_run("long_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -340,7 +340,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_incdec", code), 0);
+    assert_eq!(compile_and_run("long_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -369,7 +369,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("long_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -399,7 +399,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_complex", code), 0);
+    assert_eq!(compile_and_run("long_complex", code, &[]), 0);
 }
 
 // ############################################################################
@@ -457,7 +457,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_arith", code), 0);
+    assert_eq!(compile_and_run("ulong_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -529,7 +529,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_cmp", code), 0);
+    assert_eq!(compile_and_run("ulong_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -577,7 +577,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_logical", code), 0);
+    assert_eq!(compile_and_run("ulong_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -617,7 +617,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_bitwise", code), 0);
+    assert_eq!(compile_and_run("ulong_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -687,7 +687,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_assign", code), 0);
+    assert_eq!(compile_and_run("ulong_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -731,7 +731,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_incdec", code), 0);
+    assert_eq!(compile_and_run("ulong_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -760,7 +760,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("ulong_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -790,7 +790,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ulong_complex", code), 0);
+    assert_eq!(compile_and_run("ulong_complex", code, &[]), 0);
 }
 
 // ============================================================================
@@ -892,5 +892,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("long_advanced", code), 0);
+    assert_eq!(compile_and_run("long_advanced", code, &[]), 0);
 }

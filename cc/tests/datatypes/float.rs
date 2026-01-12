@@ -55,7 +55,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_arith", code), 0);
+    assert_eq!(compile_and_run("float_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -111,7 +111,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_cmp", code), 0);
+    assert_eq!(compile_and_run("float_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -151,7 +151,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_assign", code), 0);
+    assert_eq!(compile_and_run("float_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -197,7 +197,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_incdec", code), 0);
+    assert_eq!(compile_and_run("float_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -235,7 +235,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_int_conv", code), 0);
+    assert_eq!(compile_and_run("float_int_conv", code, &[]), 0);
 }
 
 // ############################################################################
@@ -285,7 +285,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("double_arith", code), 0);
+    assert_eq!(compile_and_run("double_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -341,7 +341,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("double_cmp", code), 0);
+    assert_eq!(compile_and_run("double_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -381,7 +381,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("double_assign", code), 0);
+    assert_eq!(compile_and_run("double_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -419,7 +419,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("double_int_conv", code), 0);
+    assert_eq!(compile_and_run("double_int_conv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -452,7 +452,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_double_conv", code), 0);
+    assert_eq!(compile_and_run("float_double_conv", code, &[]), 0);
 }
 
 // ============================================================================
@@ -489,7 +489,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_literals", code), 0);
+    assert_eq!(compile_and_run("float_literals", code, &[]), 0);
 }
 
 // ============================================================================
@@ -519,7 +519,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_complex", code), 0);
+    assert_eq!(compile_and_run("float_complex", code, &[]), 0);
 }
 
 // ============================================================================
@@ -656,5 +656,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("float_advanced", code), 0);
+    assert_eq!(compile_and_run("float_advanced", code, &[]), 0);
 }

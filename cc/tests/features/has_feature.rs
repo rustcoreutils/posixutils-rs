@@ -125,7 +125,7 @@ int main(void) {
     return ok1 + ok2 + ok3 - 3;
 }
 "#;
-    assert_eq!(compile_and_run("has_builtin", code), 0);
+    assert_eq!(compile_and_run("has_builtin", code, &[]), 0);
 }
 
 // ============================================================================
@@ -189,5 +189,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("has_attr_feature", code), 0);
+    assert_eq!(compile_and_run("has_attr_feature", code, &[]), 0);
 }

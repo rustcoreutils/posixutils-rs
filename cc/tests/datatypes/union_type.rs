@@ -69,7 +69,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("union_basic", code), 0);
+    assert_eq!(compile_and_run("union_basic", code, &[]), 0);
 }
 
 // ============================================================================
@@ -137,7 +137,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("union_funcs", code), 0);
+    assert_eq!(compile_and_run("union_funcs", code, &[]), 0);
 }
 
 // ============================================================================
@@ -200,5 +200,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("union_nesting", code), 0);
+    assert_eq!(compile_and_run("union_nesting", code, &[]), 0);
 }

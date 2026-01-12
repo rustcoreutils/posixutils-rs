@@ -315,12 +315,7 @@ impl Type {
     }
 
     /// Create a function type (return type and param types are TypeIds)
-    pub fn function(return_type: TypeId, params: Vec<TypeId>, variadic: bool) -> Self {
-        Self::function_with_attrs(return_type, params, variadic, false)
-    }
-
-    /// Create a function type with noreturn attribute
-    pub fn function_with_attrs(
+    pub fn function(
         return_type: TypeId,
         params: Vec<TypeId>,
         variadic: bool,
@@ -563,11 +558,11 @@ enum TypeKey {
         params: Vec<TypeId>,
         variadic: bool,
         noreturn: bool,
+        modifiers: u32,
     },
 }
 
-/// Default capacity for type table allocations (reduces reallocation overhead)
-const DEFAULT_TYPE_TABLE_CAPACITY: usize = 2048;
+const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
 
 /// Type table - stores all types and provides ID-based lookup
 /// Pattern follows IdentTable in token/lexer.rs
@@ -728,6 +723,7 @@ impl TypeTable {
                     params,
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
+                    modifiers: typ.modifiers.bits(),
                 })
             }
             _ => Some(TypeKey::Basic(typ.kind, typ.modifiers.bits())),
@@ -738,6 +734,18 @@ impl TypeTable {
     #[inline]
     pub fn get(&self, id: TypeId) -> &Type {
         &self.types[id.0 as usize]
+    }
+
+    /// Complete an incomplete struct/union type with its full definition.
+    /// This updates the type in place so that all existing pointers to
+    /// the incomplete type will now see the complete type.
+    pub fn complete_struct(&mut self, id: TypeId, composite: CompositeType) {
+        let typ = &mut self.types[id.0 as usize];
+        debug_assert!(
+            matches!(typ.kind, TypeKind::Struct | TypeKind::Union),
+            "complete_struct called on non-struct/union type"
+        );
+        typ.composite = Some(Box::new(composite));
     }
 
     // =========================================================================
@@ -1136,6 +1144,12 @@ impl TypeTable {
         (size, max_align)
     }
 
+    /// Get the number of interned types
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.types.len()
+    }
+
     /// Compute union layout (all members at offset 0)
     /// Returns (total_size, alignment)
     pub fn compute_union_layout(&self, members: &mut [StructMember]) -> (usize, usize) {
@@ -1203,6 +1217,7 @@ mod tests {
         let func_id = types.intern(Type::function(
             types.int_id,
             vec![types.int_id, types.char_id],
+            false,
             false,
         ));
         assert_eq!(types.kind(func_id), TypeKind::Function);

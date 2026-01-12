@@ -76,7 +76,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_arith", code), 0);
+    assert_eq!(compile_and_run("llong_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -154,7 +154,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_cmp", code), 0);
+    assert_eq!(compile_and_run("llong_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -206,7 +206,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_logical", code), 0);
+    assert_eq!(compile_and_run("llong_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -255,7 +255,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_bitwise", code), 0);
+    assert_eq!(compile_and_run("llong_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -329,7 +329,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_assign", code), 0);
+    assert_eq!(compile_and_run("llong_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -378,7 +378,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_incdec", code), 0);
+    assert_eq!(compile_and_run("llong_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -412,7 +412,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("llong_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -448,7 +448,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_complex", code), 0);
+    assert_eq!(compile_and_run("llong_complex", code, &[]), 0);
 }
 
 // ############################################################################
@@ -516,7 +516,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_arith", code), 0);
+    assert_eq!(compile_and_run("ullong_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -599,7 +599,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_cmp", code), 0);
+    assert_eq!(compile_and_run("ullong_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -651,7 +651,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_logical", code), 0);
+    assert_eq!(compile_and_run("ullong_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -704,7 +704,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_bitwise", code), 0);
+    assert_eq!(compile_and_run("ullong_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -778,7 +778,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_assign", code), 0);
+    assert_eq!(compile_and_run("ullong_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -827,7 +827,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_incdec", code), 0);
+    assert_eq!(compile_and_run("ullong_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -861,7 +861,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_ternary_comma", code), 0);
+    assert_eq!(compile_and_run("ullong_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -902,7 +902,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("ullong_complex", code), 0);
+    assert_eq!(compile_and_run("ullong_complex", code, &[]), 0);
 }
 
 // ============================================================================
@@ -1004,5 +1004,5 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("llong_advanced", code), 0);
+    assert_eq!(compile_and_run("llong_advanced", code, &[]), 0);
 }

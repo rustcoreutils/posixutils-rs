@@ -14,8 +14,7 @@ use crate::strings::StringId;
 use crate::types::TypeId;
 use std::collections::HashMap;
 
-/// Default capacity for symbol table name lookup HashMap
-const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 256;
+const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 16384;
 
 // ============================================================================
 // Symbol ID
@@ -355,6 +354,12 @@ impl SymbolTable {
         self.lookup(name, Namespace::Ordinary)
             .filter(|s| s.is_enum_constant())
     }
+
+    /// Get the number of symbols declared
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.symbols.len()
+    }
 }
 
 impl Default for SymbolTable {
@@ -522,7 +527,12 @@ mod tests {
         let foo_id = strings.intern("foo");
 
         // Declare a function
-        let func_type = types.intern(Type::function(types.int_id, vec![types.int_id], false));
+        let func_type = types.intern(Type::function(
+            types.int_id,
+            vec![types.int_id],
+            false,
+            false,
+        ));
         let func = Symbol::function(foo_id, func_type, 0);
         table.declare(func).unwrap();
 

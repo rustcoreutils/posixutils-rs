@@ -1,12 +1,46 @@
+#: tree/ls.rs:105
+msgid ""
+"(The letter ell.) Do not follow symbolic links named as operands unless the -"
+"H or -L options are specified. Write out in long format. Disable the -C, -m, "
+"and -x options"
+msgstr ""
+
+#: tree/ls.rs:211
+msgid ""
+"(The numeric digit one.) Force output to be one entry per line. This option "
+"does not disable long format output. (Long format output is enabled by -g, -"
+"l (ell), -n, and -o; and disabled by -C, -m, and -x.)"
+msgstr ""
+
 #: text/patch.rs:116
 msgid "-R cannot be used with ed scripts"
+msgstr ""
+
+#: tree/mkdir.rs:28
+msgid "A pathname of a directory to be created"
+msgstr ""
+
+#: xform/uudecode.rs:28
+msgid ""
+"A pathname of a file that shall be used instead of any pathname contained in "
+"the input data"
+msgstr ""
+
+#: tree/ls.rs:215
+msgid ""
+"A pathname of a file to be written. If the file specified is not found, a "
+"diagnostic message shall be output on standard error"
 msgstr ""
 
 #: text/sed.rs:43
 msgid "A pathname of a file whose contents are read and edited."
 msgstr ""
 
-#: fs/df.rs:47
+#: tree/touch.rs:36
+msgid "A pathname of a file whose times shall be modified"
+msgstr ""
+
+#: fs/df.rs:40
 msgid "A pathname of a file within the hierarchy of the desired file system"
 msgstr ""
 
@@ -14,10 +48,14 @@ msgstr ""
 msgid "A pathname of a message text source file"
 msgstr ""
 
-#: i18n/xgettext.rs:104
+#: i18n/xgettext.rs:111
 msgid ""
 "A pathname of an input file containing C-language source code. If '-' is "
 "specified for an instance of file, the standard input shall be used."
+msgstr ""
+
+#: tree/mkfifo.rs:23
+msgid "A pathname of the FIFO special file to be created"
 msgstr ""
 
 #: file/cmp.rs:42
@@ -47,10 +85,26 @@ msgid ""
 "function with the numeric value of the increment option-argument"
 msgstr ""
 
-#: i18n/xgettext.rs:76
+#: man/man.rs:71
+msgid "A synonym for whatis(1)"
+msgstr ""
+
+#: i18n/xgettext.rs:83
 msgid ""
 "Add comment lines to the output file indicating pathnames and line numbers "
 "in the source files where each extracted string is encountered"
+msgstr ""
+
+#: i18n/msgfmt.rs:46
+msgid "Add directory to search path for input files"
+msgstr ""
+
+#: cc/main.rs:84
+msgid "Add include path"
+msgstr ""
+
+#: cc/main.rs:145
+msgid "Add library search path (passed to linker)"
 msgstr ""
 
 #: text/sed.rs:40
@@ -65,17 +119,45 @@ msgid ""
 "of the script of editing commands."
 msgstr ""
 
+#: sccs/admin.rs:53
+msgid "Add user to authorized list"
+msgstr ""
+
+#: text/join.rs:21
+msgid "Additional lines to include when there are no matches"
+msgstr ""
+
 #: file/od.rs:26
 msgid ""
 "Address base (d for decimal, o for octal, x for hexadecimal, n for none)"
 msgstr ""
 
-#: users/talk.rs:41
+#: users/talk.rs:43
 msgid "Address to connect or listen to"
+msgstr ""
+
+#: dev/ar.rs:111
+msgid "Allow truncation of file names from the archive"
+msgstr ""
+
+#: i18n/msgfmt.rs:40
+msgid "Append .mo suffix to output file names"
+msgstr ""
+
+#: dev/ar.rs:126
+msgid "Append files to the archive without checking for duplicates"
+msgstr ""
+
+#: pax/main.rs:69
+msgid "Append files to the end of an existing archive"
 msgstr ""
 
 #: file/tee.rs:20
 msgid "Append the output to the files"
+msgstr ""
+
+#: cc/ctags.rs:38
+msgid "Append to tagsfile"
 msgstr ""
 
 #: file/file.rs:36
@@ -84,8 +166,8 @@ msgid ""
 "tests to the file"
 msgstr ""
 
-#: datetime/cal.rs:43
-msgid "April"
+#: text/diff.rs:52
+msgid "Apply diff recursively to files and directories of the same name"
 msgstr ""
 
 #: datetime/time.rs:41
@@ -96,98 +178,513 @@ msgstr ""
 msgid "Arguments to pass to the utility."
 msgstr ""
 
+#: screen/tabs.rs:76
+msgid "Assembler variant: 1,10,16,40,72"
+msgstr ""
+
+#: screen/tabs.rs:73
+msgid "Assembler: 1,10,16,36,72"
+msgstr ""
+
+#: screen/tabs.rs:97
+msgid "Assembler: 1,12,20,44"
+msgstr ""
+
 #: text/patch.rs:89
 msgid "Assume the patch was created with old and new files swapped"
 msgstr ""
 
-#: man/man.rs:115
+#: man/man.rs:106
 msgid "Augment the list of directories to search for manual pages"
 msgstr ""
 
-#: datetime/cal.rs:47
-msgid "August"
+#: fs/df.rs:139
+msgid "Available"
 msgstr ""
 
-#: fs/df.rs:146
-msgid "Available"
+#: text/pr_util/args.rs:25
+msgid "Begin output at page number FIRST_PAGE, stop at LAST_PAGE if present"
+msgstr ""
+
+#: sys/uname.rs:17
+msgid "Behave as though all of the options -mnrsv were specified"
+msgstr ""
+
+#: i18n/gettext.rs:38
+msgid "Behave like echo command (interpret multiple MSGIDs)"
+msgstr ""
+
+#: pax/main.rs:72
+msgid ""
+"Block the output at a positive decimal integer number of bytes per write"
+msgstr ""
+
+#: text/fold.rs:27
+msgid "Break on spaces."
+msgstr ""
+
+#: dev/strings.rs:31
+msgid "Byte offset format"
+msgstr ""
+
+#: screen/tabs.rs:85
+msgid ""
+"COBOL compact extended: 1,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,67"
+msgstr ""
+
+#: screen/tabs.rs:82
+msgid "COBOL compact: 1,6,10,14,49"
+msgstr ""
+
+#: screen/tabs.rs:79
+msgid "COBOL: 1,8,12,16,20,55"
+msgstr ""
+
+#: sys/who.rs:284 sys/who.rs:295
+msgid "COMMENT"
+msgstr ""
+
+#: screen/tput.rs:146
+msgid "Cannot determine terminal type from TERM environment variable"
 msgstr ""
 
 #: sccs/what.rs:72
 msgid "Cannot open file"
 msgstr ""
 
-#: fs/df.rs:147
+#: tree/readlink.rs:27
+msgid ""
+"Canonicalize the provided path, resolving symbolic links repeatedly if "
+"needed. The absolute path of the resolved file is printed"
+msgstr ""
+
+#: fs/df.rs:140
 msgid "Capacity"
+msgstr ""
+
+#: text/diff.rs:37
+msgid "Cause EOL whitespace to be treated as blanks"
+msgstr ""
+
+#: pax/main.rs:78
+msgid ""
+"Cause files of type directory to match only the file or archive member itself"
+msgstr ""
+
+#: tree/touch.rs:18
+msgid "Change the access time of file"
+msgstr ""
+
+#: users/newgrp.rs:51
+msgid ""
+"Change the environment to what would be expected if the user actually logged "
+"in again (letter 'l')."
+msgstr ""
+
+#: tree/touch.rs:24
+msgid "Change the modification time of file"
 msgstr ""
 
 #: text/patch.rs:49
 msgid "Change to directory before processing"
 msgstr ""
 
-#: cc/main.rs:89
+#: sccs/admin.rs:59
+msgid "Check file structure and checksum"
+msgstr ""
+
+#: sccs/val.rs:39
+msgid "Check that SID exists"
+msgstr ""
+
+#: text/sort.rs:26
+msgid "Check that the single input file is ordered as specified"
+msgstr ""
+
+#: i18n/msgfmt.rs:34
+msgid "Check the PO file for validity"
+msgstr ""
+
+#: screen/tabs.rs:42
+msgid "Clear all tab stops"
+msgstr ""
+
+#: cc/cxref.rs:38
+msgid "Combine all input files"
+msgstr ""
+
+#: uucp/uux.rs:40
+msgid "Command string to execute"
+msgstr ""
+
+#: sccs/delta.rs:31
+msgid "Comment for delta"
+msgstr ""
+
+#: sccs/admin.rs:41
+msgid "Comment for initial delta"
+msgstr ""
+
+#: sccs/val.rs:36
+msgid "Compare module name with %M% keyword"
+msgstr ""
+
+#: sccs/val.rs:42
+msgid "Compare type with %Y% keyword"
+msgstr ""
+
+#: text/comm.rs:33
+msgid "Comparison file1"
+msgstr ""
+
+#: text/comm.rs:36
+msgid "Comparison file2"
+msgstr ""
+
+#: cc/main.rs:96
 msgid "Compile and assemble, but do not link"
 msgstr ""
 
-#: cc/main.rs:93
+#: cc/main.rs:100
 msgid "Compile only; output assembly"
 msgstr ""
 
-#: i18n/xgettext.rs:82
+#: pax/main.rs:102
+msgid "Compress/decompress archive using gzip"
+msgstr ""
+
+#: text/paste.rs:27
+msgid ""
+"Concatenate all of the lines from each input file into one line of output "
+"per file, in command line order"
+msgstr ""
+
+#: text/unexpand.rs:10
+msgid "Convert all sequences of two or more spaces to tabs"
+msgstr ""
+
+#: tree/cp.rs:71
+msgid "Copy file hierarchies"
+msgstr ""
+
+#: print/lp.rs:25
+msgid "Copy files to spool directory before printing"
+msgstr ""
+
+#: man/man.rs:68
+msgid "Copy the manual page to the standard output"
+msgstr ""
+
+#: i18n/ngettext.rs:48
+msgid "Count for plural selection"
+msgstr ""
+
+#: text/wc.rs:26
+msgid "Count number of bytes in each file"
+msgstr ""
+
+#: text/wc.rs:32
+msgid "Count number of characters in each file"
+msgstr ""
+
+#: text/wc.rs:29
+msgid "Count number of lines in each file"
+msgstr ""
+
+#: text/wc.rs:35
+msgid "Count number of words in each file"
+msgstr ""
+
+#: text/uniq.rs:11
+msgid "Count the number of repeated lines"
+msgstr ""
+
+#: text/fold.rs:24
+msgid "Count width in bytes rather than column positions."
+msgstr ""
+
+#: sccs/admin.rs:32
+msgid "Create a new SCCS file"
+msgstr ""
+
+#: tree/mkdir.rs:22
+msgid "Create any missing intermediate pathname components"
+msgstr ""
+
+#: sccs/get.rs:33
+msgid "Create branch (with -e)"
+msgstr ""
+
+#: uucp/uucp.rs:38
+msgid "Create intermediate directories as needed (default)"
+msgstr ""
+
+#: i18n/xgettext.rs:89
 msgid ""
 "Create output files in the directory specified by pathname instead of in the "
 "current working directory"
 msgstr ""
 
-#: datetime/cal.rs:51
-msgid "December"
+#: i18n/localedef.rs:32
+msgid "Create permanent output even if warnings occur"
+msgstr ""
+
+#: tree/ln.rs:22
+msgid "Create symbolic links instead of hard links"
+msgstr ""
+
+#: pax/main.rs:129
+msgid "Create/read multi-volume archives"
+msgstr ""
+
+#: text/cut.rs:20
+msgid "Cut based on a list of bytes"
+msgstr ""
+
+#: text/cut.rs:23
+msgid "Cut based on a list of characters"
+msgstr ""
+
+#: text/cut.rs:26
+msgid "Cut based on a list of fields"
+msgstr ""
+
+#: cc/cflow.rs:42
+msgid "Cut off flowgraph at specified depth"
+msgstr ""
+
+#: sccs/prs.rs:28
+msgid "Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])"
+msgstr ""
+
+#: sccs/prs.rs:31
+msgid "Data format specification"
+msgstr ""
+
+#: xform/uuencode.rs:31
+msgid "Decode pathname"
+msgstr ""
+
+#: cc/main.rs:78
+msgid "Define a macro (-D name or -D name=value)"
 msgstr ""
 
 #: awk/main.rs:27
 msgid "Define the input field separator"
 msgstr ""
 
+#: text/tr.rs:19
+msgid "Delete characters in STRING1 from the input"
+msgstr ""
+
+#: sccs/admin.rs:50
+msgid "Delete flag (can be repeated)"
+msgstr ""
+
+#: dev/ar.rs:120
+msgid "Delete one or more files from the archive"
+msgstr ""
+
 #: make/src/signal_handler.rs:26
 msgid "Deleting file"
 msgstr ""
 
-#: cc/main.rs:105
+#: text/paste.rs:31
+msgid "Delimiter list"
+msgstr ""
+
+#: tree/du.rs:28
+msgid "Dereference all symlinks"
+msgstr ""
+
+#: sccs/admin.rs:44
+msgid "Descriptive text file"
+msgstr ""
+
+#: text/sort.rs:41
+msgid ""
+"Dictionary order: only blank and alphanumeric characters are significant"
+msgstr ""
+
+#: tree/rmdir.rs:23
+msgid "Directories to remove"
+msgstr ""
+
+#: cc/main.rs:112
 msgid "Disable CFI unwind table generation"
+msgstr ""
+
+#: cc/main.rs:92
+msgid "Disable builtin #include directories"
 msgstr ""
 
 #: file/cat.rs:30
 msgid "Disable output buffering (a no-op, for POSIX compat)"
 msgstr ""
 
+#: cc/main.rs:88
+msgid "Disable standard system include paths"
+msgstr ""
+
+#: man/man.rs:58
+msgid "Display all matching manual pages"
+msgstr ""
+
 #: sccs/what.rs:23
 msgid "Display at most one identification string per file"
 msgstr ""
 
-#: cc/main.rs:49
+#: cc/main.rs:51
 msgid "Display available target architectures"
+msgstr ""
+
+#: man/man.rs:77
+msgid "Display only the SYNOPSIS lines of the requested manual pages"
+msgstr ""
+
+#: cron/at.rs:61
+msgid "Displays a list of all scheduled jobs"
+msgstr ""
+
+#: uucp/uucp.rs:32
+msgid "Do not copy local file to spool directory (default)"
+msgstr ""
+
+#: tree/touch.rs:21
+msgid "Do not create a specified file if it does not exist"
+msgstr ""
+
+#: uucp/uucp.rs:41
+msgid "Do not create intermediate directories"
+msgstr ""
+
+#: pax/main.rs:126
+msgid "Do not cross filesystem boundaries"
+msgstr ""
+
+#: pathnames/realpath.rs:22
+msgid "Do not error if the path cannot be resolved (default)"
+msgstr ""
+
+#: tree/ls.rs:62
+msgid ""
+"Do not follow symbolic links named as operands unless the -H or -L options "
+"are specified. Do not treat directories differently than other types of "
+"files. The use of -d with -R or -f produces unspecified results"
+msgstr ""
+
+#: tree/ls.rs:80
+msgid ""
+"Do not follow symbolic links named as operands unless the -H or -L options "
+"are specified. Write a <slash> ( '/' ) immediately after each pathname that "
+"is a directory, an <asterisk> ( '*' ) after each that is executable, a "
+"<vertical-line> ( '|' ) after each that is a FIFO, and an at-sign ( '@' ) "
+"after each that is a symbolic link. For other file types, other symbols may "
+"be written"
+msgstr ""
+
+#: tree/readlink.rs:23
+msgid "Do not output a trailing <newline> character"
+msgstr ""
+
+#: pax/main.rs:90
+msgid "Do not overwrite existing files"
+msgstr ""
+
+#: tree/rm.rs:28
+msgid "Do not prompt for confirmation"
+msgstr ""
+
+#: tree/cp.rs:23 tree/mv.rs:30
+msgid "Do not prompt for confirmation if the destination path exists"
+msgstr ""
+
+#: xform/compress.rs:32 xform/uncompress.rs:27
+msgid "Do not prompt for overwriting files"
+msgstr ""
+
+#: sccs/unget.rs:31
+msgid "Do not remove the g-file (keep edited file)"
+msgstr ""
+
+#: dev/ar.rs:108
+msgid "Do not replace existing files"
 msgstr ""
 
 #: display/more.rs:46
 msgid "Do not scroll, display text and clean line ends"
 msgstr ""
 
+#: uucp/uux.rs:34
+msgid "Do not send mail notification on failure"
+msgstr ""
+
+#: text/cut.rs:35
+msgid "Do not split characters"
+msgstr ""
+
 #: file/file.rs:51
 msgid "Don't perform further classification on regular file"
 msgstr ""
 
-#: cc/main.rs:53
+#: pathnames/realpath.rs:25
+msgid "Don't print errors when paths cannot be resolved"
+msgstr ""
+
+#: cc/main.rs:55
 msgid "Dump tokens to stdout"
+msgstr ""
+
+#: tree/cp.rs:68
+msgid ""
+"Duplicate the characteristics of each source file in the corresponding "
+"destination file"
 msgstr ""
 
 #: display/more.rs:110
 msgid "Enable interactive session test"
 msgstr ""
 
-#: users/write.rs:99
+#: i18n/gettext.rs:32 i18n/ngettext.rs:33
+msgid "Enable interpretation of some escape sequences"
+msgstr ""
+
+#: text/pr_util/args.rs:94
+msgid "Enable pretty printing of headers"
+msgstr ""
+
+#: xform/uuencode.rs:25
+msgid "Encode to base64 (MIME) standard, rather than UUE format"
+msgstr ""
+
+#: users/write.rs:113
 msgid "Error checking metadata for terminal"
 msgstr ""
 
 #: make/src/signal_handler.rs:30
 msgid "Error deleting file"
+msgstr ""
+
+#: pathnames/realpath.rs:19
+msgid "Error if the path cannot be resolved"
+msgstr ""
+
+#: tree/ls.rs:112
+msgid ""
+"Evaluate the file information and file type for all symbolic links (whether "
+"named on the command line or encountered in a file hierarchy) to be those of "
+"the file referenced by the link, and not the link itself; however, ls shall "
+"write the name of the link itself and not the file referenced by the link. "
+"When -L is used with -l, write the contents of symbolic links in the long "
+"format"
+msgstr ""
+
+#: tree/ls.rs:92
+msgid ""
+"Evaluate the file information and file type for symbolic links specified on "
+"the command line to be those of the file referenced by the link, and not the "
+"link itself; however, ls shall write the name of the link itself and not the "
+"file referenced by the link"
 msgstr ""
 
 #: display/more.rs:70
@@ -199,22 +696,42 @@ msgstr ""
 msgid "Exit on end-of-file"
 msgstr ""
 
-#: i18n/xgettext.rs:37
+#: text/pr_util/args.rs:40
+msgid "Expand input tabs to column positions"
+msgstr ""
+
+#: i18n/xgettext.rs:44
 msgid ""
 "Extract all strings, not just those found in calls to gettext family "
 "functions. Only one dot-po file shall be created"
 msgstr ""
 
-#: screen/tabs.rs:189
-msgid "Failed to clear tabs"
+#: dev/ar.rs:132
+msgid "Extract files from the archive"
 msgstr ""
 
-#: screen/tabs.rs:204
-msgid "Failed to set tab"
+#: screen/tabs.rs:88
+msgid "FORTRAN: 1,7,11,15,19,23"
 msgstr ""
 
-#: datetime/cal.rs:41
-msgid "February"
+#: users/write.rs:253
+msgid "Failed to register signal handler"
+msgstr ""
+
+#: text/join.rs:30
+msgid "Field separator character"
+msgstr ""
+
+#: i18n/gettext_lib/catalog.rs:250
+msgid "File"
+msgstr ""
+
+#: text/join.rs:42
+msgid "File 1"
+msgstr ""
+
+#: text/join.rs:45
+msgid "File 2"
 msgstr ""
 
 #: file/file.rs:63
@@ -229,24 +746,162 @@ msgstr ""
 msgid "File to be split"
 msgstr ""
 
+#: editors/ed_main.rs:37
+msgid "File to edit"
+msgstr ""
+
 #: text/patch.rs:97
 msgid "File to patch"
+msgstr ""
+
+#: text/csplit.rs:37 text/tsort.rs:22 xform/uuencode.rs:28
+msgid "File to read as input"
+msgstr ""
+
+#: text/nl.rs:70
+msgid "File to read as input (use - for stdin)"
+msgstr ""
+
+#: tree/rm.rs:37
+msgid "Filepaths to remove"
+msgstr ""
+
+#: print/lp.rs:49
+msgid "Files to print (use '-' for stdin)"
+msgstr ""
+
+#: text/pr_util/args.rs:100
+msgid "Files to print (use - for stdin)"
+msgstr ""
+
+#: dev/lex/main.rs:43 text/asa.rs:33
+msgid "Files to read as input"
+msgstr ""
+
+#: text/expand.rs:25 text/fold.rs:34 text/head.rs:36 text/wc.rs:38
+msgid "Files to read as input."
+msgstr ""
+
+#: xform/compress.rs:38 xform/uncompress.rs:33
+msgid "Files to read as input. Use \"-\" or no-args for stdin"
 msgstr ""
 
 #: file/cat.rs:34
 msgid "Files to read as input. Use '-' or no-args for stdin"
 msgstr ""
 
-#: fs/df.rs:143
+#: text/grep.rs:62
+msgid "Files to search (stdin if not specified)"
+msgstr ""
+
+#: fs/df.rs:136
 msgid "Filesystem"
 msgstr ""
 
-#: cc/main.rs:101
+#: text/pr_util/args.rs:33
+msgid "Fill columns across the page in round-robin order"
+msgstr ""
+
+#: uucp/uustat.rs:37
+msgid "Filter jobs by system name"
+msgstr ""
+
+#: uucp/uustat.rs:40
+msgid "Filter jobs by user name"
+msgstr ""
+
+#: text/diff.rs:61
+msgid "First comparison file (or directory, if -r is specified)"
+msgstr ""
+
+#: text/tr.rs:31
+msgid "First string"
+msgstr ""
+
+#: text/sort.rs:44
+msgid "Fold lowercase to uppercase for comparison"
+msgstr ""
+
+#: tree/cp.rs:35 tree/du.rs:25
+msgid "Follow command line symlinks"
+msgstr ""
+
+#: pax/main.rs:96
+msgid "Follow symlinks"
+msgstr ""
+
+#: tree/cp.rs:49
+msgid "Follow symlinks in source"
+msgstr ""
+
+#: pax/main.rs:84
+msgid ""
+"Follow symlinks on the command line, rather than archiving the symlink itself"
+msgstr ""
+
+#: tree/ls.rs:97
+msgid "For each file, write the file's file serial number"
+msgstr ""
+
+#: uucp/uucp.rs:35
+msgid "Force copy of local file to spool directory"
+msgstr ""
+
+#: tree/ls.rs:144
+msgid ""
+"Force each instance of non-printable filename characters and <tab> "
+"characters to be written as the <question-mark> ( '?' ) character. "
+"Implementations may provide this option by default if the output is to a "
+"terminal device"
+msgstr ""
+
+#: tree/ln.rs:19
+msgid "Force existing destination pathnames to be removed to allow the link"
+msgstr ""
+
+#: dev/ar.rs:52 dev/ar.rs:93 dev/ar.rs:105
+msgid "Force regeneration of the archive's symbol table"
+msgstr ""
+
+#: pax/main.rs:105
+msgid "Format-specific options"
+msgstr ""
+
+#: sys/who.rs:64
+msgid "Gather information from FILE, instead of default utmp file"
+msgstr ""
+
+#: sys/ps.rs:110
+msgid "Generate a full listing"
+msgstr ""
+
+#: sys/ps.rs:114
+msgid "Generate a long listing"
+msgstr ""
+
+#: cc/main.rs:108
 msgid "Generate debug information"
+msgstr ""
+
+#: sccs/get.rs:30
+msgid "Get for editing (create p-file)"
+msgstr ""
+
+#: dev/ar.rs:32 dev/ar.rs:49 dev/ar.rs:64 dev/ar.rs:79 dev/ar.rs:90
+#: dev/ar.rs:102
+msgid "Give verbose output"
 msgstr ""
 
 #: awk/main.rs:40
 msgid "Globals assignments, executed before the start of the program"
+msgstr ""
+
+#: i18n/gettext_lib/catalog.rs:215 i18n/gettext_lib/mo_file.rs:504
+msgid "Hello"
+msgstr ""
+
+#: sys/who.rs:282 sys/who.rs:293
+msgid "IDLE"
 msgstr ""
 
 #: file/file.rs:44
@@ -267,6 +922,18 @@ msgid ""
 "strftime(3). Otherwise, set the current time to the given string"
 msgstr ""
 
+#: text/sort.rs:47
+msgid "Ignore all characters that are non-printable"
+msgstr ""
+
+#: pax/main.rs:114
+msgid "Ignore files older than existing files/archive members with same name"
+msgstr ""
+
+#: text/sort.rs:56
+msgid "Ignore leading blank characters in sort keys"
+msgstr ""
+
 #: text/patch.rs:73
 msgid "Ignore patches that appear to be already applied"
 msgstr ""
@@ -275,15 +942,72 @@ msgstr ""
 msgid "Ignore the SIGINT signal"
 msgstr ""
 
-#: fs/df.rs:42
-msgid "Include total allocated-space figures in the output"
+#: text/uniq.rs:23
+msgid "Ignore the first chars characters on each input line"
 msgstr ""
 
-#: screen/tabs.rs:27 screen/tput.rs:23
+#: text/uniq.rs:20
+msgid "Ignore the first fields fields on each input line"
+msgstr ""
+
+#: pax/main.rs:93
+msgid ""
+"In copy mode, hard links shall be made between the source and destination"
+msgstr ""
+
+#: pax/main.rs:120
+msgid "In list mode, produce a verbose table of contents"
+msgstr ""
+
+#: cc/cflow.rs:46
+msgid "Include additional symbols: x=data, _=underscore names"
+msgstr ""
+
+#: i18n/msgfmt.rs:37
+msgid "Include fuzzy entries in the output"
+msgstr ""
+
+#: cc/cflow.rs:52 cc/cxref.rs:56
+msgid "Include paths"
+msgstr ""
+
+#: sccs/prs.rs:25
+msgid "Include removed deltas"
+msgstr ""
+
+#: sys/who.rs:52
+msgid "Indicate the last change to the system clock"
+msgstr ""
+
+#: tree/ls.rs:156
+msgid ""
+"Indicate the total number of file system blocks consumed by each file "
+"displayed. If the -k option is also specified, the block size shall be 1024 "
+"bytes; otherwise, the block size is implementation-defined"
+msgstr ""
+
+#: screen/tabs.rs:38 screen/tput.rs:28
 msgid "Indicate the type of terminal"
 msgstr ""
 
-#: file/od.rs:79 sccs/what.rs:27
+#: sccs/admin.rs:38
+msgid "Initial SID for new file"
+msgstr ""
+
+#: sccs/admin.rs:35
+msgid "Initialize from file (use stdin if no name given)"
+msgstr ""
+
+#: i18n/msgfmt.rs:58
+msgid "Input .po files"
+msgstr ""
+
+#: text/uniq.rs:26
+msgid "Input file (if not specified, use stdin)"
+msgstr ""
+
+#: cc/cflow.rs:58 cc/ctags.rs:49 cc/cxref.rs:62 cc/main.rs:47 file/od.rs:79
+#: sccs/what.rs:27 text/cut.rs:38 text/sort.rs:65 text/unexpand.rs:16
 msgid "Input files"
 msgstr ""
 
@@ -291,9 +1015,21 @@ msgstr ""
 msgid "Input files (reads from stdin if empty)"
 msgstr ""
 
-#: process/xargs.rs:82
+#: dev/nm.rs:65
+msgid "Input object file"
+msgstr ""
+
+#: process/xargs.rs:88
 msgid ""
 "Insert mode: execute utility for each line, replacing replstr with input"
+msgstr ""
+
+#: dev/ar.rs:23
+msgid "Insert the files after the specified member"
+msgstr ""
+
+#: dev/ar.rs:26
+msgid "Insert the files before the specified member"
 msgstr ""
 
 #: pathnames/pathchk.rs:37
@@ -308,6 +1044,14 @@ msgid ""
 "portable, POSIX-compliant checks"
 msgstr ""
 
+#: pax/main.rs:87
+msgid "Interactively rename files or archive members"
+msgstr ""
+
+#: man/man.rs:91
+msgid "Interpret PAGE argument(s) as local filename(s)"
+msgstr ""
+
 #: file/od.rs:60
 msgid "Interpret bytes as characters"
 msgstr ""
@@ -316,7 +1060,7 @@ msgstr ""
 msgid "Interpret bytes in octal"
 msgstr ""
 
-#: man/man.rs:90
+#: man/man.rs:84
 msgid "Interpret name operands as keywords for searching the summary database"
 msgstr ""
 
@@ -368,17 +1112,17 @@ msgstr ""
 msgid "Interpret words (two-byte units) in unsigned decimal"
 msgstr ""
 
-#: screen/tabs.rs:153
-msgid "Invalid tabstop value."
+#: screen/tput.rs:104 screen/tput.rs:134
+msgid "Invalid operand"
 msgstr ""
 
-#: process/xargs.rs:65
+#: process/xargs.rs:71
 msgid ""
 "Invoke utility using as many standard input arguments as possible yielding a "
 "command line length less than size"
 msgstr ""
 
-#: process/xargs.rs:56
+#: process/xargs.rs:62
 msgid ""
 "Invoke utility using as many standard input arguments as possible, up to "
 "number"
@@ -390,11 +1134,11 @@ msgid ""
 "inherited environment shall be ignored completely"
 msgstr ""
 
-#: datetime/cal.rs:40
-msgid "January"
+#: cron/at.rs:85
+msgid "Job IDs for reporting jobs scheduled"
 msgstr ""
 
-#: i18n/xgettext.rs:50
+#: i18n/xgettext.rs:57
 msgid ""
 "Join messages from C-language source files with existing dot-po files. For "
 "each dot-po file that xgettext writes messages to, if the file does not "
@@ -408,81 +1152,174 @@ msgid ""
 "not created by xgettext or has been modified by another application."
 msgstr ""
 
-#: datetime/cal.rs:46
-msgid "July"
+#: text/join.rs:36
+msgid "Join on the specified field of file 1"
 msgstr ""
 
-#: datetime/cal.rs:45
-msgid "June"
+#: text/join.rs:39
+msgid "Join on the specified field of file 2"
 msgstr ""
 
-#: sys/who.rs:244
+#: uucp/uustat.rs:31
+msgid "Kill (remove) the specified job"
+msgstr ""
+
+#: sys/who.rs:280 sys/who.rs:291 sys/who.rs:302 sys/who.rs:310
 msgid "LINE"
 msgstr ""
 
-#: cc/main.rs:65
+#: text/diff.rs:64
+msgid "Label for first file"
+msgstr ""
+
+#: text/diff.rs:67
+msgid "Label for second file"
+msgstr ""
+
+#: text/csplit.rs:26
+msgid ""
+"Leave previously created files intact. By default, csplit shall remove "
+"created files if an error occurs"
+msgstr ""
+
+#: cc/main.rs:67
 msgid "Linearize and dump IR to stdout"
+msgstr ""
+
+#: cc/main.rs:148
+msgid "Link library (passed to linker)"
+msgstr ""
+
+#: sys/who.rs:28
+msgid "List all processes that have expired and not been respawned"
 msgstr ""
 
 #: i18n/iconv.rs:45
 msgid "List all supported codeset values"
 msgstr ""
 
-#: screen/stty.rs:51
+#: sys/who.rs:40
+msgid ""
+"List any other process that is currently active and has been previously "
+"spawned by init"
+msgstr ""
+
+#: screen/stty.rs:57
 msgid "List of terminal configuration commands"
 msgstr ""
 
-#: man/man.rs:137
+#: sys/who.rs:49
+msgid "List only the name, line, and time fields (default)"
+msgstr ""
+
+#: sys/who.rs:43
+msgid "List only the names and the number of users currently logged on"
+msgstr ""
+
+#: sys/who.rs:34
+msgid ""
+"List only those lines on which the system is waiting for someone to login"
+msgstr ""
+
+#: dev/ar.rs:130
+msgid "List the contents of the archive"
+msgstr ""
+
+#: tree/ls.rs:72
+msgid ""
+"List the entries in directory operands in the order they appear in the "
+"directory. The behavior for non-directory operands is unspecified. This "
+"option shall turn on -a. When -f is specified, any occurrences of the -r, -"
+"S, and -t options shall be ignored and any occurrences of the -A, -g, -l, -"
+"n, -o, and -s options may be ignored. The use of -f with -R or -d produces "
+"unspecified results"
+msgstr ""
+
+#: man/man.rs:125
 msgid ""
 "List the pathnames of all matching manual pages instead of displaying any of "
 "them"
-msgstr ""
-
-#: datetime/cal.rs:42
-msgid "March"
 msgstr ""
 
 #: text/patch.rs:53
 msgid "Mark changes with #ifdef/#endif using DEFINE"
 msgstr ""
 
+#: pax/main.rs:75
+msgid ""
+"Match all file or archive members except those specified by the pattern or "
+"file operands"
+msgstr ""
+
 #: text/patch.rs:65
 msgid "Match any sequence of blanks in the diff to any sequence in the file"
+msgstr ""
+
+#: text/grep.rs:56
+msgid "Match entire lines only"
+msgstr ""
+
+#: text/grep.rs:23
+msgid "Match using extended regular expressions"
 msgstr ""
 
 #: text/sed.rs:31
 msgid "Match using extended regular expressions."
 msgstr ""
 
-#: datetime/cal.rs:44
-msgid "May"
+#: text/grep.rs:26
+msgid "Match using fixed strings"
 msgstr ""
 
-#: sys/ipcs.rs:556
+#: cc/cxref.rs:50
+msgid "Maximum output width"
+msgstr ""
+
+#: text/pr_util/args.rs:62
+msgid "Merge files, printing one line from each file side by side"
+msgstr ""
+
+#: text/sort.rs:32
+msgid "Merge only; the input file shall be assumed to be already sorted"
+msgstr ""
+
+#: sys/ipcs.rs:571
 msgid "Message Queue facility not in system."
 msgstr ""
 
-#: sys/ipcs.rs:505
+#: sys/ipcs.rs:520
 msgid "Message Queues"
 msgstr ""
 
-#: fs/df.rs:148
+#: dev/strings.rs:34
+msgid "Minimum string length"
+msgstr ""
+
+#: pax/main.rs:108
+msgid "Modify file/archive member names using substitution expression"
+msgstr ""
+
+#: fs/df.rs:141
 msgid "Mounted on"
 msgstr ""
 
-#: tree/cp.rs:112
+#: dev/ar.rs:122
+msgid "Move named files within the archive"
+msgstr ""
+
+#: tree/cp.rs:108
 msgid "Must supply a source and target for copy"
 msgstr ""
 
-#: tree/ln.rs:57
+#: tree/ln.rs:55
 msgid "Must supply a source and target for linking"
 msgstr ""
 
-#: tree/mv.rs:382
+#: tree/mv.rs:380
 msgid "Must supply a source and target for move"
 msgstr ""
 
-#: sys/who.rs:243
+#: sys/who.rs:279 sys/who.rs:290 sys/who.rs:301 sys/who.rs:309
 msgid "NAME"
 msgstr ""
 
@@ -490,55 +1327,94 @@ msgstr ""
 msgid "NAME=VALUE pairs, the utility to invoke, and its arguments"
 msgstr ""
 
-#: i18n/xgettext.rs:43
+#: i18n/localedef.rs:53
+msgid "Name of the locale to define"
+msgstr ""
+
+#: text/csplit.rs:22
+msgid "Name the created files prefix 00, prefix 01, ..., prefixn"
+msgstr ""
+
+#: i18n/xgettext.rs:50
 msgid "Name the default output file DEFAULT_DOMAIN.po instead of messages.po"
 msgstr ""
 
-#: man/man.rs:150
+#: i18n/locale.rs:50
+msgid "Names of categories or keywords to query"
+msgstr ""
+
+#: man/man.rs:137
 msgid "Names of the utilities or keywords to display documentation for"
+msgstr ""
+
+#: tree/cp.rs:61
+msgid "Never follow symlinks in source"
 msgstr ""
 
 #: text/patch.rs:207
 msgid "No such file or directory"
 msgstr ""
 
-#: users/write.rs:49
+#: users/write.rs:54
 msgid "No terminals found for user"
 msgstr ""
 
-#: users/write.rs:63
+#: users/write.rs:77
 msgid "No valid terminals found for user"
 msgstr ""
 
-#: tree/rmdir.rs:37
+#: tree/rmdir.rs:36
 msgid "Non-unicode directory name rejected"
 msgstr ""
 
-#: datetime/cal.rs:50
-msgid "November"
+#: sys/who.rs:58
+msgid "Normal selection of information"
+msgstr ""
+
+#: i18n/gettext_lib/catalog.rs:216 i18n/gettext_lib/mo_file.rs:505
+msgid "NotFound"
+msgstr ""
+
+#: uucp/uucp.rs:50
+msgid "Notify user on remote system when copy completes"
+msgstr ""
+
+#: print/lp.rs:31
+msgid "Number of copies to print"
 msgstr ""
 
 #: datetime/sleep.rs:19
 msgid "Number of seconds to sleep"
 msgstr ""
 
-#: datetime/cal.rs:49
-msgid "October"
+#: text/pr_util/args.rs:87
+msgid "Omit header and trailer, quit after last line"
 msgstr ""
 
 #: i18n/iconv.rs:36
 msgid "Omit invalid characters of the input file from the output"
 msgstr ""
 
+#: i18n/gettext_lib/catalog.rs:230 i18n/gettext_lib/catalog.rs:234
+#: i18n/gettext_lib/catalog.rs:238
+msgid "One item"
+msgid_plural "%d items"
+msgstr[0] ""
+msgstr[1] ""
+
+#: text/paste.rs:34
+msgid "One or more input files"
+msgstr ""
+
 #: file/tee.rs:26
 msgid "One or more output files"
 msgstr ""
 
-#: man/man.rs:130
+#: man/man.rs:119
 msgid "Only select manuals from the specified section"
 msgstr ""
 
-#: man/man.rs:122
+#: man/man.rs:112
 msgid "Only show pages for the specified machine(1) architecture"
 msgstr ""
 
@@ -546,118 +1422,537 @@ msgstr ""
 msgid "Only time out the utility itself, not its descendants."
 msgstr ""
 
-#: cc/main.rs:115
+#: text/csplit.rs:40
+msgid "Operands defining context on which to split"
+msgstr ""
+
+#: cc/main.rs:131
 msgid "Optimization level"
 msgstr ""
 
-#: man/man.rs:107
+#: text/diff.rs:40
+msgid "Output 3 lines of copied context"
+msgstr ""
+
+#: text/diff.rs:55
+msgid "Output 3 lines of unified context"
+msgstr ""
+
+#: text/diff.rs:43
+msgid "Output <N> lines of copied context"
+msgstr ""
+
+#: text/diff.rs:58
+msgid "Output <N> lines of unified context"
+msgstr ""
+
+#: users/id.rs:22
+msgid ""
+"Output all different group IDs (effective, real, and supplementary) only"
+msgstr ""
+
+#: text/tail.rs:92
+msgid "Output appended data as the file grows"
+msgstr ""
+
+#: text/join.rs:27
+msgid "Output fields in specified order"
+msgstr ""
+
+#: text/uniq.rs:29
+msgid "Output file (if not specified, use stdout)"
+msgstr ""
+
+#: i18n/msgfmt.rs:49
+msgid "Output file name"
+msgstr ""
+
+#: sys/who.rs:37
+msgid "Output only information about the current terminal"
+msgstr ""
+
+#: users/id.rs:25
+msgid "Output only the effective group ID"
+msgstr ""
+
+#: users/id.rs:28
+msgid "Output only the effective user ID"
+msgstr ""
+
+#: text/join.rs:33
+msgid "Output only unpairable lines from file_number"
+msgstr ""
+
+#: users/id.rs:34
+msgid "Output the name in string format, instead of the numeric"
+msgstr ""
+
+#: users/id.rs:31
+msgid "Output the real ID instead of the effective ID"
+msgstr ""
+
+#: text/pr_util/args.rs:58
+msgid "Override the 66-line default page length"
+msgstr ""
+
+#: man/man.rs:99
 msgid "Override the list of directories to search for manual pages"
+msgstr ""
+
+#: sys/who.rs:283 sys/who.rs:294
+msgid "PID"
+msgstr ""
+
+#: screen/tabs.rs:91
+msgid "PL/1: 1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61"
 msgstr ""
 
 #: text/pr.rs:92
 msgid "Page"
 msgstr ""
 
-#: cc/main.rs:61
+#: cc/main.rs:63
 msgid "Parse and dump AST to stdout"
 msgstr ""
 
-#: sys/getconf.rs:28
+#: i18n/localedef.rs:35
+msgid "Path of charmap file"
+msgstr ""
+
+#: i18n/localedef.rs:38
+msgid "Path of source definitions"
+msgstr ""
+
+#: sys/getconf.rs:27
 msgid "Pathname for path configuration variables"
+msgstr ""
+
+#: process/fuser.rs:1376
+msgid "Pathname on which the file or file system is to be reported"
+msgstr ""
+
+#: pax/main.rs:138
+msgid "Pathnames, patterns and file operands to be processed"
+msgstr ""
+
+#: pathnames/realpath.rs:28
+msgid "Paths to resolve"
+msgstr ""
+
+#: text/grep.rs:59
+msgid "Pattern to search for"
+msgstr ""
+
+#: text/pr_util/args.rs:77
+msgid "Pause before beginning each page on terminal output"
+msgstr ""
+
+#: cc/main.rs:138
+msgid "Pedantic mode (compatibility)"
 msgstr ""
 
 #: datetime/date.rs:27
 msgid "Perform operations as if the TZ env var was set to the string \"UTC0\""
 msgstr ""
 
-#: display/more.rs:62
+#: display/more.rs:62 text/grep.rs:38
 msgid "Perform pattern matching in searches without regard to case"
 msgstr ""
 
-#: users/write.rs:225
+#: users/write.rs:278
 msgid "Permission denied"
 msgstr ""
 
-#: cc/main.rs:97
+#: cc/main.rs:104
 msgid "Place output in file"
+msgstr ""
+
+#: i18n/ngettext.rs:45
+msgid "Plural form (MSGID2)"
+msgstr ""
+
+#: text/pr_util/args.rs:74
+msgid "Precede each line with MARGIN space characters"
+msgstr ""
+
+#: text/grep.rs:44
+msgid "Precede each output line by its relative line number in the file"
+msgstr ""
+
+#: sccs/get.rs:48
+msgid "Prefix each line with SID of inserting delta"
+msgstr ""
+
+#: sccs/get.rs:51
+msgid "Prefix each line with module name"
 msgstr ""
 
 #: file/split.rs:56
 msgid "Prefix of output files"
 msgstr ""
 
-#: cc/main.rs:57
+#: cc/main.rs:59
 msgid "Preprocess only, output to stdout"
+msgstr ""
+
+#: cc/cflow.rs:49 cc/cxref.rs:53
+msgid "Preprocessor defines"
 msgstr ""
 
 #: process/timeout.rs:35
 msgid "Preserve the exit status of the utility."
 msgstr ""
 
-#: datetime/time.rs:45 i18n/xgettext.rs:95
+#: tree/readlink.rs:30
+msgid ""
+"Print an error description to standard error when an error occurs and the "
+"specified file could not be resolved"
+msgstr ""
+
+#: sys/who.rs:31
+msgid "Print column headings above the regular output"
+msgstr ""
+
+#: cc/main.rs:142
+msgid "Print compilation statistics"
+msgstr ""
+
+#: sccs/delta.rs:37
+msgid "Print diff output"
+msgstr ""
+
+#: datetime/time.rs:45 i18n/gettext.rs:41 i18n/locale.rs:44
+#: i18n/localedef.rs:47 i18n/msgfmt.rs:52 i18n/ngettext.rs:36
+#: i18n/xgettext.rs:102
 msgid "Print help"
 msgstr ""
 
-#: datetime/time.rs:48 i18n/xgettext.rs:98
+#: man/man.rs:132 sccs/admin.rs:29
+msgid "Print help information"
+msgstr ""
+
+#: cc/ctags.rs:46
+msgid "Print index to stdout"
+msgstr ""
+
+#: cc/cflow.rs:38
+msgid "Print inverted listing showing callers of each function"
+msgstr ""
+
+#: text/uniq.rs:14
+msgid "Print only the repeated lines"
+msgstr ""
+
+#: text/uniq.rs:17
+msgid "Print only unique lines"
+msgstr ""
+
+#: dev/ar.rs:124
+msgid "Print the contents of the files in the archive"
+msgstr ""
+
+#: sys/who.rs:46
+msgid "Print the current run-level of the init process"
+msgstr ""
+
+#: sys/who.rs:25
+msgid "Print the time and date of the last reboot"
+msgstr ""
+
+#: datetime/time.rs:48 i18n/gettext.rs:44 i18n/locale.rs:47
+#: i18n/localedef.rs:50 i18n/msgfmt.rs:55 i18n/ngettext.rs:39
+#: i18n/xgettext.rs:105
 msgid "Print version"
+msgstr ""
+
+#: print/lp.rs:28
+msgid "Printer destination (IPP URI)"
+msgstr ""
+
+#: print/lp.rs:43
+msgid "Printer-dependent options"
+msgstr ""
+
+#: sys/who.rs:22
+msgid "Process all utmpx entries"
 msgstr ""
 
 #: process/renice.rs:66
 msgid "Process id to adjust priority"
 msgstr ""
 
-#: process/xargs.rs:86
+#: cc/main.rs:121
+msgid "Produce a shared library"
+msgstr ""
+
+#: text/pr_util/args.rs:36
+msgid "Produce double-spaced output"
+msgstr ""
+
+#: dev/nm.rs:41
+msgid "Produce full output"
+msgstr ""
+
+#: text/pr_util/args.rs:29
+msgid "Produce multi-column output arranged in COLUMN columns"
+msgstr ""
+
+#: text/diff.rs:46
+msgid "Produce output in a form suitable as input for the ed utility"
+msgstr ""
+
+#: text/diff.rs:49
+msgid "Produce output in an alternative form, similar in format to -e"
+msgstr ""
+
+#: tree/rm.rs:31
+msgid "Prompt for confirmation"
+msgstr ""
+
+#: tree/cp.rs:65 tree/mv.rs:33
+msgid "Prompt for confirmation if the destination path exists"
+msgstr ""
+
+#: process/xargs.rs:92
 msgid "Prompt mode: ask before executing each command"
+msgstr ""
+
+#: text/pr_util/args.rs:66
+msgid "Provide line numbering with specified width and separator"
+msgstr ""
+
+#: uucp/uucp.rs:53
+msgid "Queue job only, do not start transfer"
+msgstr ""
+
+#: text/grep.rs:47
+msgid "Quiet mode, only return exit status"
+msgstr ""
+
+#: pax/main.rs:63
+msgid "Read an archive file from standard input"
+msgstr ""
+
+#: text/grep.rs:35
+msgid "Read one or more patterns from the file named by the pathname"
 msgstr ""
 
 #: file/od.rs:34
 msgid "Read only the specified number of bytes"
 msgstr ""
 
+#: uucp/uux.rs:37
+msgid "Read stdin and pipe to command"
+msgstr ""
+
 #: text/patch.rs:61
 msgid "Read the patch from PATCHFILE"
 msgstr ""
 
-#: sys/ipcrm.rs:70
+#: sccs/admin.rs:62
+msgid "Recompute and store checksum"
+msgstr ""
+
+#: tree/chmod.rs:23
+msgid "Recursively change file mode bits"
+msgstr ""
+
+#: tree/ls.rs:152
+msgid ""
+"Recursively list subdirectories encountered. When a symbolic link to a "
+"directory is encountered, the directory shall not be recursively listed "
+"unless the -L option is specified. The use of -R with -d or -f produces "
+"unspecified results"
+msgstr ""
+
+#: uucp/uustat.rs:34
+msgid "Rejuvenate (touch) the specified job"
+msgstr ""
+
+#: tree/rmdir.rs:20
+msgid "Remove all directories in a pathname"
+msgstr ""
+
+#: tree/rm.rs:34
+msgid "Remove file hierarchies"
+msgstr ""
+
+#: cron/at.rs:77
+msgid ""
+"Remove the jobs with the specified at_job_id operands that were previously "
+"scheduled by the at utility."
+msgstr ""
+
+#: sys/ipcrm.rs:74
 msgid "Remove the message queue identifier msgid from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:78
+#: sys/ipcrm.rs:82
 msgid ""
 "Remove the message queue identifier, created with key msgkey, from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:40
+#: sys/ipcrm.rs:44
 msgid "Remove the semaphore identifier semid from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:48
+#: sys/ipcrm.rs:52
 msgid ""
 "Remove the semaphore identifier, created with key semkey, from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:55
+#: sys/ipcrm.rs:59
 msgid "Remove the shared memory identifier shmid from the system"
 msgstr ""
 
-#: sys/ipcrm.rs:63
+#: sys/ipcrm.rs:67
 msgid ""
 "Remove the shared memory identifier, created with key shmkey, from the system"
 msgstr ""
 
-#: sccs/admin.rs:373
+#: sccs/admin.rs:56
+msgid "Remove user from authorized list"
+msgstr ""
+
+#: text/tr.rs:22
+msgid ""
+"Replace each input sequence of a repeated character that is listed in the "
+"last specified SET, with a single occurrence of that character"
+msgstr ""
+
+#: text/join.rs:24
+msgid "Replace empty output fields with the specified string"
+msgstr ""
+
+#: dev/ar.rs:128
+msgid "Replace or add files to the archive"
+msgstr ""
+
+#: text/pr_util/args.rs:54
+msgid "Replace spaces with tabs in output"
+msgstr ""
+
+#: process/fuser.rs:1370
+msgid "Report only for the named files"
+msgstr ""
+
+#: uucp/uustat.rs:28
+msgid "Report queue summary (jobs per system)"
+msgstr ""
+
+#: tree/chmod.rs:27
+msgid ""
+"Represents the change to be made to the file mode bits of each file named by "
+"one of the file operands"
+msgstr ""
+
+#: pax/main.rs:111
+msgid "Reset access times of files after reading them"
+msgstr ""
+
+#: text/sort.rs:50
+msgid "Restrict the sort key to an initial numeric string"
+msgstr ""
+
+#: sccs/delta.rs:34
+msgid "Retain g-file after delta"
+msgstr ""
+
+#: tree/ls.rs:148
+msgid ""
+"Reverse the order of the sort to get reverse collating sequence oldest "
+"first, or smallest file size first depending on the other options given"
+msgstr ""
+
+#: text/sort.rs:53
+msgid "Reverse the sense of comparisons"
+msgstr ""
+
+#: pax/main.rs:135
+msgid "Run this script at end of each volume (for -M mode)"
+msgstr ""
+
+#: sccs/admin.rs:360
 msgid "SCCS file names must begin with 's.'"
+msgstr ""
+
+#: sccs/sact.rs:25
+msgid "SCCS files to check (use - for stdin)"
+msgstr ""
+
+#: sccs/admin.rs:65 sccs/delta.rs:43 sccs/get.rs:54
+msgid "SCCS files to process"
+msgstr ""
+
+#: sccs/prs.rs:43 sccs/rmdel.rs:28 sccs/unget.rs:34
+msgid "SCCS files to process (use - for stdin)"
+msgstr ""
+
+#: sccs/val.rs:45
+msgid "SCCS files to validate (use - for stdin)"
+msgstr ""
+
+#: sccs/delta.rs:28
+msgid "SID of delta to create (if multiple edits pending)"
+msgstr ""
+
+#: sccs/rmdel.rs:25
+msgid "SID of delta to remove (required)"
+msgstr ""
+
+#: sccs/prs.rs:40
+msgid "SID to report on"
+msgstr ""
+
+#: sccs/get.rs:27
+msgid "SID to retrieve"
+msgstr ""
+
+#: screen/tabs.rs:94
+msgid "SNOBOL: 1,10,55"
+msgstr ""
+
+#: text/sort.rs:29
+msgid "Same as -c, but without warning message for disorder or duplicate keys"
 msgstr ""
 
 #: text/patch.rs:41
 msgid "Save a copy of the original file with .orig suffix"
 msgstr ""
 
+#: dev/strings.rs:28
+msgid "Scan the input files in their entirety"
+msgstr ""
+
+#: text/diff.rs:70
+msgid "Second comparison file (or directory, if -r is specified)"
+msgstr ""
+
+#: text/tr.rs:34
+msgid "Second string (not required if delete mode is on)"
+msgstr ""
+
+#: sccs/prs.rs:34
+msgid "Select deltas earlier than or equal to -c or -r"
+msgstr ""
+
+#: sccs/prs.rs:37
+msgid "Select deltas later than or equal to -c or -r"
+msgstr ""
+
+#: text/grep.rs:53
+msgid "Select lines not matching any of the specified patterns"
+msgstr ""
+
+#: pax/main.rs:99
+msgid "Select only the first archive member that matches each pattern operand"
+msgstr ""
+
 #: file/od.rs:37
 msgid "Select the output format"
 msgstr ""
 
-#: sys/ipcs.rs:655
+#: sys/ipcs.rs:670
 msgid "Semaphores"
 msgstr ""
 
@@ -667,23 +1962,132 @@ msgid ""
 "period."
 msgstr ""
 
-#: datetime/cal.rs:48
-msgid "September"
+#: print/lp.rs:34
+msgid "Send mail after printing"
 msgstr ""
 
-#: sys/ipcs.rs:587
+#: uucp/uucp.rs:47
+msgid "Send mail to requester when copy completes"
+msgstr ""
+
+#: cron/at.rs:69
+msgid "Send mail to the invoking user after the at-job has run."
+msgstr ""
+
+#: text/pr_util/args.rs:84
+msgid "Separate text columns by single character CHAR"
+msgstr ""
+
+#: sccs/admin.rs:47
+msgid "Set flag (can be repeated)"
+msgstr ""
+
+#: text/pr_util/args.rs:91
+msgid "Set line width to PAGE_WIDTH for multi-column output"
+msgstr ""
+
+#: tree/ls.rs:101
+msgid ""
+"Set the block size for the -s option and the per-directory block count "
+"written for the -l, -n, -s, -g, and -o options to 1024 bytes"
+msgstr ""
+
+#: text/cut.rs:29
+msgid "Set the field delimiter"
+msgstr ""
+
+#: tree/mkfifo.rs:20
+msgid ""
+"Set the file permission bits of the newly-created FIFO to the specified mode "
+"value"
+msgstr ""
+
+#: tree/mkdir.rs:25
+msgid ""
+"Set the file permission bits of the newly-created directory to the specified "
+"mode value"
+msgstr ""
+
+#: sys/ipcs.rs:602
 msgid "Shared Memory"
+msgstr ""
+
+#: sys/who.rs:55
+msgid "Show the state of each terminal"
+msgstr ""
+
+#: sccs/val.rs:33
+msgid "Silence diagnostic messages"
+msgstr ""
+
+#: sccs/delta.rs:40 sccs/get.rs:42
+msgid "Silent mode (suppress informational messages)"
+msgstr ""
+
+#: sccs/unget.rs:28
+msgid "Silent mode (suppress output)"
+msgstr ""
+
+#: cc/cxref.rs:42
+msgid "Silent mode, suppress filenames"
+msgstr ""
+
+#: i18n/ngettext.rs:42
+msgid "Singular form (MSGID1)"
 msgstr ""
 
 #: file/od.rs:31
 msgid "Skip bytes from the beginning of the input"
 msgstr ""
 
-#: sys/getconf.rs:34
+#: dev/nm.rs:62
+msgid "Sort output by value instead of by symbol name"
+msgstr ""
+
+#: tree/ls.rs:166
+msgid ""
+"Sort with the primary key being file size (in decreasing order) and the "
+"secondary key being filename in the collating sequence (in increasing order)"
+msgstr ""
+
+#: tree/ls.rs:177
+msgid ""
+"Sort with the primary key being time modified (most recently modified first) "
+"and the secondary key being filename in the collating sequence. For a "
+"symbolic link, the time used as the sort key is that of the symbolic link "
+"itself, unless ls is evaluating its file information to be that of the file "
+"referenced by the link (see the -H and -L options)"
+msgstr ""
+
+#: uucp/uucp.rs:56
+msgid "Source files and destination"
+msgstr ""
+
+#: tree/ln.rs:25
+msgid "Source(s) and target of link(s)"
+msgstr ""
+
+#: tree/cp.rs:74 tree/mv.rs:40
+msgid "Source(s) and target of move(s)"
+msgstr ""
+
+#: sys/getconf.rs:33
 msgid "Specification for the variable (optional)"
 msgstr ""
 
-#: i18n/xgettext.rs:88
+#: users/newgrp.rs:58
+msgid ""
+"Specifies the group ID or group name. This is a positional argument that "
+"must be provided."
+msgstr ""
+
+#: cron/at.rs:65
+msgid ""
+"Specifies the pathname of a file to be used as the source of the at-job, "
+"instead of standard input."
+msgstr ""
+
+#: i18n/xgettext.rs:95
 msgid ""
 "Specify a file containing strings that shall not be extracted from the input "
 "files. The format of EXCLUDE_FILE is identical to that of a dot-po file. "
@@ -691,7 +2095,7 @@ msgid ""
 "be used. All other statements shall be ignored."
 msgstr ""
 
-#: i18n/xgettext.rs:62
+#: i18n/xgettext.rs:69
 msgid ""
 "Specify an additional keyword to be looked for:\n"
 "* If KEYWORD_SPEC is an empty string, this shall disable the use of default "
@@ -707,28 +2111,135 @@ msgid ""
 "respectively."
 msgstr ""
 
-#: screen/tabs.rs:33
-msgid "Specify repetitive tab stops separated by (1) columns"
+#: cron/at.rs:73
+msgid "Specify in which queue to schedule a job for submission."
 msgstr ""
 
-#: datetime/cal.rs:24
+#: pax/main.rs:117
+msgid "Specify one or more file characteristic options (privileges)"
+msgstr ""
+
+#: text/grep.rs:32
+msgid "Specify one or more patterns to be used during the search for input"
+msgstr ""
+
+#: sys/ps.rs:142
+msgid "Specify output format"
+msgstr ""
+
+#: text/unexpand.rs:13
+msgid "Specify tab stops"
+msgstr ""
+
+#: text/nl.rs:55
+msgid ""
+"Specify that numbering should not be restarted at logical page delimiters"
+msgstr ""
+
+#: sccs/unget.rs:25
+msgid "Specify the SID to unget (when user has multiple pending edits)"
+msgstr ""
+
+#: text/nl.rs:59
+msgid ""
+"Specify the characters used in separating the line number and the "
+"corresponding text line"
+msgstr ""
+
+#: text/nl.rs:31
+msgid ""
+"Specify the delimiter characters that indicate the start of a logical page "
+"section"
+msgstr ""
+
+#: text/sort.rs:59
+msgid "Specify the field separator character"
+msgstr ""
+
+#: text/nl.rs:43
+msgid "Specify the increment value used to number logical page lines"
+msgstr ""
+
+#: text/nl.rs:63
+msgid "Specify the initial value used to number logical page lines"
+msgstr ""
+
+#: text/sort.rs:62
+msgid "Specify the key definition for sorting"
+msgstr ""
+
+#: text/nl.rs:51
+msgid ""
+"Specify the line numbering format (ln=left, rn=right, rz=right with zeros)"
+msgstr ""
+
+#: text/fold.rs:31
+msgid ""
+"Specify the maximum line length, in column positions (or bytes if -b is "
+"specified)."
+msgstr ""
+
+#: xform/compress.rs:26
+msgid "Specify the maximum number of bits to use in a code. 9 <= bits <= 14"
+msgstr ""
+
+#: datetime/cal.rs:137
 msgid ""
 "Specify the month to be displayed, represented as a decimal integer from 1 "
 "(January) to 12 (December)"
+msgstr ""
+
+#: text/sort.rs:35
+msgid ""
+"Specify the name of an output file to be used instead of the standard output"
+msgstr ""
+
+#: text/nl.rs:47
+msgid "Specify the number of blank lines to be considered as one"
+msgstr ""
+
+#: text/nl.rs:67
+msgid "Specify the number of characters to be used for the line number"
+msgstr ""
+
+#: pax/main.rs:123
+msgid "Specify the output archive format"
+msgstr ""
+
+#: pax/main.rs:81
+msgid "Specify the pathname of the input or output archive"
 msgstr ""
 
 #: awk/main.rs:33
 msgid "Specify the program files"
 msgstr ""
 
+#: text/nl.rs:35
+msgid "Specify the same as -b type except for footer"
+msgstr ""
+
+#: text/nl.rs:39
+msgid "Specify the same as -b type except for header"
+msgstr ""
+
 #: process/timeout.rs:41
 msgid "Specify the signal to send when the time limit is reached."
 msgstr ""
 
-#: datetime/cal.rs:32
+#: pax/main.rs:132
+msgid "Specify the tape/volume length in bytes (used with -M)"
+msgstr ""
+
+#: datetime/cal.rs:145
 msgid ""
 "Specify the year for which the calendar is displayed, represented as a "
 "decimal integer from 1 to 9999"
+msgstr ""
+
+#: text/nl.rs:27
+msgid ""
+"Specify which logical page body lines shall be numbered (a=all, t=non-empty, "
+"n=none, pREGEX=matching)"
 msgstr ""
 
 #: file/split.rs:49
@@ -739,16 +2250,57 @@ msgstr ""
 msgid "Squeeze multiple blank lines into one"
 msgstr ""
 
+#: text/pr_util/args.rs:70
+msgid "Start line counting with NUMBER at first line of first page"
+msgstr ""
+
+#: tree/ls.rs:124
+msgid ""
+"Stream output format; list pathnames across the page, separated by a <comma> "
+"character followed by a <space> character. Use a <newline> character as the "
+"list terminator and after the separator sequence when there is not room on a "
+"line for the next list entry. This option disables long format output"
+msgstr ""
+
 #: text/patch.rs:81
 msgid "Strip NUM leading path components from file names"
 msgstr ""
 
-#: datetime/cal.rs:56
+#: datetime/cal.rs:155
 msgid "Su Mo Tu We Th Fr Sa"
+msgstr ""
+
+#: cron/at.rs:58
+msgid "Submit the job to be run at the date and time specified."
+msgstr ""
+
+#: cron/at.rs:81
+msgid ""
+"Submit the job to be run at the time specified by the time option-argument."
+msgstr ""
+
+#: dev/ar.rs:61 dev/ar.rs:73
+msgid "Suppress archive creation diagnostics"
+msgstr ""
+
+#: sccs/get.rs:36
+msgid "Suppress keyword expansion"
+msgstr ""
+
+#: text/cut.rs:32
+msgid "Suppress lines with no delimiter characters"
+msgstr ""
+
+#: print/lp.rs:37
+msgid "Suppress messages (no request ID output)"
 msgstr ""
 
 #: i18n/iconv.rs:39
 msgid "Suppress messages about invalid characters"
+msgstr ""
+
+#: sccs/get.rs:45
+msgid "Suppress retrieval, just verify SID exists"
 msgstr ""
 
 #: text/sed.rs:34
@@ -757,34 +2309,159 @@ msgid ""
 "written."
 msgstr ""
 
+#: text/grep.rs:50
+msgid "Suppress the error messages for nonexistent or unreadable files"
+msgstr ""
+
+#: text/comm.rs:30
+msgid "Suppress the output column of lines duplicated in file1 and file2."
+msgstr ""
+
+#: text/comm.rs:24
+msgid "Suppress the output column of lines unique to file1."
+msgstr ""
+
+#: text/comm.rs:27
+msgid "Suppress the output column of lines unique to file2."
+msgstr ""
+
+#: text/csplit.rs:34
+msgid "Suppress the output of file size messages"
+msgstr ""
+
+#: dev/lex/main.rs:31
+msgid "Suppress the summary of statistics usually written with the -v option"
+msgstr ""
+
+#: editors/ed_main.rs:34
+msgid ""
+"Suppress the writing of byte counts by e, E, r, and w commands and the '!' "
+"prompt after !command"
+msgstr ""
+
+#: i18n/gettext.rs:35
+msgid "Suppress trailing newline"
+msgstr ""
+
 #: display/more.rs:94
 msgid "Suppress underlining and bold"
 msgstr ""
 
-#: sys/who.rs:245
+#: i18n/gettext.rs:47
+msgid ""
+"TEXTDOMAIN and/or MSGID. If one argument: MSGID. If two arguments: "
+"TEXTDOMAIN MSGID"
+msgstr ""
+
+#: sys/who.rs:281 sys/who.rs:292 sys/who.rs:303 sys/who.rs:311
 msgid "TIME"
 msgstr ""
 
-#: cc/main.rs:109
+#: screen/tabs.rs:45
+msgid "Tab stops every 1 column"
+msgstr ""
+
+#: screen/tabs.rs:48
+msgid "Tab stops every 2 columns"
+msgstr ""
+
+#: screen/tabs.rs:51
+msgid "Tab stops every 3 columns"
+msgstr ""
+
+#: screen/tabs.rs:54
+msgid "Tab stops every 4 columns"
+msgstr ""
+
+#: screen/tabs.rs:57
+msgid "Tab stops every 5 columns"
+msgstr ""
+
+#: screen/tabs.rs:60
+msgid "Tab stops every 6 columns"
+msgstr ""
+
+#: screen/tabs.rs:63
+msgid "Tab stops every 7 columns"
+msgstr ""
+
+#: screen/tabs.rs:66
+msgid "Tab stops every 8 columns"
+msgstr ""
+
+#: screen/tabs.rs:69
+msgid "Tab stops every 9 columns"
+msgstr ""
+
+#: text/expand.rs:22
+msgid ""
+"Tab stops, either a single positive decimal integer or a list of tabstops "
+"separated by commas."
+msgstr ""
+
+#: screen/tabs.rs:100
+msgid "Tab-stop values (comma or blank separated, +N for increments)"
+msgstr ""
+
+#: i18n/localedef.rs:41
+msgid "Target codeset for conversion"
+msgstr ""
+
+#: cc/main.rs:125
 msgid "Target triple for cross-compilation"
 msgstr ""
 
-#: screen/tabs.rs:181
-msgid "Terminal does not support hardware tabs."
-msgstr ""
-
-#: users/talk.rs:44
+#: users/talk.rs:46
 msgid "Terminal name to use (optional)"
 msgstr ""
 
-#: screen/tput.rs:26
-msgid "Terminal operand to execute"
+#: screen/tput.rs:31
+msgid "Terminal operand(s) to execute"
 msgstr ""
 
-#: process/xargs.rs:99
+#: process/xargs.rs:105
 msgid ""
 "Terminate if a constructed command line will not fit in the implied or "
 "specified size"
+msgstr ""
+
+#: cron/at.rs:48
+msgid ""
+"The 'at' command schedules commands to be executed later.\n"
+"Usage:\n"
+"at [-m] [-f file] [-q queuename] -t time_arg\n"
+"at [-m] [-f file] [-q queuename] timespec...\n"
+"at -r at_job_id...\n"
+"at -l -q queuename\n"
+"at -l [at_job_id...]"
+msgstr ""
+
+#: text/tail.rs:95
+msgid "The file to read"
+msgstr ""
+
+#: tree/chmod.rs:30
+msgid "The files to change"
+msgstr ""
+
+#: tree/du.rs:40
+msgid "The files to receive metadata processing"
+msgstr ""
+
+#: text/head.rs:33
+msgid ""
+"The first <N> bytes of each input file shall be copied to standard output "
+"(mutually exclusive with -n)"
+msgstr ""
+
+#: text/head.rs:27
+msgid ""
+"The first <N> lines of each input file shall be copied to standard output "
+"(mutually exclusive with -c)"
+msgstr ""
+
+#: users/id.rs:37
+msgid "The login name for which information is to be written"
 msgstr ""
 
 #: process/timeout.rs:44
@@ -793,8 +2470,16 @@ msgid ""
 "decimal number with an optional decimal fraction and an optional suffix."
 msgstr ""
 
+#: text/tail.rs:89
+msgid "The number of bytes to print from the end of the file"
+msgstr ""
+
 #: display/more.rs:102
 msgid "The number of lines per screenful"
+msgstr ""
+
+#: text/tail.rs:85
+msgid "The number of lines to print from the end of the file"
 msgstr ""
 
 #: text/patch.rs:37
@@ -803,11 +2488,26 @@ msgid ""
 "and applies those differences to a file."
 msgstr ""
 
+#: xform/uudecode.rs:31
+msgid "The pathname of a file containing uuencoded data"
+msgstr ""
+
+#: tree/readlink.rs:33
+msgid "The pathname of an existing symbolic link"
+msgstr ""
+
 #: pathnames/pathchk.rs:43
 msgid "The pathnames to be checked"
 msgstr ""
 
-#: process/xargs.rs:46
+#: tree/ls.rs:199
+msgid ""
+"The same as -C, except that the multi-text-column output is produced with "
+"entries sorted across, rather than down, the columns. This option disables "
+"long format output"
+msgstr ""
+
+#: process/xargs.rs:52
 msgid ""
 "The utility shall be executed for each non-empty number lines of arguments "
 "from standard input"
@@ -821,12 +2521,55 @@ msgstr ""
 msgid "The utility to execute."
 msgstr ""
 
-#: process/xargs.rs:89
+#: print/lp.rs:46
+msgid "Title for the banner page"
+msgstr ""
+
+#: process/xargs.rs:95
 msgid "Trace mode: print each command before execution"
 msgstr ""
 
-#: screen/tput.rs:91
-msgid "Unknown terminal command"
+#: process/fuser.rs:1367
+msgid "Treat file as mount point, report on any files open in the file system"
+msgstr ""
+
+#: tree/ls.rs:133
+msgid ""
+"Turn on the -l (ell) option, but disable writing the file's group name or "
+"number. Disable the -C, -m, and -x options"
+msgstr ""
+
+#: tree/ls.rs:85
+msgid ""
+"Turn on the -l (ell) option, but disable writing the file's owner name or "
+"number. Disable the -C, -m, and -x options"
+msgstr ""
+
+#: tree/ls.rs:129
+msgid ""
+"Turn on the -l (ell) option, but when writing the file's owner or group, "
+"write the file's numeric UID or GID rather than the user or group name, "
+"respectively. Disable the -C, -m, and -x options"
+msgstr ""
+
+#: cc/main.rs:81
+msgid "Undefine a macro"
+msgstr ""
+
+#: cc/cflow.rs:55 cc/cxref.rs:59
+msgid "Undefine macros"
+msgstr ""
+
+#: text/sort.rs:38
+msgid "Unique: suppress all but one in each set of lines having equal keys"
+msgstr ""
+
+#: screen/tput.rs:154
+msgid "Unknown terminal type"
+msgstr ""
+
+#: dev/ar.rs:76
+msgid "Update older files in the archive"
 msgstr ""
 
 #: fs/df.rs:28
@@ -835,16 +2578,48 @@ msgid ""
 "space figures"
 msgstr ""
 
+#: users/pwd.rs:24
+msgid "Use PWD from environment if valid"
+msgstr ""
+
+#: i18n/gettext.rs:29 i18n/ngettext.rs:30
+msgid "Use TEXTDOMAIN as the text domain for translating MSGID"
+msgstr ""
+
 #: sys/ipcs.rs:33
 msgid "Use all print options (-b, -c, -o, -p, -t)"
 msgstr ""
 
-#: process/xargs.rs:74
+#: users/pwd.rs:27
+msgid "Use current working directory from process"
+msgstr ""
+
+#: process/xargs.rs:80
 msgid "Use eofstr as the logical end-of-file string"
 msgstr ""
 
-#: process/xargs.rs:92
+#: text/pr_util/args.rs:46
+msgid "Use form-feed for new pages"
+msgstr ""
+
+#: text/pr_util/args.rs:43
+msgid "Use form-feed for new pages, pause before first page"
+msgstr ""
+
+#: process/xargs.rs:98
 msgid "Use null character as input delimiter"
+msgstr ""
+
+#: text/csplit.rs:30
+msgid "Use number decimal digits to form filenames for the file pieces"
+msgstr ""
+
+#: text/pr_util/args.rs:50
+msgid "Use string HEADER to replace the file name in page header"
+msgstr ""
+
+#: editors/ed_main.rs:31
+msgid "Use string as the prompt when in command mode"
 msgstr ""
 
 #: file/split.rs:29 file/split.rs:40
@@ -853,11 +2628,53 @@ msgid ""
 "split file"
 msgstr ""
 
-#: fs/df.rs:145
+#: text/tr.rs:28
+msgid "Use the complement of STRING1's characters"
+msgstr ""
+
+#: text/tr.rs:25
+msgid "Use the complement of STRING1's values"
+msgstr ""
+
+#: tree/touch.rs:33
+msgid ""
+"Use the corresponding time of the file named by the pathname ref_file "
+"instead of the current time"
+msgstr ""
+
+#: tree/touch.rs:27
+msgid ""
+"Use the specified ISO 8601:2000 date-time format, instead of the current time"
+msgstr ""
+
+#: tree/touch.rs:30
+msgid ""
+"Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current "
+"time"
+msgstr ""
+
+#: man/man.rs:64
+msgid "Use the specified file instead of the default configuration file"
+msgstr ""
+
+#: tree/ls.rs:187
+msgid ""
+"Use time of last access instead of last modification of the file for sorting "
+"(-t) or writing (-l)"
+msgstr ""
+
+#: tree/ls.rs:45
+msgid ""
+"Use time of last modification of the file status information (see XBD <sys/"
+"stat.h>) instead of last modification of the file itself for sorting ( -t) "
+"or writing (-l)"
+msgstr ""
+
+#: fs/df.rs:138
 msgid "Used"
 msgstr ""
 
-#: process/nice.rs:40 process/xargs.rs:107
+#: process/nice.rs:40 process/xargs.rs:113
 msgid "Utility arguments"
 msgstr ""
 
@@ -865,24 +2682,62 @@ msgstr ""
 msgid "Utility to invoke"
 msgstr ""
 
-#: process/xargs.rs:104
+#: process/xargs.rs:110
 msgid "Utility to invoke (default: echo)"
 msgstr ""
 
-#: sys/getconf.rs:25
+#: sys/getconf.rs:24
 msgid "Variable to get the value of"
 msgstr ""
 
-#: file/od.rs:76
+#: i18n/msgfmt.rs:43
+msgid "Verbose mode - print warnings"
+msgstr ""
+
+#: file/od.rs:76 i18n/localedef.rs:44
 msgid "Verbose output"
 msgstr ""
 
-#: cc/main.rs:72
+#: cc/main.rs:74
 msgid "Verbose output with position info"
+msgstr ""
+
+#: cc/main.rs:135
+msgid "Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"
+msgstr ""
+
+#: tree/du.rs:37
+msgid ""
+"When evaluating file sizes, evaluate only those files that have the same "
+"device as the file specified by the file operand"
+msgstr ""
+
+#: sys/who.rs:61
+msgid "Write \"idle time\" for each displayed user"
+msgstr ""
+
+#: tree/ls.rs:139
+msgid "Write a <slash> ( '/' ) after each filename if that file is a directory"
+msgstr ""
+
+#: dev/lex/main.rs:37
+msgid "Write a summary of lex statistics to the standard output"
+msgstr ""
+
+#: tree/du.rs:22
+msgid "Write counts for all files, not just directories"
 msgstr ""
 
 #: sys/ipcs.rs:39
 msgid "Write creator's user name and group name"
+msgstr ""
+
+#: dev/nm.rs:56
+msgid "Write each numeric value in the specified format"
+msgstr ""
+
+#: pax/main.rs:66
+msgid "Write files to the standard output in the specified archive format"
 msgstr ""
 
 #: sys/ipcs.rs:24
@@ -897,7 +2752,47 @@ msgstr ""
 msgid "Write information about active shared memory segments"
 msgstr ""
 
-#: fs/df.rs:35
+#: sys/ps.rs:94
+msgid "Write information for all processes"
+msgstr ""
+
+#: sys/ps.rs:98
+msgid "Write information for all processes (alias for -A)"
+msgstr ""
+
+#: sys/ps.rs:102
+msgid "Write information for all processes associated with terminals"
+msgstr ""
+
+#: sys/ps.rs:106
+msgid "Write information for all processes except session leaders"
+msgstr ""
+
+#: sys/ps.rs:126
+msgid "Write information for processes in proclist"
+msgstr ""
+
+#: sys/ps.rs:130
+msgid "Write information for processes on terminals in termlist"
+msgstr ""
+
+#: sys/ps.rs:122
+msgid "Write information for processes whose real group ID is in grouplist"
+msgstr ""
+
+#: sys/ps.rs:138
+msgid "Write information for processes whose real user ID is in userlist"
+msgstr ""
+
+#: sys/ps.rs:118
+msgid "Write information for processes whose session leaders are in grouplist"
+msgstr ""
+
+#: sys/ps.rs:134
+msgid "Write information for processes whose user ID is in userlist"
+msgstr ""
+
+#: dev/nm.rs:53 fs/df.rs:35
 msgid "Write information in a portable output format"
 msgstr ""
 
@@ -909,12 +2804,97 @@ msgstr ""
 msgid "Write information on outstanding usage"
 msgstr ""
 
+#: uucp/uucp.rs:44 uucp/uux.rs:31
+msgid "Write job ID to stdout"
+msgstr ""
+
+#: xform/compress.rs:35 xform/uncompress.rs:30
+msgid "Write messages to standard error concerning the expansion of each file"
+msgstr ""
+
+#: tree/ls.rs:57
+msgid ""
+"Write multi-text-column output with entries sorted down the columns, "
+"according to the collating sequence. The number of text columns and the "
+"column separator characters are unspecified, but should be adapted to the "
+"nature of the output device. This option disables long format output"
+msgstr ""
+
+#: i18n/locale.rs:41
+msgid "Write names and values of selected keywords"
+msgstr ""
+
+#: i18n/locale.rs:32
+msgid "Write names of all available public locales"
+msgstr ""
+
+#: i18n/locale.rs:35
+msgid "Write names of available charmaps"
+msgstr ""
+
+#: text/pr_util/args.rs:80
+msgid "Write no diagnostic reports on failure to open files"
+msgstr ""
+
 #: file/cmp.rs:36
 msgid "Write nothing for differing files; return exit status only"
 msgstr ""
 
+#: dev/nm.rs:50
+msgid "Write numeric values in hexadecimal (equivalent to -t x)"
+msgstr ""
+
+#: dev/nm.rs:47
+msgid "Write numeric values in octal (equivalent to -t o)"
+msgstr ""
+
+#: text/grep.rs:29
+msgid "Write only a count of selected lines to standard output"
+msgstr ""
+
+#: dev/nm.rs:38
+msgid "Write only external (global) and static symbol information"
+msgstr ""
+
+#: dev/nm.rs:44
+msgid "Write only external (global) symbol information"
+msgstr ""
+
+#: text/grep.rs:41
+msgid ""
+"Write only the names of files containing selected lines to standard output"
+msgstr ""
+
+#: tree/du.rs:34
+msgid "Write only the sum of all arguments"
+msgstr ""
+
+#: dev/nm.rs:59
+msgid "Write only undefined symbols"
+msgstr ""
+
+#: tree/ls.rs:32
+msgid ""
+"Write out all directory entries, including those whose names begin with a "
+"<period> ( '.' )"
+msgstr ""
+
+#: tree/ls.rs:36
+msgid ""
+"Write out all directory entries, including those whose names begin with a "
+"<period> ( '.' ) but excluding the entries dot and dot-dot (if they exist)"
+msgstr ""
+
 #: text/patch.rs:77
 msgid "Write output to OUTFILE instead of patching in place"
+msgstr ""
+
+#: cc/cxref.rs:46
+msgid "Write output to file"
+msgstr ""
+
+#: dev/lex/main.rs:40
+msgid "Write output to this filename (unless superceded by -t)"
 msgstr ""
 
 #: sys/ipcs.rs:45
@@ -925,10 +2905,58 @@ msgstr ""
 msgid "Write rejects to REJECTFILE instead of .rej"
 msgstr ""
 
+#: cc/ctags.rs:42
+msgid "Write tags to specified file"
+msgstr ""
+
 #: file/cmp.rs:26
 msgid ""
 "Write the byte number (decimal) and the differing bytes (octal) for each "
 "difference"
+msgstr ""
+
+#: sys/uname.rs:26
+msgid "Write the current release level of the operating system implementation"
+msgstr ""
+
+#: sys/uname.rs:32
+msgid ""
+"Write the current version level of this release of the operating system "
+"implementation"
+msgstr ""
+
+#: tree/du.rs:31
+msgid ""
+"Write the files sizes in units of 1024 bytes, rather than the default 512-"
+"byte units"
+msgstr ""
+
+#: dev/nm.rs:35
+msgid "Write the full pathname or library name of an object on each line"
+msgstr ""
+
+#: sys/uname.rs:20
+msgid ""
+"Write the name of the hardware type on which the system is running to "
+"standard output"
+msgstr ""
+
+#: sys/uname.rs:29
+msgid "Write the name of the implementation of the operating system"
+msgstr ""
+
+#: sys/uname.rs:23
+msgid ""
+"Write the name of this node within an implementation-defined communications "
+"network"
+msgstr ""
+
+#: i18n/locale.rs:38
+msgid "Write the names of selected categories"
+msgstr ""
+
+#: dev/lex/main.rs:34
+msgid "Write the resulting program to standard output instead of lex.yy.c"
 msgstr ""
 
 #: display/more.rs:86
@@ -945,21 +2973,43 @@ msgstr ""
 msgid "Write timing output to standard error in POSIX format"
 msgstr ""
 
-#: screen/stty.rs:36
+#: screen/stty.rs:42
 msgid ""
 "Write to standard output all the current settings, in human-readable form"
 msgstr ""
 
-#: screen/stty.rs:46
+#: screen/stty.rs:52
 msgid ""
 "Write to standard output all the current settings, in stty-readable form"
+msgstr ""
+
+#: xform/uncompress.rs:24
+msgid "Write to standard output; no files are changed"
+msgstr ""
+
+#: sccs/get.rs:39
+msgid "Write to stdout instead of g-file"
+msgstr ""
+
+#: print/lp.rs:40
+msgid "Write to terminal after printing"
+msgstr ""
+
+#: xform/compress.rs:29
+msgid ""
+"Write to the standard output; the input file is not changed, and no .Z files "
+"are created"
+msgstr ""
+
+#: process/fuser.rs:1373
+msgid "Write user name associated with each process ID to standard error"
 msgstr ""
 
 #: sccs/admin.rs:27
 msgid "admin - create and administer SCCS files"
 msgstr ""
 
-#: dev/ar.rs:161
+#: dev/ar.rs:138
 msgid "ar - create and maintain library archives"
 msgstr ""
 
@@ -967,8 +3017,12 @@ msgstr ""
 msgid "argument expected"
 msgstr ""
 
-#: text/asa.rs:19
+#: text/asa.rs:31
 msgid "asa - interpret carriage-control characters"
+msgstr ""
+
+#: cron/at.rs:47
+msgid "at - execute commands at a later time"
 msgstr ""
 
 #: awk/main.rs:25
@@ -983,16 +3037,28 @@ msgstr ""
 msgid "bc - arbitrary-precision arithmetic language"
 msgstr ""
 
-#: fs/df.rs:140
+#: fs/df.rs:133
 msgid "blocks"
 msgstr ""
 
-#: datetime/cal.rs:19
+#: datetime/cal.rs:132
 msgid "cal - print a calendar"
+msgstr ""
+
+#: screen/tabs.rs:332
+msgid "cannot determine terminal type"
+msgstr ""
+
+#: print/lp.rs:215
+msgid "cannot open"
 msgstr ""
 
 #: file/cat.rs:24
 msgid "cat - concatenate and print files"
+msgstr ""
+
+#: cc/cflow.rs:35
+msgid "cflow - generate a C-language flowgraph"
 msgstr ""
 
 #: tree/chgrp.rs:19
@@ -1019,7 +3085,7 @@ msgstr ""
 msgid "comm - select or reject lines common to two files"
 msgstr ""
 
-#: xform/compress.rs:22
+#: xform/compress.rs:24
 msgid "compress - compress data"
 msgstr ""
 
@@ -1031,12 +3097,24 @@ msgstr ""
 msgid "csplit - split files based on context"
 msgstr ""
 
+#: cc/ctags.rs:35
+msgid "ctags - create a tags file"
+msgstr ""
+
 #: text/cut.rs:18
 msgid "cut - cut out selected fields of each line of a file"
 msgstr ""
 
+#: cc/cxref.rs:35
+msgid "cxref - generate a C-language program cross-reference table"
+msgstr ""
+
 #: datetime/date.rs:21
 msgid "date - write the date and time"
+msgstr ""
+
+#: cron/crontab.rs:25
+msgid "delete user's crontab"
 msgstr ""
 
 #: sccs/delta.rs:26
@@ -1055,8 +3133,16 @@ msgstr ""
 msgid "dirname - return the directory portion of a pathname"
 msgstr ""
 
-#: tree/du.rs:21
+#: tree/du.rs:20
 msgid "du - estimate file space usage"
+msgstr ""
+
+#: editors/ed_main.rs:29
+msgid "ed - edit text"
+msgstr ""
+
+#: cron/crontab.rs:21
+msgid "edit user's crontab"
 msgstr ""
 
 #: process/env.rs:20
@@ -1075,16 +3161,35 @@ msgstr ""
 msgid "failed to change terminal mode"
 msgstr ""
 
+#: screen/tabs.rs:262
+msgid "failed to clear tabs"
+msgstr ""
+
+#: screen/tabs.rs:275
+msgid "failed to set tab stop"
+msgstr ""
+
+#: i18n/gettext_lib/catalog.rs:269 i18n/gettext_lib/catalog.rs:270
+#: i18n/gettext_lib/catalog.rs:271 i18n/gettext_lib/catalog.rs:272
+msgid "file"
+msgid_plural "files"
+msgstr[0] ""
+msgstr[1] ""
+
 #: file/file.rs:26
 msgid "file - determine file type"
 msgstr ""
 
-#: sccs/admin.rs:401
+#: sccs/admin.rs:388
 msgid "file already exists"
 msgstr ""
 
-#: sccs/admin.rs:460
+#: sccs/admin.rs:447
 msgid "file does not exist"
+msgstr ""
+
+#: cron/crontab.rs:27
+msgid "file to replace user's current crontab with"
 msgstr ""
 
 #: text/fold.rs:22
@@ -1108,8 +3213,12 @@ msgstr ""
 msgid "get - get a version of an SCCS file"
 msgstr ""
 
-#: sys/getconf.rs:23
+#: sys/getconf.rs:22
 msgid "getconf - get configuration values"
+msgstr ""
+
+#: i18n/gettext.rs:24
+msgid "gettext - retrieve text string from message database"
 msgstr ""
 
 #: text/grep.rs:21
@@ -1124,7 +3233,7 @@ msgstr ""
 msgid "iconv - codeset conversion"
 msgstr ""
 
-#: users/id.rs:21
+#: users/id.rs:20
 msgid "id - return user identity"
 msgstr ""
 
@@ -1132,31 +3241,47 @@ msgstr ""
 msgid "integer expression expected"
 msgstr ""
 
-#: file/dd.rs:332
+#: file/dd.rs:544
 msgid "invalid block size suffix"
 msgstr ""
 
-#: file/dd.rs:310
+#: file/dd.rs:515
 msgid "invalid conv option"
 msgstr ""
 
-#: sccs/admin.rs:352
+#: print/lp.rs:83
+msgid "invalid destination URI"
+msgstr ""
+
+#: print/lp.rs:79
+msgid "invalid destination URI (must be ipp://...)"
+msgstr ""
+
+#: sccs/admin.rs:339
 msgid "invalid flag"
 msgstr ""
 
-#: sys/ipcrm.rs:88 sys/ipcrm.rs:121 sys/ipcrm.rs:153
+#: sys/ipcrm.rs:92 sys/ipcrm.rs:125 sys/ipcrm.rs:157
 msgid "invalid key: IPC_PRIVATE"
 msgstr ""
 
-#: file/dd.rs:351 file/dd.rs:377
+#: file/dd.rs:582 file/dd.rs:610
 msgid "invalid option"
+msgstr ""
+
+#: sys/getconf.rs:746
+msgid "invalid specification"
+msgstr ""
+
+#: screen/tabs.rs:125
+msgid "invalid tab stop specification"
 msgstr ""
 
 #: make/src/error_code.rs:80
 msgid "io error"
 msgstr ""
 
-#: sys/ipcrm.rs:34
+#: sys/ipcrm.rs:38
 msgid ""
 "ipcrm - remove an XSI message queue, semaphore set, or shared memory segment "
 "identifier"
@@ -1166,7 +3291,11 @@ msgstr ""
 msgid "ipcs - report XSI interprocess communication facilities status"
 msgstr ""
 
-#: tree/rm.rs:254
+#: users/write.rs:67
+msgid "is logged on more than one terminal, writing to"
+msgstr ""
+
+#: tree/rm.rs:250
 msgid "it is dangerous to operate recursively on '/'"
 msgstr ""
 
@@ -1174,12 +3303,32 @@ msgstr ""
 msgid "join - relational database operator"
 msgstr ""
 
+#: dev/lex/main.rs:29
+msgid "lex - generate programs for lexical tasks (POSIX compatible)"
+msgstr ""
+
 #: tree/link.rs:16
 msgid "link - call link function"
 msgstr ""
 
+#: cron/crontab.rs:23
+msgid "list user's crontab"
+msgstr ""
+
 #: tree/ln.rs:17
 msgid "ln - link files"
+msgstr ""
+
+#: i18n/locale.rs:27
+msgid "locale - get locale-specific information"
+msgstr ""
+
+#: i18n/localedef.rs:27
+msgid "localedef - define locale environment"
+msgstr ""
+
+#: print/lp.rs:23
+msgid "lp - send files to a printer"
 msgstr ""
 
 #: tree/ls.rs:29
@@ -1206,15 +3355,15 @@ msgstr ""
 msgid "mesg - permit or deny messages"
 msgstr ""
 
-#: sys/ipcrm.rs:273 sys/ipcrm.rs:294
+#: sys/ipcrm.rs:277 sys/ipcrm.rs:298
 msgid "message queue id"
 msgstr ""
 
-#: sys/ipcrm.rs:254 sys/ipcrm.rs:261 sys/ipcrm.rs:285
+#: sys/ipcrm.rs:258 sys/ipcrm.rs:265 sys/ipcrm.rs:289
 msgid "message queue key"
 msgstr ""
 
-#: sys/ipcrm.rs:287 sys/ipcrm.rs:296
+#: sys/ipcrm.rs:291 sys/ipcrm.rs:300
 msgid "message queues not supported on this system"
 msgstr ""
 
@@ -1238,7 +3387,7 @@ msgstr ""
 msgid "mkfifo - make FIFO special files"
 msgstr ""
 
-#: datetime/cal.rs:126
+#: datetime/cal.rs:236
 msgid "month must be between 1 and 12"
 msgstr ""
 
@@ -1246,8 +3395,20 @@ msgstr ""
 msgid "more - display files on a page-by-page basis"
 msgstr ""
 
+#: i18n/msgfmt.rs:29
+msgid "msgfmt - compile message catalog to binary format"
+msgstr ""
+
 #: tree/mv.rs:28
 msgid "mv - move files"
+msgstr ""
+
+#: users/newgrp.rs:47
+msgid "newgrp  change to a new group"
+msgstr ""
+
+#: i18n/ngettext.rs:25
+msgid "ngettext - translate message and choose plural form"
 msgstr ""
 
 #: process/nice.rs:20
@@ -1262,7 +3423,11 @@ msgstr ""
 msgid "nm - write the name list of an object file"
 msgstr ""
 
-#: i18n/xgettext.rs:268
+#: print/lp.rs:72
+msgid "no destination specified"
+msgstr ""
+
+#: i18n/xgettext.rs:1025
 msgid "no input file given"
 msgstr ""
 
@@ -1274,6 +3439,10 @@ msgstr ""
 msgid "no rule"
 msgstr ""
 
+#: screen/tabs.rs:149
+msgid "no tab stops specified"
+msgstr ""
+
 #: make/src/error_code.rs:84
 msgid "no target"
 msgstr ""
@@ -1282,15 +3451,15 @@ msgstr ""
 msgid "no targets to execute"
 msgstr ""
 
-#: sccs/delta.rs:417 sccs/get.rs:392
+#: sccs/delta.rs:411 sccs/get.rs:382
 msgid "not an SCCS file"
 msgstr ""
 
-#: display/printf.rs:1204
+#: display/printf.rs:1212
 msgid "not enough arguments"
 msgstr ""
 
-#: tree/ls.rs:1249
+#: tree/ls.rs:1186
 msgid "not listing already-listed directory"
 msgstr ""
 
@@ -1318,11 +3487,11 @@ msgstr ""
 msgid "pathchk - check pathnames"
 msgstr ""
 
-#: pax/main.rs:59
+#: pax/main.rs:61
 msgid "pax - portable archive interchange"
 msgstr ""
 
-#: cc/main.rs:42
+#: cc/main.rs:45
 msgid "pcc - compile standard C programs"
 msgstr ""
 
@@ -1330,12 +3499,24 @@ msgstr ""
 msgid "pr - print files"
 msgstr ""
 
-#: sys/ps.rs:33
+#: print/lp.rs:168 print/lp.rs:175
+msgid "printer error"
+msgstr ""
+
+#: sccs/prs.rs:23
+msgid "prs - print SCCS file information"
+msgstr ""
+
+#: sys/ps.rs:91
 msgid "ps - report process status"
 msgstr ""
 
 #: users/pwd.rs:22
 msgid "pwd - return working directory name"
+msgstr ""
+
+#: file/dd.rs:428
+msgid "read error"
 msgstr ""
 
 #: tree/readlink.rs:21
@@ -1374,19 +3555,19 @@ msgstr ""
 msgid "sed - stream editor"
 msgstr ""
 
-#: sys/ipcrm.rs:212
+#: sys/ipcrm.rs:216
 msgid "semaphore id"
 msgstr ""
 
-#: sys/ipcrm.rs:193 sys/ipcrm.rs:200
+#: sys/ipcrm.rs:197 sys/ipcrm.rs:204
 msgid "semaphore key"
 msgstr ""
 
-#: sys/ipcrm.rs:241
+#: sys/ipcrm.rs:245
 msgid "shared memory id"
 msgstr ""
 
-#: sys/ipcrm.rs:222 sys/ipcrm.rs:229
+#: sys/ipcrm.rs:226 sys/ipcrm.rs:233
 msgid "shared memory key"
 msgstr ""
 
@@ -1406,7 +3587,7 @@ msgstr ""
 msgid "split - split a file into pieces"
 msgstr ""
 
-#: dev/strings.rs:43
+#: dev/strings.rs:40
 msgid "strings - find printable strings in files"
 msgstr ""
 
@@ -1414,7 +3595,7 @@ msgstr ""
 msgid "strip - remove unnecessary information from strippable files"
 msgstr ""
 
-#: screen/stty.rs:29
+#: screen/stty.rs:35
 msgid "stty - set the options for a terminal"
 msgstr ""
 
@@ -1422,7 +3603,23 @@ msgstr ""
 msgid "syntax error"
 msgstr ""
 
-#: screen/tabs.rs:25
+#: screen/tabs.rs:128
+msgid "tab stop must be positive"
+msgstr ""
+
+#: screen/tabs.rs:134
+msgid "tab stop value overflow"
+msgstr ""
+
+#: screen/tabs.rs:141
+msgid "tab stops must be in strictly ascending order"
+msgstr ""
+
+#: screen/tabs.rs:319 screen/tabs.rs:331 screen/tabs.rs:344 screen/tabs.rs:351
+msgid "tabs"
+msgstr ""
+
+#: screen/tabs.rs:36
 msgid "tabs - set terminal tabs"
 msgstr ""
 
@@ -1430,8 +3627,12 @@ msgstr ""
 msgid "tail - copy the last part of a file"
 msgstr ""
 
-#: users/talk.rs:39
+#: users/talk.rs:41
 msgid "talk - talk to another user"
+msgstr ""
+
+#: users/talkd.rs:47
+msgid "talkd - local talk daemon"
 msgstr ""
 
 #: make/src/error_code.rs:65
@@ -1440,6 +3641,10 @@ msgstr ""
 
 #: file/tee.rs:18
 msgid "tee - duplicate standard input"
+msgstr ""
+
+#: screen/tabs.rs:254
+msgid "terminal does not support setting tab stops"
 msgstr ""
 
 #: make/src/error_code.rs:76
@@ -1466,7 +3671,7 @@ msgstr ""
 msgid "timeout - execute a utility with a time limit"
 msgstr ""
 
-#: tree/ls.rs:738
+#: tree/ls.rs:674
 msgid "total"
 msgstr ""
 
@@ -1478,7 +3683,7 @@ msgstr ""
 msgid "touch - change file access and modification times"
 msgstr ""
 
-#: screen/tput.rs:21
+#: screen/tput.rs:26
 msgid "tput - change terminal characteristics"
 msgstr ""
 
@@ -1490,6 +3695,18 @@ msgstr ""
 msgid "tsort - topological sort"
 msgstr ""
 
+#: text/tsort.rs:140
+msgid "tsort: cycle in data"
+msgstr ""
+
+#: text/tsort.rs:127
+msgid "tsort: odd number of tokens"
+msgstr ""
+
+#: users/tty.rs:17
+msgid "tty - return user's terminal name"
+msgstr ""
+
 #: sys/uname.rs:15
 msgid "uname - return system name"
 msgstr ""
@@ -1498,7 +3715,7 @@ msgstr ""
 msgid "unary operator expected"
 msgstr ""
 
-#: xform/uncompress.rs:23
+#: xform/uncompress.rs:22
 msgid "uncompress - expand compressed data"
 msgstr ""
 
@@ -1510,6 +3727,10 @@ msgstr ""
 msgid "unexpected argument"
 msgstr ""
 
+#: sccs/unget.rs:23
+msgid "unget - undo a previous get of an SCCS file"
+msgstr ""
+
 #: text/uniq.rs:9
 msgid "uniq - report or filter out repeated lines in a file"
 msgstr ""
@@ -1518,20 +3739,20 @@ msgstr ""
 msgid "unknown operator"
 msgstr ""
 
+#: screen/tabs.rs:320
+msgid "unknown terminal type"
+msgstr ""
+
 #: tree/unlink.rs:16
 msgid "unlink - call the unlink function"
 msgstr ""
 
-#: sys/getconf.rs:62 sys/getconf.rs:98 sys/getconf.rs:110 sys/getconf.rs:167
+#: sys/getconf.rs:61 sys/getconf.rs:98 sys/getconf.rs:155
 msgid "unrecognized variable"
 msgstr ""
 
-#: i18n/xgettext.rs:282
+#: i18n/xgettext.rs:1080
 msgid "unsupported file type"
-msgstr ""
-
-#: sys/getconf.rs:524
-msgid "unsupported specification"
 msgstr ""
 
 #: uucp/uucp.rs:28
@@ -1554,6 +3775,10 @@ msgstr ""
 msgid "uux - remote command execution"
 msgstr ""
 
+#: sccs/val.rs:31
+msgid "val - validate SCCS files"
+msgstr ""
+
 #: text/wc.rs:24
 msgid "wc - word, line, and byte or character count"
 msgstr ""
@@ -1562,33 +3787,25 @@ msgstr ""
 msgid "what - identify SCCS files"
 msgstr ""
 
-#: sys/who.rs:23
+#: sys/who.rs:20
 msgid "who - display who is on the system"
 msgstr ""
 
-#: sys/who.rs:301
-msgid "who: -f option not yet implemented"
-msgstr ""
-
-#: users/write.rs:28
+#: users/write.rs:33
 msgid "write - write to another user"
 msgstr ""
 
-#: process/xargs.rs:37
+#: process/xargs.rs:43
 msgid "xargs - construct argument lists and invoke utility"
 msgstr ""
 
-#: i18n/xgettext.rs:29
+#: i18n/xgettext.rs:36
 msgid ""
 "xgettext - extract gettext call strings from C-language source files "
 "(DEVELOPMENT)"
 msgstr ""
 
-#: datetime/cal.rs:117
-msgid "year must be between 1 and 9999"
-msgstr ""
-
-#: datetime/time.rs:23 i18n/xgettext.rs:30
+#: datetime/time.rs:23 i18n/xgettext.rs:37
 msgid ""
 "{about}\n"
 "\n"
@@ -1599,4 +3816,9 @@ msgid ""
 "\n"
 "Options:\n"
 "{options}"
+msgstr ""
+
+#: i18n/gettext_lib/catalog.rs:249
+msgctxt "menu"
+msgid "File"
 msgstr ""

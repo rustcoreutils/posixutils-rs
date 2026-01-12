@@ -316,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build NFA from rules using Thompson's construction
     // This version properly tracks main pattern end states for trailing context
-    let nfa = Nfa::from_rules_with_trailing_context(&nfa_rules)?;
+    let nfa = Nfa::from_rules(&nfa_rules)?;
 
     // Convert NFA to DFA using subset construction
     let dfa = Dfa::from_nfa(&nfa);
@@ -386,7 +386,10 @@ mod tests {
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
         assert_eq!(rules.len(), 1);
 
-        let nfa_rules: Vec<(Hir, usize)> = rules.iter().map(|r| (r.hir.clone(), r.index)).collect();
+        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+            .iter()
+            .map(|r| (r.hir.clone(), None, r.index))
+            .collect();
         let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
         assert!(!nfa.states.is_empty());
 
@@ -408,7 +411,10 @@ mod tests {
         assert_eq!(lexinfo.rules.len(), 3);
 
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
-        let nfa_rules: Vec<(Hir, usize)> = rules.iter().map(|r| (r.hir.clone(), r.index)).collect();
+        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+            .iter()
+            .map(|r| (r.hir.clone(), None, r.index))
+            .collect();
         let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
         let minimized = dfa.minimize();
@@ -428,7 +434,10 @@ mod tests {
 
         let lexinfo = lexfile::parse(&input).expect("Failed to parse");
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
-        let nfa_rules: Vec<(Hir, usize)> = rules.iter().map(|r| (r.hir.clone(), r.index)).collect();
+        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+            .iter()
+            .map(|r| (r.hir.clone(), None, r.index))
+            .collect();
         let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
 

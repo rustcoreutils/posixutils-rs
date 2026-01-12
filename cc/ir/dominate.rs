@@ -16,6 +16,9 @@
 use super::{BasicBlockId, Function};
 use std::collections::{HashMap, HashSet};
 
+const DEFAULT_POSTORDER_CAPACITY: usize = 16;
+const DEFAULT_IDF_CAPACITY: usize = 8;
+
 // ============================================================================
 // Reverse Postorder Computation
 // ============================================================================
@@ -24,8 +27,8 @@ use std::collections::{HashMap, HashSet};
 /// Returns a vector of block IDs in reverse postorder, and updates each block
 /// with its postorder number (stored temporarily in dom_level for now).
 fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
-    let mut visited = HashSet::new();
-    let mut postorder = Vec::new();
+    let mut visited = HashSet::with_capacity(DEFAULT_POSTORDER_CAPACITY);
+    let mut postorder = Vec::with_capacity(DEFAULT_POSTORDER_CAPACITY);
 
     fn dfs(
         func: &Function,
@@ -50,7 +53,7 @@ fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
     dfs(func, func.entry, &mut visited, &mut postorder);
 
     // Assign postorder numbers
-    let mut postorder_map = HashMap::new();
+    let mut postorder_map = HashMap::with_capacity(postorder.len());
     for (i, &bb_id) in postorder.iter().enumerate() {
         postorder_map.insert(bb_id, i as u32);
     }
@@ -93,7 +96,7 @@ pub fn domtree_build(func: &mut Function) {
     }
 
     // Create postorder number lookup
-    let mut postorder_nr: HashMap<BasicBlockId, usize> = HashMap::new();
+    let mut postorder_nr: HashMap<BasicBlockId, usize> = HashMap::with_capacity(size);
     for (i, &bb_id) in rpo.iter().rev().enumerate() {
         postorder_nr.insert(bb_id, i);
     }
@@ -173,7 +176,7 @@ pub fn domtree_build(func: &mut Function) {
     }
 
     // Create reverse mapping: postorder_nr -> BasicBlockId
-    let mut nr_to_bb: HashMap<usize, BasicBlockId> = HashMap::new();
+    let mut nr_to_bb: HashMap<usize, BasicBlockId> = HashMap::with_capacity(size);
     for (&bb_id, &nr) in &postorder_nr {
         nr_to_bb.insert(nr, bb_id);
     }
@@ -360,10 +363,10 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
         return Vec::new();
     }
 
-    let mut visited = HashSet::new();
-    let mut in_idf = HashSet::new();
+    let mut visited = HashSet::with_capacity(DEFAULT_IDF_CAPACITY);
+    let mut in_idf = HashSet::with_capacity(DEFAULT_IDF_CAPACITY);
     let mut in_alpha: HashSet<BasicBlockId> = alpha.iter().copied().collect();
-    let mut idf = Vec::new();
+    let mut idf = Vec::with_capacity(DEFAULT_IDF_CAPACITY);
 
     let mut queue = LevelQueue::new(func.max_dom_level);
 

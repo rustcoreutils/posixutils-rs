@@ -136,7 +136,27 @@ pub struct Editor {
 
 impl Editor {
     /// Create a new editor.
-    pub fn new() -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `ex_mode` - If true, start in ex (line-oriented) mode
+    /// * `silent` - If true, suppress prompts and informational messages
+    pub fn new(ex_mode: bool, silent: bool) -> Result<Self> {
+        let mut editor = if ex_mode && silent {
+            // Ex silent mode - no terminal needed, use headless-like setup
+            Self::new_ex_silent()?
+        } else {
+            // Visual mode or Ex mode with terminal
+            Self::new_with_terminal()?
+        };
+
+        editor.ex_standalone_mode = ex_mode;
+        editor.silent_mode = silent;
+
+        Ok(editor)
+    }
+
+    /// Create an editor with terminal (internal helper).
+    fn new_with_terminal() -> Result<Self> {
         let terminal = Terminal::new()?;
         let size = terminal.size();
         let mut options = Options::default();
@@ -173,29 +193,6 @@ impl Editor {
             ex_standalone_mode: false,
             silent_mode: false,
         })
-    }
-
-    /// Create a new editor with specified mode options.
-    ///
-    /// # Arguments
-    /// * `ex_mode` - If true, start in ex (line-oriented) mode
-    /// * `silent` - If true, suppress prompts and informational messages
-    pub fn new_with_mode(ex_mode: bool, silent: bool) -> Result<Self> {
-        let mut editor = if ex_mode && !silent {
-            // Ex mode with terminal - still need terminal for potential visual switch
-            Self::new()?
-        } else if ex_mode && silent {
-            // Ex silent mode - no terminal needed, use headless-like setup
-            Self::new_ex_silent()?
-        } else {
-            // Visual mode
-            Self::new()?
-        };
-
-        editor.ex_standalone_mode = ex_mode;
-        editor.silent_mode = silent;
-
-        Ok(editor)
     }
 
     /// Create an editor for ex silent/batch mode (no terminal).
@@ -3329,7 +3326,7 @@ impl Editor {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self::new().expect("Failed to create editor")
+        Self::new(false, false).expect("Failed to create editor")
     }
 }
 

@@ -86,13 +86,12 @@ impl Aarch64CodeGen {
     /// - On macOS: external symbols always need GOT access (even without PIC)
     #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        let is_extern = self.extern_symbols.contains(name);
         // External symbols always need GOT access:
         // - On macOS: required for dynamic linking
         // - On Linux: required for PIE (default) and when linking with shared libs
         // - In PIC mode: always required
         // Using GOT unconditionally for external symbols is safe and matches GCC/Clang behavior
-        is_extern
+        self.extern_symbols.contains(name)
     }
 
     /// Compute the actual FP-relative offset for a stack location.

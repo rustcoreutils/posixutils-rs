@@ -113,7 +113,9 @@ fn test_rm_cycle() {
     fs::create_dir_all(a_b).unwrap();
     fs::File::create(a_b_file).unwrap();
 
-    let ug_w = libc::S_IWUSR | libc::S_IWGRP;
+    // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+    #[allow(clippy::unnecessary_cast)]
+    let ug_w = libc::S_IWUSR as u32 | libc::S_IWGRP as u32;
     let mode = fs::metadata(a_b).unwrap().mode();
     fs::set_permissions(a_b, fs::Permissions::from_mode(mode & !ug_w)).unwrap();
 
@@ -869,7 +871,9 @@ fn test_rm_rm3() {
     }
     for path in [fu, du, empty_u] {
         let mode = fs::metadata(path).unwrap().mode();
-        let write = libc::S_IWUSR;
+        // Cast needed: libc mode constants are u16 on macOS, u32 on Linux
+        #[allow(clippy::unnecessary_cast)]
+        let write = libc::S_IWUSR as u32;
         fs::set_permissions(path, fs::Permissions::from_mode(mode & !write)).unwrap();
     }
 

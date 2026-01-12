@@ -9,6 +9,7 @@
 // pcc - A POSIX C99 compiler
 //
 
+mod abi;
 mod arch;
 mod builtin_headers;
 mod diag;

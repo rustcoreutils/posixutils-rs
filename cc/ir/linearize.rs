@@ -12,9 +12,10 @@
 
 use super::ssa::ssa_convert;
 use super::{
-    AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
-    Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer,
+    Instruction, Module, Opcode, Pseudo, PseudoId,
 };
+use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
@@ -117,6 +118,8 @@ pub struct Linearizer<'a> {
     current_func_is_non_static_inline: bool,
     /// Set of file-scope static variable names (for inline semantic checks)
     file_scope_statics: std::collections::HashSet<String>,
+    /// Calling convention of the current function being linearized
+    current_calling_conv: CallingConv,
 }
 
 impl<'a> Linearizer<'a> {
@@ -155,6 +158,7 @@ impl<'a> Linearizer<'a> {
             file_scope_statics: std::collections::HashSet::with_capacity(
                 DEFAULT_FILE_SCOPE_CAPACITY,
             ),
+            current_calling_conv: CallingConv::default(),
         }
     }
 
@@ -869,6 +873,9 @@ impl<'a> Linearizer<'a> {
         // C99 6.7.4: non-static inline functions have restrictions on
         // static variables they can access
         self.current_func_is_non_static_inline = is_inline && !is_static;
+
+        // Store calling convention from function attributes (e.g., __attribute__((sysv_abi)))
+        self.current_calling_conv = func.calling_conv;
 
         let mut ir_func = Function::new(self.str(func.name), func.return_type);
         // For linkage:
@@ -3639,6 +3646,17 @@ impl<'a> Linearizer<'a> {
             arg_vals.push(arg_val);
         }
 
+        // Compute ABI classification for parameters and return value.
+        // This provides rich metadata for the backend to generate correct calling code.
+        // Use the current function's calling convention (which may be overridden via attributes)
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types_vec
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(typ, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
         if returns_large_struct {
             // For large struct returns, the return value is the address
             // stored in result_sym (which is a local symbol containing the struct)
@@ -3672,6 +3690,7 @@ impl<'a> Linearizer<'a> {
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_sret_call = true;
             call_insn.is_noreturn_call = is_noreturn_call;
+            call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // Return the symbol (address) where struct is stored
             result_sym
@@ -3701,6 +3720,7 @@ impl<'a> Linearizer<'a> {
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.is_two_reg_return = returns_two_reg_struct;
+            call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             result_sym
         }

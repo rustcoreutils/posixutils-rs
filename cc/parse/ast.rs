@@ -787,6 +787,8 @@ pub struct FunctionDef {
     pub is_static: bool,
     /// Whether function is inline
     pub is_inline: bool,
+    /// Calling convention override (from __attribute__((sysv_abi)) etc.)
+    pub calling_conv: crate::abi::CallingConv,
 }
 
 // ============================================================================

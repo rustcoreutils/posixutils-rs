@@ -12,13 +12,14 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
+use crate::abi::{get_abi, ArgClass, RegClass};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -510,17 +511,164 @@ impl X86_64CodeGen {
     fn emit_ret(&mut self, insn: &Instruction, types: &TypeTable) {
         // Move return value to appropriate register if present
         // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
-        // Two-register struct returns (9-16 bytes) go in RAX+RDX
+        // Struct returns depend on ABI classification (SSE for all-float structs)
         if let Some(src) = insn.src.first() {
             let src_loc = self.get_location(*src);
             let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
             let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
                 || insn.typ.is_some_and(|t| types.is_float(t));
+
+            // Check if return type is a struct/union
+            let ret_typ = insn.typ;
+            let is_struct_or_union = ret_typ.is_some_and(|t| {
+                let kind = types.kind(t);
+                kind == TypeKind::Struct || kind == TypeKind::Union
+            });
+
             if insn.is_two_reg_return {
-                // Two-register struct return: src[0] -> RAX, src[1] -> RDX
-                self.emit_move(*src, Reg::Rax, 64);
-                if let Some(&src2) = insn.src.get(1) {
-                    self.emit_move(src2, Reg::Rdx, 64);
+                // Two-register struct return: check ABI for SSE vs INTEGER
+                if is_struct_or_union {
+                    if let Some(typ) = ret_typ {
+                        let abi = get_abi(&self.base.target);
+                        if let ArgClass::Direct { classes, .. } = abi.classify_return(typ, types) {
+                            // Handle mixed SSE+INTEGER returns per ABI classification
+                            // Each SSE class uses XMM0, XMM1; each INTEGER uses RAX, RDX
+                            let mut xmm_idx = 0;
+                            let mut gp_idx = 0;
+                            let srcs = [Some(*src), insn.src.get(1).copied()];
+
+                            for (i, &class) in classes.iter().enumerate() {
+                                if let Some(s) = srcs.get(i).copied().flatten() {
+                                    match class {
+                                        RegClass::Sse => {
+                                            let xmm = if xmm_idx == 0 {
+                                                XmmReg::Xmm0
+                                            } else {
+                                                XmmReg::Xmm1
+                                            };
+                                            self.emit_fp_move(s, xmm, 64);
+                                            xmm_idx += 1;
+                                        }
+                                        RegClass::Integer => {
+                                            let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
+                                            self.emit_move(s, gp, 64);
+                                            gp_idx += 1;
+                                        }
+                                        _ => {
+                                            // NoClass, Memory - shouldn't happen for Direct
+                                            let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
+                                            self.emit_move(s, gp, 64);
+                                            gp_idx += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            self.emit_move(*src, Reg::Rax, 64);
+                            if let Some(&src2) = insn.src.get(1) {
+                                self.emit_move(src2, Reg::Rdx, 64);
+                            }
+                        }
+                    } else {
+                        self.emit_move(*src, Reg::Rax, 64);
+                        if let Some(&src2) = insn.src.get(1) {
+                            self.emit_move(src2, Reg::Rdx, 64);
+                        }
+                    }
+                } else {
+                    self.emit_move(*src, Reg::Rax, 64);
+                    if let Some(&src2) = insn.src.get(1) {
+                        self.emit_move(src2, Reg::Rdx, 64);
+                    }
+                }
+            } else if is_struct_or_union && !is_complex {
+                // Single-register struct return: use ABI classification
+                if let Some(typ) = ret_typ {
+                    let abi = get_abi(&self.base.target);
+                    if let ArgClass::Direct { classes, size_bits } = abi.classify_return(typ, types)
+                    {
+                        if classes.iter().all(|c| *c == RegClass::Sse) {
+                            if classes.len() == 2 {
+                                // Two SSE regs for 9-16 byte float struct
+                                match src_loc {
+                                    Loc::Stack(offset) => {
+                                        let adjusted = offset + self.callee_saved_offset;
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                        });
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted + 8,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm1),
+                                        });
+                                    }
+                                    Loc::Reg(r) => {
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: r,
+                                                offset: 0,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                        });
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: r,
+                                                offset: 8,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm1),
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // Single SSE reg for small float struct (<=8 bytes)
+                                let fp_size = if size_bits <= 32 {
+                                    FpSize::Single
+                                } else {
+                                    FpSize::Double
+                                };
+                                match src_loc {
+                                    Loc::Stack(offset) => {
+                                        let adjusted = offset + self.callee_saved_offset;
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: fp_size,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                        });
+                                    }
+                                    Loc::Reg(r) => {
+                                        // GP reg contains struct value, move to XMM
+                                        self.push_lir(X86Inst::MovGpXmm {
+                                            size: OperandSize::B64,
+                                            src: r,
+                                            dst: XmmReg::Xmm0,
+                                        });
+                                    }
+                                    _ => self.emit_move(*src, Reg::Rax, insn.size),
+                                }
+                            }
+                        } else {
+                            // INTEGER class - return in RAX
+                            self.emit_move(*src, Reg::Rax, insn.size);
+                        }
+                    } else {
+                        self.emit_move(*src, Reg::Rax, insn.size);
+                    }
+                } else {
+                    self.emit_move(*src, Reg::Rax, insn.size);
                 }
             } else if is_complex {
                 // Complex return value: load real into XMM0, imag into XMM1

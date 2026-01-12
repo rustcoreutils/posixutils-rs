@@ -22,6 +22,7 @@ pub mod linearize;
 pub mod lower;
 pub mod ssa;
 
+use crate::abi::ArgClass;
 use crate::diag::Position;
 use crate::types::TypeId;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,30 @@ const DEFAULT_PARAM_CAPACITY: usize = 8;
 const DEFAULT_BLOCK_CAPACITY: usize = 512;
 const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
 const DEFAULT_LOCAL_CAPACITY: usize = 64;
+
+// ============================================================================
+// Call ABI Information
+// ============================================================================
+
+/// ABI classification information for a function call.
+///
+/// This carries the argument and return value classifications from the
+/// frontend through the IR to the backend. It replaces the binary
+/// is_sret_call/is_two_reg_return flags with richer type information.
+#[derive(Debug, Clone)]
+pub struct CallAbiInfo {
+    /// Per-argument classification (parallel to src for Call instructions)
+    pub params: Vec<ArgClass>,
+    /// Return value classification
+    pub ret: ArgClass,
+}
+
+impl CallAbiInfo {
+    /// Create a new CallAbiInfo with the given classifications.
+    pub fn new(params: Vec<ArgClass>, ret: ArgClass) -> Self {
+        Self { params, ret }
+    }
+}
 
 // ============================================================================
 // Instruction Reference - for def-use chains
@@ -551,6 +576,10 @@ pub struct Instruction {
     pub pos: Option<Position>,
     /// For inline assembly: the asm data (template, operands, clobbers)
     pub asm_data: Option<Box<AsmData>>,
+    /// For calls: rich ABI classification for arguments and return value.
+    /// When present, this provides more detailed information than is_sret_call
+    /// and is_two_reg_return, including per-argument register class info.
+    pub abi_info: Option<Box<CallAbiInfo>>,
 }
 
 impl Default for Instruction {
@@ -577,6 +606,7 @@ impl Default for Instruction {
             indirect_target: None,
             pos: None,
             asm_data: None,
+            abi_info: None,
         }
     }
 }
@@ -1400,6 +1430,7 @@ impl fmt::Display for Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::{ArgClass, RegClass};
     use crate::types::{Type, TypeTable};
 
     #[test]
@@ -1510,7 +1541,7 @@ mod tests {
         let mut types = TypeTable::new(64);
         let char_ptr = types.intern(Type::pointer(types.char_id));
         let arg_types = vec![char_ptr, types.int_id];
-        let call = Instruction::call(
+        let mut call = Instruction::call(
             Some(PseudoId(1)),
             "printf",
             vec![PseudoId(2), PseudoId(3)],
@@ -1518,10 +1549,28 @@ mod tests {
             types.int_id,
             32,
         );
+        // Add abi_info (required for codegen)
+        call.abi_info = Some(Box::new(CallAbiInfo::new(
+            vec![
+                ArgClass::Direct {
+                    classes: vec![RegClass::Integer],
+                    size_bits: 64,
+                },
+                ArgClass::Direct {
+                    classes: vec![RegClass::Integer],
+                    size_bits: 32,
+                },
+            ],
+            ArgClass::Direct {
+                classes: vec![RegClass::Integer],
+                size_bits: 32,
+            },
+        )));
         assert_eq!(call.op, Opcode::Call);
         assert_eq!(call.func_name, Some("printf".to_string()));
         assert_eq!(call.src.len(), 2);
         assert_eq!(call.arg_types.len(), 2);
+        assert!(call.abi_info.is_some());
     }
 
     #[test]

@@ -102,6 +102,7 @@ fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDe
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     }
 }
 
@@ -133,6 +134,7 @@ fn test_parameter_stored_to_local() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -185,6 +187,7 @@ fn test_function_with_many_params() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -247,6 +250,7 @@ fn test_compound_assignment_deref() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -321,6 +325,7 @@ fn test_compound_assignment_index() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -389,6 +394,7 @@ fn test_simple_array_element_store() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -484,6 +490,7 @@ fn test_nested_if_cfg_linking() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -554,6 +561,7 @@ fn test_switch_basic() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -628,6 +636,7 @@ fn test_switch_with_break() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -703,6 +712,7 @@ fn test_do_while_basic() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -786,6 +796,7 @@ fn test_do_while_with_break() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -859,6 +870,7 @@ fn test_goto_forward() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -933,6 +945,7 @@ fn test_goto_backward() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1008,6 +1021,7 @@ fn test_nested_loop_break() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1093,6 +1107,7 @@ fn test_nested_loop_continue() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1151,6 +1166,7 @@ fn test_unary_logical_not() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1195,6 +1211,7 @@ fn test_unary_bitwise_not() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1239,6 +1256,7 @@ fn test_unary_negate() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1283,6 +1301,7 @@ fn test_pre_increment() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1339,6 +1358,7 @@ fn test_pointer_add_int() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1401,6 +1421,7 @@ fn test_pointer_difference() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1462,6 +1483,7 @@ fn test_float_add() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1513,6 +1535,7 @@ fn test_float_comparison() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1558,6 +1581,7 @@ fn test_float_to_int_cast() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1603,6 +1627,7 @@ fn test_int_to_float_cast() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1800,6 +1825,7 @@ fn test_linearize_function_with_params() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1996,6 +2022,7 @@ fn test_local_var_emits_load_store() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2062,6 +2089,7 @@ fn test_ssa_converts_local_to_phi() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2122,6 +2150,7 @@ fn test_ssa_loop_variable() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2169,6 +2198,7 @@ fn test_short_circuit_and() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2226,6 +2256,7 @@ fn test_short_circuit_or() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2294,6 +2325,7 @@ fn test_ternary_pure_uses_select() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2367,6 +2399,7 @@ fn test_ternary_impure_uses_phi() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2452,6 +2485,7 @@ fn test_ternary_with_assignment_uses_phi() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2522,6 +2556,7 @@ fn test_ternary_with_post_increment_uses_phi() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2581,6 +2616,7 @@ fn test_string_literal_char_array_init() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2629,6 +2665,7 @@ fn test_string_literal_char_pointer_init() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2781,6 +2818,7 @@ fn test_incomplete_struct_type_resolution() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2863,6 +2901,7 @@ fn test_static_local_pre_increment() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -2935,6 +2974,7 @@ fn test_static_local_pre_decrement() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3000,6 +3040,7 @@ fn test_static_local_post_increment() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3065,6 +3106,7 @@ fn test_static_local_post_decrement() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3138,6 +3180,7 @@ fn test_static_local_compound_assignment() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3191,6 +3234,7 @@ fn test_wide_string_literal_expression() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3254,6 +3298,7 @@ fn test_wide_string_literal_is_pure() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3295,6 +3340,7 @@ fn test_gcc_function_identifier() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3334,6 +3380,7 @@ fn test_gcc_pretty_function_identifier() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3424,6 +3471,7 @@ fn test_static_local_address_in_initializer() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {
@@ -3512,6 +3560,7 @@ fn test_struct_deref_returns_address() {
         pos: test_pos(),
         is_static: false,
         is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
     };
 
     let tu = TranslationUnit {

@@ -167,6 +167,31 @@ impl AttributeList {
             .iter()
             .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
     }
+
+    /// Check if this attribute list contains sysv_abi attribute
+    pub fn has_sysv_abi(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "sysv_abi" || a.name == "__sysv_abi__")
+    }
+
+    /// Check if this attribute list contains ms_abi attribute
+    pub fn has_ms_abi(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "ms_abi" || a.name == "__ms_abi__")
+    }
+
+    /// Get the calling convention from attributes, if any
+    pub fn calling_conv(&self) -> Option<crate::abi::CallingConv> {
+        if self.has_sysv_abi() {
+            Some(crate::abi::CallingConv::SysV)
+        } else if self.has_ms_abi() {
+            Some(crate::abi::CallingConv::Win64)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for AttributeList {
@@ -4847,6 +4872,7 @@ impl Parser<'_> {
             pos: func_pos,
             is_static: false, // Test function, storage class not parsed
             is_inline: false,
+            calling_conv: crate::abi::CallingConv::default(),
         })
     }
 
@@ -5012,8 +5038,9 @@ impl Parser<'_> {
                     ));
                 }
 
-                // Skip any __attribute__ after declarator
-                self.skip_extensions();
+                // Parse any __attribute__ after declarator
+                let attrs = self.parse_attributes();
+                let calling_conv = attrs.calling_conv().unwrap_or_default();
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
@@ -5065,6 +5092,7 @@ impl Parser<'_> {
                         pos: decl_pos,
                         is_static,
                         is_inline,
+                        calling_conv,
                     }));
                 }
 
@@ -5184,8 +5212,9 @@ impl Parser<'_> {
                     ));
                 }
 
-                // Skip any __attribute__ after declarator
-                self.skip_extensions();
+                // Parse any __attribute__ after declarator
+                let attrs = self.parse_attributes();
+                let calling_conv = attrs.calling_conv().unwrap_or_default();
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
@@ -5236,6 +5265,7 @@ impl Parser<'_> {
                         pos: decl_pos,
                         is_static,
                         is_inline,
+                        calling_conv,
                     }));
                 }
 
@@ -5294,6 +5324,8 @@ impl Parser<'_> {
             let base_type = self.types.get(typ_id);
             let is_noreturn =
                 attrs.has_noreturn() || base_type.modifiers.contains(TypeModifiers::NORETURN);
+            // Extract calling convention from attributes
+            let calling_conv = attrs.calling_conv().unwrap_or_default();
 
             if self.is_special(b'{') {
                 // Function definition
@@ -5342,6 +5374,7 @@ impl Parser<'_> {
                     pos: decl_pos,
                     is_static,
                     is_inline,
+                    calling_conv,
                 }));
             } else {
                 // Function declaration

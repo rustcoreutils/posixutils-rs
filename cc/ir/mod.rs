@@ -22,6 +22,7 @@ pub mod linearize;
 pub mod lower;
 pub mod ssa;
 
+use crate::abi::ArgClass;
 use crate::diag::Position;
 use crate::types::TypeId;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,30 @@ const DEFAULT_PARAM_CAPACITY: usize = 8;
 const DEFAULT_BLOCK_CAPACITY: usize = 512;
 const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
 const DEFAULT_LOCAL_CAPACITY: usize = 64;
+
+// ============================================================================
+// Call ABI Information
+// ============================================================================
+
+/// ABI classification information for a function call.
+///
+/// This carries the argument and return value classifications from the
+/// frontend through the IR to the backend. It replaces the binary
+/// is_sret_call/is_two_reg_return flags with richer type information.
+#[derive(Debug, Clone)]
+pub struct CallAbiInfo {
+    /// Per-argument classification (parallel to src for Call instructions)
+    pub params: Vec<ArgClass>,
+    /// Return value classification
+    pub ret: ArgClass,
+}
+
+impl CallAbiInfo {
+    /// Create a new CallAbiInfo with the given classifications.
+    pub fn new(params: Vec<ArgClass>, ret: ArgClass) -> Self {
+        Self { params, ret }
+    }
+}
 
 // ============================================================================
 // Instruction Reference - for def-use chains
@@ -191,6 +216,30 @@ impl Opcode {
                 | Opcode::Switch
                 | Opcode::Unreachable
                 | Opcode::Longjmp
+        )
+    }
+
+    /// Check if this opcode has side effects (cannot be deleted even if unused).
+    /// These are "root" instructions for dead code elimination.
+    pub fn has_side_effects(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Ret
+                | Opcode::Br
+                | Opcode::Cbr
+                | Opcode::Switch
+                | Opcode::Unreachable
+                | Opcode::Store
+                | Opcode::Call
+                | Opcode::Entry
+                | Opcode::VaStart
+                | Opcode::VaEnd
+                | Opcode::VaCopy
+                | Opcode::VaArg
+                | Opcode::Alloca
+                | Opcode::Setjmp
+                | Opcode::Longjmp
+                | Opcode::Asm
         )
     }
 
@@ -526,6 +575,8 @@ pub struct Instruction {
     pub size: u32,
     /// Source size for extension/truncation operations
     pub src_size: u32,
+    /// Source type for conversion operations (interned TypeId)
+    pub src_typ: Option<TypeId>,
     /// For switch: case value to target block mapping
     pub switch_cases: Vec<(i64, BasicBlockId)>,
     /// For switch: default block (if no case matches)
@@ -551,6 +602,10 @@ pub struct Instruction {
     pub pos: Option<Position>,
     /// For inline assembly: the asm data (template, operands, clobbers)
     pub asm_data: Option<Box<AsmData>>,
+    /// For calls: rich ABI classification for arguments and return value.
+    /// When present, this provides more detailed information than is_sret_call
+    /// and is_two_reg_return, including per-argument register class info.
+    pub abi_info: Option<Box<CallAbiInfo>>,
 }
 
 impl Default for Instruction {
@@ -567,6 +622,7 @@ impl Default for Instruction {
             func_name: None,
             size: 0,
             src_size: 0,
+            src_typ: None,
             switch_cases: Vec::new(),
             switch_default: None,
             arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
@@ -577,6 +633,7 @@ impl Default for Instruction {
             indirect_target: None,
             pos: None,
             asm_data: None,
+            abi_info: None,
         }
     }
 }
@@ -1011,6 +1068,21 @@ impl BasicBlock {
             self.children.push(child);
         }
     }
+
+    /// Remove edges to/from blocks not in the keep set
+    pub fn retain_edges(&mut self, keep: &std::collections::HashSet<BasicBlockId>) {
+        self.parents.retain(|p| keep.contains(p));
+        self.children.retain(|c| keep.contains(c));
+    }
+
+    /// Remove phi entries for a specific predecessor
+    pub fn remove_phi_predecessor(&mut self, pred: BasicBlockId) {
+        for insn in &mut self.insns {
+            if insn.op == Opcode::Phi {
+                insn.phi_list.retain(|(p, _)| *p != pred);
+            }
+        }
+    }
 }
 
 impl fmt::Display for BasicBlock {
@@ -1175,7 +1247,6 @@ impl Function {
     }
 
     /// Get a pseudo by its ID
-    #[cfg(test)]
     pub fn get_pseudo(&self, id: PseudoId) -> Option<&Pseudo> {
         self.pseudos.iter().find(|p| p.id == id)
     }
@@ -1400,6 +1471,8 @@ impl fmt::Display for Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::{ArgClass, RegClass};
+    use crate::target::Target;
     use crate::types::{Type, TypeTable};
 
     #[test]
@@ -1431,7 +1504,7 @@ mod tests {
 
     #[test]
     fn test_instruction_binop() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1447,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_instruction_display() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1477,7 +1550,7 @@ mod tests {
 
     #[test]
     fn test_function_display() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("main", types.int_id);
         func.add_param("argc", types.int_id);
 
@@ -1507,10 +1580,10 @@ mod tests {
 
     #[test]
     fn test_call_instruction() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let char_ptr = types.intern(Type::pointer(types.char_id));
         let arg_types = vec![char_ptr, types.int_id];
-        let call = Instruction::call(
+        let mut call = Instruction::call(
             Some(PseudoId(1)),
             "printf",
             vec![PseudoId(2), PseudoId(3)],
@@ -1518,15 +1591,33 @@ mod tests {
             types.int_id,
             32,
         );
+        // Add abi_info (required for codegen)
+        call.abi_info = Some(Box::new(CallAbiInfo::new(
+            vec![
+                ArgClass::Direct {
+                    classes: vec![RegClass::Integer],
+                    size_bits: 64,
+                },
+                ArgClass::Direct {
+                    classes: vec![RegClass::Integer],
+                    size_bits: 32,
+                },
+            ],
+            ArgClass::Direct {
+                classes: vec![RegClass::Integer],
+                size_bits: 32,
+            },
+        )));
         assert_eq!(call.op, Opcode::Call);
         assert_eq!(call.func_name, Some("printf".to_string()));
         assert_eq!(call.src.len(), 2);
         assert_eq!(call.arg_types.len(), 2);
+        assert!(call.abi_info.is_some());
     }
 
     #[test]
     fn test_load_store() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
 
         let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, 32);
         assert_eq!(load.op, Opcode::Load);
@@ -1539,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_module() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut module = Module::new();
 
         module.add_global("counter", types.int_id, Initializer::Int(0));

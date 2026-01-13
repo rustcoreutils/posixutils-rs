@@ -12,6 +12,7 @@
 // for use by other crates (cflow, ctags, cxref).
 //
 
+pub mod abi;
 pub mod arch;
 pub mod builtin_headers;
 pub mod diag;
@@ -19,6 +20,7 @@ pub mod ir;
 pub mod opt;
 pub mod os;
 pub mod parse;
+pub mod rtlib;
 pub mod strings;
 pub mod symbol;
 pub mod target;

@@ -23,7 +23,7 @@ use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGen
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -581,7 +581,8 @@ impl Aarch64CodeGen {
                                     if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
                                     {
                                         let actual_offset = self.stack_offset(total_frame, *offset);
-                                        let (fp_size, imag_offset) = complex_fp_info(types, *typ);
+                                        let (fp_size, imag_offset) =
+                                            complex_fp_info(types, &self.base.target, *typ);
                                         // Store real part from first FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
@@ -694,7 +695,8 @@ impl Aarch64CodeGen {
                     self.emit_move(src2, Reg::X1, 64, total_frame);
                 }
             } else if is_complex {
-                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+                let (fp_size, imag_offset) =
+                    complex_fp_info(types, &self.base.target, insn.typ.unwrap());
                 match src_loc {
                     Loc::Stack(offset) => {
                         let actual_offset = self.stack_offset(total_frame, offset);
@@ -741,7 +743,7 @@ impl Aarch64CodeGen {
                     _ => {}
                 }
             } else if is_fp {
-                self.emit_fp_move(src, VReg::V0, insn.size, total_frame);
+                self.emit_fp_move(src, VReg::V0, insn.typ, insn.size, total_frame, types);
             } else {
                 self.emit_move(src, Reg::X0, insn.size, total_frame);
             }
@@ -1083,15 +1085,18 @@ impl Aarch64CodeGen {
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
                                     // Load FP constant using integer register
+                                    // Use type to determine float vs double
+                                    let typ = insn.typ.expect("FP constant must have type");
+                                    let is_float = types.kind(typ) == TypeKind::Float;
                                     let (scratch0, _, _) = Reg::scratch_regs();
-                                    let bits = if insn.size <= 32 {
+                                    let bits = if is_float {
                                         (*f as f32).to_bits() as i64
                                     } else {
                                         f.to_bits() as i64
                                     };
                                     self.emit_mov_imm(scratch0, bits, 64);
                                     // LIR: fmov from GP to FP register
-                                    let fp_size = if insn.size <= 32 {
+                                    let fp_size = if is_float {
                                         FpSize::Single
                                     } else {
                                         FpSize::Double
@@ -1159,12 +1164,12 @@ impl Aarch64CodeGen {
 
             // Floating-point arithmetic operations
             Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
-                self.emit_fp_binop(insn, *total_frame);
+                self.emit_fp_binop(insn, *total_frame, types);
             }
 
             // Floating-point negation
             Opcode::FNeg => {
-                self.emit_fp_neg(insn, *total_frame);
+                self.emit_fp_neg(insn, *total_frame, types);
             }
 
             // Floating-point comparisons
@@ -1174,22 +1179,22 @@ impl Aarch64CodeGen {
             | Opcode::FCmpOLe
             | Opcode::FCmpOGt
             | Opcode::FCmpOGe => {
-                self.emit_fp_compare(insn, *total_frame);
+                self.emit_fp_compare(insn, *total_frame, types);
             }
 
             // Int to float conversions
             Opcode::UCvtF | Opcode::SCvtF => {
-                self.emit_int_to_float(insn, *total_frame);
+                self.emit_int_to_float(insn, *total_frame, types);
             }
 
             // Float to int conversions
             Opcode::FCvtU | Opcode::FCvtS => {
-                self.emit_float_to_int(insn, *total_frame);
+                self.emit_float_to_int(insn, *total_frame, types);
             }
 
             // Float to float conversions (size changes)
             Opcode::FCvtF => {
-                self.emit_float_to_float(insn, *total_frame);
+                self.emit_float_to_float(insn, *total_frame, types);
             }
 
             // ================================================================
@@ -1578,7 +1583,7 @@ impl Aarch64CodeGen {
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t)) || matches!(dst_loc, Loc::VReg(_));
 
         if is_fp {
-            self.emit_fp_load(insn, frame_size);
+            self.emit_fp_load(insn, frame_size, types);
             return;
         }
 
@@ -2006,10 +2011,10 @@ impl Aarch64CodeGen {
                 _ => VReg::V16, // Use scratch register
             };
 
-            self.emit_fp_move(src, dst_vreg, reg_size, frame_size);
+            self.emit_fp_move(src, dst_vreg, typ, reg_size, frame_size, types);
 
             if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-                self.emit_fp_move_to_loc(dst_vreg, &dst_loc, reg_size, frame_size);
+                self.emit_fp_move_to_loc(dst_vreg, &dst_loc, typ, reg_size, frame_size, types);
             }
         } else {
             // Integer copy

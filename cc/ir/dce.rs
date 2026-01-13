@@ -50,26 +50,9 @@ pub fn run(func: &mut Function) -> bool {
 // ============================================================================
 
 /// Check if an opcode is a "root" (has side effects, cannot be deleted).
+#[inline]
 fn is_root(op: Opcode) -> bool {
-    matches!(
-        op,
-        Opcode::Ret
-            | Opcode::Br
-            | Opcode::Cbr
-            | Opcode::Switch
-            | Opcode::Unreachable
-            | Opcode::Store
-            | Opcode::Call
-            | Opcode::Entry
-            | Opcode::VaStart
-            | Opcode::VaEnd
-            | Opcode::VaCopy
-            | Opcode::VaArg
-            | Opcode::Alloca
-            | Opcode::Setjmp  // Has side effects (saves context)
-            | Opcode::Longjmp // Never returns (noreturn)
-            | Opcode::Asm // Inline assembly has side effects
-    )
+    op.has_side_effects()
 }
 
 /// Get all pseudo IDs used by an instruction (operands).
@@ -298,24 +281,22 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
     let reachable = compute_reachable(func);
     let before = func.blocks.len();
 
-    // Compute unreachable set BEFORE removing blocks
-    let all_block_ids: HashSet<_> = func.blocks.iter().map(|bb| bb.id).collect();
-    let unreachable: HashSet<_> = all_block_ids.difference(&reachable).copied().collect();
+    // Collect unreachable predecessors before removing blocks
+    let unreachable: HashSet<_> = func
+        .blocks
+        .iter()
+        .map(|bb| bb.id)
+        .filter(|id| !reachable.contains(id))
+        .collect();
 
     // Remove unreachable blocks
     func.blocks.retain(|bb| reachable.contains(&bb.id));
 
-    // Update parent/child references to remove dead blocks
+    // Update parent/child references and phi nodes to remove dead blocks
     for bb in &mut func.blocks {
-        bb.parents.retain(|p| !unreachable.contains(p));
-        bb.children.retain(|c| !unreachable.contains(c));
-
-        // Also clean phi_list entries that reference removed blocks
-        for insn in &mut bb.insns {
-            if insn.op == Opcode::Phi {
-                insn.phi_list
-                    .retain(|(pred, _)| !unreachable.contains(pred));
-            }
+        bb.retain_edges(&reachable);
+        for &pred in &unreachable {
+            bb.remove_phi_predecessor(pred);
         }
     }
 
@@ -330,10 +311,11 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Instruction, Pseudo};
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_simple_func() -> Function {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -385,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_live_instruction_preserved() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -414,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_transitive_liveness() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -454,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_unreachable_block_removed() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         // Entry block
@@ -505,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_store_is_live() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -537,7 +519,7 @@ mod tests {
         // Test that get_uses() includes indirect_target for function pointer calls.
         // This prevents DCE from eliminating the instruction that computes
         // the function pointer before an indirect call.
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let call_insn = Instruction::call_indirect(
             Some(PseudoId(0)),                // return value target
             PseudoId(5),                      // func_addr (the function pointer)
@@ -562,7 +544,7 @@ mod tests {
     #[test]
     fn test_indirect_call_keeps_func_ptr_live() {
         // Full DCE test: verify an indirect call keeps its function pointer live.
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0)); // result

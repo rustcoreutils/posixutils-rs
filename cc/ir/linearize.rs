@@ -12,14 +12,16 @@
 
 use super::ssa::ssa_convert;
 use super::{
-    AsmConstraint, AsmData, BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module,
-    Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer,
+    Instruction, Module, Opcode, Pseudo, PseudoId,
 };
+use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
     ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
 };
+use crate::rtlib::RtlibNames;
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
@@ -117,6 +119,8 @@ pub struct Linearizer<'a> {
     current_func_is_non_static_inline: bool,
     /// Set of file-scope static variable names (for inline semantic checks)
     file_scope_statics: std::collections::HashSet<String>,
+    /// Calling convention of the current function being linearized
+    current_calling_conv: CallingConv,
 }
 
 impl<'a> Linearizer<'a> {
@@ -155,6 +159,7 @@ impl<'a> Linearizer<'a> {
             file_scope_statics: std::collections::HashSet::with_capacity(
                 DEFAULT_FILE_SCOPE_CAPACITY,
             ),
+            current_calling_conv: CallingConv::default(),
         }
     }
 
@@ -397,6 +402,7 @@ impl<'a> Linearizer<'a> {
 
             let mut insn = Instruction::binop(opcode, result, val, zero, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
 
             return result;
@@ -431,6 +437,7 @@ impl<'a> Linearizer<'a> {
 
             let mut insn = Instruction::unop(opcode, result, val, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
             return result;
         }
@@ -456,11 +463,13 @@ impl<'a> Linearizer<'a> {
             };
             let mut insn = Instruction::unop(opcode, result, val, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
         } else {
             // Truncating
             let mut insn = Instruction::unop(Opcode::Trunc, result, val, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
         }
 
@@ -869,6 +878,9 @@ impl<'a> Linearizer<'a> {
         // C99 6.7.4: non-static inline functions have restrictions on
         // static variables they can access
         self.current_func_is_non_static_inline = is_inline && !is_static;
+
+        // Store calling convention from function attributes (e.g., __attribute__((sysv_abi)))
+        self.current_calling_conv = func.calling_conv;
 
         let mut ir_func = Function::new(self.str(func.name), func.return_type);
         // For linkage:
@@ -2490,6 +2502,7 @@ impl<'a> Linearizer<'a> {
                         Instruction::new(Opcode::Copy)
                             .with_target(pseudo)
                             .with_src(*param_pseudo)
+                            .with_type(typ)
                             .with_size(size),
                     );
                 } else {
@@ -2540,6 +2553,7 @@ impl<'a> Linearizer<'a> {
                         Instruction::new(Opcode::Copy)
                             .with_target(out_pseudo)
                             .with_src(val)
+                            .with_type(typ)
                             .with_size(size),
                     );
                     out_pseudo
@@ -3110,6 +3124,83 @@ impl<'a> Linearizer<'a> {
         // Emit conversion if needed
         let src_is_float = self.types.is_float(src_type);
         let dst_is_float = self.types.is_float(cast_type);
+        let src_kind = self.types.kind(src_type);
+        let dst_kind = self.types.kind(cast_type);
+
+        // Check for long double conversions that need rtlib
+        let src_is_longdouble = src_kind == TypeKind::LongDouble;
+        let dst_is_longdouble = dst_kind == TypeKind::LongDouble;
+
+        if src_is_longdouble || dst_is_longdouble {
+            let rtlib = RtlibNames::new(self.target);
+
+            // Determine conversion suffixes based on types
+            // sf = float, df = double, xf/tf = long double, si = int32, di = int64
+            let ld_suffix = if self.target.arch == crate::target::Arch::X86_64 {
+                "xf"
+            } else {
+                "tf"
+            };
+
+            let (from_suffix, to_suffix) = if src_is_longdouble && dst_is_float {
+                // Long double -> float/double
+                let to = match dst_kind {
+                    TypeKind::Float => "sf",
+                    TypeKind::Double => "df",
+                    _ => "",
+                };
+                (ld_suffix, to)
+            } else if dst_is_longdouble && src_is_float {
+                // Float/double -> long double
+                let from = match src_kind {
+                    TypeKind::Float => "sf",
+                    TypeKind::Double => "df",
+                    _ => "",
+                };
+                (from, ld_suffix)
+            } else if src_is_longdouble && !dst_is_float {
+                // Long double -> integer
+                let dst_size = self.types.size_bits(cast_type);
+                let is_unsigned = self.types.is_unsigned(cast_type);
+                let to = if is_unsigned {
+                    if dst_size <= 32 {
+                        "usi"
+                    } else {
+                        "udi"
+                    }
+                } else if dst_size <= 32 {
+                    "si"
+                } else {
+                    "di"
+                };
+                (ld_suffix, to)
+            } else if dst_is_longdouble && !src_is_float {
+                // Integer -> long double
+                let src_size = self.types.size_bits(src_type);
+                let is_unsigned = self.types.is_unsigned(src_type);
+                let from = if is_unsigned {
+                    if src_size <= 32 {
+                        "usi"
+                    } else {
+                        "udi"
+                    }
+                } else if src_size <= 32 {
+                    "si"
+                } else {
+                    "di"
+                };
+                (from, ld_suffix)
+            } else {
+                ("", "")
+            };
+
+            if !from_suffix.is_empty() && !to_suffix.is_empty() {
+                if let Some(func_name) = rtlib.longdouble_convert(from_suffix, to_suffix) {
+                    return self.emit_longdouble_convert_call(func_name, src, src_type, cast_type);
+                }
+            }
+            // Fall through to native FP for macOS aarch64 (long double == double)
+        }
 
         if src_is_float && !dst_is_float {
             // Float to integer conversion
@@ -3129,6 +3220,7 @@ impl<'a> Linearizer<'a> {
                 .with_src(src)
                 .with_type(cast_type);
             insn.src_size = self.types.size_bits(src_type);
+            insn.src_typ = Some(src_type);
             self.emit(insn);
             result
         } else if !src_is_float && dst_is_float {
@@ -3150,6 +3242,7 @@ impl<'a> Linearizer<'a> {
                 .with_src(src)
                 .with_type_and_size(cast_type, dst_size);
             insn.src_size = self.types.size_bits(src_type);
+            insn.src_typ = Some(src_type);
             self.emit(insn);
             result
         } else if src_is_float && dst_is_float {
@@ -3167,6 +3260,7 @@ impl<'a> Linearizer<'a> {
                     .with_src(src)
                     .with_type(cast_type);
                 insn.src_size = src_size;
+                insn.src_typ = Some(src_type);
                 self.emit(insn);
                 result
             } else {
@@ -3639,6 +3733,17 @@ impl<'a> Linearizer<'a> {
             arg_vals.push(arg_val);
         }
 
+        // Compute ABI classification for parameters and return value.
+        // This provides rich metadata for the backend to generate correct calling code.
+        // Use the current function's calling convention (which may be overridden via attributes)
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types_vec
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(typ, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
         if returns_large_struct {
             // For large struct returns, the return value is the address
             // stored in result_sym (which is a local symbol containing the struct)
@@ -3672,6 +3777,7 @@ impl<'a> Linearizer<'a> {
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_sret_call = true;
             call_insn.is_noreturn_call = is_noreturn_call;
+            call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // Return the symbol (address) where struct is stored
             result_sym
@@ -3701,6 +3807,7 @@ impl<'a> Linearizer<'a> {
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.is_two_reg_return = returns_two_reg_struct;
+            call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             result_sym
         }
@@ -3732,6 +3839,7 @@ impl<'a> Linearizer<'a> {
                 Instruction::new(Opcode::Copy)
                     .with_target(temp)
                     .with_src(val)
+                    .with_type(typ)
                     .with_size(self.types.size_bits(typ)),
             );
             temp
@@ -5244,9 +5352,19 @@ impl<'a> Linearizer<'a> {
     }
 
     fn emit_unary(&mut self, op: UnaryOp, src: PseudoId, typ: TypeId) -> PseudoId {
-        let result = self.alloc_pseudo();
         let is_float = self.types.is_float(typ);
         let size = self.types.size_bits(typ);
+
+        // Check for long double negation that needs rtlib
+        if op == UnaryOp::Neg && self.types.kind(typ) == TypeKind::LongDouble {
+            let rtlib = RtlibNames::new(self.target);
+            if let Some(func_name) = rtlib.longdouble_neg() {
+                return self.emit_longdouble_neg_call(func_name, src, typ);
+            }
+            // Fall through to native FP for macOS aarch64 (long double == double)
+        }
+
+        let result = self.alloc_pseudo();
 
         let opcode = match op {
             UnaryOp::Neg => {
@@ -5348,10 +5466,48 @@ impl<'a> Linearizer<'a> {
         result_typ: TypeId,
         operand_typ: TypeId,
     ) -> PseudoId {
-        let result = self.alloc_pseudo();
-
         let is_float = self.types.is_float(operand_typ);
         let is_unsigned = self.types.is_unsigned(operand_typ);
+
+        // Check if this is a long double operation that needs rtlib
+        if self.types.kind(operand_typ) == TypeKind::LongDouble {
+            let rtlib = RtlibNames::new(self.target);
+
+            // Handle arithmetic operations
+            let arith_op = match op {
+                BinaryOp::Add => Some("add"),
+                BinaryOp::Sub => Some("sub"),
+                BinaryOp::Mul => Some("mul"),
+                BinaryOp::Div => Some("div"),
+                _ => None,
+            };
+
+            if let Some(op_str) = arith_op {
+                if let Some(func_name) = rtlib.longdouble_binop(op_str) {
+                    return self.emit_longdouble_binop_call(func_name, left, right, operand_typ);
+                }
+            }
+
+            // Handle comparison operations
+            let cmp_kind = match op {
+                BinaryOp::Lt => Some("lt"),
+                BinaryOp::Le => Some("le"),
+                BinaryOp::Gt => Some("gt"),
+                BinaryOp::Ge => Some("ge"),
+                BinaryOp::Eq => Some("eq"),
+                BinaryOp::Ne => Some("ne"),
+                _ => None,
+            };
+
+            if let Some(kind) = cmp_kind {
+                if let Some(func_name) = rtlib.longdouble_cmp(kind) {
+                    return self.emit_longdouble_cmp_call(func_name, left, right, op);
+                }
+            }
+            // Fall through to native FP for macOS aarch64 (long double == double)
+        }
+
+        let result = self.alloc_pseudo();
 
         let opcode = match op {
             BinaryOp::Add => {
@@ -5577,165 +5733,52 @@ impl<'a> Linearizer<'a> {
                 (real, imag)
             }
             BinaryOp::Mul => {
-                // (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
-                let ac = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    ac,
-                    left_real,
-                    right_real,
+                // Complex multiply via rtlib call (__mulsc3, __muldc3, etc.)
+                // Uses robust implementation that handles overflow correctly
+                let rtlib = RtlibNames::new(self.target);
+                let base_kind = self.types.kind(base_typ);
+                let func_name = rtlib.complex_mul(base_kind);
+                let call_result = self.emit_complex_rtlib_call(
+                    func_name,
+                    (left_real, left_imag),
+                    (right_real, right_imag),
                     base_typ,
-                    base_size,
-                ));
-                let bd = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    bd,
-                    left_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
-                ));
-                let ad = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    ad,
-                    left_real,
-                    right_imag,
-                    base_typ,
-                    base_size,
-                ));
-                let bc = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    bc,
-                    left_imag,
-                    right_real,
-                    base_typ,
-                    base_size,
-                ));
+                    complex_typ,
+                );
+                // Load real/imag from the call result
                 let real = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FSub,
-                    real,
-                    ac,
-                    bd,
-                    base_typ,
-                    base_size,
-                ));
+                self.emit(Instruction::load(real, call_result, 0, base_typ, base_size));
                 let imag = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FAdd,
+                self.emit(Instruction::load(
                     imag,
-                    ad,
-                    bc,
+                    call_result,
+                    base_bytes,
                     base_typ,
                     base_size,
                 ));
                 (real, imag)
             }
             BinaryOp::Div => {
-                // (a + bi) / (c + di) = ((ac + bd) + (bc - ad)i) / (c^2 + d^2)
-                // Naive formula without overflow handling
-                let cc = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    cc,
-                    right_real,
-                    right_real,
+                // Complex divide via rtlib call (__divsc3, __divdc3, etc.)
+                // Uses Smith's method for robust overflow handling
+                let rtlib = RtlibNames::new(self.target);
+                let base_kind = self.types.kind(base_typ);
+                let func_name = rtlib.complex_div(base_kind);
+                let call_result = self.emit_complex_rtlib_call(
+                    func_name,
+                    (left_real, left_imag),
+                    (right_real, right_imag),
                     base_typ,
-                    base_size,
-                ));
-                let dd = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    dd,
-                    right_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
-                ));
-                let denom = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FAdd,
-                    denom,
-                    cc,
-                    dd,
-                    base_typ,
-                    base_size,
-                ));
-
-                let ac = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    ac,
-                    left_real,
-                    right_real,
-                    base_typ,
-                    base_size,
-                ));
-                let bd = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    bd,
-                    left_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
-                ));
-                let bc = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    bc,
-                    left_imag,
-                    right_real,
-                    base_typ,
-                    base_size,
-                ));
-                let ad = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FMul,
-                    ad,
-                    left_real,
-                    right_imag,
-                    base_typ,
-                    base_size,
-                ));
-
-                let real_num = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FAdd,
-                    real_num,
-                    ac,
-                    bd,
-                    base_typ,
-                    base_size,
-                ));
-                let imag_num = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FSub,
-                    imag_num,
-                    bc,
-                    ad,
-                    base_typ,
-                    base_size,
-                ));
-
+                    complex_typ,
+                );
+                // Load real/imag from the call result
                 let real = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FDiv,
-                    real,
-                    real_num,
-                    denom,
-                    base_typ,
-                    base_size,
-                ));
+                self.emit(Instruction::load(real, call_result, 0, base_typ, base_size));
                 let imag = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FDiv,
+                self.emit(Instruction::load(
                     imag,
-                    imag_num,
-                    denom,
+                    call_result,
+                    base_bytes,
                     base_typ,
                     base_size,
                 ));
@@ -5781,6 +5824,257 @@ impl<'a> Linearizer<'a> {
             .with_type_and_size(self.types.void_ptr_id, 64);
         self.emit(alloca_insn);
         addr
+    }
+
+    /// Emit a call to a complex rtlib function (__mulXc3, __divXc3).
+    ///
+    /// These functions take 4 scalar args (left_real, left_imag, right_real, right_imag)
+    /// and return a complex value. The result is stored in newly allocated local storage.
+    ///
+    /// Returns the address where the complex result is stored.
+    fn emit_complex_rtlib_call(
+        &mut self,
+        func_name: &str,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        base_typ: TypeId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        let (left_real, left_imag) = left;
+        let (right_real, right_imag) = right;
+        // Allocate local storage for the complex result
+        let result_sym = self.alloc_pseudo();
+        let unique_name = format!("__cret_{}", result_sym.0);
+        let result_pseudo = Pseudo::sym(result_sym, unique_name.clone());
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(result_pseudo);
+            func.add_local(
+                &unique_name,
+                result_sym,
+                complex_typ,
+                false,
+                self.current_bb,
+            );
+        }
+
+        // Build argument list: 4 scalar FP values
+        let arg_vals = vec![left_real, left_imag, right_real, right_imag];
+        let arg_types = vec![base_typ, base_typ, base_typ, base_typ];
+
+        // Compute ABI classification for the call
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(complex_typ, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        // Create the call instruction
+        let ret_size = self.types.size_bits(complex_typ);
+        let mut call_insn = Instruction::call(
+            Some(result_sym),
+            func_name,
+            arg_vals,
+            arg_types,
+            complex_typ,
+            ret_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result_sym
+    }
+
+    /// Emit a call to a long double rtlib function (__addxf3, __multf3, etc.).
+    ///
+    /// These functions take 2 long double args and return a long double.
+    fn emit_longdouble_binop_call(
+        &mut self,
+        func_name: &str,
+        left: PseudoId,
+        right: PseudoId,
+        longdouble_typ: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let size = self.types.size_bits(longdouble_typ);
+
+        let arg_vals = vec![left, right];
+        let arg_types = vec![longdouble_typ, longdouble_typ];
+
+        // Compute ABI classification for the call
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(longdouble_typ, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            func_name,
+            arg_vals,
+            arg_types,
+            longdouble_typ,
+            size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
+    }
+
+    /// Emit a call to a long double comparison rtlib function (__cmpxf2, __cmptf2).
+    ///
+    /// The comparison function returns an int:
+    /// - < 0 if a < b
+    /// - 0 if a == b
+    /// - > 0 if a > b
+    ///
+    /// We then compare that result with 0 to produce the final boolean.
+    fn emit_longdouble_cmp_call(
+        &mut self,
+        func_name: &str,
+        left: PseudoId,
+        right: PseudoId,
+        op: BinaryOp,
+    ) -> PseudoId {
+        let longdouble_typ = self.types.longdouble_id;
+        let int_typ = self.types.int_id;
+        let int_size = self.types.size_bits(int_typ);
+
+        let arg_vals = vec![left, right];
+        let arg_types = vec![longdouble_typ, longdouble_typ];
+
+        // Compute ABI classification for the call
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(int_typ, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        // Call the comparison function - it returns an int
+        let cmp_result = self.alloc_pseudo();
+        let mut call_insn = Instruction::call(
+            Some(cmp_result),
+            func_name,
+            arg_vals,
+            arg_types,
+            int_typ,
+            int_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        // Now compare the result with 0 based on the original comparison op
+        let zero = self.emit_const(0, int_typ);
+        let result = self.alloc_pseudo();
+
+        // Map the original FP comparison to an int comparison
+        // cmp_result < 0 means a < b
+        // cmp_result == 0 means a == b
+        // cmp_result > 0 means a > b
+        let opcode = match op {
+            BinaryOp::Lt => Opcode::SetLt, // cmp_result < 0
+            BinaryOp::Gt => Opcode::SetGt, // cmp_result > 0
+            BinaryOp::Le => Opcode::SetLe, // cmp_result <= 0
+            BinaryOp::Ge => Opcode::SetGe, // cmp_result >= 0
+            BinaryOp::Eq => Opcode::SetEq, // cmp_result == 0
+            BinaryOp::Ne => Opcode::SetNe, // cmp_result != 0
+            _ => unreachable!("emit_longdouble_cmp_call called with non-comparison op"),
+        };
+
+        self.emit(Instruction::binop(
+            opcode, result, cmp_result, zero, int_typ, int_size,
+        ));
+
+        result
+    }
+
+    /// Emit a call to a long double conversion rtlib function.
+    ///
+    /// These functions convert between long double and other types:
+    /// - __extendsfxf2/__extendsftf2: float -> long double
+    /// - __extenddfxf2/__extenddftf2: double -> long double
+    /// - __truncxfsf2/__trunctfsf2: long double -> float
+    /// - __truncxfdf2/__trunctfdf2: long double -> double
+    /// - __floatsixf/__floatsitf: int32 -> long double
+    /// - __floatdixf/__floatditf: int64 -> long double
+    /// - __fixxfsi/__fixtfsi: long double -> int32
+    /// - __fixxfdi/__fixtfdi: long double -> int64
+    fn emit_longdouble_convert_call(
+        &mut self,
+        func_name: &str,
+        src: PseudoId,
+        src_type: TypeId,
+        dst_type: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let dst_size = self.types.size_bits(dst_type);
+
+        let arg_vals = vec![src];
+        let arg_types = vec![src_type];
+
+        // Compute ABI classification for the call
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(dst_type, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            func_name,
+            arg_vals,
+            arg_types,
+            dst_type,
+            dst_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
+    }
+
+    /// Emit a call to a long double negation rtlib function (__negxf2, __negtf2).
+    fn emit_longdouble_neg_call(
+        &mut self,
+        func_name: &str,
+        src: PseudoId,
+        longdouble_typ: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let size = self.types.size_bits(longdouble_typ);
+
+        let arg_vals = vec![src];
+        let arg_types = vec![longdouble_typ];
+
+        // Compute ABI classification for the call
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(longdouble_typ, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            func_name,
+            arg_vals,
+            arg_types,
+            longdouble_typ,
+            size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
     }
 
     fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {

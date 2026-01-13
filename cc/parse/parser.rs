@@ -167,6 +167,31 @@ impl AttributeList {
             .iter()
             .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
     }
+
+    /// Check if this attribute list contains sysv_abi attribute
+    pub fn has_sysv_abi(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "sysv_abi" || a.name == "__sysv_abi__")
+    }
+
+    /// Check if this attribute list contains ms_abi attribute
+    pub fn has_ms_abi(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "ms_abi" || a.name == "__ms_abi__")
+    }
+
+    /// Get the calling convention from attributes, if any
+    pub fn calling_conv(&self) -> Option<crate::abi::CallingConv> {
+        if self.has_sysv_abi() {
+            Some(crate::abi::CallingConv::SysV)
+        } else if self.has_ms_abi() {
+            Some(crate::abi::CallingConv::Win64)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for AttributeList {
@@ -3922,7 +3947,10 @@ impl Parser<'_> {
                         base_kind = Some(TypeKind::LongLong);
                     } else {
                         modifiers |= TypeModifiers::LONG;
-                        if base_kind.is_none() {
+                        // long double case
+                        if base_kind == Some(TypeKind::Double) {
+                            base_kind = Some(TypeKind::LongDouble);
+                        } else if base_kind.is_none() {
                             base_kind = Some(TypeKind::Long);
                         }
                     }
@@ -3952,7 +3980,12 @@ impl Parser<'_> {
                 }
                 "double" => {
                     self.advance();
-                    base_kind = Some(TypeKind::Double);
+                    // Handle long double
+                    if modifiers.contains(TypeModifiers::LONG) {
+                        base_kind = Some(TypeKind::LongDouble);
+                    } else {
+                        base_kind = Some(TypeKind::Double);
+                    }
                 }
                 "_Bool" => {
                     self.advance();
@@ -4847,6 +4880,7 @@ impl Parser<'_> {
             pos: func_pos,
             is_static: false, // Test function, storage class not parsed
             is_inline: false,
+            calling_conv: crate::abi::CallingConv::default(),
         })
     }
 
@@ -5012,8 +5046,9 @@ impl Parser<'_> {
                     ));
                 }
 
-                // Skip any __attribute__ after declarator
-                self.skip_extensions();
+                // Parse any __attribute__ after declarator
+                let attrs = self.parse_attributes();
+                let calling_conv = attrs.calling_conv().unwrap_or_default();
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
@@ -5065,6 +5100,7 @@ impl Parser<'_> {
                         pos: decl_pos,
                         is_static,
                         is_inline,
+                        calling_conv,
                     }));
                 }
 
@@ -5184,8 +5220,9 @@ impl Parser<'_> {
                     ));
                 }
 
-                // Skip any __attribute__ after declarator
-                self.skip_extensions();
+                // Parse any __attribute__ after declarator
+                let attrs = self.parse_attributes();
+                let calling_conv = attrs.calling_conv().unwrap_or_default();
 
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
@@ -5236,6 +5273,7 @@ impl Parser<'_> {
                         pos: decl_pos,
                         is_static,
                         is_inline,
+                        calling_conv,
                     }));
                 }
 
@@ -5294,6 +5332,8 @@ impl Parser<'_> {
             let base_type = self.types.get(typ_id);
             let is_noreturn =
                 attrs.has_noreturn() || base_type.modifiers.contains(TypeModifiers::NORETURN);
+            // Extract calling convention from attributes
+            let calling_conv = attrs.calling_conv().unwrap_or_default();
 
             if self.is_special(b'{') {
                 // Function definition
@@ -5342,6 +5382,7 @@ impl Parser<'_> {
                     pos: decl_pos,
                     is_static,
                     is_inline,
+                    calling_conv,
                 }));
             } else {
                 // Function declaration
@@ -5719,6 +5760,7 @@ mod tests {
     use super::*;
     use crate::strings::StringTable;
     use crate::symbol::SymbolTable;
+    use crate::target::Target;
     use crate::token::lexer::Tokenizer;
 
     fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
@@ -5734,7 +5776,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
 
         // Pre-declare variables
         for var_name in vars {
@@ -7052,7 +7094,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
 
         // Pre-declare variables
         for var_name in vars {
@@ -7298,7 +7340,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let decl = parser.parse_declaration()?;
@@ -7426,7 +7468,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let func = parser.parse_function_def()?;
@@ -7481,7 +7523,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         let tu = parser.parse_translation_unit()?;
         Ok((tu, types, strings, symbols))
@@ -9934,5 +9976,40 @@ mod tests {
         // Type should be char*
         let typ = expr.typ.unwrap();
         assert_eq!(types.kind(typ), TypeKind::Pointer);
+    }
+
+    // ========================================================================
+    // Long double type parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_long_double_type() {
+        // Test "long double x;"
+        let (decl, types, _, _) = parse_decl("long double x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::LongDouble);
+    }
+
+    #[test]
+    fn test_double_long_type() {
+        // Test "double long x;" - alternative ordering per C standard
+        let (decl, types, _, _) = parse_decl("double long x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::LongDouble);
+    }
+
+    #[test]
+    fn test_long_double_function_return() {
+        // Test function returning long double
+        let (func, types, _, _) = parse_func("long double foo(void) { return 1.0L; }").unwrap();
+        assert_eq!(types.kind(func.return_type), TypeKind::LongDouble);
+    }
+
+    #[test]
+    fn test_long_double_function_param() {
+        // Test function with long double parameter
+        let (func, types, _, _) = parse_func("void foo(long double x) {}").unwrap();
+        let param_type = func.params[0].typ;
+        assert_eq!(types.kind(param_type), TypeKind::LongDouble);
     }
 }

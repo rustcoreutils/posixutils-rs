@@ -12,13 +12,14 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
+use crate::abi::{get_abi, ArgClass, RegClass};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -28,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 /// x86-64 code generator
 pub struct X86_64CodeGen {
     /// Common code generation infrastructure
-    base: CodeGenBase<X86Inst>,
+    pub(super) base: CodeGenBase<X86Inst>,
     /// Current function's register allocation
     locations: HashMap<PseudoId, Loc>,
     /// Current function's pseudos (for looking up values)
@@ -49,6 +50,10 @@ pub struct X86_64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
+    /// Long double constants to emit (label_bits -> value_bits)
+    pub(super) ld_constants: HashMap<u64, [u8; 16]>,
+    /// Double constants to emit (label_bits -> f64 value)
+    pub(super) double_constants: HashMap<u64, f64>,
 }
 
 impl X86_64CodeGen {
@@ -65,6 +70,8 @@ impl X86_64CodeGen {
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
             pic_mode: false,
+            ld_constants: HashMap::new(),
+            double_constants: HashMap::new(),
         }
     }
 
@@ -146,6 +153,57 @@ impl X86_64CodeGen {
             return;
         }
         self.base.emit_global(name, typ, init, types);
+    }
+
+    /// Emit long double constants collected during codegen
+    fn emit_ld_constants(&mut self) {
+        if self.ld_constants.is_empty() {
+            return;
+        }
+
+        // Emit in rodata section
+        self.base.push_directive(Directive::Rodata);
+
+        // Emit each constant
+        for (label_bits, bytes) in &self.ld_constants {
+            let label = format!(".Lld_const_{}", label_bits);
+            // Align to 16 bytes (power of 2: 4 means 2^4 = 16)
+            self.base.push_directive(Directive::Align(4));
+            self.base.push_directive(Directive::local_label(&label));
+
+            // Emit the 16 bytes as .byte directives
+            let mut byte_str = String::from(".byte ");
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    byte_str.push_str(", ");
+                }
+                byte_str.push_str(&format!("0x{:02x}", b));
+            }
+            self.base.push_directive(Directive::Raw(byte_str));
+        }
+    }
+
+    /// Emit double constants collected during codegen (for x87 conversions)
+    fn emit_double_constants(&mut self) {
+        if self.double_constants.is_empty() {
+            return;
+        }
+
+        // Emit in rodata section
+        self.base.push_directive(Directive::Rodata);
+
+        // Emit each constant
+        for (label_bits, value) in &self.double_constants {
+            let label = format!(".Ldbl_const_{}", label_bits);
+            // Align to 8 bytes (power of 2: 3 means 2^3 = 8)
+            self.base.push_directive(Directive::Align(3));
+            self.base.push_directive(Directive::local_label(&label));
+
+            // Emit as .quad (8 bytes)
+            let bits = value.to_bits();
+            self.base
+                .push_directive(Directive::Raw(format!(".quad 0x{:016x}", bits)));
+        }
     }
 
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
@@ -378,8 +436,12 @@ impl X86_64CodeGen {
                             // Still need to count this arg for register assignment tracking
                             let is_fp = types.is_float(*typ);
                             let is_complex = types.is_complex(*typ);
+                            let is_longdouble =
+                                types.kind(*typ) == crate::types::TypeKind::LongDouble;
                             if is_complex {
                                 fp_arg_idx += 2;
+                            } else if is_longdouble {
+                                // Long double is on stack, doesn't use XMM registers
                             } else if is_fp {
                                 fp_arg_idx += 1;
                             } else {
@@ -400,7 +462,8 @@ impl X86_64CodeGen {
                                     if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
                                     {
                                         let adjusted = offset + self.callee_saved_offset;
-                                        let (fp_size, imag_offset) = complex_fp_info(types, *typ);
+                                        let (fp_size, imag_offset) =
+                                            complex_fp_info(types, &self.base.target, *typ);
                                         // Store real part from first XMM register
                                         self.push_lir(X86Inst::MovFp {
                                             size: fp_size,
@@ -423,8 +486,12 @@ impl X86_64CodeGen {
                                 }
                             }
                             fp_arg_idx += 2; // Complex uses two XMM registers
+                        } else if types.kind(*typ) == crate::types::TypeKind::LongDouble {
+                            // Long double is passed on the stack per System V AMD64 ABI
+                            // No XMM register move needed - already at IncomingArg offset
+                            // Don't increment fp_arg_idx - long double doesn't use XMM
                         } else if is_fp {
-                            // FP argument
+                            // FP argument (float/double)
                             if fp_arg_idx < fp_arg_regs.len() {
                                 if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
                                     // Move from FP arg register to stack
@@ -488,7 +555,9 @@ impl X86_64CodeGen {
         self.num_fixed_fp_params = func
             .params
             .iter()
-            .filter(|(_, typ)| types.is_float(*typ))
+            .filter(|(_, typ)| {
+                types.is_float(*typ) && types.kind(*typ) != crate::types::TypeKind::LongDouble
+            })
             .count();
     }
 
@@ -510,21 +579,173 @@ impl X86_64CodeGen {
     fn emit_ret(&mut self, insn: &Instruction, types: &TypeTable) {
         // Move return value to appropriate register if present
         // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
-        // Two-register struct returns (9-16 bytes) go in RAX+RDX
+        // Struct returns depend on ABI classification (SSE for all-float structs)
         if let Some(src) = insn.src.first() {
             let src_loc = self.get_location(*src);
             let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
             let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
                 || insn.typ.is_some_and(|t| types.is_float(t));
+
+            // Check if return type is a struct/union
+            let ret_typ = insn.typ;
+            let is_struct_or_union = ret_typ.is_some_and(|t| {
+                let kind = types.kind(t);
+                kind == TypeKind::Struct || kind == TypeKind::Union
+            });
+
             if insn.is_two_reg_return {
-                // Two-register struct return: src[0] -> RAX, src[1] -> RDX
-                self.emit_move(*src, Reg::Rax, 64);
-                if let Some(&src2) = insn.src.get(1) {
-                    self.emit_move(src2, Reg::Rdx, 64);
+                // Two-register struct return: check ABI for SSE vs INTEGER
+                if is_struct_or_union {
+                    if let Some(typ) = ret_typ {
+                        let abi = get_abi(&self.base.target);
+                        if let ArgClass::Direct { classes, .. } = abi.classify_return(typ, types) {
+                            // Handle mixed SSE+INTEGER returns per ABI classification
+                            // Each SSE class uses XMM0, XMM1; each INTEGER uses RAX, RDX
+                            let mut xmm_idx = 0;
+                            let mut gp_idx = 0;
+                            let srcs = [Some(*src), insn.src.get(1).copied()];
+
+                            for (i, &class) in classes.iter().enumerate() {
+                                if let Some(s) = srcs.get(i).copied().flatten() {
+                                    match class {
+                                        RegClass::Sse => {
+                                            let xmm = if xmm_idx == 0 {
+                                                XmmReg::Xmm0
+                                            } else {
+                                                XmmReg::Xmm1
+                                            };
+                                            self.emit_fp_move(s, xmm, 64);
+                                            xmm_idx += 1;
+                                        }
+                                        RegClass::Integer => {
+                                            let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
+                                            self.emit_move(s, gp, 64);
+                                            gp_idx += 1;
+                                        }
+                                        _ => {
+                                            // NoClass, Memory - shouldn't happen for Direct
+                                            let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
+                                            self.emit_move(s, gp, 64);
+                                            gp_idx += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            self.emit_move(*src, Reg::Rax, 64);
+                            if let Some(&src2) = insn.src.get(1) {
+                                self.emit_move(src2, Reg::Rdx, 64);
+                            }
+                        }
+                    } else {
+                        self.emit_move(*src, Reg::Rax, 64);
+                        if let Some(&src2) = insn.src.get(1) {
+                            self.emit_move(src2, Reg::Rdx, 64);
+                        }
+                    }
+                } else {
+                    self.emit_move(*src, Reg::Rax, 64);
+                    if let Some(&src2) = insn.src.get(1) {
+                        self.emit_move(src2, Reg::Rdx, 64);
+                    }
+                }
+            } else if is_struct_or_union && !is_complex {
+                // Single-register struct return: use ABI classification
+                if let Some(typ) = ret_typ {
+                    let abi = get_abi(&self.base.target);
+                    if let ArgClass::Direct { classes, size_bits } = abi.classify_return(typ, types)
+                    {
+                        if classes.iter().all(|c| *c == RegClass::Sse) {
+                            if classes.len() == 2 {
+                                // Two SSE regs for 9-16 byte float struct
+                                match src_loc {
+                                    Loc::Stack(offset) => {
+                                        let adjusted = offset + self.callee_saved_offset;
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                        });
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted + 8,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm1),
+                                        });
+                                    }
+                                    Loc::Reg(r) => {
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: r,
+                                                offset: 0,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                        });
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: r,
+                                                offset: 8,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm1),
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // Single SSE reg for small float struct (<=8 bytes)
+                                let fp_size = if size_bits <= 32 {
+                                    FpSize::Single
+                                } else {
+                                    FpSize::Double
+                                };
+                                match src_loc {
+                                    Loc::Stack(offset) => {
+                                        let adjusted = offset + self.callee_saved_offset;
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: fp_size,
+                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted,
+                                            }),
+                                            dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                        });
+                                    }
+                                    Loc::Reg(r) => {
+                                        // GP reg contains struct value, move to XMM
+                                        self.push_lir(X86Inst::MovGpXmm {
+                                            size: OperandSize::B64,
+                                            src: r,
+                                            dst: XmmReg::Xmm0,
+                                        });
+                                    }
+                                    _ => self.emit_move(*src, Reg::Rax, insn.size),
+                                }
+                            }
+                        } else {
+                            // INTEGER class - return in RAX
+                            self.emit_move(*src, Reg::Rax, insn.size);
+                        }
+                    } else {
+                        self.emit_move(*src, Reg::Rax, insn.size);
+                    }
+                } else {
+                    self.emit_move(*src, Reg::Rax, insn.size);
                 }
             } else if is_complex {
-                // Complex return value: load real into XMM0, imag into XMM1
-                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+                // Complex return value handling:
+                // - float _Complex (8 bytes): packed in XMM0 (real in low 32, imag in high 32)
+                // - double _Complex (16 bytes): real in XMM0, imag in XMM1
+                let (fp_size, imag_offset) =
+                    complex_fp_info(types, &self.base.target, insn.typ.unwrap());
+                let is_float_complex = fp_size == FpSize::Single;
+
                 match src_loc {
                     Loc::Stack(offset) => {
                         let adjusted = offset + self.callee_saved_offset;
@@ -536,42 +757,78 @@ impl X86_64CodeGen {
                             }),
                             dst: GpOperand::Reg(Reg::Rax),
                         });
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rax,
-                                offset: 0,
-                            }),
-                            dst: XmmOperand::Reg(XmmReg::Xmm0),
-                        });
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rax,
-                                offset: imag_offset,
-                            }),
-                            dst: XmmOperand::Reg(XmmReg::Xmm1),
-                        });
+                        if is_float_complex {
+                            // Load entire 64-bit packed value into XMM0
+                            self.push_lir(X86Inst::MovFp {
+                                size: FpSize::Double, // 64-bit movq
+                                src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rax,
+                                    offset: 0,
+                                }),
+                                dst: XmmOperand::Reg(XmmReg::Xmm0),
+                            });
+                        } else {
+                            // Load real into XMM0, imag into XMM1
+                            self.push_lir(X86Inst::MovFp {
+                                size: fp_size,
+                                src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rax,
+                                    offset: 0,
+                                }),
+                                dst: XmmOperand::Reg(XmmReg::Xmm0),
+                            });
+                            self.push_lir(X86Inst::MovFp {
+                                size: fp_size,
+                                src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rax,
+                                    offset: imag_offset,
+                                }),
+                                dst: XmmOperand::Reg(XmmReg::Xmm1),
+                            });
+                        }
                     }
                     Loc::Reg(r) => {
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
-                            dst: XmmOperand::Reg(XmmReg::Xmm0),
-                        });
-                        self.push_lir(X86Inst::MovFp {
-                            size: fp_size,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                base: r,
-                                offset: imag_offset,
-                            }),
-                            dst: XmmOperand::Reg(XmmReg::Xmm1),
-                        });
+                        if is_float_complex {
+                            // Load entire 64-bit packed value into XMM0
+                            self.push_lir(X86Inst::MovFp {
+                                size: FpSize::Double, // 64-bit movq
+                                src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
+                                dst: XmmOperand::Reg(XmmReg::Xmm0),
+                            });
+                        } else {
+                            // Load real into XMM0, imag into XMM1
+                            self.push_lir(X86Inst::MovFp {
+                                size: fp_size,
+                                src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
+                                dst: XmmOperand::Reg(XmmReg::Xmm0),
+                            });
+                            self.push_lir(X86Inst::MovFp {
+                                size: fp_size,
+                                src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                    base: r,
+                                    offset: imag_offset,
+                                }),
+                                dst: XmmOperand::Reg(XmmReg::Xmm1),
+                            });
+                        }
                     }
                     _ => {}
                 }
             } else if is_fp {
-                self.emit_fp_move(*src, XmmReg::Xmm0, insn.size);
+                // Check for long double - return in ST(0) per x86-64 ABI
+                let is_longdouble = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+                if is_longdouble {
+                    // Load long double to x87 ST(0) for return
+                    let src_addr = self.get_x87_mem_addr(*src);
+                    self.push_lir(X86Inst::X87Load { addr: src_addr });
+                } else {
+                    // Use type-aware size for FP return
+                    let fp_typ = insn.typ.expect("FP return must have type");
+                    let fp_size = types.size_bits(fp_typ).max(32);
+                    self.emit_fp_move(*src, XmmReg::Xmm0, fp_size);
+                }
             } else {
                 self.emit_move(*src, Reg::Rax, insn.size);
             }
@@ -775,11 +1032,19 @@ impl X86_64CodeGen {
 
             // Floating-point arithmetic operations
             Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
-                self.emit_fp_binop(insn);
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_binop(insn);
+                } else {
+                    self.emit_fp_binop(insn, types);
+                }
             }
 
             Opcode::FNeg => {
-                self.emit_fp_neg(insn);
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_neg(insn);
+                } else {
+                    self.emit_fp_neg(insn, types);
+                }
             }
 
             // Floating-point comparisons
@@ -789,22 +1054,53 @@ impl X86_64CodeGen {
             | Opcode::FCmpOLe
             | Opcode::FCmpOGt
             | Opcode::FCmpOGe => {
-                self.emit_fp_compare(insn);
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_compare(insn);
+                } else {
+                    self.emit_fp_compare(insn, types);
+                }
             }
 
             // Integer to float conversions
             Opcode::UCvtF | Opcode::SCvtF => {
-                self.emit_int_to_float(insn);
+                // Use x87 for long double destination
+                let dst_is_longdouble = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+                if dst_is_longdouble {
+                    self.emit_x87_int_to_float(insn);
+                } else {
+                    self.emit_int_to_float(insn, types);
+                }
             }
 
             // Float to integer conversions
             Opcode::FCvtU | Opcode::FCvtS => {
-                self.emit_float_to_int(insn);
+                // Use x87 for long double source
+                let src_is_longdouble = insn
+                    .src_typ
+                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+                if src_is_longdouble {
+                    self.emit_x87_float_to_int(insn);
+                } else {
+                    self.emit_float_to_int(insn, types);
+                }
             }
 
             // Float to float conversions (e.g., float to double)
             Opcode::FCvtF => {
-                self.emit_float_to_float(insn);
+                // Use x87 when long double is involved
+                let dst_is_longdouble = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+                let src_is_longdouble = insn
+                    .src_typ
+                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+                if dst_is_longdouble || src_is_longdouble {
+                    self.emit_x87_fp_cvt(insn, types);
+                } else {
+                    self.emit_float_to_float(insn, types);
+                }
             }
 
             Opcode::SetEq
@@ -1216,7 +1512,12 @@ impl X86_64CodeGen {
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t)) || matches!(dst_loc, Loc::Xmm(_));
 
         if is_fp {
-            self.emit_fp_load(insn);
+            // Long double uses x87, not SSE
+            if self.is_longdouble_op(insn, types) {
+                self.emit_x87_load(insn);
+            } else {
+                self.emit_fp_load(insn, types);
+            }
             return;
         }
 
@@ -1520,7 +1821,12 @@ impl X86_64CodeGen {
             || matches!(value_loc, Loc::Xmm(_) | Loc::FImm(..));
 
         if is_fp {
-            self.emit_fp_store(insn);
+            // Long double uses x87, not SSE
+            if self.is_longdouble_op(insn, types) {
+                self.emit_x87_store(insn);
+            } else {
+                self.emit_fp_store(insn, types);
+            }
             return;
         }
 
@@ -2013,9 +2319,13 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(dst);
         let src_loc = self.get_location(src);
 
-        // Check if this is a FP copy (source or dest is in XMM or is FImm)
-        let is_fp_copy =
-            matches!(&src_loc, Loc::Xmm(_) | Loc::FImm(..)) || matches!(&dst_loc, Loc::Xmm(_));
+        // Check if this is a FP copy (source or dest is in XMM, is FImm, or type is float)
+        let is_fp_copy = matches!(&src_loc, Loc::Xmm(_) | Loc::FImm(..))
+            || matches!(&dst_loc, Loc::Xmm(_))
+            || typ.is_some_and(|t| types.is_float(t));
+
+        // Check if this is long double (uses x87, not XMM)
+        let is_longdouble = typ.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
 
         // Determine if the type is unsigned (for proper sign/zero extension)
         // For plain char, use target.char_signed to determine signedness
@@ -2031,16 +2341,26 @@ impl X86_64CodeGen {
         });
 
         if is_fp_copy {
-            // Handle FP copy
-            let dst_xmm = match &dst_loc {
-                Loc::Xmm(x) => *x,
-                _ => XmmReg::Xmm0,
-            };
+            // Long double uses x87, not XMM
+            if is_longdouble {
+                let src_addr = self.get_x87_mem_addr(src);
+                self.push_lir(X86Inst::X87Load { addr: src_addr });
+                let dst_addr = self.get_x87_mem_addr(dst);
+                self.push_lir(X86Inst::X87Store { addr: dst_addr });
+            } else {
+                // Handle regular FP copy (float/double)
+                let dst_xmm = match &dst_loc {
+                    Loc::Xmm(x) => *x,
+                    _ => XmmReg::Xmm0,
+                };
 
-            self.emit_fp_move(src, dst_xmm, reg_size);
+                // Use type-aware size for FP operations
+                let fp_size = typ.map(|t| types.size_bits(t)).unwrap_or(reg_size).max(32);
+                self.emit_fp_move(src, dst_xmm, fp_size);
 
-            if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-                self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, reg_size);
+                if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
+                    self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
+                }
             }
         } else {
             // Integer copy
@@ -2689,6 +3009,16 @@ impl CodeGenerator for X86_64CodeGen {
         if module.debug && !module.functions.is_empty() {
             self.base
                 .push_directive(Directive::local_label(".Ltext_end"));
+        }
+
+        // Emit long double constants collected during codegen
+        if !self.ld_constants.is_empty() {
+            self.emit_ld_constants();
+        }
+
+        // Emit double constants collected during x87 conversions
+        if !self.double_constants.is_empty() {
+            self.emit_double_constants();
         }
 
         // Generate DWARF debug sections if debug mode is enabled

@@ -449,6 +449,8 @@ pub struct RegAlloc {
     used_callee_saved: Vec<Reg>,
     /// Track which pseudos need FP registers (based on type)
     fp_pseudos: HashSet<PseudoId>,
+    /// Track which pseudos are long double (use x87, need 16-byte stack slots)
+    ld_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
 }
@@ -464,6 +466,7 @@ impl RegAlloc {
             stack_offset: 0,
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
+            ld_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
         }
     }
@@ -473,6 +476,8 @@ impl RegAlloc {
         self.reset_state();
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
+        // Identify long double pseudos (use x87 not XMM)
+        self.identify_ld_pseudos(func, types);
         self.allocate_arguments(func, types);
 
         let (intervals, constraint_points) = self.compute_live_intervals(func);
@@ -496,7 +501,32 @@ impl RegAlloc {
         self.stack_offset = 0;
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
+        self.ld_pseudos.clear();
         self.spilled_args.clear();
+    }
+
+    /// Identify pseudos that are long double (80-bit extended precision).
+    /// These use x87 FPU instead of XMM and need 16-byte stack slots.
+    fn identify_ld_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for block in &func.blocks {
+            for insn in &block.insns {
+                // Check if this instruction operates on long double
+                let is_longdouble = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::LongDouble);
+
+                if is_longdouble {
+                    // Mark target as long double
+                    if let Some(target) = insn.target {
+                        self.ld_pseudos.insert(target);
+                    }
+                    // Mark sources as long double for Load/Store/Copy
+                    for &src in &insn.src {
+                        self.ld_pseudos.insert(src);
+                    }
+                }
+            }
+        }
     }
 
     /// Pre-allocate argument registers per System V AMD64 ABI
@@ -533,8 +563,17 @@ impl RegAlloc {
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     if arg_idx == (i as u32) + arg_idx_offset {
+                        let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
                         let is_fp = types.is_float(*typ);
-                        if is_fp {
+
+                        // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
+                        if is_longdouble {
+                            // Long double takes 16 bytes on stack (80-bit padded to 128-bit)
+                            self.locations
+                                .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                            self.fp_pseudos.insert(pseudo.id);
+                            stack_arg_offset += 16;
+                        } else if is_fp {
                             if fp_arg_idx < fp_arg_regs.len() {
                                 self.locations
                                     .insert(pseudo.id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
@@ -706,7 +745,15 @@ impl RegAlloc {
                         if let Some(local_var) = func.locals.get(name) {
                             let size = (types.size_bits(local_var.typ) / 8) as i32;
                             let size = size.max(8);
-                            let aligned_size = (size + 7) & !7;
+                            // Long double (size 16) needs 16-byte alignment for x87 access
+                            let (alignment, aligned_size) = if size >= 16 {
+                                (16, (size + 15) & !15)
+                            } else {
+                                (8, (size + 7) & !7)
+                            };
+                            // Align stack offset before allocating
+                            self.stack_offset =
+                                (self.stack_offset + alignment - 1) & !(alignment - 1);
                             self.stack_offset += aligned_size;
                             self.locations
                                 .insert(interval.pseudo, Loc::Stack(self.stack_offset));
@@ -731,7 +778,17 @@ impl RegAlloc {
             let conflicting_regs = find_conflicting_registers(&interval, constraint_points);
 
             if needs_fp {
-                if let Some(xmm) = self.free_xmm_regs.pop() {
+                // Long double uses x87 FPU (stack-based), not XMM registers.
+                // Always allocate to stack with 16-byte slots for 80-bit extended precision.
+                let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
+                if is_longdouble {
+                    // Long double needs 16 bytes (80-bit padded to 128-bit)
+                    // Align to 16-byte boundary for proper x87 access
+                    self.stack_offset = (self.stack_offset + 15) & !15;
+                    self.stack_offset += 16;
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
                     self.active_xmm.push((interval.clone(), xmm));
                     self.active_xmm.sort_by_key(|(i, _)| i.end);

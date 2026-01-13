@@ -83,23 +83,50 @@ pub enum FpSize {
     Single,
     /// 64-bit double precision (double)
     Double,
+    /// 80-bit x87 extended precision (long double on x86-64)
+    /// Stored in 128-bit (16-byte) slots per ABI
+    Extended,
 }
 
 impl FpSize {
     /// Create from bit count
     pub fn from_bits(bits: u32) -> Self {
-        if bits <= 32 {
-            FpSize::Single
-        } else {
-            FpSize::Double
+        match bits {
+            0..=32 => FpSize::Single,
+            33..=64 => FpSize::Double,
+            _ => FpSize::Extended, // 80-bit x87 (stored as 128)
         }
     }
 
+    /// Create from TypeKind. This is the preferred way to determine FP size
+    /// when type information is available, rather than inferring from bit size.
+    ///
+    /// Note: LongDouble maps to Extended for x86-64. On aarch64, call sites
+    /// should handle LongDouble specially since it maps to Double on macOS
+    /// and quad precision on Linux.
+    pub fn from_type_kind(kind: TypeKind) -> Self {
+        match kind {
+            TypeKind::Float => FpSize::Single,
+            TypeKind::Double => FpSize::Double,
+            TypeKind::LongDouble => FpSize::Extended,
+            _ => FpSize::Double, // Non-FP types default to double
+        }
+    }
+
+    /// Create from type with fallback to size-based detection.
+    /// Preferred method when both type and size information are available.
+    pub fn from_type_or_bits(typ: Option<TypeId>, size: u32, types: &TypeTable) -> Self {
+        typ.map(|t| Self::from_type_kind(types.kind(t)))
+            .unwrap_or_else(|| Self::from_bits(size.max(32)))
+    }
+
     /// x86-64 SSE instruction suffix (ss for single, sd for double)
+    /// Note: Extended uses x87 instructions, not SSE - use x87_suffix() instead
     pub fn x86_suffix(&self) -> &'static str {
         match self {
             FpSize::Single => "ss",
             FpSize::Double => "sd",
+            FpSize::Extended => "t", // x87 uses 't' suffix (fldt, fstpt)
         }
     }
 
@@ -108,6 +135,7 @@ impl FpSize {
         match self {
             FpSize::Single => "ps",
             FpSize::Double => "pd",
+            FpSize::Extended => "pd", // x87 doesn't have packed ops, fallback
         }
     }
 }
@@ -117,6 +145,7 @@ impl fmt::Display for FpSize {
         match self {
             FpSize::Single => write!(f, "f32"),
             FpSize::Double => write!(f, "f64"),
+            FpSize::Extended => write!(f, "f80"),
         }
     }
 }
@@ -223,13 +252,27 @@ pub enum CallTarget<R> {
 
 /// Get FpSize and element offset for a complex type's components.
 /// Returns (FpSize for each component, byte offset to imaginary part).
-pub fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
+///
+/// For long double _Complex, the offset depends on the target:
+/// - x86-64: 80-bit extended precision, padded to 16 bytes per element
+/// - AArch64/Linux: 128-bit IEEE quad precision, 16 bytes per element
+/// - AArch64/macOS: 64-bit (same as double), 8 bytes per element
+pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) -> (FpSize, i32) {
     let base = types.complex_base(complex_typ);
     match types.kind(base) {
         TypeKind::Float => (FpSize::Single, 4),
         TypeKind::Double => (FpSize::Double, 8),
-        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
-        _ => (FpSize::Double, 8),                    // fallback
+        TypeKind::LongDouble => {
+            // On macOS AArch64, long double == double
+            if target.os == Os::MacOS && target.arch == crate::target::Arch::Aarch64 {
+                (FpSize::Double, 8)
+            } else {
+                // x86-64: 80-bit extended precision (padded to 16 bytes)
+                // AArch64/Linux: 128-bit IEEE quad (16 bytes)
+                (FpSize::Extended, 16)
+            }
+        }
+        _ => (FpSize::Double, 8), // fallback
     }
 }
 
@@ -787,9 +830,12 @@ mod tests {
     fn test_fp_size() {
         assert_eq!(FpSize::from_bits(32), FpSize::Single);
         assert_eq!(FpSize::from_bits(64), FpSize::Double);
+        assert_eq!(FpSize::from_bits(80), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(128), FpSize::Extended);
 
         assert_eq!(FpSize::Single.x86_suffix(), "ss");
         assert_eq!(FpSize::Double.x86_suffix(), "sd");
+        assert_eq!(FpSize::Extended.x86_suffix(), "t");
     }
 
     #[test]

@@ -9,6 +9,7 @@
 // pcc - A POSIX C99 compiler
 //
 
+mod abi;
 mod arch;
 mod builtin_headers;
 mod diag;
@@ -16,6 +17,7 @@ mod ir;
 mod opt;
 mod os;
 mod parse;
+mod rtlib;
 mod strings;
 mod symbol;
 mod target;
@@ -32,10 +34,34 @@ use std::process::Command;
 use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
+use target::Os;
 use target::Target;
 use token::{
     preprocess_with_defines, show_token, token_type_name, PreprocessConfig, StreamTable, Tokenizer,
 };
+
+// ============================================================================
+// Runtime Library Selection
+// ============================================================================
+
+/// Runtime library for soft-float and complex operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLib {
+    /// GNU runtime library (libgcc) - default on Linux/FreeBSD
+    Libgcc,
+    /// LLVM compiler-rt - default on macOS
+    CompilerRt,
+}
+
+impl RuntimeLib {
+    /// Get the default runtime library for a target
+    pub fn default_for_target(target: &Target) -> Self {
+        match target.os {
+            Os::MacOS => RuntimeLib::CompilerRt,
+            Os::Linux | Os::FreeBSD => RuntimeLib::Libgcc,
+        }
+    }
+}
 
 // ============================================================================
 // CLI
@@ -124,6 +150,11 @@ struct Args {
     /// Target triple (e.g., aarch64-apple-darwin, x86_64-unknown-linux-gnu)
     #[arg(long = "target", value_name = "triple", help = gettext("Target triple for cross-compilation"))]
     target: Option<String>,
+
+    /// Runtime library to use (libgcc or compiler-rt)
+    /// Default: libgcc on Linux/FreeBSD, compiler-rt on macOS
+    #[arg(long = "rtlib", value_name = "library", help = gettext("Runtime library (libgcc, compiler-rt)"))]
+    rtlib: Option<String>,
 
     /// Optimization level (0=none, 1+=basic optimizations)
     /// -O alone means -O1, -O0 means none, -O2/-O3 mapped to -O1
@@ -294,7 +325,7 @@ fn process_file(
     // Create symbol table and type table BEFORE parsing
     // symbols are bound during parsing
     let mut symbols = SymbolTable::new();
-    let mut types = types::TypeTable::new(target.pointer_width);
+    let mut types = types::TypeTable::new(target);
 
     // Parse (this also binds symbols to the symbol table)
     let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
@@ -548,6 +579,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         Target::host()
+    };
+
+    // Parse runtime library selection
+    let _rtlib = match args.rtlib.as_deref() {
+        Some("libgcc") => RuntimeLib::Libgcc,
+        Some("compiler-rt") => RuntimeLib::CompilerRt,
+        Some(other) => {
+            eprintln!(
+                "pcc: unknown rtlib '{}' (use 'libgcc' or 'compiler-rt')",
+                other
+            );
+            std::process::exit(1);
+        }
+        None => RuntimeLib::default_for_target(&target),
     };
 
     // Separate source files from object files

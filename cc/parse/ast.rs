@@ -787,6 +787,8 @@ pub struct FunctionDef {
     pub is_static: bool,
     /// Whether function is inline
     pub is_inline: bool,
+    /// Calling convention override (from __attribute__((sysv_abi)) etc.)
+    pub calling_conv: crate::abi::CallingConv,
 }
 
 // ============================================================================
@@ -834,11 +836,12 @@ mod tests {
     use super::*;
     use crate::strings::StringTable;
     use crate::symbol::{Symbol, SymbolTable};
+    use crate::target::Target;
     use crate::types::TypeKind;
 
     #[test]
     fn test_int_literal() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let expr = Expr::int(42, &types);
         match expr.kind {
             ExprKind::IntLit(v) => assert_eq!(v, 42),
@@ -848,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_binary_expr() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         // 1 + 2
         let expr = Expr::binary(
             BinaryOp::Add,
@@ -875,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_nested_binary() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         // 1 + 2 * 3 (represented as 1 + (2 * 3))
         let mul = Expr::binary(
             BinaryOp::Mul,
@@ -904,7 +907,7 @@ mod tests {
     #[test]
     fn test_unary_expr() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let x_name = strings.intern("x");
         let x_sym = symbols
@@ -928,7 +931,7 @@ mod tests {
     #[test]
     fn test_assignment() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let x_name = strings.intern("x");
         let x_sym = symbols
@@ -956,7 +959,7 @@ mod tests {
     #[test]
     fn test_function_call() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let foo_name = strings.intern("foo");
         let foo_sym = symbols
@@ -984,7 +987,7 @@ mod tests {
     #[test]
     fn test_if_stmt() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let x_name = strings.intern("x");
         let x_sym = symbols
@@ -1023,7 +1026,7 @@ mod tests {
     #[test]
     fn test_while_stmt() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let x_name = strings.intern("x");
         let x_sym = symbols
@@ -1058,7 +1061,7 @@ mod tests {
     #[test]
     fn test_declaration() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let x_name = strings.intern("x");
         let x_sym = symbols
@@ -1076,7 +1079,7 @@ mod tests {
     #[test]
     fn test_translation_unit() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let x_name = strings.intern("x");
         let x_sym = symbols
@@ -1094,7 +1097,7 @@ mod tests {
     #[test]
     fn test_for_loop() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut symbols = SymbolTable::new();
         let i_name = strings.intern("i");
         let i_sym = symbols

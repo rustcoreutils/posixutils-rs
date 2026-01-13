@@ -105,10 +105,11 @@ fn optimize_function(func: &mut Function) {
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Opcode};
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_test_func() -> Function {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         // Add some pseudos

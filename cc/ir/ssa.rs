@@ -555,7 +555,7 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
                 let addr = insn.src[0];
 
                 // Check if this is a store to our variable
-                if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == addr) {
+                if let Some(pseudo) = func.get_pseudo(addr) {
                     if let PseudoKind::Sym(name) = &pseudo.kind {
                         if name == var {
                             return Some(insn.src[1]);
@@ -682,6 +682,7 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
 mod tests {
     use super::*;
     use crate::ir::BasicBlock;
+    use crate::target::Target;
 
     fn make_simple_if_cfg(types: &TypeTable) -> Function {
         // Create a CFG with a simple if-then-else:
@@ -759,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_analyze_variable() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let func = make_simple_if_cfg(&types);
 
         let info = analyze_variable(&func, &types, "x").unwrap();
@@ -770,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_ssa_convert_creates_phi() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = make_simple_if_cfg(&types);
         ssa_convert(&mut func, &types);
 
@@ -783,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_domtree_built() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = make_simple_if_cfg(&types);
         domtree_build(&mut func);
 
@@ -812,7 +813,7 @@ mod tests {
     fn test_max_pseudo_id_from_instructions() {
         // Regression test: pseudo IDs allocated but not in func.pseudos are tracked
         // This tests the fix in SsaConverter::new() that scans instruction operands
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
 

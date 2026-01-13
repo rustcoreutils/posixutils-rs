@@ -399,12 +399,13 @@ impl std::error::Error for SymbolError {}
 mod tests {
     use super::*;
     use crate::strings::StringTable;
+    use crate::target::Target;
     use crate::types::{Type, TypeKind, TypeTable};
 
     #[test]
     fn test_declare_and_lookup() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -422,7 +423,7 @@ mod tests {
     #[test]
     fn test_scopes() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -454,7 +455,7 @@ mod tests {
     #[test]
     fn test_shadowing() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -485,7 +486,7 @@ mod tests {
     #[test]
     fn test_redefinition_error() {
         let mut strings = StringTable::new();
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut table = SymbolTable::new();
 
         let x_id = strings.intern("x");
@@ -523,7 +524,7 @@ mod tests {
     #[test]
     fn test_function_symbol() {
         let mut strings = StringTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut table = SymbolTable::new();
 
         let foo_id = strings.intern("foo");

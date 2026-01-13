@@ -121,6 +121,23 @@ pub enum ShiftCount {
 }
 
 // ============================================================================
+// x87 FPU Binary Operations
+// ============================================================================
+
+/// x87 FPU binary operation type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X87BinOp {
+    /// FADDP - Add ST(1) + ST(0), pop
+    Add,
+    /// FSUBRP - Subtract ST(1) - ST(0), pop (reverse for correct operand order)
+    Sub,
+    /// FMULP - Multiply ST(1) * ST(0), pop
+    Mul,
+    /// FDIVRP - Divide ST(1) / ST(0), pop (reverse for correct operand order)
+    Div,
+}
+
+// ============================================================================
 // x86-64 LIR Instructions
 // ============================================================================
 
@@ -395,6 +412,52 @@ pub enum X86Inst {
         src: XmmReg,
         dst: XmmReg,
     },
+
+    // ========================================================================
+    // x87 FPU (Long Double / 80-bit Extended Precision)
+    // ========================================================================
+    /// FLDT - Load 80-bit extended precision to x87 ST(0)
+    X87Load { addr: MemAddr },
+
+    /// FSTPT - Store ST(0) to 80-bit memory and pop
+    X87Store { addr: MemAddr },
+
+    /// x87 binary operation with pop (faddp, fsubrp, fmulp, fdivrp)
+    /// Computes ST(1) op ST(0), pops, result in ST(0)
+    X87BinOp { op: X87BinOp },
+
+    /// FCHS - Negate ST(0)
+    X87Neg,
+
+    /// FCOMIP - Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
+    X87CmpPop,
+
+    /// FSTP %st(0) - Pop and discard top of x87 stack
+    X87Pop,
+
+    /// FLDS - Load 32-bit float to x87 ST(0)
+    X87LoadFloat { addr: MemAddr },
+
+    /// FLDL - Load 64-bit double to x87 ST(0)
+    X87LoadDouble { addr: MemAddr },
+
+    /// FSTPS - Store ST(0) as 32-bit float and pop
+    X87StoreFloat { addr: MemAddr },
+
+    /// FSTPL - Store ST(0) as 64-bit double and pop
+    X87StoreDouble { addr: MemAddr },
+
+    /// FILDL - Load 32-bit integer to x87 ST(0), converting to extended precision
+    X87LoadInt32 { addr: MemAddr },
+
+    /// FILDQ - Load 64-bit integer to x87 ST(0), converting to extended precision
+    X87LoadInt64 { addr: MemAddr },
+
+    /// FISTTPL - Convert ST(0) to 32-bit integer with truncation, pop
+    X87StoreInt32 { addr: MemAddr },
+
+    /// FISTTPQ - Convert ST(0) to 64-bit integer with truncation, pop
+    X87StoreInt64 { addr: MemAddr },
 
     // ========================================================================
     // Special Instructions
@@ -905,6 +968,69 @@ impl EmitAsm for X86Inst {
                     src.name(),
                     dst.name()
                 );
+            }
+
+            // x87 FPU Instructions
+            X86Inst::X87Load { addr } => {
+                let _ = writeln!(out, "    fldt {}", addr.format(target));
+            }
+
+            X86Inst::X87Store { addr } => {
+                let _ = writeln!(out, "    fstpt {}", addr.format(target));
+            }
+
+            X86Inst::X87BinOp { op } => {
+                let mnemonic = match op {
+                    X87BinOp::Add => "faddp",
+                    X87BinOp::Sub => "fsubrp", // reverse: ST(1) - ST(0)
+                    X87BinOp::Mul => "fmulp",
+                    X87BinOp::Div => "fdivrp", // reverse: ST(1) / ST(0)
+                };
+                let _ = writeln!(out, "    {} %st, %st(1)", mnemonic);
+            }
+
+            X86Inst::X87Neg => {
+                let _ = writeln!(out, "    fchs");
+            }
+
+            X86Inst::X87CmpPop => {
+                let _ = writeln!(out, "    fcomip %st(1), %st");
+            }
+
+            X86Inst::X87Pop => {
+                let _ = writeln!(out, "    fstp %st(0)");
+            }
+
+            X86Inst::X87LoadFloat { addr } => {
+                let _ = writeln!(out, "    flds {}", addr.format(target));
+            }
+
+            X86Inst::X87LoadDouble { addr } => {
+                let _ = writeln!(out, "    fldl {}", addr.format(target));
+            }
+
+            X86Inst::X87StoreFloat { addr } => {
+                let _ = writeln!(out, "    fstps {}", addr.format(target));
+            }
+
+            X86Inst::X87StoreDouble { addr } => {
+                let _ = writeln!(out, "    fstpl {}", addr.format(target));
+            }
+
+            X86Inst::X87LoadInt32 { addr } => {
+                let _ = writeln!(out, "    fildl {}", addr.format(target));
+            }
+
+            X86Inst::X87LoadInt64 { addr } => {
+                let _ = writeln!(out, "    fildq {}", addr.format(target));
+            }
+
+            X86Inst::X87StoreInt32 { addr } => {
+                let _ = writeln!(out, "    fisttpl {}", addr.format(target));
+            }
+
+            X86Inst::X87StoreInt64 { addr } => {
+                let _ = writeln!(out, "    fisttpq {}", addr.format(target));
             }
 
             // Special Instructions

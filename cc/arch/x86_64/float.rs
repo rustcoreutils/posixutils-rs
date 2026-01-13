@@ -14,12 +14,16 @@ use super::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl X86_64CodeGen {
+    /// Get size in bits from type, with fallback to provided size.
+    fn size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> u32 {
+        typ.map(|t| types.size_bits(t)).unwrap_or(size).max(32)
+    }
+
     /// Emit a floating-point load operation
-    pub(super) fn emit_fp_load(&mut self, insn: &Instruction) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_fp_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -35,11 +39,8 @@ impl X86_64CodeGen {
         };
         let addr_loc = self.get_location(addr);
 
-        let fp_size = if size <= 32 {
-            FpSize::Single
-        } else {
-            FpSize::Double
-        };
+        // Use type-aware FP size determination
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -136,22 +137,22 @@ impl X86_64CodeGen {
 
         // If destination is not the XMM register we loaded to, move it
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, size);
+            self.emit_fp_move_from_xmm(
+                dst_xmm,
+                &dst_loc,
+                Self::size_from_type(insn.typ, insn.size, types),
+            );
         }
     }
 
     /// Emit a floating-point store operation
-    pub(super) fn emit_fp_store(&mut self, insn: &Instruction) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_fp_store(&mut self, insn: &Instruction, types: &TypeTable) {
         let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&a), Some(&v)) => (a, v),
             _ => return,
         };
-        let fp_size = if size <= 32 {
-            FpSize::Single
-        } else {
-            FpSize::Double
-        };
+        // Use type-aware FP size determination
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
 
         // IMPORTANT: Check address location BEFORE emit_fp_move, because emit_fp_move
         // may clobber RAX when loading immediate values. If addr is in RAX, we need
@@ -172,7 +173,11 @@ impl X86_64CodeGen {
         };
 
         // Move value to XMM15 (scratch register) - this may clobber RAX
-        self.emit_fp_move(value, XmmReg::Xmm15, size);
+        self.emit_fp_move(
+            value,
+            XmmReg::Xmm15,
+            Self::size_from_type(insn.typ, insn.size, types),
+        );
 
         match addr_loc {
             Loc::Reg(_) => {
@@ -271,8 +276,7 @@ impl X86_64CodeGen {
     }
 
     /// Emit floating-point binary operation (addss/addsd, subss/subsd, etc.)
-    pub(super) fn emit_fp_binop(&mut self, insn: &Instruction) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -287,7 +291,8 @@ impl X86_64CodeGen {
             Loc::Xmm(x) => *x,
             _ => XmmReg::Xmm0, // Use XMM0 as work register
         };
-        let fp_size = FpSize::from_bits(size);
+        // Use type-aware FP size determination
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
 
         // Helper to emit the FP binop LIR instruction
         let emit_fp_binop_lir = |cg: &mut Self, src: XmmOperand, dst: XmmReg| match insn.op {
@@ -315,7 +320,11 @@ impl X86_64CodeGen {
         };
 
         // Move first operand to destination XMM register
-        self.emit_fp_move(src1, dst_xmm, size);
+        self.emit_fp_move(
+            src1,
+            dst_xmm,
+            Self::size_from_type(insn.typ, insn.size, types),
+        );
 
         // Apply operation with second operand
         let src2_loc = self.get_location(src2);
@@ -342,7 +351,11 @@ impl X86_64CodeGen {
                 } else {
                     XmmReg::Xmm15
                 };
-                self.emit_fp_imm_to_xmm(v, scratch, size);
+                self.emit_fp_imm_to_xmm(
+                    v,
+                    scratch,
+                    Self::size_from_type(insn.typ, insn.size, types),
+                );
                 emit_fp_binop_lir(self, XmmOperand::Reg(scratch), dst_xmm);
             }
             _ => {
@@ -353,20 +366,27 @@ impl X86_64CodeGen {
                 } else {
                     XmmReg::Xmm15
                 };
-                self.emit_fp_move(src2, scratch, size);
+                self.emit_fp_move(
+                    src2,
+                    scratch,
+                    Self::size_from_type(insn.typ, insn.size, types),
+                );
                 emit_fp_binop_lir(self, XmmOperand::Reg(scratch), dst_xmm);
             }
         }
 
         // Move result to destination if not already there
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, size);
+            self.emit_fp_move_from_xmm(
+                dst_xmm,
+                &dst_loc,
+                Self::size_from_type(insn.typ, insn.size, types),
+            );
         }
     }
 
     /// Emit floating-point negation
-    pub(super) fn emit_fp_neg(&mut self, insn: &Instruction) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -381,10 +401,15 @@ impl X86_64CodeGen {
             Loc::Xmm(x) => *x,
             _ => XmmReg::Xmm0,
         };
-        let fp_size = FpSize::from_bits(size);
+        // Use type-aware FP size determination
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
 
         // Move source to destination
-        self.emit_fp_move(src, dst_xmm, size);
+        self.emit_fp_move(
+            src,
+            dst_xmm,
+            Self::size_from_type(insn.typ, insn.size, types),
+        );
 
         // XOR with sign bit mask to negate
         // For float: 0x80000000, for double: 0x8000000000000000
@@ -394,7 +419,7 @@ impl X86_64CodeGen {
         } else {
             XmmReg::Xmm15
         };
-        if size <= 32 {
+        if fp_size == FpSize::Single {
             // Create sign mask in scratch register: all zeros except sign bit
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
@@ -429,13 +454,16 @@ impl X86_64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, size);
+            self.emit_fp_move_from_xmm(
+                dst_xmm,
+                &dst_loc,
+                Self::size_from_type(insn.typ, insn.size, types),
+            );
         }
     }
 
     /// Emit floating-point comparison
-    pub(super) fn emit_fp_compare(&mut self, insn: &Instruction) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, types: &TypeTable) {
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -444,10 +472,15 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-        let fp_size = FpSize::from_bits(size);
+        // Use type-aware FP size determination
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
 
         // Load first operand to XMM0
-        self.emit_fp_move(src1, XmmReg::Xmm0, size);
+        self.emit_fp_move(
+            src1,
+            XmmReg::Xmm0,
+            Self::size_from_type(insn.typ, insn.size, types),
+        );
 
         // Compare with second operand using ucomiss/ucomisd
         let src2_loc = self.get_location(src2);
@@ -471,7 +504,11 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, _) => {
-                self.emit_fp_imm_to_xmm(v, XmmReg::Xmm15, size);
+                self.emit_fp_imm_to_xmm(
+                    v,
+                    XmmReg::Xmm15,
+                    Self::size_from_type(insn.typ, insn.size, types),
+                );
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -479,7 +516,11 @@ impl X86_64CodeGen {
                 });
             }
             _ => {
-                self.emit_fp_move(src2, XmmReg::Xmm15, size);
+                self.emit_fp_move(
+                    src2,
+                    XmmReg::Xmm15,
+                    Self::size_from_type(insn.typ, insn.size, types),
+                );
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -522,9 +563,13 @@ impl X86_64CodeGen {
     }
 
     /// Emit integer to float conversion
-    pub(super) fn emit_int_to_float(&mut self, insn: &Instruction) {
-        let dst_size = insn.size.max(32);
-        let src_size = insn.src_size.max(32);
+    pub(super) fn emit_int_to_float(&mut self, insn: &Instruction, types: &TypeTable) {
+        // Use type-aware sizing: src_typ is the integer type, typ is the float type
+        let src_size = insn
+            .src_typ
+            .map(|t| types.size_bits(t))
+            .unwrap_or(insn.src_size)
+            .max(32);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -544,8 +589,9 @@ impl X86_64CodeGen {
         self.emit_move(src, Reg::R10, src_size);
 
         // Convert using cvtsi2ss/cvtsi2sd
+        // Use type-aware FP size for destination
         let int_size = OperandSize::from_bits(src_size);
-        let fp_size = FpSize::from_bits(dst_size);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
         self.push_lir(X86Inst::CvtIntToFp {
             int_size,
             fp_size,
@@ -554,14 +600,19 @@ impl X86_64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, dst_size);
+            self.emit_fp_move_from_xmm(
+                dst_xmm,
+                &dst_loc,
+                Self::size_from_type(insn.typ, insn.size, types),
+            );
         }
     }
 
     /// Emit float to integer conversion
-    pub(super) fn emit_float_to_int(&mut self, insn: &Instruction) {
-        let dst_size = insn.size.max(32);
-        let src_size = insn.src_size.max(32);
+    pub(super) fn emit_float_to_int(&mut self, insn: &Instruction, types: &TypeTable) {
+        // Use type-aware sizing: src_typ is the float type, typ is the integer type
+        let dst_typ = insn.typ.expect("float-to-int conversion must have typ");
+        let dst_size = types.size_bits(dst_typ).max(32);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -571,8 +622,13 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        // Move float to XMM0
-        self.emit_fp_move(src, XmmReg::Xmm0, src_size);
+        // Move float to XMM0 using type-aware source FP size
+        let fp_size = FpSize::from_type_or_bits(insn.src_typ, insn.src_size, types);
+        self.emit_fp_move(
+            src,
+            XmmReg::Xmm0,
+            Self::size_from_type(insn.src_typ, insn.src_size, types),
+        );
 
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
@@ -581,7 +637,6 @@ impl X86_64CodeGen {
         };
 
         // Convert using cvttss2si/cvttsd2si (truncate toward zero)
-        let fp_size = FpSize::from_bits(src_size);
         let int_size = OperandSize::from_bits(dst_size);
         self.push_lir(X86Inst::CvtFpToInt {
             fp_size,
@@ -596,9 +651,7 @@ impl X86_64CodeGen {
     }
 
     /// Emit float to float conversion (e.g., float to double)
-    pub(super) fn emit_float_to_float(&mut self, insn: &Instruction) {
-        let dst_size = insn.size.max(32);
-        let src_size = insn.src_size.max(32);
+    pub(super) fn emit_float_to_float(&mut self, insn: &Instruction, types: &TypeTable) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -615,39 +668,54 @@ impl X86_64CodeGen {
         };
 
         // Move source to XMM0
-        self.emit_fp_move(src, XmmReg::Xmm0, src_size);
+        self.emit_fp_move(
+            src,
+            XmmReg::Xmm0,
+            Self::size_from_type(insn.src_typ, insn.src_size, types),
+        );
 
-        // Convert
-        if src_size <= 32 && dst_size > 32 {
-            // float to double: cvtss2sd
-            self.push_lir(X86Inst::CvtFpFp {
-                src_size: FpSize::Single,
-                dst_size: FpSize::Double,
-                src: XmmReg::Xmm0,
-                dst: dst_xmm,
-            });
-        } else if src_size > 32 && dst_size <= 32 {
-            // double to float: cvtsd2ss
-            self.push_lir(X86Inst::CvtFpFp {
-                src_size: FpSize::Double,
-                dst_size: FpSize::Single,
-                src: XmmReg::Xmm0,
-                dst: dst_xmm,
-            });
-        } else {
-            // Same size, just move
-            if dst_xmm != XmmReg::Xmm0 {
-                let fp_size = FpSize::from_bits(dst_size);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm0),
-                    dst: XmmOperand::Reg(dst_xmm),
+        // Check types directly to determine conversion needed
+        let src_kind = insn.src_typ.map(|t| types.kind(t));
+        let dst_kind = insn.typ.map(|t| types.kind(t));
+
+        match (src_kind, dst_kind) {
+            (Some(TypeKind::Float), Some(TypeKind::Double | TypeKind::LongDouble)) => {
+                // float to double: cvtss2sd
+                self.push_lir(X86Inst::CvtFpFp {
+                    src_size: FpSize::Single,
+                    dst_size: FpSize::Double,
+                    src: XmmReg::Xmm0,
+                    dst: dst_xmm,
                 });
+            }
+            (Some(TypeKind::Double | TypeKind::LongDouble), Some(TypeKind::Float)) => {
+                // double to float: cvtsd2ss
+                self.push_lir(X86Inst::CvtFpFp {
+                    src_size: FpSize::Double,
+                    dst_size: FpSize::Single,
+                    src: XmmReg::Xmm0,
+                    dst: dst_xmm,
+                });
+            }
+            _ => {
+                // Same type or types unknown, just move if needed
+                if dst_xmm != XmmReg::Xmm0 {
+                    let dst_fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+                    self.push_lir(X86Inst::MovFp {
+                        size: dst_fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Reg(dst_xmm),
+                    });
+                }
             }
         }
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, dst_size);
+            self.emit_fp_move_from_xmm(
+                dst_xmm,
+                &dst_loc,
+                Self::size_from_type(insn.typ, insn.size, types),
+            );
         }
     }
 

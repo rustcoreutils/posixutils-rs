@@ -126,6 +126,28 @@ Call fields:
 - `is_sret_call`: large struct return via hidden pointer
 - `is_two_reg_return`: 9-16 byte struct via RAX+RDX / X0+X1
 - `is_noreturn_call`: function never returns
+- `abi_info`: rich ABI classification (see below)
+
+### ABI Classification (`abi_info`)
+
+Optional `CallAbiInfo` provides detailed ABI classification:
+
+```
+CallAbiInfo {
+    params: Vec<ArgClass>,  // Per-argument classification
+    ret: ArgClass,          // Return value classification
+}
+```
+
+`ArgClass` variants:
+- `Direct { classes, size_bits }` - pass in register(s)
+- `Indirect { align, size_bits }` - pass by pointer (sret)
+- `Hfa { base, count }` - homogeneous FP aggregate (AArch64)
+- `Extend { signed, size_bits }` - extend small integer
+- `Ignore` - zero-sized type
+
+This provides more detailed ABI information than `is_sret_call`/`is_two_reg_return`,
+including per-eightbyte register class (INTEGER vs SSE) for struct fields.
 
 ### Variadic Support
 

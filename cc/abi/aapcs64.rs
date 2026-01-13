@@ -281,15 +281,8 @@ impl Abi for Aapcs64Abi {
             };
         }
 
-        // Floating-point types - return in V0
-        if is_float(kind) {
-            return ArgClass::Direct {
-                classes: vec![RegClass::Sse],
-                size_bits,
-            };
-        }
-
-        // Complex types - return as HFA
+        // Complex types - return as HFA (must check BEFORE is_float since complex
+        // types have TypeKind::Float/Double/LongDouble)
         if types.is_complex(ty) {
             let base_ty = types.complex_base(ty);
             let base_kind = types.kind(base_ty);
@@ -311,6 +304,14 @@ impl Abi for Aapcs64Abi {
                     size_bits,
                 };
             }
+        }
+
+        // Floating-point types (non-complex) - return in V0
+        if is_float(kind) {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Sse],
+                size_bits,
+            };
         }
 
         // Aggregate types

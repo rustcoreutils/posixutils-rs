@@ -982,9 +982,9 @@ impl EmitAsm for X86Inst {
             X86Inst::X87BinOp { op } => {
                 let mnemonic = match op {
                     X87BinOp::Add => "faddp",
-                    X87BinOp::Sub => "fsubrp", // reverse: ST(1) - ST(0)
+                    X87BinOp::Sub => "fsubrp", // ST(1) = ST(1) - ST(0)
                     X87BinOp::Mul => "fmulp",
-                    X87BinOp::Div => "fdivrp", // reverse: ST(1) / ST(0)
+                    X87BinOp::Div => "fdivrp", // ST(1) = ST(1) / ST(0)
                 };
                 let _ = writeln!(out, "    {} %st, %st(1)", mnemonic);
             }

@@ -778,12 +778,17 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // Write global header if this is the first entry and we have global options
         self.write_global_header()?;
 
-        // Check if we need extended headers (respecting -o times option)
-        let ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
+        // Build extended header (respecting -o times option)
+        let mut ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
 
-        if !ext_header.is_empty() {
-            self.write_extended_header(&ext_header, entry)?;
+        // For pax format, always include at least mtime to ensure the archive
+        // is identifiable as pax (has extended headers with typeflag 'x')
+        if ext_header.is_empty() {
+            let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
+            ext_header.mtime = Some(mtime_float);
         }
+
+        self.write_extended_header(&ext_header, entry)?;
 
         // Write the regular ustar header
         let header = build_ustar_header(entry)?;

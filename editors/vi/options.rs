@@ -271,37 +271,83 @@ impl Options {
         Ok(Some(result))
     }
 
-    /// Show all options.
+    /// Show all options in formatted columns.
     fn show_all(&self) -> String {
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "{}number       tabstop={}    shiftwidth={}",
-            if self.number { "" } else { "no" },
-            self.tabstop,
-            self.shiftwidth
+        // Collect all options
+        let mut items: Vec<String> = Vec::new();
+
+        // Boolean options (alphabetically sorted)
+        items.push(format!(
+            "{}autoindent",
+            if self.autoindent { "" } else { "no" }
         ));
-        lines.push(format!(
-            "{}list         {}showmatch   {}showmode",
-            if self.list { "" } else { "no" },
-            if self.showmatch { "" } else { "no" },
-            if self.showmode { "" } else { "no" }
+        items.push(format!(
+            "{}autowrite",
+            if self.autowrite { "" } else { "no" }
         ));
-        lines.push(format!("window={}    scroll={}", self.window, self.scroll));
-        lines.push(format!(
-            "{}autoindent   {}autowrite   {}ignorecase",
-            if self.autoindent { "" } else { "no" },
-            if self.autowrite { "" } else { "no" },
+        items.push(format!("{}backup", if self.backup { "" } else { "no" }));
+        items.push(format!(
+            "{}errorbells",
+            if self.errorbells { "" } else { "no" }
+        ));
+        items.push(format!(
+            "{}expandtab",
+            if self.expandtab { "" } else { "no" }
+        ));
+        items.push(format!("{}flash", if self.flash { "" } else { "no" }));
+        items.push(format!(
+            "{}ignorecase",
             if self.ignorecase { "" } else { "no" }
         ));
-        lines.push(format!(
-            "{}magic        {}wrap        {}wrapscan",
-            if self.magic { "" } else { "no" },
-            if self.wrap { "" } else { "no" },
-            if self.wrapscan { "" } else { "no" }
+        items.push(format!("{}list", if self.list { "" } else { "no" }));
+        items.push(format!("{}magic", if self.magic { "" } else { "no" }));
+        items.push(format!("{}number", if self.number { "" } else { "no" }));
+        items.push(format!("{}readonly", if self.readonly { "" } else { "no" }));
+        items.push(format!(
+            "{}showmatch",
+            if self.showmatch { "" } else { "no" }
         ));
-        lines.push(format!("shell={}", self.shell));
-        lines.push(format!("tags={}", self.tags));
-        lines.join("\n")
+        items.push(format!("{}showmode", if self.showmode { "" } else { "no" }));
+        items.push(format!("{}timeout", if self.timeout { "" } else { "no" }));
+        items.push(format!("{}wrap", if self.wrap { "" } else { "no" }));
+        items.push(format!("{}wrapscan", if self.wrapscan { "" } else { "no" }));
+        items.push(format!("{}writeany", if self.writeany { "" } else { "no" }));
+
+        // Numeric options
+        items.push(format!("scroll={}", self.scroll));
+        items.push(format!("shiftwidth={}", self.shiftwidth));
+        items.push(format!("tabstop={}", self.tabstop));
+        items.push(format!("taglength={}", self.taglength));
+        items.push(format!("window={}", self.window));
+
+        // String options
+        items.push(format!("paragraphs={}", self.paragraphs));
+        items.push(format!("sections={}", self.sections));
+        items.push(format!("shell={}", self.shell));
+        items.push(format!("tags={}", self.tags));
+        items.push(format!("term={}", self.term));
+
+        // Format in 3 columns with fixed width
+        Self::format_columns(&items, 3, 20)
+    }
+
+    /// Format items in columns.
+    fn format_columns(items: &[String], cols: usize, col_width: usize) -> String {
+        let mut result = String::new();
+        for chunk in items.chunks(cols) {
+            for (i, item) in chunk.iter().enumerate() {
+                if i > 0 {
+                    result.push_str("  "); // separator between columns
+                }
+                result.push_str(&format!("{:<width$}", item, width = col_width));
+            }
+            result.push('\n');
+        }
+        // Remove trailing newline
+        if result.ends_with('\n') {
+            result.pop();
+        }
+        result
     }
 
     /// Show changed options (different from defaults).

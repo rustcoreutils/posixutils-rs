@@ -88,6 +88,15 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         editor.set_readonly(true);
     }
 
+    // Load startup configuration (EXINIT or $HOME/.exrc)
+    // Per POSIX, this happens before editing the first file
+    if let Err(e) = editor.load_startup_config() {
+        if !opts.silent_mode {
+            eprintln!("{}: startup config: {}", prog_name, e);
+        }
+        // Continue anyway - don't fail on config errors
+    }
+
     // Open files
     if !opts.files.is_empty() {
         if let Err(e) = editor.open_files(opts.files) {

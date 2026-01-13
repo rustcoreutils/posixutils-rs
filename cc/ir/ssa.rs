@@ -555,7 +555,7 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
                 let addr = insn.src[0];
 
                 // Check if this is a store to our variable
-                if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == addr) {
+                if let Some(pseudo) = func.get_pseudo(addr) {
                     if let PseudoKind::Sym(name) = &pseudo.kind {
                         if name == var {
                             return Some(insn.src[1]);

@@ -50,26 +50,9 @@ pub fn run(func: &mut Function) -> bool {
 // ============================================================================
 
 /// Check if an opcode is a "root" (has side effects, cannot be deleted).
+#[inline]
 fn is_root(op: Opcode) -> bool {
-    matches!(
-        op,
-        Opcode::Ret
-            | Opcode::Br
-            | Opcode::Cbr
-            | Opcode::Switch
-            | Opcode::Unreachable
-            | Opcode::Store
-            | Opcode::Call
-            | Opcode::Entry
-            | Opcode::VaStart
-            | Opcode::VaEnd
-            | Opcode::VaCopy
-            | Opcode::VaArg
-            | Opcode::Alloca
-            | Opcode::Setjmp  // Has side effects (saves context)
-            | Opcode::Longjmp // Never returns (noreturn)
-            | Opcode::Asm // Inline assembly has side effects
-    )
+    op.has_side_effects()
 }
 
 /// Get all pseudo IDs used by an instruction (operands).
@@ -298,24 +281,22 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
     let reachable = compute_reachable(func);
     let before = func.blocks.len();
 
-    // Compute unreachable set BEFORE removing blocks
-    let all_block_ids: HashSet<_> = func.blocks.iter().map(|bb| bb.id).collect();
-    let unreachable: HashSet<_> = all_block_ids.difference(&reachable).copied().collect();
+    // Collect unreachable predecessors before removing blocks
+    let unreachable: HashSet<_> = func
+        .blocks
+        .iter()
+        .map(|bb| bb.id)
+        .filter(|id| !reachable.contains(id))
+        .collect();
 
     // Remove unreachable blocks
     func.blocks.retain(|bb| reachable.contains(&bb.id));
 
-    // Update parent/child references to remove dead blocks
+    // Update parent/child references and phi nodes to remove dead blocks
     for bb in &mut func.blocks {
-        bb.parents.retain(|p| !unreachable.contains(p));
-        bb.children.retain(|c| !unreachable.contains(c));
-
-        // Also clean phi_list entries that reference removed blocks
-        for insn in &mut bb.insns {
-            if insn.op == Opcode::Phi {
-                insn.phi_list
-                    .retain(|(pred, _)| !unreachable.contains(pred));
-            }
+        bb.retain_edges(&reachable);
+        for &pred in &unreachable {
+            bb.remove_phi_predecessor(pred);
         }
     }
 

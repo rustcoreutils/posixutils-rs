@@ -938,7 +938,7 @@ fn remove_dead_functions(module: &mut Module) {
                     // Check if this takes the address of a function
                     if !insn.src.is_empty() {
                         let src_id = insn.src[0];
-                        if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == src_id) {
+                        if let Some(pseudo) = func.get_pseudo(src_id) {
                             if let PseudoKind::Sym(ref name) = pseudo.kind {
                                 // Check if this symbol is a function name
                                 if func_names.contains(name) {

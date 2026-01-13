@@ -219,6 +219,30 @@ impl Opcode {
         )
     }
 
+    /// Check if this opcode has side effects (cannot be deleted even if unused).
+    /// These are "root" instructions for dead code elimination.
+    pub fn has_side_effects(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Ret
+                | Opcode::Br
+                | Opcode::Cbr
+                | Opcode::Switch
+                | Opcode::Unreachable
+                | Opcode::Store
+                | Opcode::Call
+                | Opcode::Entry
+                | Opcode::VaStart
+                | Opcode::VaEnd
+                | Opcode::VaCopy
+                | Opcode::VaArg
+                | Opcode::Alloca
+                | Opcode::Setjmp
+                | Opcode::Longjmp
+                | Opcode::Asm
+        )
+    }
+
     /// Get the opcode name for display
     pub fn name(&self) -> &'static str {
         match self {
@@ -1041,6 +1065,21 @@ impl BasicBlock {
             self.children.push(child);
         }
     }
+
+    /// Remove edges to/from blocks not in the keep set
+    pub fn retain_edges(&mut self, keep: &std::collections::HashSet<BasicBlockId>) {
+        self.parents.retain(|p| keep.contains(p));
+        self.children.retain(|c| keep.contains(c));
+    }
+
+    /// Remove phi entries for a specific predecessor
+    pub fn remove_phi_predecessor(&mut self, pred: BasicBlockId) {
+        for insn in &mut self.insns {
+            if insn.op == Opcode::Phi {
+                insn.phi_list.retain(|(p, _)| *p != pred);
+            }
+        }
+    }
 }
 
 impl fmt::Display for BasicBlock {
@@ -1205,7 +1244,6 @@ impl Function {
     }
 
     /// Get a pseudo by its ID
-    #[cfg(test)]
     pub fn get_pseudo(&self, id: PseudoId) -> Option<&Pseudo> {
         self.pseudos.iter().find(|p| p.id == id)
     }

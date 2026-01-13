@@ -397,68 +397,67 @@ impl X86_64CodeGen {
             .expect("abi_info must be populated for Call instructions");
 
         match &abi_info.ret {
-                ArgClass::Direct { classes, size_bits } => {
-                    // Check for two-register struct return (9-16 bytes)
-                    if *size_bits > 64 && classes.len() == 2 {
-                        // Check if it's two INTEGER (struct) vs two SSE (complex) vs mixed
-                        if classes.iter().all(|c| *c == RegClass::Integer) {
-                            self.handle_two_reg_return(&dst_loc);
-                            return;
-                        }
-                        // Check for mixed SSE+INTEGER return (e.g., {double, int})
-                        if classes.contains(&RegClass::Sse) && classes.contains(&RegClass::Integer)
-                        {
-                            self.handle_mixed_return(&dst_loc, classes);
-                            return;
-                        }
-                    }
-                    // Check for complex return (two SSE registers)
-                    if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Sse) {
-                        let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
-                        if is_complex_result {
-                            self.handle_complex_return(insn, &dst_loc, types);
-                            return;
-                        }
-                        // Two SSE struct return (not complex)
-                        self.handle_two_sse_return(&dst_loc);
+            ArgClass::Direct { classes, size_bits } => {
+                // Check for two-register struct return (9-16 bytes)
+                if *size_bits > 64 && classes.len() == 2 {
+                    // Check if it's two INTEGER (struct) vs two SSE (complex) vs mixed
+                    if classes.iter().all(|c| *c == RegClass::Integer) {
+                        self.handle_two_reg_return(&dst_loc);
                         return;
                     }
-                    // Check for single SSE return
-                    if classes.first() == Some(&RegClass::Sse) {
-                        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_size);
+                    // Check for mixed SSE+INTEGER return (e.g., {double, int})
+                    if classes.contains(&RegClass::Sse) && classes.contains(&RegClass::Integer) {
+                        self.handle_mixed_return(&dst_loc, classes);
                         return;
                     }
-                    // Integer return
-                    self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
                 }
-                ArgClass::Indirect { .. } => {
-                    // sret: return value already written to memory, nothing to do
-                }
-                ArgClass::Hfa { count, base } => {
-                    // HFA returns (primarily AArch64, but handle for completeness)
-                    // Complex types are similar - return in XMM0, XMM1
-                    if *count == 2 {
-                        let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
-                        if is_complex_result {
-                            self.handle_complex_return(insn, &dst_loc, types);
-                            return;
-                        }
+                // Check for complex return (two SSE registers)
+                if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Sse) {
+                    let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
+                    if is_complex_result {
+                        self.handle_complex_return(insn, &dst_loc, types);
+                        return;
                     }
-                    // For other HFA cases, treat as FP return
-                    let size_bits = match base {
-                        crate::abi::HfaBase::Float32 => 32,
-                        crate::abi::HfaBase::Float64 => 64,
-                    };
-                    self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size_bits);
+                    // Two SSE struct return (not complex)
+                    self.handle_two_sse_return(&dst_loc);
+                    return;
                 }
-                ArgClass::Extend { .. } => {
-                    // Extended return value in RAX
-                    self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
+                // Check for single SSE return
+                if classes.first() == Some(&RegClass::Sse) {
+                    self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_size);
+                    return;
                 }
-                ArgClass::Ignore => {
-                    // Void return, nothing to do
-                }
+                // Integer return
+                self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
             }
+            ArgClass::Indirect { .. } => {
+                // sret: return value already written to memory, nothing to do
+            }
+            ArgClass::Hfa { count, base } => {
+                // HFA returns (primarily AArch64, but handle for completeness)
+                // Complex types are similar - return in XMM0, XMM1
+                if *count == 2 {
+                    let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
+                    if is_complex_result {
+                        self.handle_complex_return(insn, &dst_loc, types);
+                        return;
+                    }
+                }
+                // For other HFA cases, treat as FP return
+                let size_bits = match base {
+                    crate::abi::HfaBase::Float32 => 32,
+                    crate::abi::HfaBase::Float64 => 64,
+                };
+                self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size_bits);
+            }
+            ArgClass::Extend { .. } => {
+                // Extended return value in RAX
+                self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
+            }
+            ArgClass::Ignore => {
+                // Void return, nothing to do
+            }
+        }
     }
 
     /// Handle two-register struct return (RAX + RDX)

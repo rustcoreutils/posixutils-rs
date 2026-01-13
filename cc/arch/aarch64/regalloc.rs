@@ -40,7 +40,7 @@ use crate::arch::regalloc::{
     identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeTable;
+use crate::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 /// Get constraint info for an instruction (used by shared compute_live_intervals).
@@ -856,6 +856,42 @@ impl RegAlloc {
                     }
                     _ => {}
                 }
+            }
+
+            // Force stack allocation for complex and struct return values from calls
+            // These types span multiple FP/GP registers and cannot fit in a single register
+            let needs_stack_for_multi_reg_return = func.blocks.iter().any(|b| {
+                b.insns.iter().any(|insn| {
+                    if insn.op == Opcode::Call && insn.target == Some(interval.pseudo) {
+                        if let Some(typ) = insn.typ {
+                            // Complex types use V0+V1 (2 FP regs)
+                            // Struct/union types may use multiple regs depending on size
+                            let kind = types.kind(typ);
+                            types.is_complex(typ)
+                                || matches!(kind, TypeKind::Struct | TypeKind::Union)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                })
+            });
+
+            if needs_stack_for_multi_reg_return {
+                let size = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insns)
+                    .find(|insn| insn.target == Some(interval.pseudo))
+                    .map(|insn| (insn.size / 8) as i32)
+                    .unwrap_or(8)
+                    .max(8);
+                let aligned_size = (size + 7) & !7;
+                self.stack_offset += aligned_size;
+                self.locations
+                    .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                continue;
             }
 
             // Allocate register based on type

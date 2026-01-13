@@ -611,11 +611,8 @@ impl X86_64CodeGen {
     /// Emit float to integer conversion
     pub(super) fn emit_float_to_int(&mut self, insn: &Instruction, types: &TypeTable) {
         // Use type-aware sizing: src_typ is the float type, typ is the integer type
-        let dst_size = insn
-            .typ
-            .map(|t| types.size_bits(t))
-            .unwrap_or(insn.size)
-            .max(32);
+        let dst_typ = insn.typ.expect("float-to-int conversion must have typ");
+        let dst_size = types.size_bits(dst_typ).max(32);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,

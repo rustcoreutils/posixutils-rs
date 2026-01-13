@@ -825,11 +825,8 @@ impl X86_64CodeGen {
                     self.push_lir(X86Inst::X87Load { addr: src_addr });
                 } else {
                     // Use type-aware size for FP return
-                    let fp_size = insn
-                        .typ
-                        .map(|t| types.size_bits(t))
-                        .unwrap_or(insn.size)
-                        .max(32);
+                    let fp_typ = insn.typ.expect("FP return must have type");
+                    let fp_size = types.size_bits(fp_typ).max(32);
                     self.emit_fp_move(*src, XmmReg::Xmm0, fp_size);
                 }
             } else {

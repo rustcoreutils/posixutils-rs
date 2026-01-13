@@ -373,12 +373,8 @@ impl X86_64CodeGen {
         let dst_kind = insn.typ.map(|t| types.kind(t));
         let src_is_longdouble = src_kind == Some(TypeKind::LongDouble);
         let dst_is_longdouble = dst_kind == Some(TypeKind::LongDouble);
-        let src_is_float = src_kind
-            .map(|k| k == TypeKind::Float)
-            .unwrap_or(insn.src_size <= 32);
-        let dst_is_float = dst_kind
-            .map(|k| k == TypeKind::Float)
-            .unwrap_or(insn.size <= 32);
+        let src_is_float = src_kind.expect("x87 convert must have src_typ") == TypeKind::Float;
+        let dst_is_float = dst_kind.expect("x87 convert must have typ") == TypeKind::Float;
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,

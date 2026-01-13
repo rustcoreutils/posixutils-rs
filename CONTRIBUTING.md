@@ -1,5 +1,45 @@
 # Welcome to the Project :)
 
+## How to Contribute: Issues, Not Pull Requests
+
+**This project accepts contributions via GitHub Issues exclusively.** We do not accept Pull Requests.
+
+### Why Issues Instead of PRs?
+
+This project uses AI-assisted coding for development. In this workflow:
+
+- **PRs lose context**: A pull request shows *what* changed, but not *why* or *how* decisions were made. The AI prompts, design discussions, and iterative refinements that produced the code are invisible.
+- **PRs are hard to review**: AI-generated PRs tend to be large, touching many files, making thorough review impractical.
+- **Issues preserve context**: A well-written issue captures the problem, expected behavior, examples, and constraints—everything both humans and AI agents need to produce a good solution.
+
+### What Makes a Good Issue?
+
+The more context you provide, the better the result. Include:
+
+- **Problem description**: What's wrong, or what's missing?
+- **Expected behavior**: What should happen?
+- **Actual behavior**: What happens instead? (for bugs)
+- **Example output**: Paste terminal output, error messages, stack traces
+- **Reproduction steps**: Commands to reproduce the issue
+- **System info**: Output of `uname -a`, Rust version, etc.
+- **POSIX spec references**: Link to relevant POSIX documentation
+- **Test cases**: Input files, expected output files
+- **Feature rationale**: Why is this feature needed? What use cases?
+
+Think of your issue as providing context for an AI coding agent. The richer the context, the better the implementation.
+
+### Contribution Types
+
+All contributions are welcome via issues:
+
+- **Bug reports**: Describe the bug with reproduction steps and expected behavior
+- **Feature requests**: Describe the feature and its use cases
+- **POSIX compliance issues**: Reference the spec, show non-compliant behavior
+- **Documentation improvements**: Describe what's unclear or missing
+- **Test case suggestions**: Provide input/output examples for testing
+
+---
+
 There are several ways to contribute to posixutils-rs:
 
 * coding
@@ -25,13 +65,12 @@ Test (one module): `cargo test --release -p posixutils-SOMECRATE`
 6. Audited:  An external party has reviewed and tested for correctness, 
    POSIX compliance, security, races and similar issues.
 
-### Coding considerations
+### For Maintainers: Commit Standards
 
 1. Separate logical changes into separate commits.  For example, bug fixes
    and new features should be separate commits.
 2. All commits should pass tests.  This keeps `git bisect` working.
-3. All PRs must pass tests before merging.
-4. All code contributions must be **copyright clean**:  either freshly written,
+3. All code must be **copyright clean**:  either freshly written,
    or copied from source code with a compatible open source license.
 
 ### CLI utility and Rust style guidelines

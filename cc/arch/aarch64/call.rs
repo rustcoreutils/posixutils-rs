@@ -327,10 +327,11 @@ impl Aarch64CodeGen {
 
         match arg_loc {
             Loc::Stack(offset) => {
+                // Complex value is stored directly on stack, load both parts
                 let actual_offset = self.stack_offset(frame_size, offset);
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B64,
-                    dst: Reg::X9,
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    dst: real_reg,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: actual_offset,
@@ -338,18 +339,10 @@ impl Aarch64CodeGen {
                 });
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
-                    dst: real_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X9,
-                        offset: 0,
-                    },
-                });
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
                     dst: imag_reg,
                     addr: MemAddr::BaseOffset {
-                        base: Reg::X9,
-                        offset: imag_offset,
+                        base: Reg::X29,
+                        offset: actual_offset + imag_offset,
                     },
                 });
             }

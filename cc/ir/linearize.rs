@@ -2502,6 +2502,7 @@ impl<'a> Linearizer<'a> {
                         Instruction::new(Opcode::Copy)
                             .with_target(pseudo)
                             .with_src(*param_pseudo)
+                            .with_type(typ)
                             .with_size(size),
                     );
                 } else {
@@ -2552,6 +2553,7 @@ impl<'a> Linearizer<'a> {
                         Instruction::new(Opcode::Copy)
                             .with_target(out_pseudo)
                             .with_src(val)
+                            .with_type(typ)
                             .with_size(size),
                     );
                     out_pseudo

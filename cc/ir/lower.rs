@@ -16,6 +16,7 @@
 //
 
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
+use crate::types::TypeId;
 use std::collections::HashMap;
 
 const DEFAULT_COPY_CAPACITY: usize = 8;
@@ -71,6 +72,7 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
                             target,
                             source: *src_pseudo,
                             size,
+                            typ: insn.typ,
                         };
 
                         copies_to_insert
@@ -101,10 +103,11 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
     for (pred_bb_id, copies) in sequenced_copies {
         if let Some(pred_bb) = func.get_block_mut(pred_bb_id) {
             for copy_info in copies {
-                let copy_insn = Instruction::new(Opcode::Copy)
+                let mut copy_insn = Instruction::new(Opcode::Copy)
                     .with_target(copy_info.target)
                     .with_src(copy_info.source)
                     .with_size(copy_info.size);
+                copy_insn.typ = copy_info.typ;
 
                 pred_bb.insert_before_terminator(copy_insn);
             }
@@ -132,6 +135,7 @@ struct CopyInfo {
     target: crate::ir::PseudoId,
     source: crate::ir::PseudoId,
     size: u32,
+    typ: Option<TypeId>,
 }
 
 /// Sequentialize parallel copies to handle the "lost copy" problem.
@@ -199,6 +203,7 @@ fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInf
             let copy = &pending[0];
             let original_source = copy.source;
             let copy_size = copy.size;
+            let copy_typ = copy.typ;
 
             // Create a temporary pseudo to hold the original source value
             let temp_id = super::PseudoId(func.next_pseudo);
@@ -211,6 +216,7 @@ fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInf
                 target: temp_id,
                 source: original_source,
                 size: copy_size,
+                typ: copy_typ,
             });
 
             // Update ALL pending copies that use this source to use temp instead
@@ -440,11 +446,13 @@ mod tests {
                 target: PseudoId(1),
                 source: PseudoId(10),
                 size: 32,
+                typ: None,
             },
             CopyInfo {
                 target: PseudoId(2),
                 source: PseudoId(20),
                 size: 32,
+                typ: None,
             },
         ];
 
@@ -469,11 +477,13 @@ mod tests {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
                 size: 32,
+                typ: None,
             },
             CopyInfo {
                 target: PseudoId(2),  // b
                 source: PseudoId(10), // x
                 size: 32,
+                typ: None,
             },
         ];
 
@@ -497,11 +507,13 @@ mod tests {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
                 size: 32,
+                typ: None,
             },
             CopyInfo {
                 target: PseudoId(2), // b
                 source: PseudoId(1), // a
                 size: 32,
+                typ: None,
             },
         ];
 
@@ -530,16 +542,19 @@ mod tests {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
                 size: 32,
+                typ: None,
             },
             CopyInfo {
                 target: PseudoId(2), // b
                 source: PseudoId(3), // c
                 size: 32,
+                typ: None,
             },
             CopyInfo {
                 target: PseudoId(3), // c
                 source: PseudoId(1), // a
                 size: 32,
+                typ: None,
             },
         ];
 

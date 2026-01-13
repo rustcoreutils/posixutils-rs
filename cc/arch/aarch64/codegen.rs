@@ -1085,11 +1085,11 @@ impl Aarch64CodeGen {
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
                                     // Load FP constant using integer register
-                                    // Use type to determine float vs double, fall back to size
+                                    // Type must be present for FP constants
                                     let is_float = insn
                                         .typ
                                         .map(|t| types.kind(t) == TypeKind::Float)
-                                        .unwrap_or(insn.size <= 32);
+                                        .expect("FP constant must have type info");
                                     let (scratch0, _, _) = Reg::scratch_regs();
                                     let bits = if is_float {
                                         (*f as f32).to_bits() as i64

@@ -310,7 +310,15 @@ fn run_read_multi_volume(args: &Args, options: &ReadOptions) -> PaxResult<()> {
 fn run_write(args: &Args) -> PaxResult<()> {
     let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
-    let format_options = parse_format_options(args)?;
+    let mut format_options = parse_format_options(args)?;
+
+    let format = ArchiveFormat::from(args.format);
+
+    // For pax format, automatically enable times option to ensure extended headers
+    // are always present (this distinguishes pax from ustar format)
+    if format == ArchiveFormat::Pax && !format_options.include_times {
+        format_options.include_times = true;
+    }
 
     let options = WriteOptions {
         cli_dereference: args.cli_dereference,
@@ -323,8 +331,6 @@ fn run_write(args: &Args) -> PaxResult<()> {
         substitutions,
         format_options,
     };
-
-    let format = ArchiveFormat::from(args.format);
 
     // Check for multi-volume mode
     if args.multi_volume {

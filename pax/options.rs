@@ -393,6 +393,7 @@ pub fn format_list_entry(
     uname: Option<&str>,
     gname: Option<&str>,
     link_target: Option<&str>,
+    entry_type: crate::archive::EntryType,
 ) -> String {
     let mut result = String::new();
     let mut chars = format.chars().peekable();
@@ -424,7 +425,7 @@ pub fn format_list_entry(
                 }
                 Some('M') => {
                     // Mode (symbolic)
-                    result.push_str(&format_mode_symbolic(mode));
+                    result.push_str(&format_mode_symbolic(mode, entry_type));
                 }
                 Some('s') => {
                     // Size
@@ -480,20 +481,22 @@ pub fn format_list_entry(
 }
 
 /// Format mode as symbolic string (like ls -l)
-fn format_mode_symbolic(mode: u32) -> String {
+fn format_mode_symbolic(mode: u32, entry_type: crate::archive::EntryType) -> String {
     let mut s = String::with_capacity(10);
 
-    // File type
-    let file_type = (mode >> 12) & 0xF;
-    s.push(match file_type {
-        0o12 => 'l', // symlink
-        0o04 => 'd', // directory
-        0o10 => '-', // regular
-        0o01 => 'p', // fifo
-        0o06 => 'b', // block
-        0o02 => 'c', // char
-        0o14 => 's', // socket
-        _ => '?',
+    // File type - use entry_type from archive header, not mode bits
+    // In tar archives, the mode field only contains permissions (0-07777),
+    // and the file type comes from the typeflag field
+    use crate::archive::EntryType;
+    s.push(match entry_type {
+        EntryType::Symlink => 'l',
+        EntryType::Directory => 'd',
+        EntryType::Regular => '-',
+        EntryType::Fifo => 'p',
+        EntryType::BlockDevice => 'b',
+        EntryType::CharDevice => 'c',
+        EntryType::Socket => 's',
+        EntryType::Hardlink => '-', // Hard links are shown as regular files
     });
 
     // Owner permissions
@@ -720,10 +723,11 @@ mod tests {
 
     #[test]
     fn test_format_list_entry_basic() {
+        use crate::archive::EntryType;
         let result = format_list_entry(
             "%F",
             "path/to/file.txt",
-            0o100644,
+            0o644,
             1234,
             0,
             1000,
@@ -731,16 +735,18 @@ mod tests {
             Some("user"),
             Some("group"),
             None,
+            EntryType::Regular,
         );
         assert_eq!(result, "path/to/file.txt");
     }
 
     #[test]
     fn test_format_list_entry_complex() {
+        use crate::archive::EntryType;
         let result = format_list_entry(
             "%M %u %g %s %f",
             "dir/file.txt",
-            0o100755,
+            0o755,
             4096,
             0,
             1000,
@@ -748,19 +754,21 @@ mod tests {
             Some("alice"),
             Some("users"),
             None,
+            EntryType::Regular,
         );
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
     }
 
     #[test]
     fn test_format_mode_symbolic() {
-        assert_eq!(format_mode_symbolic(0o100644), "-rw-r--r--");
-        assert_eq!(format_mode_symbolic(0o100755), "-rwxr-xr-x");
-        assert_eq!(format_mode_symbolic(0o040755), "drwxr-xr-x");
-        assert_eq!(format_mode_symbolic(0o120777), "lrwxrwxrwx");
-        assert_eq!(format_mode_symbolic(0o104755), "-rwsr-xr-x"); // setuid
-        assert_eq!(format_mode_symbolic(0o102755), "-rwxr-sr-x"); // setgid
-        assert_eq!(format_mode_symbolic(0o101755), "-rwxr-xr-t"); // sticky
+        use crate::archive::EntryType;
+        assert_eq!(format_mode_symbolic(0o644, EntryType::Regular), "-rw-r--r--");
+        assert_eq!(format_mode_symbolic(0o755, EntryType::Regular), "-rwxr-xr-x");
+        assert_eq!(format_mode_symbolic(0o755, EntryType::Directory), "drwxr-xr-x");
+        assert_eq!(format_mode_symbolic(0o777, EntryType::Symlink), "lrwxrwxrwx");
+        assert_eq!(format_mode_symbolic(0o4755, EntryType::Regular), "-rwsr-xr-x"); // setuid
+        assert_eq!(format_mode_symbolic(0o2755, EntryType::Regular), "-rwxr-sr-x"); // setgid
+        assert_eq!(format_mode_symbolic(0o1755, EntryType::Regular), "-rwxr-xr-t"); // sticky
     }
 
     #[test]

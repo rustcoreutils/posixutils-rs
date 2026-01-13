@@ -189,6 +189,7 @@ fn print_entry<W: Write>(
             entry.uname.as_deref(),
             entry.gname.as_deref(),
             link_target_str.as_deref(),
+            entry.entry_type,
         );
         write!(writer, "{}", output)?;
         // Add newline if format doesn't end with one

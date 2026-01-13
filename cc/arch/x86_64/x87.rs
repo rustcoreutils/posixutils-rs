@@ -368,19 +368,17 @@ impl X86_64CodeGen {
     /// Emit float-to-float conversion involving long double.
     /// Handles conversions between float/double and long double using x87 FPU.
     pub(super) fn emit_x87_fp_cvt(&mut self, insn: &Instruction, types: &TypeTable) {
-        // Type info must be present for FP conversions
-        let src_kind = insn
-            .src_typ
-            .map(|t| types.kind(t))
-            .expect("FP conversion must have src_typ");
-        let dst_kind = insn
-            .typ
-            .map(|t| types.kind(t))
-            .expect("FP conversion must have dst typ");
-        let src_is_longdouble = src_kind == TypeKind::LongDouble;
-        let dst_is_longdouble = dst_kind == TypeKind::LongDouble;
-        let src_is_float = src_kind == TypeKind::Float;
-        let dst_is_float = dst_kind == TypeKind::Float;
+        // Use type info for proper FP size detection, fall back to size
+        let src_kind = insn.src_typ.map(|t| types.kind(t));
+        let dst_kind = insn.typ.map(|t| types.kind(t));
+        let src_is_longdouble = src_kind == Some(TypeKind::LongDouble);
+        let dst_is_longdouble = dst_kind == Some(TypeKind::LongDouble);
+        let src_is_float = src_kind
+            .map(|k| k == TypeKind::Float)
+            .unwrap_or(insn.src_size <= 32);
+        let dst_is_float = dst_kind
+            .map(|k| k == TypeKind::Float)
+            .unwrap_or(insn.size <= 32);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,

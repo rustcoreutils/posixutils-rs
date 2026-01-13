@@ -368,24 +368,13 @@ impl X86_64CodeGen {
     /// Emit float-to-float conversion involving long double.
     /// Handles conversions between float/double and long double using x87 FPU.
     pub(super) fn emit_x87_fp_cvt(&mut self, insn: &Instruction, types: &TypeTable) {
-        // Use type info for proper detection of long double
-        let src_is_longdouble = insn
-            .src_typ
-            .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
-        let dst_is_longdouble = insn
-            .typ
-            .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
-        // Get sizes from type (type-aware approach) - fall back to insn.size
-        let dst_size = insn
-            .typ
-            .map(|t| types.size_bits(t))
-            .unwrap_or(insn.size)
-            .max(32);
-        let src_size = insn
-            .src_typ
-            .map(|t| types.size_bits(t))
-            .unwrap_or(insn.src_size)
-            .max(32);
+        // Use type info for proper FP size detection
+        let src_kind = insn.src_typ.map(|t| types.kind(t));
+        let dst_kind = insn.typ.map(|t| types.kind(t));
+        let src_is_longdouble = src_kind == Some(TypeKind::LongDouble);
+        let dst_is_longdouble = dst_kind == Some(TypeKind::LongDouble);
+        let src_is_float = src_kind == Some(TypeKind::Float);
+        let dst_is_float = dst_kind == Some(TypeKind::Float);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -447,7 +436,7 @@ impl X86_64CodeGen {
                 get_mem_addr(&dst_loc, self)
             };
 
-            if dst_size <= 32 {
+            if dst_is_float {
                 // Store as float (32-bit)
                 self.push_lir(X86Inst::X87StoreFloat {
                     addr: dst_addr.clone(),
@@ -463,7 +452,7 @@ impl X86_64CodeGen {
             if let Loc::Xmm(xmm_reg) = &dst_loc {
                 use super::lir::XmmOperand;
                 use crate::arch::lir::FpSize;
-                let fp_size = if dst_size <= 32 {
+                let fp_size = if dst_is_float {
                     FpSize::Single
                 } else {
                     FpSize::Double
@@ -486,7 +475,7 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: -8,
                     };
-                    let fp_size = if src_size <= 32 {
+                    let fp_size = if src_is_float {
                         FpSize::Single
                     } else {
                         FpSize::Double
@@ -509,7 +498,7 @@ impl X86_64CodeGen {
             };
 
             // Load as float/double to x87
-            if src_size <= 32 {
+            if src_is_float {
                 // Load float (32-bit)
                 self.push_lir(X86Inst::X87LoadFloat { addr: src_addr });
             } else {

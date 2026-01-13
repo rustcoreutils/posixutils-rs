@@ -23,7 +23,7 @@ use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGen
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -1085,15 +1085,17 @@ impl Aarch64CodeGen {
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
                                     // Load FP constant using integer register
+                                    // Use type to determine float vs double
+                                    let is_float = insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Float);
                                     let (scratch0, _, _) = Reg::scratch_regs();
-                                    let bits = if insn.size <= 32 {
+                                    let bits = if is_float {
                                         (*f as f32).to_bits() as i64
                                     } else {
                                         f.to_bits() as i64
                                     };
                                     self.emit_mov_imm(scratch0, bits, 64);
                                     // LIR: fmov from GP to FP register
-                                    let fp_size = if insn.size <= 32 {
+                                    let fp_size = if is_float {
                                         FpSize::Single
                                     } else {
                                         FpSize::Double

@@ -824,7 +824,9 @@ impl X86_64CodeGen {
                     let src_addr = self.get_x87_mem_addr(*src);
                     self.push_lir(X86Inst::X87Load { addr: src_addr });
                 } else {
-                    self.emit_fp_move(*src, XmmReg::Xmm0, insn.size);
+                    // Use type-aware size for FP return
+                    let fp_size = insn.typ.map(|t| types.size_bits(t)).unwrap_or(insn.size).max(32);
+                    self.emit_fp_move(*src, XmmReg::Xmm0, fp_size);
                 }
             } else {
                 self.emit_move(*src, Reg::Rax, insn.size);
@@ -2351,10 +2353,12 @@ impl X86_64CodeGen {
                     _ => XmmReg::Xmm0,
                 };
 
-                self.emit_fp_move(src, dst_xmm, reg_size);
+                // Use type-aware size for FP operations
+                let fp_size = typ.map(|t| types.size_bits(t)).unwrap_or(reg_size).max(32);
+                self.emit_fp_move(src, dst_xmm, fp_size);
 
                 if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
-                    self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, reg_size);
+                    self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
                 }
             }
         } else {

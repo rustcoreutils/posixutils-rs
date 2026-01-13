@@ -15,7 +15,7 @@ use super::regalloc::{Loc, Reg, VReg};
 use crate::abi::{ArgClass, HfaBase, RegClass};
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
-use crate::types::TypeTable;
+use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
     /// Handle sret (hidden struct return pointer) argument
@@ -156,6 +156,7 @@ impl Aarch64CodeGen {
             pseudo: PseudoId,
             is_fp: bool,
             size: u32,
+            typ: Option<TypeId>,
         }
         let mut stack_args_info: Vec<StackArg> = Vec::new();
         let mut int_arg_idx = 0;
@@ -194,11 +195,13 @@ impl Aarch64CodeGen {
                         pseudo: arg,
                         is_fp: true,
                         size: arg_size,
+                        typ: arg_type,
                     });
                     stack_args_info.push(StackArg {
                         pseudo: arg,
                         is_fp: true,
                         size: arg_size,
+                        typ: arg_type,
                     });
                 }
             } else if is_fp {
@@ -222,6 +225,7 @@ impl Aarch64CodeGen {
                         pseudo: arg,
                         is_fp: true,
                         size: arg_size,
+                        typ: arg_type,
                     });
                 }
             } else if int_arg_idx < int_arg_regs.len() {
@@ -232,6 +236,7 @@ impl Aarch64CodeGen {
                     pseudo: arg,
                     is_fp: false,
                     size: arg_size,
+                    typ: arg_type,
                 });
             }
         }
@@ -257,20 +262,31 @@ impl Aarch64CodeGen {
         for (idx, stack_arg) in stack_args_info.into_iter().enumerate() {
             let offset = (idx * 8) as i32;
             if stack_arg.is_fp {
-                // Stack args don't retain precise type info, use size-based detection
+                // Use type info for proper FP size determination
                 self.emit_fp_move(
                     stack_arg.pseudo,
                     VReg::V16,
-                    None,
+                    stack_arg.typ,
                     stack_arg.size,
                     frame_size,
                     types,
                 );
-                let fp_sz = if stack_arg.size == 32 {
-                    FpSize::Single
-                } else {
-                    FpSize::Double
-                };
+                let fp_sz = stack_arg
+                    .typ
+                    .map(|t| {
+                        if types.kind(t) == TypeKind::Float {
+                            FpSize::Single
+                        } else {
+                            FpSize::Double
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if stack_arg.size == 32 {
+                            FpSize::Single
+                        } else {
+                            FpSize::Double
+                        }
+                    });
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_sz,
                     src: VReg::V16,

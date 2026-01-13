@@ -762,13 +762,34 @@ mod tests {
     #[test]
     fn test_format_mode_symbolic() {
         use crate::archive::EntryType;
-        assert_eq!(format_mode_symbolic(0o644, EntryType::Regular), "-rw-r--r--");
-        assert_eq!(format_mode_symbolic(0o755, EntryType::Regular), "-rwxr-xr-x");
-        assert_eq!(format_mode_symbolic(0o755, EntryType::Directory), "drwxr-xr-x");
-        assert_eq!(format_mode_symbolic(0o777, EntryType::Symlink), "lrwxrwxrwx");
-        assert_eq!(format_mode_symbolic(0o4755, EntryType::Regular), "-rwsr-xr-x"); // setuid
-        assert_eq!(format_mode_symbolic(0o2755, EntryType::Regular), "-rwxr-sr-x"); // setgid
-        assert_eq!(format_mode_symbolic(0o1755, EntryType::Regular), "-rwxr-xr-t"); // sticky
+        assert_eq!(
+            format_mode_symbolic(0o644, EntryType::Regular),
+            "-rw-r--r--"
+        );
+        assert_eq!(
+            format_mode_symbolic(0o755, EntryType::Regular),
+            "-rwxr-xr-x"
+        );
+        assert_eq!(
+            format_mode_symbolic(0o755, EntryType::Directory),
+            "drwxr-xr-x"
+        );
+        assert_eq!(
+            format_mode_symbolic(0o777, EntryType::Symlink),
+            "lrwxrwxrwx"
+        );
+        assert_eq!(
+            format_mode_symbolic(0o4755, EntryType::Regular),
+            "-rwsr-xr-x"
+        ); // setuid
+        assert_eq!(
+            format_mode_symbolic(0o2755, EntryType::Regular),
+            "-rwxr-sr-x"
+        ); // setgid
+        assert_eq!(
+            format_mode_symbolic(0o1755, EntryType::Regular),
+            "-rwxr-xr-t"
+        ); // sticky
     }
 
     #[test]

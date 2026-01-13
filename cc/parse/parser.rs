@@ -3947,7 +3947,10 @@ impl Parser<'_> {
                         base_kind = Some(TypeKind::LongLong);
                     } else {
                         modifiers |= TypeModifiers::LONG;
-                        if base_kind.is_none() {
+                        // long double case
+                        if base_kind == Some(TypeKind::Double) {
+                            base_kind = Some(TypeKind::LongDouble);
+                        } else if base_kind.is_none() {
                             base_kind = Some(TypeKind::Long);
                         }
                     }
@@ -3977,7 +3980,12 @@ impl Parser<'_> {
                 }
                 "double" => {
                     self.advance();
-                    base_kind = Some(TypeKind::Double);
+                    // Handle long double
+                    if modifiers.contains(TypeModifiers::LONG) {
+                        base_kind = Some(TypeKind::LongDouble);
+                    } else {
+                        base_kind = Some(TypeKind::Double);
+                    }
                 }
                 "_Bool" => {
                     self.advance();
@@ -5752,6 +5760,7 @@ mod tests {
     use super::*;
     use crate::strings::StringTable;
     use crate::symbol::SymbolTable;
+    use crate::target::Target;
     use crate::token::lexer::Tokenizer;
 
     fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
@@ -5767,7 +5776,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
 
         // Pre-declare variables
         for var_name in vars {
@@ -7085,7 +7094,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
 
         // Pre-declare variables
         for var_name in vars {
@@ -7331,7 +7340,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let decl = parser.parse_declaration()?;
@@ -7459,7 +7468,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let func = parser.parse_function_def()?;
@@ -7514,7 +7523,7 @@ mod tests {
         let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
         let mut symbols = SymbolTable::new();
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         let tu = parser.parse_translation_unit()?;
         Ok((tu, types, strings, symbols))
@@ -9967,5 +9976,40 @@ mod tests {
         // Type should be char*
         let typ = expr.typ.unwrap();
         assert_eq!(types.kind(typ), TypeKind::Pointer);
+    }
+
+    // ========================================================================
+    // Long double type parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_long_double_type() {
+        // Test "long double x;"
+        let (decl, types, _, _) = parse_decl("long double x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::LongDouble);
+    }
+
+    #[test]
+    fn test_double_long_type() {
+        // Test "double long x;" - alternative ordering per C standard
+        let (decl, types, _, _) = parse_decl("double long x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::LongDouble);
+    }
+
+    #[test]
+    fn test_long_double_function_return() {
+        // Test function returning long double
+        let (func, types, _, _) = parse_func("long double foo(void) { return 1.0L; }").unwrap();
+        assert_eq!(types.kind(func.return_type), TypeKind::LongDouble);
+    }
+
+    #[test]
+    fn test_long_double_function_param() {
+        // Test function with long double parameter
+        let (func, types, _, _) = parse_func("void foo(long double x) {}").unwrap();
+        let param_type = func.params[0].typ;
+        assert_eq!(types.kind(param_type), TypeKind::LongDouble);
     }
 }

@@ -73,7 +73,14 @@ impl Aarch64CodeGen {
                         64
                     };
                     if fp_arg_idx < fp_arg_regs.len() {
-                        self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size, frame_size);
+                        self.emit_fp_move(
+                            arg,
+                            fp_arg_regs[fp_arg_idx],
+                            arg_type,
+                            fp_size,
+                            frame_size,
+                            types,
+                        );
                         fp_arg_idx += 1;
                     }
                 } else if int_arg_idx < int_arg_regs.len() {
@@ -99,7 +106,8 @@ impl Aarch64CodeGen {
             for (idx, (arg, is_fp, arg_size)) in variadic_args.into_iter().enumerate() {
                 let offset = (idx * 8) as i32;
                 if is_fp {
-                    self.emit_fp_move(arg, VReg::V16, arg_size, frame_size);
+                    // Variadic FP args don't have precise type info, use size-based detection
+                    self.emit_fp_move(arg, VReg::V16, None, arg_size, frame_size, types);
                     self.push_lir(Aarch64Inst::StrFp {
                         size: FpSize::Double,
                         src: VReg::V16,
@@ -200,7 +208,14 @@ impl Aarch64CodeGen {
                     } else {
                         64
                     };
-                    self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size, frame_size);
+                    self.emit_fp_move(
+                        arg,
+                        fp_arg_regs[fp_arg_idx],
+                        arg_type,
+                        fp_size,
+                        frame_size,
+                        types,
+                    );
                     fp_arg_idx += 1;
                 } else {
                     stack_args_info.push(StackArg {
@@ -242,7 +257,15 @@ impl Aarch64CodeGen {
         for (idx, stack_arg) in stack_args_info.into_iter().enumerate() {
             let offset = (idx * 8) as i32;
             if stack_arg.is_fp {
-                self.emit_fp_move(stack_arg.pseudo, VReg::V16, stack_arg.size, frame_size);
+                // Stack args don't retain precise type info, use size-based detection
+                self.emit_fp_move(
+                    stack_arg.pseudo,
+                    VReg::V16,
+                    None,
+                    stack_arg.size,
+                    frame_size,
+                    types,
+                );
                 let fp_sz = if stack_arg.size == 32 {
                     FpSize::Single
                 } else {
@@ -284,7 +307,7 @@ impl Aarch64CodeGen {
         frame_size: i32,
     ) {
         let arg_loc = self.get_location(arg);
-        let (fp_size, imag_offset) = complex_fp_info(types, arg_type.unwrap());
+        let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, arg_type.unwrap());
 
         match arg_loc {
             Loc::Stack(offset) => {
@@ -399,7 +422,14 @@ impl Aarch64CodeGen {
                 }
                 // Single SSE return
                 if classes.first() == Some(&RegClass::Sse) {
-                    self.emit_fp_move_to_loc(VReg::V0, &dst_loc, ret_size, frame_size);
+                    self.emit_fp_move_to_loc(
+                        VReg::V0,
+                        &dst_loc,
+                        insn.typ,
+                        ret_size,
+                        frame_size,
+                        types,
+                    );
                     return;
                 }
                 // Integer return
@@ -420,6 +450,9 @@ impl Aarch64CodeGen {
             }
             ArgClass::Extend { .. } => {
                 self.emit_move_to_loc(Reg::X0, &dst_loc, ret_size, frame_size);
+            }
+            ArgClass::X87 { .. } => {
+                unreachable!("x87 FPU returns not available on AArch64");
             }
             ArgClass::Ignore => {
                 // Void return, nothing to do
@@ -479,7 +512,7 @@ impl Aarch64CodeGen {
         types: &TypeTable,
         frame_size: i32,
     ) {
-        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+        let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, insn.typ.unwrap());
         match dst_loc {
             Loc::Stack(offset) => {
                 let actual_offset = self.stack_offset(frame_size, *offset);

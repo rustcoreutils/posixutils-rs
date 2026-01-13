@@ -17,5 +17,6 @@ mod float;
 pub mod lir;
 pub mod macros;
 pub mod regalloc;
+mod x87;
 
 pub use macros::get_macros;

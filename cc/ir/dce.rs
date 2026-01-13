@@ -311,10 +311,11 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Instruction, Pseudo};
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_simple_func() -> Function {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -366,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_live_instruction_preserved() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -395,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_transitive_liveness() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -435,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_unreachable_block_removed() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         // Entry block
@@ -486,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_store_is_live() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
@@ -518,7 +519,7 @@ mod tests {
         // Test that get_uses() includes indirect_target for function pointer calls.
         // This prevents DCE from eliminating the instruction that computes
         // the function pointer before an indirect call.
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let call_insn = Instruction::call_indirect(
             Some(PseudoId(0)),                // return value target
             PseudoId(5),                      // func_addr (the function pointer)
@@ -543,7 +544,7 @@ mod tests {
     #[test]
     fn test_indirect_call_keeps_func_ptr_live() {
         // Full DCE test: verify an indirect call keeps its function pointer live.
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         func.add_pseudo(Pseudo::reg(PseudoId(0), 0)); // result

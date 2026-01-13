@@ -575,6 +575,8 @@ pub struct Instruction {
     pub size: u32,
     /// Source size for extension/truncation operations
     pub src_size: u32,
+    /// Source type for conversion operations (interned TypeId)
+    pub src_typ: Option<TypeId>,
     /// For switch: case value to target block mapping
     pub switch_cases: Vec<(i64, BasicBlockId)>,
     /// For switch: default block (if no case matches)
@@ -620,6 +622,7 @@ impl Default for Instruction {
             func_name: None,
             size: 0,
             src_size: 0,
+            src_typ: None,
             switch_cases: Vec::new(),
             switch_default: None,
             arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
@@ -1469,6 +1472,7 @@ impl fmt::Display for Module {
 mod tests {
     use super::*;
     use crate::abi::{ArgClass, RegClass};
+    use crate::target::Target;
     use crate::types::{Type, TypeTable};
 
     #[test]
@@ -1500,7 +1504,7 @@ mod tests {
 
     #[test]
     fn test_instruction_binop() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1516,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_instruction_display() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(3),
@@ -1546,7 +1550,7 @@ mod tests {
 
     #[test]
     fn test_function_display() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("main", types.int_id);
         func.add_param("argc", types.int_id);
 
@@ -1576,7 +1580,7 @@ mod tests {
 
     #[test]
     fn test_call_instruction() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let char_ptr = types.intern(Type::pointer(types.char_id));
         let arg_types = vec![char_ptr, types.int_id];
         let mut call = Instruction::call(
@@ -1613,7 +1617,7 @@ mod tests {
 
     #[test]
     fn test_load_store() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
 
         let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, 32);
         assert_eq!(load.op, Opcode::Load);
@@ -1626,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_module() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut module = Module::new();
 
         module.add_global("counter", types.int_id, Initializer::Int(0));

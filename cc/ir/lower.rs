@@ -256,6 +256,7 @@ pub fn lower_function(func: &mut Function) {
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Instruction, Opcode, Pseudo, PseudoId};
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_loop_cfg() -> Function {
@@ -274,7 +275,7 @@ mod tests {
         // With phi node in cond block:
         //   %3 = phi [.L0: %1], [.L2: %2]
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let int_type = types.int_id;
         let mut func = Function::new("test", int_type);
 
@@ -422,7 +423,7 @@ mod tests {
     // ========================================================================
 
     fn make_minimal_func() -> Function {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let int_type = types.int_id;
         let mut func = Function::new("test", int_type);
         func.next_pseudo = 100; // Start high to avoid conflicts

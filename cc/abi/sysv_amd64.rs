@@ -296,11 +296,8 @@ impl Abi for SysVAmd64Abi {
         // Floating-point types - return in XMM0 (non-complex)
         if is_float(kind) {
             if kind == TypeKind::LongDouble {
-                // Long double returned via sret
-                return ArgClass::Indirect {
-                    align: 16,
-                    size_bits,
-                };
+                // Long double returned in ST(0) per System V AMD64 ABI
+                return ArgClass::X87 { size_bits };
             }
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse],

@@ -506,6 +506,7 @@ fn visit_domtree(
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Instruction, Opcode};
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_test_cfg() -> Function {
@@ -521,7 +522,7 @@ mod tests {
         //          v
         //        exit(4)
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
@@ -660,7 +661,7 @@ mod tests {
         //          v
         //        bb1(1) <-- unreachable points TO bb1, making bb1 have unreachable as predecessor
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
 
         let mut entry = BasicBlock::new(BasicBlockId(0));

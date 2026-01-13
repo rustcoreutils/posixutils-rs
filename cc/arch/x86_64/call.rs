@@ -15,7 +15,7 @@ use super::regalloc::{Loc, Reg, XmmReg};
 use crate::abi::{ArgClass, RegClass};
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
-use crate::types::TypeTable;
+use crate::types::{TypeKind, TypeTable};
 use std::collections::HashMap;
 
 /// Information about call argument classification
@@ -28,7 +28,7 @@ pub(super) struct CallArgInfo {
 
 impl X86_64CodeGen {
     /// Classify call arguments into register vs stack arguments using ABI info.
-    pub(super) fn classify_call_args(&self, insn: &Instruction, _types: &TypeTable) -> CallArgInfo {
+    pub(super) fn classify_call_args(&self, insn: &Instruction, types: &TypeTable) -> CallArgInfo {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = XmmReg::arg_regs();
 
@@ -42,6 +42,19 @@ impl X86_64CodeGen {
             .expect("abi_info must be populated for Call instructions");
 
         for (i, arg_class) in abi_info.params.iter().enumerate() {
+            // Check if this is a long double argument - these are always passed
+            // BY VALUE on the stack per System V AMD64 ABI (not via pointer)
+            let is_longdouble = insn
+                .arg_types
+                .get(i)
+                .is_some_and(|&ty| types.kind(ty) == TypeKind::LongDouble);
+
+            if is_longdouble {
+                // Long double is always passed on the stack by value
+                stack_arg_indices.push(i);
+                continue;
+            }
+
             match arg_class {
                 ArgClass::Direct { classes, .. } => {
                     // Count GP and FP registers needed
@@ -78,6 +91,11 @@ impl X86_64CodeGen {
                         stack_arg_indices.push(i);
                     }
                     temp_fp_idx += *count as usize;
+                }
+                ArgClass::X87 { .. } => {
+                    // X87 is only used for return values, not parameters
+                    // Long double parameters are passed via Indirect (pointer in memory)
+                    unreachable!("X87 classification only applies to return values");
                 }
                 ArgClass::Ignore => {
                     // Zero-sized type, skip
@@ -128,6 +146,29 @@ impl X86_64CodeGen {
                 } else {
                     64
                 };
+                let is_longdouble = arg_type.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+
+                // Long double uses x87, needs 16 bytes on stack
+                if is_longdouble {
+                    // Allocate 16 bytes on stack for long double
+                    self.push_lir(X86Inst::Sub {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(16),
+                        dst: Reg::Rsp,
+                    });
+                    // Load value using x87 and store to stack
+                    let src_addr = self.get_x87_mem_addr(arg);
+                    self.push_lir(X86Inst::X87Load { addr: src_addr });
+                    self.push_lir(X86Inst::X87Store {
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::Rsp,
+                            offset: 0,
+                        },
+                    });
+                    stack_args += 2; // 16 bytes = 2 stack slots
+                    continue;
+                }
+
                 self.emit_fp_move(arg, XmmReg::Xmm15, fp_size);
                 self.push_lir(X86Inst::Sub {
                     size: OperandSize::B64,
@@ -289,6 +330,12 @@ impl X86_64CodeGen {
                 } else {
                     64
                 };
+                // Long double uses x87 and is passed on stack, not in XMM registers
+                // Skip it here - it's handled by push_stack_args
+                let is_longdouble = arg_type.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
+                if is_longdouble {
+                    continue;
+                }
                 self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size);
                 fp_arg_idx += 1;
             } else {
@@ -310,7 +357,7 @@ impl X86_64CodeGen {
         types: &TypeTable,
     ) {
         let arg_loc = self.get_location(arg);
-        let (fp_size, imag_offset) = complex_fp_info(types, arg_type.unwrap());
+        let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, arg_type.unwrap());
 
         match arg_loc {
             Loc::Stack(offset) => {
@@ -454,6 +501,11 @@ impl X86_64CodeGen {
                 // Extended return value in RAX
                 self.emit_move_to_loc(Reg::Rax, &dst_loc, ret_size);
             }
+            ArgClass::X87 { .. } => {
+                // Long double returned in ST(0) - store to destination
+                let dst_addr = self.get_x87_mem_addr(target);
+                self.push_lir(X86Inst::X87Store { addr: dst_addr });
+            }
             ArgClass::Ignore => {
                 // Void return, nothing to do
             }
@@ -504,46 +556,85 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Handle complex return value (XMM0 + XMM1)
+    /// Handle complex return value.
+    ///
+    /// For float _Complex (8 bytes): entire value is packed in XMM0
+    ///   - Real part in bits 0-31, imag part in bits 32-63
+    ///   - Use a single 64-bit (movq) store to write both parts
+    ///
+    /// For double _Complex (16 bytes): split across XMM0 and XMM1
+    ///   - Real part in XMM0, imag part in XMM1
+    ///   - Use two separate 64-bit stores
     fn handle_complex_return(&mut self, insn: &Instruction, dst_loc: &Loc, types: &TypeTable) {
-        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+        let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, insn.typ.unwrap());
+
+        // float _Complex: packed in XMM0 (8 bytes total)
+        // double _Complex: XMM0 (real) + XMM1 (imag)
+        let is_float_complex = fp_size == FpSize::Single;
+
         match dst_loc {
             Loc::Stack(offset) => {
                 let adjusted = offset + self.callee_saved_offset;
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm0),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
-                });
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm1),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted + imag_offset,
-                    }),
-                });
+                if is_float_complex {
+                    // Store entire 64-bit value from XMM0 (packed real + imag)
+                    self.push_lir(X86Inst::MovFp {
+                        size: FpSize::Double, // 64-bit movq
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                    });
+                } else {
+                    // Store XMM0 (real) and XMM1 (imag) separately
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                    });
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm1),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted + imag_offset,
+                        }),
+                    });
+                }
             }
             Loc::Reg(r) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm0),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: *r,
-                        offset: 0,
-                    }),
-                });
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm1),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: *r,
-                        offset: imag_offset,
-                    }),
-                });
+                if is_float_complex {
+                    // Store entire 64-bit value from XMM0 (packed real + imag)
+                    self.push_lir(X86Inst::MovFp {
+                        size: FpSize::Double, // 64-bit movq
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: *r,
+                            offset: 0,
+                        }),
+                    });
+                } else {
+                    // Store XMM0 (real) and XMM1 (imag) separately
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: *r,
+                            offset: 0,
+                        }),
+                    });
+                    self.push_lir(X86Inst::MovFp {
+                        size: fp_size,
+                        src: XmmOperand::Reg(XmmReg::Xmm1),
+                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: *r,
+                            offset: imag_offset,
+                        }),
+                    });
+                }
             }
             _ => {}
         }

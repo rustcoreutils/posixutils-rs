@@ -11,6 +11,7 @@
 //
 
 use crate::strings::StringId;
+use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -573,6 +574,10 @@ pub struct TypeTable {
     lookup: HashMap<TypeKey, TypeId>,
     /// Pointer size in bits (target-dependent, defaults to 64 for LP64)
     pointer_width: u32,
+    /// Target architecture for runtime type size calculations
+    target_arch: Arch,
+    /// Target OS for runtime type size calculations
+    target_os: Os,
 
     // Pre-computed common type IDs for fast access
     pub void_id: TypeId,
@@ -600,11 +605,13 @@ pub struct TypeTable {
 
 impl TypeTable {
     /// Create a new type table with common types pre-interned
-    pub fn new(pointer_width: u32) -> Self {
+    pub fn new(target: &Target) -> Self {
         let mut table = Self {
             types: Vec::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             lookup: HashMap::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
-            pointer_width,
+            pointer_width: target.pointer_width,
+            target_arch: target.arch,
+            target_os: target.os,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
             char_id: TypeId::INVALID,
@@ -989,7 +996,7 @@ impl TypeTable {
             TypeKind::LongLong => 64,
             TypeKind::Float => 32 * multiplier,
             TypeKind::Double => 64 * multiplier,
-            TypeKind::LongDouble => 128 * multiplier,
+            TypeKind::LongDouble => self.longdouble_size_bits() * multiplier,
             TypeKind::Pointer => self.pointer_width,
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0);
@@ -1001,24 +1008,7 @@ impl TypeTable {
             }
             TypeKind::Function => 0,
             TypeKind::Enum => 32,
-            TypeKind::VaList => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    192
-                }
-                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                {
-                    64
-                }
-                #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
-                {
-                    256
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                {
-                    64
-                }
-            }
+            TypeKind::VaList => self.va_list_size_bits(),
         }
     }
 
@@ -1043,15 +1033,55 @@ impl TypeTable {
             TypeKind::Short => 2,
             TypeKind::Int | TypeKind::Float => 4,
             TypeKind::Long | TypeKind::LongLong | TypeKind::Double | TypeKind::Pointer => 8,
-            TypeKind::LongDouble => 16,
+            TypeKind::LongDouble => self.longdouble_alignment(),
             TypeKind::Struct | TypeKind::Union => {
                 typ.composite.as_ref().map(|c| c.align).unwrap_or(1)
             }
             TypeKind::Enum => 4,
             TypeKind::Array => typ.base.map(|b| self.alignment(b)).unwrap_or(1),
             TypeKind::Function => 1,
-            TypeKind::VaList => 8,
+            TypeKind::VaList => self.va_list_alignment(),
         }
+    }
+
+    // ========================================================================
+    // Target-dependent type size helpers
+    // ========================================================================
+
+    /// Get long double size in bits based on target architecture
+    /// - macOS aarch64: 64 bits (same as double)
+    /// - x86-64: 128 bits (80-bit x87 padded to 16 bytes)
+    /// - aarch64 Linux: 128 bits (IEEE quad precision)
+    fn longdouble_size_bits(&self) -> u32 {
+        match (self.target_arch, self.target_os) {
+            (Arch::Aarch64, Os::MacOS) => 64, // Same as double
+            _ => 128, // 80-bit padded (x86-64) or 128-bit quad (aarch64/Linux)
+        }
+    }
+
+    /// Get long double alignment in bytes based on target architecture
+    fn longdouble_alignment(&self) -> usize {
+        match (self.target_arch, self.target_os) {
+            (Arch::Aarch64, Os::MacOS) => 8, // Same as double
+            _ => 16,                         // 16-byte alignment for 80-bit or 128-bit
+        }
+    }
+
+    /// Get va_list size in bits based on target architecture
+    /// - x86-64: 192 bits (24-byte struct)
+    /// - aarch64 macOS: 64 bits (simple pointer)
+    /// - aarch64 Linux/FreeBSD: 256 bits (32-byte struct)
+    fn va_list_size_bits(&self) -> u32 {
+        match (self.target_arch, self.target_os) {
+            (Arch::X86_64, _) => 192,
+            (Arch::Aarch64, Os::MacOS) => 64,
+            (Arch::Aarch64, _) => 256, // Linux/FreeBSD
+        }
+    }
+
+    /// Get va_list alignment in bytes based on target architecture
+    fn va_list_alignment(&self) -> usize {
+        8 // All supported platforms use 8-byte alignment for va_list
     }
 
     /// Find a member in a struct/union type
@@ -1181,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_basic_types() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         assert!(types.is_integer(types.int_id));
         assert!(types.is_arithmetic(types.int_id));
         assert!(types.is_scalar(types.int_id));
@@ -1190,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_pointer_type() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let int_ptr_id = types.intern(Type::pointer(types.int_id));
         assert_eq!(types.kind(int_ptr_id), TypeKind::Pointer);
         assert!(types.is_scalar(int_ptr_id));
@@ -1202,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_array_type() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let int_arr_id = types.intern(Type::array(types.int_id, 10));
         assert_eq!(types.kind(int_arr_id), TypeKind::Array);
         assert_eq!(types.array_size(int_arr_id), Some(10));
@@ -1213,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_function_type() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         let func_id = types.intern(Type::function(
             types.int_id,
             vec![types.int_id, types.char_id],
@@ -1231,21 +1261,21 @@ mod tests {
 
     #[test]
     fn test_unsigned_modifier() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
     }
 
     #[test]
     fn test_type_format() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         assert_eq!(types.format_type(types.int_id), "int");
         assert_eq!(types.format_type(types.uint_id), "unsigned int");
     }
 
     #[test]
     fn test_nested_pointer() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         // int **pp
         let int_ptr_id = types.intern(Type::pointer(types.int_id));
         let int_ptr_ptr_id = types.intern(Type::pointer(int_ptr_id));
@@ -1260,7 +1290,7 @@ mod tests {
 
     #[test]
     fn test_pointer_to_array() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         // int (*p)[10] - pointer to array of 10 ints
         let arr_id = types.intern(Type::array(types.int_id, 10));
         let ptr_to_arr_id = types.intern(Type::pointer(arr_id));
@@ -1319,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_types_compatible_pointers() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let int_ptr = Type::pointer(types.int_id);
         let int_ptr2 = Type::pointer(types.int_id);
         assert!(int_ptr.types_compatible(&int_ptr2));
@@ -1330,7 +1360,7 @@ mod tests {
 
     #[test]
     fn test_types_compatible_arrays() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let arr10 = Type::array(types.int_id, 10);
         let arr10_2 = Type::array(types.int_id, 10);
         assert!(arr10.types_compatible(&arr10_2));
@@ -1341,7 +1371,7 @@ mod tests {
 
     #[test]
     fn test_type_deduplication() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
         // Interning the same type should return the same ID
         let int_ptr1 = types.intern(Type::pointer(types.int_id));
         let int_ptr2 = types.intern(Type::pointer(types.int_id));
@@ -1354,7 +1384,7 @@ mod tests {
 
     #[test]
     fn test_type_table_pre_interned() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         // Pre-interned types should be valid
         assert!(types.int_id.is_valid());
         assert!(types.char_id.is_valid());
@@ -1368,7 +1398,7 @@ mod tests {
 
     #[test]
     fn test_array_with_modifiers_deduplication() {
-        let mut types = TypeTable::new(64);
+        let mut types = TypeTable::new(&Target::host());
 
         // Create a plain array type: int arr[10]
         let plain_arr = types.intern(Type::array(types.int_id, 10));

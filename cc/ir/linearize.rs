@@ -402,6 +402,7 @@ impl<'a> Linearizer<'a> {
 
             let mut insn = Instruction::binop(opcode, result, val, zero, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
 
             return result;
@@ -436,6 +437,7 @@ impl<'a> Linearizer<'a> {
 
             let mut insn = Instruction::unop(opcode, result, val, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
             return result;
         }
@@ -461,11 +463,13 @@ impl<'a> Linearizer<'a> {
             };
             let mut insn = Instruction::unop(opcode, result, val, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
         } else {
             // Truncating
             let mut insn = Instruction::unop(Opcode::Trunc, result, val, to_typ, to_size);
             insn.src_size = from_size;
+            insn.src_typ = Some(from_typ);
             self.emit(insn);
         }
 
@@ -3214,6 +3218,7 @@ impl<'a> Linearizer<'a> {
                 .with_src(src)
                 .with_type(cast_type);
             insn.src_size = self.types.size_bits(src_type);
+            insn.src_typ = Some(src_type);
             self.emit(insn);
             result
         } else if !src_is_float && dst_is_float {
@@ -3235,6 +3240,7 @@ impl<'a> Linearizer<'a> {
                 .with_src(src)
                 .with_type_and_size(cast_type, dst_size);
             insn.src_size = self.types.size_bits(src_type);
+            insn.src_typ = Some(src_type);
             self.emit(insn);
             result
         } else if src_is_float && dst_is_float {
@@ -3252,6 +3258,7 @@ impl<'a> Linearizer<'a> {
                     .with_src(src)
                     .with_type(cast_type);
                 insn.src_size = src_size;
+                insn.src_typ = Some(src_type);
                 self.emit(insn);
                 result
             } else {
@@ -3830,6 +3837,7 @@ impl<'a> Linearizer<'a> {
                 Instruction::new(Opcode::Copy)
                     .with_target(temp)
                     .with_src(val)
+                    .with_type(typ)
                     .with_size(self.types.size_bits(typ)),
             );
             temp

@@ -122,6 +122,12 @@ pub enum ArgClass {
         /// Original size in bits
         size_bits: u32,
     },
+    /// x87 FPU return (long double returned in ST(0)).
+    /// Only used for return values on x86-64.
+    X87 {
+        /// Size in bits (80 for long double, stored in 128-bit slot)
+        size_bits: u32,
+    },
     /// Zero-sized type, ignored in parameter passing.
     Ignore,
 }
@@ -251,7 +257,7 @@ mod tests {
     fn test_sysv_amd64_basic_types() {
         use crate::types::TypeTable;
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let abi = SysVAmd64Abi::new();
 
         // Integer types -> INTEGER class
@@ -292,7 +298,7 @@ mod tests {
     fn test_sysv_amd64_small_integers() {
         use crate::types::TypeTable;
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let abi = SysVAmd64Abi::new();
 
         // char (8 bits) needs extension
@@ -311,7 +317,7 @@ mod tests {
     fn test_sysv_amd64_return_values() {
         use crate::types::TypeTable;
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let abi = SysVAmd64Abi::new();
 
         // Integer return -> INTEGER
@@ -335,7 +341,7 @@ mod tests {
     fn test_aapcs64_basic_types() {
         use crate::types::TypeTable;
 
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let abi = Aapcs64Abi::new();
 
         // Integer types -> INTEGER class (in X registers)

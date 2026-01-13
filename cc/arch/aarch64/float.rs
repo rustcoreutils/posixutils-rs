@@ -14,11 +14,29 @@ use super::lir::{Aarch64Inst, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
+use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
+    /// Get FP size from type on aarch64.
+    ///
+    /// On aarch64, LongDouble is treated as Double (64-bit on macOS,
+    /// uses runtime library calls for quad precision on Linux).
+    fn fp_size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
+        typ.map(|t| match types.kind(t) {
+            TypeKind::Float => FpSize::Single,
+            TypeKind::Double | TypeKind::LongDouble => FpSize::Double,
+            _ => FpSize::from_bits(size.max(32)),
+        })
+        .unwrap_or_else(|| FpSize::from_bits(size.max(32)))
+    }
+
+    /// Get size in bits from type, with fallback to provided size.
+    fn size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> u32 {
+        typ.map(|t| types.size_bits(t)).unwrap_or(size).max(32)
+    }
     /// Emit a floating-point load instruction
-    pub(super) fn emit_fp_load(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_fp_load(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+        let size = Self::size_from_type(insn.typ, insn.size, types);
         let addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -34,11 +52,7 @@ impl Aarch64CodeGen {
         };
         let addr_loc = self.get_location(addr);
 
-        let fp_size = if size <= 32 {
-            FpSize::Single
-        } else {
-            FpSize::Double
-        };
+        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -148,14 +162,22 @@ impl Aarch64CodeGen {
 
         // Move to final destination if needed
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, size, frame_size);
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, size, frame_size, types);
         }
     }
 
     /// Move FP value to a VReg
-    pub(super) fn emit_fp_move(&mut self, src: PseudoId, dst: VReg, size: u32, frame_size: i32) {
+    pub(super) fn emit_fp_move(
+        &mut self,
+        src: PseudoId,
+        dst: VReg,
+        typ: Option<TypeId>,
+        size: u32,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
         let loc = self.get_location(src);
-        let fp_size = FpSize::from_bits(size.max(32));
+        let fp_size = Self::fp_size_from_type(typ, size, types);
 
         match loc {
             Loc::VReg(v) if v == dst => {}
@@ -218,6 +240,7 @@ impl Aarch64CodeGen {
                 let load_size = match fp_size {
                     FpSize::Single => OperandSize::B32,
                     FpSize::Double => OperandSize::B64,
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 self.emit_load_global(&name, scratch0, load_size);
                 self.push_lir(Aarch64Inst::FmovFromGp {
@@ -230,8 +253,16 @@ impl Aarch64CodeGen {
     }
 
     /// Move FP register value to a location
-    pub(super) fn emit_fp_move_to_loc(&mut self, src: VReg, dst: &Loc, size: u32, frame_size: i32) {
-        let fp_size = FpSize::from_bits(size.max(32));
+    pub(super) fn emit_fp_move_to_loc(
+        &mut self,
+        src: VReg,
+        dst: &Loc,
+        typ: Option<TypeId>,
+        size: u32,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
+        let fp_size = Self::fp_size_from_type(typ, size, types);
 
         match dst {
             Loc::VReg(v) if *v == src => {}
@@ -267,9 +298,9 @@ impl Aarch64CodeGen {
     }
 
     /// Emit FP binary operation (fadd, fsub, fmul, fdiv)
-    pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
-        let fp_size = FpSize::from_bits(size);
+    pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -285,8 +316,8 @@ impl Aarch64CodeGen {
         };
 
         // Load operands
-        self.emit_fp_move(src1, VReg::V17, size, frame_size);
-        self.emit_fp_move(src2, VReg::V18, size, frame_size);
+        self.emit_fp_move(src1, VReg::V17, insn.typ, size, frame_size, types);
+        self.emit_fp_move(src2, VReg::V18, insn.typ, size, frame_size, types);
 
         match insn.op {
             Opcode::FAdd => {
@@ -325,14 +356,14 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
-            self.emit_fp_move_to_loc(work_reg, &dst_loc, size, frame_size);
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, frame_size, types);
         }
     }
 
     /// Emit FP negation
-    pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
-        let fp_size = FpSize::from_bits(size);
+    pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -347,7 +378,7 @@ impl Aarch64CodeGen {
             _ => VReg::V16,
         };
 
-        self.emit_fp_move(src, VReg::V17, size, frame_size);
+        self.emit_fp_move(src, VReg::V17, insn.typ, size, frame_size, types);
 
         self.push_lir(Aarch64Inst::Fneg {
             size: fp_size,
@@ -356,14 +387,19 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
-            self.emit_fp_move_to_loc(work_reg, &dst_loc, size, frame_size);
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, frame_size, types);
         }
     }
 
     /// Emit FP comparison
-    pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
-        let fp_size = FpSize::from_bits(size);
+    pub(super) fn emit_fp_compare(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -374,8 +410,8 @@ impl Aarch64CodeGen {
         };
 
         // Load operands to FP registers
-        self.emit_fp_move(src1, VReg::V17, size, frame_size);
-        self.emit_fp_move(src2, VReg::V18, size, frame_size);
+        self.emit_fp_move(src1, VReg::V17, insn.typ, size, frame_size, types);
+        self.emit_fp_move(src2, VReg::V18, insn.typ, size, frame_size, types);
 
         // Perform comparison
         self.push_lir(Aarch64Inst::Fcmp {
@@ -410,7 +446,12 @@ impl Aarch64CodeGen {
     }
 
     /// Emit integer to float conversion
-    pub(super) fn emit_int_to_float(&mut self, insn: &Instruction, frame_size: i32) {
+    pub(super) fn emit_int_to_float(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -420,9 +461,9 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let src_size = insn.src_size.max(32);
-        let dst_size = insn.size.max(32);
-        let fp_size = FpSize::from_bits(dst_size);
+        let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
+        let dst_size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let int_size = OperandSize::from_bits(src_size);
 
         let dst_loc = self.get_location(target);
@@ -458,12 +499,17 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, dst_size, frame_size);
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, frame_size, types);
         }
     }
 
     /// Emit float to integer conversion
-    pub(super) fn emit_float_to_int(&mut self, insn: &Instruction, frame_size: i32) {
+    pub(super) fn emit_float_to_int(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -473,9 +519,9 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let src_size = insn.src_size.max(32);
-        let dst_size = insn.size.max(32);
-        let fp_size = FpSize::from_bits(src_size);
+        let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
+        let dst_size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = Self::fp_size_from_type(insn.src_typ, insn.src_size, types);
         let int_size = OperandSize::from_bits(dst_size);
 
         let dst_loc = self.get_location(target);
@@ -485,7 +531,7 @@ impl Aarch64CodeGen {
         };
 
         // Load source to FP register
-        self.emit_fp_move(src, VReg::V17, src_size, frame_size);
+        self.emit_fp_move(src, VReg::V17, insn.src_typ, src_size, frame_size, types);
 
         // Convert float to integer using truncation toward zero
         // fcvtzu/fcvtzs: float to unsigned/signed int with truncation
@@ -515,7 +561,12 @@ impl Aarch64CodeGen {
     }
 
     /// Emit float to float conversion (size change)
-    pub(super) fn emit_float_to_float(&mut self, insn: &Instruction, frame_size: i32) {
+    pub(super) fn emit_float_to_float(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -525,10 +576,10 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let src_size = insn.src_size.max(32);
-        let dst_size = insn.size.max(32);
-        let src_fp_size = FpSize::from_bits(src_size);
-        let dst_fp_size = FpSize::from_bits(dst_size);
+        let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
+        let dst_size = Self::size_from_type(insn.typ, insn.size, types);
+        let src_fp_size = Self::fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let dst_fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
 
         let dst_loc = self.get_location(target);
         let dst_vreg = match &dst_loc {
@@ -537,13 +588,21 @@ impl Aarch64CodeGen {
         };
 
         // Load source to FP register
-        self.emit_fp_move(src, VReg::V17, src_size, frame_size);
+        self.emit_fp_move(src, VReg::V17, insn.src_typ, src_size, frame_size, types);
 
-        // Convert between float sizes if they differ
+        // Convert between float sizes if types differ
         // fcvt: convert between single and double precision
-        // Note: On Apple Silicon, long double == double (both 64-bit),
-        // so skip fcvt when sizes are equal to avoid invalid "fcvt d, d"
-        if src_fp_size != dst_fp_size {
+        // Check types directly rather than FpSizes to properly distinguish conversions
+        let src_kind = insn.src_typ.map(|t| types.kind(t));
+        let dst_kind = insn.typ.map(|t| types.kind(t));
+        let needs_convert = match (src_kind, dst_kind) {
+            (Some(TypeKind::Float), Some(TypeKind::Double | TypeKind::LongDouble)) => true,
+            (Some(TypeKind::Double | TypeKind::LongDouble), Some(TypeKind::Float)) => true,
+            // On aarch64, Double and LongDouble are the same, no conversion needed
+            _ => false,
+        };
+
+        if needs_convert {
             self.push_lir(Aarch64Inst::Fcvt {
                 src_size: src_fp_size,
                 dst_size: dst_fp_size,
@@ -551,7 +610,7 @@ impl Aarch64CodeGen {
                 dst: dst_vreg,
             });
         } else if dst_vreg != VReg::V17 {
-            // Same size, just move if needed
+            // Same type (or types unknown), just move if needed
             self.push_lir(Aarch64Inst::FmovReg {
                 size: dst_fp_size,
                 src: VReg::V17,
@@ -560,7 +619,7 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, dst_size, frame_size);
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, frame_size, types);
         }
     }
 }

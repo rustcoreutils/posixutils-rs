@@ -1134,6 +1134,7 @@ impl EmitAsm for Aarch64Inst {
                 let name = match size {
                     FpSize::Single => (src.name_s(), dst.name_s()),
                     FpSize::Double => (src.name_d(), dst.name_d()),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    fmov {}, {}", name.1, name.0);
             }
@@ -1142,10 +1143,12 @@ impl EmitAsm for Aarch64Inst {
                 let fp_name = match size {
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let gp_name = match size {
                     FpSize::Single => src.name32(),
                     FpSize::Double => src.name64(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    fmov {}, {}", fp_name, gp_name);
             }
@@ -1154,10 +1157,12 @@ impl EmitAsm for Aarch64Inst {
                 let fp_name = match size {
                     FpSize::Single => src.name_s(),
                     FpSize::Double => src.name_d(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let gp_name = match size {
                     FpSize::Single => dst.name32(),
                     FpSize::Double => dst.name64(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    fmov {}, {}", gp_name, fp_name);
             }
@@ -1166,6 +1171,7 @@ impl EmitAsm for Aarch64Inst {
                 let name = match size {
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    ldr {}, {}", name, addr.format());
             }
@@ -1174,6 +1180,7 @@ impl EmitAsm for Aarch64Inst {
                 let name = match size {
                     FpSize::Single => src.name_s(),
                     FpSize::Double => src.name_d(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    str {}, {}", name, addr.format());
             }
@@ -1187,6 +1194,7 @@ impl EmitAsm for Aarch64Inst {
                 let (name1, name2) = match size {
                     FpSize::Single => (src1.name_s(), src2.name_s()),
                     FpSize::Double => (src1.name_d(), src2.name_d()),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    stp {}, {}, {}", name1, name2, addr.format());
             }
@@ -1200,6 +1208,7 @@ impl EmitAsm for Aarch64Inst {
                 let (name1, name2) = match size {
                     FpSize::Single => (dst1.name_s(), dst2.name_s()),
                     FpSize::Double => (dst1.name_d(), dst2.name_d()),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let _ = writeln!(out, "    ldp {}, {}, {}", name1, name2, addr.format());
             }
@@ -1214,6 +1223,7 @@ impl EmitAsm for Aarch64Inst {
                 let fp_name = match size {
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
+                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 match target.os {
                     Os::MacOS => {
@@ -1407,6 +1417,7 @@ fn size_bits(size: FpSize) -> u32 {
     match size {
         FpSize::Single => 32,
         FpSize::Double => 64,
+        FpSize::Extended => 80, // x87 not used on AArch64, but provide size
     }
 }
 

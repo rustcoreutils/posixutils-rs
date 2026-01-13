@@ -606,10 +606,11 @@ fn simplify_not(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId};
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_test_func_with_insn(insn: Instruction, pseudos: Vec<Pseudo>) -> Function {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.int_id);
 
         for p in &pseudos {
@@ -637,7 +638,7 @@ mod tests {
     #[test]
     fn test_add_zero_right() {
         // x + 0 -> x
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(2),
@@ -664,7 +665,7 @@ mod tests {
     #[test]
     fn test_add_zero_left() {
         // 0 + x -> x
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(2),
@@ -691,7 +692,7 @@ mod tests {
     #[test]
     fn test_mul_one() {
         // x * 1 -> x
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Mul,
             PseudoId(2),
@@ -718,7 +719,7 @@ mod tests {
     #[test]
     fn test_and_self() {
         // x & x -> x
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::And,
             PseudoId(1),
@@ -741,7 +742,7 @@ mod tests {
     #[test]
     fn test_or_self() {
         // x | x -> x
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Or,
             PseudoId(1),
@@ -764,7 +765,7 @@ mod tests {
     #[test]
     fn test_xor_zero() {
         // x ^ 0 -> x
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Xor,
             PseudoId(2),
@@ -791,7 +792,7 @@ mod tests {
     #[test]
     fn test_xor_self() {
         // x ^ x -> 0
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Xor,
             PseudoId(1),
@@ -815,7 +816,7 @@ mod tests {
     #[test]
     fn test_no_change_for_non_const() {
         // x + y (neither const) -> no change
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(2),
@@ -845,7 +846,7 @@ mod tests {
     #[test]
     fn test_const_fold_add() {
         // 2 + 3 -> 5
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Add,
             PseudoId(2),
@@ -875,7 +876,7 @@ mod tests {
     #[test]
     fn test_const_fold_sub() {
         // 10 - 3 -> 7
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Sub,
             PseudoId(2),
@@ -904,7 +905,7 @@ mod tests {
     #[test]
     fn test_sub_self() {
         // x - x -> 0
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Sub,
             PseudoId(1),
@@ -929,7 +930,7 @@ mod tests {
     #[test]
     fn test_const_fold_mul() {
         // 6 * 7 -> 42
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Mul,
             PseudoId(2),
@@ -958,7 +959,7 @@ mod tests {
     #[test]
     fn test_const_fold_mul_zero() {
         // x * 0 -> 0
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Mul,
             PseudoId(2),
@@ -987,7 +988,7 @@ mod tests {
     #[test]
     fn test_const_fold_div() {
         // 10 / 2 -> 5
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::DivS,
             PseudoId(2),
@@ -1016,7 +1017,7 @@ mod tests {
     #[test]
     fn test_const_fold_mod() {
         // 10 % 3 -> 1
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::ModS,
             PseudoId(2),
@@ -1045,7 +1046,7 @@ mod tests {
     #[test]
     fn test_const_fold_shift() {
         // 1 << 4 -> 16
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::Shl,
             PseudoId(2),
@@ -1074,7 +1075,7 @@ mod tests {
     #[test]
     fn test_const_fold_and() {
         // 0xFF & 0x0F -> 0x0F
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::And,
             PseudoId(2),
@@ -1107,7 +1108,7 @@ mod tests {
     #[test]
     fn test_const_fold_seteq_true() {
         // 5 == 5 -> 1
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::SetEq,
             PseudoId(2),
@@ -1136,7 +1137,7 @@ mod tests {
     #[test]
     fn test_const_fold_seteq_false() {
         // 5 == 3 -> 0
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::SetEq,
             PseudoId(2),
@@ -1165,7 +1166,7 @@ mod tests {
     #[test]
     fn test_const_fold_setlt() {
         // 3 < 5 -> 1
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::SetLt,
             PseudoId(2),
@@ -1194,7 +1195,7 @@ mod tests {
     #[test]
     fn test_identity_eq_self() {
         // x == x -> 1
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::SetEq,
             PseudoId(1),
@@ -1219,7 +1220,7 @@ mod tests {
     #[test]
     fn test_identity_lt_self() {
         // x < x -> 0
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::binop(
             Opcode::SetLt,
             PseudoId(1),
@@ -1248,7 +1249,7 @@ mod tests {
     #[test]
     fn test_const_fold_neg() {
         // -42 -> -42
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::unop(Opcode::Neg, PseudoId(1), PseudoId(0), types.int_id, 32);
         let pseudos = vec![Pseudo::val(PseudoId(0), 42), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1266,7 +1267,7 @@ mod tests {
     #[test]
     fn test_const_fold_not() {
         // ~0 -> -1
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let insn = Instruction::unop(Opcode::Not, PseudoId(1), PseudoId(0), types.int_id, 32);
         let pseudos = vec![Pseudo::val(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);

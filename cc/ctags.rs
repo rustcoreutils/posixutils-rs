@@ -135,7 +135,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
 
     // Create symbol table and type table
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(target.pointer_width);
+    let mut types = TypeTable::new(&target);
 
     // Parse
     let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);

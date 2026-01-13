@@ -975,10 +975,11 @@ fn remove_dead_functions(module: &mut Module) {
 mod tests {
     use super::*;
     use crate::ir::Initializer;
+    use crate::target::Target;
     use crate::types::TypeTable;
 
     fn make_simple_func(name: &str, is_inline: bool) -> Function {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut func = Function::new(name, types.int_id);
         func.is_inline = is_inline;
         func.is_static = is_inline; // inline implies static for our purposes
@@ -1104,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_address_taken_function_not_removed() {
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut module = Module::new();
 
         // Create a static function "handler" that would be removed if not address-taken
@@ -1171,7 +1172,7 @@ mod tests {
         // Test that static functions referenced in global struct/array initializers
         // are NOT removed by dead function elimination.
         // This tests the fix for: static const struct { func_ptr fn; } = { my_func };
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut module = Module::new();
 
         // Create a static function "callback" with no direct callers
@@ -1230,7 +1231,7 @@ mod tests {
     #[test]
     fn test_global_struct_initializer_func_ref_preserved() {
         // Test function refs inside struct initializers in globals
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut module = Module::new();
 
         // Create static function "my_handler"
@@ -1283,7 +1284,7 @@ mod tests {
     #[test]
     fn test_global_array_initializer_func_ref_preserved() {
         // Test function refs inside array initializers in globals
-        let types = TypeTable::new(64);
+        let types = TypeTable::new(&Target::host());
         let mut module = Module::new();
 
         // Create static function "arr_func"

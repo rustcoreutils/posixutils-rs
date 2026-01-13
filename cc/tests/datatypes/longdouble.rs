@@ -435,3 +435,211 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("longdouble_advanced", code, &[]), 0);
 }
+
+// ============================================================================
+// Type Specifier Ordering: "double long" vs "long double"
+// Both orderings should be valid per C standard and produce the same type.
+// Note: This test avoids int-to-long-double conversions (not yet supported).
+// ============================================================================
+
+#[test]
+fn longdouble_type_specifier_ordering() {
+    let code = r#"
+// Both "double long" and "long double" should produce the same type
+double long get_double_long_value(double long x) {
+    return x * 2.0L;
+}
+
+long double get_long_double_value(long double x) {
+    return x * 2.0L;
+}
+
+int main(void) {
+    // "double long" variable declaration with literal
+    double long a;
+    a = 21.0L;
+    if (a < 20.9L || a > 21.1L) return 1;
+
+    // "long double" variable declaration with literal
+    long double b;
+    b = 21.0L;
+    if (b < 20.9L || b > 21.1L) return 2;
+
+    // Function with "double long" parameter and return
+    double long result1 = get_double_long_value(21.0L);
+    if (result1 < 41.9L || result1 > 42.1L) return 3;
+
+    // Function with "long double" parameter and return
+    long double result2 = get_long_double_value(21.0L);
+    if (result2 < 41.9L || result2 > 42.1L) return 4;
+
+    // Mixing both orderings in expressions
+    double long dl;
+    dl = 10.0L;
+    long double ld;
+    ld = 32.0L;
+    long double sum = dl + ld;
+    if (sum < 41.9L || sum > 42.1L) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("longdouble_ordering", code, &[]), 0);
+}
+
+// ============================================================================
+// Multiple Long Double Function Arguments
+// Tests x87 stack-based argument passing for long double parameters.
+// Note: This test avoids int/double-to-long-double conversions (not yet supported).
+// ============================================================================
+
+#[test]
+fn longdouble_multiple_function_args() {
+    let code = r#"
+// Two long double arguments
+long double add_ld(long double a, long double b) {
+    return a + b;
+}
+
+long double sub_ld(long double a, long double b) {
+    return a - b;
+}
+
+long double mul_ld(long double a, long double b) {
+    return a * b;
+}
+
+long double div_ld(long double a, long double b) {
+    return a / b;
+}
+
+// Three long double arguments
+long double triple_add(long double a, long double b, long double c) {
+    return a + b + c;
+}
+
+// Four long double arguments
+long double quad_add(long double a, long double b, long double c, long double d) {
+    return a + b + c + d;
+}
+
+int main(void) {
+    long double a;
+    a = 6.0L;
+    long double b;
+    b = 2.0L;
+
+    // Addition
+    long double sum = add_ld(a, b);
+    if (sum < 7.9L || sum > 8.1L) return 1;
+
+    // Subtraction
+    long double diff = sub_ld(a, b);
+    if (diff < 3.9L || diff > 4.1L) return 2;
+
+    // Multiplication
+    long double prod = mul_ld(a, b);
+    if (prod < 11.9L || prod > 12.1L) return 3;
+
+    // Division
+    long double quot = div_ld(a, b);
+    if (quot < 2.9L || quot > 3.1L) return 4;
+
+    // Three arguments
+    long double c;
+    c = 4.0L;
+    long double triple = triple_add(a, b, c);  // 6 + 2 + 4 = 12
+    if (triple < 11.9L || triple > 12.1L) return 5;
+
+    // Four arguments
+    long double d;
+    d = 8.0L;
+    long double quad = quad_add(a, b, c, d);  // 6 + 2 + 4 + 8 = 20
+    if (quad < 19.9L || quad > 20.1L) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("longdouble_multi_args", code, &[]), 0);
+}
+
+// ============================================================================
+// Long Double Function Returns via x87 ST(0)
+// Tests that long double return values are properly passed via x87 FPU stack.
+// Note: This test avoids int-to-long-double conversions (not yet supported).
+// ============================================================================
+
+#[test]
+fn longdouble_return_via_x87() {
+    let code = r#"
+// Simple return
+long double return_literal(void) {
+    return 42.0L;
+}
+
+// Return parameter
+long double return_param(long double x) {
+    return x;
+}
+
+// Return computed value
+long double return_computed(long double a, long double b) {
+    long double result = a + b;
+    return result;
+}
+
+// Negation and return
+long double neg_ld(long double a) {
+    return -a;
+}
+
+// Chained calls - each result passes through ST(0)
+long double chain_add(long double a, long double b) {
+    return a + b;
+}
+
+long double chain_double(long double x) {
+    return x * 2.0L;
+}
+
+long double chain_negate(long double x) {
+    return -x;
+}
+
+int main(void) {
+    // Return literal value
+    long double lit = return_literal();
+    if (lit < 41.9L || lit > 42.1L) return 1;
+
+    // Return parameter unchanged
+    long double param = return_param(42.0L);
+    if (param < 41.9L || param > 42.1L) return 2;
+
+    // Return computed value
+    long double computed = return_computed(20.0L, 22.0L);
+    if (computed < 41.9L || computed > 42.1L) return 3;
+
+    // Return negation
+    long double neg = neg_ld(6.0L);
+    if (neg < -6.1L || neg > -5.9L) return 4;
+
+    // Chained function calls with x87 returns
+    // Each intermediate result must pass correctly through ST(0)
+    long double base;
+    base = 10.0L;
+    long double five;
+    five = 5.0L;
+    long double after_add = chain_add(base, five);     // 15
+    long double after_double = chain_double(after_add); // 30
+    long double after_neg = chain_negate(after_double); // -30
+    if (after_neg < -30.1L || after_neg > -29.9L) return 5;
+
+    // Use return value immediately in expression
+    long double immediate = chain_add(10.0L, 5.0L) * 2.0L;  // 15 * 2 = 30
+    if (immediate < 29.9L || immediate > 30.1L) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("longdouble_x87_return", code, &[]), 0);
+}

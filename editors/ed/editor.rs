@@ -168,9 +168,15 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Print the prompt if enabled.
+    /// Per POSIX, if no prompt string was specified via -p, the default is '*'.
     fn print_prompt(&mut self) -> io::Result<()> {
-        if self.show_prompt && !self.prompt.is_empty() {
-            write!(self.writer, "{}", self.prompt)?;
+        if self.show_prompt {
+            let prompt = if self.prompt.is_empty() {
+                "*"
+            } else {
+                &self.prompt
+            };
+            write!(self.writer, "{}", prompt)?;
             self.writer.flush()?;
         }
         Ok(())
@@ -1645,5 +1651,24 @@ mod tests {
         let mut editor = create_test_editor("");
         editor.process_line("q\n").unwrap();
         assert!(editor.should_quit);
+    }
+
+    #[test]
+    fn test_prompt_toggle() {
+        let mut editor = create_test_editor("");
+        // Initially false
+        assert!(!editor.show_prompt);
+
+        // Toggle on
+        editor.process_line("P\n").unwrap();
+        assert!(editor.show_prompt, "P should toggle prompt ON");
+
+        // Toggle off
+        editor.process_line("P\n").unwrap();
+        assert!(!editor.show_prompt, "P should toggle prompt OFF");
+
+        // Toggle on again
+        editor.process_line("P\n").unwrap();
+        assert!(editor.show_prompt, "P should toggle prompt ON again");
     }
 }

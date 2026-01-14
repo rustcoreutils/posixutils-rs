@@ -428,9 +428,10 @@ impl X86_64CodeGen {
             let needs_xmm_load = matches!(&dst_loc, Loc::Xmm(_));
             let dst_addr = if needs_xmm_load {
                 // Use scratch location for x87 -> XMM transfer
+                // Must be after callee-saved register area to avoid collision
                 MemAddr::BaseOffset {
                     base: Reg::Rbp,
-                    offset: -8,
+                    offset: -(self.callee_saved_offset + 8),
                 }
             } else {
                 get_mem_addr(&dst_loc, self)
@@ -469,11 +470,12 @@ impl X86_64CodeGen {
             let src_addr = match &src_loc {
                 Loc::Xmm(xmm_reg) => {
                     // XMM register - store to scratch memory first
+                    // Must be after callee-saved register area to avoid collision
                     use super::lir::XmmOperand;
                     use crate::arch::lir::FpSize;
                     let scratch = MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: -8,
+                        offset: -(self.callee_saved_offset + 8),
                     };
                     let fp_size = if src_is_float {
                         FpSize::Single
@@ -561,10 +563,10 @@ impl X86_64CodeGen {
                         offset: -adjusted,
                     }
                 } else {
-                    // Use a fixed scratch location
+                    // Use a fixed scratch location after callee-saved area
                     MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: -8,
+                        offset: -(self.callee_saved_offset + 8),
                     }
                 };
 
@@ -581,10 +583,10 @@ impl X86_64CodeGen {
                 temp_addr
             }
             Loc::Imm(val) => {
-                // Immediate - store to temp location
+                // Immediate - store to temp location after callee-saved area
                 let temp_addr = MemAddr::BaseOffset {
                     base: Reg::Rbp,
-                    offset: -8,
+                    offset: -(self.callee_saved_offset + 8),
                 };
                 let op_size = if src_size <= 32 {
                     OperandSize::B32
@@ -663,9 +665,10 @@ impl X86_64CodeGen {
             },
             _ => {
                 // Store to scratch location, will load to register afterwards
+                // Must be after callee-saved register area to avoid collision
                 MemAddr::BaseOffset {
                     base: Reg::Rbp,
-                    offset: -8,
+                    offset: -(self.callee_saved_offset + 8),
                 }
             }
         };

@@ -644,6 +644,93 @@ fn test_cross_tool_cpio_write() {
     assert!(content.contains("Hello from pax"), "Content mismatch");
 }
 
+/// Test that pax format always generates extended headers, even for simple files
+/// that would fit in ustar limits. This ensures the archive is identifiable as
+/// pax format (not indistinguishable from ustar).
+#[test]
+fn test_pax_always_generates_extended_headers() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.pax");
+
+    // Create a simple file that would fit in ustar limits
+    // (short name, small size, normal uid/gid, no subsecond timestamps)
+    fs::create_dir(&src_dir).unwrap();
+    File::create(src_dir.join("simple.txt"))
+        .unwrap()
+        .write_all(b"simple content")
+        .unwrap();
+
+    // Create archive using pax format
+    let output = run_pax_in_dir(
+        &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+    assert_success(&output, "pax write");
+
+    // Read the archive bytes and verify extended header presence
+    let archive_data = fs::read(&archive).unwrap();
+
+    // In tar/pax format, typeflag is at offset 156 within each 512-byte header block
+    // Typeflag 'x' (0x78) indicates an extended header
+    const BLOCK_SIZE: usize = 512;
+    const TYPEFLAG_OFFSET: usize = 156;
+
+    let mut found_extended_header = false;
+    let mut found_mtime_record = false;
+
+    // Scan through header blocks looking for extended header
+    let mut offset = 0;
+    while offset + BLOCK_SIZE <= archive_data.len() {
+        let block = &archive_data[offset..offset + BLOCK_SIZE];
+
+        // Check if this is a zero block (end of archive)
+        if block.iter().all(|&b| b == 0) {
+            break;
+        }
+
+        let typeflag = block[TYPEFLAG_OFFSET];
+
+        if typeflag == b'x' {
+            found_extended_header = true;
+
+            // Get the size of the extended header data from the header
+            // Size field is at offset 124, 12 bytes, octal
+            let size_field = &block[124..136];
+            let size_str = std::str::from_utf8(size_field)
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('\0');
+            if let Ok(size) = u64::from_str_radix(size_str.trim(), 8) {
+                // Read the extended header data (follows this header block)
+                let data_start = offset + BLOCK_SIZE;
+                let data_end = data_start + size as usize;
+                if data_end <= archive_data.len() {
+                    let ext_data = &archive_data[data_start..data_end];
+                    let ext_str = String::from_utf8_lossy(ext_data);
+
+                    // Check for mtime record (format: "NN mtime=TIMESTAMP\n")
+                    if ext_str.contains("mtime=") {
+                        found_mtime_record = true;
+                    }
+                }
+            }
+            break; // Found what we're looking for
+        }
+
+        offset += BLOCK_SIZE;
+    }
+
+    assert!(
+        found_extended_header,
+        "pax archive should contain extended header (typeflag 'x') even for simple files"
+    );
+    assert!(
+        found_mtime_record,
+        "pax extended header should contain mtime record"
+    );
+}
+
 #[test]
 fn test_symlink_tar_no_damaged_warning() {
     // Verify that system tar can read our tar archives with symlinks without

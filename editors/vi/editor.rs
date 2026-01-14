@@ -1975,6 +1975,75 @@ impl Editor {
         Ok(())
     }
 
+    /// Load startup configuration from EXINIT or .exrc.
+    ///
+    /// Per POSIX, the initialization sequence is:
+    /// 1. If EXINIT is set, execute its commands
+    /// 2. Otherwise, if $HOME/.exrc exists and passes security checks, source it
+    ///
+    /// Security requirements for .exrc:
+    /// - Must be owned by the real user ID
+    /// - Must NOT be writable by group or others
+    pub fn load_startup_config(&mut self) -> Result<()> {
+        // 1. Check EXINIT environment variable
+        if let Ok(exinit) = std::env::var("EXINIT") {
+            if !exinit.is_empty() {
+                // EXINIT uses '|' to separate multiple commands
+                for cmd in exinit.split('|') {
+                    let cmd = cmd.trim();
+                    if !cmd.is_empty() {
+                        // Ignore errors from individual commands
+                        let _ = self.execute_ex_input(cmd);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // 2. Check $HOME/.exrc
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                let exrc_path = format!("{}/.exrc", home);
+                if self.is_safe_exrc(&exrc_path) {
+                    // Ignore errors from sourcing (file might not exist)
+                    let _ = self.execute_source(&exrc_path);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if an .exrc file is safe to source.
+    ///
+    /// Per POSIX, the file must be:
+    /// - Owned by the real user ID (or process has appropriate privileges)
+    /// - Not writable by group or others
+    fn is_safe_exrc(&self, path: &str) -> bool {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false, // File doesn't exist - not an error
+        };
+
+        // Check ownership: must be owned by real user ID
+        let real_uid = unsafe { libc::getuid() };
+        if metadata.uid() != real_uid {
+            return false;
+        }
+
+        // Check permissions: not writable by group or others
+        let mode = metadata.mode();
+        if (mode & 0o022) != 0 {
+            // group or other write bit set
+            return false;
+        }
+
+        true
+    }
+
     /// Execute a shell command (:! or :shell).
     fn execute_shell_command(&mut self, command: &str) -> Result<()> {
         // Temporarily restore terminal to cooked mode

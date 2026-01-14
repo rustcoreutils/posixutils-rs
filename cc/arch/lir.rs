@@ -437,7 +437,7 @@ pub enum Directive {
     /// Switch to data section (.data or .section __DATA,__data)
     Data,
 
-    /// Switch to read-only data section (.section .rodata or __TEXT,__cstring)
+    /// Switch to read-only data section (.section .rodata or __TEXT,__const)
     Rodata,
 
     // ========================================================================
@@ -651,7 +651,7 @@ impl EmitAsm for Directive {
             },
             Directive::Rodata => match target.os {
                 Os::MacOS => {
-                    let _ = writeln!(out, ".section __TEXT,__cstring,cstring_literals");
+                    let _ = writeln!(out, ".section __TEXT,__const");
                 }
                 Os::Linux | Os::FreeBSD => {
                     let _ = writeln!(out, ".section .rodata");

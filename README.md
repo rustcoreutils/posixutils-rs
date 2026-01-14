@@ -18,7 +18,9 @@ Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (O
 
 ## WANTED:  Volunteers!
 
-Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
+Contributions are welcome!  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
+
+**Note:** This project accepts contributions via **GitHub Issues only** (not Pull Requests). See CONTRIBUTING.md for details on this policy.
 
 ### Non-goals
 

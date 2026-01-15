@@ -261,10 +261,11 @@ fn parse_algorithm(s: &str) -> io::Result<Algorithm> {
 fn validate_bits(algo: Algorithm, bits: u32) -> io::Result<()> {
     match algo {
         Algorithm::Lzw => {
-            if !(9..=16).contains(&bits) {
+            // POSIX compress specifies 9-14 bit range
+            if !(9..=14).contains(&bits) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "LZW bits must be 9-16",
+                    "LZW bits must be 9-14 (POSIX)",
                 ));
             }
         }

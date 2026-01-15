@@ -391,7 +391,7 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
     }
 
     // Read input
-    let mut file = input_stream(&pathname.to_path_buf(), true)?;
+    let mut file = input_stream(pathname, true)?;
     let orig_metadata = if !reading_stdin {
         Some(FileMetadata::from_path(pathname)?)
     } else {

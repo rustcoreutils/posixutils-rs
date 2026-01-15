@@ -31,10 +31,6 @@ name = "vi"
 path = "vi_main.rs"
 
 [[bin]]
-name = "ex"
-path = "ex_main.rs"
-
-[[bin]]
 name = "ed"
 path = "ed_main.rs"
 

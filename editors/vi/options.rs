@@ -29,6 +29,8 @@ pub struct Options {
     // Edit options
     /// Autoindent new lines (autoindent/ai).
     pub autoindent: bool,
+    /// Auto-print current line after certain commands (autoprint/ap).
+    pub autoprint: bool,
     /// Auto write before commands (autowrite/aw).
     pub autowrite: bool,
     /// Expand tabs to spaces (expandtab/et).
@@ -39,8 +41,8 @@ pub struct Options {
     pub magic: bool,
     /// Read-only mode (readonly/ro).
     pub readonly: bool,
-    /// Wrap long lines (wrap).
-    pub wrap: bool,
+    /// Right margin for auto line-wrap during insert (wrapmargin/wm).
+    pub wrapmargin: usize,
     /// Wrap search at end of file (wrapscan/ws).
     pub wrapscan: bool,
 
@@ -55,6 +57,12 @@ pub struct Options {
     pub backup: bool,
     /// Write any buffer (writeany/wa).
     pub writeany: bool,
+
+    // Reporting
+    /// Threshold for reporting number of lines changed (report).
+    pub report: usize,
+    /// Use shorter error messages (terse).
+    pub terse: bool,
 
     // Paragraph/section definitions
     /// Paragraph delimiters (paragraphs).
@@ -94,12 +102,13 @@ impl Default for Options {
 
             // Edit
             autoindent: false,
+            autoprint: true,
             autowrite: false,
             expandtab: false,
             ignorecase: false,
             magic: true,
             readonly: false,
-            wrap: true,
+            wrapmargin: 0,
             wrapscan: true,
 
             // Error
@@ -109,6 +118,10 @@ impl Default for Options {
             // File
             backup: false,
             writeany: false,
+
+            // Reporting
+            report: 5,
+            terse: false,
 
             // Paragraph/section
             paragraphs: "IPLPPPQPP LIpplpipbp".to_string(),
@@ -181,12 +194,13 @@ impl Options {
             "showmatch" | "sm" => self.showmatch = value,
             "showmode" => self.showmode = value,
             "autoindent" | "ai" => self.autoindent = value,
+            "autoprint" | "ap" => self.autoprint = value,
             "autowrite" | "aw" => self.autowrite = value,
             "expandtab" | "et" => self.expandtab = value,
             "ignorecase" | "ic" => self.ignorecase = value,
             "magic" => self.magic = value,
             "readonly" | "ro" => self.readonly = value,
-            "wrap" => self.wrap = value,
+            "terse" => self.terse = value,
             "wrapscan" | "ws" => self.wrapscan = value,
             "errorbells" | "eb" => self.errorbells = value,
             "flash" => self.flash = value,
@@ -221,6 +235,16 @@ impl Options {
                     .parse()
                     .map_err(|_| ViError::InvalidOption(format!("{}={}", name, value)))?;
             }
+            "report" => {
+                self.report = value
+                    .parse()
+                    .map_err(|_| ViError::InvalidOption(format!("{}={}", name, value)))?;
+            }
+            "wrapmargin" | "wm" => {
+                self.wrapmargin = value
+                    .parse()
+                    .map_err(|_| ViError::InvalidOption(format!("{}={}", name, value)))?;
+            }
             "paragraphs" => self.paragraphs = value.to_string(),
             "sections" => self.sections = value.to_string(),
             "tags" => self.tags = value.to_string(),
@@ -248,12 +272,15 @@ impl Options {
             "window" => format!("window={}", self.window),
             "scroll" => format!("scroll={}", self.scroll),
             "autoindent" | "ai" => format!("{}autoindent", if self.autoindent { "" } else { "no" }),
+            "autoprint" | "ap" => format!("{}autoprint", if self.autoprint { "" } else { "no" }),
             "autowrite" | "aw" => format!("{}autowrite", if self.autowrite { "" } else { "no" }),
             "expandtab" | "et" => format!("{}expandtab", if self.expandtab { "" } else { "no" }),
             "ignorecase" | "ic" => format!("{}ignorecase", if self.ignorecase { "" } else { "no" }),
             "magic" => format!("{}magic", if self.magic { "" } else { "no" }),
             "readonly" | "ro" => format!("{}readonly", if self.readonly { "" } else { "no" }),
-            "wrap" => format!("{}wrap", if self.wrap { "" } else { "no" }),
+            "report" => format!("report={}", self.report),
+            "terse" => format!("{}terse", if self.terse { "" } else { "no" }),
+            "wrapmargin" | "wm" => format!("wrapmargin={}", self.wrapmargin),
             "wrapscan" | "ws" => format!("{}wrapscan", if self.wrapscan { "" } else { "no" }),
             "errorbells" | "eb" => format!("{}errorbells", if self.errorbells { "" } else { "no" }),
             "flash" => format!("{}flash", if self.flash { "" } else { "no" }),
@@ -282,6 +309,10 @@ impl Options {
             if self.autoindent { "" } else { "no" }
         ));
         items.push(format!(
+            "{}autoprint",
+            if self.autoprint { "" } else { "no" }
+        ));
+        items.push(format!(
             "{}autowrite",
             if self.autowrite { "" } else { "no" }
         ));
@@ -308,17 +339,19 @@ impl Options {
             if self.showmatch { "" } else { "no" }
         ));
         items.push(format!("{}showmode", if self.showmode { "" } else { "no" }));
+        items.push(format!("{}terse", if self.terse { "" } else { "no" }));
         items.push(format!("{}timeout", if self.timeout { "" } else { "no" }));
-        items.push(format!("{}wrap", if self.wrap { "" } else { "no" }));
         items.push(format!("{}wrapscan", if self.wrapscan { "" } else { "no" }));
         items.push(format!("{}writeany", if self.writeany { "" } else { "no" }));
 
         // Numeric options
+        items.push(format!("report={}", self.report));
         items.push(format!("scroll={}", self.scroll));
         items.push(format!("shiftwidth={}", self.shiftwidth));
         items.push(format!("tabstop={}", self.tabstop));
         items.push(format!("taglength={}", self.taglength));
         items.push(format!("window={}", self.window));
+        items.push(format!("wrapmargin={}", self.wrapmargin));
 
         // String options
         items.push(format!("paragraphs={}", self.paragraphs));
@@ -370,11 +403,26 @@ impl Options {
                 if self.autoindent { "" } else { "no" }
             ));
         }
+        if self.autoprint != defaults.autoprint {
+            changes.push(format!(
+                "{}autoprint",
+                if self.autoprint { "" } else { "no" }
+            ));
+        }
         if self.ignorecase != defaults.ignorecase {
             changes.push(format!(
                 "{}ignorecase",
                 if self.ignorecase { "" } else { "no" }
             ));
+        }
+        if self.report != defaults.report {
+            changes.push(format!("report={}", self.report));
+        }
+        if self.terse != defaults.terse {
+            changes.push(format!("{}terse", if self.terse { "" } else { "no" }));
+        }
+        if self.wrapmargin != defaults.wrapmargin {
+            changes.push(format!("wrapmargin={}", self.wrapmargin));
         }
 
         if changes.is_empty() {

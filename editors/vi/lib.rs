@@ -50,6 +50,21 @@ pub enum InvokedAs {
     Ex,
 }
 
+impl InvokedAs {
+    /// Detect invocation mode from argv[0].
+    ///
+    /// If the program name ends with "ex", returns `Ex`.
+    /// Otherwise returns `Vi` (default).
+    pub fn detect() -> Self {
+        let prog = std::env::args().next().unwrap_or_default();
+        if prog.ends_with("ex") {
+            InvokedAs::Ex
+        } else {
+            InvokedAs::Vi
+        }
+    }
+}
+
 /// Run the editor with the given invocation mode and command-line arguments.
 ///
 /// This is the main entry point for both vi and ex binaries.

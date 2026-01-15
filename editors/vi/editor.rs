@@ -425,10 +425,11 @@ impl Editor {
 
     /// Run in ex (line) mode.
     fn run_ex_mode(&mut self) -> Result<i32> {
-        use std::io::{self, BufRead, Write};
+        use std::io::{self, BufRead, IsTerminal, Write};
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
+        let stdin_is_tty = stdin.is_terminal();
 
         while !self.should_quit {
             // Check if we should switch to visual mode
@@ -479,8 +480,8 @@ impl Editor {
                 continue;
             }
 
-            // Print prompt unless in silent mode
-            if !self.silent_mode {
+            // Print prompt unless in silent mode or stdin is not a tty
+            if !self.silent_mode && stdin_is_tty {
                 print!(":");
                 stdout.flush()?;
             }

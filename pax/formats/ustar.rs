@@ -385,11 +385,9 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
         write_string(&mut header[GNAME_OFF..], gname, GNAME_LEN);
     }
 
-    // Device major/minor for block/char devices
-    if entry.is_device() {
-        write_octal(&mut header[DEVMAJOR_OFF..], entry.devmajor as u64, 8);
-        write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8);
-    }
+    // Device major/minor (always written for POSIX compliance)
+    write_octal(&mut header[DEVMAJOR_OFF..], entry.devmajor as u64, 8);
+    write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8);
 
     // Prefix
     write_string(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);

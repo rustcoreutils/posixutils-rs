@@ -11,7 +11,7 @@
 
 use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst};
-use super::regalloc::{Loc, Reg};
+use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
 use crate::ir::Instruction;
@@ -1135,5 +1135,53 @@ impl X86_64CodeGen {
         // Store result
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+    }
+
+    /// Emit __builtin_fabsf - absolute value of float
+    pub(super) fn emit_fabs32(&mut self, insn: &Instruction) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into XMM0 (first FP argument register)
+        self.emit_fp_move(arg, XmmReg::Xmm0, 32);
+
+        // Call fabsf from libc
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("fabsf".to_string())),
+        });
+
+        // Result is in XMM0, store to target
+        let dst_loc = self.get_location(target);
+        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, 32);
+    }
+
+    /// Emit __builtin_fabs - absolute value of double
+    pub(super) fn emit_fabs64(&mut self, insn: &Instruction) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into XMM0 (first FP argument register)
+        self.emit_fp_move(arg, XmmReg::Xmm0, 64);
+
+        // Call fabs from libc
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("fabs".to_string())),
+        });
+
+        // Result is in XMM0, store to target
+        let dst_loc = self.get_location(target);
+        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, 64);
     }
 }

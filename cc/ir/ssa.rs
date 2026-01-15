@@ -147,7 +147,8 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
     let decl_block = local.decl_block;
 
     // Check basic promotability - only scalar types can be promoted
-    if local.is_volatile || !types.is_scalar(typ) {
+    // Volatile and atomic variables must go through memory
+    if local.is_volatile || local.is_atomic || !types.is_scalar(typ) {
         return None;
     }
 
@@ -711,6 +712,7 @@ mod tests {
             x_sym,
             int_id,
             false, // not volatile
+            false, // not atomic
             Some(BasicBlockId(0)),
         );
 
@@ -820,7 +822,7 @@ mod tests {
         // Only add ONE pseudo to func.pseudos with ID 0
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local("x", x_sym, int_id, false, Some(BasicBlockId(0)));
+        func.add_local("x", x_sym, int_id, false, false, Some(BasicBlockId(0)));
 
         // Create an instruction that uses a HIGHER pseudo ID (say, 100)
         // that is NOT in func.pseudos. This simulates what the linearizer does

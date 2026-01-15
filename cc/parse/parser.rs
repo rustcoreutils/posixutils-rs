@@ -1517,6 +1517,7 @@ impl<'a> Parser<'a> {
             "void"
                 | "_Bool"
                 | "_Complex"
+                | "_Atomic"
                 | "char"
                 | "short"
                 | "int"
@@ -1563,7 +1564,7 @@ impl<'a> Parser<'a> {
                 }
                 "_Atomic" => {
                     self.advance();
-                    // Atomic qualifier - consume but don't track for now
+                    mods |= TypeModifiers::ATOMIC;
                 }
                 _ => break,
             }
@@ -2599,6 +2600,65 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        // Infinity builtins - return float constants
+                        "__builtin_inf" | "__builtin_huge_val" => {
+                            self.expect_special(b'(')?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FloatLit(f64::INFINITY),
+                                self.types.double_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_inff" | "__builtin_huge_valf" => {
+                            self.expect_special(b'(')?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FloatLit(f64::INFINITY),
+                                self.types.float_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_infl" | "__builtin_huge_vall" => {
+                            self.expect_special(b'(')?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FloatLit(f64::INFINITY),
+                                self.types.longdouble_id,
+                                token_pos,
+                            ));
+                        }
+                        // Fabs builtins - absolute value for floats
+                        "__builtin_fabs" => {
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Fabs { arg: Box::new(arg) },
+                                self.types.double_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_fabsf" => {
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Fabsf { arg: Box::new(arg) },
+                                self.types.float_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_fabsl" => {
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Fabsl { arg: Box::new(arg) },
+                                self.types.longdouble_id,
+                                token_pos,
+                            ));
+                        }
                         "__builtin_unreachable" => {
                             // __builtin_unreachable() - marks code as unreachable
                             // Takes no arguments, returns void
@@ -2720,6 +2780,280 @@ impl<'a> Parser<'a> {
                             return Ok(Self::typed_expr(
                                 ExprKind::OffsetOf { type_id, path },
                                 self.types.ulong_id, // size_t is typically unsigned long
+                                token_pos,
+                            ));
+                        }
+                        // ================================================================
+                        // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
+                        // ================================================================
+                        "__c11_atomic_init" => {
+                            // __c11_atomic_init(ptr, val) - initialize atomic (no ordering)
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicInit {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                },
+                                self.types.void_id,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_load" => {
+                            // __c11_atomic_load(ptr, order) - returns *ptr atomically
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicLoad {
+                                    ptr: Box::new(ptr),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_store" => {
+                            // __c11_atomic_store(ptr, val, order) - *ptr = val atomically
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicStore {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                self.types.void_id,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_exchange" => {
+                            // __c11_atomic_exchange(ptr, val, order) - swap and return old
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicExchange {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_compare_exchange_strong" => {
+                            // __c11_atomic_compare_exchange_strong(ptr, expected, desired, succ, fail)
+                            // Note: fail_order is parsed but ignored (we use succ_order for both)
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let expected = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let desired = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let succ_order = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let _fail_order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Returns bool (_Bool)
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicCompareExchangeStrong {
+                                    ptr: Box::new(ptr),
+                                    expected: Box::new(expected),
+                                    desired: Box::new(desired),
+                                    succ_order: Box::new(succ_order),
+                                },
+                                self.types.bool_id,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_compare_exchange_weak" => {
+                            // __c11_atomic_compare_exchange_weak(ptr, expected, desired, succ, fail)
+                            // Note: Implemented as strong (no spurious failures)
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let expected = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let desired = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let succ_order = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let _fail_order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Returns bool (_Bool)
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicCompareExchangeWeak {
+                                    ptr: Box::new(ptr),
+                                    expected: Box::new(expected),
+                                    desired: Box::new(desired),
+                                    succ_order: Box::new(succ_order),
+                                },
+                                self.types.bool_id,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_fetch_add" => {
+                            // __c11_atomic_fetch_add(ptr, val, order) - add and return old
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicFetchAdd {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_fetch_sub" => {
+                            // __c11_atomic_fetch_sub(ptr, val, order) - subtract and return old
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicFetchSub {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_fetch_and" => {
+                            // __c11_atomic_fetch_and(ptr, val, order) - AND and return old
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicFetchAnd {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_fetch_or" => {
+                            // __c11_atomic_fetch_or(ptr, val, order) - OR and return old
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicFetchOr {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_fetch_xor" => {
+                            // __c11_atomic_fetch_xor(ptr, val, order) - XOR and return old
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            // Result type is the pointed-to type
+                            let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+                            let result_type =
+                                self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicFetchXor {
+                                    ptr: Box::new(ptr),
+                                    val: Box::new(val),
+                                    order: Box::new(order),
+                                },
+                                result_type,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_thread_fence" => {
+                            // __c11_atomic_thread_fence(order) - memory fence
+                            self.expect_special(b'(')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicThreadFence {
+                                    order: Box::new(order),
+                                },
+                                self.types.void_id,
+                                token_pos,
+                            ));
+                        }
+                        "__c11_atomic_signal_fence" => {
+                            // __c11_atomic_signal_fence(order) - compiler barrier
+                            self.expect_special(b'(')?;
+                            let order = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::C11AtomicSignalFence {
+                                    order: Box::new(order),
+                                },
+                                self.types.void_id,
                                 token_pos,
                             ));
                         }
@@ -3600,6 +3934,7 @@ impl Parser<'_> {
                     | "float"
                     | "double"
                     | "_Complex"
+                    | "_Atomic"
                     | "signed"
                     | "unsigned"
                     | "const"
@@ -3932,6 +4267,33 @@ impl Parser<'_> {
                 "_Complex" => {
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
+                }
+                "_Atomic" => {
+                    self.advance();
+                    // _Atomic can be:
+                    // 1. Type specifier: _Atomic(type-name)
+                    // 2. Type qualifier: _Atomic (without parens)
+                    if self.is_special(b'(') {
+                        // Type specifier form: _Atomic(type-name)
+                        self.advance(); // consume '('
+                        if let Some(inner_type) = self.try_parse_type_name() {
+                            self.expect_special(b')')?;
+                            // Return the type with ATOMIC modifier
+                            let inner = self.types.get(inner_type).clone();
+                            return Ok(Type {
+                                modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
+                                ..inner
+                            });
+                        } else {
+                            return Err(ParseError::new(
+                                "expected type-name in _Atomic(...)",
+                                self.current_pos(),
+                            ));
+                        }
+                    } else {
+                        // Qualifier form: just _Atomic
+                        modifiers |= TypeModifiers::ATOMIC;
+                    }
                 }
                 "short" => {
                     self.advance();
@@ -4428,7 +4790,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers (const, volatile, restrict)
+            // Parse pointer qualifiers (const, volatile, restrict, _Atomic)
             while self.peek() == TokenType::Ident {
                 if let Some(name) = self.get_ident_name(self.current()) {
                     match name.as_str() {
@@ -4443,6 +4805,10 @@ impl Parser<'_> {
                         "restrict" => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
+                        }
+                        "_Atomic" => {
+                            self.advance();
+                            ptr_modifiers |= TypeModifiers::ATOMIC;
                         }
                         _ => break,
                     }
@@ -4885,12 +5251,19 @@ impl Parser<'_> {
     }
 
     /// Parse a parameter list, returning raw parameter info (name and type)
-    /// Parameters are not declared in the symbol table at this stage
+    /// Parameters are declared in a temporary scope during parsing so that
+    /// VLA sizes like `arr[n]` can reference earlier parameters like `n`.
+    /// The scope is exited at the end; callers re-declare parameters as needed.
     fn parse_parameter_list(&mut self) -> ParseResult<(Vec<RawParam>, bool)> {
         let mut params: Vec<RawParam> = Vec::with_capacity(DEFAULT_PARAM_CAPACITY);
         let mut variadic = false;
 
+        // Enter a temporary scope for parameter parsing (C99 6.9.1p9)
+        // This allows VLA sizes to reference earlier parameters
+        self.symbols.enter_scope();
+
         if self.is_special(b')') {
+            self.symbols.leave_scope();
             return Ok((params, variadic));
         }
 
@@ -4901,6 +5274,7 @@ impl Parser<'_> {
                     let saved_pos = self.pos;
                     self.advance();
                     if self.is_special(b')') {
+                        self.symbols.leave_scope();
                         return Ok((params, variadic));
                     }
                     // Not just void, backtrack
@@ -4982,12 +5356,22 @@ impl Parser<'_> {
             };
             params.push((name_opt, typ_id));
 
+            // Declare parameter in temporary scope so later params can reference it
+            // (C99 6.9.1p9: parameters are in scope for VLA sizes)
+            if let Some(name) = name_opt {
+                let sym = Symbol::variable(name, typ_id, self.symbols.depth());
+                let _ = self.symbols.declare(sym);
+            }
+
             if self.is_special(b',') {
                 self.advance();
             } else {
                 break;
             }
         }
+
+        // Leave temporary parameter scope
+        self.symbols.leave_scope();
 
         Ok((params, variadic))
     }
@@ -10011,5 +10395,238 @@ mod tests {
         let (func, types, _, _) = parse_func("void foo(long double x) {}").unwrap();
         let param_type = func.params[0].typ;
         assert_eq!(types.kind(param_type), TypeKind::LongDouble);
+    }
+
+    // ========================================================================
+    // C11 _Atomic qualifier tests
+    // ========================================================================
+
+    #[test]
+    fn test_atomic_type_qualifier() {
+        // _Atomic as type qualifier: _Atomic int x;
+        let (decl, types, _, _) = parse_decl("_Atomic int x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Int);
+        assert!(types.get(typ).modifiers.contains(TypeModifiers::ATOMIC));
+    }
+
+    #[test]
+    fn test_atomic_type_specifier() {
+        // _Atomic as type specifier: _Atomic(int) x;
+        let (decl, types, _, _) = parse_decl("_Atomic(int) x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Int);
+        assert!(types.get(typ).modifiers.contains(TypeModifiers::ATOMIC));
+    }
+
+    #[test]
+    fn test_atomic_pointer_to_atomic() {
+        // Pointer to atomic: _Atomic int *p;
+        let (decl, types, _, _) = parse_decl("_Atomic int *p;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+        // The base type should be atomic int
+        let base = types.get(typ).base.unwrap();
+        assert_eq!(types.kind(base), TypeKind::Int);
+        assert!(types.get(base).modifiers.contains(TypeModifiers::ATOMIC));
+    }
+
+    #[test]
+    fn test_atomic_pointer_qualifier() {
+        // Atomic pointer: int * _Atomic p;
+        let (decl, types, _, _) = parse_decl("int * _Atomic p;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+        assert!(types.get(typ).modifiers.contains(TypeModifiers::ATOMIC));
+    }
+
+    #[test]
+    fn test_atomic_with_const() {
+        // Combined qualifiers: const _Atomic int x;
+        let (decl, types, _, _) = parse_decl("const _Atomic int x;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Int);
+        assert!(types.get(typ).modifiers.contains(TypeModifiers::ATOMIC));
+        assert!(types.get(typ).modifiers.contains(TypeModifiers::CONST));
+    }
+
+    #[test]
+    fn test_atomic_specifier_with_pointer() {
+        // _Atomic(int *) - atomic pointer type
+        let (decl, types, _, _) = parse_decl("_Atomic(int *) p;").unwrap();
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Pointer);
+        assert!(types.get(typ).modifiers.contains(TypeModifiers::ATOMIC));
+    }
+
+    #[test]
+    fn test_atomic_function_param() {
+        // Function with atomic parameter
+        let (func, types, _, _) = parse_func("void foo(_Atomic int x) {}").unwrap();
+        let param_type = func.params[0].typ;
+        assert_eq!(types.kind(param_type), TypeKind::Int);
+        assert!(types
+            .get(param_type)
+            .modifiers
+            .contains(TypeModifiers::ATOMIC));
+    }
+
+    #[test]
+    fn test_atomic_local_variable() {
+        // Local atomic variable
+        let (tu, types, _, _symbols) =
+            parse_tu("int main(void) { _Atomic int counter = 0; return 0; }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                // Check function body is a block
+                if let crate::parse::ast::Stmt::Block(items) = &func.body {
+                    // Find the counter variable in locals
+                    let found = items.iter().any(|item| {
+                        if let crate::parse::ast::BlockItem::Declaration(decl) = item {
+                            let typ = decl.declarators[0].typ;
+                            types.get(typ).modifiers.contains(TypeModifiers::ATOMIC)
+                        } else {
+                            false
+                        }
+                    });
+                    assert!(found, "Expected to find atomic local variable");
+                } else {
+                    panic!("Expected Block statement for function body");
+                }
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    // =======================================================================
+    // Atomic builtin tests
+    // =======================================================================
+
+    #[test]
+    fn test_atomic_load_n() {
+        // __atomic_load_n(ptr, order)
+        let (tu, types, _, _) =
+            parse_tu("int foo(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                let ret_type = func.return_type;
+                assert_eq!(types.kind(ret_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_store_n() {
+        // __atomic_store_n(ptr, val, order)
+        let (tu, _, _, _) =
+            parse_tu("void foo(int *p, int v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }")
+                .unwrap();
+        assert_eq!(tu.items.len(), 1);
+        assert!(matches!(&tu.items[0], ExternalDecl::FunctionDef(_)));
+    }
+
+    #[test]
+    fn test_atomic_exchange_n() {
+        // __atomic_exchange_n(ptr, val, order)
+        let (tu, types, _, _) = parse_tu(
+            "int foo(int *p, int v) { return __atomic_exchange_n(p, v, __ATOMIC_ACQ_REL); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                let ret_type = func.return_type;
+                assert_eq!(types.kind(ret_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_compare_exchange_n() {
+        // __atomic_compare_exchange_n(ptr, expected, desired, weak, succ, fail)
+        let (tu, types, _, _) = parse_tu(
+            "int foo(int *p, int *exp, int des) { return __atomic_compare_exchange_n(p, exp, des, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED); }",
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                // CAS returns bool
+                let ret_type = func.return_type;
+                assert_eq!(types.kind(ret_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_fetch_add() {
+        // __atomic_fetch_add(ptr, val, order)
+        let (tu, types, _, _) =
+            parse_tu("int foo(int *p) { return __atomic_fetch_add(p, 1, __ATOMIC_RELAXED); }")
+                .unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                let ret_type = func.return_type;
+                assert_eq!(types.kind(ret_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_fetch_sub() {
+        // __atomic_fetch_sub(ptr, val, order)
+        let (tu, types, _, _) =
+            parse_tu("int foo(int *p) { return __atomic_fetch_sub(p, 1, __ATOMIC_ACQUIRE); }")
+                .unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                let ret_type = func.return_type;
+                assert_eq!(types.kind(ret_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_fetch_bitwise() {
+        // __atomic_fetch_and, __atomic_fetch_or, __atomic_fetch_xor
+        let (tu, _, _, _) = parse_tu(
+            r#"
+            int foo(int *p) {
+                __atomic_fetch_and(p, 0xFF, __ATOMIC_RELAXED);
+                __atomic_fetch_or(p, 0x80, __ATOMIC_RELAXED);
+                return __atomic_fetch_xor(p, 0x01, __ATOMIC_RELAXED);
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(tu.items.len(), 1);
+        assert!(matches!(&tu.items[0], ExternalDecl::FunctionDef(_)));
+    }
+
+    #[test]
+    fn test_atomic_thread_fence() {
+        // __atomic_thread_fence(order)
+        let (tu, _, _, _) =
+            parse_tu("void foo(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        assert!(matches!(&tu.items[0], ExternalDecl::FunctionDef(_)));
+    }
+
+    #[test]
+    fn test_atomic_signal_fence() {
+        // __atomic_signal_fence(order)
+        let (tu, _, _, _) =
+            parse_tu("void foo(void) { __atomic_signal_fence(__ATOMIC_ACQUIRE); }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        assert!(matches!(&tu.items[0], ExternalDecl::FunctionDef(_)));
     }
 }

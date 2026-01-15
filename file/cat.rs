@@ -13,7 +13,7 @@
 //   continue to the next file, rather than stopping.
 
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -35,7 +35,7 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-fn cat_file(pathname: &PathBuf) -> io::Result<()> {
+fn cat_file(pathname: &Path) -> io::Result<()> {
     let mut file = input_stream(pathname, true)?;
     let mut buffer = [0; BUFSZ];
 

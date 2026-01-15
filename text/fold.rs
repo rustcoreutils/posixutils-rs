@@ -8,7 +8,7 @@
 //
 
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -98,7 +98,7 @@ fn find_last_blank(v: &[u8]) -> Option<usize> {
     None
 }
 
-fn fold_file(args: &Args, pathname: &PathBuf) -> io::Result<()> {
+fn fold_file(args: &Args, pathname: &Path) -> io::Result<()> {
     // open file, or stdin
     let mut file = input_stream(pathname, false)?;
 

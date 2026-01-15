@@ -501,6 +501,41 @@ pub enum X86Inst {
     XorpsSelf { reg: XmmReg },
 
     // ========================================================================
+    // Atomic Instructions (C11 _Atomic support)
+    // ========================================================================
+    /// XCHG - atomic exchange (implicitly has LOCK prefix)
+    Xchg {
+        size: OperandSize,
+        reg: Reg,
+        mem: MemAddr,
+    },
+
+    /// LOCK CMPXCHG - atomic compare and swap
+    /// Compares RAX with mem, if equal sets mem to src and ZF=1, else RAX=mem and ZF=0
+    LockCmpxchg {
+        size: OperandSize,
+        src: Reg,
+        mem: MemAddr,
+    },
+
+    /// LOCK XADD - atomic exchange and add
+    /// Returns old value in reg, adds reg to mem atomically
+    LockXadd {
+        size: OperandSize,
+        reg: Reg,
+        mem: MemAddr,
+    },
+
+    /// MFENCE - full memory fence (SeqCst)
+    Mfence,
+
+    /// LFENCE - load fence (typically not needed on x86)
+    Lfence,
+
+    /// SFENCE - store fence (typically not needed on x86)
+    Sfence,
+
+    // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
@@ -1100,6 +1135,52 @@ impl EmitAsm for X86Inst {
 
             X86Inst::XorpsSelf { reg } => {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
+            }
+
+            // ================================================================
+            // Atomic Instructions
+            // ================================================================
+            X86Inst::Xchg { size, reg, mem } => {
+                // XCHG implicitly has LOCK semantics
+                let _ = writeln!(
+                    out,
+                    "    xchg{} {}, {}",
+                    size.x86_suffix(),
+                    reg.name_for_size(size.bits()),
+                    mem.format(target)
+                );
+            }
+
+            X86Inst::LockCmpxchg { size, src, mem } => {
+                let _ = writeln!(
+                    out,
+                    "    lock cmpxchg{} {}, {}",
+                    size.x86_suffix(),
+                    src.name_for_size(size.bits()),
+                    mem.format(target)
+                );
+            }
+
+            X86Inst::LockXadd { size, reg, mem } => {
+                let _ = writeln!(
+                    out,
+                    "    lock xadd{} {}, {}",
+                    size.x86_suffix(),
+                    reg.name_for_size(size.bits()),
+                    mem.format(target)
+                );
+            }
+
+            X86Inst::Mfence => {
+                let _ = writeln!(out, "    mfence");
+            }
+
+            X86Inst::Lfence => {
+                let _ = writeln!(out, "    lfence");
+            }
+
+            X86Inst::Sfence => {
+                let _ = writeln!(out, "    sfence");
             }
 
             // Directives - delegate to shared implementation

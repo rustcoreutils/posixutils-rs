@@ -25,6 +25,9 @@ pub const STDBOOL_H: &str = include_str!("include/stdbool.h");
 /// Builtin limits.h - implementation limits
 pub const LIMITS_H: &str = include_str!("include/limits.h");
 
+/// Builtin stdatomic.h - C11 atomic operations
+pub const STDATOMIC_H: &str = include_str!("include/stdatomic.h");
+
 /// Look up a builtin header by name
 ///
 /// Returns the header content if found, None otherwise.
@@ -35,6 +38,7 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "stdbool.h" => Some(STDBOOL_H),
         "stddef.h" => Some(STDDEF_H),
         "limits.h" => Some(LIMITS_H),
+        "stdatomic.h" => Some(STDATOMIC_H),
         _ => None,
     }
 }
@@ -66,6 +70,15 @@ mod tests {
         assert!(header.unwrap().contains("bool"));
         assert!(header.unwrap().contains("true"));
         assert!(header.unwrap().contains("false"));
+    }
+
+    #[test]
+    fn test_stdatomic_exists() {
+        let header = get_builtin_header("stdatomic.h");
+        assert!(header.is_some());
+        assert!(header.unwrap().contains("atomic_int"));
+        assert!(header.unwrap().contains("atomic_load"));
+        assert!(header.unwrap().contains("memory_order"));
     }
 
     #[test]

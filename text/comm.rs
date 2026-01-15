@@ -11,7 +11,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_reader;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const NO1: u32 = 1 << 0;
 const NO2: u32 = 1 << 1;
@@ -69,15 +69,15 @@ fn line_out(lead_dup: &'static str, outmask: u32, curtype: u32, s: &str) -> io::
     Ok(())
 }
 
-fn open_file(pathname: &PathBuf) -> io::Result<BufReader<Box<dyn Read>>> {
+fn open_file(pathname: &Path) -> io::Result<BufReader<Box<dyn Read>>> {
     input_reader(pathname, true)
 }
 
 fn comm_file(
     mask: u32,
     lead_dup: &'static str,
-    file1name: &PathBuf,
-    file2name: &PathBuf,
+    file1name: &Path,
+    file2name: &Path,
 ) -> io::Result<()> {
     // open files, or stdin
     let mut rdr1 = open_file(file1name)?;

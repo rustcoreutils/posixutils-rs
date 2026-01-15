@@ -242,3 +242,162 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("macro_if", code, &[]), 0);
 }
+
+// ============================================================================
+// #error Directive Exit Code (Bug #1 fix: CPython configure compatibility)
+// ============================================================================
+
+#[test]
+fn error_directive_exit_code() {
+    use plib::testing::run_test_base;
+    use std::io::Write;
+
+    // Test that #error directive causes non-zero exit code in preprocess-only mode
+    let code = r#"
+#ifdef __ANDROID__
+android_api = __ANDROID_API__
+#else
+#error not Android
+#endif
+"#;
+
+    // Create temp file
+    let mut file = tempfile::Builder::new()
+        .prefix("pcc_test_error_")
+        .suffix(".c")
+        .tempfile()
+        .expect("failed to create temp file");
+    file.write_all(code.as_bytes())
+        .expect("failed to write test file");
+    let path = file.path().to_path_buf();
+
+    // Run pcc -E (preprocess only)
+    let args = vec!["-E".to_string(), path.to_str().unwrap().to_string()];
+    let output = run_test_base("pcc", &args, &[]);
+
+    // Should fail with non-zero exit code
+    assert!(
+        !output.status.success(),
+        "#error directive should cause non-zero exit code"
+    );
+}
+
+// ============================================================================
+// __has_builtin comprehensive test
+// ============================================================================
+
+#[test]
+fn has_builtin_comprehensive() {
+    let code = r#"
+int main(void) {
+    int result = 0;
+
+    // Test variadic builtins
+#if __has_builtin(__builtin_va_start)
+    result++;
+#endif
+#if __has_builtin(__builtin_va_end)
+    result++;
+#endif
+#if __has_builtin(__builtin_va_arg)
+    result++;
+#endif
+#if __has_builtin(__builtin_va_copy)
+    result++;
+#endif
+
+    // Test byte swap builtins
+#if __has_builtin(__builtin_bswap16)
+    result++;
+#endif
+#if __has_builtin(__builtin_bswap32)
+    result++;
+#endif
+#if __has_builtin(__builtin_bswap64)
+    result++;
+#endif
+
+    // Test bit manipulation builtins
+#if __has_builtin(__builtin_ctz)
+    result++;
+#endif
+#if __has_builtin(__builtin_clz)
+    result++;
+#endif
+#if __has_builtin(__builtin_popcount)
+    result++;
+#endif
+
+    // Test memory builtins
+#if __has_builtin(__builtin_alloca)
+    result++;
+#endif
+
+    // Test compile-time builtins
+#if __has_builtin(__builtin_constant_p)
+    result++;
+#endif
+#if __has_builtin(__builtin_types_compatible_p)
+    result++;
+#endif
+#if __has_builtin(__builtin_unreachable)
+    result++;
+#endif
+#if __has_builtin(__builtin_offsetof)
+    result++;
+#endif
+
+    // Test floating-point constant builtins
+#if __has_builtin(__builtin_inf)
+    result++;
+#endif
+#if __has_builtin(__builtin_inff)
+    result++;
+#endif
+#if __has_builtin(__builtin_huge_val)
+    result++;
+#endif
+
+    // Test floating-point math builtins
+#if __has_builtin(__builtin_fabs)
+    result++;
+#endif
+#if __has_builtin(__builtin_fabsf)
+    result++;
+#endif
+#if __has_builtin(__builtin_fabsl)
+    result++;
+#endif
+
+    // Test C11 atomic builtins
+#if __has_builtin(__c11_atomic_load)
+    result++;
+#endif
+#if __has_builtin(__c11_atomic_store)
+    result++;
+#endif
+#if __has_builtin(__c11_atomic_exchange)
+    result++;
+#endif
+#if __has_builtin(__c11_atomic_compare_exchange_strong)
+    result++;
+#endif
+#if __has_builtin(__c11_atomic_fetch_add)
+    result++;
+#endif
+#if __has_builtin(__c11_atomic_thread_fence)
+    result++;
+#endif
+
+    // Test unknown builtin returns 0
+#if __has_builtin(__builtin_nonexistent)
+    result = -1;  // Should not happen
+#endif
+
+    // Expected: 27 builtins detected
+    // (4 va + 3 bswap + 3 bit + 1 alloca + 4 compile-time + 3 fp-const + 3 fp-math + 6 atomic)
+    return (result == 27) ? 0 : result;
+}
+"#;
+    assert_eq!(compile_and_run("has_builtin", code, &[]), 0);
+}

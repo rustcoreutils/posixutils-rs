@@ -11,7 +11,7 @@ use std::{
     ffi::OsStr,
     io::{self, Read},
     ops::AddAssign,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use clap::Parser;
@@ -116,7 +116,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
     output
 }
 
-fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) -> io::Result<()> {
+fn wc_file_bytes(count: &mut CountInfo, pathname: &Path, chars_mode: bool) -> io::Result<()> {
     let mut file = input_stream(pathname, false)?;
 
     let mut buffer = [0; BUFSZ];
@@ -152,7 +152,7 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) ->
 fn wc_file(
     args: &Args,
     chars_mode: bool,
-    pathname: &PathBuf,
+    pathname: &Path,
     count: &mut CountInfo,
 ) -> io::Result<()> {
     wc_file_bytes(count, pathname, chars_mode)?;

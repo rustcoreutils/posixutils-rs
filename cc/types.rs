@@ -150,6 +150,9 @@ bitflags::bitflags! {
 
         // C99 complex type specifier
         const COMPLEX = 1 << 15;
+
+        // C11 atomic type qualifier
+        const ATOMIC = 1 << 16;
     }
 }
 
@@ -422,7 +425,8 @@ impl Type {
         // Top-level qualifiers to ignore
         const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
             .union(TypeModifiers::VOLATILE)
-            .union(TypeModifiers::RESTRICT);
+            .union(TypeModifiers::RESTRICT)
+            .union(TypeModifiers::ATOMIC);
 
         // Compare kinds first
         if self.kind != other.kind {
@@ -485,6 +489,9 @@ impl fmt::Display for Type {
         }
         if self.modifiers.contains(TypeModifiers::VOLATILE) {
             write!(f, "volatile ")?;
+        }
+        if self.modifiers.contains(TypeModifiers::ATOMIC) {
+            write!(f, "_Atomic ")?;
         }
         if self.modifiers.contains(TypeModifiers::UNSIGNED) {
             write!(f, "unsigned ")?;

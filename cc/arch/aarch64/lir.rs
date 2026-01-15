@@ -554,10 +554,95 @@ pub enum Aarch64Inst {
     },
 
     // ========================================================================
+    // Atomic Operations (ARMv8.1 LSE - Large System Extensions)
+    // ========================================================================
+    /// LDAR - Load-Acquire Register
+    /// Atomic load with acquire semantics
+    Ldar {
+        size: OperandSize,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// STLR - Store-Release Register
+    /// Atomic store with release semantics
+    Stlr {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+    },
+
+    /// SWPAL - Atomic Swap with Acquire-Release (LSE)
+    Swpal {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// CASAL - Compare and Swap with Acquire-Release (LSE)
+    Casal {
+        size: OperandSize,
+        expected: Reg,
+        desired: Reg,
+        addr: MemAddr,
+    },
+
+    /// LDADDAL - Atomic Add with Acquire-Release (LSE)
+    Ldaddal {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// LDCLRAL - Atomic Clear with Acquire-Release (LSE)
+    Ldclral {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// LDSETAL - Atomic Set with Acquire-Release (LSE)
+    Ldsetal {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// LDEORAL - Atomic XOR with Acquire-Release (LSE)
+    Ldeoral {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// DMB - Data Memory Barrier
+    /// Ensures ordering of memory accesses
+    Dmb {
+        /// Barrier option: ish (inner shareable), ishld, ishst, sy, etc.
+        option: DmbOption,
+    },
+
+    // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
     Directive(Directive),
+}
+
+/// DMB (Data Memory Barrier) options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmbOption {
+    /// Inner Shareable full barrier
+    Ish,
+    /// Inner Shareable store barrier
+    Ishst,
+    /// Inner Shareable load barrier
+    Ishld,
 }
 
 // ============================================================================
@@ -1404,6 +1489,158 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    addv {}, {}.8b", dst.name_b(), src.name_v());
             }
 
+            // ================================================================
+            // Atomic Operations (ARMv8.1 LSE)
+            // ================================================================
+            Aarch64Inst::Ldar { size, addr, dst } => {
+                let insn = match size {
+                    OperandSize::B8 => "ldarb",
+                    OperandSize::B16 => "ldarh",
+                    OperandSize::B32 | OperandSize::B64 => "ldar",
+                };
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    insn,
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Stlr { size, src, addr } => {
+                let insn = match size {
+                    OperandSize::B8 => "stlrb",
+                    OperandSize::B16 => "stlrh",
+                    OperandSize::B32 | OperandSize::B64 => "stlr",
+                };
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Swpal {
+                size,
+                src,
+                addr,
+                dst,
+            } => {
+                let insn = lse_size_suffix("swpal", *size);
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Casal {
+                size,
+                expected,
+                desired,
+                addr,
+            } => {
+                let insn = lse_size_suffix("casal", *size);
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    expected.name_for_size(sz),
+                    desired.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Ldaddal {
+                size,
+                src,
+                addr,
+                dst,
+            } => {
+                let insn = lse_size_suffix("ldaddal", *size);
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Ldclral {
+                size,
+                src,
+                addr,
+                dst,
+            } => {
+                let insn = lse_size_suffix("ldclral", *size);
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Ldsetal {
+                size,
+                src,
+                addr,
+                dst,
+            } => {
+                let insn = lse_size_suffix("ldsetal", *size);
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Ldeoral {
+                size,
+                src,
+                addr,
+                dst,
+            } => {
+                let insn = lse_size_suffix("ldeoral", *size);
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Dmb { option } => {
+                let opt = match option {
+                    DmbOption::Ish => "ish",
+                    DmbOption::Ishst => "ishst",
+                    DmbOption::Ishld => "ishld",
+                };
+                let _ = writeln!(out, "    dmb {}", opt);
+            }
+
             // Directives - delegate to shared implementation
             Aarch64Inst::Directive(dir) => {
                 dir.emit(target, out);
@@ -1418,6 +1655,16 @@ fn size_bits(size: FpSize) -> u32 {
         FpSize::Single => 32,
         FpSize::Double => 64,
         FpSize::Extended => 80, // x87 not used on AArch64, but provide size
+    }
+}
+
+/// Helper to add size suffix for LSE atomic instructions
+/// AArch64 LSE atomics use B (byte), H (halfword), or nothing (word/doubleword)
+fn lse_size_suffix(base: &str, size: OperandSize) -> String {
+    match size {
+        OperandSize::B8 => format!("{}b", base),
+        OperandSize::B16 => format!("{}h", base),
+        OperandSize::B32 | OperandSize::B64 => base.to_string(),
     }
 }
 

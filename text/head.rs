@@ -9,7 +9,7 @@
 
 use std::error::Error;
 use std::io::{self, Read, StdoutLock, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -44,7 +44,7 @@ enum CountType {
 
 fn head_file(
     count_type: &CountType,
-    pathname: &PathBuf,
+    pathname: &Path,
     first: bool,
     want_header: bool,
     stdout_lock: &mut StdoutLock,

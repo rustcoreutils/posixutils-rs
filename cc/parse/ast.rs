@@ -432,6 +432,24 @@ pub enum ExprKind {
     },
 
     // =========================================================================
+    // Floating-point builtins
+    // =========================================================================
+    /// __builtin_fabs(x) - absolute value of double
+    Fabs {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_fabsf(x) - absolute value of float
+    Fabsf {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_fabsl(x) - absolute value of long double
+    Fabsl {
+        arg: Box<Expr>,
+    },
+
+    // =========================================================================
     // Optimization hints
     // =========================================================================
     /// __builtin_unreachable()
@@ -473,6 +491,145 @@ pub enum ExprKind {
         type_id: TypeId,
         /// The member path (.field or [index] components)
         path: Vec<OffsetOfPath>,
+    },
+
+    // =========================================================================
+    // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
+    // =========================================================================
+    /// __c11_atomic_init(ptr, val)
+    /// Initialize an atomic variable (no memory ordering)
+    C11AtomicInit {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Initial value
+        val: Box<Expr>,
+    },
+
+    /// __c11_atomic_load(ptr, order)
+    /// Atomically loads and returns *ptr with given memory ordering
+    C11AtomicLoad {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_store(ptr, val, order)
+    /// Atomically stores val to *ptr with given memory ordering
+    C11AtomicStore {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to store
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_exchange(ptr, val, order)
+    /// Atomically replaces *ptr with val and returns the old value
+    C11AtomicExchange {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to store
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_compare_exchange_strong(ptr, expected, desired, succ_order, fail_order)
+    /// Atomically compares *ptr with *expected; if equal, stores desired to *ptr,
+    /// otherwise stores *ptr to *expected. Returns true if exchange happened.
+    C11AtomicCompareExchangeStrong {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Pointer to expected value (updated on failure)
+        expected: Box<Expr>,
+        /// Desired value to store on success
+        desired: Box<Expr>,
+        /// Memory ordering on success
+        succ_order: Box<Expr>,
+    },
+
+    /// __c11_atomic_compare_exchange_weak(ptr, expected, desired, succ_order, fail_order)
+    /// Like strong version but may spuriously fail (implemented as strong)
+    C11AtomicCompareExchangeWeak {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Pointer to expected value (updated on failure)
+        expected: Box<Expr>,
+        /// Desired value to store on success
+        desired: Box<Expr>,
+        /// Memory ordering on success
+        succ_order: Box<Expr>,
+    },
+
+    /// __c11_atomic_fetch_add(ptr, val, order)
+    /// Atomically adds val to *ptr and returns the old value
+    C11AtomicFetchAdd {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to add
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_fetch_sub(ptr, val, order)
+    /// Atomically subtracts val from *ptr and returns the old value
+    C11AtomicFetchSub {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to subtract
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_fetch_and(ptr, val, order)
+    /// Atomically ANDs val with *ptr and returns the old value
+    C11AtomicFetchAnd {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to AND
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_fetch_or(ptr, val, order)
+    /// Atomically ORs val with *ptr and returns the old value
+    C11AtomicFetchOr {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to OR
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_fetch_xor(ptr, val, order)
+    /// Atomically XORs val with *ptr and returns the old value
+    C11AtomicFetchXor {
+        /// Pointer to the atomic variable
+        ptr: Box<Expr>,
+        /// Value to XOR
+        val: Box<Expr>,
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_thread_fence(order)
+    /// Synchronization fence with given memory ordering
+    C11AtomicThreadFence {
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
+    },
+
+    /// __c11_atomic_signal_fence(order)
+    /// Signal handler fence (compiler barrier only)
+    C11AtomicSignalFence {
+        /// Memory ordering constant (0-5)
+        order: Box<Expr>,
     },
 }
 
@@ -1140,6 +1297,249 @@ mod tests {
                 }
             }
             _ => panic!("Expected For"),
+        }
+    }
+
+    #[test]
+    fn test_fabs_builtins() {
+        let types = TypeTable::new(&Target::host());
+
+        // Test Fabs (double)
+        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(1.5), types.double_id);
+        let fabs = Expr::new_unpositioned(ExprKind::Fabs { arg: Box::new(arg) });
+        match fabs.kind {
+            ExprKind::Fabs { arg } => {
+                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
+            }
+            _ => panic!("Expected Fabs"),
+        }
+
+        // Test Fabsf (float)
+        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(2.5), types.float_id);
+        let fabsf = Expr::new_unpositioned(ExprKind::Fabsf { arg: Box::new(arg) });
+        match fabsf.kind {
+            ExprKind::Fabsf { arg } => {
+                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
+            }
+            _ => panic!("Expected Fabsf"),
+        }
+
+        // Test Fabsl (long double)
+        let arg = Expr::typed_unpositioned(ExprKind::FloatLit(3.5), types.longdouble_id);
+        let fabsl = Expr::new_unpositioned(ExprKind::Fabsl { arg: Box::new(arg) });
+        match fabsl.kind {
+            ExprKind::Fabsl { arg } => {
+                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
+            }
+            _ => panic!("Expected Fabsl"),
+        }
+    }
+
+    #[test]
+    fn test_c11_atomic_init() {
+        let types = TypeTable::new(&Target::host());
+        let ptr = Expr::int(0x1000, &types); // dummy pointer
+        let val = Expr::int(42, &types);
+
+        let init = Expr::new_unpositioned(ExprKind::C11AtomicInit {
+            ptr: Box::new(ptr),
+            val: Box::new(val),
+        });
+
+        match init.kind {
+            ExprKind::C11AtomicInit { ptr, val } => {
+                assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
+                assert!(matches!(val.kind, ExprKind::IntLit(42)));
+            }
+            _ => panic!("Expected C11AtomicInit"),
+        }
+    }
+
+    #[test]
+    fn test_c11_atomic_load_store() {
+        let types = TypeTable::new(&Target::host());
+        let ptr = Expr::int(0x1000, &types);
+        let val = Expr::int(42, &types);
+        let order = Expr::int(5, &types); // seq_cst
+
+        // Test AtomicLoad
+        let load = Expr::new_unpositioned(ExprKind::C11AtomicLoad {
+            ptr: Box::new(ptr.clone()),
+            order: Box::new(order.clone()),
+        });
+        match load.kind {
+            ExprKind::C11AtomicLoad { ptr, order } => {
+                assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
+                assert!(matches!(order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicLoad"),
+        }
+
+        // Test AtomicStore
+        let store = Expr::new_unpositioned(ExprKind::C11AtomicStore {
+            ptr: Box::new(ptr),
+            val: Box::new(val),
+            order: Box::new(order),
+        });
+        match store.kind {
+            ExprKind::C11AtomicStore { ptr, val, order } => {
+                assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
+                assert!(matches!(val.kind, ExprKind::IntLit(42)));
+                assert!(matches!(order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicStore"),
+        }
+    }
+
+    #[test]
+    fn test_c11_atomic_exchange() {
+        let types = TypeTable::new(&Target::host());
+        let ptr = Expr::int(0x1000, &types);
+        let val = Expr::int(42, &types);
+        let order = Expr::int(5, &types);
+
+        let xchg = Expr::new_unpositioned(ExprKind::C11AtomicExchange {
+            ptr: Box::new(ptr),
+            val: Box::new(val),
+            order: Box::new(order),
+        });
+
+        match xchg.kind {
+            ExprKind::C11AtomicExchange { ptr, val, order } => {
+                assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
+                assert!(matches!(val.kind, ExprKind::IntLit(42)));
+                assert!(matches!(order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicExchange"),
+        }
+    }
+
+    #[test]
+    fn test_c11_atomic_compare_exchange() {
+        let types = TypeTable::new(&Target::host());
+        let ptr = Expr::int(0x1000, &types);
+        let expected = Expr::int(0x2000, &types);
+        let desired = Expr::int(42, &types);
+        let succ_order = Expr::int(5, &types);
+
+        // Test strong variant
+        let cas_strong = Expr::new_unpositioned(ExprKind::C11AtomicCompareExchangeStrong {
+            ptr: Box::new(ptr.clone()),
+            expected: Box::new(expected.clone()),
+            desired: Box::new(desired.clone()),
+            succ_order: Box::new(succ_order.clone()),
+        });
+        match cas_strong.kind {
+            ExprKind::C11AtomicCompareExchangeStrong {
+                ptr,
+                expected,
+                desired,
+                succ_order,
+            } => {
+                assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
+                assert!(matches!(expected.kind, ExprKind::IntLit(0x2000)));
+                assert!(matches!(desired.kind, ExprKind::IntLit(42)));
+                assert!(matches!(succ_order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicCompareExchangeStrong"),
+        }
+
+        // Test weak variant
+        let cas_weak = Expr::new_unpositioned(ExprKind::C11AtomicCompareExchangeWeak {
+            ptr: Box::new(ptr),
+            expected: Box::new(expected),
+            desired: Box::new(desired),
+            succ_order: Box::new(succ_order),
+        });
+        match cas_weak.kind {
+            ExprKind::C11AtomicCompareExchangeWeak {
+                ptr,
+                expected,
+                desired,
+                succ_order,
+            } => {
+                assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
+                assert!(matches!(expected.kind, ExprKind::IntLit(0x2000)));
+                assert!(matches!(desired.kind, ExprKind::IntLit(42)));
+                assert!(matches!(succ_order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicCompareExchangeWeak"),
+        }
+    }
+
+    #[test]
+    fn test_c11_atomic_fetch_ops() {
+        let types = TypeTable::new(&Target::host());
+        let ptr = Expr::int(0x1000, &types);
+        let val = Expr::int(10, &types);
+        let order = Expr::int(5, &types);
+
+        // Test FetchAdd
+        let fetch_add = Expr::new_unpositioned(ExprKind::C11AtomicFetchAdd {
+            ptr: Box::new(ptr.clone()),
+            val: Box::new(val.clone()),
+            order: Box::new(order.clone()),
+        });
+        assert!(matches!(fetch_add.kind, ExprKind::C11AtomicFetchAdd { .. }));
+
+        // Test FetchSub
+        let fetch_sub = Expr::new_unpositioned(ExprKind::C11AtomicFetchSub {
+            ptr: Box::new(ptr.clone()),
+            val: Box::new(val.clone()),
+            order: Box::new(order.clone()),
+        });
+        assert!(matches!(fetch_sub.kind, ExprKind::C11AtomicFetchSub { .. }));
+
+        // Test FetchAnd
+        let fetch_and = Expr::new_unpositioned(ExprKind::C11AtomicFetchAnd {
+            ptr: Box::new(ptr.clone()),
+            val: Box::new(val.clone()),
+            order: Box::new(order.clone()),
+        });
+        assert!(matches!(fetch_and.kind, ExprKind::C11AtomicFetchAnd { .. }));
+
+        // Test FetchOr
+        let fetch_or = Expr::new_unpositioned(ExprKind::C11AtomicFetchOr {
+            ptr: Box::new(ptr.clone()),
+            val: Box::new(val.clone()),
+            order: Box::new(order.clone()),
+        });
+        assert!(matches!(fetch_or.kind, ExprKind::C11AtomicFetchOr { .. }));
+
+        // Test FetchXor
+        let fetch_xor = Expr::new_unpositioned(ExprKind::C11AtomicFetchXor {
+            ptr: Box::new(ptr),
+            val: Box::new(val),
+            order: Box::new(order),
+        });
+        assert!(matches!(fetch_xor.kind, ExprKind::C11AtomicFetchXor { .. }));
+    }
+
+    #[test]
+    fn test_c11_atomic_fences() {
+        let types = TypeTable::new(&Target::host());
+        let order = Expr::int(5, &types); // seq_cst
+
+        // Test thread fence
+        let thread_fence = Expr::new_unpositioned(ExprKind::C11AtomicThreadFence {
+            order: Box::new(order.clone()),
+        });
+        match thread_fence.kind {
+            ExprKind::C11AtomicThreadFence { order } => {
+                assert!(matches!(order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicThreadFence"),
+        }
+
+        // Test signal fence
+        let signal_fence = Expr::new_unpositioned(ExprKind::C11AtomicSignalFence {
+            order: Box::new(order),
+        });
+        match signal_fence.kind {
+            ExprKind::C11AtomicSignalFence { order } => {
+                assert!(matches!(order.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected C11AtomicSignalFence"),
         }
     }
 }

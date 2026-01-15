@@ -794,3 +794,187 @@ fn test_warn_z_suffix_on_compress() {
     cleanup_file(&test_file);
     cleanup_file(&double_compressed);
 }
+
+// =============================================================================
+// Symlink invocation tests (zcat, uncompress)
+// =============================================================================
+
+#[test]
+fn test_zcat_lzw() {
+    // Test zcat symlink with LZW (.Z) format
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("zcat_lzw_test.txt");
+    let compressed_file = test_dir.join("zcat_lzw_test.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+
+    // Compress with LZW (default)
+    compress_test(&[test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "Compressed .Z file should exist");
+
+    // Use zcat to decompress to stdout
+    run_test(TestPlan {
+        cmd: String::from("zcat"),
+        args: vec![compressed_file.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: original_content,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_zcat_gzip() {
+    // Test zcat symlink with gzip (.gz) format
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("zcat_gzip_test.txt");
+    let compressed_file = test_dir.join("zcat_gzip_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+
+    // Compress with gzip
+    compress_test(&["-g", test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "Compressed .gz file should exist");
+
+    // Use zcat to decompress to stdout
+    run_test(TestPlan {
+        cmd: String::from("zcat"),
+        args: vec![compressed_file.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: original_content,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_uncompress_lzw() {
+    // Test uncompress symlink with LZW (.Z) format - in-place decompression
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("uncompress_lzw_test.txt");
+    let compressed_file = test_dir.join("uncompress_lzw_test.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+
+    // Compress with LZW (default)
+    compress_test(&[test_file.to_str().unwrap()], "", "");
+
+    assert!(!test_file.exists(), "Original file should be deleted");
+    assert!(compressed_file.exists(), "Compressed .Z file should exist");
+
+    // Use uncompress to decompress in-place
+    run_test(TestPlan {
+        cmd: String::from("uncompress"),
+        args: vec![compressed_file.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    // Verify original file is restored
+    assert!(test_file.exists(), "Decompressed file should exist");
+    assert!(
+        !compressed_file.exists(),
+        "Compressed file should be removed"
+    );
+
+    let mut decompressed_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut decompressed_content)
+        .unwrap();
+
+    assert_eq!(original_content, decompressed_content);
+
+    cleanup_file(&test_file);
+}
+
+#[test]
+fn test_uncompress_gzip() {
+    // Test uncompress symlink with gzip (.gz) format - in-place decompression
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("uncompress_gzip_test.txt");
+    let compressed_file = test_dir.join("uncompress_gzip_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+
+    // Compress with gzip
+    compress_test(&["-g", test_file.to_str().unwrap()], "", "");
+
+    assert!(!test_file.exists(), "Original file should be deleted");
+    assert!(compressed_file.exists(), "Compressed .gz file should exist");
+
+    // Use uncompress to decompress in-place
+    run_test(TestPlan {
+        cmd: String::from("uncompress"),
+        args: vec![compressed_file.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    // Verify original file is restored
+    assert!(test_file.exists(), "Decompressed file should exist");
+    assert!(
+        !compressed_file.exists(),
+        "Compressed file should be removed"
+    );
+
+    let mut decompressed_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut decompressed_content)
+        .unwrap();
+
+    assert_eq!(original_content, decompressed_content);
+
+    cleanup_file(&test_file);
+}

@@ -53,6 +53,8 @@ pub struct Aarch64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
+    /// Counter for generating unique labels (atomic loops, etc.)
+    unique_label_counter: u32,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -78,6 +80,7 @@ impl Aarch64CodeGen {
             num_fixed_gp_params: 0,
             extern_symbols: HashSet::new(),
             pic_mode: false,
+            unique_label_counter: 0,
         }
     }
 
@@ -2324,7 +2327,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit atomic swap
+    /// Emit atomic swap using LL/SC (LDAXR/STLXR loop)
     fn emit_atomic_swap(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic swap needs target");
         let addr = insn.src[0];
@@ -2335,24 +2338,47 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load value into X0
+        // Load new value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
 
         // Load pointer value into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // SWPAL for full acquire-release semantics (SeqCst)
-        self.push_lir(Aarch64Inst::Swpal {
+        // LL/SC loop for atomic swap
+        let loop_label = self.next_unique_label("swap_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            src: Reg::X0,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X1,
         });
 
+        // STLXR: Try to store X0 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X0,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed (status != 0)
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32, // Status is always 32-bit
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
         self.locations.insert(target, Loc::Reg(Reg::X1));
     }
 
-    /// Emit atomic compare-and-swap
+    /// Emit atomic compare-and-swap using LL/SC
     fn emit_atomic_cas(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic CAS needs target");
         let addr = insn.src[0];
@@ -2366,18 +2392,11 @@ impl Aarch64CodeGen {
         let desired_loc = self.get_location(desired);
 
         // Load expected_ptr (pointer to expected value) into X11
-        // Then load the expected value from that address into X0
+        // Then load the expected value from that address into X9
         self.emit_mov_to_reg(expected_loc, Reg::X11, 64, total_frame);
         self.push_lir(Aarch64Inst::Ldr {
             size: op_size,
             addr: MemAddr::Base(Reg::X11),
-            dst: Reg::X0,
-        });
-
-        // Save original expected value in X9 for later comparison
-        self.push_lir(Aarch64Inst::Mov {
-            size: op_size,
-            src: GpOperand::Reg(Reg::X0),
             dst: Reg::X9,
         });
 
@@ -2387,41 +2406,85 @@ impl Aarch64CodeGen {
         // Load pointer to atomic variable into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // CASAL for full acquire-release semantics
-        // On success: X0 unchanged, *addr = X1
-        // On failure: X0 = *addr (actual value)
-        self.push_lir(Aarch64Inst::Casal {
+        // LL/SC loop for CAS
+        let loop_label = self.next_unique_label("cas_loop");
+        let fail_label = self.next_unique_label("cas_fail");
+        let done_label = self.next_unique_label("cas_done");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive current value into X0
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            expected: Reg::X0,
-            desired: Reg::X1,
             addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X0,
         });
 
-        // Store result back to expected_ptr (X11 still has the pointer)
-        // On failure, X0 contains the actual value; on success X0 is unchanged
+        // Compare current value (X0) with expected (X9)
+        self.push_lir(Aarch64Inst::Cmp {
+            size: op_size,
+            src1: Reg::X0,
+            src2: GpOperand::Reg(Reg::X9),
+        });
+
+        // If not equal, branch to fail
+        self.push_lir(Aarch64Inst::BCond {
+            cond: CondCode::Ne,
+            target: fail_label.clone(),
+        });
+
+        // STLXR: Try to store desired (X1), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X1,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry loop if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Success: set result to 1
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(1),
+            dst: Reg::X2,
+        });
+        self.push_lir(Aarch64Inst::B {
+            target: done_label.clone(),
+        });
+
+        // Fail label: CAS failed (value != expected)
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(fail_label)));
+
+        // Store actual value to *expected_ptr (X11 has expected_ptr)
         self.push_lir(Aarch64Inst::Str {
             size: op_size,
             src: Reg::X0,
             addr: MemAddr::Base(Reg::X11),
         });
 
-        // Compare X0 (result) with X9 (original expected)
-        // If equal, CAS succeeded
-        self.push_lir(Aarch64Inst::Cmp {
-            size: op_size,
-            src1: Reg::X0,
-            src2: GpOperand::Reg(Reg::X9),
-        });
-        // CSET X2, EQ - set X2 to 1 if equal, 0 otherwise
-        self.push_lir(Aarch64Inst::Cset {
-            cond: CondCode::Eq,
+        // Set result to 0 (failure)
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0),
             dst: Reg::X2,
         });
+
+        // Done label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
 
         self.locations.insert(target, Loc::Reg(Reg::X2));
     }
 
-    /// Emit atomic fetch-and-add
+    /// Emit atomic fetch-and-add using LL/SC
     fn emit_atomic_fetch_add(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic fetch_add needs target");
         let addr = insn.src[0];
@@ -2432,25 +2495,55 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load value into X0
+        // Load addend value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
 
         // Load pointer value into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // LDADDAL for full acquire-release semantics
-        // Returns old value in X1
-        self.push_lir(Aarch64Inst::Ldaddal {
+        // LL/SC loop for fetch_add
+        let loop_label = self.next_unique_label("fadd_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            src: Reg::X0,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X1,
         });
 
+        // ADD: X2 = X1 (old) + X0 (addend)
+        self.push_lir(Aarch64Inst::Add {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
         self.locations.insert(target, Loc::Reg(Reg::X1));
     }
 
-    /// Emit atomic fetch-and-subtract
+    /// Emit atomic fetch-and-subtract using LL/SC
     fn emit_atomic_fetch_sub(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic fetch_sub needs target");
         let addr = insn.src[0];
@@ -2461,29 +2554,55 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load value into X0, then negate it
+        // Load subtrahend value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-        self.push_lir(Aarch64Inst::Neg {
-            size: op_size,
-            src: Reg::X0,
-            dst: Reg::X0,
-        });
 
         // Load pointer value into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // LDADDAL with negated value
-        self.push_lir(Aarch64Inst::Ldaddal {
+        // LL/SC loop for fetch_sub
+        let loop_label = self.next_unique_label("fsub_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            src: Reg::X0,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X1,
         });
 
+        // SUB: X2 = X1 (old) - X0 (subtrahend)
+        self.push_lir(Aarch64Inst::Sub {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
         self.locations.insert(target, Loc::Reg(Reg::X1));
     }
 
-    /// Emit atomic fetch-and-AND
+    /// Emit atomic fetch-and-AND using LL/SC
     fn emit_atomic_fetch_and(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic fetch_and needs target");
         let addr = insn.src[0];
@@ -2494,32 +2613,55 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // For AND, we use LDCLR with the complement
-        // fetch_and(ptr, val) = old; *ptr = old & val
-        // This is equivalent to: clear bits that are 0 in val
-        // LDCLR clears bits that are 1 in src, so we need to NOT the value
+        // Load mask value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-        self.push_lir(Aarch64Inst::Mvn {
-            size: op_size,
-            src: Reg::X0,
-            dst: Reg::X0,
-        });
 
         // Load pointer value into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // LDCLRAL with inverted value
-        self.push_lir(Aarch64Inst::Ldclral {
+        // LL/SC loop for fetch_and
+        let loop_label = self.next_unique_label("fand_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            src: Reg::X0,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X1,
         });
 
+        // AND: X2 = X1 (old) & X0 (mask)
+        self.push_lir(Aarch64Inst::And {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
         self.locations.insert(target, Loc::Reg(Reg::X1));
     }
 
-    /// Emit atomic fetch-and-OR
+    /// Emit atomic fetch-and-OR using LL/SC
     fn emit_atomic_fetch_or(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic fetch_or needs target");
         let addr = insn.src[0];
@@ -2530,24 +2672,55 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load value into X0
+        // Load OR value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
 
         // Load pointer value into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // LDSETAL for OR with acquire-release
-        self.push_lir(Aarch64Inst::Ldsetal {
+        // LL/SC loop for fetch_or
+        let loop_label = self.next_unique_label("for_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            src: Reg::X0,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X1,
         });
 
+        // ORR: X2 = X1 (old) | X0 (bits to set)
+        self.push_lir(Aarch64Inst::Orr {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
         self.locations.insert(target, Loc::Reg(Reg::X1));
     }
 
-    /// Emit atomic fetch-and-XOR
+    /// Emit atomic fetch-and-XOR using LL/SC
     fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, total_frame: i32) {
         let target = insn.target.expect("atomic fetch_xor needs target");
         let addr = insn.src[0];
@@ -2558,20 +2731,51 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load value into X0
+        // Load XOR value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
 
         // Load pointer value into X10 (pointer is 64-bit)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // LDEORAL for XOR with acquire-release
-        self.push_lir(Aarch64Inst::Ldeoral {
+        // LL/SC loop for fetch_xor
+        let loop_label = self.next_unique_label("fxor_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
-            src: Reg::X0,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X1,
         });
 
+        // EOR: X2 = X1 (old) ^ X0 (bits to toggle)
+        self.push_lir(Aarch64Inst::Eor {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
         self.locations.insert(target, Loc::Reg(Reg::X1));
     }
 
@@ -2608,6 +2812,13 @@ impl Aarch64CodeGen {
         if let Some(target) = insn.target {
             self.locations.insert(target, Loc::Imm(0));
         }
+    }
+
+    /// Generate a unique label with the given prefix
+    fn next_unique_label(&mut self, prefix: &str) -> Label {
+        let id = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        Label::new(prefix, id)
     }
 
     /// Helper to move a value into a register

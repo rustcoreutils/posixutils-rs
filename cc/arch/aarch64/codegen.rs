@@ -2308,11 +2308,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // STLR provides release semantics (sufficient for SeqCst on AArch64)
         self.push_lir(Aarch64Inst::Stlr {
@@ -2338,11 +2338,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load new value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for atomic swap
         let loop_label = self.next_unique_label("swap_loop");
@@ -2391,6 +2391,10 @@ impl Aarch64CodeGen {
         let expected_loc = self.get_location(expected_ptr);
         let desired_loc = self.get_location(desired);
 
+        // Load pointer to atomic variable into X10 FIRST
+        // (before other loads in case addr is in X11, X9, or X1)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load expected_ptr (pointer to expected value) into X11
         // Then load the expected value from that address into X9
         self.emit_mov_to_reg(expected_loc, Reg::X11, 64, total_frame);
@@ -2402,9 +2406,6 @@ impl Aarch64CodeGen {
 
         // Load desired value into X1
         self.emit_mov_to_reg(desired_loc, Reg::X1, size, total_frame);
-
-        // Load pointer to atomic variable into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for CAS
         let loop_label = self.next_unique_label("cas_loop");
@@ -2495,11 +2496,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load addend value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for fetch_add
         let loop_label = self.next_unique_label("fadd_loop");
@@ -2554,11 +2555,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load subtrahend value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for fetch_sub
         let loop_label = self.next_unique_label("fsub_loop");
@@ -2613,11 +2614,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load mask value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for fetch_and
         let loop_label = self.next_unique_label("fand_loop");
@@ -2672,11 +2673,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load OR value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for fetch_or
         let loop_label = self.next_unique_label("for_loop");
@@ -2731,11 +2732,11 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
         // Load XOR value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // Load pointer value into X10 (pointer is 64-bit)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
         // LL/SC loop for fetch_xor
         let loop_label = self.next_unique_label("fxor_loop");

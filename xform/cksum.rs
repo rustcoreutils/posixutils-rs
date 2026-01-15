@@ -22,7 +22,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::io::input_stream;
 use plib::BUFSZ;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// cksum - write file checksums and sizes
 #[derive(Parser)]
@@ -32,7 +32,7 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-fn cksum_file(filename: &PathBuf) -> io::Result<()> {
+fn cksum_file(filename: &Path) -> io::Result<()> {
     let mut file = input_stream(filename, false)?;
 
     let mut buffer = [0; BUFSZ];

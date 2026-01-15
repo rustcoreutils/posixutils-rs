@@ -9,10 +9,10 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// open file, or stdin
-pub fn input_stream(pathname: &PathBuf, dashed_stdin: bool) -> io::Result<Box<dyn Read>> {
+pub fn input_stream(pathname: &Path, dashed_stdin: bool) -> io::Result<Box<dyn Read>> {
     let path_str = pathname.as_os_str();
     let file: Box<dyn Read> =
         if (dashed_stdin && path_str == "-") || (!dashed_stdin && path_str.is_empty()) {
@@ -32,7 +32,7 @@ pub fn input_stream_opt(pathname: &Option<PathBuf>) -> io::Result<Box<dyn Read>>
 }
 
 pub fn input_reader(
-    pathname: &PathBuf,
+    pathname: &Path,
     dashed_stdin: bool,
 ) -> io::Result<io::BufReader<Box<dyn Read>>> {
     let file = input_stream(pathname, dashed_stdin)?;

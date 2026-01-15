@@ -7,3 +7,4 @@ mod ed;
 mod ex;
 mod headless;
 mod integration;
+mod pty;

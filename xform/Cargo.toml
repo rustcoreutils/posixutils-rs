@@ -13,6 +13,7 @@ clap.workspace = true
 libc.workspace = true
 gettext-rs.workspace = true
 base64 = "0"
+flate2 = "1"
 
 [lints]
 workspace = true
@@ -20,10 +21,6 @@ workspace = true
 [[bin]]
 name = "cksum"
 path = "./cksum.rs"
-
-[[bin]]
-name = "uncompress"
-path = "./uncompress.rs"
 
 [[bin]]
 name = "compress"

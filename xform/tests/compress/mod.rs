@@ -40,19 +40,6 @@ fn compress_test_with_exit(args: &[&str], expected_exit: i32) {
     });
 }
 
-fn uncompress_test(args: &[&str], expected_output: &str, expected_error: &str) {
-    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
-
-    run_test(TestPlan {
-        cmd: String::from("uncompress"),
-        args: str_args,
-        stdin_data: String::new(),
-        expected_out: String::from(expected_output),
-        expected_err: String::from(expected_error),
-        expected_exit_code: 0,
-    });
-}
-
 fn compress_stdin_test(stdin_data: &str) -> Vec<u8> {
     let str_args: Vec<String> = vec![String::from("-c")];
     let mut result = Vec::new();
@@ -82,6 +69,38 @@ fn compress_stdin_test(stdin_data: &str) -> Vec<u8> {
     result
 }
 
+fn compress_stdin_gzip_test(stdin_data: &str) -> Vec<u8> {
+    let str_args: Vec<String> = vec![String::from("-c"), String::from("-g")];
+    let mut result = Vec::new();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: str_args,
+            stdin_data: String::from(stdin_data),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            result = output.stdout.clone();
+            assert!(
+                !output.stdout.is_empty(),
+                "compress -g should produce output"
+            );
+            assert!(
+                output.stdout.len() >= 2,
+                "compress -g output too short for magic header"
+            );
+            // Check gzip magic header
+            assert_eq!(output.stdout[0], 0x1F, "Wrong gzip magic byte 0");
+            assert_eq!(output.stdout[1], 0x8B, "Wrong gzip magic byte 1");
+        },
+    );
+
+    result
+}
+
 fn get_test_dir() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
         .join("tests")
@@ -95,7 +114,7 @@ fn cleanup_file(path: &PathBuf) {
 }
 
 // =============================================================================
-// Basic functionality tests
+// Basic LZW functionality tests
 // =============================================================================
 
 #[test]
@@ -147,14 +166,262 @@ fn test_compress_roundtrip() {
     assert!(!test_file.exists(), "Original file should be deleted");
     assert!(compressed_file.exists(), "Compressed file should exist");
 
-    // Uncompress with -c to stdout
-    uncompress_test(
-        &["-c", compressed_file.to_str().unwrap()],
-        &original_content,
-        "",
+    // Decompress with -c -d to stdout
+    let str_args: Vec<String> = vec![
+        String::from("-c"),
+        String::from("-d"),
+        compressed_file.to_str().unwrap().to_string(),
+    ];
+
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: original_content,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    cleanup_file(&compressed_file);
+}
+
+// =============================================================================
+// Gzip/DEFLATE tests
+// =============================================================================
+
+#[test]
+fn test_compress_gzip_magic_header() {
+    const GZIP_MAGIC: [u8; 2] = [0x1F, 0x8B];
+
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("gzip_magic_test.txt");
+    let compressed_file = test_dir.join("gzip_magic_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    compress_test(&["-g", test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "Compressed .gz file should exist");
+
+    let mut file = File::open(&compressed_file).unwrap();
+    let mut buffer = vec![0; GZIP_MAGIC.len()];
+    file.read_exact(&mut buffer).unwrap();
+
+    assert_eq!(buffer, GZIP_MAGIC);
+
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_compress_gzip_roundtrip() {
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("gzip_roundtrip_test.txt");
+    let compressed_file = test_dir.join("gzip_roundtrip_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+
+    // Compress with gzip
+    compress_test(&["-g", test_file.to_str().unwrap()], "", "");
+
+    assert!(!test_file.exists(), "Original file should be deleted");
+    assert!(compressed_file.exists(), "Compressed .gz file should exist");
+
+    // Decompress with -c -d
+    let str_args: Vec<String> = vec![
+        String::from("-c"),
+        String::from("-d"),
+        compressed_file.to_str().unwrap().to_string(),
+    ];
+
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: original_content,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_compress_m_deflate() {
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("m_deflate_test.txt");
+    let compressed_file = test_dir.join("m_deflate_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    // Use -m deflate
+    compress_test(&["-m", "deflate", test_file.to_str().unwrap()], "", "");
+
+    assert!(
+        compressed_file.exists(),
+        "-m deflate should create .gz file"
     );
 
     cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_compress_m_gzip() {
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("m_gzip_test.txt");
+    let compressed_file = test_dir.join("m_gzip_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    // Use -m gzip
+    compress_test(&["-m", "gzip", test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "-m gzip should create .gz file");
+
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_compress_m_lzw() {
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("m_lzw_test.txt");
+    let compressed_file = test_dir.join("m_lzw_test.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    // Explicit -m lzw
+    compress_test(&["-m", "lzw", test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "-m lzw should create .Z file");
+
+    cleanup_file(&compressed_file);
+}
+
+// =============================================================================
+// -d decompress option tests
+// =============================================================================
+
+#[test]
+fn test_compress_d_option() {
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("d_option_test.txt");
+    let compressed_file = test_dir.join("d_option_test.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
+
+    // Compress
+    compress_test(&[test_file.to_str().unwrap()], "", "");
+    assert!(compressed_file.exists());
+
+    // Decompress using -d -f (file replacement)
+    compress_test(&["-d", "-f", compressed_file.to_str().unwrap()], "", "");
+
+    assert!(test_file.exists(), "Decompressed file should exist");
+    assert!(!compressed_file.exists(), ".Z file should be removed");
+
+    let mut decompressed_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut decompressed_content)
+        .unwrap();
+
+    assert_eq!(original_content, decompressed_content);
+
+    cleanup_file(&test_file);
+}
+
+#[test]
+fn test_decompress_finds_z_file() {
+    // Test that decompress finds .Z file when given filename without .Z
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("find_z_test.txt");
+    let compressed_file = test_dir.join("find_z_test.txt.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    compress_test(&[test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "Compressed file should exist");
+
+    // Decompress with filename without .Z - should find the .Z file
+    compress_test(&["-d", "-f", test_file.to_str().unwrap()], "", "");
+
+    assert!(test_file.exists(), "Decompressed file should exist");
+    assert!(
+        !compressed_file.exists(),
+        "Compressed file should be removed"
+    );
+
+    cleanup_file(&test_file);
+}
+
+#[test]
+fn test_decompress_finds_gz_file() {
+    // Test that decompress finds .gz file when given filename without .gz
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("find_gz_test.txt");
+    let compressed_file = test_dir.join("find_gz_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    // Compress with gzip
+    compress_test(&["-g", test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "Compressed .gz file should exist");
+
+    // Decompress with filename without .gz - should find the .gz file
+    compress_test(&["-d", "-f", test_file.to_str().unwrap()], "", "");
+
+    assert!(test_file.exists(), "Decompressed file should exist");
+    assert!(
+        !compressed_file.exists(),
+        "Compressed .gz file should be removed"
+    );
+
+    cleanup_file(&test_file);
 }
 
 // =============================================================================
@@ -183,17 +450,18 @@ fn test_compress_stdin_small_data() {
 }
 
 #[test]
+fn test_compress_gzip_stdin() {
+    let compressed = compress_stdin_gzip_test("Hello World! This is a test of gzip compression.\n");
+    assert!(compressed.len() >= 10, "Gzip output should have header");
+    assert_eq!(compressed[0], 0x1F);
+    assert_eq!(compressed[1], 0x8B);
+}
+
+#[test]
 fn test_compress_stdout_flag() {
     let test_dir = get_test_dir();
     let source_file = test_dir.join("lorem_ipsum.txt");
 
-    let mut expected = String::new();
-    File::open(&source_file)
-        .unwrap()
-        .read_to_string(&mut expected)
-        .unwrap();
-
-    // Compress to stdout and pipe to uncompress
     let str_args: Vec<String> = vec![
         String::from("-c"),
         source_file.to_str().unwrap().to_string(),
@@ -218,7 +486,7 @@ fn test_compress_stdout_flag() {
 }
 
 // =============================================================================
-// -b bits option tests
+// -b bits/level option tests
 // =============================================================================
 
 #[test]
@@ -275,6 +543,27 @@ fn test_compress_bits_14() {
     cleanup_file(&compressed_file);
 }
 
+#[test]
+fn test_compress_gzip_level() {
+    // Test -b with gzip (compression level)
+    let test_dir = get_test_dir();
+    let source_file = test_dir.join("lorem_ipsum.txt");
+    let test_file = test_dir.join("gzip_level_test.txt");
+    let compressed_file = test_dir.join("gzip_level_test.txt.gz");
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    fs::copy(&source_file, &test_file).unwrap();
+
+    // Use -g with -b 9 (maximum compression)
+    compress_test(&["-g", "-b", "9", test_file.to_str().unwrap()], "", "");
+
+    assert!(compressed_file.exists(), "Compressed .gz file should exist");
+
+    cleanup_file(&compressed_file);
+}
+
 // =============================================================================
 // Force mode tests
 // =============================================================================
@@ -309,15 +598,15 @@ fn test_compress_force_small_file() {
 }
 
 // =============================================================================
-// File output mode tests (uncompress)
+// Algorithm auto-detection tests
 // =============================================================================
 
 #[test]
-fn test_uncompress_file_output() {
+fn test_auto_detect_lzw() {
     let test_dir = get_test_dir();
     let source_file = test_dir.join("lorem_ipsum.txt");
-    let test_file = test_dir.join("file_output_test.txt");
-    let compressed_file = test_dir.join("file_output_test.txt.Z");
+    let test_file = test_dir.join("auto_lzw_test.txt");
+    let compressed_file = test_dir.join("auto_lzw_test.txt.Z");
 
     cleanup_file(&test_file);
     cleanup_file(&compressed_file);
@@ -330,80 +619,66 @@ fn test_uncompress_file_output() {
         .read_to_string(&mut original_content)
         .unwrap();
 
+    // Compress with LZW
     compress_test(&[test_file.to_str().unwrap()], "", "");
 
-    // Now uncompress to file (not stdout)
+    // Decompress - should auto-detect LZW from magic bytes
     let str_args: Vec<String> = vec![
-        String::from("-f"),
+        String::from("-c"),
+        String::from("-d"),
         compressed_file.to_str().unwrap().to_string(),
     ];
 
     run_test(TestPlan {
-        cmd: String::from("uncompress"),
+        cmd: String::from("compress"),
         args: str_args,
         stdin_data: String::new(),
-        expected_out: String::new(),
+        expected_out: original_content,
         expected_err: String::new(),
         expected_exit_code: 0,
     });
 
-    // .Z file should be removed, original recreated
-    assert!(
-        !compressed_file.exists(),
-        "Compressed file should be deleted"
-    );
-    assert!(test_file.exists(), "Decompressed file should exist");
-
-    let mut decompressed_content = String::new();
-    File::open(&test_file)
-        .unwrap()
-        .read_to_string(&mut decompressed_content)
-        .unwrap();
-
-    assert_eq!(original_content, decompressed_content);
-
-    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
 }
 
 #[test]
-fn test_uncompress_finds_z_file() {
-    // Test that uncompress finds .Z file when given filename without .Z
+fn test_auto_detect_gzip() {
     let test_dir = get_test_dir();
     let source_file = test_dir.join("lorem_ipsum.txt");
-    let test_file = test_dir.join("find_z_test.txt");
-    let compressed_file = test_dir.join("find_z_test.txt.Z");
+    let test_file = test_dir.join("auto_gzip_test.txt");
+    let compressed_file = test_dir.join("auto_gzip_test.txt.gz");
 
     cleanup_file(&test_file);
     cleanup_file(&compressed_file);
 
     fs::copy(&source_file, &test_file).unwrap();
 
-    compress_test(&[test_file.to_str().unwrap()], "", "");
+    let mut original_content = String::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_string(&mut original_content)
+        .unwrap();
 
-    assert!(compressed_file.exists(), "Compressed file should exist");
+    // Compress with gzip
+    compress_test(&["-g", test_file.to_str().unwrap()], "", "");
 
-    // Uncompress with filename without .Z - should find the .Z file
+    // Decompress - should auto-detect gzip from magic bytes
     let str_args: Vec<String> = vec![
-        String::from("-f"),
-        test_file.to_str().unwrap().to_string(), // Note: no .Z
+        String::from("-c"),
+        String::from("-d"),
+        compressed_file.to_str().unwrap().to_string(),
     ];
 
     run_test(TestPlan {
-        cmd: String::from("uncompress"),
+        cmd: String::from("compress"),
         args: str_args,
         stdin_data: String::new(),
-        expected_out: String::new(),
+        expected_out: original_content,
         expected_err: String::new(),
         expected_exit_code: 0,
     });
 
-    assert!(test_file.exists(), "Decompressed file should exist");
-    assert!(
-        !compressed_file.exists(),
-        "Compressed file should be removed"
-    );
-
-    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
 }
 
 // =============================================================================
@@ -432,12 +707,12 @@ fn test_compress_missing_file() {
 }
 
 #[test]
-fn test_uncompress_missing_file() {
-    let str_args: Vec<String> = vec![String::from("/nonexistent/file/path.Z")];
+fn test_decompress_missing_file() {
+    let str_args: Vec<String> = vec![String::from("-d"), String::from("/nonexistent/file/path.Z")];
 
     run_test_with_checker(
         TestPlan {
-            cmd: String::from("uncompress"),
+            cmd: String::from("compress"),
             args: str_args,
             stdin_data: String::new(),
             expected_out: String::new(),
@@ -450,4 +725,72 @@ fn test_uncompress_missing_file() {
             assert!(output.stdout.is_empty(), "Should have no stdout");
         },
     );
+}
+
+#[test]
+fn test_invalid_algorithm() {
+    let str_args: Vec<String> = vec![
+        String::from("-m"),
+        String::from("invalid_algo"),
+        String::from("/dev/null"),
+    ];
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_plan, output| {
+            assert!(
+                !output.stderr.is_empty(),
+                "Should have error for invalid algorithm"
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Warning tests
+// =============================================================================
+
+#[test]
+fn test_warn_z_suffix_on_compress() {
+    let test_dir = get_test_dir();
+    let test_file = test_dir.join("already_compressed.Z");
+    let double_compressed = test_dir.join("already_compressed.Z.Z");
+
+    cleanup_file(&test_file);
+    cleanup_file(&double_compressed);
+
+    // Create a fake .Z file
+    fs::write(&test_file, "test data").unwrap();
+
+    let str_args: Vec<String> = vec![String::from("-f"), test_file.to_str().unwrap().to_string()];
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("compress"),
+            args: str_args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            // Should warn about .Z suffix
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("already has") && stderr.contains("suffix"),
+                "Should warn about existing .Z suffix: {}",
+                stderr
+            );
+        },
+    );
+
+    cleanup_file(&test_file);
+    cleanup_file(&double_compressed);
 }

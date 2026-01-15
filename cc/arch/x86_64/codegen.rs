@@ -1267,6 +1267,14 @@ impl X86_64CodeGen {
                 self.emit_alloca(insn);
             }
 
+            Opcode::Fabs32 => {
+                self.emit_fabs32(insn);
+            }
+
+            Opcode::Fabs64 => {
+                self.emit_fabs64(insn);
+            }
+
             Opcode::Unreachable => {
                 // Emit ud2 instruction - undefined instruction that traps
                 // This is used for __builtin_unreachable() to indicate code
@@ -1288,6 +1296,49 @@ impl X86_64CodeGen {
 
             Opcode::Asm => {
                 self.emit_inline_asm(insn);
+            }
+
+            // ================================================================
+            // Atomic Operations (C11 _Atomic support)
+            // ================================================================
+            Opcode::AtomicLoad => {
+                self.emit_atomic_load(insn, types);
+            }
+
+            Opcode::AtomicStore => {
+                self.emit_atomic_store(insn, types);
+            }
+
+            Opcode::AtomicSwap => {
+                self.emit_atomic_swap(insn, types);
+            }
+
+            Opcode::AtomicCas => {
+                self.emit_atomic_cas(insn, types);
+            }
+
+            Opcode::AtomicFetchAdd => {
+                self.emit_atomic_fetch_add(insn, types);
+            }
+
+            Opcode::AtomicFetchSub => {
+                self.emit_atomic_fetch_sub(insn, types);
+            }
+
+            Opcode::AtomicFetchAnd => {
+                self.emit_atomic_fetch_and(insn, types);
+            }
+
+            Opcode::AtomicFetchOr => {
+                self.emit_atomic_fetch_or(insn, types);
+            }
+
+            Opcode::AtomicFetchXor => {
+                self.emit_atomic_fetch_xor(insn, types);
+            }
+
+            Opcode::Fence => {
+                self.emit_fence(insn);
             }
 
             // Skip no-ops and unimplemented
@@ -2929,6 +2980,508 @@ impl X86_64CodeGen {
             _ => self.reg_name_64(reg),
         }
     }
+
+    // ========================================================================
+    // Atomic Operations (C11 _Atomic support)
+    // ========================================================================
+
+    /// Emit atomic load
+    /// On x86-64, aligned loads are already atomic - just use regular mov
+    fn emit_atomic_load(&mut self, insn: &Instruction, types: &TypeTable) {
+        // Atomic load is identical to regular load on x86-64 for aligned data
+        // Memory ordering is handled by x86's strong memory model
+        self.emit_load(insn, types);
+    }
+
+    /// Emit atomic store
+    /// On x86-64, aligned stores are atomic. For SeqCst, use XCHG for full barrier.
+    fn emit_atomic_store(&mut self, insn: &Instruction, types: &TypeTable) {
+        use crate::ir::MemoryOrder;
+
+        let target = insn.target.expect("atomic store needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        // For SeqCst, use XCHG which provides full barrier
+        // For weaker orderings, regular store + optional SFENCE is sufficient
+        if insn.memory_order == MemoryOrder::SeqCst {
+            // Load value into a register
+            let value_loc = self.get_location(value);
+            let addr_loc = self.get_location(addr);
+
+            // Move value to R10
+            self.emit_mov_to_reg(value_loc, Reg::R10, size);
+
+            // Get address into R11
+            let mem_addr = match addr_loc {
+                Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
+                Loc::Stack(offset) => {
+                    let adjusted = offset + self.callee_saved_offset;
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: -adjusted,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    MemAddr::BaseOffset {
+                        base: Reg::R11,
+                        offset: 0,
+                    }
+                }
+                Loc::Global(name) => {
+                    let symbol = Symbol::global(self.format_symbol_name(&name));
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::RipRelative(symbol),
+                        dst: Reg::R11,
+                    });
+                    MemAddr::BaseOffset {
+                        base: Reg::R11,
+                        offset: 0,
+                    }
+                }
+                _ => {
+                    // Handle other cases
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(0),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    MemAddr::BaseOffset {
+                        base: Reg::R11,
+                        offset: 0,
+                    }
+                }
+            };
+
+            // XCHG provides atomic store with full barrier
+            self.push_lir(X86Inst::Xchg {
+                size: op_size,
+                reg: Reg::R10,
+                mem: mem_addr,
+            });
+        } else {
+            // For release/relaxed, regular store is sufficient on x86
+            self.emit_store(insn, types);
+        }
+
+        // Target is void, but we need to assign something
+        self.locations.insert(target, Loc::Imm(0));
+    }
+
+    /// Emit atomic exchange (swap)
+    fn emit_atomic_swap(&mut self, insn: &Instruction, _types: &TypeTable) {
+        let target = insn.target.expect("atomic swap needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let value_loc = self.get_location(value);
+        let addr_loc = self.get_location(addr);
+
+        // Get address FIRST (before loading value, in case addr is in RAX)
+        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+
+        // Move new value to RAX (will hold old value after XCHG)
+        self.emit_mov_to_reg(value_loc, Reg::Rax, size);
+
+        // XCHG atomically swaps RAX with memory
+        self.push_lir(X86Inst::Xchg {
+            size: op_size,
+            reg: Reg::Rax,
+            mem: mem_addr,
+        });
+
+        // Result (old value) is in RAX
+        self.locations.insert(target, Loc::Reg(Reg::Rax));
+    }
+
+    /// Emit atomic compare-and-swap
+    fn emit_atomic_cas(&mut self, insn: &Instruction, _types: &TypeTable) {
+        let target = insn.target.expect("atomic cas needs target");
+        let addr = insn.src[0];
+        let expected_ptr = insn.src[1];
+        let desired = insn.src[2];
+        let size = insn.size; // Element size in bits
+
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let expected_loc = self.get_location(expected_ptr);
+        let desired_loc = self.get_location(desired);
+
+        // Load expected_ptr (pointer to expected value) into R9
+        // We need this for later store-back on failure
+        self.emit_mov_to_reg(expected_loc, Reg::R9, 64);
+
+        // Load address of atomic variable into R11
+        self.emit_mov_to_reg(addr_loc, Reg::R11, 64);
+
+        // Load expected value from *expected_ptr (R9) into RAX
+        self.push_lir(X86Inst::Mov {
+            size: op_size,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R9,
+                offset: 0,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+
+        // Load desired value into R10
+        self.emit_mov_to_reg(desired_loc, Reg::R10, size);
+
+        // LOCK CMPXCHG: if *addr == RAX, set *addr = R10 and ZF=1
+        //               else RAX = *addr and ZF=0
+        self.push_lir(X86Inst::LockCmpxchg {
+            size: op_size,
+            src: Reg::R10,
+            mem: MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset: 0,
+            },
+        });
+
+        // SETE stores 1 if ZF=1 (success), 0 otherwise (use R8 to avoid clobbering)
+        self.push_lir(X86Inst::SetCC {
+            cc: CondCode::Eq,
+            dst: Reg::R8,
+        });
+
+        // On failure, store RAX (actual value) to *expected (R9 has expected_ptr)
+        let label_suffix = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let skip_label = Label::new("cas_done", label_suffix);
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Eq, // Jump if equal (success)
+            target: skip_label.clone(),
+        });
+        // Failed: store actual value to *expected
+        self.push_lir(X86Inst::Mov {
+            size: op_size,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R9,
+                offset: 0,
+            }),
+        });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(skip_label)));
+
+        // Zero-extend result (0 or 1) to full register
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B8,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::R8),
+            dst: Reg::Rax,
+        });
+
+        // Result (success flag) is in RAX
+        self.locations.insert(target, Loc::Reg(Reg::Rax));
+    }
+
+    /// Emit atomic fetch-and-add
+    fn emit_atomic_fetch_add(&mut self, insn: &Instruction, _types: &TypeTable) {
+        let target = insn.target.expect("atomic fetch_add needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let value_loc = self.get_location(value);
+        let addr_loc = self.get_location(addr);
+
+        // Get address FIRST (before loading value, in case addr is in RAX)
+        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+
+        // Move value to RAX
+        self.emit_mov_to_reg(value_loc, Reg::Rax, size);
+
+        // LOCK XADD: atomically adds RAX to *addr, returns old value in RAX
+        self.push_lir(X86Inst::LockXadd {
+            size: op_size,
+            reg: Reg::Rax,
+            mem: mem_addr,
+        });
+
+        // Result (old value) is in RAX
+        self.locations.insert(target, Loc::Reg(Reg::Rax));
+    }
+
+    /// Emit atomic fetch-and-subtract
+    fn emit_atomic_fetch_sub(&mut self, insn: &Instruction, _types: &TypeTable) {
+        let target = insn.target.expect("atomic fetch_sub needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let value_loc = self.get_location(value);
+        let addr_loc = self.get_location(addr);
+
+        // Get address FIRST (before loading value, in case addr is in RAX)
+        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+
+        // Negate value: sub is add of negative
+        self.emit_mov_to_reg(value_loc, Reg::Rax, size);
+        self.push_lir(X86Inst::Neg {
+            size: op_size,
+            dst: Reg::Rax,
+        });
+
+        // LOCK XADD with negated value
+        self.push_lir(X86Inst::LockXadd {
+            size: op_size,
+            reg: Reg::Rax,
+            mem: mem_addr,
+        });
+
+        // Result (old value) is in RAX
+        self.locations.insert(target, Loc::Reg(Reg::Rax));
+    }
+
+    /// Emit atomic fetch-and-and
+    fn emit_atomic_fetch_and(&mut self, insn: &Instruction, _types: &TypeTable) {
+        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::And);
+    }
+
+    /// Emit atomic fetch-and-or
+    fn emit_atomic_fetch_or(&mut self, insn: &Instruction, _types: &TypeTable) {
+        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Or);
+    }
+
+    /// Emit atomic fetch-and-xor
+    fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, _types: &TypeTable) {
+        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Xor);
+    }
+
+    /// Helper for atomic fetch bitwise operations (AND, OR, XOR)
+    /// Uses CMPXCHG loop since x86 doesn't have LOCK AND/OR/XOR that return old value
+    fn emit_atomic_fetch_bitop(&mut self, insn: &Instruction, op: AtomicBitOp) {
+        let target = insn.target.expect("atomic fetch needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let value_loc = self.get_location(value);
+        let addr_loc = self.get_location(addr);
+
+        // Get address into R11
+        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+
+        // Move operand value to R10
+        self.emit_mov_to_reg(value_loc, Reg::R10, size);
+
+        // Load current value into RAX
+        self.push_lir(X86Inst::Mov {
+            size: op_size,
+            src: GpOperand::Mem(mem_addr.clone()),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+
+        // Loop label
+        let label_suffix = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let loop_label = Label::new("atomic_bitop", label_suffix);
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // Copy old value to RCX for computing new value
+        self.push_lir(X86Inst::Mov {
+            size: op_size,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
+
+        // Apply bitwise operation: RCX = RCX op R10
+        match op {
+            AtomicBitOp::And => {
+                self.push_lir(X86Inst::And {
+                    size: op_size,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: Reg::Rcx,
+                });
+            }
+            AtomicBitOp::Or => {
+                self.push_lir(X86Inst::Or {
+                    size: op_size,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: Reg::Rcx,
+                });
+            }
+            AtomicBitOp::Xor => {
+                self.push_lir(X86Inst::Xor {
+                    size: op_size,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: Reg::Rcx,
+                });
+            }
+        }
+
+        // LOCK CMPXCHG: if *addr == RAX, set *addr = RCX
+        self.push_lir(X86Inst::LockCmpxchg {
+            size: op_size,
+            src: Reg::Rcx,
+            mem: mem_addr,
+        });
+
+        // If failed (ZF=0), retry - RAX now has actual value
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ne,
+            target: loop_label,
+        });
+
+        // Result (old value) is in RAX
+        self.locations.insert(target, Loc::Reg(Reg::Rax));
+    }
+
+    /// Emit memory fence
+    fn emit_fence(&mut self, insn: &Instruction) {
+        use crate::ir::MemoryOrder;
+
+        let target = insn.target.expect("fence needs target");
+
+        // Emit appropriate fence based on memory ordering
+        match insn.memory_order {
+            MemoryOrder::SeqCst | MemoryOrder::AcqRel => {
+                self.push_lir(X86Inst::Mfence);
+            }
+            MemoryOrder::Acquire | MemoryOrder::Consume => {
+                // LFENCE - but x86 loads have acquire semantics anyway
+                self.push_lir(X86Inst::Lfence);
+            }
+            MemoryOrder::Release => {
+                // SFENCE - but x86 stores have release semantics anyway
+                self.push_lir(X86Inst::Sfence);
+            }
+            MemoryOrder::Relaxed => {
+                // No fence needed for relaxed
+            }
+        }
+
+        self.locations.insert(target, Loc::Imm(0));
+    }
+
+    /// Helper to move a value to a register
+    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32) {
+        let op_size = OperandSize::from_bits(size);
+        match loc {
+            Loc::Reg(src) => {
+                if src != reg {
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(src),
+                        dst: GpOperand::Reg(reg),
+                    });
+                }
+            }
+            Loc::Imm(v) => {
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(v),
+                    dst: GpOperand::Reg(reg),
+                });
+            }
+            Loc::Stack(offset) => {
+                let adjusted = offset + self.callee_saved_offset;
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -adjusted,
+                    }),
+                    dst: GpOperand::Reg(reg),
+                });
+            }
+            Loc::Global(name) => {
+                let symbol = Symbol::global(self.format_symbol_name(&name));
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
+                    dst: GpOperand::Reg(reg),
+                });
+            }
+            _ => {
+                // Default: load 0
+                self.push_lir(X86Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Reg(reg),
+                });
+            }
+        }
+    }
+
+    /// Helper to get memory address for atomic operations
+    /// Always copies the address to R11 to avoid conflicts with RAX used for values
+    fn get_mem_addr_for_atomic(&mut self, loc: Loc) -> MemAddr {
+        match loc {
+            Loc::Reg(r) => {
+                // Always copy to R11 to avoid conflicts when RAX is used for values
+                if r != Reg::R11 {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(r),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                }
+                MemAddr::BaseOffset {
+                    base: Reg::R11,
+                    offset: 0,
+                }
+            }
+            Loc::Stack(offset) => {
+                let adjusted = offset + self.callee_saved_offset;
+                // Load address into R11
+                self.push_lir(X86Inst::Lea {
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -adjusted,
+                    },
+                    dst: Reg::R11,
+                });
+                MemAddr::BaseOffset {
+                    base: Reg::R11,
+                    offset: 0,
+                }
+            }
+            Loc::Global(name) => {
+                let symbol = Symbol::global(self.format_symbol_name(&name));
+                self.push_lir(X86Inst::Lea {
+                    addr: MemAddr::RipRelative(symbol),
+                    dst: Reg::R11,
+                });
+                MemAddr::BaseOffset {
+                    base: Reg::R11,
+                    offset: 0,
+                }
+            }
+            _ => {
+                // Load zero address into R11 (this shouldn't happen)
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+                MemAddr::BaseOffset {
+                    base: Reg::R11,
+                    offset: 0,
+                }
+            }
+        }
+    }
+}
+
+/// Helper enum for atomic bitwise operations
+#[derive(Clone, Copy)]
+enum AtomicBitOp {
+    And,
+    Or,
+    Xor,
 }
 
 // ============================================================================

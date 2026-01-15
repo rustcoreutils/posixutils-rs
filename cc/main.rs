@@ -178,6 +178,17 @@ struct Args {
 
     #[arg(short = 'l', action = clap::ArgAction::Append, value_name = "library", help = gettext("Link library (passed to linker)"))]
     libraries: Vec<String>,
+
+    /// Disable builtin function recognition (GCC compatibility)
+    /// pcc does not implicitly recognize standard library functions as builtins,
+    /// so this flag is accepted for compatibility but has no effect.
+    #[arg(long = "fno-builtin", help = gettext("Disable builtin function recognition"))]
+    fno_builtin: bool,
+
+    /// Disable specific builtin function (GCC compatibility)
+    /// Accepts -fno-builtin-FUNC format via preprocess_args
+    #[arg(long = "pcc-fno-builtin-func", action = clap::ArgAction::Append, value_name = "func", hide = true)]
+    fno_builtin_funcs: Vec<String>,
 }
 
 /// Print compilation statistics for capacity tuning
@@ -319,6 +330,13 @@ fn process_file(
         if !args.verbose {
             println!();
         }
+        // Check for preprocessor errors (e.g., #error directive)
+        if diag::has_error() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "preprocessing failed",
+            ));
+        }
         return Ok(());
     }
 
@@ -332,6 +350,14 @@ fn process_file(
     let ast = parser
         .parse_translation_unit()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;
+
+    // Check for semantic errors (e.g., undeclared identifiers) reported during parsing
+    if diag::has_error() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compilation failed",
+        ));
+    }
 
     if args.dump_ast {
         println!("{:#?}", ast);
@@ -522,6 +548,9 @@ fn preprocess_args() -> Vec<String> {
             result.push("-l".to_string());
             result.push(arg[2..].to_string());
             i += 1;
+        } else if arg.starts_with("-std=") {
+            // -std=c99, -std=c11, etc. - ignore (pcc is C99)
+            i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
             // -fPIC / -fpic → --pcc-fpic (internal flag)
             result.push("--pcc-fpic".to_string());
@@ -529,6 +558,21 @@ fn preprocess_args() -> Vec<String> {
         } else if arg == "-shared" {
             // -shared → --shared
             result.push("--shared".to_string());
+            i += 1;
+        } else if arg == "-fno-builtin" {
+            // -fno-builtin → --fno-builtin
+            result.push("--fno-builtin".to_string());
+            i += 1;
+        } else if let Some(func) = arg.strip_prefix("-fno-builtin-") {
+            // -fno-builtin-FUNC → --pcc-fno-builtin-func FUNC
+            result.push("--pcc-fno-builtin-func".to_string());
+            result.push(func.to_string());
+            i += 1;
+        } else if arg == "-fstrict-overflow" || arg == "-fno-strict-overflow" || arg == "-fwrapv" {
+            // GCC optimization flags - silently ignore (pcc doesn't have these optimizations)
+            i += 1;
+        } else if arg == "-p" || arg == "-pg" {
+            // Profiling flags - silently ignore (pcc doesn't support profiling)
             i += 1;
         } else {
             result.push(arg.clone());

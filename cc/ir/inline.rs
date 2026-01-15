@@ -697,6 +697,7 @@ fn inline_call_site(
                     sym: new_sym,
                     typ: local_var.typ,
                     is_volatile: local_var.is_volatile,
+                    is_atomic: local_var.is_atomic,
                     decl_block: new_decl_block,
                 },
             );

@@ -263,7 +263,6 @@ static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 static WARNING_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Get current error state
-#[cfg(test)]
 pub fn has_error() -> u32 {
     HAS_ERROR.load(Ordering::Relaxed)
 }

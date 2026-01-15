@@ -8,7 +8,7 @@
 //
 
 use std::io::{self, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -65,7 +65,7 @@ fn space_out(column: &mut usize, writer: &mut BufWriter<dyn Write>) -> io::Resul
     Ok(())
 }
 
-fn expand_file(tablist: &TabList, pathname: &PathBuf) -> io::Result<()> {
+fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
     // open file, or stdin
     let mut file = input_stream(pathname, false)?;
 

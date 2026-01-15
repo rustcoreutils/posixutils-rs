@@ -450,7 +450,7 @@ impl<'a> Preprocessor<'a> {
     fn init_predefined_macros(&mut self) {
         // Standard C macros
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
-        self.define_macro(Macro::predefined("__STDC_VERSION__", Some("199901L"))); // C99
+        self.define_macro(Macro::predefined("__STDC_VERSION__", Some("201112L"))); // C11
         self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
 
         // GCC compatibility macros (required by system headers)
@@ -477,6 +477,14 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::keyword_alias("__extension__", "")); // expands to nothing
         self.define_macro(Macro::keyword_alias("__restrict", "restrict"));
         self.define_macro(Macro::keyword_alias("__restrict__", "restrict"));
+
+        // C11 atomic memory order constants (GCC-compatible for <stdatomic.h>)
+        self.define_macro(Macro::predefined("__ATOMIC_RELAXED", Some("0")));
+        self.define_macro(Macro::predefined("__ATOMIC_CONSUME", Some("1")));
+        self.define_macro(Macro::predefined("__ATOMIC_ACQUIRE", Some("2")));
+        self.define_macro(Macro::predefined("__ATOMIC_RELEASE", Some("3")));
+        self.define_macro(Macro::predefined("__ATOMIC_ACQ_REL", Some("4")));
+        self.define_macro(Macro::predefined("__ATOMIC_SEQ_CST", Some("5")));
 
         // Architecture macros
         for (name, value) in arch::get_arch_macros(self.target) {
@@ -520,6 +528,11 @@ impl<'a> Preprocessor<'a> {
 
         // Miscellaneous macros
         for (name, value) in arch::get_misc_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Floating-point limit macros
+        for (name, value) in arch::get_float_limit_macros(self.target) {
             self.define_macro(Macro::predefined(name, Some(value)));
         }
 
@@ -2430,14 +2443,17 @@ impl<'a> Preprocessor<'a> {
                 // Return true only for builtins actually implemented in the compiler
                 matches!(
                     name.as_str(),
+                    // Variadic function support
                     "__builtin_va_list"
                         | "__builtin_va_start"
                         | "__builtin_va_end"
                         | "__builtin_va_arg"
                         | "__builtin_va_copy"
+                        // Byte swap
                         | "__builtin_bswap16"
                         | "__builtin_bswap32"
                         | "__builtin_bswap64"
+                        // Bit manipulation
                         | "__builtin_ctz"
                         | "__builtin_ctzl"
                         | "__builtin_ctzll"
@@ -2447,12 +2463,39 @@ impl<'a> Preprocessor<'a> {
                         | "__builtin_popcount"
                         | "__builtin_popcountl"
                         | "__builtin_popcountll"
+                        // Memory
                         | "__builtin_alloca"
+                        // Compile-time evaluation
                         | "__builtin_constant_p"
                         | "__builtin_types_compatible_p"
                         | "__builtin_unreachable"
                         | "__builtin_offsetof"
                         | "offsetof"
+                        // Floating-point constants
+                        | "__builtin_inf"
+                        | "__builtin_inff"
+                        | "__builtin_infl"
+                        | "__builtin_huge_val"
+                        | "__builtin_huge_valf"
+                        | "__builtin_huge_vall"
+                        // Floating-point math
+                        | "__builtin_fabs"
+                        | "__builtin_fabsf"
+                        | "__builtin_fabsl"
+                        // Atomic builtins (C11 - Clang style)
+                        | "__c11_atomic_init"
+                        | "__c11_atomic_load"
+                        | "__c11_atomic_store"
+                        | "__c11_atomic_exchange"
+                        | "__c11_atomic_compare_exchange_strong"
+                        | "__c11_atomic_compare_exchange_weak"
+                        | "__c11_atomic_fetch_add"
+                        | "__c11_atomic_fetch_sub"
+                        | "__c11_atomic_fetch_and"
+                        | "__c11_atomic_fetch_or"
+                        | "__c11_atomic_fetch_xor"
+                        | "__c11_atomic_thread_fence"
+                        | "__c11_atomic_signal_fence"
                 )
             }
             BuiltinMacro::HasFeature => {
@@ -2898,14 +2941,17 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         // Return 1 for builtins actually implemented in the compiler
         let supported = matches!(
             name.as_str(),
+            // Variadic function support
             "__builtin_va_list"
                 | "__builtin_va_start"
                 | "__builtin_va_end"
                 | "__builtin_va_arg"
                 | "__builtin_va_copy"
+                // Byte swap
                 | "__builtin_bswap16"
                 | "__builtin_bswap32"
                 | "__builtin_bswap64"
+                // Bit manipulation
                 | "__builtin_ctz"
                 | "__builtin_ctzl"
                 | "__builtin_ctzll"
@@ -2915,12 +2961,39 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 | "__builtin_popcount"
                 | "__builtin_popcountl"
                 | "__builtin_popcountll"
+                // Memory
                 | "__builtin_alloca"
+                // Compile-time evaluation
                 | "__builtin_constant_p"
                 | "__builtin_types_compatible_p"
                 | "__builtin_unreachable"
                 | "__builtin_offsetof"
                 | "offsetof"
+                // Floating-point constants
+                | "__builtin_inf"
+                | "__builtin_inff"
+                | "__builtin_infl"
+                | "__builtin_huge_val"
+                | "__builtin_huge_valf"
+                | "__builtin_huge_vall"
+                // Floating-point math
+                | "__builtin_fabs"
+                | "__builtin_fabsf"
+                | "__builtin_fabsl"
+                // Atomic builtins (C11 - Clang style)
+                | "__c11_atomic_init"
+                | "__c11_atomic_load"
+                | "__c11_atomic_store"
+                | "__c11_atomic_exchange"
+                | "__c11_atomic_compare_exchange_strong"
+                | "__c11_atomic_compare_exchange_weak"
+                | "__c11_atomic_fetch_add"
+                | "__c11_atomic_fetch_sub"
+                | "__c11_atomic_fetch_and"
+                | "__c11_atomic_fetch_or"
+                | "__c11_atomic_fetch_xor"
+                | "__c11_atomic_thread_fence"
+                | "__c11_atomic_signal_fence"
         );
 
         if supported {

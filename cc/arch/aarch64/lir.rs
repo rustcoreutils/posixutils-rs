@@ -384,6 +384,14 @@ pub enum Aarch64Inst {
     /// B.cond - Conditional branch
     BCond { cond: CondCode, target: Label },
 
+    /// CBNZ - Compare and Branch if Not Zero
+    /// Used for atomic LL/SC retry loops
+    Cbnz {
+        size: OperandSize,
+        src: Reg,
+        target: Label,
+    },
+
     /// BL - Branch with link (function call)
     Bl { target: CallTarget<Reg> },
 
@@ -554,10 +562,64 @@ pub enum Aarch64Inst {
     },
 
     // ========================================================================
+    // Atomic Operations (ARMv8.1 LSE - Large System Extensions)
+    // ========================================================================
+    /// LDAR - Load-Acquire Register
+    /// Atomic load with acquire semantics
+    Ldar {
+        size: OperandSize,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// STLR - Store-Release Register
+    /// Atomic store with release semantics
+    Stlr {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+    },
+
+    /// LDAXR - Load-Acquire Exclusive Register (LL/SC baseline ARMv8.0)
+    /// Used for atomic read-modify-write operations
+    Ldaxr {
+        size: OperandSize,
+        addr: MemAddr,
+        dst: Reg,
+    },
+
+    /// STLXR - Store-Release Exclusive Register (LL/SC baseline ARMv8.0)
+    /// Returns 0 on success, 1 on failure (exclusive monitor lost)
+    Stlxr {
+        size: OperandSize,
+        src: Reg,
+        addr: MemAddr,
+        status: Reg, // W register for status (0=success, 1=fail)
+    },
+
+    /// DMB - Data Memory Barrier
+    /// Ensures ordering of memory accesses
+    Dmb {
+        /// Barrier option: ish (inner shareable), ishld, ishst, sy, etc.
+        option: DmbOption,
+    },
+
+    // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
     Directive(Directive),
+}
+
+/// DMB (Data Memory Barrier) options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmbOption {
+    /// Inner Shareable full barrier
+    Ish,
+    /// Inner Shareable store barrier
+    Ishst,
+    /// Inner Shareable load barrier
+    Ishld,
 }
 
 // ============================================================================
@@ -580,12 +642,98 @@ impl EmitAsm for Aarch64Inst {
             // Data Movement
             Aarch64Inst::Mov { size, src, dst } => {
                 let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    mov {}, {}",
-                    dst.name_for_size(sz),
-                    src.format(OperandSize::from_bits(sz))
-                );
+                match src {
+                    GpOperand::Reg(_) => {
+                        let _ = writeln!(
+                            out,
+                            "    mov {}, {}",
+                            dst.name_for_size(sz),
+                            src.format(OperandSize::from_bits(sz))
+                        );
+                    }
+                    GpOperand::Imm(v) => {
+                        // AArch64 MOV immediate has limited encoding
+                        // For values that don't fit, use MOVZ + MOVK sequence
+                        let v = *v as u64;
+                        if v == 0 {
+                            let _ = writeln!(out, "    mov {}, #0", dst.name_for_size(sz));
+                        } else if sz == 32 {
+                            // 32-bit: up to 2 MOVZ/MOVK instructions
+                            let v32 = v as u32;
+                            let lo = (v32 & 0xFFFF) as u16;
+                            let hi = ((v32 >> 16) & 0xFFFF) as u16;
+                            if hi == 0 {
+                                // Fits in 16 bits
+                                let _ =
+                                    writeln!(out, "    movz {}, #{}", dst.name_for_size(32), lo);
+                            } else if lo == 0 {
+                                // Upper 16 bits only
+                                let _ = writeln!(
+                                    out,
+                                    "    movz {}, #{}, lsl #16",
+                                    dst.name_for_size(32),
+                                    hi
+                                );
+                            } else {
+                                // Need both
+                                let _ =
+                                    writeln!(out, "    movz {}, #{}", dst.name_for_size(32), lo);
+                                let _ = writeln!(
+                                    out,
+                                    "    movk {}, #{}, lsl #16",
+                                    dst.name_for_size(32),
+                                    hi
+                                );
+                            }
+                        } else {
+                            // 64-bit: up to 4 MOVZ/MOVK instructions
+                            let parts = [
+                                (v & 0xFFFF) as u16,
+                                ((v >> 16) & 0xFFFF) as u16,
+                                ((v >> 32) & 0xFFFF) as u16,
+                                ((v >> 48) & 0xFFFF) as u16,
+                            ];
+                            // Find first non-zero part
+                            let mut first = true;
+                            for (i, &part) in parts.iter().enumerate() {
+                                if part != 0 || (first && i == 3) {
+                                    let shift = i * 16;
+                                    if first {
+                                        if shift == 0 {
+                                            let _ = writeln!(
+                                                out,
+                                                "    movz {}, #{}",
+                                                dst.name_for_size(64),
+                                                part
+                                            );
+                                        } else {
+                                            let _ = writeln!(
+                                                out,
+                                                "    movz {}, #{}, lsl #{}",
+                                                dst.name_for_size(64),
+                                                part,
+                                                shift
+                                            );
+                                        }
+                                        first = false;
+                                    } else {
+                                        let _ = writeln!(
+                                            out,
+                                            "    movk {}, #{}, lsl #{}",
+                                            dst.name_for_size(64),
+                                            part,
+                                            shift
+                                        );
+                                    }
+                                }
+                            }
+                            // Handle all-zero case
+                            if first {
+                                let _ = writeln!(out, "    movz {}, #0", dst.name_for_size(64));
+                            }
+                        }
+                    }
+                }
             }
 
             Aarch64Inst::Movz {
@@ -1108,6 +1256,11 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    b.{} {}", cond.aarch64_suffix(), lbl.name());
             }
 
+            Aarch64Inst::Cbnz { size, src, target } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(out, "    cbnz {}, {}", src.name_for_size(sz), target.name());
+            }
+
             Aarch64Inst::Bl {
                 target: call_target,
             } => match call_target {
@@ -1404,6 +1557,92 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    addv {}, {}.8b", dst.name_b(), src.name_v());
             }
 
+            // ================================================================
+            // Atomic Operations (ARMv8.1 LSE)
+            // ================================================================
+            Aarch64Inst::Ldar { size, addr, dst } => {
+                let insn = match size {
+                    OperandSize::B8 => "ldarb",
+                    OperandSize::B16 => "ldarh",
+                    OperandSize::B32 | OperandSize::B64 => "ldar",
+                };
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    insn,
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Stlr { size, src, addr } => {
+                let insn = match size {
+                    OperandSize::B8 => "stlrb",
+                    OperandSize::B16 => "stlrh",
+                    OperandSize::B32 | OperandSize::B64 => "stlr",
+                };
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    insn,
+                    src.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            // ================================================================
+            // Atomic LL/SC Operations (baseline ARMv8.0)
+            // ================================================================
+            Aarch64Inst::Ldaxr { size, addr, dst } => {
+                let insn = match size {
+                    OperandSize::B8 => "ldaxrb",
+                    OperandSize::B16 => "ldaxrh",
+                    OperandSize::B32 | OperandSize::B64 => "ldaxr",
+                };
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    insn,
+                    dst.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Stlxr {
+                size,
+                src,
+                addr,
+                status,
+            } => {
+                let insn = match size {
+                    OperandSize::B8 => "stlxrb",
+                    OperandSize::B16 => "stlxrh",
+                    OperandSize::B32 | OperandSize::B64 => "stlxr",
+                };
+                let sz = size.bits().max(32);
+                // Status is always W register
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}, {}",
+                    insn,
+                    status.name_for_size(32),
+                    src.name_for_size(sz),
+                    addr.format()
+                );
+            }
+
+            Aarch64Inst::Dmb { option } => {
+                let opt = match option {
+                    DmbOption::Ish => "ish",
+                    DmbOption::Ishst => "ishst",
+                    DmbOption::Ishld => "ishld",
+                };
+                let _ = writeln!(out, "    dmb {}", opt);
+            }
+
             // Directives - delegate to shared implementation
             Aarch64Inst::Directive(dir) => {
                 dir.emit(target, out);
@@ -1463,7 +1702,7 @@ mod tests {
             dst: Reg::X0,
         };
         inst.emit(&target, &mut out);
-        assert_eq!(out.trim(), "mov w0, #42");
+        assert_eq!(out.trim(), "movz w0, #42");
     }
 
     #[test]

@@ -17,7 +17,7 @@
 // for prologue/epilogue, call stack argument passing, and alloca itself.
 //
 
-use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
+use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
@@ -53,6 +53,8 @@ pub struct Aarch64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
+    /// Counter for generating unique labels (atomic loops, etc.)
+    unique_label_counter: u32,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -78,6 +80,7 @@ impl Aarch64CodeGen {
             num_fixed_gp_params: 0,
             extern_symbols: HashSet::new(),
             pic_mode: false,
+            unique_label_counter: 0,
         }
     }
 
@@ -1237,6 +1240,14 @@ impl Aarch64CodeGen {
                 self.emit_alloca(insn, *total_frame);
             }
 
+            Opcode::Fabs32 => {
+                self.emit_fabs32(insn, *total_frame, types);
+            }
+
+            Opcode::Fabs64 => {
+                self.emit_fabs64(insn, *total_frame, types);
+            }
+
             Opcode::Unreachable => {
                 // Emit brk #1 instruction - software breakpoint that traps
                 // This is used for __builtin_unreachable() to indicate code
@@ -1261,6 +1272,49 @@ impl Aarch64CodeGen {
             // ================================================================
             Opcode::Asm => {
                 self.emit_inline_asm(insn, *total_frame);
+            }
+
+            // ================================================================
+            // Atomic Operations
+            // ================================================================
+            Opcode::AtomicLoad => {
+                self.emit_atomic_load(insn, *total_frame);
+            }
+
+            Opcode::AtomicStore => {
+                self.emit_atomic_store(insn, *total_frame);
+            }
+
+            Opcode::AtomicSwap => {
+                self.emit_atomic_swap(insn, *total_frame);
+            }
+
+            Opcode::AtomicCas => {
+                self.emit_atomic_cas(insn, *total_frame);
+            }
+
+            Opcode::AtomicFetchAdd => {
+                self.emit_atomic_fetch_add(insn, *total_frame);
+            }
+
+            Opcode::AtomicFetchSub => {
+                self.emit_atomic_fetch_sub(insn, *total_frame);
+            }
+
+            Opcode::AtomicFetchAnd => {
+                self.emit_atomic_fetch_and(insn, *total_frame);
+            }
+
+            Opcode::AtomicFetchOr => {
+                self.emit_atomic_fetch_or(insn, *total_frame);
+            }
+
+            Opcode::AtomicFetchXor => {
+                self.emit_atomic_fetch_xor(insn, *total_frame);
+            }
+
+            Opcode::Fence => {
+                self.emit_fence(insn);
             }
 
             // Skip no-ops and unimplemented
@@ -2216,6 +2270,601 @@ impl Aarch64CodeGen {
             operand_names,
             goto_labels,
         )
+    }
+
+    // ========================================================================
+    // Atomic Operations (ARMv8.1 LSE)
+    // ========================================================================
+
+    /// Emit atomic load
+    fn emit_atomic_load(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic load needs target");
+        let addr = insn.src[0];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+
+        // Load pointer value into X10 (pointer is 64-bit)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // LDAR provides acquire semantics (sufficient for SeqCst on AArch64)
+        self.push_lir(Aarch64Inst::Ldar {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X0,
+        });
+
+        self.locations.insert(target, Loc::Reg(Reg::X0));
+    }
+
+    /// Emit atomic store
+    fn emit_atomic_store(&mut self, insn: &Instruction, total_frame: i32) {
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // STLR provides release semantics (sufficient for SeqCst on AArch64)
+        self.push_lir(Aarch64Inst::Stlr {
+            size: op_size,
+            src: Reg::X0,
+            addr: MemAddr::Base(Reg::X10),
+        });
+
+        // Atomic store has no result value
+        if let Some(target) = insn.target {
+            self.locations.insert(target, Loc::Imm(0));
+        }
+    }
+
+    /// Emit atomic swap using LL/SC (LDAXR/STLXR loop)
+    fn emit_atomic_swap(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic swap needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load new value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // LL/SC loop for atomic swap
+        let loop_label = self.next_unique_label("swap_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X1,
+        });
+
+        // STLXR: Try to store X0 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X0,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed (status != 0)
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32, // Status is always 32-bit
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
+        self.locations.insert(target, Loc::Reg(Reg::X1));
+    }
+
+    /// Emit atomic compare-and-swap using LL/SC
+    fn emit_atomic_cas(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic CAS needs target");
+        let addr = insn.src[0];
+        let expected_ptr = insn.src[1];
+        let desired = insn.src[2];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let expected_loc = self.get_location(expected_ptr);
+        let desired_loc = self.get_location(desired);
+
+        // Load pointer to atomic variable into X10 FIRST
+        // (before other loads in case addr is in X11, X9, or X1)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load expected_ptr (pointer to expected value) into X11
+        // Then load the expected value from that address into X9
+        self.emit_mov_to_reg(expected_loc, Reg::X11, 64, total_frame);
+        self.push_lir(Aarch64Inst::Ldr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X11),
+            dst: Reg::X9,
+        });
+
+        // Load desired value into X1
+        self.emit_mov_to_reg(desired_loc, Reg::X1, size, total_frame);
+
+        // LL/SC loop for CAS
+        let loop_label = self.next_unique_label("cas_loop");
+        let fail_label = self.next_unique_label("cas_fail");
+        let done_label = self.next_unique_label("cas_done");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive current value into X0
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X0,
+        });
+
+        // Compare current value (X0) with expected (X9)
+        self.push_lir(Aarch64Inst::Cmp {
+            size: op_size,
+            src1: Reg::X0,
+            src2: GpOperand::Reg(Reg::X9),
+        });
+
+        // If not equal, branch to fail
+        self.push_lir(Aarch64Inst::BCond {
+            cond: CondCode::Ne,
+            target: fail_label.clone(),
+        });
+
+        // STLXR: Try to store desired (X1), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X1,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry loop if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Success: set result to 1
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(1),
+            dst: Reg::X2,
+        });
+        self.push_lir(Aarch64Inst::B {
+            target: done_label.clone(),
+        });
+
+        // Fail label: CAS failed (value != expected)
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(fail_label)));
+
+        // Store actual value to *expected_ptr (X11 has expected_ptr)
+        self.push_lir(Aarch64Inst::Str {
+            size: op_size,
+            src: Reg::X0,
+            addr: MemAddr::Base(Reg::X11),
+        });
+
+        // Set result to 0 (failure)
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0),
+            dst: Reg::X2,
+        });
+
+        // Done label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
+
+        self.locations.insert(target, Loc::Reg(Reg::X2));
+    }
+
+    /// Emit atomic fetch-and-add using LL/SC
+    fn emit_atomic_fetch_add(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic fetch_add needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load addend value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // LL/SC loop for fetch_add
+        let loop_label = self.next_unique_label("fadd_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X1,
+        });
+
+        // ADD: X2 = X1 (old) + X0 (addend)
+        self.push_lir(Aarch64Inst::Add {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
+        self.locations.insert(target, Loc::Reg(Reg::X1));
+    }
+
+    /// Emit atomic fetch-and-subtract using LL/SC
+    fn emit_atomic_fetch_sub(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic fetch_sub needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load subtrahend value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // LL/SC loop for fetch_sub
+        let loop_label = self.next_unique_label("fsub_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X1,
+        });
+
+        // SUB: X2 = X1 (old) - X0 (subtrahend)
+        self.push_lir(Aarch64Inst::Sub {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
+        self.locations.insert(target, Loc::Reg(Reg::X1));
+    }
+
+    /// Emit atomic fetch-and-AND using LL/SC
+    fn emit_atomic_fetch_and(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic fetch_and needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load mask value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // LL/SC loop for fetch_and
+        let loop_label = self.next_unique_label("fand_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X1,
+        });
+
+        // AND: X2 = X1 (old) & X0 (mask)
+        self.push_lir(Aarch64Inst::And {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
+        self.locations.insert(target, Loc::Reg(Reg::X1));
+    }
+
+    /// Emit atomic fetch-and-OR using LL/SC
+    fn emit_atomic_fetch_or(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic fetch_or needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load OR value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // LL/SC loop for fetch_or
+        let loop_label = self.next_unique_label("for_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X1,
+        });
+
+        // ORR: X2 = X1 (old) | X0 (bits to set)
+        self.push_lir(Aarch64Inst::Orr {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
+        self.locations.insert(target, Loc::Reg(Reg::X1));
+    }
+
+    /// Emit atomic fetch-and-XOR using LL/SC
+    fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, total_frame: i32) {
+        let target = insn.target.expect("atomic fetch_xor needs target");
+        let addr = insn.src[0];
+        let value = insn.src[1];
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
+
+        let addr_loc = self.get_location(addr);
+        let value_loc = self.get_location(value);
+
+        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
+
+        // Load XOR value into X0
+        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
+
+        // LL/SC loop for fetch_xor
+        let loop_label = self.next_unique_label("fxor_loop");
+
+        // Loop label
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
+            loop_label.clone(),
+        )));
+
+        // LDAXR: Load-acquire exclusive old value into X1
+        self.push_lir(Aarch64Inst::Ldaxr {
+            size: op_size,
+            addr: MemAddr::Base(Reg::X10),
+            dst: Reg::X1,
+        });
+
+        // EOR: X2 = X1 (old) ^ X0 (bits to toggle)
+        self.push_lir(Aarch64Inst::Eor {
+            size: op_size,
+            src1: Reg::X1,
+            src2: GpOperand::Reg(Reg::X0),
+            dst: Reg::X2,
+        });
+
+        // STLXR: Try to store X2 (new value), status in W8
+        self.push_lir(Aarch64Inst::Stlxr {
+            size: op_size,
+            src: Reg::X2,
+            addr: MemAddr::Base(Reg::X10),
+            status: Reg::X8,
+        });
+
+        // CBNZ: Retry if store failed
+        self.push_lir(Aarch64Inst::Cbnz {
+            size: OperandSize::B32,
+            src: Reg::X8,
+            target: loop_label,
+        });
+
+        // Result: X1 = old value
+        self.locations.insert(target, Loc::Reg(Reg::X1));
+    }
+
+    /// Emit memory fence
+    fn emit_fence(&mut self, insn: &Instruction) {
+        use crate::ir::MemoryOrder;
+
+        // Emit appropriate fence based on memory ordering
+        match insn.memory_order {
+            MemoryOrder::SeqCst | MemoryOrder::AcqRel => {
+                // Full barrier
+                self.push_lir(Aarch64Inst::Dmb {
+                    option: DmbOption::Ish,
+                });
+            }
+            MemoryOrder::Acquire | MemoryOrder::Consume => {
+                // Load barrier
+                self.push_lir(Aarch64Inst::Dmb {
+                    option: DmbOption::Ishld,
+                });
+            }
+            MemoryOrder::Release => {
+                // Store barrier
+                self.push_lir(Aarch64Inst::Dmb {
+                    option: DmbOption::Ishst,
+                });
+            }
+            MemoryOrder::Relaxed => {
+                // No fence needed for relaxed
+            }
+        }
+
+        // Fence has no result value, but set target to 0 if present
+        if let Some(target) = insn.target {
+            self.locations.insert(target, Loc::Imm(0));
+        }
+    }
+
+    /// Generate a unique label with the given prefix
+    fn next_unique_label(&mut self, prefix: &str) -> Label {
+        let id = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        Label::new(prefix, id)
+    }
+
+    /// Helper to move a value into a register
+    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32, total_frame: i32) {
+        let op_size = OperandSize::from_bits(size);
+        match loc {
+            Loc::Reg(src) => {
+                if src != reg {
+                    self.push_lir(Aarch64Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(src),
+                        dst: reg,
+                    });
+                }
+            }
+            Loc::Imm(v) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(v),
+                    dst: reg,
+                });
+            }
+            Loc::Stack(offset) => {
+                let adjusted = offset + (total_frame - self.callee_saved_size);
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: op_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::SP,
+                        offset: adjusted,
+                    },
+                    dst: reg,
+                });
+            }
+            Loc::Global(name) => {
+                self.emit_load_global(&name, reg, op_size);
+            }
+            _ => {
+                // Default: load 0
+                self.push_lir(Aarch64Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(0),
+                    dst: reg,
+                });
+            }
+        }
     }
 }
 

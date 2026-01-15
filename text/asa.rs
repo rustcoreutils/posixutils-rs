@@ -8,7 +8,7 @@
 //
 
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -42,7 +42,7 @@ struct Args {
 /// - Control character determines line spacing/positioning
 /// - First line of file has special handling: '+' treated as space
 /// - Each file is processed independently with its own state
-fn asa_file(pathname: &PathBuf) -> io::Result<()> {
+fn asa_file(pathname: &Path) -> io::Result<()> {
     let mut reader = input_reader(pathname, true)?;
     let mut first_line = true;
     let mut had_output = false;

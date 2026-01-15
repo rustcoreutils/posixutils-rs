@@ -194,6 +194,10 @@ pub enum Opcode {
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
 
+    // Floating-point builtins
+    Fabs32, // Absolute value of float
+    Fabs64, // Absolute value of double
+
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
 
@@ -203,6 +207,18 @@ pub enum Opcode {
 
     // Inline assembly
     Asm, // Inline assembly statement
+
+    // Atomic memory operations (C11 _Atomic support)
+    AtomicLoad,     // Atomic load with memory ordering
+    AtomicStore,    // Atomic store with memory ordering
+    AtomicSwap,     // Atomic exchange (returns old value)
+    AtomicCas,      // Compare-and-swap (returns success/old value)
+    AtomicFetchAdd, // Atomic fetch-and-add
+    AtomicFetchSub, // Atomic fetch-and-subtract
+    AtomicFetchAnd, // Atomic fetch-and-and
+    AtomicFetchOr,  // Atomic fetch-and-or
+    AtomicFetchXor, // Atomic fetch-and-xor
+    Fence,          // Memory fence
 }
 
 impl Opcode {
@@ -240,6 +256,16 @@ impl Opcode {
                 | Opcode::Setjmp
                 | Opcode::Longjmp
                 | Opcode::Asm
+                | Opcode::AtomicLoad
+                | Opcode::AtomicStore
+                | Opcode::AtomicSwap
+                | Opcode::AtomicCas
+                | Opcode::AtomicFetchAdd
+                | Opcode::AtomicFetchSub
+                | Opcode::AtomicFetchAnd
+                | Opcode::AtomicFetchOr
+                | Opcode::AtomicFetchXor
+                | Opcode::Fence
         )
     }
 
@@ -318,10 +344,22 @@ impl Opcode {
             Opcode::Popcount32 => "popcount32",
             Opcode::Popcount64 => "popcount64",
             Opcode::Alloca => "alloca",
+            Opcode::Fabs32 => "fabs32",
+            Opcode::Fabs64 => "fabs64",
             Opcode::Unreachable => "unreachable",
             Opcode::Setjmp => "setjmp",
             Opcode::Longjmp => "longjmp",
             Opcode::Asm => "asm",
+            Opcode::AtomicLoad => "atomic_load",
+            Opcode::AtomicStore => "atomic_store",
+            Opcode::AtomicSwap => "atomic_swap",
+            Opcode::AtomicCas => "atomic_cas",
+            Opcode::AtomicFetchAdd => "atomic_fetch_add",
+            Opcode::AtomicFetchSub => "atomic_fetch_sub",
+            Opcode::AtomicFetchAnd => "atomic_fetch_and",
+            Opcode::AtomicFetchOr => "atomic_fetch_or",
+            Opcode::AtomicFetchXor => "atomic_fetch_xor",
+            Opcode::Fence => "fence",
         }
     }
 }
@@ -329,6 +367,42 @@ impl Opcode {
 impl fmt::Display for Opcode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+// ============================================================================
+// Memory Ordering - for atomic operations
+// ============================================================================
+
+/// Memory ordering for atomic operations (C11 memory model)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum MemoryOrder {
+    /// No ordering constraints
+    #[default]
+    Relaxed = 0,
+    /// Data dependency ordering (rarely used, treated as Acquire)
+    Consume = 1,
+    /// Acquire semantics: no reads/writes can be reordered before this
+    Acquire = 2,
+    /// Release semantics: no reads/writes can be reordered after this
+    Release = 3,
+    /// Both acquire and release semantics
+    AcqRel = 4,
+    /// Sequential consistency: total global ordering
+    SeqCst = 5,
+}
+
+impl fmt::Display for MemoryOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemoryOrder::Relaxed => write!(f, "relaxed"),
+            MemoryOrder::Consume => write!(f, "consume"),
+            MemoryOrder::Acquire => write!(f, "acquire"),
+            MemoryOrder::Release => write!(f, "release"),
+            MemoryOrder::AcqRel => write!(f, "acq_rel"),
+            MemoryOrder::SeqCst => write!(f, "seq_cst"),
+        }
     }
 }
 
@@ -606,6 +680,8 @@ pub struct Instruction {
     /// When present, this provides more detailed information than is_sret_call
     /// and is_two_reg_return, including per-argument register class info.
     pub abi_info: Option<Box<CallAbiInfo>>,
+    /// For atomic operations: memory ordering constraint
+    pub memory_order: MemoryOrder,
 }
 
 impl Default for Instruction {
@@ -634,6 +710,7 @@ impl Default for Instruction {
             pos: None,
             asm_data: None,
             abi_info: None,
+            memory_order: MemoryOrder::default(),
         }
     }
 }
@@ -717,6 +794,12 @@ impl Instruction {
     /// Set source position for debug info
     pub fn with_pos(mut self, pos: Position) -> Self {
         self.pos = Some(pos);
+        self
+    }
+
+    /// Set memory ordering for atomic operations
+    pub fn with_memory_order(mut self, order: MemoryOrder) -> Self {
+        self.memory_order = order;
         self
     }
 
@@ -1116,6 +1199,8 @@ pub struct LocalVar {
     pub typ: TypeId,
     /// Is this variable volatile?
     pub is_volatile: bool,
+    /// Is this variable atomic?
+    pub is_atomic: bool,
     /// Block where this variable was declared (for scope-aware phi placement)
     /// Phi nodes for this variable should only be placed at blocks dominated by this block.
     pub decl_block: Option<BasicBlockId>,
@@ -1211,6 +1296,7 @@ impl Function {
         sym: PseudoId,
         typ: TypeId,
         is_volatile: bool,
+        is_atomic: bool,
         decl_block: Option<BasicBlockId>,
     ) {
         self.locals.insert(
@@ -1219,6 +1305,7 @@ impl Function {
                 sym,
                 typ,
                 is_volatile,
+                is_atomic,
                 decl_block,
             },
         );
@@ -1662,5 +1749,90 @@ mod tests {
         assert_eq!(module.extern_symbols.len(), 1);
         assert!(!module.extern_symbols.contains("printf"));
         assert!(module.extern_symbols.contains("malloc"));
+    }
+
+    #[test]
+    fn test_memory_order_display() {
+        assert_eq!(format!("{}", MemoryOrder::Relaxed), "relaxed");
+        assert_eq!(format!("{}", MemoryOrder::Consume), "consume");
+        assert_eq!(format!("{}", MemoryOrder::Acquire), "acquire");
+        assert_eq!(format!("{}", MemoryOrder::Release), "release");
+        assert_eq!(format!("{}", MemoryOrder::AcqRel), "acq_rel");
+        assert_eq!(format!("{}", MemoryOrder::SeqCst), "seq_cst");
+    }
+
+    #[test]
+    fn test_memory_order_default() {
+        let order: MemoryOrder = Default::default();
+        assert_eq!(order, MemoryOrder::Relaxed);
+    }
+
+    #[test]
+    fn test_atomic_opcodes_not_terminators() {
+        // Atomic operations should not be terminators
+        assert!(!Opcode::AtomicLoad.is_terminator());
+        assert!(!Opcode::AtomicStore.is_terminator());
+        assert!(!Opcode::AtomicSwap.is_terminator());
+        assert!(!Opcode::AtomicCas.is_terminator());
+        assert!(!Opcode::AtomicFetchAdd.is_terminator());
+        assert!(!Opcode::AtomicFetchSub.is_terminator());
+        assert!(!Opcode::AtomicFetchAnd.is_terminator());
+        assert!(!Opcode::AtomicFetchOr.is_terminator());
+        assert!(!Opcode::AtomicFetchXor.is_terminator());
+        assert!(!Opcode::Fence.is_terminator());
+    }
+
+    #[test]
+    fn test_atomic_opcode_names() {
+        assert_eq!(Opcode::AtomicLoad.name(), "atomic_load");
+        assert_eq!(Opcode::AtomicStore.name(), "atomic_store");
+        assert_eq!(Opcode::AtomicSwap.name(), "atomic_swap");
+        assert_eq!(Opcode::AtomicCas.name(), "atomic_cas");
+        assert_eq!(Opcode::AtomicFetchAdd.name(), "atomic_fetch_add");
+        assert_eq!(Opcode::AtomicFetchSub.name(), "atomic_fetch_sub");
+        assert_eq!(Opcode::AtomicFetchAnd.name(), "atomic_fetch_and");
+        assert_eq!(Opcode::AtomicFetchOr.name(), "atomic_fetch_or");
+        assert_eq!(Opcode::AtomicFetchXor.name(), "atomic_fetch_xor");
+        assert_eq!(Opcode::Fence.name(), "fence");
+    }
+
+    #[test]
+    fn test_instruction_with_memory_order() {
+        let mut insn = Instruction::new(Opcode::AtomicLoad);
+        assert_eq!(insn.memory_order, MemoryOrder::Relaxed); // default
+
+        insn = insn.with_memory_order(MemoryOrder::SeqCst);
+        assert_eq!(insn.memory_order, MemoryOrder::SeqCst);
+
+        insn = insn.with_memory_order(MemoryOrder::Acquire);
+        assert_eq!(insn.memory_order, MemoryOrder::Acquire);
+    }
+
+    #[test]
+    fn test_local_var_is_atomic() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.void_id);
+
+        // Add a non-atomic local
+        let sym1 = PseudoId(1);
+        func.add_pseudo(Pseudo::sym(sym1, "x".to_string()));
+        func.add_local("x", sym1, types.int_id, false, false, None);
+
+        // Add an atomic local
+        let sym2 = PseudoId(2);
+        func.add_pseudo(Pseudo::sym(sym2, "y".to_string()));
+        func.add_local("y", sym2, types.int_id, false, true, None);
+
+        // Check the is_atomic field
+        assert!(!func.locals.get("x").unwrap().is_atomic);
+        assert!(func.locals.get("y").unwrap().is_atomic);
+    }
+
+    #[test]
+    fn test_fabs_opcodes() {
+        assert_eq!(Opcode::Fabs32.name(), "fabs32");
+        assert_eq!(Opcode::Fabs64.name(), "fabs64");
+        assert!(!Opcode::Fabs32.is_terminator());
+        assert!(!Opcode::Fabs64.is_terminator());
     }
 }

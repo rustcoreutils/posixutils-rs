@@ -353,8 +353,86 @@ pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
         ("__ORDER_PDP_ENDIAN__", "3412"),
         ("__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
         ("__LITTLE_ENDIAN__", "1"),
-        // Floating point
+        // Floating point base
         ("__FLT_RADIX__", "2"),
         ("__FINITE_MATH_ONLY__", "0"),
+    ]
+}
+
+/// Get floating-point limit macros (IEEE 754)
+pub fn get_float_limit_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+    vec![
+        // Float (32-bit IEEE 754)
+        ("__FLT_MIN__", "1.17549435082228750796873653722224568e-38F"),
+        ("__FLT_MAX__", "3.40282346638528859811704183484516925e+38F"),
+        (
+            "__FLT_EPSILON__",
+            "1.19209289550781250000000000000000000e-7F",
+        ),
+        (
+            "__FLT_DENORM_MIN__",
+            "1.40129846432481707092372958328991613e-45F",
+        ),
+        ("__FLT_MANT_DIG__", "24"),
+        ("__FLT_DIG__", "6"),
+        ("__FLT_MIN_EXP__", "(-125)"),
+        ("__FLT_MAX_EXP__", "128"),
+        ("__FLT_MIN_10_EXP__", "(-37)"),
+        ("__FLT_MAX_10_EXP__", "38"),
+        ("__FLT_HAS_DENORM__", "1"),
+        ("__FLT_HAS_INFINITY__", "1"),
+        ("__FLT_HAS_QUIET_NAN__", "1"),
+        // Double (64-bit IEEE 754)
+        ("__DBL_MIN__", "2.22507385850720138309023271733240406e-308"),
+        ("__DBL_MAX__", "1.79769313486231570814527423731704357e+308"),
+        (
+            "__DBL_EPSILON__",
+            "2.22044604925031308084726333618164062e-16",
+        ),
+        (
+            "__DBL_DENORM_MIN__",
+            "4.94065645841246544176568792868221372e-324",
+        ),
+        ("__DBL_MANT_DIG__", "53"),
+        ("__DBL_DIG__", "15"),
+        ("__DBL_MIN_EXP__", "(-1021)"),
+        ("__DBL_MAX_EXP__", "1024"),
+        ("__DBL_MIN_10_EXP__", "(-307)"),
+        ("__DBL_MAX_10_EXP__", "308"),
+        ("__DBL_HAS_DENORM__", "1"),
+        ("__DBL_HAS_INFINITY__", "1"),
+        ("__DBL_HAS_QUIET_NAN__", "1"),
+        // Long double (80-bit x87 extended on x86_64, 128-bit on aarch64)
+        // Using x86_64 values as default
+        (
+            "__LDBL_MIN__",
+            "3.36210314311209350626267781732175260e-4932L",
+        ),
+        (
+            "__LDBL_MAX__",
+            "1.18973149535723176502126385303097021e+4932L",
+        ),
+        (
+            "__LDBL_EPSILON__",
+            "1.08420217248550443400745280086994171e-19L",
+        ),
+        (
+            "__LDBL_DENORM_MIN__",
+            "3.64519953188247460252840593361941982e-4951L",
+        ),
+        ("__LDBL_MANT_DIG__", "64"),
+        ("__LDBL_DIG__", "18"),
+        ("__LDBL_MIN_EXP__", "(-16381)"),
+        ("__LDBL_MAX_EXP__", "16384"),
+        ("__LDBL_MIN_10_EXP__", "(-4931)"),
+        ("__LDBL_MAX_10_EXP__", "4932"),
+        ("__LDBL_HAS_DENORM__", "1"),
+        ("__LDBL_HAS_INFINITY__", "1"),
+        ("__LDBL_HAS_QUIET_NAN__", "1"),
+        // Decimal digits for exact conversion
+        ("__FLT_DECIMAL_DIG__", "9"),
+        ("__DBL_DECIMAL_DIG__", "17"),
+        ("__LDBL_DECIMAL_DIG__", "21"),
+        ("__DECIMAL_DIG__", "21"),
     ]
 }

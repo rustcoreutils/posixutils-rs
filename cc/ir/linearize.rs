@@ -13,7 +13,7 @@
 use super::ssa::ssa_convert;
 use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer,
-    Instruction, Module, Opcode, Pseudo, PseudoId,
+    Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
@@ -983,8 +983,10 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
-                func.add_local(&name, local_sym, typ, is_volatile, None);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
             }
 
             let typ_size = self.types.size_bits(typ);
@@ -1049,8 +1051,10 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
-                func.add_local(&name, local_sym, typ, is_volatile, None);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
             }
 
             // Don't emit a store here - the prologue codegen handles storing
@@ -1080,8 +1084,10 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
-                func.add_local(&name, local_sym, typ, is_volatile, None);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
             }
 
             // Store the incoming argument value to the local
@@ -1396,8 +1402,17 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(sym);
                 // Register with function's local variable tracking for SSA
                 // Pass the current basic block as the declaration block for scope-aware phi placement
-                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
-                func.add_local(&unique_name, sym_id, typ, is_volatile, self.current_bb);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(
+                    &unique_name,
+                    sym_id,
+                    typ,
+                    is_volatile,
+                    is_atomic,
+                    self.current_bb,
+                );
             }
 
             // Track in linearizer's locals map using SymbolId as key
@@ -1580,7 +1595,8 @@ impl<'a> Linearizer<'a> {
                     &dim_var_name,
                     dim_sym_id,
                     ulong_type,
-                    false,
+                    false, // not volatile
+                    false, // not atomic
                     self.current_bb,
                 );
             }
@@ -1621,7 +1637,8 @@ impl<'a> Linearizer<'a> {
                 &size_var_name,
                 size_sym_id,
                 ulong_type,
-                false,
+                false, // not volatile
+                false, // not atomic
                 self.current_bb,
             );
         }
@@ -1661,8 +1678,17 @@ impl<'a> Linearizer<'a> {
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(sym);
             // Register as a pointer variable, not as the array type
-            let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
-            func.add_local(&unique_name, sym_id, ptr_type, is_volatile, self.current_bb);
+            let mods = self.types.modifiers(typ);
+            let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+            let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+            func.add_local(
+                &unique_name,
+                sym_id,
+                ptr_type,
+                is_volatile,
+                is_atomic,
+                self.current_bb,
+            );
         }
 
         // Store the Alloca result (pointer) into the VLA symbol
@@ -2801,7 +2827,10 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Clzll { arg }
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
-            | ExprKind::Popcountll { arg } => self.is_pure_expr(arg),
+            | ExprKind::Popcountll { arg }
+            | ExprKind::Fabs { arg }
+            | ExprKind::Fabsf { arg }
+            | ExprKind::Fabsl { arg } => self.is_pure_expr(arg),
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
@@ -2811,6 +2840,21 @@ impl<'a> Linearizer<'a> {
 
             // Setjmp/longjmp have control flow side effects
             ExprKind::Setjmp { .. } | ExprKind::Longjmp { .. } => false,
+
+            // Atomic operations have side effects (memory ordering)
+            ExprKind::C11AtomicInit { .. }
+            | ExprKind::C11AtomicLoad { .. }
+            | ExprKind::C11AtomicStore { .. }
+            | ExprKind::C11AtomicExchange { .. }
+            | ExprKind::C11AtomicCompareExchangeStrong { .. }
+            | ExprKind::C11AtomicCompareExchangeWeak { .. }
+            | ExprKind::C11AtomicFetchAdd { .. }
+            | ExprKind::C11AtomicFetchSub { .. }
+            | ExprKind::C11AtomicFetchAnd { .. }
+            | ExprKind::C11AtomicFetchOr { .. }
+            | ExprKind::C11AtomicFetchXor { .. }
+            | ExprKind::C11AtomicThreadFence { .. }
+            | ExprKind::C11AtomicSignalFence { .. } => false,
         }
     }
 
@@ -2903,6 +2947,7 @@ impl<'a> Linearizer<'a> {
                                 sym: local_sym,
                                 typ: param_type,
                                 is_volatile: false,
+                                is_atomic: false,
                                 decl_block: self.current_bb,
                             },
                         );
@@ -3095,7 +3140,7 @@ impl<'a> Linearizer<'a> {
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
-                    func.add_local(&unique_name, sym_id, *typ, false, self.current_bb);
+                    func.add_local(&unique_name, sym_id, *typ, false, false, self.current_bb);
                 }
                 self.linearize_init_list(sym_id, *typ, elements);
 
@@ -3637,12 +3682,13 @@ impl<'a> Linearizer<'a> {
             let sret_pseudo = Pseudo::sym(sret_sym, format!("__sret_{}", sret_sym.0));
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sret_pseudo);
-                // Internal sret storage is never volatile
+                // Internal sret storage is never volatile or atomic
                 func.add_local(
                     format!("__sret_{}", sret_sym.0),
                     sret_sym,
                     typ,
-                    false,
+                    false, // not volatile
+                    false, // not atomic
                     self.current_bb,
                 );
             }
@@ -3669,7 +3715,7 @@ impl<'a> Linearizer<'a> {
             let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(local_pseudo);
-                func.add_local(&unique_name, local_sym, typ, false, self.current_bb);
+                func.add_local(&unique_name, local_sym, typ, false, false, self.current_bb);
             }
             (local_sym, Vec::new(), Vec::new())
         } else if returns_complex {
@@ -3680,7 +3726,7 @@ impl<'a> Linearizer<'a> {
             let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(local_pseudo);
-                func.add_local(&unique_name, local_sym, typ, false, self.current_bb);
+                func.add_local(&unique_name, local_sym, typ, false, false, self.current_bb);
             }
             (local_sym, Vec::new(), Vec::new())
         } else {
@@ -4717,7 +4763,7 @@ impl<'a> Linearizer<'a> {
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
                     // Register as local for proper stack allocation
-                    func.add_local(&unique_name, sym_id, *typ, false, self.current_bb);
+                    func.add_local(&unique_name, sym_id, *typ, false, false, self.current_bb);
                 }
 
                 // Initialize using existing init list machinery
@@ -4952,6 +4998,46 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::Fabs { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Fabs64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.double_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Fabsf { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Fabs32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.float_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Fabsl { arg } => {
+                // Long double fabs - treat as 64-bit for now
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Fabs64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(128) // long double is 128-bit on our targets
+                    .with_type(self.types.longdouble_id);
+                self.emit(insn);
+                result
+            }
+
             ExprKind::Unreachable => {
                 // __builtin_unreachable() - marks code path as never reached
                 // Emits an instruction that will trap if actually executed
@@ -5026,6 +5112,263 @@ impl<'a> Linearizer<'a> {
                 self.emit_const(offset as i64, self.types.ulong_id)
             }
 
+            // ================================================================
+            // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
+            // ================================================================
+            ExprKind::C11AtomicInit { ptr, val } => {
+                // atomic_init is a non-atomic store (no memory ordering)
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let ptr_type = self.expr_type(ptr);
+                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(elem_type);
+                let result = self.alloc_pseudo();
+
+                // Use AtomicStore with Relaxed ordering for init
+                let insn = Instruction::new(Opcode::AtomicStore)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(self.emit_const(0, self.types.int_id)) // Relaxed = 0
+                    .with_type_and_size(elem_type, size)
+                    .with_memory_order(MemoryOrder::Relaxed);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicLoad { ptr, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicLoad)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicStore { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(elem_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicStore)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(elem_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicExchange { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicSwap)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicCompareExchangeStrong {
+                ptr,
+                expected,
+                desired,
+                succ_order,
+            }
+            | ExprKind::C11AtomicCompareExchangeWeak {
+                ptr,
+                expected,
+                desired,
+                succ_order,
+            } => {
+                // Both strong and weak are implemented the same (as strong)
+                let ptr_val = self.linearize_expr(ptr);
+                let expected_ptr = self.linearize_expr(expected);
+                let desired_val = self.linearize_expr(desired);
+                let order_val = self.linearize_expr(succ_order);
+                let memory_order = self.eval_memory_order(succ_order);
+                let ptr_type = self.expr_type(ptr);
+                let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let elem_size = self.types.size_bits(elem_type);
+                let result = self.alloc_pseudo();
+
+                // For CAS, typ is bool (result), but size is the element size for codegen
+                let insn = Instruction::new(Opcode::AtomicCas)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(expected_ptr)
+                    .with_src(desired_val)
+                    .with_src(order_val)
+                    .with_type(self.types.bool_id)
+                    .with_size(elem_size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicFetchAdd { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicFetchAdd)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicFetchSub { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicFetchSub)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicFetchAnd { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicFetchAnd)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicFetchOr { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicFetchOr)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicFetchXor { ptr, val, order } => {
+                let ptr_val = self.linearize_expr(ptr);
+                let value = self.linearize_expr(val);
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let ptr_type = self.expr_type(ptr);
+                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+                let size = self.types.size_bits(result_type);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::AtomicFetchXor)
+                    .with_target(result)
+                    .with_src(ptr_val)
+                    .with_src(value)
+                    .with_src(order_val)
+                    .with_type_and_size(result_type, size)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicThreadFence { order } => {
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Fence)
+                    .with_target(result)
+                    .with_src(order_val)
+                    .with_type(self.types.void_id)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::C11AtomicSignalFence { order } => {
+                // Signal fence is a compiler barrier only (no memory fence instruction)
+                // For now, treat it the same as thread fence
+                let order_val = self.linearize_expr(order);
+                let memory_order = self.eval_memory_order(order);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Fence)
+                    .with_target(result)
+                    .with_src(order_val)
+                    .with_type(self.types.void_id)
+                    .with_memory_order(memory_order);
+                self.emit(insn);
+                result
+            }
+
             ExprKind::StmtExpr { stmts, result } => {
                 // GNU statement expression: ({ stmt; stmt; expr; })
                 // Linearize all the statements first
@@ -5038,6 +5381,26 @@ impl<'a> Linearizer<'a> {
                 // The result is the value of the final expression
                 self.linearize_expr(result)
             }
+        }
+    }
+
+    /// Evaluate a memory order expression to a MemoryOrder enum value.
+    /// If the expression is not a constant or out of range, defaults to SeqCst.
+    fn eval_memory_order(&self, expr: &Expr) -> MemoryOrder {
+        // Try to evaluate as a constant integer
+        if let ExprKind::IntLit(val) = &expr.kind {
+            match *val {
+                0 => MemoryOrder::Relaxed,
+                1 => MemoryOrder::Consume,
+                2 => MemoryOrder::Acquire,
+                3 => MemoryOrder::Release,
+                4 => MemoryOrder::AcqRel,
+                5 => MemoryOrder::SeqCst,
+                _ => MemoryOrder::SeqCst, // Invalid, use strongest ordering
+            }
+        } else {
+            // Non-constant order expression - use SeqCst for safety
+            MemoryOrder::SeqCst
         }
     }
 
@@ -5852,7 +6215,8 @@ impl<'a> Linearizer<'a> {
                 &unique_name,
                 result_sym,
                 complex_typ,
-                false,
+                false, // not volatile
+                false, // not atomic
                 self.current_bb,
             );
         }

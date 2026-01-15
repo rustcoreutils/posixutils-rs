@@ -9,7 +9,7 @@ use std::{
     fs::File,
     io::{self, Cursor, Read, Seek, Write},
     num::ParseIntError,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
@@ -292,7 +292,7 @@ impl MessageCatalog {
 
     /// Parse the message file and override the catalog file(if it already exists)
     pub fn parse(
-        input_path: &PathBuf,
+        input_path: &Path,
         catfile_catalog: Option<MessageCatalog>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut file = input_stream(input_path, true)?;

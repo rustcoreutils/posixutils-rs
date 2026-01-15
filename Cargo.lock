@@ -1938,6 +1938,7 @@ version = "0.7.0"
 dependencies = [
  "base64",
  "clap",
+ "flate2",
  "gettext-rs",
  "libc",
  "plib",

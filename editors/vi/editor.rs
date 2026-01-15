@@ -2252,7 +2252,11 @@ impl Editor {
         let mut lines = Vec::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
-                lines.push(line.content().to_string());
+                if self.options.number {
+                    lines.push(format!("{:6}\t{}", line_num, line.content()));
+                } else {
+                    lines.push(line.content().to_string());
+                }
             }
         }
         Ok(lines)

@@ -294,9 +294,9 @@ fn get_compress_algorithm(args: &Args) -> io::Result<Algorithm> {
 
 /// Build output path for compression
 fn compress_output_path(input: &Path, algo: Algorithm) -> io::Result<PathBuf> {
-    let file_name = input.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "input path has no filename")
-    })?;
+    let file_name = input
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input path has no filename"))?;
     let fname = format!("{}{}", file_name.to_string_lossy(), algo.suffix());
 
     if fname.len() > NAME_MAX {

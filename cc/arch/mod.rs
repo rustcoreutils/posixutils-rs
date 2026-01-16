@@ -362,6 +362,34 @@ pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
 /// Get floating-point limit macros (IEEE 754)
 pub fn get_float_limit_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
     vec![
+        // Float16 (16-bit IEEE 754 binary16, half precision)
+        (
+            "__FLT16_MIN__",
+            "6.10351562500000000000000000000000000e-5F16",
+        ),
+        (
+            "__FLT16_MAX__",
+            "6.55040000000000000000000000000000000e+4F16",
+        ),
+        (
+            "__FLT16_EPSILON__",
+            "9.76562500000000000000000000000000000e-4F16",
+        ),
+        (
+            "__FLT16_DENORM_MIN__",
+            "5.96046447753906250000000000000000000e-8F16",
+        ),
+        ("__FLT16_MANT_DIG__", "11"),
+        ("__FLT16_DIG__", "3"),
+        ("__FLT16_MIN_EXP__", "(-13)"),
+        ("__FLT16_MAX_EXP__", "16"),
+        ("__FLT16_MIN_10_EXP__", "(-4)"),
+        ("__FLT16_MAX_10_EXP__", "4"),
+        ("__FLT16_HAS_DENORM__", "1"),
+        ("__FLT16_HAS_INFINITY__", "1"),
+        ("__FLT16_HAS_QUIET_NAN__", "1"),
+        ("__FLT16_DECIMAL_DIG__", "5"),
+        ("__SIZEOF_FLOAT16__", "2"),
         // Float (32-bit IEEE 754)
         ("__FLT_MIN__", "1.17549435082228750796873653722224568e-38F"),
         ("__FLT_MAX__", "3.40282346638528859811704183484516925e+38F"),

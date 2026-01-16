@@ -3729,3 +3729,203 @@ fn test_integer_extension_has_src_typ() {
     });
     assert!(has_src_typ, "Integer extension should have src_typ set");
 }
+
+// ========================================================================
+// Float16 (_Float16) conversion tests
+// ========================================================================
+
+#[test]
+fn test_float16_to_float_conversion() {
+    // Test: _Float16 x; return (float)x;
+    // Should call __extendhfsf2 runtime library function
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let float_type = ctx.types.float_id;
+    let float16_type = ctx.types.float16_id;
+    let x_sym = ctx.var("x", float16_type);
+
+    let cast_expr = Expr::typed_unpositioned(
+        ExprKind::Cast {
+            cast_type: float_type,
+            expr: Box::new(Expr::var_typed(x_sym, float16_type)),
+        },
+        float_type,
+    );
+
+    let func = FunctionDef {
+        return_type: float_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: float16_type,
+        }],
+        body: Stmt::Return(Some(cast_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    // Find call to __extendhfsf2
+    let func = &module.functions[0];
+    let has_rtlib_call = func.blocks.iter().any(|bb| {
+        bb.insns.iter().any(|insn| {
+            insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__extendhfsf2")
+        })
+    });
+    assert!(
+        has_rtlib_call,
+        "Float16 to float conversion should call __extendhfsf2"
+    );
+}
+
+#[test]
+fn test_float_to_float16_conversion() {
+    // Test: float x; return (_Float16)x;
+    // Should call __truncsfhf2 runtime library function
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let float_type = ctx.types.float_id;
+    let float16_type = ctx.types.float16_id;
+    let x_sym = ctx.var("x", float_type);
+
+    let cast_expr = Expr::typed_unpositioned(
+        ExprKind::Cast {
+            cast_type: float16_type,
+            expr: Box::new(Expr::var_typed(x_sym, float_type)),
+        },
+        float16_type,
+    );
+
+    let func = FunctionDef {
+        return_type: float16_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: float_type,
+        }],
+        body: Stmt::Return(Some(cast_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    // Find call to __truncsfhf2
+    let func = &module.functions[0];
+    let has_rtlib_call = func.blocks.iter().any(|bb| {
+        bb.insns.iter().any(|insn| {
+            insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__truncsfhf2")
+        })
+    });
+    assert!(
+        has_rtlib_call,
+        "Float to Float16 conversion should call __truncsfhf2"
+    );
+}
+
+#[test]
+fn test_float16_to_int_conversion() {
+    // Test: _Float16 x; return (int)x;
+    // Should call __fixhfsi runtime library function
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let float16_type = ctx.types.float16_id;
+    let x_sym = ctx.var("x", float16_type);
+
+    let cast_expr = Expr::typed_unpositioned(
+        ExprKind::Cast {
+            cast_type: int_type,
+            expr: Box::new(Expr::var_typed(x_sym, float16_type)),
+        },
+        int_type,
+    );
+
+    let func = FunctionDef {
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: float16_type,
+        }],
+        body: Stmt::Return(Some(cast_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    // Find call to __fixhfsi
+    let func = &module.functions[0];
+    let has_rtlib_call = func.blocks.iter().any(|bb| {
+        bb.insns
+            .iter()
+            .any(|insn| insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__fixhfsi"))
+    });
+    assert!(
+        has_rtlib_call,
+        "Float16 to int conversion should call __fixhfsi"
+    );
+}
+
+#[test]
+fn test_int_to_float16_conversion() {
+    // Test: int x; return (_Float16)x;
+    // Should call __floatsihf runtime library function
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let float16_type = ctx.types.float16_id;
+    let x_sym = ctx.var("x", int_type);
+
+    let cast_expr = Expr::typed_unpositioned(
+        ExprKind::Cast {
+            cast_type: float16_type,
+            expr: Box::new(Expr::var_typed(x_sym, int_type)),
+        },
+        float16_type,
+    );
+
+    let func = FunctionDef {
+        return_type: float16_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: int_type,
+        }],
+        body: Stmt::Return(Some(cast_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    // Find call to __floatsihf
+    let func = &module.functions[0];
+    let has_rtlib_call = func.blocks.iter().any(|bb| {
+        bb.insns
+            .iter()
+            .any(|insn| insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__floatsihf"))
+    });
+    assert!(
+        has_rtlib_call,
+        "Int to Float16 conversion should call __floatsihf"
+    );
+}

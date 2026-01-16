@@ -1088,22 +1088,22 @@ impl Aarch64CodeGen {
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
                                     // Load FP constant using integer register
-                                    // Use type to determine float vs double
+                                    // Use type to determine float16 vs float vs double
                                     let typ = insn.typ.expect("FP constant must have type");
-                                    let is_float = types.kind(typ) == TypeKind::Float;
+                                    let type_kind = types.kind(typ);
                                     let (scratch0, _, _) = Reg::scratch_regs();
-                                    let bits = if is_float {
-                                        (*f as f32).to_bits() as i64
-                                    } else {
-                                        f.to_bits() as i64
+                                    let (bits, fp_size) = match type_kind {
+                                        TypeKind::Float16 => {
+                                            // Convert f64 to IEEE 754 half-precision bits
+                                            (f64_to_f16_bits(*f) as i64, FpSize::Half)
+                                        }
+                                        TypeKind::Float => {
+                                            ((*f as f32).to_bits() as i64, FpSize::Single)
+                                        }
+                                        _ => (f.to_bits() as i64, FpSize::Double),
                                     };
                                     self.emit_mov_imm(scratch0, bits, 64);
                                     // LIR: fmov from GP to FP register
-                                    let fp_size = if is_float {
-                                        FpSize::Single
-                                    } else {
-                                        FpSize::Double
-                                    };
                                     self.push_lir(Aarch64Inst::FmovFromGp {
                                         size: fp_size,
                                         src: scratch0,
@@ -1518,8 +1518,10 @@ impl Aarch64CodeGen {
             }
             Loc::FImm(f, imm_size) => {
                 // Use the size from the FImm, not the passed-in size
-                // This ensures float constants are loaded as float, not double
-                let bits = if imm_size <= 32 {
+                // This ensures float constants are loaded correctly for their type
+                let bits = if imm_size == 16 {
+                    f64_to_f16_bits(f) as i64
+                } else if imm_size == 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64
@@ -2867,6 +2869,9 @@ impl Aarch64CodeGen {
         }
     }
 }
+
+// Import shared helper from parent module
+use super::f64_to_f16_bits;
 
 // ============================================================================
 // Inline Assembly Helper Functions

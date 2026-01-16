@@ -15,6 +15,7 @@
 use crate::abi::{get_abi, ArgClass, RegClass};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::x86_64::float::f64_to_f16_bits;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
@@ -1468,16 +1469,51 @@ impl X86_64CodeGen {
             }
             Loc::Xmm(x) => {
                 // Move from XMM to general-purpose register
+                // For Float16 (16-bit), XMM may have garbage in bits 16-31 from movss loads.
+                // We need to: 1) use movd (32-bit), 2) zero-extend from 16 to 32 if needed.
                 // LIR: XMM to GP move
                 self.push_lir(X86Inst::MovXmmGp {
-                    size: OperandSize::B64,
+                    size: OperandSize::B32, // Use movd instead of movq
                     src: x,
                     dst,
                 });
+                // For sub-32-bit values (e.g., Float16), zero-extend to clear garbage
+                if actual_size < 32 {
+                    self.push_lir(X86Inst::Movzx {
+                        src_size: OperandSize::from_bits(actual_size),
+                        dst_size: OperandSize::B32,
+                        src: GpOperand::Reg(dst),
+                        dst,
+                    });
+                }
             }
-            Loc::FImm(..) => {
-                // Float immediate cannot be directly moved to GP register
-                // This should not normally happen
+            Loc::FImm(v, fp_size) => {
+                // Float immediate to GP register - used for Float16 rtlib calls
+                // Convert the float value to its bit representation and load as integer
+                if fp_size == 16 {
+                    // Float16: convert to 16-bit representation
+                    let bits = f64_to_f16_bits(v);
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(bits as i64),
+                        dst: GpOperand::Reg(dst),
+                    });
+                } else if fp_size == 32 {
+                    // float: convert to 32-bit representation
+                    let bits = (v as f32).to_bits();
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(bits as i64),
+                        dst: GpOperand::Reg(dst),
+                    });
+                } else {
+                    // double: convert to 64-bit representation
+                    let bits = v.to_bits();
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: bits as i64,
+                        dst,
+                    });
+                }
             }
         }
     }
@@ -1541,6 +1577,19 @@ impl X86_64CodeGen {
                         }),
                     });
                 }
+            }
+            Loc::Xmm(xmm) => {
+                // Move from GP register to XMM register (used for Float16 rtlib returns)
+                let op_size = if size <= 32 {
+                    OperandSize::B32
+                } else {
+                    OperandSize::B64
+                };
+                self.push_lir(X86Inst::MovGpXmm {
+                    size: op_size,
+                    src,
+                    dst: *xmm,
+                });
             }
             _ => {}
         }

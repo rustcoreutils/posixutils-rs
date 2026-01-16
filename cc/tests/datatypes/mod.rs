@@ -17,6 +17,7 @@ mod bool;
 mod char;
 mod complex;
 mod float;
+mod float16;
 mod int;
 mod long;
 mod longdouble;

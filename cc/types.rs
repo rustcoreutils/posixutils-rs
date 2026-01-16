@@ -174,6 +174,9 @@ pub enum TypeKind {
     Float,
     Double,
     LongDouble,
+    /// _Float16 - IEEE 754 binary16 (half precision)
+    /// TS 18661-3 / C23 interchange type
+    Float16,
 
     // Derived types
     Pointer,
@@ -206,6 +209,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Float => write!(f, "float"),
             TypeKind::Double => write!(f, "double"),
             TypeKind::LongDouble => write!(f, "long double"),
+            TypeKind::Float16 => write!(f, "_Float16"),
             TypeKind::Pointer => write!(f, "pointer"),
             TypeKind::Array => write!(f, "array"),
             TypeKind::Function => write!(f, "function"),
@@ -603,9 +607,11 @@ pub struct TypeTable {
     pub float_id: TypeId,
     pub double_id: TypeId,
     pub longdouble_id: TypeId,
+    pub float16_id: TypeId,
     pub complex_float_id: TypeId,
     pub complex_double_id: TypeId,
     pub complex_longdouble_id: TypeId,
+    pub complex_float16_id: TypeId,
     pub void_ptr_id: TypeId,
     pub char_ptr_id: TypeId,
 }
@@ -635,9 +641,11 @@ impl TypeTable {
             float_id: TypeId::INVALID,
             double_id: TypeId::INVALID,
             longdouble_id: TypeId::INVALID,
+            float16_id: TypeId::INVALID,
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
             complex_longdouble_id: TypeId::INVALID,
+            complex_float16_id: TypeId::INVALID,
             void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
         };
@@ -671,6 +679,7 @@ impl TypeTable {
         table.float_id = table.intern(Type::basic(TypeKind::Float));
         table.double_id = table.intern(Type::basic(TypeKind::Double));
         table.longdouble_id = table.intern(Type::basic(TypeKind::LongDouble));
+        table.float16_id = table.intern(Type::basic(TypeKind::Float16));
 
         // Pre-intern complex types
         table.complex_float_id = table.intern(Type::with_modifiers(
@@ -683,6 +692,10 @@ impl TypeTable {
         ));
         table.complex_longdouble_id = table.intern(Type::with_modifiers(
             TypeKind::LongDouble,
+            TypeModifiers::COMPLEX,
+        ));
+        table.complex_float16_id = table.intern(Type::with_modifiers(
+            TypeKind::Float16,
             TypeModifiers::COMPLEX,
         ));
 
@@ -923,7 +936,7 @@ impl TypeTable {
         let typ = self.get(id);
         matches!(
             typ.kind,
-            TypeKind::Float | TypeKind::Double | TypeKind::LongDouble
+            TypeKind::Float | TypeKind::Double | TypeKind::LongDouble | TypeKind::Float16
         ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
     }
 
@@ -944,6 +957,7 @@ impl TypeTable {
             TypeKind::Float => self.float_id,
             TypeKind::Double => self.double_id,
             TypeKind::LongDouble => self.longdouble_id,
+            TypeKind::Float16 => self.float16_id,
             _ => id,
         }
     }
@@ -1004,6 +1018,7 @@ impl TypeTable {
             TypeKind::Float => 32 * multiplier,
             TypeKind::Double => 64 * multiplier,
             TypeKind::LongDouble => self.longdouble_size_bits() * multiplier,
+            TypeKind::Float16 => 16 * multiplier,
             TypeKind::Pointer => self.pointer_width,
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0);
@@ -1041,6 +1056,7 @@ impl TypeTable {
             TypeKind::Int | TypeKind::Float => 4,
             TypeKind::Long | TypeKind::LongLong | TypeKind::Double | TypeKind::Pointer => 8,
             TypeKind::LongDouble => self.longdouble_alignment(),
+            TypeKind::Float16 => 2,
             TypeKind::Struct | TypeKind::Union => {
                 typ.composite.as_ref().map(|c| c.align).unwrap_or(1)
             }

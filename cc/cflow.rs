@@ -393,6 +393,7 @@ fn format_type(typ: posixutils_cc::types::TypeId, types: &TypeTable) -> String {
         TypeKind::Float => "float".to_string(),
         TypeKind::Double => "double".to_string(),
         TypeKind::LongDouble => "long double".to_string(),
+        TypeKind::Float16 => "_Float16".to_string(),
         TypeKind::Pointer => {
             if let Some(base) = t.base {
                 format!("{} *", format_type(base, types))

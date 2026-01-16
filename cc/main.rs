@@ -306,7 +306,8 @@ fn process_file(
 
     if args.preprocess_only {
         // Output preprocessed tokens
-        for token in &preprocessed {
+        let mut iter = preprocessed.iter().peekable();
+        while let Some(token) = iter.next() {
             if args.verbose {
                 println!(
                     "{:>4}:{:<3} {:12} {}",
@@ -319,11 +320,20 @@ fn process_file(
                 let text = show_token(token, &strings);
                 // Skip stream markers (e.g., <STREAM_BEGIN>, <STREAM_END>)
                 // but NOT the '<' operator or '<=', etc.
-                if !(text.starts_with("<STREAM")
+                if text.starts_with("<STREAM")
                     || text.starts_with("<ident")
-                    || text.starts_with("<special"))
+                    || text.starts_with("<special")
                 {
-                    print!("{} ", text);
+                    continue;
+                }
+                print!("{}", text);
+                // Check next token to determine separator
+                if let Some(next) = iter.peek() {
+                    if next.pos.newline {
+                        println!();
+                    } else if next.pos.whitespace {
+                        print!(" ");
+                    }
                 }
             }
         }

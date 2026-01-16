@@ -19,10 +19,12 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 impl Aarch64CodeGen {
     /// Get FP size from type on aarch64.
     ///
-    /// On aarch64, LongDouble is treated as Double (64-bit on macOS,
-    /// uses runtime library calls for quad precision on Linux).
+    /// On aarch64:
+    /// - Float16 uses native FP16 instructions (AArch64 supports half-precision)
+    /// - LongDouble is treated as Double (64-bit on macOS)
     fn fp_size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
         typ.map(|t| match types.kind(t) {
+            TypeKind::Float16 => FpSize::Half,
             TypeKind::Float => FpSize::Single,
             TypeKind::Double | TypeKind::LongDouble => FpSize::Double,
             _ => FpSize::from_bits(size.max(32)),
@@ -204,7 +206,9 @@ impl Aarch64CodeGen {
                 // Load FP constant using integer register
                 // Use the size from the FImm for correct constant representation
                 let (scratch0, _, _) = Reg::scratch_regs();
-                let bits = if imm_size <= 32 {
+                let bits = if imm_size == 16 {
+                    super::f64_to_f16_bits(f) as i64
+                } else if imm_size == 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64
@@ -238,6 +242,7 @@ impl Aarch64CodeGen {
                 // Load from global - use size matching FP precision
                 let (scratch0, _, _) = Reg::scratch_regs();
                 let load_size = match fp_size {
+                    FpSize::Half => OperandSize::B16,
                     FpSize::Single => OperandSize::B32,
                     FpSize::Double => OperandSize::B64,
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),

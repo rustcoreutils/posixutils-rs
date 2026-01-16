@@ -744,7 +744,20 @@ impl X86_64CodeGen {
                 src: xmm,
                 dst: xmm,
             });
-        } else if size <= 32 {
+        } else if size == 16 {
+            // Float16: load via integer register (use R10 scratch)
+            let bits = f64_to_f16_bits(value);
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B32,
+                src: GpOperand::Imm(bits as i64),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            self.push_lir(X86Inst::MovGpXmm {
+                size: OperandSize::B32,
+                src: Reg::R10,
+                dst: xmm,
+            });
+        } else if size == 32 {
             // Float: load via integer register (use R10 scratch)
             let bits = (value as f32).to_bits();
             self.push_lir(X86Inst::Mov {
@@ -1067,4 +1080,50 @@ impl X86_64CodeGen {
 
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
     }
+}
+
+/// Convert f64 to IEEE 754 half-precision (binary16) bits.
+/// This handles the conversion from 64-bit double to 16-bit half precision.
+pub fn f64_to_f16_bits(val: f64) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 63) & 1) as u16;
+    let exp = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & 0xFFFFFFFFFFFFF;
+
+    // Handle special cases
+    if exp == 0x7FF {
+        // NaN or Infinity
+        if frac != 0 {
+            // NaN: preserve some mantissa bits
+            return (sign << 15) | 0x7E00 | ((frac >> 42) as u16 & 0x1FF);
+        } else {
+            // Infinity
+            return (sign << 15) | 0x7C00;
+        }
+    }
+
+    // Rebias exponent: f64 bias is 1023, f16 bias is 15
+    let new_exp = exp - 1023 + 15;
+
+    if new_exp >= 31 {
+        // Overflow to infinity
+        return (sign << 15) | 0x7C00;
+    }
+
+    if new_exp <= 0 {
+        // Denormal or zero
+        if new_exp < -10 {
+            // Too small, flush to zero
+            return sign << 15;
+        }
+        // Denormal: shift mantissa right
+        let shift = 1 - new_exp;
+        let frac_with_hidden = frac | 0x10000000000000; // Add hidden bit
+        let shifted = frac_with_hidden >> (42 + shift);
+        return (sign << 15) | (shifted as u16 & 0x3FF);
+    }
+
+    // Normal number: truncate mantissa from 52 bits to 10 bits
+    let new_frac = (frac >> 42) as u16;
+    (sign << 15) | ((new_exp as u16) << 10) | (new_frac & 0x3FF)
 }

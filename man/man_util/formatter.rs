@@ -7295,7 +7295,7 @@ footer text                     January 1, 1970                    footer text";
         fn delimiters_inline_common() {
             fn test(macro_str: &str) {
                 let input = [
-                    format!(".Dd January 1, 1970\n.Dt PROGNAME section\n.Os footer text"),
+                    ".Dd January 1, 1970\n.Dt PROGNAME section\n.Os footer text".to_string(),
                     format!(".{} {} text {}", macro_str, "(", ")"),
                     format!(".{} {} text {}", macro_str, "[", "]"),
                     format!(".{} text {}", macro_str, "."),
@@ -7343,7 +7343,7 @@ footer text                     January 1, 1970                    footer text";
                 };
 
                 let input = [
-                    format!(".Dd January 1, 1970\n.Dt PROGNAME section\n.Os footer text"),
+                    ".Dd January 1, 1970\n.Dt PROGNAME section\n.Os footer text".to_string(),
                     format!(".{} {} text {}", macro_str, "(", ")"),
                     format!(".{} {} text {}", macro_str, "[", "]"),
                     format!(".{} text {}", macro_str, "."),

@@ -1757,10 +1757,9 @@ mod tests {
 
         // Verify we can get different versions
         for delta in &sccs.header.deltas {
-            let applied = sccs.compute_applied_set(delta.serial).expect(&format!(
-                "Failed to compute applied set for serial {}",
-                delta.serial
-            ));
+            let applied = sccs.compute_applied_set(delta.serial).unwrap_or_else(|_| {
+                panic!("Failed to compute applied set for serial {}", delta.serial)
+            });
             let content = sccs.evaluate_body(&applied);
             // Each version should produce some content
             assert!(

@@ -50,7 +50,7 @@ fn test_readlink_valid_symlink_no_newline() {
             symlink_path.to_str().unwrap().to_string(),
         ],
         stdin_data: String::new(),
-        expected_out: format!("{}", file_path.to_str().unwrap()),
+        expected_out: file_path.to_str().unwrap().to_string(),
         expected_err: String::new(),
         expected_exit_code: 0,
     });

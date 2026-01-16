@@ -9,7 +9,7 @@
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use tempfile::TempDir;
 
@@ -32,7 +32,7 @@ fn setup_sccs_file(tmp: &TempDir, name: &str, content: &str) -> (PathBuf, PathBu
 }
 
 // Helper to run get for editing that ignores stderr
-fn get_for_editing(sfile: &PathBuf) {
+fn get_for_editing(sfile: &Path) {
     let plan = TestPlan {
         cmd: String::from("get"),
         args: vec!["-e".into(), sfile.to_string_lossy().into()],
@@ -48,7 +48,7 @@ fn get_for_editing(sfile: &PathBuf) {
 }
 
 // Helper to run get -p -s (silent) which has exact output
-fn get_version_silent(sfile: &PathBuf, expected: &str) {
+fn get_version_silent(sfile: &Path, expected: &str) {
     run_test(TestPlan {
         cmd: String::from("get"),
         args: vec!["-p".into(), "-s".into(), sfile.to_string_lossy().into()],
@@ -59,7 +59,7 @@ fn get_version_silent(sfile: &PathBuf, expected: &str) {
     });
 }
 
-fn get_version_silent_sid(sfile: &PathBuf, sid: &str, expected: &str) {
+fn get_version_silent_sid(sfile: &Path, sid: &str, expected: &str) {
     run_test(TestPlan {
         cmd: String::from("get"),
         args: vec![
@@ -76,7 +76,7 @@ fn get_version_silent_sid(sfile: &PathBuf, sid: &str, expected: &str) {
 }
 
 // Helper to run delta that ignores stderr (has version info)
-fn run_delta(sfile: &PathBuf, comment: &str) {
+fn run_delta(sfile: &Path, comment: &str) {
     let plan = TestPlan {
         cmd: String::from("delta"),
         args: vec![format!("-y{}", comment), sfile.to_string_lossy().into()],

@@ -1706,12 +1706,7 @@ mod tests {
     #[test]
     fn test_write_float_hex_lower_subnormal() {
         let mut target = String::new();
-        fmt_write_hex_float(
-            &mut target,
-            4.9406564584124654e-324,
-            true,
-            &FormatArgs::default(),
-        );
+        fmt_write_hex_float(&mut target, 5e-324, true, &FormatArgs::default());
         assert_eq!(target, "0x0.0000000000001p-1022");
     }
 
@@ -2665,13 +2660,13 @@ mod tests {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
-            0.7853981633974,
+            0.123456789,
             true,
             &FormatArgs {
                 precision: Some(6),
                 ..Default::default()
             },
         );
-        assert_eq!(target, "0.785398");
+        assert_eq!(target, "0.123457");
     }
 }

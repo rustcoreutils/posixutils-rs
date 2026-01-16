@@ -479,7 +479,7 @@ fn test_caret_notation_math() {
     // ASCII 3 (ETX/Ctrl-C) -> ^C
     // ASCII 7 (BEL) -> ^G
     // ASCII 127 (DEL) -> ^?
-    assert_eq!(0u8 + 64, b'@'); // ^@
+    assert_eq!(64, b'@'); // ^@
     assert_eq!(1u8 + 64, b'A'); // ^A
     assert_eq!(3u8 + 64, b'C'); // ^C
     assert_eq!(7u8 + 64, b'G'); // ^G

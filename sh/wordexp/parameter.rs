@@ -347,9 +347,10 @@ mod tests {
     }
 
     fn shell_with_positional_arguments(args: Vec<&str>) -> Shell {
-        let mut shell = Shell::default();
-        shell.positional_parameters = args.iter().map(|s| s.to_string()).collect();
-        shell
+        Shell {
+            positional_parameters: args.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     fn expand_parameter_to_string(
@@ -400,8 +401,10 @@ mod tests {
 
     #[test]
     fn expand_dollar() {
-        let mut shell = Shell::default();
-        shell.shell_pid = 123;
+        let mut shell = Shell {
+            shell_pid: 123,
+            ..Default::default()
+        };
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Dollar)),

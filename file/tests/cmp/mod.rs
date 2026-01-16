@@ -68,8 +68,8 @@ fn cmp_different_silent() {
 
     let indices = [0, 45, 90, 135, 180, 225, 270, 315, 360, 405, 450];
 
-    for i in 0..indices.len() {
-        let modified = format!("tests/cmp/lorem_ipsum_{}.txt", indices[i]);
+    for index in indices {
+        let modified = format!("tests/cmp/lorem_ipsum_{}.txt", index);
         run_test_helper(&["-s", original, &modified], "", "", 1);
     }
 }
@@ -86,10 +86,7 @@ fn cmp_different_less_verbose() {
         let modified = format!("tests/cmp/lorem_ipsum_{}.txt", indices[i]);
         run_test_helper(
             &["-l", original, &modified],
-            &format!(
-                "{} {:o} {:o}\n",
-                bytes[i], chars_original[i] as u8, '?' as u8
-            ),
+            &format!("{} {:o} {:o}\n", bytes[i], chars_original[i] as u8, b'?'),
             "",
             1,
         );

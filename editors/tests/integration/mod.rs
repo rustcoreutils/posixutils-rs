@@ -560,8 +560,10 @@ fn test_search_wrap() {
 fn test_search_no_wrap() {
     let buffer = Buffer::from_text("find me\nother line");
     let mut search = SearchState::new();
-    let mut options = Options::default();
-    options.wrapscan = false;
+    let options = Options {
+        wrapscan: false,
+        ..Default::default()
+    };
     search.update_options(&options);
 
     search
@@ -576,8 +578,10 @@ fn test_search_no_wrap() {
 fn test_search_ignorecase() {
     let buffer = Buffer::from_text("other HELLO world");
     let mut search = SearchState::new();
-    let mut options = Options::default();
-    options.ignorecase = true;
+    let options = Options {
+        ignorecase: true,
+        ..Default::default()
+    };
     search.update_options(&options);
 
     search

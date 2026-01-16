@@ -72,12 +72,12 @@ fn file_is_a_valid_sym_link() {
     file.push("tests/file/regular_file.txt");
 
     // Remove the symlink or file inside the tests/file folder, if it already exists
-    if let Ok(_) = symlink_metadata(&valid_sym_link) {
+    if symlink_metadata(&valid_sym_link).is_ok() {
         remove_file(&valid_sym_link).unwrap()
     }
 
     // Create the valid symlink
-    let _ = symlink(&file, &valid_sym_link).unwrap();
+    symlink(&file, &valid_sym_link).unwrap();
 
     file_test(
         &[valid_sym_link.to_str().unwrap()],
@@ -106,12 +106,12 @@ fn file_file_is_a_broken_sym_link() {
     file.push("tests/file/this_file_does_not_exist.txt");
 
     // Remove the symlink or file inside the tests/file folder, if it already exists
-    if let Ok(_) = symlink_metadata(&broken_sym_link) {
+    if symlink_metadata(&broken_sym_link).is_ok() {
         remove_file(&broken_sym_link).unwrap()
     }
 
     // Create a broken sym link
-    let _ = symlink(&file, &broken_sym_link).unwrap();
+    symlink(&file, &broken_sym_link).unwrap();
 
     file_test(
         &[broken_sym_link.to_str().unwrap()],
@@ -142,10 +142,10 @@ fn file_symlink_with_h_flag_for_both_valid_and_broken_symlink() {
     let regular_file = cargo_manifest_dir.join("tests/file/regular_file.txt");
 
     // Remove any existing symbolic links or files
-    if let Ok(_) = symlink_metadata(&valid_symlink) {
+    if symlink_metadata(&valid_symlink).is_ok() {
         remove_file(&valid_symlink).unwrap();
     }
-    if let Ok(_) = symlink_metadata(&broken_symlink) {
+    if symlink_metadata(&broken_symlink).is_ok() {
         remove_file(&broken_symlink).unwrap();
     }
 

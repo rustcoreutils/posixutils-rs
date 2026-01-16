@@ -194,7 +194,7 @@ fn test_chown_change_to_non_member_group() {
 
     // Get the GID of a group that the test runner doesn't belong to
     fn get_non_member_group() -> Option<u32> {
-        let user_groups: HashSet<_> = current_user_group_ids().into_iter().collect();
+        let user_groups: HashSet<_> = current_user_group_ids().iter().collect();
         let mut non_member_group: Option<u32> = None; // Group that the current user does not belong to
 
         // Start reading the group database
@@ -253,7 +253,7 @@ fn test_chown_nonexistent() {
 
     // Nonexistent file
     chown_test(
-        &[&format!(":1"), f],
+        &[":1", f],
         "",
         &format!("chown: cannot access '{f}': No such file or directory\n"),
         1,
@@ -262,17 +262,17 @@ fn test_chown_nonexistent() {
 
     // Nonexistent user
     chown_test(
-        &[&format!("nonexistent_user"), f],
+        &["nonexistent_user", f],
         "",
-        &format!("chown: invalid user: 'nonexistent_user'\n"),
+        "chown: invalid user: 'nonexistent_user'\n",
         1,
     );
 
     // Nonexistent group
     chown_test(
-        &[&format!(":nonexistent_group"), f],
+        &[":nonexistent_group", f],
         "",
-        &format!("chown: invalid group: 'nonexistent_group'\n"),
+        "chown: invalid group: 'nonexistent_group'\n",
         1,
     );
     fs::remove_dir_all(test_dir).unwrap();

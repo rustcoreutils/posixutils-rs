@@ -1667,6 +1667,35 @@ impl<'a> Parser<'a> {
                     modifiers |= TypeModifiers::COMPLEX;
                     parsed_something = true;
                 }
+                "_Atomic" => {
+                    self.advance();
+                    // _Atomic can be:
+                    // 1. Type specifier: _Atomic(type-name)
+                    // 2. Type qualifier: _Atomic (without parens)
+                    if self.is_special(b'(') {
+                        // Type specifier form: _Atomic(type-name)
+                        self.advance(); // consume '('
+                        if let Some(inner_type) = self.try_parse_type_name() {
+                            if !self.is_special(b')') {
+                                return None;
+                            }
+                            self.advance(); // consume ')'
+                            let inner = self.types.get(inner_type).clone();
+                            let result = Type {
+                                modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
+                                ..inner
+                            };
+                            let result_id = self.types.intern(result);
+                            return Some(self.parse_pointer_chain(result_id));
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        // Qualifier form: just _Atomic
+                        modifiers |= TypeModifiers::ATOMIC;
+                    }
+                    parsed_something = true;
+                }
                 "short" => {
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
@@ -10563,6 +10592,51 @@ mod tests {
             }
             _ => panic!("Expected FunctionDef"),
         }
+    }
+
+    #[test]
+    fn test_atomic_in_cast() {
+        // _Atomic in cast expression: (_Atomic int)value
+        let (tu, types, _, _) =
+            parse_tu("int main(void) { int x = 42; return (_Atomic int)x; }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                // Verify the function parsed successfully
+                assert_eq!(types.kind(func.return_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_specifier_in_cast() {
+        // _Atomic(type) specifier form in cast: (_Atomic(int))value
+        let (tu, types, _, _) =
+            parse_tu("int main(void) { int x = 42; return (_Atomic(int))x; }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::FunctionDef(func) => {
+                assert_eq!(types.kind(func.return_type), TypeKind::Int);
+            }
+            _ => panic!("Expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_in_sizeof() {
+        // sizeof(_Atomic int)
+        let (tu, _types, _, _) =
+            parse_tu("int main(void) { return sizeof(_Atomic int); }").unwrap();
+        assert_eq!(tu.items.len(), 1);
+    }
+
+    #[test]
+    fn test_atomic_specifier_in_sizeof() {
+        // sizeof(_Atomic(int))
+        let (tu, _types, _, _) =
+            parse_tu("int main(void) { return sizeof(_Atomic(int)); }").unwrap();
+        assert_eq!(tu.items.len(), 1);
     }
 
     // =======================================================================

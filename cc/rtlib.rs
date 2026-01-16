@@ -29,10 +29,32 @@
 use crate::target::{Arch, Os, Target};
 use crate::types::TypeKind;
 
+/// ABI used for Float16 parameters/returns in rtlib functions.
+///
+/// Different runtime libraries use different ABIs for passing Float16 values:
+/// - compiler-rt (used by clang): Float16 passed as 16-bit integer in GP registers
+/// - libgcc (used by GCC): Float16 passed in XMM registers (SSE ABI)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Float16Abi {
+    /// Float16 passed/returned as 16-bit integer in GP registers (RDI/RAX on x86-64)
+    /// Used by compiler-rt (LLVM/clang runtime library)
+    Integer,
+    /// Float16 passed/returned in XMM registers using SSE ABI
+    /// Used by libgcc (GCC runtime library)
+    Sse,
+}
+
 /// Runtime library function name provider.
 ///
-/// Provides function names for soft-float and complex arithmetic operations
-/// based on the target architecture and operating system.
+/// Provides function names and ABI information for soft-float and complex
+/// arithmetic operations. The rtlib determines calling conventions for
+/// operations that require runtime library support.
+///
+/// Currently, the rtlib is inferred from the target:
+/// - macOS: compiler-rt (LLVM runtime)
+/// - Linux: libgcc (GCC runtime)
+///
+/// Future: explicit rtlib selection could be added via command-line flag.
 pub struct RtlibNames<'a> {
     target: &'a Target,
 }
@@ -54,6 +76,26 @@ impl<'a> RtlibNames<'a> {
     /// On AArch64, native FP16 instructions exist (FADD, FSUB, etc.).
     pub fn float16_needs_softfloat(&self) -> bool {
         self.target.arch == Arch::X86_64
+    }
+
+    /// Returns the ABI used by this rtlib for Float16 parameters/returns.
+    ///
+    /// This is an rtlib attribute - different runtime libraries have different
+    /// calling conventions for Float16:
+    /// - compiler-rt: INTEGER ABI (Float16 as 16-bit int in GP registers)
+    /// - libgcc: SSE ABI (Float16 in XMM registers)
+    ///
+    /// Currently inferred from target OS (macOS → compiler-rt, Linux → libgcc).
+    pub fn float16_abi(&self) -> Float16Abi {
+        if self.target.arch != Arch::X86_64 {
+            // AArch64 uses native FP16 instructions, not rtlib
+            return Float16Abi::Sse;
+        }
+        match self.target.os {
+            Os::MacOS => Float16Abi::Integer, // compiler-rt
+            Os::Linux => Float16Abi::Sse,     // libgcc
+            Os::FreeBSD => Float16Abi::Sse,   // libgcc
+        }
     }
 
     // ========================================================================

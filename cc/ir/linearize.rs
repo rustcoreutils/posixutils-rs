@@ -21,7 +21,7 @@ use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
     ExternalDecl, ForInit, FunctionDef, InitElement, OffsetOfPath, Stmt, TranslationUnit, UnaryOp,
 };
-use crate::rtlib::RtlibNames;
+use crate::rtlib::{Float16Abi, RtlibNames};
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
@@ -3253,7 +3253,8 @@ impl<'a> Linearizer<'a> {
 
             if !from_suffix.is_empty() && !to_suffix.is_empty() {
                 if let Some(func_name) = rtlib.float16_convert(from_suffix, to_suffix) {
-                    return self.emit_longdouble_convert_call(func_name, src, src_type, cast_type);
+                    // Use Float16-specific call that handles x86-64 soft-float ABI
+                    return self.emit_float16_convert_call(func_name, src, src_type, cast_type);
                 }
             }
         }
@@ -6597,28 +6598,46 @@ impl<'a> Linearizer<'a> {
 
     /// Emit call to __extendhfsf2 to extend Float16 to float.
     ///
-    /// On x86-64, Float16 values are passed to rtlib functions as integers (in RDI),
-    /// not as SSE values. This function manually sets up the correct ABI classification.
+    /// The ABI for Float16 parameter depends on the runtime library:
+    /// - compiler-rt: Float16 passed as 16-bit integer in RDI
+    /// - libgcc: Float16 passed in XMM (SSE ABI)
     fn emit_float16_extend_call(
         &mut self,
         src: PseudoId,
-        _src_type: TypeId,
+        src_type: TypeId,
         dst_type: TypeId,
     ) -> PseudoId {
         let result = self.alloc_pseudo();
         let dst_size = self.types.size_bits(dst_type);
 
-        // Use u16 type for the argument to get INTEGER ABI classification
-        let arg_type_for_abi = self.types.ushort_id;
+        // Query rtlib for Float16 ABI
+        let rtlib = RtlibNames::new(self.target);
+        let f16_abi = rtlib.float16_abi();
+
+        // Set up argument type based on rtlib ABI
+        let arg_type_for_abi = if f16_abi == Float16Abi::Integer {
+            self.types.ushort_id // compiler-rt: use integer type
+        } else {
+            src_type // libgcc: use Float16 type (SSE ABI)
+        };
 
         let arg_vals = vec![src];
         let arg_types = vec![arg_type_for_abi];
 
-        // Manually set ABI: argument is INTEGER (16-bit), return is SSE (float)
-        let param_classes = vec![ArgClass::Extend {
-            signed: false,
-            size_bits: 16,
-        }];
+        // Set up ABI classification based on rtlib
+        let param_classes = if f16_abi == Float16Abi::Integer {
+            // compiler-rt: argument is INTEGER (16-bit)
+            vec![ArgClass::Extend {
+                signed: false,
+                size_bits: 16,
+            }]
+        } else {
+            // libgcc: use standard SSE ABI
+            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+            vec![abi.classify_param(arg_type_for_abi, self.types)]
+        };
+
+        // Return is always SSE (float)
         let ret_class = ArgClass::Direct {
             classes: vec![RegClass::Sse],
             size_bits: 32,
@@ -6641,8 +6660,9 @@ impl<'a> Linearizer<'a> {
 
     /// Emit call to __truncsfhf2 to truncate float to Float16.
     ///
-    /// On x86-64, Float16 values are returned from rtlib functions as integers (in RAX),
-    /// not as SSE values. This function manually sets up the correct ABI classification.
+    /// The ABI for Float16 return depends on the runtime library:
+    /// - compiler-rt: Float16 returned as 16-bit integer in RAX
+    /// - libgcc: Float16 returned in XMM (SSE ABI)
     fn emit_float16_truncate_call(
         &mut self,
         src: PseudoId,
@@ -6655,16 +6675,29 @@ impl<'a> Linearizer<'a> {
         let arg_vals = vec![src];
         let arg_types = vec![src_type];
 
-        // Manually set ABI: argument is SSE (float), return is INTEGER (16-bit)
-        // The return comes in RAX, but the result is treated as Float16 for subsequent ops
+        // Query rtlib for Float16 ABI
+        let rtlib = RtlibNames::new(self.target);
+        let f16_abi = rtlib.float16_abi();
+
+        // Argument is always SSE (float)
         let param_classes = vec![ArgClass::Direct {
             classes: vec![RegClass::Sse],
             size_bits: 32,
         }];
-        let ret_class = ArgClass::Extend {
-            signed: false,
-            size_bits: 16,
+
+        // Return type depends on rtlib
+        let ret_class = if f16_abi == Float16Abi::Integer {
+            // compiler-rt: return is INTEGER (16-bit in RAX)
+            ArgClass::Extend {
+                signed: false,
+                size_bits: 16,
+            }
+        } else {
+            // libgcc: return is SSE (Float16 in XMM)
+            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+            abi.classify_return(dst_type, self.types)
         };
+
         let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
 
         let mut call_insn = Instruction::call(
@@ -6712,6 +6745,83 @@ impl<'a> Linearizer<'a> {
             .map(|&t| abi.classify_param(t, self.types))
             .collect();
         let ret_class = abi.classify_return(dst_type, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            func_name,
+            arg_vals,
+            arg_types,
+            dst_type,
+            dst_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
+    }
+
+    /// Emit a call to a Float16 conversion rtlib function with correct ABI for x86-64.
+    ///
+    /// On x86-64 without native FP16, Float16 values are passed/returned as integers:
+    /// - Float16 argument: 16-bit value in RDI (zero-extended)
+    /// - Float16 return: 16-bit value in AX
+    /// - Other float types: standard SSE ABI (XMM0)
+    /// - Integer types: standard integer ABI
+    fn emit_float16_convert_call(
+        &mut self,
+        func_name: &str,
+        src: PseudoId,
+        src_type: TypeId,
+        dst_type: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let dst_size = self.types.size_bits(dst_type);
+        let src_kind = self.types.kind(src_type);
+        let dst_kind = self.types.kind(dst_type);
+
+        // Query rtlib for Float16 ABI - this is an rtlib attribute
+        let rtlib = RtlibNames::new(self.target);
+        let f16_abi = rtlib.float16_abi();
+
+        // For argument type, use u16 if src is Float16 with integer ABI (compiler-rt)
+        let arg_type_for_abi = if f16_abi == Float16Abi::Integer && src_kind == TypeKind::Float16 {
+            self.types.ushort_id
+        } else {
+            src_type
+        };
+
+        let arg_vals = vec![src];
+        let arg_types = vec![arg_type_for_abi];
+
+        // Compute ABI classification based on rtlib requirements
+        let param_classes = if f16_abi == Float16Abi::Integer && src_kind == TypeKind::Float16 {
+            // compiler-rt: Float16 passed as 16-bit integer (zero-extended)
+            vec![ArgClass::Extend {
+                signed: false,
+                size_bits: 16,
+            }]
+        } else {
+            // libgcc or non-Float16: use standard ABI classification
+            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+            arg_types
+                .iter()
+                .map(|&t| abi.classify_param(t, self.types))
+                .collect()
+        };
+
+        let ret_class = if f16_abi == Float16Abi::Integer && dst_kind == TypeKind::Float16 {
+            // compiler-rt: Float16 returned as 16-bit integer
+            ArgClass::Extend {
+                signed: false,
+                size_bits: 16,
+            }
+        } else {
+            // libgcc or non-Float16: use standard ABI classification
+            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+            abi.classify_return(dst_type, self.types)
+        };
+
         let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
 
         let mut call_insn = Instruction::call(

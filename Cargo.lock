@@ -1211,13 +1211,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
-name = "m4-test-manager"
-version = "0.7.0"
-dependencies = [
- "clap",
-]
-
-[[package]]
 name = "match_cfg"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1766,8 +1759,8 @@ dependencies = [
  "errno",
  "libc",
  "log",
- "m4-test-manager",
  "nom",
+ "plib",
  "regex-lite",
  "similar-asserts",
  "test-log",

@@ -54,7 +54,7 @@ fn check_output_nonempty_single_line(_: &TestPlan, output: &Output) {
 
 fn check_output_has_five_fields(_: &TestPlan, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let fields: Vec<&str> = stdout.trim().split_whitespace().collect();
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     // -a produces: sysname nodename release version machine
     // Note: version field may contain spaces, so we check at least 5 parts
     assert!(
@@ -67,7 +67,7 @@ fn check_output_has_five_fields(_: &TestPlan, output: &Output) {
 
 fn check_output_has_two_fields(_: &TestPlan, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let fields: Vec<&str> = stdout.trim().split_whitespace().collect();
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
         fields.len() >= FIELD_COUNT_TWO,
         "Expected at least {} fields, got {}",
@@ -78,7 +78,7 @@ fn check_output_has_two_fields(_: &TestPlan, output: &Output) {
 
 fn check_output_has_three_fields(_: &TestPlan, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let fields: Vec<&str> = stdout.trim().split_whitespace().collect();
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
         fields.len() >= FIELD_COUNT_THREE,
         "Expected at least {} fields, got {}",

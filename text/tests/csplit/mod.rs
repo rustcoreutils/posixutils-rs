@@ -232,7 +232,7 @@ fn test_csplit_regex_in_seq() {
 // Test that line number 0 is rejected (POSIX: lines numbered starting at 1)
 #[test]
 fn test_csplit_error_line_zero() {
-    let str_args: Vec<String> = vec!["-f", "err_zero", "-", "0"]
+    let str_args: Vec<String> = ["-f", "err_zero", "-", "0"]
         .iter()
         .map(|s| String::from(*s))
         .collect();
@@ -252,7 +252,7 @@ fn test_csplit_error_line_zero() {
 // Test invalid BRE pattern error
 #[test]
 fn test_csplit_error_invalid_bre() {
-    let str_args: Vec<String> = vec!["-f", "err_bre", "-", "/[invalid/"]
+    let str_args: Vec<String> = ["-f", "err_bre", "-", "/[invalid/"]
         .iter()
         .map(|s| String::from(*s))
         .collect();
@@ -285,7 +285,7 @@ fn test_csplit_error_invalid_bre() {
 fn test_csplit_keep_files_on_error() {
     // This test creates some files then encounters an error (line 999 doesn't exist)
     // With -k, the files should be kept
-    let str_args: Vec<String> = vec!["-k", "-f", "keep_err", "-", "3", "999"]
+    let str_args: Vec<String> = ["-k", "-f", "keep_err", "-", "3", "999"]
         .iter()
         .map(|s| String::from(*s))
         .collect();

@@ -105,5 +105,6 @@ fn test_fuser_with_user() {
     );
 
     process.kill().expect("Failed to kill the process");
+    process.wait().expect("Failed to wait for process");
     std::fs::remove_file(temp_file_path).expect("Failed to remove temporary file");
 }

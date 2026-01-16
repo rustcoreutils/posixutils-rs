@@ -434,14 +434,14 @@ fn test_chgrp_no_x() {
 #[allow(non_snake_case)]
 fn test_chgrp_posix_h() {
     let test_dir = &format!("{}/test_chgrp_posix_h", env!("CARGO_TARGET_TMPDIR"));
-    let _1 = &format!("{test_dir}/1");
-    let _1_1F = &format!("{test_dir}/1/1F");
-    let _1s = &format!("{test_dir}/1s");
-    let _2 = &format!("{test_dir}/2");
-    let _2_2F = &format!("{test_dir}/2/2F");
-    let _2_2s = &format!("{test_dir}/2/2s");
-    let _3 = &format!("{test_dir}/3");
-    let _3_3F = &format!("{test_dir}/3/3F");
+    let dir1 = &format!("{test_dir}/1");
+    let dir1_1f = &format!("{test_dir}/1/1F");
+    let dir1s = &format!("{test_dir}/1s");
+    let dir2 = &format!("{test_dir}/2");
+    let dir2_2f = &format!("{test_dir}/2/2F");
+    let dir2_2s = &format!("{test_dir}/2/2s");
+    let dir3 = &format!("{test_dir}/3");
+    let dir3_3f = &format!("{test_dir}/3/3F");
 
     let ((g1, gid1), (g2, gid2)) = get_groups();
     let g1 = &g1;
@@ -449,23 +449,23 @@ fn test_chgrp_posix_h() {
 
     fs::create_dir(test_dir).unwrap();
 
-    for dir in [_1, _2, _3] {
+    for dir in [dir1, dir2, dir3] {
         fs::create_dir(dir).unwrap();
     }
-    for file in [_1_1F, _2_2F, _3_3F] {
+    for file in [dir1_1f, dir2_2f, dir3_3f] {
         fs::File::create(file).unwrap();
     }
-    unix::fs::symlink(_1, _1s).unwrap();
-    unix::fs::symlink("../3", _2_2s).unwrap();
-    chgrp_test(&["-R", g1, _1, _2, _3], "", "", 0);
+    unix::fs::symlink(dir1, dir1s).unwrap();
+    unix::fs::symlink("../3", dir2_2s).unwrap();
+    chgrp_test(&["-R", g1, dir1, dir2, dir3], "", "", 0);
 
-    chgrp_test(&["-H", "-R", g2, _1s, _2], "", "", 0);
+    chgrp_test(&["-H", "-R", g2, dir1s, dir2], "", "", 0);
 
-    for file in [_1, _1_1F, _2, _2_2F, _3] {
+    for file in [dir1, dir1_1f, dir2, dir2_2f, dir3] {
         assert_eq!(file_gid(file).unwrap(), gid2);
     }
 
-    for file in [_1s, _2_2s, _3_3F] {
+    for file in [dir1s, dir2_2s, dir3_3f] {
         assert_eq!(file_gid(file).unwrap(), gid1);
     }
 

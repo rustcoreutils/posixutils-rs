@@ -31,7 +31,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(format!("failed to spawn command {}", cmd).as_str());
+        .unwrap_or_else(|_| panic!("failed to spawn command {}", cmd));
 
     // Separate the mutable borrow of stdin from the child process
     if let Some(mut stdin) = child.stdin.take() {
@@ -56,8 +56,8 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     }
 
     // Ensure we wait for the process to complete after writing to stdin
-    let output = child.wait_with_output().expect("failed to wait for child");
-    output
+
+    child.wait_with_output().expect("failed to wait for child")
 }
 
 #[test]

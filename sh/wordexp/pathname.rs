@@ -193,7 +193,7 @@ pub mod tests {
     impl TestFileSystem {
         fn get_dir(&self, path: &Path) -> Option<&Directory> {
             let mut current_dir = &self.root;
-            for entry in path.into_iter() {
+            for entry in path.iter() {
                 let next_dir_name = entry.to_str().unwrap();
                 match current_dir.get(next_dir_name)? {
                     FileSystemNode::File => return None,

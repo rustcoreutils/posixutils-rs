@@ -116,6 +116,6 @@ ignore=true
         assert_eq!(snapshot.stdout, "1 2 \n");
         assert_eq!(snapshot.stderr, "i 1 2 i  |i 1 2 i  |");
         assert_eq!(snapshot.status, 0);
-        assert_eq!(snapshot.ignore, true);
+        assert!(snapshot.ignore);
     }
 }

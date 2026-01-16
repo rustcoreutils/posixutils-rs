@@ -47,8 +47,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
         .write_all(stdin_data)
         .expect("failed to write to stdin");
 
-    let output = child.wait_with_output().expect("failed to wait for child");
-    output
+    child.wait_with_output().expect("failed to wait for child")
 }
 
 fn get_output(plan: TestPlan) -> Output {

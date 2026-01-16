@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     fn pattern_to_regex_string(parsed_pattern: &[PatternItem]) -> String {
-        parsed_pattern_to_regex(&parsed_pattern)
+        parsed_pattern_to_regex(parsed_pattern)
             .expect("failed to convert pattern")
             .to_string()
     }

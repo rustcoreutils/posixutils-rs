@@ -52,7 +52,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(format!("failed to spawn command {}", cmd).as_str());
+        .unwrap_or_else(|_| panic!("failed to spawn command {}", cmd));
 
     let pgid = unsafe { libc::getpgid(child.id() as i32) };
 
@@ -99,7 +99,7 @@ pub fn run_test(plan: TestPlan) {
 
     let mut system = System::new_all();
     system.refresh_all();
-    for (_, process) in system.processes() {
+    for process in system.processes().values() {
         if let Some(gid) = process.group_id() {
             if *gid == pgid as u32 {
                 assert!(plan.has_subprocesses)

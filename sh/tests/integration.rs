@@ -21,12 +21,14 @@ fn set_env_vars() {
 
         let write_dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
         if !write_dir.exists() {
-            std::fs::create_dir(&write_dir).expect("failed to create write_dir");
+            std::fs::create_dir(write_dir).expect("failed to create write_dir");
         }
         std::env::set_var("TEST_WRITE_DIR", write_dir);
         TEST_VARS_ARE_SET.store(true, Ordering::SeqCst);
     }
-    while !TEST_VARS_ARE_SET.load(Ordering::SeqCst) {}
+    while !TEST_VARS_ARE_SET.load(Ordering::SeqCst) {
+        std::hint::spin_loop()
+    }
 }
 
 fn run_script_with_checker<F: Fn(&Output)>(script: &str, checker: F) {

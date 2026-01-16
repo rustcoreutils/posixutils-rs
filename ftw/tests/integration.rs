@@ -121,7 +121,7 @@ fn test_ftw_simple() {
     }
 
     let mut expected_filenames = [
-        format!("{test_dir}"),
+        test_dir.to_string(),
         format!("{test_dir}/b"),
         format!("{test_dir}/b/1"),
         format!("{test_dir}/b/2"),
@@ -196,7 +196,7 @@ fn test_ftw_symlinks() {
     // 2
     // Filenames below should be the same as what `ls` should produce
     let mut expected_filenames = [
-        format!("{test_dir}"),
+        test_dir.to_string(),
         format!("{test_dir}/0"),
         format!("{test_dir}/0/symlink"),
         format!("{test_dir}/0/symlink/symlink"),

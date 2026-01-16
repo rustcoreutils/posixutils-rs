@@ -87,7 +87,7 @@ fn ls_test(args: &[&str], expected_output: &str, expected_error: &str, expected_
         stdin_data: String::new(),
         expected_out: String::from(expected_output),
         expected_err: String::from(expected_error),
-        expected_exit_code: expected_exit_code,
+        expected_exit_code,
     });
 }
 
@@ -254,10 +254,8 @@ fn test_ls_file_type() {
         // rw-r--r--
         let mode = libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH;
         let ret = libc::mkfifo(fifo_cstr.as_ptr(), mode);
-        if ret != 0 {
-            if get_errno() != libc::EEXIST {
-                panic!("{}", io::Error::last_os_error());
-            }
+        if ret != 0 && get_errno() != libc::EEXIST {
+            panic!("{}", io::Error::last_os_error());
         }
     }
 
@@ -405,13 +403,13 @@ fn test_ls_m_option() {
     // paths.
 
     // Original test is using -w2 here
-    cd_and_ls_test(test_dir, &["-m", "a", "b"], &format!("a, b\n"));
+    cd_and_ls_test(test_dir, &["-m", "a", "b"], "a, b\n");
 
     // -k for 1024-byte block sizes which is the default for coreutils. Default
     // for this implementation is 512-byte blocks as mentioned in the STDOUT
     // section of:
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/ls.html
-    cd_and_ls_test(test_dir, &["-smk", "a", "b"], &format!("0 a, 12 b\n"));
+    cd_and_ls_test(test_dir, &["-smk", "a", "b"], "0 a, 12 b\n");
 
     fs::remove_dir_all(test_dir).unwrap();
 }

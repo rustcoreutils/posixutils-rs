@@ -142,14 +142,10 @@ fn test_chmod_symlinks() {
 
     fn count_755(files: &[&str], expected: usize) {
         let count = files
-            .into_iter()
-            .filter_map(|file| {
+            .iter()
+            .filter(|file| {
                 let mode = fs::metadata(file).unwrap().permissions().mode();
-                if (mode & 0o777) == 0o755 {
-                    Some(file)
-                } else {
-                    None
-                }
+                (mode & 0o777) == 0o755
             })
             .count();
         assert_eq!(count, expected)

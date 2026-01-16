@@ -153,6 +153,9 @@ bitflags::bitflags! {
 
         // C11 atomic type qualifier
         const ATOMIC = 1 << 16;
+
+        // C11 thread-local storage specifier
+        const THREAD_LOCAL = 1 << 17;
     }
 }
 

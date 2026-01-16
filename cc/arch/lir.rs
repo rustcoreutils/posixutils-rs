@@ -386,6 +386,8 @@ pub enum SymbolType {
     Function,
     /// @object
     Object,
+    /// @tls_object (ELF TLS symbol)
+    TlsObject,
 }
 
 impl SymbolType {
@@ -393,6 +395,7 @@ impl SymbolType {
         match self {
             SymbolType::Function => "@function",
             SymbolType::Object => "@object",
+            SymbolType::TlsObject => "@tls_object",
         }
     }
 }
@@ -448,6 +451,12 @@ pub enum Directive {
 
     /// Switch to read-only data section (.section .rodata or __TEXT,__const)
     Rodata,
+
+    /// Switch to thread-local data section (.section .tdata or __DATA,__thread_data)
+    Tdata,
+
+    /// Switch to thread-local BSS section (.section .tbss or __DATA,__thread_bss)
+    Tbss,
 
     // ========================================================================
     // Symbol Visibility and Attributes
@@ -589,6 +598,13 @@ impl Directive {
         }
     }
 
+    pub fn type_tls_object(name: impl Into<String>) -> Self {
+        Directive::Type {
+            sym: Symbol::global(name),
+            kind: SymbolType::TlsObject,
+        }
+    }
+
     pub fn size(name: impl Into<String>, size: u32) -> Self {
         Directive::Size {
             sym: Symbol::global(name),
@@ -664,6 +680,22 @@ impl EmitAsm for Directive {
                 }
                 Os::Linux | Os::FreeBSD => {
                     let _ = writeln!(out, ".section .rodata");
+                }
+            },
+            Directive::Tdata => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __DATA,__thread_data,thread_local_regular");
+                }
+                Os::Linux | Os::FreeBSD => {
+                    let _ = writeln!(out, ".section .tdata,\"awT\",@progbits");
+                }
+            },
+            Directive::Tbss => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __DATA,__thread_bss,thread_local_zerofill");
+                }
+                Os::Linux | Os::FreeBSD => {
+                    let _ = writeln!(out, ".section .tbss,\"awT\",@nobits");
                 }
             },
 

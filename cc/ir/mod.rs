@@ -201,6 +201,10 @@ pub enum Opcode {
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
 
+    // Stack introspection
+    FrameAddress,  // __builtin_frame_address(level) - returns frame pointer at level
+    ReturnAddress, // __builtin_return_address(level) - returns return address at level
+
     // Non-local jumps (setjmp/longjmp)
     Setjmp,  // Save execution context, returns 0 or value from longjmp
     Longjmp, // Restore execution context (never returns)
@@ -347,6 +351,8 @@ impl Opcode {
             Opcode::Fabs32 => "fabs32",
             Opcode::Fabs64 => "fabs64",
             Opcode::Unreachable => "unreachable",
+            Opcode::FrameAddress => "frame_address",
+            Opcode::ReturnAddress => "return_address",
             Opcode::Setjmp => "setjmp",
             Opcode::Longjmp => "longjmp",
             Opcode::Asm => "asm",
@@ -1454,6 +1460,45 @@ impl fmt::Display for Initializer {
 }
 
 // ============================================================================
+// Global Variable Definition
+// ============================================================================
+
+/// A global variable definition with full metadata
+#[derive(Debug, Clone)]
+pub struct GlobalDef {
+    /// Variable name
+    pub name: String,
+    /// Variable type
+    pub typ: TypeId,
+    /// Initializer (None for uninitialized)
+    pub init: Initializer,
+    /// C11 _Thread_local / GCC __thread
+    pub is_thread_local: bool,
+}
+
+impl GlobalDef {
+    /// Create a new global variable definition
+    pub fn new(name: impl Into<String>, typ: TypeId, init: Initializer) -> Self {
+        Self {
+            name: name.into(),
+            typ,
+            init,
+            is_thread_local: false,
+        }
+    }
+
+    /// Create a thread-local global variable definition
+    pub fn thread_local(name: impl Into<String>, typ: TypeId, init: Initializer) -> Self {
+        Self {
+            name: name.into(),
+            typ,
+            init,
+            is_thread_local: true,
+        }
+    }
+}
+
+// ============================================================================
 // Module (Translation Unit)
 // ============================================================================
 
@@ -1462,8 +1507,8 @@ impl fmt::Display for Initializer {
 pub struct Module {
     /// Functions
     pub functions: Vec<Function>,
-    /// Global variables (name, type, initializer)
-    pub globals: Vec<(String, TypeId, Initializer)>,
+    /// Global variables
+    pub globals: Vec<GlobalDef>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
     /// Wide string literals (label, content)
@@ -1504,7 +1549,12 @@ impl Module {
 
     /// Add a global variable
     pub fn add_global(&mut self, name: impl Into<String>, typ: TypeId, init: Initializer) {
-        self.globals.push((name.into(), typ, init));
+        self.globals.push(GlobalDef::new(name, typ, init));
+    }
+
+    /// Add a thread-local global variable
+    pub fn add_global_tls(&mut self, name: impl Into<String>, typ: TypeId, init: Initializer) {
+        self.globals.push(GlobalDef::thread_local(name, typ, init));
     }
 
     /// Add a string literal and return its label
@@ -1531,10 +1581,17 @@ impl Default for Module {
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Globals
-        for (name, typ, init) in &self.globals {
-            match init {
-                Initializer::None => writeln!(f, "@{}: type#{}", name, typ.0)?,
-                _ => writeln!(f, "@{}: type#{} = {}", name, typ.0, init)?,
+        for global in &self.globals {
+            let tls_marker = if global.is_thread_local { " [tls]" } else { "" };
+            match &global.init {
+                Initializer::None => {
+                    writeln!(f, "@{}: type#{}{}", global.name, global.typ.0, tls_marker)?
+                }
+                init => writeln!(
+                    f,
+                    "@{}: type#{} = {}{}",
+                    global.name, global.typ.0, init, tls_marker
+                )?,
             }
         }
 

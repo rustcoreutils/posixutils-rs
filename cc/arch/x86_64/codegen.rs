@@ -147,13 +147,15 @@ impl X86_64CodeGen {
         name: &str,
         typ: &TypeId,
         init: &crate::ir::Initializer,
+        is_thread_local: bool,
         types: &TypeTable,
     ) {
         // Skip extern symbols - they're defined elsewhere
         if self.extern_symbols.contains(name) {
             return;
         }
-        self.base.emit_global(name, typ, init, types);
+        self.base
+            .emit_global(name, typ, init, is_thread_local, types);
     }
 
     /// Emit long double constants collected during codegen
@@ -1282,6 +1284,16 @@ impl X86_64CodeGen {
                 // that should never be reached. If it is reached, the CPU
                 // will generate a SIGILL.
                 self.push_lir(X86Inst::Ud2);
+            }
+
+            Opcode::FrameAddress => {
+                // __builtin_frame_address(level)
+                self.emit_frame_address(insn);
+            }
+
+            Opcode::ReturnAddress => {
+                // __builtin_return_address(level)
+                self.emit_return_address(insn);
             }
 
             // ================================================================
@@ -3583,8 +3595,14 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         // Emit globals
-        for (name, typ, init) in &module.globals {
-            self.emit_global(name, typ, init, types);
+        for global in &module.globals {
+            self.emit_global(
+                &global.name,
+                &global.typ,
+                &global.init,
+                global.is_thread_local,
+                types,
+            );
         }
 
         // Emit string literals

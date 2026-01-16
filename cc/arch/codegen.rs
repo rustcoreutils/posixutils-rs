@@ -201,6 +201,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         name: &str,
         typ: &crate::types::TypeId,
         init: &Initializer,
+        is_thread_local: bool,
         types: &TypeTable,
     ) {
         let size = types.size_bits(*typ) / 8;
@@ -216,8 +217,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             align = align.max(16);
         }
 
-        // Use .comm for uninitialized external (non-static) globals
-        let use_bss = matches!(init, Initializer::None) && !is_static;
+        // Use .comm for uninitialized external (non-static) non-TLS globals
+        // TLS variables can't use .comm
+        let use_bss = matches!(init, Initializer::None) && !is_static && !is_thread_local;
 
         if use_bss {
             // Use .comm for uninitialized external globals
@@ -225,8 +227,19 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         }
 
-        // Data section
-        self.push_directive(Directive::Data);
+        // Select appropriate section for TLS vs regular data
+        if is_thread_local {
+            if matches!(init, Initializer::None) {
+                // Uninitialized TLS: .tbss section
+                self.push_directive(Directive::Tbss);
+            } else {
+                // Initialized TLS: .tdata section
+                self.push_directive(Directive::Tdata);
+            }
+        } else {
+            // Regular data section
+            self.push_directive(Directive::Data);
+        }
 
         // Check if this is a local symbol (starts with '.')
         let is_local = name.starts_with('.');
@@ -237,7 +250,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         // ELF-only type and size (handled by Directive::emit which skips on macOS)
-        self.push_directive(Directive::type_object(name));
+        // TLS objects have TLS type instead of regular object type
+        if is_thread_local {
+            self.push_directive(Directive::type_tls_object(name));
+        } else {
+            self.push_directive(Directive::type_object(name));
+        }
         self.push_directive(Directive::size(name, size));
 
         // Alignment

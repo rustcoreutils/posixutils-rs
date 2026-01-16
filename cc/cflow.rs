@@ -208,7 +208,7 @@ fn extract_calls_from_expr(
         ExprKind::Cast { expr, .. } => {
             extract_calls_from_expr(expr, strings, symbols, calls);
         }
-        ExprKind::SizeofExpr(e) => {
+        ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => {
             extract_calls_from_expr(e, strings, symbols, calls);
         }
         ExprKind::Comma(exprs) => {
@@ -248,7 +248,9 @@ fn extract_calls_from_expr(
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
-        | ExprKind::Alloca { size: arg } => {
+        | ExprKind::Alloca { size: arg }
+        | ExprKind::FrameAddress { level: arg }
+        | ExprKind::ReturnAddress { level: arg } => {
             extract_calls_from_expr(arg, strings, symbols, calls);
         }
         // Literals, identifiers, and other terminals - no recursion needed

@@ -427,7 +427,8 @@ impl<'a> Parser<'a> {
                             | TypeModifiers::STATIC
                             | TypeModifiers::TYPEDEF
                             | TypeModifiers::REGISTER
-                            | TypeModifiers::AUTO;
+                            | TypeModifiers::AUTO
+                            | TypeModifiers::THREAD_LOCAL;
                         let new_storage_class = typ.modifiers & storage_class_mask;
                         if !new_storage_class.is_empty() {
                             // Create a new type with the existing struct's data but new modifiers
@@ -1459,12 +1460,20 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        // sizeof
+        // sizeof and _Alignof
         if self.peek() == TokenType::Ident {
             if let Some(name) = self.get_ident_name(self.current()) {
                 if name == "sizeof" {
                     self.advance();
                     return self.parse_sizeof();
+                }
+                if name == "_Alignof"
+                    || name == "__alignof__"
+                    || name == "__alignof"
+                    || name == "alignof"
+                {
+                    self.advance();
+                    return self.parse_alignof();
                 }
             }
         }
@@ -1506,6 +1515,41 @@ impl<'a> Parser<'a> {
                 ExprKind::SizeofExpr(Box::new(expr)),
                 size_t,
                 sizeof_pos,
+            ))
+        }
+    }
+
+    /// Parse _Alignof expression (C11)
+    fn parse_alignof(&mut self) -> ParseResult<Expr> {
+        let alignof_pos = self.current_pos();
+        // _Alignof returns size_t
+        let size_t = self.types.ulong_id;
+
+        if self.is_special(b'(') {
+            // Could be _Alignof(type) or _Alignof(expr)
+            self.advance(); // consume '('
+
+            // Try to parse as type first
+            if let Some(typ) = self.try_parse_type_name() {
+                self.expect_special(b')')?;
+                return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
+            }
+
+            // Not a type, parse as expression
+            let expr = self.parse_expression()?;
+            self.expect_special(b')')?;
+            Ok(Expr::typed(
+                ExprKind::AlignofExpr(Box::new(expr)),
+                size_t,
+                alignof_pos,
+            ))
+        } else {
+            // _Alignof without parens - must be expression
+            let expr = self.parse_unary_expr()?;
+            Ok(Expr::typed(
+                ExprKind::AlignofExpr(Box::new(expr)),
+                size_t,
+                alignof_pos,
             ))
         }
     }
@@ -2754,6 +2798,36 @@ impl<'a> Parser<'a> {
                             return Ok(Self::typed_expr(
                                 ExprKind::IntLit(if compatible { 1 } else { 0 }),
                                 self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_frame_address" => {
+                            // __builtin_frame_address(level) - returns void*, address of frame at level
+                            // Level 0 is the current frame, 1 is the caller's frame, etc.
+                            // Returns NULL for invalid levels (beyond stack bounds)
+                            self.expect_special(b'(')?;
+                            let level = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FrameAddress {
+                                    level: Box::new(level),
+                                },
+                                self.types.void_ptr_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_return_address" => {
+                            // __builtin_return_address(level) - returns void*, return address at level
+                            // Level 0 is the current function's return address
+                            // Returns NULL for invalid levels (beyond stack bounds)
+                            self.expect_special(b'(')?;
+                            let level = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::ReturnAddress {
+                                    level: Box::new(level),
+                                },
+                                self.types.void_ptr_id,
                                 token_pos,
                             ));
                         }
@@ -4022,6 +4096,7 @@ impl Parser<'_> {
                     | "_Float64"
                     | "_Complex"
                     | "_Atomic"
+                    | "_Alignas"
                     | "signed"
                     | "unsigned"
                     | "const"
@@ -4041,6 +4116,13 @@ impl Parser<'_> {
                     | "__attribute__"
                     | "__attribute"
                     | "__builtin_va_list"
+                    | "typeof"
+                    | "__typeof__"
+                    | "__typeof"
+                    | "_Thread_local"
+                    | "__thread"
+                    | "_Static_assert"
+                    | "static_assert"
             ) {
                 return true;
             }
@@ -4177,6 +4259,15 @@ impl Parser<'_> {
         &mut self,
         forbid_storage_class: bool,
     ) -> ParseResult<Declaration> {
+        // Check for _Static_assert first (C11)
+        if self.is_static_assert() {
+            self.parse_static_assert()?;
+            // Return empty declaration - static_assert produces nothing
+            return Ok(Declaration {
+                declarators: vec![],
+            });
+        }
+
         // Parse type specifiers
         let base_type = self.parse_type_specifier()?;
 
@@ -4191,6 +4282,28 @@ impl Parser<'_> {
             if base_type.modifiers.contains(TypeModifiers::EXTERN) {
                 return Err(ParseError::new(
                     "declaration of extern variable in for loop initial declaration",
+                    self.current_pos(),
+                ));
+            }
+            if base_type.modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+                return Err(ParseError::new(
+                    "declaration of thread-local variable in for loop initial declaration",
+                    self.current_pos(),
+                ));
+            }
+        }
+
+        // C11 6.7.1p2: _Thread_local shall not appear in a declaration with auto or register
+        if base_type.modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+            if base_type.modifiers.contains(TypeModifiers::AUTO) {
+                return Err(ParseError::new(
+                    "_Thread_local cannot be combined with auto",
+                    self.current_pos(),
+                ));
+            }
+            if base_type.modifiers.contains(TypeModifiers::REGISTER) {
+                return Err(ParseError::new(
+                    "_Thread_local cannot be combined with register",
                     self.current_pos(),
                 ));
             }
@@ -4335,6 +4448,10 @@ impl Parser<'_> {
                     self.advance();
                     modifiers |= TypeModifiers::TYPEDEF;
                 }
+                "_Thread_local" | "__thread" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::THREAD_LOCAL;
+                }
                 "inline" => {
                     self.advance();
                     modifiers |= TypeModifiers::INLINE;
@@ -4381,6 +4498,23 @@ impl Parser<'_> {
                         // Qualifier form: just _Atomic
                         modifiers |= TypeModifiers::ATOMIC;
                     }
+                }
+                "_Alignas" => {
+                    // C11 alignment specifier: _Alignas(type-name) or _Alignas(constant-expression)
+                    self.advance();
+                    self.expect_special(b'(')?;
+                    // Try type name first
+                    if self.try_parse_type_name().is_some() {
+                        // _Alignas(type) - alignment of the type
+                        // TODO: Store alignment = alignof(type)
+                    } else {
+                        // Parse as constant expression: _Alignas(16)
+                        let _expr = self.parse_expression()?;
+                        // TODO: Evaluate and store alignment value
+                    }
+                    self.expect_special(b')')?;
+                    // For now, we accept the syntax but don't enforce alignment
+                    // Multiple _Alignas can appear; the strictest wins
                 }
                 "short" => {
                     self.advance();
@@ -4675,6 +4809,12 @@ impl Parser<'_> {
             let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
 
             while !self.is_special(b'}') && !self.is_eof() {
+                // Check for _Static_assert in struct (C11 6.7.2.1p1)
+                if self.is_static_assert() {
+                    self.parse_static_assert()?;
+                    continue;
+                }
+
                 // Parse member declaration
                 let member_base_type = self.parse_type_specifier()?;
                 let is_struct_or_union =
@@ -5168,7 +5308,8 @@ impl Parser<'_> {
             | TypeModifiers::STATIC
             | TypeModifiers::TYPEDEF
             | TypeModifiers::REGISTER
-            | TypeModifiers::AUTO;
+            | TypeModifiers::AUTO
+            | TypeModifiers::THREAD_LOCAL;
         let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
         if !base_storage_class.is_empty() && result_type_id != base_type_id {
             // Add storage class modifiers to the result type
@@ -5493,8 +5634,91 @@ impl Parser<'_> {
         Ok(tu)
     }
 
+    /// Check if current token is _Static_assert or static_assert
+    fn is_static_assert(&self) -> bool {
+        if self.peek() != TokenType::Ident {
+            return false;
+        }
+        if let Some(name_id) = self.get_ident_id(self.current()) {
+            let name = self.str(name_id);
+            matches!(name, "_Static_assert" | "static_assert")
+        } else {
+            false
+        }
+    }
+
+    /// Parse _Static_assert(constant-expression, string-literal);
+    /// C11: _Static_assert(expr, msg)
+    /// C23: static_assert(expr) or static_assert(expr, msg)
+    fn parse_static_assert(&mut self) -> ParseResult<()> {
+        let pos = self.current_pos();
+        self.advance(); // consume _Static_assert / static_assert
+        self.expect_special(b'(')?;
+
+        // Parse constant expression
+        let expr = self.parse_conditional_expr()?;
+
+        // Evaluate the constant expression
+        let value = self.eval_const_expr(&expr);
+
+        // Check for optional message (C23 allows omitting it)
+        let message = if self.is_special(b',') {
+            self.advance(); // consume ','
+                            // Expect string literal
+            if self.peek() != TokenType::String {
+                return Err(ParseError::new(
+                    "expected string literal in _Static_assert",
+                    self.current_pos(),
+                ));
+            }
+            let msg = if let TokenValue::String(s) = &self.current().value {
+                s.clone()
+            } else {
+                String::new()
+            };
+            self.advance(); // consume string
+            msg
+        } else {
+            // C23: no message provided
+            String::new()
+        };
+
+        self.expect_special(b')')?;
+        self.expect_special(b';')?;
+
+        // Check if assertion failed
+        if let Some(v) = value {
+            if v == 0 {
+                // Assertion failed
+                let msg = if message.is_empty() {
+                    "static assertion failed".to_string()
+                } else {
+                    format!("static assertion failed: {}", message)
+                };
+                return Err(ParseError::new(msg, pos));
+            }
+        } else {
+            // Could not evaluate at compile time
+            return Err(ParseError::new(
+                "_Static_assert expression is not a constant expression",
+                pos,
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Parse an external declaration (function definition or declaration)
     fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        // Check for _Static_assert first (C11)
+        if self.is_static_assert() {
+            self.parse_static_assert()?;
+            // Return empty declaration - static_assert produces nothing
+            return Ok(ExternalDecl::Declaration(Declaration {
+                declarators: vec![],
+            }));
+        }
+
         let decl_pos = self.current_pos();
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;
@@ -5606,12 +5830,19 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Add to symbol table and capture SymbolId
+                // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
-                    self.symbols.declare(sym).ok()
+                    self.symbols
+                        .declare(sym)
+                        .ok()
+                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
                     let var_sym = Symbol::variable(name, typ, self.symbols.depth());
-                    self.symbols.declare(var_sym).ok()
+                    self.symbols
+                        .declare(var_sym)
+                        .ok()
+                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
@@ -5677,7 +5908,8 @@ impl Parser<'_> {
                 | TypeModifiers::STATIC
                 | TypeModifiers::TYPEDEF
                 | TypeModifiers::REGISTER
-                | TypeModifiers::AUTO;
+                | TypeModifiers::AUTO
+                | TypeModifiers::THREAD_LOCAL;
             let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
             if !base_storage_class.is_empty() {
                 let mut typ = self.types.get(typ_id).clone();
@@ -5779,12 +6011,19 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Add to symbol table and capture SymbolId
+                // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
                     let sym = Symbol::typedef(name, full_typ, self.symbols.depth());
-                    self.symbols.declare(sym).ok()
+                    self.symbols
+                        .declare(sym)
+                        .ok()
+                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
                     let var_sym = Symbol::variable(name, full_typ, self.symbols.depth());
-                    self.symbols.declare(var_sym).ok()
+                    self.symbols
+                        .declare(var_sym)
+                        .ok()
+                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
@@ -5878,14 +6117,21 @@ impl Parser<'_> {
                 let func_type = Type::function(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 // Add to symbol table and capture SymbolId
+                // C allows multiple declarations of the same function
                 let symbol_id = if is_typedef {
                     // Function type typedef: typedef void my_func(void);
                     let sym = Symbol::typedef(name, func_type_id, self.symbols.depth());
-                    self.symbols.declare(sym).ok()
+                    self.symbols
+                        .declare(sym)
+                        .ok()
+                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
                     // Function declaration: add so the variadic flag is available when called
                     let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
-                    self.symbols.declare(func_sym).ok()
+                    self.symbols
+                        .declare(func_sym)
+                        .ok()
+                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
                 return Ok(ExternalDecl::Declaration(Declaration {
@@ -5935,7 +6181,8 @@ impl Parser<'_> {
                 | TypeModifiers::STATIC
                 | TypeModifiers::TYPEDEF
                 | TypeModifiers::REGISTER
-                | TypeModifiers::AUTO;
+                | TypeModifiers::AUTO
+                | TypeModifiers::THREAD_LOCAL;
             let base_storage_class = self.types.modifiers(typ_id) & storage_class_mask;
             if !base_storage_class.is_empty() {
                 let mut var_type = self.types.get(var_type_id).clone();
@@ -10876,5 +11123,83 @@ mod tests {
             _ => panic!("Expected FloatLit"),
         }
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
+    }
+
+    // ========================================================================
+    // _Alignof expression tests (C11)
+    // ========================================================================
+
+    #[test]
+    fn test_alignof_type_int() {
+        let (expr, types, _, _) = parse_expr("_Alignof(int)").unwrap();
+        match expr.kind {
+            ExprKind::AlignofType(tid) => assert_eq!(tid, types.int_id),
+            _ => panic!("Expected AlignofType, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_alignof_type_char() {
+        let (expr, types, _, _) = parse_expr("_Alignof(char)").unwrap();
+        match expr.kind {
+            ExprKind::AlignofType(tid) => assert_eq!(tid, types.char_id),
+            _ => panic!("Expected AlignofType, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_alignof_type_double() {
+        let (expr, types, _, _) = parse_expr("_Alignof(double)").unwrap();
+        match expr.kind {
+            ExprKind::AlignofType(tid) => assert_eq!(tid, types.double_id),
+            _ => panic!("Expected AlignofType, got {:?}", expr.kind),
+        }
+    }
+
+    #[test]
+    fn test_alignof_alias_alignof() {
+        // C23 alignof keyword
+        let (expr, _, _, _) = parse_expr("alignof(char)").unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::AlignofType(_)),
+            "Expected AlignofType"
+        );
+    }
+
+    #[test]
+    fn test_alignof_alias_gcc_double_underscore() {
+        // GCC __alignof__
+        let (expr, _, _, _) = parse_expr("__alignof__(int)").unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::AlignofType(_)),
+            "Expected AlignofType"
+        );
+    }
+
+    #[test]
+    fn test_alignof_alias_gcc_single_underscore() {
+        // GCC __alignof
+        let (expr, _, _, _) = parse_expr("__alignof(long)").unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::AlignofType(_)),
+            "Expected AlignofType"
+        );
+    }
+
+    #[test]
+    fn test_alignof_expr_variable() {
+        // _Alignof on an expression (variable)
+        let (expr, _, _, _) = parse_expr_with_vars("_Alignof(x)", &["x"]).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::AlignofExpr(_)),
+            "Expected AlignofExpr"
+        );
+    }
+
+    #[test]
+    fn test_alignof_returns_size_t_type() {
+        // _Alignof should return size_t (unsigned long on 64-bit)
+        let (expr, types, _, _) = parse_expr("_Alignof(int)").unwrap();
+        assert_eq!(expr.typ, Some(types.ulong_id));
     }
 }

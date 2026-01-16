@@ -478,6 +478,16 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::keyword_alias("__restrict", "restrict"));
         self.define_macro(Macro::keyword_alias("__restrict__", "restrict"));
 
+        // C99/C11 boolean type support (normally from <stdbool.h>)
+        // Pre-define these for compatibility with code that uses bool without including stdbool.h
+        self.define_macro(Macro::keyword_alias("bool", "_Bool"));
+        self.define_macro(Macro::predefined("true", Some("1")));
+        self.define_macro(Macro::predefined("false", Some("0")));
+        self.define_macro(Macro::predefined(
+            "__bool_true_false_are_defined",
+            Some("1"),
+        ));
+
         // C11 atomic memory order constants (GCC-compatible for <stdatomic.h>)
         self.define_macro(Macro::predefined("__ATOMIC_RELAXED", Some("0")));
         self.define_macro(Macro::predefined("__ATOMIC_CONSUME", Some("1")));
@@ -1642,6 +1652,250 @@ impl<'a> Preprocessor<'a> {
         None
     }
 
+    /// Detect include guard macro from file content.
+    /// Returns Some(macro_name) if the file starts with `#ifndef MACRO` followed by `#define MACRO`.
+    /// This ensures we only detect true include guards, not conditional includes like:
+    ///   #ifndef _CDEFS_H_
+    ///   # error "Use <sys/cdefs.h> instead"
+    ///   #endif
+    fn detect_include_guard(content: &[u8]) -> Option<String> {
+        // Convert to string for simple parsing
+        let text = match std::str::from_utf8(content) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        // Skip leading whitespace and find the first preprocessor directive
+        let mut chars = text.chars().peekable();
+
+        // Helper to skip whitespace and comments
+        let skip_ws_and_comments = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+            loop {
+                // Skip whitespace
+                while chars.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
+                    chars.next();
+                }
+
+                // Check for comment
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    match chars.peek() {
+                        Some(&'/') => {
+                            // Line comment - skip to end of line
+                            while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                                chars.next();
+                            }
+                            continue;
+                        }
+                        Some(&'*') => {
+                            // Block comment - skip to */
+                            chars.next();
+                            while let Some(c) = chars.next() {
+                                if c == '*' && chars.peek() == Some(&'/') {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        _ => return false, // Unexpected /
+                    }
+                }
+                return true;
+            }
+        };
+
+        if !skip_ws_and_comments(&mut chars) {
+            return None;
+        }
+
+        // Now we should be at #
+        if chars.next() != Some('#') {
+            return None;
+        }
+
+        // Skip whitespace after #
+        while chars
+            .peek()
+            .map(|c| *c == ' ' || *c == '\t')
+            .unwrap_or(false)
+        {
+            chars.next();
+        }
+
+        // Collect directive name
+        let mut directive = String::new();
+        while chars
+            .peek()
+            .map(|c| c.is_ascii_alphabetic() || *c == '_')
+            .unwrap_or(false)
+        {
+            directive.push(chars.next().unwrap());
+        }
+
+        match directive.as_str() {
+            "ifndef" => {
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+                // Collect macro name
+                let mut macro_name = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    macro_name.push(chars.next().unwrap());
+                }
+                if macro_name.is_empty() {
+                    return None;
+                }
+
+                // Skip to end of line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments before next directive
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Now check for #define MACRO (the second part of include guard pattern)
+                if chars.next() != Some('#') {
+                    return None;
+                }
+
+                // Skip whitespace after #
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+
+                // Collect directive name
+                let mut next_directive = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    next_directive.push(chars.next().unwrap());
+                }
+
+                if next_directive != "define" {
+                    return None;
+                }
+
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+
+                // Collect the defined macro name
+                let mut define_name = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    define_name.push(chars.next().unwrap());
+                }
+
+                // The #define must define the same macro as the #ifndef
+                if define_name == macro_name {
+                    return Some(macro_name);
+                }
+
+                return None;
+            }
+            "if" => {
+                // Check for !defined(MACRO) pattern
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+                // Check for !
+                if chars.next() != Some('!') {
+                    return None;
+                }
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+                // Collect "defined"
+                let mut keyword = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphabetic())
+                    .unwrap_or(false)
+                {
+                    keyword.push(chars.next().unwrap());
+                }
+                if keyword != "defined" {
+                    return None;
+                }
+                // Skip whitespace and optional (
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+                let has_paren = chars.peek() == Some(&'(');
+                if has_paren {
+                    chars.next();
+                }
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+                // Collect macro name
+                let mut macro_name = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    macro_name.push(chars.next().unwrap());
+                }
+                if !macro_name.is_empty() {
+                    return Some(macro_name);
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
     /// Include a file
     fn include_file(
         &mut self,
@@ -1662,7 +1916,28 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
-        // Check for include cycle
+        // Read the file first so we can check for include guards
+        let content = match fs::read(path) {
+            Ok(c) => c,
+            Err(e) => {
+                diag::error(
+                    hash_token.pos,
+                    &format!("cannot read '{}': {}", path.display(), e),
+                );
+                return;
+            }
+        };
+
+        // Check for include guard optimization: if file starts with #ifndef MACRO
+        // or #if !defined(MACRO) and that macro is already defined, skip the include.
+        // This allows circular includes protected by guards to work correctly.
+        if let Some(guard_macro) = Self::detect_include_guard(&content) {
+            if self.is_defined(&guard_macro) {
+                return;
+            }
+        }
+
+        // Check for include cycle (only error if no include guard protects it)
         if self.include_stack.contains(&canonical) {
             diag::error(
                 hash_token.pos,
@@ -1682,18 +1957,6 @@ impl<'a> Preprocessor<'a> {
             );
             return;
         }
-
-        // Read the file
-        let content = match fs::read(path) {
-            Ok(c) => c,
-            Err(e) => {
-                diag::error(
-                    hash_token.pos,
-                    &format!("cannot read '{}': {}", path.display(), e),
-                );
-                return;
-            }
-        };
 
         // Save current state
         let saved_file =
@@ -2055,7 +2318,8 @@ impl<'a> Preprocessor<'a> {
         pos: &Position,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
-        self.expanding.insert(mac.name.clone());
+        // Note: Don't add to expanding set yet - arguments need to be fully expanded first.
+        // The expanding set is only used during the rescan phase to prevent infinite recursion.
 
         let mut result = Vec::new();
         let mut i = 0;
@@ -2174,15 +2438,23 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Rescan for more macro expansion
-        // NOTE: Keep macro in expanding set during rescan to prevent infinite recursion
+        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
+        // Arguments were already expanded above, so this only affects the replacement list rescan
+        self.expanding.insert(mac.name.clone());
         let rescanned = self.preprocess(result, idents);
-
         self.expanding.remove(&mac.name);
 
-        let filtered: Vec<_> = rescanned
+        let mut filtered: Vec<_> = rescanned
             .into_iter()
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .collect();
+
+        // The FIRST token of a macro expansion should inherit whitespace
+        // from the macro invocation position, not the macro body.
+        // This ensures "MACRO(args)" expands with proper spacing.
+        if let Some(first) = filtered.first_mut() {
+            first.pos.whitespace = pos.whitespace;
+        }
 
         Some(filtered)
     }
@@ -2239,7 +2511,7 @@ impl<'a> Preprocessor<'a> {
             return Some(vec![]);
         }
 
-        self.expanding.insert(mac.name.clone());
+        // Note: Don't add to expanding set yet - that happens during rescan phase only.
 
         let mut result = Vec::new();
         let mut i = 0;
@@ -2274,16 +2546,23 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Rescan for more macro expansion
-        // NOTE: Keep macro in expanding set during rescan to prevent infinite recursion
+        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // (e.g., when const -> __const and __const -> const both exist)
+        self.expanding.insert(mac.name.clone());
         let rescanned = self.preprocess(result, idents);
-
         self.expanding.remove(&mac.name);
 
-        let filtered: Vec<_> = rescanned
+        let mut filtered: Vec<_> = rescanned
             .into_iter()
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .collect();
+
+        // The FIRST token of a macro expansion should inherit whitespace
+        // from the macro invocation position, not the macro body.
+        // This ensures "extern __inline" expands to "extern inline" with space.
+        if let Some(first) = filtered.first_mut() {
+            first.pos.whitespace = pos.whitespace;
+        }
 
         Some(filtered)
     }
@@ -4123,5 +4402,107 @@ PASTE(foo, bar)
         assert!(strs.contains(&"int".to_string()));
         assert!(strs.contains(&"z".to_string()));
         assert!(!strs.contains(&"_Pragma".to_string()));
+    }
+
+    // ========================================================================
+    // Include guard detection tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_include_guard_ifndef_define() {
+        // Standard include guard pattern: #ifndef X / #define X
+        let content = b"#ifndef FOO_H\n#define FOO_H\n// content\n#endif\n";
+        assert_eq!(
+            Preprocessor::detect_include_guard(content),
+            Some("FOO_H".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_include_guard_with_leading_comment() {
+        // Include guard with leading block comment
+        let content = b"/* Header file */\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n#endif\n";
+        assert_eq!(
+            Preprocessor::detect_include_guard(content),
+            Some("MY_HEADER_H".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_include_guard_with_line_comment() {
+        // Include guard with leading line comment
+        let content = b"// Header file\n#ifndef GUARD_H\n#define GUARD_H\n#endif\n";
+        assert_eq!(
+            Preprocessor::detect_include_guard(content),
+            Some("GUARD_H".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_include_guard_no_define() {
+        // Not a guard - #ifndef without matching #define
+        let content = b"#ifndef FOO_H\n#error \"Use other header\"\n#endif\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
+    #[test]
+    fn test_detect_include_guard_different_macro() {
+        // Not a guard - #define defines different macro
+        let content = b"#ifndef FOO_H\n#define BAR_H\n#endif\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
+    #[test]
+    fn test_detect_include_guard_if_not_defined() {
+        // Alternative pattern: #if !defined(X)
+        let content = b"#if !defined(MYGUARD)\n#define MYGUARD\n#endif\n";
+        assert_eq!(
+            Preprocessor::detect_include_guard(content),
+            Some("MYGUARD".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_include_guard_no_guard() {
+        // Not a guard - just regular code
+        let content = b"int x = 1;\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
+    // ========================================================================
+    // bool/true/false predefined macro tests
+    // ========================================================================
+
+    #[test]
+    fn test_bool_macro_expands_to_bool() {
+        // bool should expand to _Bool
+        let (tokens, idents) = preprocess_str("bool x;");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"_Bool".to_string()));
+        assert!(!strs.contains(&"bool".to_string()));
+    }
+
+    #[test]
+    fn test_true_macro_expands_to_1() {
+        // true should expand to 1
+        let (tokens, idents) = preprocess_str("int x = true;");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_false_macro_expands_to_0() {
+        // false should expand to 0
+        let (tokens, idents) = preprocess_str("int x = false;");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"0".to_string()));
+    }
+
+    #[test]
+    fn test_bool_true_false_are_defined() {
+        // __bool_true_false_are_defined should be defined as 1
+        let (tokens, idents) = preprocess_str("int x = __bool_true_false_are_defined;");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"1".to_string()));
     }
 }

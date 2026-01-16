@@ -194,7 +194,7 @@ fn test_chown_change_to_non_member_group() {
 
     // Get the GID of a group that the test runner doesn't belong to
     fn get_non_member_group() -> Option<u32> {
-        let user_groups: HashSet<_> = current_user_group_ids().iter().collect();
+        let user_groups: HashSet<_> = current_user_group_ids().iter().copied().collect();
         let mut non_member_group: Option<u32> = None; // Group that the current user does not belong to
 
         // Start reading the group database

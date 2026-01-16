@@ -390,12 +390,89 @@ impl VReg {
         }
     }
 
-    /// Get register name for a given size (32 = float, 64 = double)
+    /// Get 16-bit (half) register name
+    pub fn name_h(&self) -> &'static str {
+        match self {
+            VReg::V0 => "h0",
+            VReg::V1 => "h1",
+            VReg::V2 => "h2",
+            VReg::V3 => "h3",
+            VReg::V4 => "h4",
+            VReg::V5 => "h5",
+            VReg::V6 => "h6",
+            VReg::V7 => "h7",
+            VReg::V8 => "h8",
+            VReg::V9 => "h9",
+            VReg::V10 => "h10",
+            VReg::V11 => "h11",
+            VReg::V12 => "h12",
+            VReg::V13 => "h13",
+            VReg::V14 => "h14",
+            VReg::V15 => "h15",
+            VReg::V16 => "h16",
+            VReg::V17 => "h17",
+            VReg::V18 => "h18",
+            VReg::V19 => "h19",
+            VReg::V20 => "h20",
+            VReg::V21 => "h21",
+            VReg::V22 => "h22",
+            VReg::V23 => "h23",
+            VReg::V24 => "h24",
+            VReg::V25 => "h25",
+            VReg::V26 => "h26",
+            VReg::V27 => "h27",
+            VReg::V28 => "h28",
+            VReg::V29 => "h29",
+            VReg::V30 => "h30",
+            VReg::V31 => "h31",
+        }
+    }
+
+    /// Get 128-bit (quad) register name
+    pub fn name_q(&self) -> &'static str {
+        match self {
+            VReg::V0 => "q0",
+            VReg::V1 => "q1",
+            VReg::V2 => "q2",
+            VReg::V3 => "q3",
+            VReg::V4 => "q4",
+            VReg::V5 => "q5",
+            VReg::V6 => "q6",
+            VReg::V7 => "q7",
+            VReg::V8 => "q8",
+            VReg::V9 => "q9",
+            VReg::V10 => "q10",
+            VReg::V11 => "q11",
+            VReg::V12 => "q12",
+            VReg::V13 => "q13",
+            VReg::V14 => "q14",
+            VReg::V15 => "q15",
+            VReg::V16 => "q16",
+            VReg::V17 => "q17",
+            VReg::V18 => "q18",
+            VReg::V19 => "q19",
+            VReg::V20 => "q20",
+            VReg::V21 => "q21",
+            VReg::V22 => "q22",
+            VReg::V23 => "q23",
+            VReg::V24 => "q24",
+            VReg::V25 => "q25",
+            VReg::V26 => "q26",
+            VReg::V27 => "q27",
+            VReg::V28 => "q28",
+            VReg::V29 => "q29",
+            VReg::V30 => "q30",
+            VReg::V31 => "q31",
+        }
+    }
+
+    /// Get register name for a given size (16 = half, 32 = float, 64 = double, 128 = quad)
     pub fn name_for_size(&self, bits: u32) -> &'static str {
-        if bits <= 32 {
-            self.name_s()
-        } else {
-            self.name_d()
+        match bits {
+            0..=16 => self.name_h(),
+            17..=32 => self.name_s(),
+            33..=64 => self.name_d(),
+            _ => self.name_q(),
         }
     }
 

@@ -1285,6 +1285,7 @@ impl EmitAsm for Aarch64Inst {
             // Floating-Point
             Aarch64Inst::FmovReg { size, src, dst } => {
                 let name = match size {
+                    FpSize::Half => (src.name_h(), dst.name_h()),
                     FpSize::Single => (src.name_s(), dst.name_s()),
                     FpSize::Double => (src.name_d(), dst.name_d()),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1294,11 +1295,13 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::FmovFromGp { size, src, dst } => {
                 let fp_name = match size {
+                    FpSize::Half => dst.name_h(),
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let gp_name = match size {
+                    FpSize::Half => src.name32(), // half is moved via 32-bit GP
                     FpSize::Single => src.name32(),
                     FpSize::Double => src.name64(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1308,11 +1311,13 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::FmovToGp { size, src, dst } => {
                 let fp_name = match size {
+                    FpSize::Half => src.name_h(),
                     FpSize::Single => src.name_s(),
                     FpSize::Double => src.name_d(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
                 };
                 let gp_name = match size {
+                    FpSize::Half => dst.name32(), // half is moved via 32-bit GP
                     FpSize::Single => dst.name32(),
                     FpSize::Double => dst.name64(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1322,6 +1327,7 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::LdrFp { size, addr, dst } => {
                 let name = match size {
+                    FpSize::Half => dst.name_h(),
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1331,6 +1337,7 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::StrFp { size, src, addr } => {
                 let name = match size {
+                    FpSize::Half => src.name_h(),
                     FpSize::Single => src.name_s(),
                     FpSize::Double => src.name_d(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1345,6 +1352,7 @@ impl EmitAsm for Aarch64Inst {
                 addr,
             } => {
                 let (name1, name2) = match size {
+                    FpSize::Half => (src1.name_h(), src2.name_h()),
                     FpSize::Single => (src1.name_s(), src2.name_s()),
                     FpSize::Double => (src1.name_d(), src2.name_d()),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1359,6 +1367,7 @@ impl EmitAsm for Aarch64Inst {
                 dst2,
             } => {
                 let (name1, name2) = match size {
+                    FpSize::Half => (dst1.name_h(), dst2.name_h()),
                     FpSize::Single => (dst1.name_s(), dst2.name_s()),
                     FpSize::Double => (dst1.name_d(), dst2.name_d()),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1374,6 +1383,7 @@ impl EmitAsm for Aarch64Inst {
             } => {
                 let sym_name = sym.format_for_target(target);
                 let fp_name = match size {
+                    FpSize::Half => dst.name_h(),
                     FpSize::Single => dst.name_s(),
                     FpSize::Double => dst.name_d(),
                     FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
@@ -1654,6 +1664,7 @@ impl EmitAsm for Aarch64Inst {
 /// Helper to convert FpSize to bits
 fn size_bits(size: FpSize) -> u32 {
     match size {
+        FpSize::Half => 16,
         FpSize::Single => 32,
         FpSize::Double => 64,
         FpSize::Extended => 80, // x87 not used on AArch64, but provide size

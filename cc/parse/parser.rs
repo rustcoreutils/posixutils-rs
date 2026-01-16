@@ -1524,6 +1524,9 @@ impl<'a> Parser<'a> {
                 | "long"
                 | "float"
                 | "double"
+                | "_Float16"
+                | "_Float32"
+                | "_Float64"
                 | "signed"
                 | "unsigned"
                 | "const"
@@ -1723,6 +1726,23 @@ impl<'a> Parser<'a> {
                     } else {
                         base_kind = Some(TypeKind::Double);
                     }
+                    parsed_something = true;
+                }
+                "_Float16" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Float16);
+                    parsed_something = true;
+                }
+                "_Float32" => {
+                    // _Float32 is an alias for float (TS 18661-3 / C23)
+                    self.advance();
+                    base_kind = Some(TypeKind::Float);
+                    parsed_something = true;
+                }
+                "_Float64" => {
+                    // _Float64 is an alias for double (TS 18661-3 / C23)
+                    self.advance();
+                    base_kind = Some(TypeKind::Double);
                     parsed_something = true;
                 }
                 "_Bool" => {
@@ -3267,20 +3287,43 @@ impl<'a> Parser<'a> {
             || (s_lower.contains('e') && !is_hex)
             || (s_lower.contains('p') && is_hex);
 
+        // Detect C23 _Float* suffixes (f16, F16, f32, F32, f64, F64)
+        let is_float16_suffix =
+            s_lower.ends_with("f16") || s.ends_with("F16") || s.ends_with("f16");
+        let is_float32_suffix = s_lower.ends_with("f32") || s.ends_with("F32");
+        let is_float64_suffix = s_lower.ends_with("f64") || s.ends_with("F64");
+
         // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
         let num_str = if is_hex {
             // For hex, only strip u/l suffixes (not f which is a hex digit)
             s_lower.trim_end_matches(['u', 'l'])
+        } else if is_float16_suffix {
+            s_lower.trim_end_matches("f16")
+        } else if is_float32_suffix {
+            s_lower.trim_end_matches("f32")
+        } else if is_float64_suffix {
+            s_lower.trim_end_matches("f64")
         } else {
             // For decimal/octal, strip u/l/f suffixes
             s_lower.trim_end_matches(['u', 'l', 'f'])
         };
 
-        if is_float {
-            // Float - type is double by default, float if 'f' suffix, long double if 'l' suffix
-            // C99: floating-suffix is f, F, l, or L
-            let is_float_suffix = s_lower.ends_with('f');
-            let is_longdouble_suffix = s_lower.ends_with('l');
+        if is_float || is_float16_suffix || is_float32_suffix || is_float64_suffix {
+            // Float - type depends on suffix:
+            // - no suffix = double
+            // - f/F = float
+            // - l/L = long double
+            // - f16/F16 = _Float16
+            // - f32/F32 = float (alias)
+            // - f64/F64 = double (alias)
+            let is_float_suffix = !is_float16_suffix
+                && !is_float32_suffix
+                && !is_float64_suffix
+                && s_lower.ends_with('f');
+            let is_longdouble_suffix = !is_float16_suffix
+                && !is_float32_suffix
+                && !is_float64_suffix
+                && s_lower.ends_with('l');
             let value: f64 = if is_hex {
                 // Hex float parsing: 0x[hex-digits].[hex-digits]p[±exponent]
                 // Value = significand × 2^exponent
@@ -3292,7 +3335,13 @@ impl<'a> Parser<'a> {
                     .parse()
                     .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?
             };
-            let typ = if is_float_suffix {
+            let typ = if is_float16_suffix {
+                self.types.float16_id
+            } else if is_float32_suffix {
+                self.types.float_id // f32 is alias for float
+            } else if is_float64_suffix {
+                self.types.double_id // f64 is alias for double
+            } else if is_float_suffix {
                 self.types.float_id
             } else if is_longdouble_suffix {
                 self.types.longdouble_id
@@ -3933,6 +3982,9 @@ impl Parser<'_> {
                     | "long"
                     | "float"
                     | "double"
+                    | "_Float16"
+                    | "_Float32"
+                    | "_Float64"
                     | "_Complex"
                     | "_Atomic"
                     | "signed"
@@ -4348,6 +4400,20 @@ impl Parser<'_> {
                     } else {
                         base_kind = Some(TypeKind::Double);
                     }
+                }
+                "_Float16" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Float16);
+                }
+                "_Float32" => {
+                    // _Float32 is an alias for float (TS 18661-3 / C23)
+                    self.advance();
+                    base_kind = Some(TypeKind::Float);
+                }
+                "_Float64" => {
+                    // _Float64 is an alias for double (TS 18661-3 / C23)
+                    self.advance();
+                    base_kind = Some(TypeKind::Double);
                 }
                 "_Bool" => {
                     self.advance();
@@ -10628,5 +10694,107 @@ mod tests {
             parse_tu("void foo(void) { __atomic_signal_fence(__ATOMIC_ACQUIRE); }").unwrap();
         assert_eq!(tu.items.len(), 1);
         assert!(matches!(&tu.items[0], ExternalDecl::FunctionDef(_)));
+    }
+
+    // ========================================================================
+    // C23 _Float* type tests (TS 18661-3)
+    // ========================================================================
+
+    #[test]
+    fn test_float16_type_decl() {
+        let (tu, types, _, _) = parse_tu("_Float16 x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Float16);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_float32_type_decl() {
+        // _Float32 is alias for float
+        let (tu, types, _, _) = parse_tu("_Float32 x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Float);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    #[test]
+    fn test_float64_type_decl() {
+        // _Float64 is alias for double
+        let (tu, types, _, _) = parse_tu("_Float64 x;").unwrap();
+        assert_eq!(tu.items.len(), 1);
+        match &tu.items[0] {
+            ExternalDecl::Declaration(decl) => {
+                assert_eq!(decl.declarators.len(), 1);
+                assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Double);
+            }
+            _ => panic!("Expected Declaration"),
+        }
+    }
+
+    // ========================================================================
+    // C23 _Float* literal suffix tests (f16, f32, f64)
+    // ========================================================================
+
+    #[test]
+    fn test_float16_literal_suffix() {
+        let (expr, types, _, _) = parse_expr("1.0f16").unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert!((v - 1.0).abs() < 0.001),
+            _ => panic!("Expected FloatLit"),
+        }
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
+    }
+
+    #[test]
+    fn test_float16_literal_suffix_upper() {
+        let (expr, types, _, _) = parse_expr("3.14F16").unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert!((v - 3.14).abs() < 0.001),
+            _ => panic!("Expected FloatLit"),
+        }
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
+    }
+
+    #[test]
+    fn test_float32_literal_suffix() {
+        // f32 is alias for float
+        let (expr, types, _, _) = parse_expr("2.5f32").unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert!((v - 2.5).abs() < 0.001),
+            _ => panic!("Expected FloatLit"),
+        }
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float);
+    }
+
+    #[test]
+    fn test_float64_literal_suffix() {
+        // f64 is alias for double
+        let (expr, types, _, _) = parse_expr("2.5f64").unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert!((v - 2.5).abs() < 0.001),
+            _ => panic!("Expected FloatLit"),
+        }
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Double);
+    }
+
+    #[test]
+    fn test_int_with_float16_suffix() {
+        // Integer with f16 suffix becomes float literal
+        let (expr, types, _, _) = parse_expr("42f16").unwrap();
+        match expr.kind {
+            ExprKind::FloatLit(v) => assert!((v - 42.0).abs() < 0.001),
+            _ => panic!("Expected FloatLit"),
+        }
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
     }
 }

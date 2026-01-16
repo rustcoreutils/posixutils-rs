@@ -3176,6 +3176,72 @@ impl<'a> Linearizer<'a> {
         let src_is_longdouble = src_kind == TypeKind::LongDouble;
         let dst_is_longdouble = dst_kind == TypeKind::LongDouble;
 
+        // Check for Float16 conversions that need rtlib
+        let src_is_float16 = src_kind == TypeKind::Float16;
+        let dst_is_float16 = dst_kind == TypeKind::Float16;
+
+        if src_is_float16 || dst_is_float16 {
+            let rtlib = RtlibNames::new(self.target);
+
+            let (from_suffix, to_suffix) = if src_is_float16 && dst_is_float {
+                // Float16 -> float/double
+                let to = match dst_kind {
+                    TypeKind::Float => "sf",
+                    TypeKind::Double => "df",
+                    _ => "",
+                };
+                ("hf", to)
+            } else if dst_is_float16 && src_is_float {
+                // float/double -> Float16
+                let from = match src_kind {
+                    TypeKind::Float => "sf",
+                    TypeKind::Double => "df",
+                    _ => "",
+                };
+                (from, "hf")
+            } else if src_is_float16 && !dst_is_float {
+                // Float16 -> integer
+                let dst_size = self.types.size_bits(cast_type);
+                let is_unsigned = self.types.is_unsigned(cast_type);
+                let to = if is_unsigned {
+                    if dst_size <= 32 {
+                        "usi"
+                    } else {
+                        "udi"
+                    }
+                } else if dst_size <= 32 {
+                    "si"
+                } else {
+                    "di"
+                };
+                ("hf", to)
+            } else if dst_is_float16 && !src_is_float {
+                // Integer -> Float16
+                let src_size = self.types.size_bits(src_type);
+                let is_unsigned = self.types.is_unsigned(src_type);
+                let from = if is_unsigned {
+                    if src_size <= 32 {
+                        "usi"
+                    } else {
+                        "udi"
+                    }
+                } else if src_size <= 32 {
+                    "si"
+                } else {
+                    "di"
+                };
+                (from, "hf")
+            } else {
+                ("", "")
+            };
+
+            if !from_suffix.is_empty() && !to_suffix.is_empty() {
+                if let Some(func_name) = rtlib.float16_convert(from_suffix, to_suffix) {
+                    return self.emit_longdouble_convert_call(func_name, src, src_type, cast_type);
+                }
+            }
+        }
+
         if src_is_longdouble || dst_is_longdouble {
             let rtlib = RtlibNames::new(self.target);
 

@@ -79,6 +79,8 @@ impl fmt::Display for OperandSize {
 /// Floating-point size specifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FpSize {
+    /// 16-bit half precision (_Float16, IEEE 754 binary16)
+    Half,
     /// 32-bit single precision (float)
     Single,
     /// 64-bit double precision (double)
@@ -92,7 +94,8 @@ impl FpSize {
     /// Create from bit count
     pub fn from_bits(bits: u32) -> Self {
         match bits {
-            0..=32 => FpSize::Single,
+            0..=16 => FpSize::Half,
+            17..=32 => FpSize::Single,
             33..=64 => FpSize::Double,
             _ => FpSize::Extended, // 80-bit x87 (stored as 128)
         }
@@ -106,6 +109,7 @@ impl FpSize {
     /// and quad precision on Linux.
     pub fn from_type_kind(kind: TypeKind) -> Self {
         match kind {
+            TypeKind::Float16 => FpSize::Half,
             TypeKind::Float => FpSize::Single,
             TypeKind::Double => FpSize::Double,
             TypeKind::LongDouble => FpSize::Extended,
@@ -121,9 +125,11 @@ impl FpSize {
     }
 
     /// x86-64 SSE instruction suffix (ss for single, sd for double)
+    /// Note: Half uses runtime library calls, not direct SSE instructions.
     /// Note: Extended uses x87 instructions, not SSE - use x87_suffix() instead
     pub fn x86_suffix(&self) -> &'static str {
         match self {
+            FpSize::Half => "ss", // Half uses single-precision for storage/move
             FpSize::Single => "ss",
             FpSize::Double => "sd",
             FpSize::Extended => "t", // x87 uses 't' suffix (fldt, fstpt)
@@ -133,6 +139,7 @@ impl FpSize {
     /// x86-64 packed suffix (ps for single, pd for double)
     pub fn x86_packed_suffix(&self) -> &'static str {
         match self {
+            FpSize::Half => "ps", // Use single-precision packed
             FpSize::Single => "ps",
             FpSize::Double => "pd",
             FpSize::Extended => "pd", // x87 doesn't have packed ops, fallback
@@ -143,6 +150,7 @@ impl FpSize {
 impl fmt::Display for FpSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FpSize::Half => write!(f, "f16"),
             FpSize::Single => write!(f, "f32"),
             FpSize::Double => write!(f, "f64"),
             FpSize::Extended => write!(f, "f80"),
@@ -260,6 +268,7 @@ pub enum CallTarget<R> {
 pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) -> (FpSize, i32) {
     let base = types.complex_base(complex_typ);
     match types.kind(base) {
+        TypeKind::Float16 => (FpSize::Half, 2),
         TypeKind::Float => (FpSize::Single, 4),
         TypeKind::Double => (FpSize::Double, 8),
         TypeKind::LongDouble => {
@@ -828,11 +837,13 @@ mod tests {
 
     #[test]
     fn test_fp_size() {
+        assert_eq!(FpSize::from_bits(16), FpSize::Half);
         assert_eq!(FpSize::from_bits(32), FpSize::Single);
         assert_eq!(FpSize::from_bits(64), FpSize::Double);
         assert_eq!(FpSize::from_bits(80), FpSize::Extended);
-        assert_eq!(FpSize::from_bits(128), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(128), FpSize::Extended); // 128-bit maps to Extended
 
+        assert_eq!(FpSize::Half.x86_suffix(), "ss");
         assert_eq!(FpSize::Single.x86_suffix(), "ss");
         assert_eq!(FpSize::Double.x86_suffix(), "sd");
         assert_eq!(FpSize::Extended.x86_suffix(), "t");

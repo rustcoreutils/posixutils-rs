@@ -15,7 +15,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer,
     Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId,
 };
-use crate::abi::{get_abi_for_conv, CallingConv};
+use crate::abi::{get_abi_for_conv, ArgClass, CallingConv, RegClass};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
@@ -5801,6 +5801,15 @@ impl<'a> Linearizer<'a> {
             // Fall through to native FP for macOS aarch64 (long double == double)
         }
 
+        // Check for Float16 negation that needs soft-float on x86-64
+        if op == UnaryOp::Neg && self.types.kind(typ) == TypeKind::Float16 {
+            let rtlib = RtlibNames::new(self.target);
+            if rtlib.float16_needs_softfloat() {
+                return self.emit_float16_neg_via_float(src);
+            }
+            // Fall through to native FP16 for AArch64
+        }
+
         let result = self.alloc_pseudo();
 
         let opcode = match op {
@@ -5905,6 +5914,33 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let is_float = self.types.is_float(operand_typ);
         let is_unsigned = self.types.is_unsigned(operand_typ);
+
+        // Check if this is a Float16 operation that needs soft-float on x86-64
+        if self.types.kind(operand_typ) == TypeKind::Float16 {
+            let rtlib = RtlibNames::new(self.target);
+            if rtlib.float16_needs_softfloat() {
+                // Arithmetic: promote-operate-truncate
+                if matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                ) {
+                    return self.emit_float16_arith_via_float(op, left, right);
+                }
+                // Comparisons: promote-compare (no truncate needed)
+                if matches!(
+                    op,
+                    BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::Eq
+                        | BinaryOp::Ne
+                ) {
+                    return self.emit_float16_cmp_via_float(op, left, right);
+                }
+            }
+            // Fall through to native FP16 for AArch64
+        }
 
         // Check if this is a long double operation that needs rtlib
         if self.types.kind(operand_typ) == TypeKind::LongDouble {
@@ -6432,6 +6468,219 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    // ========================================================================
+    // Float16 soft-float helpers (for x86-64)
+    // ========================================================================
+
+    /// Emit Float16 arithmetic using promote-operate-truncate pattern.
+    ///
+    /// For x86-64 without native FP16 instructions:
+    /// 1. Extend both operands from Float16 to float using __extendhfsf2
+    /// 2. Perform native SSE arithmetic operation
+    /// 3. Truncate result back to Float16 using __truncsfhf2
+    fn emit_float16_arith_via_float(
+        &mut self,
+        op: BinaryOp,
+        left: PseudoId,
+        right: PseudoId,
+    ) -> PseudoId {
+        let float16_typ = self.types.float16_id;
+        let float_typ = self.types.float_id;
+        let float_size = self.types.size_bits(float_typ);
+
+        // 1. Extend left operand: Float16 -> float
+        let left_ext = self.emit_float16_extend_call(left, float16_typ, float_typ);
+
+        // 2. Extend right operand: Float16 -> float
+        let right_ext = self.emit_float16_extend_call(right, float16_typ, float_typ);
+
+        // 3. Perform native float operation
+        let result_float = self.alloc_pseudo();
+        let pseudo = Pseudo::reg(result_float, result_float.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        let opcode = match op {
+            BinaryOp::Add => Opcode::FAdd,
+            BinaryOp::Sub => Opcode::FSub,
+            BinaryOp::Mul => Opcode::FMul,
+            BinaryOp::Div => Opcode::FDiv,
+            _ => unreachable!("emit_float16_arith_via_float called with non-arithmetic op"),
+        };
+        self.emit(Instruction::binop(
+            opcode,
+            result_float,
+            left_ext,
+            right_ext,
+            float_typ,
+            float_size,
+        ));
+
+        // 4. Truncate result: float -> Float16
+        self.emit_float16_truncate_call(result_float, float_typ, float16_typ)
+    }
+
+    /// Emit Float16 comparison using promote-compare pattern.
+    ///
+    /// For x86-64 without native FP16 instructions:
+    /// 1. Extend both operands from Float16 to float using __extendhfsf2
+    /// 2. Perform native SSE comparison (no truncation needed - result is int)
+    fn emit_float16_cmp_via_float(
+        &mut self,
+        op: BinaryOp,
+        left: PseudoId,
+        right: PseudoId,
+    ) -> PseudoId {
+        let float16_typ = self.types.float16_id;
+        let float_typ = self.types.float_id;
+        let float_size = self.types.size_bits(float_typ);
+
+        // 1. Extend left operand: Float16 -> float
+        let left_ext = self.emit_float16_extend_call(left, float16_typ, float_typ);
+
+        // 2. Extend right operand: Float16 -> float
+        let right_ext = self.emit_float16_extend_call(right, float16_typ, float_typ);
+
+        // 3. Perform native float comparison
+        let result = self.alloc_pseudo();
+        let pseudo = Pseudo::reg(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        let opcode = match op {
+            BinaryOp::Lt => Opcode::FCmpOLt,
+            BinaryOp::Le => Opcode::FCmpOLe,
+            BinaryOp::Gt => Opcode::FCmpOGt,
+            BinaryOp::Ge => Opcode::FCmpOGe,
+            BinaryOp::Eq => Opcode::FCmpOEq,
+            BinaryOp::Ne => Opcode::FCmpONe,
+            _ => unreachable!("emit_float16_cmp_via_float called with non-comparison op"),
+        };
+        self.emit(Instruction::binop(
+            opcode, result, left_ext, right_ext, float_typ, float_size,
+        ));
+
+        result
+    }
+
+    /// Emit Float16 negation using promote-negate-truncate pattern.
+    ///
+    /// For x86-64 without native FP16 instructions:
+    /// 1. Extend operand from Float16 to float using __extendhfsf2
+    /// 2. Perform native SSE negation
+    /// 3. Truncate result back to Float16 using __truncsfhf2
+    fn emit_float16_neg_via_float(&mut self, src: PseudoId) -> PseudoId {
+        let float16_typ = self.types.float16_id;
+        let float_typ = self.types.float_id;
+        let float_size = self.types.size_bits(float_typ);
+
+        // 1. Extend operand: Float16 -> float
+        let src_ext = self.emit_float16_extend_call(src, float16_typ, float_typ);
+
+        // 2. Perform native float negation
+        let result_float = self.alloc_pseudo();
+        let pseudo = Pseudo::reg(result_float, result_float.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        self.emit(Instruction::unop(
+            Opcode::FNeg,
+            result_float,
+            src_ext,
+            float_typ,
+            float_size,
+        ));
+
+        // 3. Truncate result: float -> Float16
+        self.emit_float16_truncate_call(result_float, float_typ, float16_typ)
+    }
+
+    /// Emit call to __extendhfsf2 to extend Float16 to float.
+    ///
+    /// On x86-64, Float16 values are passed to rtlib functions as integers (in RDI),
+    /// not as SSE values. This function manually sets up the correct ABI classification.
+    fn emit_float16_extend_call(
+        &mut self,
+        src: PseudoId,
+        _src_type: TypeId,
+        dst_type: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let dst_size = self.types.size_bits(dst_type);
+
+        // Use u16 type for the argument to get INTEGER ABI classification
+        let arg_type_for_abi = self.types.ushort_id;
+
+        let arg_vals = vec![src];
+        let arg_types = vec![arg_type_for_abi];
+
+        // Manually set ABI: argument is INTEGER (16-bit), return is SSE (float)
+        let param_classes = vec![ArgClass::Extend {
+            signed: false,
+            size_bits: 16,
+        }];
+        let ret_class = ArgClass::Direct {
+            classes: vec![RegClass::Sse],
+            size_bits: 32,
+        };
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            "__extendhfsf2",
+            arg_vals,
+            arg_types,
+            dst_type,
+            dst_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
+    }
+
+    /// Emit call to __truncsfhf2 to truncate float to Float16.
+    ///
+    /// On x86-64, Float16 values are returned from rtlib functions as integers (in RAX),
+    /// not as SSE values. This function manually sets up the correct ABI classification.
+    fn emit_float16_truncate_call(
+        &mut self,
+        src: PseudoId,
+        src_type: TypeId,
+        dst_type: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let dst_size = self.types.size_bits(dst_type);
+
+        let arg_vals = vec![src];
+        let arg_types = vec![src_type];
+
+        // Manually set ABI: argument is SSE (float), return is INTEGER (16-bit)
+        // The return comes in RAX, but the result is treated as Float16 for subsequent ops
+        let param_classes = vec![ArgClass::Direct {
+            classes: vec![RegClass::Sse],
+            size_bits: 32,
+        }];
+        let ret_class = ArgClass::Extend {
+            signed: false,
+            size_bits: 16,
+        };
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            "__truncsfhf2",
+            arg_vals,
+            arg_types,
+            dst_type, // Keep Float16 type for proper subsequent handling
+            dst_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
+    }
+
     /// Emit a call to a long double conversion rtlib function.
     ///
     /// These functions convert between long double and other types:
@@ -6801,11 +7050,41 @@ impl<'a> Linearizer<'a> {
                 } else {
                     target_typ
                 };
-                let arith_size = self.types.size_bits(arith_type);
-                self.emit(Instruction::binop(
-                    opcode, result, lhs, rhs, arith_type, arith_size,
-                ));
-                result
+
+                // Check for Float16 soft-float on x86-64
+                let needs_float16_softfloat = self.types.kind(target_typ) == TypeKind::Float16
+                    && RtlibNames::new(self.target).float16_needs_softfloat();
+
+                if needs_float16_softfloat {
+                    // Use promote-operate-truncate pattern for Float16
+                    match op {
+                        AssignOp::AddAssign => {
+                            self.emit_float16_arith_via_float(BinaryOp::Add, lhs, rhs)
+                        }
+                        AssignOp::SubAssign => {
+                            self.emit_float16_arith_via_float(BinaryOp::Sub, lhs, rhs)
+                        }
+                        AssignOp::MulAssign => {
+                            self.emit_float16_arith_via_float(BinaryOp::Mul, lhs, rhs)
+                        }
+                        AssignOp::DivAssign => {
+                            self.emit_float16_arith_via_float(BinaryOp::Div, lhs, rhs)
+                        }
+                        _ => {
+                            let arith_size = self.types.size_bits(arith_type);
+                            self.emit(Instruction::binop(
+                                opcode, result, lhs, rhs, arith_type, arith_size,
+                            ));
+                            result
+                        }
+                    }
+                } else {
+                    let arith_size = self.types.size_bits(arith_type);
+                    self.emit(Instruction::binop(
+                        opcode, result, lhs, rhs, arith_type, arith_size,
+                    ));
+                    result
+                }
             }
         };
 

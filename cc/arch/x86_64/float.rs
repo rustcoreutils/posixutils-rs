@@ -1084,7 +1084,7 @@ impl X86_64CodeGen {
 
 /// Convert f64 to IEEE 754 half-precision (binary16) bits.
 /// This handles the conversion from 64-bit double to 16-bit half precision.
-fn f64_to_f16_bits(val: f64) -> u16 {
+pub fn f64_to_f16_bits(val: f64) -> u16 {
     let bits = val.to_bits();
     let sign = ((bits >> 63) & 1) as u16;
     let exp = ((bits >> 52) & 0x7FF) as i32;

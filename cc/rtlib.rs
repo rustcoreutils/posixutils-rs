@@ -85,6 +85,14 @@ impl<'a> RtlibNames<'a> {
             ("hf", "udi") => Some("__fixunshfdi"),
             ("udi", "hf") => Some("__floatundihf"),
 
+            // half <-> x87 extended precision (80-bit, x86_64)
+            ("hf", "xf") => Some("__extendhfxf2"),
+            ("xf", "hf") => Some("__truncxfhf2"),
+
+            // half <-> quad precision (128-bit, aarch64)
+            ("hf", "tf") => Some("__extendhftf2"),
+            ("tf", "hf") => Some("__trunctfhf2"),
+
             _ => None,
         }
     }
@@ -491,7 +499,15 @@ mod tests {
         assert_eq!(rtlib.float16_convert("hf", "udi"), Some("__fixunshfdi"));
         assert_eq!(rtlib.float16_convert("udi", "hf"), Some("__floatundihf"));
 
+        // half <-> x87 extended precision (x86_64)
+        assert_eq!(rtlib.float16_convert("hf", "xf"), Some("__extendhfxf2"));
+        assert_eq!(rtlib.float16_convert("xf", "hf"), Some("__truncxfhf2"));
+
+        // half <-> quad precision (aarch64)
+        assert_eq!(rtlib.float16_convert("hf", "tf"), Some("__extendhftf2"));
+        assert_eq!(rtlib.float16_convert("tf", "hf"), Some("__trunctfhf2"));
+
         // Invalid conversion
-        assert_eq!(rtlib.float16_convert("hf", "xf"), None);
+        assert_eq!(rtlib.float16_convert("hf", "invalid"), None);
     }
 }

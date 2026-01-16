@@ -2395,6 +2395,13 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.float_id
             }
+        } else if left_kind == TypeKind::Float16 || right_kind == TypeKind::Float16 {
+            // C23 _Float16: stays as _Float16 for arithmetic
+            if is_complex {
+                self.types.complex_float16_id
+            } else {
+                self.types.float16_id
+            }
         } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
             // If either is unsigned long long, result is unsigned long long
             if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
@@ -3317,10 +3324,9 @@ impl<'a> Parser<'a> {
             || (s_lower.contains('p') && is_hex);
 
         // Detect C23 _Float* suffixes (f16, F16, f32, F32, f64, F64)
-        let is_float16_suffix =
-            s_lower.ends_with("f16") || s.ends_with("F16") || s.ends_with("f16");
-        let is_float32_suffix = s_lower.ends_with("f32") || s.ends_with("F32");
-        let is_float64_suffix = s_lower.ends_with("f64") || s.ends_with("F64");
+        let is_float16_suffix = s_lower.ends_with("f16");
+        let is_float32_suffix = s_lower.ends_with("f32");
+        let is_float64_suffix = s_lower.ends_with("f64");
 
         // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
         let num_str = if is_hex {

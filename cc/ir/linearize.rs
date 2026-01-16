@@ -291,7 +291,14 @@ impl<'a> Linearizer<'a> {
             if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
                 return self.types.double_id;
             }
-            // Both are float or one is float and one is integer
+            if left_kind == TypeKind::Float || right_kind == TypeKind::Float {
+                return self.types.float_id;
+            }
+            // Both are Float16 (C23: _Float16 stays as _Float16)
+            if left_kind == TypeKind::Float16 || right_kind == TypeKind::Float16 {
+                return self.types.float16_id;
+            }
+            // Fallback to float for any remaining float cases
             return self.types.float_id;
         }
 
@@ -3180,22 +3187,31 @@ impl<'a> Linearizer<'a> {
         let src_is_float16 = src_kind == TypeKind::Float16;
         let dst_is_float16 = dst_kind == TypeKind::Float16;
 
+        // Get long double suffix based on target architecture
+        let ld_suffix = if self.target.arch == crate::target::Arch::X86_64 {
+            "xf"
+        } else {
+            "tf"
+        };
+
         if src_is_float16 || dst_is_float16 {
             let rtlib = RtlibNames::new(self.target);
 
             let (from_suffix, to_suffix) = if src_is_float16 && dst_is_float {
-                // Float16 -> float/double
+                // Float16 -> float/double/long double
                 let to = match dst_kind {
                     TypeKind::Float => "sf",
                     TypeKind::Double => "df",
+                    TypeKind::LongDouble => ld_suffix,
                     _ => "",
                 };
                 ("hf", to)
             } else if dst_is_float16 && src_is_float {
-                // float/double -> Float16
+                // float/double/long double -> Float16
                 let from = match src_kind {
                     TypeKind::Float => "sf",
                     TypeKind::Double => "df",
+                    TypeKind::LongDouble => ld_suffix,
                     _ => "",
                 };
                 (from, "hf")
@@ -3244,14 +3260,6 @@ impl<'a> Linearizer<'a> {
 
         if src_is_longdouble || dst_is_longdouble {
             let rtlib = RtlibNames::new(self.target);
-
-            // Determine conversion suffixes based on types
-            // sf = float, df = double, xf/tf = long double, si = int32, di = int64
-            let ld_suffix = if self.target.arch == crate::target::Arch::X86_64 {
-                "xf"
-            } else {
-                "tf"
-            };
 
             let (from_suffix, to_suffix) = if src_is_longdouble && dst_is_float {
                 // Long double -> float/double

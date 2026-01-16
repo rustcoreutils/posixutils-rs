@@ -206,7 +206,9 @@ impl Aarch64CodeGen {
                 // Load FP constant using integer register
                 // Use the size from the FImm for correct constant representation
                 let (scratch0, _, _) = Reg::scratch_regs();
-                let bits = if imm_size <= 32 {
+                let bits = if imm_size == 16 {
+                    super::f64_to_f16_bits(f) as i64
+                } else if imm_size == 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64

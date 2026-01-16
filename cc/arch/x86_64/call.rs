@@ -309,8 +309,10 @@ impl X86_64CodeGen {
                 matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
             };
 
+            // Get actual arg size without clamping - emit_move handles sub-32-bit properly
+            // This is needed for Float16 (16-bit) to get correct zero-extension
             let arg_size = if let Some(typ) = arg_type {
-                types.size_bits(typ).max(32)
+                types.size_bits(typ)
             } else {
                 64
             };

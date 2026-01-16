@@ -1469,12 +1469,23 @@ impl X86_64CodeGen {
             }
             Loc::Xmm(x) => {
                 // Move from XMM to general-purpose register
+                // For Float16 (16-bit), XMM may have garbage in bits 16-31 from movss loads.
+                // We need to: 1) use movd (32-bit), 2) zero-extend from 16 to 32 if needed.
                 // LIR: XMM to GP move
                 self.push_lir(X86Inst::MovXmmGp {
-                    size: OperandSize::B64,
+                    size: OperandSize::B32, // Use movd instead of movq
                     src: x,
                     dst,
                 });
+                // For sub-32-bit values (e.g., Float16), zero-extend to clear garbage
+                if actual_size < 32 {
+                    self.push_lir(X86Inst::Movzx {
+                        src_size: OperandSize::from_bits(actual_size),
+                        dst_size: OperandSize::B32,
+                        src: GpOperand::Reg(dst),
+                        dst,
+                    });
+                }
             }
             Loc::FImm(v, fp_size) => {
                 // Float immediate to GP register - used for Float16 rtlib calls

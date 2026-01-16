@@ -202,6 +202,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         typ: &crate::types::TypeId,
         init: &Initializer,
         is_thread_local: bool,
+        explicit_align: Option<u32>,
         types: &TypeTable,
     ) {
         let size = types.size_bits(*typ) / 8;
@@ -210,8 +211,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // Check storage class - skip .globl for static
         let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
 
-        // Get alignment from type info - use natural alignment per ABI
-        let mut align = types.alignment(*typ) as u32;
+        // Get alignment: explicit _Alignas takes precedence over natural alignment
+        let mut align = explicit_align.unwrap_or_else(|| types.alignment(*typ) as u32);
         // Use 16-byte alignment for arrays >= 16 bytes (matches clang behavior for optimization)
         if matches!(types.get(*typ).kind, crate::types::TypeKind::Array) && size >= 16 {
             align = align.max(16);

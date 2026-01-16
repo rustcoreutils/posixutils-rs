@@ -916,6 +916,8 @@ pub struct InitDeclarator {
     /// Empty for fixed-size arrays or non-array types.
     /// For int arr[n][m], contains [n_expr, m_expr] (outer to inner order).
     pub vla_sizes: Vec<Expr>,
+    /// Explicit alignment from _Alignas specifier (None = use natural alignment)
+    pub explicit_align: Option<u32>,
 }
 
 #[cfg(test)]
@@ -928,6 +930,7 @@ impl Declaration {
                 typ,
                 init,
                 vla_sizes: vec![],
+                explicit_align: None,
             }],
         }
     }

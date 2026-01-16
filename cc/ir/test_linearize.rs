@@ -1741,6 +1741,7 @@ fn test_linearize_for() {
                     typ: int_type,
                     init: Some(Expr::int(0, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             })),
             cond: Some(Expr::binary(
@@ -2016,6 +2017,7 @@ fn test_local_var_emits_load_store() {
                     typ: int_type,
                     init: Some(Expr::int(1, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
@@ -2072,6 +2074,7 @@ fn test_ssa_converts_local_to_phi() {
                     typ: int_type,
                     init: Some(Expr::int(1, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             // if (cond) x = 2;
@@ -2134,6 +2137,7 @@ fn test_ssa_loop_variable() {
                     typ: int_type,
                     init: Some(Expr::int(0, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             // while (i < 10) { i = i + 1; }
@@ -2610,6 +2614,7 @@ fn test_string_literal_char_array_init() {
                         test_pos(),
                     )),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
@@ -2659,6 +2664,7 @@ fn test_string_literal_char_pointer_init() {
                         test_pos(),
                     )),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
@@ -2736,6 +2742,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 storage_unit_size: None,
+                explicit_align: None,
             },
             StructMember {
                 name: y_id,
@@ -2744,6 +2751,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 storage_unit_size: None,
+                explicit_align: None,
             },
         ],
         enum_constants: vec![],
@@ -2814,6 +2822,7 @@ fn test_incomplete_struct_type_resolution() {
                 typ: incomplete_struct_type,
                 init: Some(init_list),
                 vla_sizes: vec![],
+                explicit_align: None,
             }],
         })]),
         pos: test_pos(),
@@ -2878,6 +2887,7 @@ fn test_static_local_pre_increment() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -2953,6 +2963,7 @@ fn test_static_local_pre_decrement() {
             typ: static_int_type,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3021,6 +3032,7 @@ fn test_static_local_post_increment() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3087,6 +3099,7 @@ fn test_static_local_post_decrement() {
             typ: static_int_type,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3153,6 +3166,7 @@ fn test_static_local_compound_assignment() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3438,6 +3452,7 @@ fn test_static_local_address_in_initializer() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3456,6 +3471,7 @@ fn test_static_local_address_in_initializer() {
             typ: static_int_ptr_type,
             init: Some(addr_of_x),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3528,6 +3544,7 @@ fn test_struct_deref_returns_address() {
             bit_width: None,
             bit_offset: None,
             storage_unit_size: None,
+            explicit_align: None,
         }],
         enum_constants: vec![],
         size: 4,

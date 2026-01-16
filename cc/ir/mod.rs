@@ -1210,6 +1210,9 @@ pub struct LocalVar {
     /// Block where this variable was declared (for scope-aware phi placement)
     /// Phi nodes for this variable should only be placed at blocks dominated by this block.
     pub decl_block: Option<BasicBlockId>,
+    /// Explicit alignment from _Alignas specifier (C11 6.7.5)
+    /// None means use natural alignment for the type
+    pub explicit_align: Option<u32>,
 }
 
 /// A function in IR form
@@ -1296,6 +1299,7 @@ impl Function {
     }
 
     /// Add a local variable
+    #[allow(clippy::too_many_arguments)]
     pub fn add_local(
         &mut self,
         name: impl Into<String>,
@@ -1304,6 +1308,7 @@ impl Function {
         is_volatile: bool,
         is_atomic: bool,
         decl_block: Option<BasicBlockId>,
+        explicit_align: Option<u32>,
     ) {
         self.locals.insert(
             name.into(),
@@ -1313,6 +1318,7 @@ impl Function {
                 is_volatile,
                 is_atomic,
                 decl_block,
+                explicit_align,
             },
         );
     }
@@ -1474,6 +1480,8 @@ pub struct GlobalDef {
     pub init: Initializer,
     /// C11 _Thread_local / GCC __thread
     pub is_thread_local: bool,
+    /// Explicit alignment from _Alignas specifier (None = use natural alignment)
+    pub explicit_align: Option<u32>,
 }
 
 impl GlobalDef {
@@ -1484,6 +1492,7 @@ impl GlobalDef {
             typ,
             init,
             is_thread_local: false,
+            explicit_align: None,
         }
     }
 
@@ -1494,7 +1503,14 @@ impl GlobalDef {
             typ,
             init,
             is_thread_local: true,
+            explicit_align: None,
         }
+    }
+
+    /// Set explicit alignment from _Alignas specifier
+    pub fn with_align(mut self, align: Option<u32>) -> Self {
+        self.explicit_align = align;
+        self
     }
 }
 
@@ -1552,9 +1568,28 @@ impl Module {
         self.globals.push(GlobalDef::new(name, typ, init));
     }
 
-    /// Add a thread-local global variable
-    pub fn add_global_tls(&mut self, name: impl Into<String>, typ: TypeId, init: Initializer) {
-        self.globals.push(GlobalDef::thread_local(name, typ, init));
+    /// Add a global variable with explicit alignment (C11 _Alignas)
+    pub fn add_global_aligned(
+        &mut self,
+        name: impl Into<String>,
+        typ: TypeId,
+        init: Initializer,
+        align: Option<u32>,
+    ) {
+        self.globals
+            .push(GlobalDef::new(name, typ, init).with_align(align));
+    }
+
+    /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
+    pub fn add_global_tls_aligned(
+        &mut self,
+        name: impl Into<String>,
+        typ: TypeId,
+        init: Initializer,
+        align: Option<u32>,
+    ) {
+        self.globals
+            .push(GlobalDef::thread_local(name, typ, init).with_align(align));
     }
 
     /// Add a string literal and return its label
@@ -1873,12 +1908,12 @@ mod tests {
         // Add a non-atomic local
         let sym1 = PseudoId(1);
         func.add_pseudo(Pseudo::sym(sym1, "x".to_string()));
-        func.add_local("x", sym1, types.int_id, false, false, None);
+        func.add_local("x", sym1, types.int_id, false, false, None, None);
 
         // Add an atomic local
         let sym2 = PseudoId(2);
         func.add_pseudo(Pseudo::sym(sym2, "y".to_string()));
-        func.add_local("y", sym2, types.int_id, false, true, None);
+        func.add_local("y", sym2, types.int_id, false, true, None, None);
 
         // Check the is_atomic field
         assert!(!func.locals.get("x").unwrap().is_atomic);

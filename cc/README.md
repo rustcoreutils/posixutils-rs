@@ -87,7 +87,6 @@ Not yet implemented (features we want to add):
   __sync_synchronize
   __sync_fetch_and_add (and maybe a couple of its siblings)
 - assembly peephole optimizations
-- C11 _Alignas enforcement (parser accepts but ignores alignment)
 - C11 atomics (_Atomic operations)
 - Other C11 features: _Generic, anonymous structs
 

@@ -85,6 +85,10 @@ pub struct Symbol {
 
     /// Value for enum constants
     pub enum_value: Option<i64>,
+
+    /// Explicit alignment from _Alignas specifier (C11 6.7.5)
+    /// None means use natural alignment for the type
+    pub explicit_align: Option<u32>,
 }
 
 impl Symbol {
@@ -98,6 +102,7 @@ impl Symbol {
             scope_depth,
             defined: true,
             enum_value: None,
+            explicit_align: None,
         }
     }
 
@@ -111,6 +116,7 @@ impl Symbol {
             scope_depth,
             defined: false, // Functions are declarations until we see the body
             enum_value: None,
+            explicit_align: None,
         }
     }
 
@@ -124,6 +130,7 @@ impl Symbol {
             scope_depth,
             defined: true,
             enum_value: None,
+            explicit_align: None,
         }
     }
 
@@ -137,6 +144,7 @@ impl Symbol {
             scope_depth,
             defined: true,
             enum_value: Some(value),
+            explicit_align: None,
         }
     }
 
@@ -150,6 +158,7 @@ impl Symbol {
             scope_depth,
             defined: true,
             enum_value: None,
+            explicit_align: None,
         }
     }
 
@@ -163,7 +172,14 @@ impl Symbol {
             scope_depth,
             defined: true,
             enum_value: None,
+            explicit_align: None,
         }
+    }
+
+    /// Set explicit alignment from _Alignas specifier (C11 6.7.5)
+    pub fn with_align(mut self, align: Option<u32>) -> Self {
+        self.explicit_align = align;
+        self
     }
 
     /// Check if this is an enum constant

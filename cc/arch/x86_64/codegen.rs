@@ -148,6 +148,7 @@ impl X86_64CodeGen {
         typ: &TypeId,
         init: &crate::ir::Initializer,
         is_thread_local: bool,
+        explicit_align: Option<u32>,
         types: &TypeTable,
     ) {
         // Skip extern symbols - they're defined elsewhere
@@ -155,7 +156,7 @@ impl X86_64CodeGen {
             return;
         }
         self.base
-            .emit_global(name, typ, init, is_thread_local, types);
+            .emit_global(name, typ, init, is_thread_local, explicit_align, types);
     }
 
     /// Emit long double constants collected during codegen
@@ -3601,6 +3602,7 @@ impl CodeGenerator for X86_64CodeGen {
                 &global.typ,
                 &global.init,
                 global.is_thread_local,
+                global.explicit_align,
                 types,
             );
         }

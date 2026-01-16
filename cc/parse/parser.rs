@@ -230,6 +230,9 @@ pub struct Parser<'a> {
     types: &'a mut TypeTable,
     /// Current position in token stream
     pos: usize,
+    /// Explicit alignment from _Alignas in current declaration
+    /// Cleared after each declaration is parsed.
+    pending_alignas: Option<u32>,
 }
 
 impl<'a> Parser<'a> {
@@ -246,6 +249,7 @@ impl<'a> Parser<'a> {
             symbols,
             types,
             pos: 0,
+            pending_alignas: None,
         }
     }
 
@@ -4159,14 +4163,16 @@ impl Parser<'_> {
                     None
                 };
 
+                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                let validated_align = self.validated_explicit_align(typ)?;
+
                 // Declare symbol in symbol table
                 let symbol = self
                     .symbols
-                    .declare(crate::symbol::Symbol::variable(
-                        name,
-                        typ,
-                        self.symbols.depth(),
-                    ))
+                    .declare(
+                        crate::symbol::Symbol::variable(name, typ, self.symbols.depth())
+                            .with_align(validated_align),
+                    )
                     .expect("symbol declaration failed in test");
 
                 declarators.push(InitDeclarator {
@@ -4174,6 +4180,7 @@ impl Parser<'_> {
                     typ,
                     init,
                     vla_sizes,
+                    explicit_align: validated_align,
                 });
 
                 if self.is_special(b',') {
@@ -4184,6 +4191,8 @@ impl Parser<'_> {
             }
         }
 
+        // Clear pending alignment after declaration
+        self.pending_alignas = None;
         self.expect_special(b';')?;
 
         Ok(Declaration { declarators })
@@ -4329,13 +4338,17 @@ impl Parser<'_> {
                 // Check if we have a name (needed for symbol binding)
                 let has_name = !self.str(name).is_empty();
 
+                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                let validated_align = self.validated_explicit_align(typ)?;
+
                 // Bind variable to symbol table BEFORE parsing initializer.
                 // This ensures the variable is in scope for sizeof(*var) in initializers.
                 // Per C99 6.2.1p7: "Any other identifier has scope that begins just
                 // after the completion of its declarator."
                 let mut symbol_id: Option<SymbolId> = None;
                 if has_name && !is_typedef {
-                    let sym = Symbol::variable(name, typ, self.symbols.depth());
+                    let sym = Symbol::variable(name, typ, self.symbols.depth())
+                        .with_align(validated_align);
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
                     }
@@ -4376,6 +4389,7 @@ impl Parser<'_> {
                         typ,
                         init,
                         vla_sizes,
+                        explicit_align: validated_align,
                     });
                 }
 
@@ -4387,6 +4401,8 @@ impl Parser<'_> {
             }
         }
 
+        // Clear pending alignment after declaration
+        self.pending_alignas = None;
         self.expect_special(b';')?;
 
         Ok(Declaration { declarators })
@@ -4501,20 +4517,37 @@ impl Parser<'_> {
                 }
                 "_Alignas" => {
                     // C11 alignment specifier: _Alignas(type-name) or _Alignas(constant-expression)
+                    let alignas_pos = self.current_pos();
                     self.advance();
                     self.expect_special(b'(')?;
-                    // Try type name first
-                    if self.try_parse_type_name().is_some() {
+                    let align = if let Some(type_id) = self.try_parse_type_name() {
                         // _Alignas(type) - alignment of the type
-                        // TODO: Store alignment = alignof(type)
+                        self.types.alignment(type_id) as u32
                     } else {
                         // Parse as constant expression: _Alignas(16)
-                        let _expr = self.parse_expression()?;
-                        // TODO: Evaluate and store alignment value
-                    }
+                        let expr = self.parse_expression()?;
+                        self.eval_const_expr(&expr).unwrap_or(0) as u32
+                    };
                     self.expect_special(b')')?;
-                    // For now, we accept the syntax but don't enforce alignment
-                    // Multiple _Alignas can appear; the strictest wins
+
+                    // C11 6.7.5p6: _Alignas(0) has no effect
+                    if align == 0 {
+                        // No effect - don't update pending_alignas
+                    } else {
+                        // C11 6.7.5: alignment must be a positive power of 2
+                        if !align.is_power_of_two() {
+                            return Err(ParseError::new(
+                                format!("_Alignas({}) must be a power of 2", align),
+                                alignas_pos,
+                            ));
+                        }
+                        // Multiple _Alignas can appear; the strictest (largest) wins (C11 6.7.5)
+                        if let Some(existing) = self.pending_alignas {
+                            self.pending_alignas = Some(existing.max(align));
+                        } else {
+                            self.pending_alignas = Some(align);
+                        }
+                    }
                 }
                 "short" => {
                     self.advance();
@@ -4836,6 +4869,7 @@ impl Parser<'_> {
                         bit_offset: None,
                         bit_width: None,
                         storage_unit_size: None,
+                        explicit_align: None, // anonymous members
                     });
                     self.advance(); // consume ';'
                     continue;
@@ -4854,6 +4888,7 @@ impl Parser<'_> {
                         bit_offset: None,
                         bit_width: Some(width),
                         storage_unit_size: None,
+                        explicit_align: None, // bitfields don't support _Alignas
                     });
 
                     self.expect_special(b';')?;
@@ -4875,6 +4910,7 @@ impl Parser<'_> {
                             bit_offset: None,
                             bit_width: Some(width),
                             storage_unit_size: None,
+                            explicit_align: None, // bitfields don't support _Alignas
                         });
 
                         if self.is_special(b',') {
@@ -4912,6 +4948,9 @@ impl Parser<'_> {
                     // Skip any __attribute__ after member declaration
                     self.skip_extensions();
 
+                    // Capture any pending _Alignas from type specifier
+                    let member_align = self.pending_alignas.take();
+
                     members.push(StructMember {
                         name,
                         typ,
@@ -4919,6 +4958,7 @@ impl Parser<'_> {
                         bit_offset: None,
                         bit_width,
                         storage_unit_size: None,
+                        explicit_align: member_align,
                     });
 
                     if self.is_special(b',') {
@@ -5829,6 +5869,9 @@ impl Parser<'_> {
 
                 self.expect_special(b';')?;
 
+                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                let validated_align = self.validated_explicit_align(typ)?;
+
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
@@ -5838,7 +5881,8 @@ impl Parser<'_> {
                         .ok()
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
-                    let var_sym = Symbol::variable(name, typ, self.symbols.depth());
+                    let var_sym = Symbol::variable(name, typ, self.symbols.depth())
+                        .with_align(validated_align);
                     self.symbols
                         .declare(var_sym)
                         .ok()
@@ -5852,6 +5896,7 @@ impl Parser<'_> {
                         typ,
                         init,
                         vla_sizes: vec![],
+                        explicit_align: validated_align,
                     }],
                 }));
             }
@@ -6010,6 +6055,9 @@ impl Parser<'_> {
 
                 self.expect_special(b';')?;
 
+                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                let validated_align = self.validated_explicit_align(full_typ)?;
+
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
@@ -6019,7 +6067,8 @@ impl Parser<'_> {
                         .ok()
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
-                    let var_sym = Symbol::variable(name, full_typ, self.symbols.depth());
+                    let var_sym = Symbol::variable(name, full_typ, self.symbols.depth())
+                        .with_align(validated_align);
                     self.symbols
                         .declare(var_sym)
                         .ok()
@@ -6033,6 +6082,7 @@ impl Parser<'_> {
                         typ: full_typ,
                         init,
                         vla_sizes: vec![],
+                        explicit_align: validated_align,
                     }],
                 }));
             }
@@ -6140,6 +6190,7 @@ impl Parser<'_> {
                         typ: func_type_id,
                         init: None,
                         vla_sizes: vec![],
+                        explicit_align: None, // Functions don't have _Alignas
                     }],
                 }));
             }
@@ -6213,6 +6264,9 @@ impl Parser<'_> {
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
         }
 
+        // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+        let validated_align = self.validated_explicit_align(var_type_id)?;
+
         // Add to symbol table and capture SymbolId
         // For extern declarations of already-defined variables, reuse existing symbol
         let symbol = if is_typedef {
@@ -6226,7 +6280,8 @@ impl Parser<'_> {
             }
         } else {
             // Add global variable to symbol table so it can be referenced by later code
-            let var_sym = Symbol::variable(name, var_type_id, self.symbols.depth());
+            let var_sym = Symbol::variable(name, var_type_id, self.symbols.depth())
+                .with_align(validated_align);
             match self.symbols.declare(var_sym) {
                 Ok(id) => id,
                 Err(_) => {
@@ -6242,6 +6297,7 @@ impl Parser<'_> {
             typ: var_type_id,
             init,
             vla_sizes: vec![],
+            explicit_align: validated_align,
         });
 
         // Handle additional declarators
@@ -6270,6 +6326,10 @@ impl Parser<'_> {
             } else {
                 None
             };
+
+            // Validate explicit alignment for this declarator's type (C11 6.7.5)
+            let decl_validated_align = self.validated_explicit_align(decl_type)?;
+
             // Add to symbol table and capture SymbolId
             // For extern declarations of already-defined variables, reuse existing symbol
             let decl_symbol = if is_typedef {
@@ -6282,7 +6342,8 @@ impl Parser<'_> {
                         .expect("redeclaration should find existing symbol"),
                 }
             } else {
-                let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth());
+                let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth())
+                    .with_align(decl_validated_align);
                 match self.symbols.declare(var_sym) {
                     Ok(id) => id,
                     Err(_) => self
@@ -6296,6 +6357,7 @@ impl Parser<'_> {
                 typ: decl_type,
                 init: decl_init,
                 vla_sizes: vec![],
+                explicit_align: decl_validated_align,
             });
         }
 
@@ -6479,6 +6541,30 @@ impl Parser<'_> {
         }
 
         Ok(())
+    }
+
+    /// Validate explicit alignment against natural alignment (C11 6.7.5)
+    ///
+    /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
+    /// Returns None if no explicit alignment was specified.
+    fn validated_explicit_align(&self, typ: TypeId) -> ParseResult<Option<u32>> {
+        match self.pending_alignas {
+            None => Ok(None),
+            Some(explicit) => {
+                let natural = self.types.alignment(typ) as u32;
+                if explicit < natural {
+                    Err(ParseError::new(
+                        format!(
+                            "_Alignas({}) cannot reduce alignment below natural alignment {}",
+                            explicit, natural
+                        ),
+                        self.current_pos(),
+                    ))
+                } else {
+                    Ok(Some(explicit))
+                }
+            }
+        }
     }
 }
 

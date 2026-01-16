@@ -586,9 +586,19 @@ impl<'a> Linearizer<'a> {
 
             // Check for thread-local storage
             if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
-                self.module.add_global_tls(&name, declarator.typ, init);
+                self.module.add_global_tls_aligned(
+                    &name,
+                    declarator.typ,
+                    init,
+                    declarator.explicit_align,
+                );
             } else {
-                self.module.add_global(&name, declarator.typ, init);
+                self.module.add_global_aligned(
+                    &name,
+                    declarator.typ,
+                    init,
+                    declarator.explicit_align,
+                );
             }
         }
     }
@@ -998,7 +1008,7 @@ impl<'a> Linearizer<'a> {
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
             let typ_size = self.types.size_bits(typ);
@@ -1066,7 +1076,7 @@ impl<'a> Linearizer<'a> {
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
             // Don't emit a store here - the prologue codegen handles storing
@@ -1099,7 +1109,7 @@ impl<'a> Linearizer<'a> {
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
             // Store the incoming argument value to the local
@@ -1424,6 +1434,7 @@ impl<'a> Linearizer<'a> {
                     is_volatile,
                     is_atomic,
                     self.current_bb,
+                    declarator.explicit_align,
                 );
             }
 
@@ -1610,6 +1621,7 @@ impl<'a> Linearizer<'a> {
                     false, // not volatile
                     false, // not atomic
                     self.current_bb,
+                    None, // no explicit alignment
                 );
             }
 
@@ -1652,6 +1664,7 @@ impl<'a> Linearizer<'a> {
                 false, // not volatile
                 false, // not atomic
                 self.current_bb,
+                None, // no explicit alignment
             );
         }
 
@@ -1700,6 +1713,7 @@ impl<'a> Linearizer<'a> {
                 is_volatile,
                 is_atomic,
                 self.current_bb,
+                declarator.explicit_align, // VLA explicit alignment
             );
         }
 
@@ -1790,10 +1804,19 @@ impl<'a> Linearizer<'a> {
         // Check for thread-local storage
         let modifiers = self.types.modifiers(declarator.typ);
         if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
-            self.module
-                .add_global_tls(&global_name, declarator.typ, init);
+            self.module.add_global_tls_aligned(
+                &global_name,
+                declarator.typ,
+                init,
+                declarator.explicit_align,
+            );
         } else {
-            self.module.add_global(&global_name, declarator.typ, init);
+            self.module.add_global_aligned(
+                &global_name,
+                declarator.typ,
+                init,
+                declarator.explicit_align,
+            );
         }
     }
 
@@ -2990,6 +3013,7 @@ impl<'a> Linearizer<'a> {
                                 is_volatile: false,
                                 is_atomic: false,
                                 decl_block: self.current_bb,
+                                explicit_align: None, // parameter spill storage
                             },
                         );
                     }
@@ -3181,7 +3205,15 @@ impl<'a> Linearizer<'a> {
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
-                    func.add_local(&unique_name, sym_id, *typ, false, false, self.current_bb);
+                    func.add_local(
+                        &unique_name,
+                        sym_id,
+                        *typ,
+                        false,
+                        false,
+                        self.current_bb,
+                        None,
+                    );
                 }
                 self.linearize_init_list(sym_id, *typ, elements);
 
@@ -3799,6 +3831,7 @@ impl<'a> Linearizer<'a> {
                     false, // not volatile
                     false, // not atomic
                     self.current_bb,
+                    None, // no explicit alignment
                 );
             }
 
@@ -3824,7 +3857,15 @@ impl<'a> Linearizer<'a> {
             let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(local_pseudo);
-                func.add_local(&unique_name, local_sym, typ, false, false, self.current_bb);
+                func.add_local(
+                    &unique_name,
+                    local_sym,
+                    typ,
+                    false,
+                    false,
+                    self.current_bb,
+                    None,
+                );
             }
             (local_sym, Vec::new(), Vec::new())
         } else if returns_complex {
@@ -3835,7 +3876,15 @@ impl<'a> Linearizer<'a> {
             let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(local_pseudo);
-                func.add_local(&unique_name, local_sym, typ, false, false, self.current_bb);
+                func.add_local(
+                    &unique_name,
+                    local_sym,
+                    typ,
+                    false,
+                    false,
+                    self.current_bb,
+                    None,
+                );
             }
             (local_sym, Vec::new(), Vec::new())
         } else {
@@ -4887,7 +4936,15 @@ impl<'a> Linearizer<'a> {
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
                     // Register as local for proper stack allocation
-                    func.add_local(&unique_name, sym_id, *typ, false, false, self.current_bb);
+                    func.add_local(
+                        &unique_name,
+                        sym_id,
+                        *typ,
+                        false,
+                        false,
+                        self.current_bb,
+                        None,
+                    );
                 }
 
                 // Initialize using existing init list machinery
@@ -6404,6 +6461,7 @@ impl<'a> Linearizer<'a> {
                 false, // not volatile
                 false, // not atomic
                 self.current_bb,
+                None, // no explicit alignment
             );
         }
 

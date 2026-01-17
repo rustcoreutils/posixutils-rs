@@ -20,6 +20,8 @@ cargo clippy                    # Lint (required)
 cargo fmt --all -- --check      # Format check (required)
 ```
 
+NEVER amend git commits.
+
 ## Architecture
 
 Workspace by category: `text/`, `fs/`, `process/`, `awk/`, `sh/`, `make/`, `editors/`, `plib/` (shared lib), `ftw/` (race-free file walking).

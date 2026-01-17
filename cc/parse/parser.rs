@@ -2732,6 +2732,48 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        // NaN builtins - returns quiet NaN
+                        // The string argument is typically empty "" for quiet NaN
+                        "__builtin_nan" | "__builtin_nans" => {
+                            self.expect_special(b'(')?;
+                            let _arg = self.parse_assignment_expr()?; // string argument (ignored)
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FloatLit(f64::NAN),
+                                self.types.double_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_nanf" | "__builtin_nansf" => {
+                            self.expect_special(b'(')?;
+                            let _arg = self.parse_assignment_expr()?; // string argument (ignored)
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FloatLit(f64::NAN),
+                                self.types.float_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_nanl" | "__builtin_nansl" => {
+                            self.expect_special(b'(')?;
+                            let _arg = self.parse_assignment_expr()?; // string argument (ignored)
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::FloatLit(f64::NAN),
+                                self.types.longdouble_id,
+                                token_pos,
+                            ));
+                        }
+                        // FLT_ROUNDS - returns current rounding mode (1 = to nearest)
+                        "__builtin_flt_rounds" => {
+                            self.expect_special(b'(')?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(1), // IEEE 754 default: round to nearest
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
                         // Fabs builtins - absolute value for floats
                         "__builtin_fabs" => {
                             self.expect_special(b'(')?;
@@ -2788,6 +2830,17 @@ impl<'a> Parser<'a> {
                                 self.types.int_id,
                                 token_pos,
                             ));
+                        }
+                        "__builtin_expect" => {
+                            // __builtin_expect(expr, c) - branch prediction hint
+                            // Returns expr, the second argument is the expected value (for optimization hints)
+                            // We just return expr since we don't do branch prediction optimization
+                            self.expect_special(b'(')?;
+                            let expr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let _expected = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(expr);
                         }
                         "__builtin_types_compatible_p" => {
                             // __builtin_types_compatible_p(type1, type2) - returns 1 if types are compatible
@@ -3258,6 +3311,23 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            TokenType::WideChar => {
+                let token = self.consume();
+                let token_pos = token.pos;
+                if let TokenValue::WideChar(s) = &token.value {
+                    // Parse wide character literal - type is wchar_t (int on most platforms)
+                    let c = self.parse_char_literal(s);
+                    // wchar_t is defined as int on macOS/most Unix
+                    Ok(Self::typed_expr(
+                        ExprKind::CharLit(c),
+                        self.types.int_id,
+                        token_pos,
+                    ))
+                } else {
+                    Err(ParseError::new("invalid wide char token", token.pos))
+                }
+            }
+
             TokenType::String => {
                 let token = self.consume();
                 let token_pos = token.pos;
@@ -3402,9 +3472,10 @@ impl<'a> Parser<'a> {
             || (s_lower.contains('p') && is_hex);
 
         // Detect C23 _Float* suffixes (f16, F16, f32, F32, f64, F64)
-        let is_float16_suffix = s_lower.ends_with("f16");
-        let is_float32_suffix = s_lower.ends_with("f32");
-        let is_float64_suffix = s_lower.ends_with("f64");
+        // Only for non-hex numbers since f16/f32/f64 are valid hex digit sequences
+        let is_float16_suffix = !is_hex && s_lower.ends_with("f16");
+        let is_float32_suffix = !is_hex && s_lower.ends_with("f32");
+        let is_float64_suffix = !is_hex && s_lower.ends_with("f64");
 
         // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
         let num_str = if is_hex {
@@ -11287,5 +11358,132 @@ mod tests {
         // _Alignof should return size_t (unsigned long on 64-bit)
         let (expr, types, _, _) = parse_expr("_Alignof(int)").unwrap();
         assert_eq!(expr.typ, Some(types.ulong_id));
+    }
+
+    // ========================================================================
+    // __builtin_nan/nanf/nanl tests
+    // ========================================================================
+
+    #[test]
+    fn test_builtin_nan() {
+        let (expr, types, _, _) = parse_expr("__builtin_nan(\"\")").unwrap();
+        assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.is_nan()));
+        assert_eq!(expr.typ, Some(types.double_id));
+    }
+
+    #[test]
+    fn test_builtin_nanf() {
+        let (expr, types, _, _) = parse_expr("__builtin_nanf(\"\")").unwrap();
+        assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.is_nan()));
+        assert_eq!(expr.typ, Some(types.float_id));
+    }
+
+    #[test]
+    fn test_builtin_nanl() {
+        let (expr, types, _, _) = parse_expr("__builtin_nanl(\"\")").unwrap();
+        assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.is_nan()));
+        assert_eq!(expr.typ, Some(types.longdouble_id));
+    }
+
+    #[test]
+    fn test_builtin_nans() {
+        // Signaling NaN variant (same implementation, returns NaN)
+        let (expr, types, _, _) = parse_expr("__builtin_nans(\"\")").unwrap();
+        assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.is_nan()));
+        assert_eq!(expr.typ, Some(types.double_id));
+    }
+
+    // ========================================================================
+    // __builtin_flt_rounds test
+    // ========================================================================
+
+    #[test]
+    fn test_builtin_flt_rounds() {
+        // __builtin_flt_rounds() returns 1 (round to nearest, IEEE 754 default)
+        let (expr, types, _, _) = parse_expr("__builtin_flt_rounds()").unwrap();
+        assert!(matches!(expr.kind, ExprKind::IntLit(1)));
+        assert_eq!(expr.typ, Some(types.int_id));
+    }
+
+    // ========================================================================
+    // __builtin_expect test
+    // ========================================================================
+
+    #[test]
+    fn test_builtin_expect() {
+        // __builtin_expect(expr, expected) returns expr
+        let (expr, _, _, _) = parse_expr("__builtin_expect(42, 1)").unwrap();
+        assert!(matches!(expr.kind, ExprKind::IntLit(42)));
+    }
+
+    #[test]
+    fn test_builtin_expect_with_expression() {
+        // __builtin_expect returns the first argument unchanged
+        let (expr, _, strings, symbols) =
+            parse_expr_with_vars("__builtin_expect(x, 0)", &["x"]).unwrap();
+        match expr.kind {
+            ExprKind::Ident(sym_id) => {
+                check_name(&strings, symbols.get(sym_id).name, "x");
+            }
+            _ => panic!("Expected Ident"),
+        }
+    }
+
+    // ========================================================================
+    // Wide character literal test
+    // ========================================================================
+
+    #[test]
+    fn test_wide_char_literal() {
+        let (expr, types, _, _) = parse_expr("L'A'").unwrap();
+        assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+        // wchar_t is int on most Unix systems
+        assert_eq!(expr.typ, Some(types.int_id));
+    }
+
+    #[test]
+    fn test_wide_char_escape() {
+        let (expr, _, _, _) = parse_expr("L'\\n'").unwrap();
+        assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    }
+
+    // ========================================================================
+    // Hex float suffix fix test (f16/f32/f64 are hex digits, not suffixes)
+    // ========================================================================
+
+    #[test]
+    fn test_hex_float_not_f16_suffix() {
+        // 0x1f16 should be parsed as hex integer 0x1f16, not 0x1 with f16 suffix
+        let (expr, types, _, _) = parse_expr("0x1f16").unwrap();
+        assert!(matches!(expr.kind, ExprKind::IntLit(0x1f16)));
+        // Should be int or long, not float16
+        let kind = types.kind(expr.typ.unwrap());
+        assert!(matches!(kind, TypeKind::Int | TypeKind::Long));
+    }
+
+    #[test]
+    fn test_hex_float_not_f32_suffix() {
+        // 0xABCf32 should be hex integer, not hex with f32 suffix
+        let (expr, types, _, _) = parse_expr("0xABCf32").unwrap();
+        assert!(matches!(expr.kind, ExprKind::IntLit(0xabcf32)));
+        let kind = types.kind(expr.typ.unwrap());
+        assert!(matches!(kind, TypeKind::Int | TypeKind::Long));
+    }
+
+    #[test]
+    fn test_hex_float_not_f64_suffix() {
+        // 0x123f64 should be hex integer
+        let (expr, types, _, _) = parse_expr("0x123f64").unwrap();
+        assert!(matches!(expr.kind, ExprKind::IntLit(0x123f64)));
+        let kind = types.kind(expr.typ.unwrap());
+        assert!(matches!(kind, TypeKind::Int | TypeKind::Long));
+    }
+
+    #[test]
+    fn test_hex_float_with_exponent() {
+        // 0x1.0p5 is a valid hex float (uses p exponent, not e)
+        let (expr, types, _, _) = parse_expr("0x1.0p5").unwrap();
+        assert!(matches!(expr.kind, ExprKind::FloatLit(_)));
+        assert_eq!(expr.typ, Some(types.double_id));
     }
 }

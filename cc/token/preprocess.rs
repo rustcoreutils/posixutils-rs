@@ -114,11 +114,38 @@ impl Macro {
     /// Create a predefined macro (value is treated as a number/literal)
     pub fn predefined(name: &str, value: Option<&str>) -> Self {
         let body = match value {
-            Some(v) => vec![MacroToken {
-                typ: TokenType::Number,
-                value: MacroTokenValue::Number(v.to_string()),
-                whitespace: false,
-            }],
+            Some(v) => {
+                // Tokenize the value string properly so (-1021) becomes (, -, 1021, )
+                let mut idents = IdentTable::new();
+                let mut tokenizer = Tokenizer::new(v.as_bytes(), 0, &mut idents);
+                let tokens = tokenizer.tokenize();
+
+                tokens
+                    .iter()
+                    .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+                    .enumerate()
+                    .map(|(i, token)| {
+                        let value = match &token.value {
+                            TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
+                            TokenValue::Ident(id) => {
+                                let ident_name = idents.get_opt(*id).unwrap_or("").to_string();
+                                MacroTokenValue::Ident(ident_name)
+                            }
+                            TokenValue::String(s) => MacroTokenValue::String(s.clone()),
+                            TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
+                            TokenValue::Special(code) => MacroTokenValue::Special(*code),
+                            TokenValue::WideString(s) => MacroTokenValue::String(s.clone()),
+                            TokenValue::WideChar(c) => MacroTokenValue::Char(c.clone()),
+                            TokenValue::None => MacroTokenValue::None,
+                        };
+                        MacroToken {
+                            typ: token.typ,
+                            value,
+                            whitespace: i > 0 && token.pos.whitespace,
+                        }
+                    })
+                    .collect()
+            }
             None => vec![],
         };
         Self {
@@ -676,6 +703,15 @@ impl<'a> Preprocessor<'a> {
                                 continue;
                             }
 
+                            // Check blue-painting: if this token was marked as no-expand
+                            // for this macro (from a previous expansion), don't expand it.
+                            // Per C99 6.10.3.4, macro names in their own expansion are
+                            // "blue painted" and should not be re-expanded.
+                            if token.is_no_expand(&name) {
+                                output.push(token);
+                                continue;
+                            }
+
                             if let Some(expanded) =
                                 self.try_expand_macro(&name, &token.pos, &mut iter, idents)
                             {
@@ -721,6 +757,12 @@ impl<'a> Preprocessor<'a> {
 
                                     // Pop the identifier and expand as function-like macro
                                     let last_token = output.pop().unwrap();
+
+                                    // Check blue-painting on the token itself
+                                    if last_token.is_no_expand(&macro_name) {
+                                        output.push(last_token);
+                                        break;
+                                    }
                                     iter.next(); // consume '('
                                     let args = self.collect_macro_args(
                                         &mut iter,
@@ -937,6 +979,7 @@ impl<'a> Preprocessor<'a> {
                                 "0".to_string()
                             }),
                             pos,
+                            no_expand: None,
                         });
                         continue;
                     }
@@ -974,6 +1017,7 @@ impl<'a> Preprocessor<'a> {
                             typ: TokenType::Number,
                             value: TokenValue::Number("0".to_string()),
                             pos: token.pos,
+                            no_expand: None,
                         });
                     }
                 } else {
@@ -982,6 +1026,7 @@ impl<'a> Preprocessor<'a> {
                         typ: TokenType::Number,
                         value: TokenValue::Number("0".to_string()),
                         pos: token.pos,
+                        no_expand: None,
                     });
                 }
             } else {
@@ -2449,6 +2494,18 @@ impl<'a> Preprocessor<'a> {
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .collect();
 
+        // Mark any occurrences of this macro's name in the result as "blue painted"
+        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
+        // not be re-expanded in subsequent contexts.
+        let mac_name_id = idents.intern(&mac.name);
+        for tok in &mut filtered {
+            if let TokenValue::Ident(id) = &tok.value {
+                if *id == mac_name_id {
+                    tok.mark_no_expand(&mac.name);
+                }
+            }
+        }
+
         // The FIRST token of a macro expansion should inherit whitespace
         // from the macro invocation position, not the macro body.
         // This ensures "MACRO(args)" expands with proper spacing.
@@ -2557,6 +2614,18 @@ impl<'a> Preprocessor<'a> {
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .collect();
 
+        // Mark any occurrences of this macro's name in the result as "blue painted"
+        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
+        // not be re-expanded in subsequent contexts.
+        let mac_name_id = idents.intern(&mac.name);
+        for tok in &mut filtered {
+            if let TokenValue::Ident(id) = &tok.value {
+                if *id == mac_name_id {
+                    tok.mark_no_expand(&mac.name);
+                }
+            }
+        }
+
         // The FIRST token of a macro expansion should inherit whitespace
         // from the macro invocation position, not the macro body.
         // This ensures "extern __inline" expands to "extern inline" with space.
@@ -2584,8 +2653,22 @@ impl<'a> Preprocessor<'a> {
                 let id = idents.intern(name);
                 TokenValue::Ident(id)
             }
-            MacroTokenValue::String(s) => TokenValue::String(s.clone()),
-            MacroTokenValue::Char(c) => TokenValue::Char(c.clone()),
+            MacroTokenValue::String(s) => {
+                // Check original token type to handle WideString correctly
+                if mt.typ == TokenType::WideString {
+                    TokenValue::WideString(s.clone())
+                } else {
+                    TokenValue::String(s.clone())
+                }
+            }
+            MacroTokenValue::Char(c) => {
+                // Check original token type to handle WideChar correctly
+                if mt.typ == TokenType::WideChar {
+                    TokenValue::WideChar(c.clone())
+                } else {
+                    TokenValue::Char(c.clone())
+                }
+            }
             MacroTokenValue::Special(code) => TokenValue::Special(*code),
             _ => TokenValue::None,
         };
@@ -2761,6 +2844,17 @@ impl<'a> Preprocessor<'a> {
                         | "__builtin_fabs"
                         | "__builtin_fabsf"
                         | "__builtin_fabsl"
+                        // NaN constants
+                        | "__builtin_nan"
+                        | "__builtin_nanf"
+                        | "__builtin_nanl"
+                        | "__builtin_nans"
+                        | "__builtin_nansf"
+                        | "__builtin_nansl"
+                        // Branch prediction
+                        | "__builtin_expect"
+                        // Floating-point rounding mode
+                        | "__builtin_flt_rounds"
                         // Atomic builtins (C11 - Clang style)
                         | "__c11_atomic_init"
                         | "__c11_atomic_load"
@@ -3259,6 +3353,20 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 | "__builtin_fabs"
                 | "__builtin_fabsf"
                 | "__builtin_fabsl"
+                // NaN constants
+                | "__builtin_nan"
+                | "__builtin_nanf"
+                | "__builtin_nanl"
+                | "__builtin_nans"
+                | "__builtin_nansf"
+                | "__builtin_nansl"
+                // Branch prediction
+                | "__builtin_expect"
+                // Floating-point rounding mode
+                | "__builtin_flt_rounds"
+                // Frame/return address
+                | "__builtin_frame_address"
+                | "__builtin_return_address"
                 // Atomic builtins (C11 - Clang style)
                 | "__c11_atomic_init"
                 | "__c11_atomic_load"
@@ -4504,5 +4612,114 @@ PASTE(foo, bar)
         let (tokens, idents) = preprocess_str("int x = __bool_true_false_are_defined;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"1".to_string()));
+    }
+
+    // ========================================================================
+    // Blue-painting tests (C99 6.10.3.4 - recursive macro prevention)
+    // ========================================================================
+
+    #[test]
+    fn test_blue_painting_object_like_macro() {
+        // A macro that expands to itself should not infinitely recurse
+        // FOO expands to "FOO + 1", but the FOO in the expansion should not re-expand
+        let (tokens, idents) = preprocess_str("#define FOO FOO + 1\nFOO");
+        let strs = get_token_strings(&tokens, &idents);
+        // Should get "FOO + 1", not infinite recursion
+        assert!(strs.contains(&"FOO".to_string()));
+        assert!(strs.contains(&"+".to_string()));
+        assert!(strs.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_blue_painting_function_like_macro() {
+        // Function-like macro that references itself
+        let (tokens, idents) = preprocess_str("#define F(x) F(x + 1)\nF(0)");
+        let strs = get_token_strings(&tokens, &idents);
+        // Should get "F(0 + 1)", the inner F should not re-expand
+        assert!(strs.contains(&"F".to_string()));
+        assert!(strs.contains(&"0".to_string()));
+        assert!(strs.contains(&"+".to_string()));
+        assert!(strs.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_blue_painting_indirect_recursion() {
+        // A -> B -> A should not infinitely recurse
+        let (tokens, idents) = preprocess_str("#define A B\n#define B A\nA");
+        let strs = get_token_strings(&tokens, &idents);
+        // A -> B -> A (blue painted, stops)
+        // Result should contain "A"
+        assert!(strs.contains(&"A".to_string()));
+    }
+
+    // ========================================================================
+    // Predefined macro tokenization tests
+    // ========================================================================
+
+    #[test]
+    fn test_predefined_macro_tokenization_parentheses() {
+        // Predefined macros like __DBL_MIN_EXP__ have values like "(-1021)"
+        // These should be tokenized as separate tokens: (, -, 1021, )
+        let mac = Macro::predefined("__TEST__", Some("(-1021)"));
+        assert_eq!(mac.body.len(), 4); // (, -, 1021, )
+        assert_eq!(mac.body[0].typ, TokenType::Special); // (
+        assert_eq!(mac.body[1].typ, TokenType::Special); // -
+        assert_eq!(mac.body[2].typ, TokenType::Number); // 1021
+        assert_eq!(mac.body[3].typ, TokenType::Special); // )
+    }
+
+    #[test]
+    fn test_predefined_macro_tokenization_simple_number() {
+        // Simple numeric value should be a single token
+        let mac = Macro::predefined("__TEST__", Some("42"));
+        assert_eq!(mac.body.len(), 1);
+        assert_eq!(mac.body[0].typ, TokenType::Number);
+    }
+
+    #[test]
+    fn test_predefined_macro_tokenization_float() {
+        // Float with exponent
+        let mac = Macro::predefined("__TEST__", Some("1.0e-37"));
+        assert_eq!(mac.body.len(), 1);
+        assert_eq!(mac.body[0].typ, TokenType::Number);
+    }
+
+    #[test]
+    fn test_predefined_macro_expansion_with_parens() {
+        // When a predefined macro with parenthesized value is used, it should expand correctly
+        let code = "#define __TEST__ (-1021)\nint x = __TEST__;";
+        let (tokens, idents) = preprocess_str(code);
+        let strs = get_token_strings(&tokens, &idents);
+        // Should contain the individual tokens
+        assert!(strs.contains(&"(".to_string()));
+        assert!(strs.contains(&"-".to_string()));
+        assert!(strs.contains(&"1021".to_string()));
+        assert!(strs.contains(&")".to_string()));
+    }
+
+    // ========================================================================
+    // Wide string/char in macro expansion tests
+    // ========================================================================
+
+    #[test]
+    fn test_wide_string_in_macro() {
+        let (tokens, _) = preprocess_str("#define WSTR L\"hello\"\nWSTR");
+        // Find the wide string token
+        let wide_string_count = tokens
+            .iter()
+            .filter(|t| t.typ == TokenType::WideString)
+            .count();
+        assert_eq!(wide_string_count, 1, "should have one wide string token");
+    }
+
+    #[test]
+    fn test_wide_char_in_macro() {
+        let (tokens, _) = preprocess_str("#define WCHAR L'x'\nWCHAR");
+        // Find the wide char token
+        let wide_char_count = tokens
+            .iter()
+            .filter(|t| t.typ == TokenType::WideChar)
+            .count();
+        assert_eq!(wide_char_count, 1, "should have one wide char token");
     }
 }

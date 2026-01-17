@@ -992,6 +992,71 @@ int main(void) {
 }
 
 // ============================================================================
+// Wide Character Literal Tests (L'x')
+// ============================================================================
+
+#[test]
+fn wide_char_basic() {
+    let code = r#"
+int main(void) {
+    // Wide char literal has type wchar_t (int on Unix)
+    int wc = L'A';
+    if (wc != 65) return 1;
+
+    wc = L'Z';
+    if (wc != 90) return 2;
+
+    // Digit
+    wc = L'0';
+    if (wc != 48) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wide_char_basic", code, &[]), 0);
+}
+
+#[test]
+fn wide_char_escape() {
+    let code = r#"
+int main(void) {
+    // Escape sequences in wide char
+    int wc = L'\n';
+    if (wc != 10) return 1;
+
+    wc = L'\t';
+    if (wc != 9) return 2;
+
+    wc = L'\0';
+    if (wc != 0) return 3;
+
+    wc = L'\\';
+    if (wc != 92) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wide_char_escape", code, &[]), 0);
+}
+
+#[test]
+fn wide_char_hex_escape() {
+    let code = r#"
+int main(void) {
+    // Hex escape in wide char
+    int wc = L'\x41';
+    if (wc != 65) return 1;  // 'A'
+
+    wc = L'\x7F';
+    if (wc != 127) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wide_char_hex", code, &[]), 0);
+}
+
+// ============================================================================
 // Char: Stack Spill/Reload Regression Test
 // Tests that char values passed through stack or spilled to stack preserve
 // correct values without garbage in upper register bits (regression test for

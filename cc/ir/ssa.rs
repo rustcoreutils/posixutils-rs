@@ -714,6 +714,7 @@ mod tests {
             false, // not volatile
             false, // not atomic
             Some(BasicBlockId(0)),
+            None, // no explicit alignment
         );
 
         // Value pseudos
@@ -822,7 +823,15 @@ mod tests {
         // Only add ONE pseudo to func.pseudos with ID 0
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local("x", x_sym, int_id, false, false, Some(BasicBlockId(0)));
+        func.add_local(
+            "x",
+            x_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(0)),
+            None,
+        );
 
         // Create an instruction that uses a HIGHER pseudo ID (say, 100)
         // that is NOT in func.pseudos. This simulates what the linearizer does

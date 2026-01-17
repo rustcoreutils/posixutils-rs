@@ -918,7 +918,12 @@ impl RegAlloc {
                         if let Some(local) = func.locals.get(name) {
                             let size = (types.size_bits(local.typ) / 8) as i32;
                             let size = size.max(8);
-                            let aligned_size = (size + 7) & !7;
+                            // Determine alignment: explicit _Alignas takes precedence
+                            let alignment = local.explicit_align.unwrap_or(8) as i32;
+                            let aligned_size = (size + alignment - 1) & !(alignment - 1);
+                            // Align stack offset before allocating
+                            self.stack_offset =
+                                (self.stack_offset + alignment - 1) & !(alignment - 1);
                             self.stack_offset += aligned_size;
                             self.locations
                                 .insert(interval.pseudo, Loc::Stack(-self.stack_offset));

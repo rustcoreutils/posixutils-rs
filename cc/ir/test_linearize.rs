@@ -1741,6 +1741,7 @@ fn test_linearize_for() {
                     typ: int_type,
                     init: Some(Expr::int(0, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             })),
             cond: Some(Expr::binary(
@@ -2016,6 +2017,7 @@ fn test_local_var_emits_load_store() {
                     typ: int_type,
                     init: Some(Expr::int(1, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
@@ -2072,6 +2074,7 @@ fn test_ssa_converts_local_to_phi() {
                     typ: int_type,
                     init: Some(Expr::int(1, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             // if (cond) x = 2;
@@ -2134,6 +2137,7 @@ fn test_ssa_loop_variable() {
                     typ: int_type,
                     init: Some(Expr::int(0, &ctx.types)),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             // while (i < 10) { i = i + 1; }
@@ -2610,6 +2614,7 @@ fn test_string_literal_char_array_init() {
                         test_pos(),
                     )),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
@@ -2659,6 +2664,7 @@ fn test_string_literal_char_pointer_init() {
                         test_pos(),
                     )),
                     vla_sizes: vec![],
+                    explicit_align: None,
                 }],
             }),
             BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
@@ -2736,6 +2742,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 storage_unit_size: None,
+                explicit_align: None,
             },
             StructMember {
                 name: y_id,
@@ -2744,6 +2751,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 storage_unit_size: None,
+                explicit_align: None,
             },
         ],
         enum_constants: vec![],
@@ -2814,6 +2822,7 @@ fn test_incomplete_struct_type_resolution() {
                 typ: incomplete_struct_type,
                 init: Some(init_list),
                 vla_sizes: vec![],
+                explicit_align: None,
             }],
         })]),
         pos: test_pos(),
@@ -2878,6 +2887,7 @@ fn test_static_local_pre_increment() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -2953,6 +2963,7 @@ fn test_static_local_pre_decrement() {
             typ: static_int_type,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3021,6 +3032,7 @@ fn test_static_local_post_increment() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3087,6 +3099,7 @@ fn test_static_local_post_decrement() {
             typ: static_int_type,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3153,6 +3166,7 @@ fn test_static_local_compound_assignment() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3438,6 +3452,7 @@ fn test_static_local_address_in_initializer() {
             typ: static_int_type,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3456,6 +3471,7 @@ fn test_static_local_address_in_initializer() {
             typ: static_int_ptr_type,
             init: Some(addr_of_x),
             vla_sizes: vec![],
+            explicit_align: None,
         }],
     };
 
@@ -3482,10 +3498,7 @@ fn test_static_local_address_in_initializer() {
     let module = ctx.linearize(&tu);
 
     // Check that p's initializer references the mangled name of x
-    let p_global = module
-        .globals
-        .iter()
-        .find(|(name, _, _)| name.contains("test.p"));
+    let p_global = module.globals.iter().find(|g| g.name.contains("test.p"));
     assert!(
         p_global.is_some(),
         "Should have a global for static local 'p'. globals: {:?}",
@@ -3493,8 +3506,8 @@ fn test_static_local_address_in_initializer() {
     );
 
     // The initializer for p should be a SymAddr pointing to the mangled x name
-    if let Some((_, _, init)) = p_global {
-        if let Initializer::SymAddr(sym_name) = init {
+    if let Some(global) = p_global {
+        if let Initializer::SymAddr(sym_name) = &global.init {
             assert!(
                 sym_name.contains("test.x"),
                 "Address of static local x should use mangled name 'test.x', got: {}",
@@ -3503,7 +3516,7 @@ fn test_static_local_address_in_initializer() {
         } else {
             panic!(
                 "Static pointer initializer should be SymAddr, got: {:?}",
-                init
+                global.init
             );
         }
     }
@@ -3531,6 +3544,7 @@ fn test_struct_deref_returns_address() {
             bit_width: None,
             bit_offset: None,
             storage_unit_size: None,
+            explicit_align: None,
         }],
         enum_constants: vec![],
         size: 4,
@@ -3927,5 +3941,176 @@ fn test_int_to_float16_conversion() {
     assert!(
         has_rtlib_call,
         "Int to Float16 conversion should call __floatsihf"
+    );
+}
+
+// ============================================================================
+// C11 _Alignof tests
+// ============================================================================
+
+#[test]
+fn test_alignof_type_emits_setval() {
+    // Test: return _Alignof(int);
+    // Should emit a SetVal instruction (constant folded at linearize time)
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+
+    let alignof_expr =
+        Expr::typed_unpositioned(ExprKind::AlignofType(int_type), ctx.types.ulong_id);
+
+    let func = FunctionDef {
+        return_type: ctx.types.ulong_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Return(Some(alignof_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    // _Alignof should emit SetVal for the constant
+    let func = &module.functions[0];
+    let has_setval = func
+        .blocks
+        .iter()
+        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::SetVal));
+    assert!(has_setval, "_Alignof(int) should emit SetVal for constant");
+}
+
+#[test]
+fn test_alignof_expr_emits_setval() {
+    // Test: int x; return _Alignof(x);
+    // Should emit a SetVal instruction (constant folded at linearize time)
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    let alignof_expr = Expr::typed_unpositioned(
+        ExprKind::AlignofExpr(Box::new(Expr::var_typed(x_sym, int_type))),
+        ctx.types.ulong_id,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.ulong_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: int_type,
+        }],
+        body: Stmt::Return(Some(alignof_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    // _Alignof(x) should emit SetVal for the constant
+    let func = &module.functions[0];
+    let has_setval = func
+        .blocks
+        .iter()
+        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::SetVal));
+    assert!(
+        has_setval,
+        "_Alignof(x) where x is int should emit SetVal for constant"
+    );
+}
+
+// ============================================================================
+// Frame/Return address builtin tests
+// ============================================================================
+
+#[test]
+fn test_frame_address_emits_opcode() {
+    // Test: return __builtin_frame_address(0);
+    // Should emit FrameAddress opcode
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let void_ptr = ctx.types.void_ptr_id;
+
+    let level_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), ctx.types.int_id);
+    let frame_addr_expr = Expr::typed_unpositioned(
+        ExprKind::FrameAddress {
+            level: Box::new(level_expr),
+        },
+        void_ptr,
+    );
+
+    let func = FunctionDef {
+        return_type: void_ptr,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Return(Some(frame_addr_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    let func = &module.functions[0];
+    let has_frame_addr = func
+        .blocks
+        .iter()
+        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::FrameAddress));
+    assert!(
+        has_frame_addr,
+        "__builtin_frame_address should emit FrameAddress opcode"
+    );
+}
+
+#[test]
+fn test_return_address_emits_opcode() {
+    // Test: return __builtin_return_address(0);
+    // Should emit ReturnAddress opcode
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let void_ptr = ctx.types.void_ptr_id;
+
+    let level_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), ctx.types.int_id);
+    let return_addr_expr = Expr::typed_unpositioned(
+        ExprKind::ReturnAddress {
+            level: Box::new(level_expr),
+        },
+        void_ptr,
+    );
+
+    let func = FunctionDef {
+        return_type: void_ptr,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Return(Some(return_addr_expr)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+
+    let func = &module.functions[0];
+    let has_return_addr = func
+        .blocks
+        .iter()
+        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::ReturnAddress));
+    assert!(
+        has_return_addr,
+        "__builtin_return_address should emit ReturnAddress opcode"
     );
 }

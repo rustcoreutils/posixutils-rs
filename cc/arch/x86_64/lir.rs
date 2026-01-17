@@ -35,6 +35,10 @@ pub enum MemAddr {
 
     /// symbol@GOTPCREL(%rip) - GOT-relative addressing for external symbols on macOS
     GotPcrel(Symbol),
+
+    /// %fs:symbol@TPOFF - Thread-local storage initial-exec model (Linux x86-64)
+    /// Uses FS segment register to access thread-local variables
+    TlsIE(Symbol),
 }
 
 impl MemAddr {
@@ -53,6 +57,10 @@ impl MemAddr {
             }
             MemAddr::GotPcrel(sym) => {
                 format!("{}@GOTPCREL(%rip)", sym.format_for_target(target))
+            }
+            MemAddr::TlsIE(sym) => {
+                // Thread-local storage initial-exec model: %fs:symbol@TPOFF
+                format!("%fs:{}@TPOFF", sym.format_for_target(target))
             }
         }
     }

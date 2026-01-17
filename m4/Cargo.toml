@@ -19,13 +19,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 env_logger = "0.11"
-m4-test-manager = { path = "./test-manager" }
+plib = { path = "../plib" }
 regex-lite = "0.1"
 similar-asserts = "1.5"
 test-log = { version = "0.2", default-features=false, features=["log"]}
-
-[build-dependencies]
-m4-test-manager = { path = "./test-manager" }
 
 [lints]
 workspace = true

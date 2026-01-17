@@ -699,6 +699,7 @@ fn inline_call_site(
                     is_volatile: local_var.is_volatile,
                     is_atomic: local_var.is_atomic,
                     decl_block: new_decl_block,
+                    explicit_align: local_var.explicit_align,
                 },
             );
         }
@@ -955,8 +956,8 @@ fn remove_dead_functions(module: &mut Module) {
 
     // Check global variable initializers for function pointer references
     // (e.g., static const struct { func_ptr fn; } table[] = { {my_func}, ... })
-    for (_, _, init) in &module.globals {
-        collect_func_refs_from_initializer(init, &func_names, &mut address_taken);
+    for global in &module.globals {
+        collect_func_refs_from_initializer(&global.init, &func_names, &mut address_taken);
     }
 
     // Remove static functions with no callers and no address taken (except main)
@@ -975,7 +976,7 @@ fn remove_dead_functions(module: &mut Module) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::Initializer;
+    use crate::ir::{GlobalDef, Initializer};
     use crate::target::Target;
     use crate::types::TypeTable;
 
@@ -1209,8 +1210,8 @@ mod tests {
 
         // Add a global variable with a SymAddr initializer referencing "callback"
         // This simulates: static void (*handler)(void) = callback;
-        module.globals.push((
-            "handler".to_string(),
+        module.globals.push(GlobalDef::new(
+            "handler",
             types.void_ptr_id,
             Initializer::SymAddr("callback".to_string()),
         ));
@@ -1265,8 +1266,8 @@ mod tests {
 
         // Add global with struct initializer containing function reference
         // Simulates: struct { void (*fn)(void); } table = { my_handler };
-        module.globals.push((
-            "table".to_string(),
+        module.globals.push(GlobalDef::new(
+            "table",
             types.void_ptr_id,
             Initializer::Struct {
                 total_size: 8,
@@ -1318,8 +1319,8 @@ mod tests {
 
         // Add global with array initializer containing function reference
         // Simulates: void (*handlers[])(void) = { arr_func };
-        module.globals.push((
-            "handlers".to_string(),
+        module.globals.push(GlobalDef::new(
+            "handlers",
             types.void_ptr_id,
             Initializer::Array {
                 elem_size: 8,

@@ -264,6 +264,12 @@ pub enum ExprKind {
     /// sizeof expression: sizeof expr
     SizeofExpr(Box<Expr>),
 
+    /// _Alignof type: _Alignof(int) - C11
+    AlignofType(TypeId),
+
+    /// _Alignof expression: _Alignof expr - C11
+    AlignofExpr(Box<Expr>),
+
     /// Comma expression: expr1, expr2
     Comma(Vec<Expr>),
 
@@ -457,6 +463,20 @@ pub enum ExprKind {
     /// If control flow reaches this point, behavior is undefined.
     /// Used for optimization hints and silencing warnings.
     Unreachable,
+
+    /// __builtin_frame_address(level)
+    /// Returns the frame pointer address at the given level.
+    /// Level 0 is the current frame, 1 is the caller's frame, etc.
+    FrameAddress {
+        level: Box<Expr>,
+    },
+
+    /// __builtin_return_address(level)
+    /// Returns the return address at the given level.
+    /// Level 0 is the current function's return address.
+    ReturnAddress {
+        level: Box<Expr>,
+    },
 
     // =========================================================================
     // setjmp/longjmp (non-local jumps)
@@ -896,6 +916,8 @@ pub struct InitDeclarator {
     /// Empty for fixed-size arrays or non-array types.
     /// For int arr[n][m], contains [n_expr, m_expr] (outer to inner order).
     pub vla_sizes: Vec<Expr>,
+    /// Explicit alignment from _Alignas specifier (None = use natural alignment)
+    pub explicit_align: Option<u32>,
 }
 
 #[cfg(test)]
@@ -908,6 +930,7 @@ impl Declaration {
                 typ,
                 init,
                 vla_sizes: vec![],
+                explicit_align: None,
             }],
         }
     }

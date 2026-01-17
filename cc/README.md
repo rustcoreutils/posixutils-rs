@@ -87,9 +87,8 @@ Not yet implemented (features we want to add):
   __sync_synchronize
   __sync_fetch_and_add (and maybe a couple of its siblings)
 - assembly peephole optimizations
-- C11 Alignment Specifiers (_Alignas, _Alignof)
-- C11 Thread-Local Storage (_Thread_local) and atomics (_Atomic)
-- Other C11 features: _Static_assert, _Generic, anonymous structs
+- C11 atomics (_Atomic operations)
+- Other C11 features: _Generic, anonymous structs
 
 ## Code Quality
 

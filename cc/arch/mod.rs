@@ -94,6 +94,8 @@ pub fn get_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
         ("__INTPTR_MAX__", "9223372036854775807L"),
         ("__INTPTR_WIDTH__", "64"),
         ("__UINTPTR_MAX__", "18446744073709551615UL"),
+        // POSIX ssize_t limits (same as LONG_MAX/LONG_MIN on LP64)
+        ("SSIZE_MAX", long_max),
     ]
 }
 

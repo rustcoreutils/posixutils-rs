@@ -565,7 +565,7 @@ impl<'a> Linearizer<'a> {
             // int x = 1; extern int x;  - x is defined, not extern)
             if modifiers.contains(TypeModifiers::EXTERN) {
                 // Check if this symbol is already defined in globals
-                if !self.module.globals.iter().any(|g| g.0 == name) {
+                if !self.module.globals.iter().any(|g| g.name == name) {
                     self.module.extern_symbols.insert(name);
                 }
                 continue;
@@ -584,7 +584,22 @@ impl<'a> Linearizer<'a> {
             // (we now have the actual definition)
             self.module.extern_symbols.remove(&name);
 
-            self.module.add_global(&name, declarator.typ, init);
+            // Check for thread-local storage
+            if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+                self.module.add_global_tls_aligned(
+                    &name,
+                    declarator.typ,
+                    init,
+                    declarator.explicit_align,
+                );
+            } else {
+                self.module.add_global_aligned(
+                    &name,
+                    declarator.typ,
+                    init,
+                    declarator.explicit_align,
+                );
+            }
         }
     }
 
@@ -993,7 +1008,7 @@ impl<'a> Linearizer<'a> {
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
             let typ_size = self.types.size_bits(typ);
@@ -1061,7 +1076,7 @@ impl<'a> Linearizer<'a> {
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
             // Don't emit a store here - the prologue codegen handles storing
@@ -1094,7 +1109,7 @@ impl<'a> Linearizer<'a> {
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
             // Store the incoming argument value to the local
@@ -1419,6 +1434,7 @@ impl<'a> Linearizer<'a> {
                     is_volatile,
                     is_atomic,
                     self.current_bb,
+                    declarator.explicit_align,
                 );
             }
 
@@ -1605,6 +1621,7 @@ impl<'a> Linearizer<'a> {
                     false, // not volatile
                     false, // not atomic
                     self.current_bb,
+                    None, // no explicit alignment
                 );
             }
 
@@ -1647,6 +1664,7 @@ impl<'a> Linearizer<'a> {
                 false, // not volatile
                 false, // not atomic
                 self.current_bb,
+                None, // no explicit alignment
             );
         }
 
@@ -1695,6 +1713,7 @@ impl<'a> Linearizer<'a> {
                 is_volatile,
                 is_atomic,
                 self.current_bb,
+                declarator.explicit_align, // VLA explicit alignment
             );
         }
 
@@ -1782,7 +1801,23 @@ impl<'a> Linearizer<'a> {
         });
 
         // Add as a global (type already has STATIC modifier which codegen uses)
-        self.module.add_global(&global_name, declarator.typ, init);
+        // Check for thread-local storage
+        let modifiers = self.types.modifiers(declarator.typ);
+        if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+            self.module.add_global_tls_aligned(
+                &global_name,
+                declarator.typ,
+                init,
+                declarator.explicit_align,
+            );
+        } else {
+            self.module.add_global_aligned(
+                &global_name,
+                declarator.typ,
+                init,
+                declarator.explicit_align,
+            );
+        }
     }
 
     /// Linearize an initializer list for arrays or structs
@@ -2396,6 +2431,22 @@ impl<'a> Linearizer<'a> {
                 }
             }
 
+            // _Alignof(type) - constant for complete types
+            ExprKind::AlignofType(type_id) => {
+                let align = self.types.alignment(*type_id);
+                Some(align as i64)
+            }
+
+            // _Alignof(expr) - constant if expr type is complete
+            ExprKind::AlignofExpr(inner_expr) => {
+                if let Some(typ) = inner_expr.typ {
+                    let align = self.types.alignment(typ);
+                    Some(align as i64)
+                } else {
+                    None
+                }
+            }
+
             // Cast to integer type - evaluate inner expression
             ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
 
@@ -2798,8 +2849,11 @@ impl<'a> Linearizer<'a> {
             // Assignments have side effects
             ExprKind::Assign { .. } => false,
 
-            // Sizeof is always pure (compile-time constant)
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => true,
+            // Sizeof and _Alignof are always pure (compile-time constant)
+            ExprKind::SizeofType(_)
+            | ExprKind::SizeofExpr(_)
+            | ExprKind::AlignofType(_)
+            | ExprKind::AlignofExpr(_) => true,
 
             // Comma expressions: pure if all sub-expressions are pure
             ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
@@ -2844,6 +2898,9 @@ impl<'a> Linearizer<'a> {
 
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
+
+            // Frame/return address builtins are pure (just read registers)
+            ExprKind::FrameAddress { .. } | ExprKind::ReturnAddress { .. } => true,
 
             // Setjmp/longjmp have control flow side effects
             ExprKind::Setjmp { .. } | ExprKind::Longjmp { .. } => false,
@@ -2956,6 +3013,7 @@ impl<'a> Linearizer<'a> {
                                 is_volatile: false,
                                 is_atomic: false,
                                 decl_block: self.current_bb,
+                                explicit_align: None, // parameter spill storage
                             },
                         );
                     }
@@ -3147,7 +3205,15 @@ impl<'a> Linearizer<'a> {
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
-                    func.add_local(&unique_name, sym_id, *typ, false, false, self.current_bb);
+                    func.add_local(
+                        &unique_name,
+                        sym_id,
+                        *typ,
+                        false,
+                        false,
+                        self.current_bb,
+                        None,
+                    );
                 }
                 self.linearize_init_list(sym_id, *typ, elements);
 
@@ -3765,6 +3831,7 @@ impl<'a> Linearizer<'a> {
                     false, // not volatile
                     false, // not atomic
                     self.current_bb,
+                    None, // no explicit alignment
                 );
             }
 
@@ -3790,7 +3857,15 @@ impl<'a> Linearizer<'a> {
             let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(local_pseudo);
-                func.add_local(&unique_name, local_sym, typ, false, false, self.current_bb);
+                func.add_local(
+                    &unique_name,
+                    local_sym,
+                    typ,
+                    false,
+                    false,
+                    self.current_bb,
+                    None,
+                );
             }
             (local_sym, Vec::new(), Vec::new())
         } else if returns_complex {
@@ -3801,7 +3876,15 @@ impl<'a> Linearizer<'a> {
             let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(local_pseudo);
-                func.add_local(&unique_name, local_sym, typ, false, false, self.current_bb);
+                func.add_local(
+                    &unique_name,
+                    local_sym,
+                    typ,
+                    false,
+                    false,
+                    self.current_bb,
+                    None,
+                );
             }
             (local_sym, Vec::new(), Vec::new())
         } else {
@@ -4813,6 +4896,21 @@ impl<'a> Linearizer<'a> {
                 self.emit_const(size as i64, result_typ)
             }
 
+            ExprKind::AlignofType(typ) => {
+                let align = self.types.alignment(*typ);
+                // _Alignof returns size_t
+                let result_typ = self.types.ulong_id;
+                self.emit_const(align as i64, result_typ)
+            }
+
+            ExprKind::AlignofExpr(inner_expr) => {
+                let inner_typ = self.expr_type(inner_expr);
+                let align = self.types.alignment(inner_typ);
+                // _Alignof returns size_t
+                let result_typ = self.types.ulong_id;
+                self.emit_const(align as i64, result_typ)
+            }
+
             ExprKind::Comma(exprs) => {
                 let mut result = self.emit_const(0, self.types.int_id);
                 for e in exprs {
@@ -4838,7 +4936,15 @@ impl<'a> Linearizer<'a> {
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
                     // Register as local for proper stack allocation
-                    func.add_local(&unique_name, sym_id, *typ, false, false, self.current_bb);
+                    func.add_local(
+                        &unique_name,
+                        sym_id,
+                        *typ,
+                        false,
+                        false,
+                        self.current_bb,
+                        None,
+                    );
                 }
 
                 // Initialize using existing init list machinery
@@ -5121,6 +5227,32 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Unreachable)
                     .with_target(result)
                     .with_type(self.types.void_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::FrameAddress { level } => {
+                // __builtin_frame_address(level) - returns frame pointer at given level
+                let level_val = self.linearize_expr(level);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::FrameAddress)
+                    .with_target(result)
+                    .with_src(level_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::ReturnAddress { level } => {
+                // __builtin_return_address(level) - returns return address at given level
+                let level_val = self.linearize_expr(level);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::ReturnAddress)
+                    .with_target(result)
+                    .with_src(level_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
                 self.emit(insn);
                 result
             }
@@ -6329,6 +6461,7 @@ impl<'a> Linearizer<'a> {
                 false, // not volatile
                 false, // not atomic
                 self.current_bb,
+                None, // no explicit alignment
             );
         }
 

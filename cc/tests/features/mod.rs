@@ -13,6 +13,7 @@ mod alloca;
 mod array_param_qualifiers;
 mod atomics;
 mod bswap;
+mod c11_features;
 mod clz;
 mod constant_p;
 mod ctz;

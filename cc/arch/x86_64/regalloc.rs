@@ -745,12 +745,16 @@ impl RegAlloc {
                         if let Some(local_var) = func.locals.get(name) {
                             let size = (types.size_bits(local_var.typ) / 8) as i32;
                             let size = size.max(8);
-                            // Long double (size 16) needs 16-byte alignment for x87 access
-                            let (alignment, aligned_size) = if size >= 16 {
-                                (16, (size + 15) & !15)
+                            // Determine alignment: explicit _Alignas takes precedence
+                            let alignment = if let Some(explicit) = local_var.explicit_align {
+                                explicit as i32
+                            } else if size >= 16 {
+                                // Long double (size 16) needs 16-byte alignment for x87 access
+                                16
                             } else {
-                                (8, (size + 7) & !7)
+                                8
                             };
+                            let aligned_size = (size + alignment - 1) & !(alignment - 1);
                             // Align stack offset before allocating
                             self.stack_offset =
                                 (self.stack_offset + alignment - 1) & !(alignment - 1);

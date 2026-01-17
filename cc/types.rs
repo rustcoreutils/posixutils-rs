@@ -53,6 +53,9 @@ pub struct StructMember {
     pub bit_width: Option<u32>,
     /// For bitfields: size of storage unit in bytes
     pub storage_unit_size: Option<u32>,
+    /// Explicit alignment from _Alignas specifier (C11 6.7.5)
+    /// None means use natural alignment for the type
+    pub explicit_align: Option<u32>,
 }
 
 /// Information about a struct/union member lookup
@@ -153,6 +156,9 @@ bitflags::bitflags! {
 
         // C11 atomic type qualifier
         const ATOMIC = 1 << 16;
+
+        // C11 thread-local storage specifier
+        const THREAD_LOCAL = 1 << 17;
     }
 }
 
@@ -1173,7 +1179,12 @@ impl TypeTable {
                     current_storage_unit_size = 0;
                 }
 
-                let align = self.alignment(member.typ);
+                // Use explicit alignment from _Alignas if specified, otherwise natural alignment
+                let natural_align = self.alignment(member.typ);
+                let align = member
+                    .explicit_align
+                    .map(|a| a as usize)
+                    .unwrap_or(natural_align);
                 max_align = max_align.max(align);
 
                 offset = (offset + align - 1) & !(align - 1);
@@ -1212,7 +1223,13 @@ impl TypeTable {
         for member in members.iter_mut() {
             member.offset = 0;
             max_size = max_size.max(self.size_bytes(member.typ));
-            max_align = max_align.max(self.alignment(member.typ));
+            // Use explicit alignment from _Alignas if specified, otherwise natural alignment
+            let natural_align = self.alignment(member.typ);
+            let align = member
+                .explicit_align
+                .map(|a| a as usize)
+                .unwrap_or(natural_align);
+            max_align = max_align.max(align);
         }
 
         let size = if max_align > 1 {

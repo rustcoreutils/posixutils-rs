@@ -1137,6 +1137,50 @@ impl X86_64CodeGen {
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
 
+    /// Emit __builtin_frame_address(level) - return frame pointer at given level
+    pub(super) fn emit_frame_address(&mut self, insn: &Instruction) {
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // For level 0, return the current frame pointer (rbp)
+        // For other levels, we'd need to walk the frame chain, but we simplify
+        // by always returning the current frame pointer
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rbp),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+
+        // Store result
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+    }
+
+    /// Emit __builtin_return_address(level) - return address at given level
+    pub(super) fn emit_return_address(&mut self, insn: &Instruction) {
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // For level 0, return [rbp+8] (the saved return address)
+        // For other levels, we'd need to walk the frame chain
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: 8,
+            }),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+
+        // Store result
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+    }
+
     /// Emit __builtin_fabsf - absolute value of float
     pub(super) fn emit_fabs32(&mut self, insn: &Instruction) {
         let arg = match insn.src.first() {

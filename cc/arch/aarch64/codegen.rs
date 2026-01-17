@@ -142,13 +142,16 @@ impl Aarch64CodeGen {
         name: &str,
         typ: &TypeId,
         init: &crate::ir::Initializer,
+        is_thread_local: bool,
+        explicit_align: Option<u32>,
         types: &TypeTable,
     ) {
         // Skip extern symbols - they're defined elsewhere
         if self.extern_symbols.contains(name) {
             return;
         }
-        self.base.emit_global(name, typ, init, types);
+        self.base
+            .emit_global(name, typ, init, is_thread_local, explicit_align, types);
     }
 
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
@@ -1254,6 +1257,16 @@ impl Aarch64CodeGen {
                 // that should never be reached. If it is reached, the CPU
                 // will generate a SIGTRAP.
                 self.push_lir(Aarch64Inst::Brk { imm: 1 });
+            }
+
+            Opcode::FrameAddress => {
+                // __builtin_frame_address(level)
+                self.emit_frame_address(insn, *total_frame);
+            }
+
+            Opcode::ReturnAddress => {
+                // __builtin_return_address(level)
+                self.emit_return_address(insn, *total_frame);
             }
 
             // ================================================================
@@ -3008,8 +3021,15 @@ impl CodeGenerator for Aarch64CodeGen {
         }
 
         // Emit globals
-        for (name, typ, init) in &module.globals {
-            self.emit_global(name, typ, init, types);
+        for global in &module.globals {
+            self.emit_global(
+                &global.name,
+                &global.typ,
+                &global.init,
+                global.is_thread_local,
+                global.explicit_align,
+                types,
+            );
         }
 
         // Emit string literals

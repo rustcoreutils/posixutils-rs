@@ -766,6 +766,46 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Brk { imm: 1 });
     }
 
+    /// Emit __builtin_frame_address(level) - return frame pointer at given level
+    pub(super) fn emit_frame_address(&mut self, insn: &Instruction, frame_size: i32) {
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // For level 0, return the current frame pointer (x29)
+        // Use x9 as scratch register to hold the frame pointer
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::X29),
+            dst: Reg::X9,
+        });
+
+        // Store result
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, 64, frame_size);
+    }
+
+    /// Emit __builtin_return_address(level) - return address at given level
+    pub(super) fn emit_return_address(&mut self, insn: &Instruction, frame_size: i32) {
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // For level 0, return the link register (x30)
+        // Use x9 as scratch register to hold the return address
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::X30),
+            dst: Reg::X9,
+        });
+
+        // Store result
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, 64, frame_size);
+    }
+
     /// Emit __builtin_alloca - dynamic stack allocation
     pub(super) fn emit_alloca(&mut self, insn: &Instruction, frame_size: i32) {
         let size = match insn.src.first() {

@@ -64,11 +64,7 @@ fn load_fixture(name: &str) -> TestPlan {
         // CLI args test - args are in the file content
         let args_content = fs::read_to_string(&args_path)
             .unwrap_or_else(|_| panic!("Failed to read {}", args_path.display()));
-        let args: Vec<String> = args_content
-            .trim()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        let args: Vec<String> = args_content.split_whitespace().map(String::from).collect();
 
         TestPlan {
             cmd: String::from("m4"),

@@ -49,6 +49,8 @@ pub struct X86_64CodeGen {
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// Thread-local storage symbols (need TLS access via FS segment)
+    pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
     /// Long double constants to emit (label_bits -> value_bits)
@@ -70,6 +72,7 @@ impl X86_64CodeGen {
             num_fixed_fp_params: 0,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
+            tls_symbols: HashSet::new(),
             pic_mode: false,
             ld_constants: HashMap::new(),
             double_constants: HashMap::new(),
@@ -110,7 +113,12 @@ impl X86_64CodeGen {
                 } else {
                     Symbol::global(name.clone())
                 };
-                GpOperand::Mem(MemAddr::RipRelative(symbol))
+                // Use TLS addressing for thread-local variables (Linux only)
+                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                    GpOperand::Mem(MemAddr::TlsIE(symbol))
+                } else {
+                    GpOperand::Mem(MemAddr::RipRelative(symbol))
+                }
             }
         }
     }
@@ -1448,8 +1456,14 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                // LIR: RIP-relative memory-to-register move
+                // LIR: memory-to-register move
                 // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
+                let symbol = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+
                 if self.needs_got_access(&name) {
                     // External symbols on macOS: load address from GOT, then load value
                     // Use R11 as temp if dst is R11, otherwise use dst
@@ -1467,12 +1481,15 @@ impl X86_64CodeGen {
                         }),
                         dst: GpOperand::Reg(dst),
                     });
+                } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                    // Thread-local storage: use FS segment (initial-exec model)
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                        dst: GpOperand::Reg(dst),
+                    });
                 } else {
-                    let symbol = if name.starts_with('.') {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
+                    // Regular RIP-relative access
                     self.push_lir(X86Inst::Mov {
                         size: op_size,
                         src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
@@ -1842,6 +1859,13 @@ impl X86_64CodeGen {
                     } else {
                         Symbol::global(name.clone())
                     };
+                    // Choose addressing mode: TLS or RIP-relative
+                    let mem_addr =
+                        if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                            MemAddr::TlsIE(symbol)
+                        } else {
+                            MemAddr::RipRelative(symbol)
+                        };
                     if mem_size <= 16 {
                         // LIR: sign/zero extending load from global
                         let src_size = OperandSize::from_bits(mem_size);
@@ -1849,14 +1873,14 @@ impl X86_64CodeGen {
                             self.push_lir(X86Inst::Movzx {
                                 src_size,
                                 dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::RipRelative(symbol.clone())),
+                                src: GpOperand::Mem(mem_addr.clone()),
                                 dst: dst_reg,
                             });
                         } else {
                             self.push_lir(X86Inst::Movsx {
                                 src_size,
                                 dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::RipRelative(symbol.clone())),
+                                src: GpOperand::Mem(mem_addr.clone()),
                                 dst: dst_reg,
                             });
                         }
@@ -1865,7 +1889,7 @@ impl X86_64CodeGen {
                         let op_size = OperandSize::from_bits(reg_size);
                         self.push_lir(X86Inst::Mov {
                             size: op_size,
-                            src: GpOperand::Mem(MemAddr::RipRelative(symbol)),
+                            src: GpOperand::Mem(mem_addr),
                             dst: GpOperand::Reg(dst_reg),
                         });
                     }
@@ -2022,6 +2046,12 @@ impl X86_64CodeGen {
                 // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
                 let is_local_label = name.starts_with('.');
                 let op_size = OperandSize::from_bits(mem_size);
+                let symbol = if is_local_label {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+
                 if self.needs_got_access(&name) {
                     // External symbols on macOS: load address from GOT, then store
                     self.push_lir(X86Inst::Mov {
@@ -2037,12 +2067,14 @@ impl X86_64CodeGen {
                             offset: insn.offset as i32,
                         }),
                     });
+                } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                    // Thread-local storage: use FS segment (initial-exec model)
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(value_reg),
+                        dst: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                    });
                 } else {
-                    let symbol = if is_local_label {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
                     // LIR: store to global via RIP-relative
                     self.push_lir(X86Inst::Mov {
                         size: op_size,
@@ -3577,6 +3609,14 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
+
+        // Collect thread-local storage symbols
+        self.tls_symbols = module
+            .globals
+            .iter()
+            .filter(|g| g.is_thread_local)
+            .map(|g| g.name.clone())
+            .collect();
 
         // Emit file header
         self.emit_header();

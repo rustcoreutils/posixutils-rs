@@ -94,7 +94,6 @@ fn load_fixture(name: &str) -> TestPlan {
     }
 }
 
-
 /// Checker for expect_error tests - only check that stderr is non-empty if expected
 fn expect_error_checker(plan: &TestPlan, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -105,7 +104,11 @@ fn expect_error_checker(plan: &TestPlan, output: &Output) {
         assert!(!output.stderr.is_empty(), "expected stderr to be non-empty");
     }
 
-    assert_eq!(output.status.code(), Some(plan.expected_exit_code), "exit code mismatch");
+    assert_eq!(
+        output.status.code(),
+        Some(plan.expected_exit_code),
+        "exit code mismatch"
+    );
 }
 
 /// Checker for stdout_regex tests
@@ -123,7 +126,11 @@ fn stdout_regex_checker(regex_pattern: &str) -> impl Fn(&TestPlan, &Output) + '_
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(stderr.as_ref(), &plan.expected_err, "stderr mismatch");
 
-        assert_eq!(output.status.code(), Some(plan.expected_exit_code), "exit code mismatch");
+        assert_eq!(
+            output.status.code(),
+            Some(plan.expected_exit_code),
+            "exit code mismatch"
+        );
     }
 }
 
@@ -207,7 +214,9 @@ fn file() {
         cmd: String::from("m4"),
         args: vec![String::from("fixtures/integration_tests/file.m4")],
         stdin_data: String::new(),
-        expected_out: String::from("fixtures/integration_tests/file.m4\nfixtures/integration_tests/include/file.m4"),
+        expected_out: String::from(
+            "fixtures/integration_tests/file.m4\nfixtures/integration_tests/include/file.m4",
+        ),
         expected_err: String::new(),
         expected_exit_code: 0,
     });

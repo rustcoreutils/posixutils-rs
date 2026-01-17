@@ -617,6 +617,87 @@ int main(void) {
 }
 
 // ============================================================================
+// C Tentative Definition Tests
+// ============================================================================
+// Tests for C tentative definitions (C99 6.9.2)
+// A declaration without initializer is tentative, and should be merged with
+// subsequent definitions.
+
+#[test]
+fn test_tentative_definition_basic() {
+    let c_file = create_c_file(
+        "tentative_def_basic",
+        r#"
+// Tentative definition (no initializer)
+int x;
+
+// Actual definition
+int x = 42;
+
+int main(void) {
+    return x;
+}
+"#,
+    );
+
+    let exe = compile(c_file.path(), &[]);
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "tentative definition should be replaced");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_tentative_definition_multiple() {
+    let c_file = create_c_file(
+        "tentative_def_multi",
+        r#"
+// Multiple tentative definitions followed by actual definition
+int y;
+int y;
+int y = 10;
+
+int main(void) {
+    return y;
+}
+"#,
+    );
+
+    let exe = compile(c_file.path(), &[]);
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 10, "multiple tentative definitions should work");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_tentative_definition_only() {
+    let c_file = create_c_file(
+        "tentative_def_only",
+        r#"
+// Only tentative definition - should be zero-initialized
+int z;
+
+int main(void) {
+    return z;
+}
+"#,
+    );
+
+    let exe = compile(c_file.path(), &[]);
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 0, "tentative-only should be zero");
+
+    cleanup_exe(&exe);
+}
+
+// ============================================================================
 // Array Alignment Tests
 // ============================================================================
 // Tests for 16-byte alignment of large arrays (>= 16 bytes)

@@ -108,6 +108,10 @@ pub struct Token {
     pub typ: TokenType,
     pub pos: Position,
     pub value: TokenValue,
+    /// Macros that should not expand this token (C preprocessor "blue painting").
+    /// When a macro's expansion contains its own name, those tokens are marked.
+    /// This prevents re-expansion in nested contexts per C99 6.10.3.4.
+    pub no_expand: Option<std::collections::HashSet<String>>,
 }
 
 impl Token {
@@ -116,11 +120,35 @@ impl Token {
             typ,
             pos,
             value: TokenValue::None,
+            no_expand: None,
         }
     }
 
     pub fn with_value(typ: TokenType, pos: Position, value: TokenValue) -> Self {
-        Self { typ, pos, value }
+        Self {
+            typ,
+            pos,
+            value,
+            no_expand: None,
+        }
+    }
+
+    /// Mark this token as not expandable for the given macro name
+    pub fn mark_no_expand(&mut self, macro_name: &str) {
+        if self.no_expand.is_none() {
+            self.no_expand = Some(std::collections::HashSet::new());
+        }
+        self.no_expand
+            .as_mut()
+            .unwrap()
+            .insert(macro_name.to_string());
+    }
+
+    /// Check if this token should not be expanded for the given macro
+    pub fn is_no_expand(&self, macro_name: &str) -> bool {
+        self.no_expand
+            .as_ref()
+            .is_some_and(|set| set.contains(macro_name))
     }
 }
 
@@ -704,6 +732,11 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 break;
             }
         }
+        // Reset newline flag - comments don't create new logical lines.
+        // This is important for multi-line comments inside macro definitions:
+        // the token after the comment should NOT have newline=true just because
+        // the comment spanned multiple lines.
+        self.newline = false;
     }
 
     /// Get a special token (operator/punctuator)
@@ -1680,5 +1713,58 @@ mod tests {
         if let TokenValue::String(s) = &tokens[1].value {
             assert_eq!(s, "\\n\\t\\r\\\\");
         }
+    }
+
+    #[test]
+    fn test_token_no_expand_initially_none() {
+        let token = Token::new(TokenType::Ident, Position::default());
+        assert!(token.no_expand.is_none());
+        assert!(!token.is_no_expand("FOO"));
+    }
+
+    #[test]
+    fn test_token_mark_no_expand() {
+        let mut token = Token::new(TokenType::Ident, Position::default());
+
+        // Mark a macro as no-expand
+        token.mark_no_expand("FOO");
+        assert!(token.is_no_expand("FOO"));
+        assert!(!token.is_no_expand("BAR"));
+
+        // Can mark multiple macros
+        token.mark_no_expand("BAR");
+        assert!(token.is_no_expand("FOO"));
+        assert!(token.is_no_expand("BAR"));
+        assert!(!token.is_no_expand("BAZ"));
+    }
+
+    #[test]
+    fn test_token_with_value_no_expand_none() {
+        let token = Token::with_value(
+            TokenType::Number,
+            Position::default(),
+            TokenValue::Number("42".to_string()),
+        );
+        assert!(token.no_expand.is_none());
+    }
+
+    #[test]
+    fn test_multiline_comment_newline_flag() {
+        // After a multiline comment, the next token should NOT have
+        // newline=true just because the comment spanned lines.
+        // The comment fix resets the newline flag.
+        let (tokens, idents) = tokenize_str("a /* multi\nline\ncomment */ b");
+        assert_eq!(tokens.len(), 4); // StreamBegin, a, b, StreamEnd
+
+        // 'a' and 'b' should both be identifiers
+        assert_eq!(show_token(&tokens[1], &idents), "a");
+        assert_eq!(show_token(&tokens[2], &idents), "b");
+
+        // 'b' should NOT have newline=true (it follows comment on same logical line)
+        // The comment was on the same line as 'a', so 'b' continues that line
+        assert!(
+            !tokens[2].pos.newline,
+            "token after multiline comment should not have newline flag"
+        );
     }
 }

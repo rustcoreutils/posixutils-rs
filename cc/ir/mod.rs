@@ -1569,6 +1569,8 @@ impl Module {
     }
 
     /// Add a global variable with explicit alignment (C11 _Alignas)
+    /// Handles C tentative definitions: if a global with the same name exists
+    /// and has Initializer::None (tentative), replace it with the new definition.
     pub fn add_global_aligned(
         &mut self,
         name: impl Into<String>,
@@ -1576,11 +1578,26 @@ impl Module {
         init: Initializer,
         align: Option<u32>,
     ) {
+        let name = name.into();
+        // Check for existing tentative definition
+        if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
+            // Replace tentative definition with actual definition
+            if matches!(existing.init, Initializer::None) {
+                existing.typ = typ;
+                existing.init = init;
+                if align.is_some() {
+                    existing.explicit_align = align;
+                }
+                return;
+            }
+        }
         self.globals
             .push(GlobalDef::new(name, typ, init).with_align(align));
     }
 
     /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
+    /// Handles C tentative definitions: if a global with the same name exists
+    /// and has Initializer::None (tentative), replace it with the new definition.
     pub fn add_global_tls_aligned(
         &mut self,
         name: impl Into<String>,
@@ -1588,6 +1605,20 @@ impl Module {
         init: Initializer,
         align: Option<u32>,
     ) {
+        let name = name.into();
+        // Check for existing tentative definition
+        if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
+            // Replace tentative definition with actual definition
+            if matches!(existing.init, Initializer::None) {
+                existing.typ = typ;
+                existing.init = init;
+                existing.is_thread_local = true;
+                if align.is_some() {
+                    existing.explicit_align = align;
+                }
+                return;
+            }
+        }
         self.globals
             .push(GlobalDef::thread_local(name, typ, init).with_align(align));
     }
@@ -1926,5 +1957,54 @@ mod tests {
         assert_eq!(Opcode::Fabs64.name(), "fabs64");
         assert!(!Opcode::Fabs32.is_terminator());
         assert!(!Opcode::Fabs64.is_terminator());
+    }
+
+    #[test]
+    fn test_add_global_aligned_tentative_definition() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::new();
+
+        // Add a tentative definition (no initializer)
+        module.add_global_aligned("x", types.int_id, Initializer::None, None);
+        assert_eq!(module.globals.len(), 1);
+        assert!(matches!(module.globals[0].init, Initializer::None));
+
+        // Add actual definition - should replace the tentative one
+        module.add_global_aligned("x", types.int_id, Initializer::Int(42), Some(4));
+        assert_eq!(module.globals.len(), 1); // Still only one global
+        assert!(matches!(module.globals[0].init, Initializer::Int(42)));
+        assert_eq!(module.globals[0].explicit_align, Some(4));
+    }
+
+    #[test]
+    fn test_add_global_aligned_non_tentative_not_replaced() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::new();
+
+        // Add a real definition (with initializer)
+        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None);
+        assert_eq!(module.globals.len(), 1);
+
+        // Add another definition with same name - should NOT replace (adds new entry)
+        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None);
+        assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
+    }
+
+    #[test]
+    fn test_add_global_tls_aligned_tentative_definition() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::new();
+
+        // Add a TLS tentative definition
+        module.add_global_tls_aligned("tls_var", types.int_id, Initializer::None, None);
+        assert_eq!(module.globals.len(), 1);
+        assert!(matches!(module.globals[0].init, Initializer::None));
+
+        // Add actual TLS definition - should replace
+        module.add_global_tls_aligned("tls_var", types.int_id, Initializer::Int(100), Some(8));
+        assert_eq!(module.globals.len(), 1);
+        assert!(matches!(module.globals[0].init, Initializer::Int(100)));
+        assert!(module.globals[0].is_thread_local);
+        assert_eq!(module.globals[0].explicit_align, Some(8));
     }
 }

@@ -523,6 +523,57 @@ int main(void) {
 }
 
 // ============================================================================
+// Hex Floats and Suffix Disambiguation Tests
+// ============================================================================
+
+#[test]
+fn hex_integer_not_float_suffix() {
+    // Hex integers ending in f16/f32/f64 should be parsed as integers,
+    // not as floats with C23 suffixes (f/F are valid hex digits)
+    let code = r#"
+int main(void) {
+    // 0x1f16 is a hex integer, not 0x1 with f16 suffix
+    int a = 0x1f16;
+    if (a != 0x1f16) return 1;  // 7958
+
+    // 0xABCf32 is hex integer 0xABCF32
+    long b = 0xABCf32;
+    if (b != 0xABCf32) return 2;  // 11259698
+
+    // 0x123f64 is hex integer
+    long c = 0x123f64;
+    if (c != 0x123f64) return 3;  // 1196900
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("hex_int_suffix", code, &[]), 0);
+}
+
+#[test]
+fn hex_float_with_exponent() {
+    // Valid hex floats use 'p' exponent (not 'e')
+    let code = r#"
+int main(void) {
+    // 0x1.0p5 = 1.0 * 2^5 = 32.0
+    double d = 0x1.0p5;
+    if (d < 31.9 || d > 32.1) return 1;
+
+    // 0x1.8p3 = 1.5 * 2^3 = 12.0
+    d = 0x1.8p3;
+    if (d < 11.9 || d > 12.1) return 2;
+
+    // Negative exponent: 0x1.0p-1 = 0.5
+    d = 0x1.0p-1;
+    if (d < 0.49 || d > 0.51) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("hex_float_exp", code, &[]), 0);
+}
+
+// ============================================================================
 // Float/Double: Structs, Functions, and Initializers
 // ============================================================================
 

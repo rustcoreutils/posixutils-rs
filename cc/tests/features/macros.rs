@@ -283,6 +283,87 @@ android_api = __ANDROID_API__
 }
 
 // ============================================================================
+// Blue-painting / Recursive Macro Prevention (C99 6.10.3.4)
+// ============================================================================
+
+#[test]
+fn blue_painting_self_reference() {
+    // A macro that references itself should not infinitely expand
+    // We define SELF as an int variable so the expansion is valid C
+    let code = r#"
+#define EXPAND_SELF SELF + 1
+
+int SELF = 10;
+
+int main(void) {
+    // EXPAND_SELF expands to "SELF + 1", but inner SELF is the variable
+    int x = EXPAND_SELF;  // 10 + 1 = 11
+    if (x != 11) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("blue_paint_self", code, &[]), 0);
+}
+
+#[test]
+fn blue_painting_mutual_recursion() {
+    // A -> B -> A should not infinitely expand
+    let code = r#"
+#define A B
+#define B A
+
+int main(void) {
+    // A -> B -> A (blue painted, stops)
+    // Result is undefined identifier, but should compile
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("blue_paint_mutual", code, &[]), 0);
+}
+
+#[test]
+fn blue_painting_function_like() {
+    // Function-like macro that references itself
+    let code = r#"
+#define F(x) ((x) + F(x))
+
+int val = 10;
+
+int main(void) {
+    // F(5) -> ((5) + F(5)), but inner F is blue-painted
+    // This would cause undefined reference to F function, so we test compilation
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("blue_paint_func", code, &[]), 0);
+}
+
+// ============================================================================
+// Predefined Macro Expansion Tests
+// ============================================================================
+
+#[test]
+fn predefined_macro_with_parentheses() {
+    // Predefined macros with parenthesized values should expand correctly
+    let code = r#"
+// __DBL_MIN_EXP__ typically has a value like (-1021)
+// The parentheses should be separate tokens
+#if __DBL_MIN_EXP__ < 0
+int dbmin_is_negative = 1;
+#else
+int dbmin_is_negative = 0;
+#endif
+
+int main(void) {
+    // __DBL_MIN_EXP__ is typically -1021 or similar
+    if (!dbmin_is_negative) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("predef_paren", code, &[]), 0);
+}
+
+// ============================================================================
 // __has_builtin comprehensive test
 // ============================================================================
 

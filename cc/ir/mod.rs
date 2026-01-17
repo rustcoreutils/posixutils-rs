@@ -1583,7 +1583,13 @@ impl Module {
         if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
-                existing.typ = typ;
+                // C99 6.9.2: Multiple declarations must have compatible types.
+                // The parser should enforce this; assert here as a safety check.
+                debug_assert_eq!(
+                    existing.typ, typ,
+                    "tentative definition type mismatch for '{}'",
+                    name
+                );
                 existing.init = init;
                 if align.is_some() {
                     existing.explicit_align = align;
@@ -1610,7 +1616,13 @@ impl Module {
         if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
-                existing.typ = typ;
+                // C99 6.9.2: Multiple declarations must have compatible types.
+                // The parser should enforce this; assert here as a safety check.
+                debug_assert_eq!(
+                    existing.typ, typ,
+                    "tentative definition type mismatch for '{}'",
+                    name
+                );
                 existing.init = init;
                 existing.is_thread_local = true;
                 if align.is_some() {

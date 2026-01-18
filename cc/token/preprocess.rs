@@ -2879,7 +2879,31 @@ impl<'a> Preprocessor<'a> {
         match builtin {
             BuiltinMacro::HasAttribute => {
                 // Return true for attributes we actually implement
-                matches!(name.as_str(), "noreturn" | "__noreturn__")
+                matches!(
+                    name.as_str(),
+                    "noreturn"
+                        | "__noreturn__"
+                        | "unused"
+                        | "__unused__"
+                        | "aligned"
+                        | "__aligned__"
+                        | "packed"
+                        | "__packed__"
+                        | "deprecated"
+                        | "__deprecated__"
+                        | "weak"
+                        | "__weak__"
+                        | "section"
+                        | "__section__"
+                        | "visibility"
+                        | "__visibility__"
+                        | "constructor"
+                        | "__constructor__"
+                        | "destructor"
+                        | "__destructor__"
+                        | "used"
+                        | "__used__"
+                )
             }
             BuiltinMacro::HasBuiltin => {
                 // Return true only for builtins actually implemented in the compiler
@@ -2954,13 +2978,20 @@ impl<'a> Preprocessor<'a> {
                         | "__c11_atomic_signal_fence"
                 )
             }
-            BuiltinMacro::HasFeature => {
-                // Return true for GNU extensions we implement
-                matches!(name.as_str(), "statement_expressions")
-            }
-            BuiltinMacro::HasExtension => {
-                // Return true for GNU extensions we implement
-                matches!(name.as_str(), "statement_expressions")
+            BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
+                // Return true for features/extensions we implement
+                matches!(
+                    name.as_str(),
+                    // GNU extensions
+                    "statement_expressions" |
+                    "statement_expressions_in_macros" |
+                    "gnu_asm" |
+                    // C11 features
+                    "c_atomic" |
+                    "c_static_assert" |
+                    "c_alignof" |
+                    "c_thread_local"
+                )
             }
             _ => false,
         }
@@ -3379,7 +3410,31 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         };
 
         // Return 1 for attributes we actually implement
-        let supported = matches!(name.as_str(), "noreturn" | "__noreturn__");
+        let supported = matches!(
+            name.as_str(),
+            "noreturn"
+                | "__noreturn__"
+                | "unused"
+                | "__unused__"
+                | "aligned"
+                | "__aligned__"
+                | "packed"
+                | "__packed__"
+                | "deprecated"
+                | "__deprecated__"
+                | "weak"
+                | "__weak__"
+                | "section"
+                | "__section__"
+                | "visibility"
+                | "__visibility__"
+                | "constructor"
+                | "__constructor__"
+                | "destructor"
+                | "__destructor__"
+                | "used"
+                | "__used__"
+        );
         if supported {
             1
         } else {
@@ -3483,10 +3538,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        // Return 1 for GNU extensions we implement
+        // Return 1 for features/extensions we implement
         let supported = matches!(
             name.as_str(),
-            "statement_expressions" // GNU ({ }) extension
+            // GNU extensions
+            "statement_expressions" | // GNU ({ }) extension
+            "statement_expressions_in_macros" |
+            "gnu_asm" |
+            // C11 features
+            "c_atomic" |
+            "c_static_assert" |
+            "c_alignof" |
+            "c_thread_local"
         );
 
         if supported {

@@ -6567,6 +6567,8 @@ impl Parser<'_> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i64),
+            // Float literals are constant, return truncated value
+            ExprKind::FloatLit(val) => Some(*val as i64),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;

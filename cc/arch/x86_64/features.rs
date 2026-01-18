@@ -278,6 +278,8 @@ impl X86_64CodeGen {
         });
 
         // Overflow path
+        // Bug fix: Load overflow_arg_area pointer into R11 FIRST, then load value into Rax.
+        // This prevents the pointer from being clobbered when storing to a register destination.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
@@ -285,20 +287,52 @@ impl X86_64CodeGen {
                 base: ap_base,
                 offset: ap_base_offset + 8,
             }),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        // Load value from [R11] into Rax, then store to destination
+        self.push_lir(X86Inst::Mov {
+            size: lir_arg_size,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset: 0,
+            }),
             dst: GpOperand::Reg(Reg::Rax),
         });
 
-        self.emit_va_arg_store_int(dst_loc, Reg::Rax, lir_arg_size);
+        // Store value from Rax to destination
+        match dst_loc {
+            Loc::Reg(r) => {
+                if *r != Reg::Rax {
+                    self.push_lir(X86Inst::Mov {
+                        size: lir_arg_size,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(*r),
+                    });
+                }
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::Mov {
+                    size: lir_arg_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
 
-        // Advance overflow_arg_area
+        // Advance overflow_arg_area (using R11 which still has the original pointer)
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
             src: GpOperand::Imm(arg_bytes as i64),
-            dst: Reg::Rax,
+            dst: Reg::R11,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rax),
+            src: GpOperand::Reg(Reg::R11),
             dst: GpOperand::Mem(MemAddr::BaseOffset {
                 base: ap_base,
                 offset: ap_base_offset + 8,

@@ -11,7 +11,6 @@
 
 use plib::testing::run_test_base;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::NamedTempFile;
 
@@ -37,15 +36,6 @@ pub const COMPILE_MATRIX: &[(&str, &[&str])] = &[("debug_opt", &["-g", "-O"])];
 // File Path Utilities
 // ============================================================================
 
-/// Get path to a test input file in a specific test directory
-pub fn get_test_file_path(test_dir: &str, filename: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests");
-    path.push(test_dir);
-    path.push(filename);
-    path
-}
-
 /// Create a temporary C file with the given content
 /// Returns NamedTempFile which auto-deletes on drop
 pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
@@ -57,68 +47,6 @@ pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
     file.write_all(content.as_bytes())
         .expect("failed to write test file");
     file
-}
-
-// ============================================================================
-// Low-level Compile/Run Utilities
-// ============================================================================
-
-/// Compile a C file using pcc and return the path to the executable
-/// The executable is placed in temp dir and must be cleaned up by caller
-pub fn compile(c_file: &Path, extra_opts: &[&str]) -> Option<PathBuf> {
-    let thread_id = format!("{:?}", std::thread::current().id());
-    let exe_path = std::env::temp_dir().join(format!(
-        "pcc_exe_{}_{}",
-        c_file.file_stem().unwrap().to_string_lossy(),
-        thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
-    ));
-
-    let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
-    args.extend(extra_opts.iter().map(|s| s.to_string()));
-    args.push(c_file.to_string_lossy().to_string());
-
-    let output = run_test_base("pcc", &args, &[]);
-
-    if output.status.success() {
-        Some(exe_path)
-    } else {
-        eprintln!("pcc failed: {}", String::from_utf8_lossy(&output.stderr));
-        None
-    }
-}
-
-/// Compile a C file from a specific test directory
-#[allow(dead_code)]
-pub fn compile_test_file(test_dir: &str, filename: &str) -> Option<PathBuf> {
-    let c_file = get_test_file_path(test_dir, filename);
-    compile(&c_file, &[])
-}
-
-/// Run an executable and return its exit code
-pub fn run(exe: &PathBuf) -> i32 {
-    let output = Command::new(exe)
-        .output()
-        .expect("failed to run executable");
-    output.status.code().unwrap_or(-1)
-}
-
-/// Run an executable and return (exit_code, stdout)
-pub fn run_with_output(exe: &PathBuf) -> (i32, String) {
-    let output = Command::new(exe)
-        .output()
-        .expect("failed to run executable");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-    )
-}
-
-/// Clean up an executable file
-#[allow(dead_code)]
-pub fn cleanup_exe(exe_file: &Option<PathBuf>) {
-    if let Some(exe) = exe_file {
-        let _ = std::fs::remove_file(exe);
-    }
 }
 
 // ============================================================================

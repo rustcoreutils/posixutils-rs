@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Tests for `char`, `signed char`, and `unsigned char` data types
+// Tests are aggregated by category to reduce compile/link overhead
 //
 // C99 Note: These three types are distinct. Plain `char` has implementation-
 // defined signedness:
@@ -15,12 +16,13 @@
 //
 // Character literals (e.g., 'A') have type `int` in C, not `char`.
 //
+// Return code convention:
+//   - char tests: return codes 1-99
+//   - signed char tests: return codes 101-199
+//   - unsigned char tests: return codes 201-299
+//
 
 use crate::common::compile_and_run;
-
-// ############################################################################
-// CHAR TESTS (platform-dependent signedness, signed on x86-64)
-// ############################################################################
 
 // ============================================================================
 // Char: Basic Operations and Character Literals
@@ -165,260 +167,525 @@ int main(void) {
 }
 
 // ============================================================================
-// Char: Arithmetic Operators
+// Char Types: Arithmetic Operators
 // ============================================================================
 
 #[test]
-fn char_arithmetic_operators() {
+fn char_types_arithmetic_operators() {
     let code = r#"
 int main(void) {
-    char a, b, result;
+    // === char arithmetic (returns 1-10) ===
+    {
+        char a, b, result;
 
-    // Addition
-    a = 30; b = 12;
-    result = a + b;
-    if (result != 42) return 1;
+        // Addition
+        a = 30; b = 12;
+        result = a + b;
+        if (result != 42) return 1;
 
-    // Subtraction
-    a = 100; b = 58;
-    result = a - b;
-    if (result != 42) return 2;
+        // Subtraction
+        a = 100; b = 58;
+        result = a - b;
+        if (result != 42) return 2;
 
-    // Multiplication
-    a = 6; b = 7;
-    result = a * b;
-    if (result != 42) return 3;
+        // Multiplication
+        a = 6; b = 7;
+        result = a * b;
+        if (result != 42) return 3;
 
-    // Division
-    a = 84; b = 2;
-    result = a / b;
-    if (result != 42) return 4;
+        // Division
+        a = 84; b = 2;
+        result = a / b;
+        if (result != 42) return 4;
 
-    // Modulo
-    a = 47; b = 10;
-    result = a % b;
-    if (result != 7) return 5;
+        // Modulo
+        a = 47; b = 10;
+        result = a % b;
+        if (result != 7) return 5;
 
-    // Unary negation (char is signed on x86-64)
-    a = 42;
-    result = -a;
-    if (result != -42) return 6;
+        // Unary negation (char is signed on x86-64)
+        a = 42;
+        result = -a;
+        if (result != -42) return 6;
 
-    // Unary plus
-    a = 42;
-    result = +a;
-    if (result != 42) return 7;
+        // Unary plus
+        a = 42;
+        result = +a;
+        if (result != 42) return 7;
+    }
+
+    // === signed char arithmetic (returns 101-110) ===
+    {
+        signed char a, b, result;
+
+        // Addition
+        a = 30; b = 12;
+        result = a + b;
+        if (result != 42) return 101;
+
+        // Subtraction
+        a = 100; b = 58;
+        result = a - b;
+        if (result != 42) return 102;
+
+        // Multiplication
+        a = 6; b = 7;
+        result = a * b;
+        if (result != 42) return 103;
+
+        // Division
+        a = 84; b = 2;
+        result = a / b;
+        if (result != 42) return 104;
+
+        // Modulo
+        a = 47; b = 10;
+        result = a % b;
+        if (result != 7) return 105;
+
+        // Negative values
+        a = -42;
+        if (-a != 42) return 106;
+
+        // Negative arithmetic
+        a = -20; b = -22;
+        if (a + b != -42) return 107;
+    }
+
+    // === unsigned char arithmetic (returns 201-210) ===
+    {
+        unsigned char a, b, result;
+
+        // Addition
+        a = 30; b = 12;
+        result = a + b;
+        if (result != 42) return 201;
+
+        // Subtraction
+        a = 100; b = 58;
+        result = a - b;
+        if (result != 42) return 202;
+
+        // Multiplication
+        a = 6; b = 7;
+        result = a * b;
+        if (result != 42) return 203;
+
+        // Division
+        a = 84; b = 2;
+        result = a / b;
+        if (result != 42) return 204;
+
+        // Modulo
+        a = 47; b = 10;
+        result = a % b;
+        if (result != 7) return 205;
+
+        // Max value
+        a = 255;
+        if (a != 255) return 206;
+
+        // Large values
+        a = 200; b = 50;
+        result = a - b;
+        if (result != 150) return 207;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_arith", code, &[]), 0);
+    assert_eq!(compile_and_run("char_types_arith", code, &[]), 0);
 }
 
 // ============================================================================
-// Char: Comparison Operators
+// Char Types: Comparison Operators
 // ============================================================================
 
 #[test]
-fn char_comparison_operators() {
+fn char_types_comparison_operators() {
     let code = r#"
 int main(void) {
-    char a, b;
+    // === char comparison (returns 1-15) ===
+    {
+        char a, b;
 
-    // Equal - true
-    a = 'X'; b = 'X';
-    if ((a == b) != 1) return 1;
+        // Equal - true
+        a = 'X'; b = 'X';
+        if ((a == b) != 1) return 1;
 
-    // Equal - false
-    a = 'X'; b = 'Y';
-    if ((a == b) != 0) return 2;
+        // Equal - false
+        a = 'X'; b = 'Y';
+        if ((a == b) != 0) return 2;
 
-    // Not equal - true
-    a = 'A'; b = 'B';
-    if ((a != b) != 1) return 3;
+        // Not equal - true
+        a = 'A'; b = 'B';
+        if ((a != b) != 1) return 3;
 
-    // Not equal - false
-    a = 'Z'; b = 'Z';
-    if ((a != b) != 0) return 4;
+        // Not equal - false
+        a = 'Z'; b = 'Z';
+        if ((a != b) != 0) return 4;
 
-    // Less than - true
-    a = 'A'; b = 'Z';
-    if ((a < b) != 1) return 5;
+        // Less than - true
+        a = 'A'; b = 'Z';
+        if ((a < b) != 1) return 5;
 
-    // Less than - false
-    a = 'Z'; b = 'A';
-    if ((a < b) != 0) return 6;
+        // Less than - false
+        a = 'Z'; b = 'A';
+        if ((a < b) != 0) return 6;
 
-    // Less or equal - true (less)
-    a = 'A'; b = 'B';
-    if ((a <= b) != 1) return 7;
+        // Less or equal - true (less)
+        a = 'A'; b = 'B';
+        if ((a <= b) != 1) return 7;
 
-    // Less or equal - true (equal)
-    a = 'M'; b = 'M';
-    if ((a <= b) != 1) return 8;
+        // Less or equal - true (equal)
+        a = 'M'; b = 'M';
+        if ((a <= b) != 1) return 8;
 
-    // Greater than - true
-    a = 'Z'; b = 'A';
-    if ((a > b) != 1) return 9;
+        // Greater than - true
+        a = 'Z'; b = 'A';
+        if ((a > b) != 1) return 9;
 
-    // Greater than - false
-    a = 'A'; b = 'Z';
-    if ((a > b) != 0) return 10;
+        // Greater than - false
+        a = 'A'; b = 'Z';
+        if ((a > b) != 0) return 10;
 
-    // Greater or equal - true
-    a = 'Z'; b = 'A';
-    if ((a >= b) != 1) return 11;
+        // Greater or equal - true
+        a = 'Z'; b = 'A';
+        if ((a >= b) != 1) return 11;
 
-    // Greater or equal - true (equal)
-    a = 'K'; b = 'K';
-    if ((a >= b) != 1) return 12;
+        // Greater or equal - true (equal)
+        a = 'K'; b = 'K';
+        if ((a >= b) != 1) return 12;
+    }
+
+    // === signed char comparison (returns 101-110) ===
+    {
+        signed char a, b;
+
+        // Negative less than positive
+        a = -10; b = 10;
+        if ((a < b) != 1) return 101;
+
+        // Negative comparison
+        a = -20; b = -10;
+        if ((a < b) != 1) return 102;  // -20 < -10
+
+        // Equal negative
+        a = -42; b = -42;
+        if ((a == b) != 1) return 103;
+
+        // Range boundaries
+        a = -128; b = 127;
+        if ((a < b) != 1) return 104;
+
+        // Min value comparison
+        a = -128;
+        if (a >= 0) return 105;  // Should be false
+    }
+
+    // === unsigned char comparison (returns 201-210) ===
+    {
+        unsigned char a, b;
+
+        // Basic comparison
+        a = 200; b = 100;
+        if ((a > b) != 1) return 201;
+
+        // Equal
+        a = 255; b = 255;
+        if ((a == b) != 1) return 202;
+
+        // Max value comparison
+        a = 255; b = 0;
+        if ((a > b) != 1) return 203;
+
+        // Zero is minimum
+        a = 0; b = 1;
+        if ((a < b) != 1) return 204;
+
+        // Unsigned comparison (no negative)
+        a = 255;
+        if (a < 0) return 205;  // Should always be false for unsigned
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_cmp", code, &[]), 0);
+    assert_eq!(compile_and_run("char_types_cmp", code, &[]), 0);
 }
 
 // ============================================================================
-// Char: Bitwise Operators
+// Char Types: Bitwise Operators
 // ============================================================================
 
 #[test]
-fn char_bitwise_operators() {
+fn char_types_bitwise_operators() {
     let code = r#"
 int main(void) {
-    char a, b;
+    // === char bitwise (returns 1-10) ===
+    {
+        char a, b;
 
-    // Bitwise AND
-    a = 0x3F; b = 0x0F;
-    if ((a & b) != 0x0F) return 1;
+        // Bitwise AND
+        a = 0x3F; b = 0x0F;
+        if ((a & b) != 0x0F) return 1;
 
-    // Bitwise OR
-    a = 0x30; b = 0x0F;
-    if ((a | b) != 0x3F) return 2;
+        // Bitwise OR
+        a = 0x30; b = 0x0F;
+        if ((a | b) != 0x3F) return 2;
 
-    // Bitwise XOR
-    a = 0x3F; b = 0x30;
-    if ((a ^ b) != 0x0F) return 3;
+        // Bitwise XOR
+        a = 0x3F; b = 0x30;
+        if ((a ^ b) != 0x0F) return 3;
 
-    // Left shift
-    a = 1;
-    if ((a << 4) != 16) return 4;
+        // Left shift
+        a = 1;
+        if ((a << 4) != 16) return 4;
 
-    // Right shift
-    a = 64;
-    if ((a >> 2) != 16) return 5;
+        // Right shift
+        a = 64;
+        if ((a >> 2) != 16) return 5;
 
-    // Case conversion: uppercase to lowercase (set bit 5)
-    a = 'A';
-    if ((a | 0x20) != 'a') return 6;
+        // Case conversion: uppercase to lowercase (set bit 5)
+        a = 'A';
+        if ((a | 0x20) != 'a') return 6;
 
-    // Case conversion: lowercase to uppercase (clear bit 5)
-    a = 'a';
-    if ((a & ~0x20) != 'A') return 7;
+        // Case conversion: lowercase to uppercase (clear bit 5)
+        a = 'a';
+        if ((a & ~0x20) != 'A') return 7;
+    }
+
+    // === unsigned char bitwise (returns 201-210) ===
+    {
+        unsigned char a, b;
+
+        // Bitwise AND
+        a = 0xFF; b = 0x0F;
+        if ((a & b) != 0x0F) return 201;
+
+        // Bitwise OR
+        a = 0xF0; b = 0x0F;
+        if ((a | b) != 0xFF) return 202;
+
+        // Bitwise XOR
+        a = 0xFF; b = 0xF0;
+        if ((a ^ b) != 0x0F) return 203;
+
+        // Bitwise NOT (result masked to 8 bits when stored)
+        a = 0;
+        b = ~a;
+        if (b != 0xFF) return 204;
+
+        // Left shift
+        a = 1;
+        if ((a << 4) != 16) return 205;
+
+        // Right shift (logical for unsigned)
+        a = 128;
+        if ((a >> 1) != 64) return 206;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_bitwise", code, &[]), 0);
+    assert_eq!(compile_and_run("char_types_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
-// Char: Assignment Operators
+// Char Types: Assignment Operators
 // ============================================================================
 
 #[test]
-fn char_assignment_operators() {
+fn char_types_assignment_operators() {
     let code = r#"
 int main(void) {
-    char a;
+    // === char assignment (returns 1-10) ===
+    {
+        char a;
 
-    // Simple assignment
-    a = 42;
-    if (a != 42) return 1;
+        // Simple assignment
+        a = 42;
+        if (a != 42) return 1;
 
-    // Add assign
-    a = 40;
-    a += 2;
-    if (a != 42) return 2;
+        // Add assign
+        a = 40;
+        a += 2;
+        if (a != 42) return 2;
 
-    // Sub assign
-    a = 50;
-    a -= 8;
-    if (a != 42) return 3;
+        // Sub assign
+        a = 50;
+        a -= 8;
+        if (a != 42) return 3;
 
-    // Mul assign
-    a = 21;
-    a *= 2;
-    if (a != 42) return 4;
+        // Mul assign
+        a = 21;
+        a *= 2;
+        if (a != 42) return 4;
 
-    // Div assign
-    a = 84;
-    a /= 2;
-    if (a != 42) return 5;
+        // Div assign
+        a = 84;
+        a /= 2;
+        if (a != 42) return 5;
 
-    // Mod assign
-    a = 50;
-    a %= 8;
-    if (a != 2) return 6;
+        // Mod assign
+        a = 50;
+        a %= 8;
+        if (a != 2) return 6;
 
-    // And assign
-    a = 0x7F;
-    a &= 0x0F;
-    if (a != 15) return 7;
+        // And assign
+        a = 0x7F;
+        a &= 0x0F;
+        if (a != 15) return 7;
 
-    // Or assign
-    a = 0x30;
-    a |= 0x0F;
-    if (a != 0x3F) return 8;
+        // Or assign
+        a = 0x30;
+        a |= 0x0F;
+        if (a != 0x3F) return 8;
 
-    // Xor assign
-    a = 0x3F;
-    a ^= 0x30;
-    if (a != 0x0F) return 9;
+        // Xor assign
+        a = 0x3F;
+        a ^= 0x30;
+        if (a != 0x0F) return 9;
+    }
+
+    // === signed char assignment (returns 101-110) ===
+    {
+        signed char a;
+
+        // Simple assignment
+        a = -42;
+        if (a != -42) return 101;
+
+        // Add assign
+        a = -50;
+        a += 8;
+        if (a != -42) return 102;
+
+        // Sub assign
+        a = -40;
+        a -= 2;
+        if (a != -42) return 103;
+
+        // Mul assign with sign
+        a = -21;
+        a *= 2;
+        if (a != -42) return 104;
+
+        // Div assign with sign
+        a = -84;
+        a /= 2;
+        if (a != -42) return 105;
+    }
+
+    // === unsigned char assignment (returns 201-210) ===
+    {
+        unsigned char a;
+
+        // Simple assignment
+        a = 200;
+        if (a != 200) return 201;
+
+        // Add assign
+        a = 40;
+        a += 2;
+        if (a != 42) return 202;
+
+        // Sub assign
+        a = 50;
+        a -= 8;
+        if (a != 42) return 203;
+
+        // Mul assign
+        a = 21;
+        a *= 2;
+        if (a != 42) return 204;
+
+        // Div assign
+        a = 84;
+        a /= 2;
+        if (a != 42) return 205;
+
+        // And assign
+        a = 0xFF;
+        a &= 0x0F;
+        if (a != 15) return 206;
+
+        // Or assign
+        a = 0xF0;
+        a |= 0x0F;
+        if (a != 255) return 207;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_assign", code, &[]), 0);
+    assert_eq!(compile_and_run("char_types_assign", code, &[]), 0);
 }
 
 // ============================================================================
-// Char: Increment/Decrement Operators
+// Char Types: Increment/Decrement Operators
 // ============================================================================
 
 #[test]
-fn char_increment_decrement_operators() {
+fn char_types_increment_decrement_operators() {
     let code = r#"
 int main(void) {
-    char a, b;
+    // === char increment/decrement (returns 1-10) ===
+    {
+        char a, b;
 
-    // Pre-increment
-    a = 'A';
-    b = ++a;
-    if (b != 'B') return 1;
+        // Pre-increment
+        a = 'A';
+        b = ++a;
+        if (b != 'B') return 1;
 
-    // Post-increment (returns original)
-    a = 'M';
-    b = a++;
-    if (b != 'M') return 2;
-    if (a != 'N') return 3;
+        // Post-increment (returns original)
+        a = 'M';
+        b = a++;
+        if (b != 'M') return 2;
+        if (a != 'N') return 3;
 
-    // Pre-decrement
-    a = 'Z';
-    b = --a;
-    if (b != 'Y') return 4;
+        // Pre-decrement
+        a = 'Z';
+        b = --a;
+        if (b != 'Y') return 4;
 
-    // Post-decrement (returns original)
-    a = 'D';
-    b = a--;
-    if (b != 'D') return 5;
-    if (a != 'C') return 6;
+        // Post-decrement (returns original)
+        a = 'D';
+        b = a--;
+        if (b != 'D') return 5;
+        if (a != 'C') return 6;
+    }
+
+    // === unsigned char increment/decrement (returns 201-210) ===
+    {
+        unsigned char a, b;
+
+        // Pre-increment
+        a = 41;
+        if (++a != 42) return 201;
+
+        // Post-increment
+        a = 42;
+        b = a++;
+        if (b != 42) return 202;
+        if (a != 43) return 203;
+
+        // Pre-decrement
+        a = 43;
+        if (--a != 42) return 204;
+
+        // Post-decrement
+        a = 42;
+        b = a--;
+        if (b != 42) return 205;
+        if (a != 41) return 206;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("char_incdec", code, &[]), 0);
+    assert_eq!(compile_and_run("char_types_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -456,352 +723,6 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("char_signed", code, &[]), 0);
-}
-
-// ############################################################################
-// SIGNED CHAR TESTS (explicitly signed, always -128 to 127)
-// ############################################################################
-
-// ============================================================================
-// Signed Char: Arithmetic Operators
-// ============================================================================
-
-#[test]
-fn schar_arithmetic_operators() {
-    let code = r#"
-int main(void) {
-    signed char a, b, result;
-
-    // Addition
-    a = 30; b = 12;
-    result = a + b;
-    if (result != 42) return 1;
-
-    // Subtraction
-    a = 100; b = 58;
-    result = a - b;
-    if (result != 42) return 2;
-
-    // Multiplication
-    a = 6; b = 7;
-    result = a * b;
-    if (result != 42) return 3;
-
-    // Division
-    a = 84; b = 2;
-    result = a / b;
-    if (result != 42) return 4;
-
-    // Modulo
-    a = 47; b = 10;
-    result = a % b;
-    if (result != 7) return 5;
-
-    // Negative values
-    a = -42;
-    if (-a != 42) return 6;
-
-    // Negative arithmetic
-    a = -20; b = -22;
-    if (a + b != -42) return 7;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("schar_arith", code, &[]), 0);
-}
-
-// ============================================================================
-// Signed Char: Comparison Operators
-// ============================================================================
-
-#[test]
-fn schar_comparison_operators() {
-    let code = r#"
-int main(void) {
-    signed char a, b;
-
-    // Negative less than positive
-    a = -10; b = 10;
-    if ((a < b) != 1) return 1;
-
-    // Negative comparison
-    a = -20; b = -10;
-    if ((a < b) != 1) return 2;  // -20 < -10
-
-    // Equal negative
-    a = -42; b = -42;
-    if ((a == b) != 1) return 3;
-
-    // Range boundaries
-    a = -128; b = 127;
-    if ((a < b) != 1) return 4;
-
-    // Min value comparison
-    a = -128;
-    if (a >= 0) return 5;  // Should be false
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("schar_cmp", code, &[]), 0);
-}
-
-// ============================================================================
-// Signed Char: Assignment Operators
-// ============================================================================
-
-#[test]
-fn schar_assignment_operators() {
-    let code = r#"
-int main(void) {
-    signed char a;
-
-    // Simple assignment
-    a = -42;
-    if (a != -42) return 1;
-
-    // Add assign
-    a = -50;
-    a += 8;
-    if (a != -42) return 2;
-
-    // Sub assign
-    a = -40;
-    a -= 2;
-    if (a != -42) return 3;
-
-    // Mul assign with sign
-    a = -21;
-    a *= 2;
-    if (a != -42) return 4;
-
-    // Div assign with sign
-    a = -84;
-    a /= 2;
-    if (a != -42) return 5;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("schar_assign", code, &[]), 0);
-}
-
-// ############################################################################
-// UNSIGNED CHAR TESTS (always 0 to 255)
-// ############################################################################
-
-// ============================================================================
-// Unsigned Char: Arithmetic Operators
-// ============================================================================
-
-#[test]
-fn uchar_arithmetic_operators() {
-    let code = r#"
-int main(void) {
-    unsigned char a, b, result;
-
-    // Addition
-    a = 30; b = 12;
-    result = a + b;
-    if (result != 42) return 1;
-
-    // Subtraction
-    a = 100; b = 58;
-    result = a - b;
-    if (result != 42) return 2;
-
-    // Multiplication
-    a = 6; b = 7;
-    result = a * b;
-    if (result != 42) return 3;
-
-    // Division
-    a = 84; b = 2;
-    result = a / b;
-    if (result != 42) return 4;
-
-    // Modulo
-    a = 47; b = 10;
-    result = a % b;
-    if (result != 7) return 5;
-
-    // Max value
-    a = 255;
-    if (a != 255) return 6;
-
-    // Large values
-    a = 200; b = 50;
-    result = a - b;
-    if (result != 150) return 7;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uchar_arith", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Char: Comparison Operators
-// ============================================================================
-
-#[test]
-fn uchar_comparison_operators() {
-    let code = r#"
-int main(void) {
-    unsigned char a, b;
-
-    // Basic comparison
-    a = 200; b = 100;
-    if ((a > b) != 1) return 1;
-
-    // Equal
-    a = 255; b = 255;
-    if ((a == b) != 1) return 2;
-
-    // Max value comparison
-    a = 255; b = 0;
-    if ((a > b) != 1) return 3;
-
-    // Zero is minimum
-    a = 0; b = 1;
-    if ((a < b) != 1) return 4;
-
-    // Unsigned comparison (no negative)
-    a = 255;
-    if (a < 0) return 5;  // Should always be false for unsigned
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uchar_cmp", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Char: Bitwise Operators
-// ============================================================================
-
-#[test]
-fn uchar_bitwise_operators() {
-    let code = r#"
-int main(void) {
-    unsigned char a, b;
-
-    // Bitwise AND
-    a = 0xFF; b = 0x0F;
-    if ((a & b) != 0x0F) return 1;
-
-    // Bitwise OR
-    a = 0xF0; b = 0x0F;
-    if ((a | b) != 0xFF) return 2;
-
-    // Bitwise XOR
-    a = 0xFF; b = 0xF0;
-    if ((a ^ b) != 0x0F) return 3;
-
-    // Bitwise NOT (result masked to 8 bits when stored)
-    a = 0;
-    b = ~a;
-    if (b != 0xFF) return 4;
-
-    // Left shift
-    a = 1;
-    if ((a << 4) != 16) return 5;
-
-    // Right shift (logical for unsigned)
-    a = 128;
-    if ((a >> 1) != 64) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uchar_bitwise", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Char: Assignment Operators
-// ============================================================================
-
-#[test]
-fn uchar_assignment_operators() {
-    let code = r#"
-int main(void) {
-    unsigned char a;
-
-    // Simple assignment
-    a = 200;
-    if (a != 200) return 1;
-
-    // Add assign
-    a = 40;
-    a += 2;
-    if (a != 42) return 2;
-
-    // Sub assign
-    a = 50;
-    a -= 8;
-    if (a != 42) return 3;
-
-    // Mul assign
-    a = 21;
-    a *= 2;
-    if (a != 42) return 4;
-
-    // Div assign
-    a = 84;
-    a /= 2;
-    if (a != 42) return 5;
-
-    // And assign
-    a = 0xFF;
-    a &= 0x0F;
-    if (a != 15) return 6;
-
-    // Or assign
-    a = 0xF0;
-    a |= 0x0F;
-    if (a != 255) return 7;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uchar_assign", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Char: Increment/Decrement Operators
-// ============================================================================
-
-#[test]
-fn uchar_increment_decrement_operators() {
-    let code = r#"
-int main(void) {
-    unsigned char a, b;
-
-    // Pre-increment
-    a = 41;
-    if (++a != 42) return 1;
-
-    // Post-increment
-    a = 42;
-    b = a++;
-    if (b != 42) return 2;
-    if (a != 43) return 3;
-
-    // Pre-decrement
-    a = 43;
-    if (--a != 42) return 4;
-
-    // Post-decrement
-    a = 42;
-    b = a--;
-    if (b != 42) return 5;
-    if (a != 41) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uchar_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -996,11 +917,14 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn wide_char_basic() {
+fn wide_char_tests() {
     let code = r#"
 int main(void) {
+    int wc;
+
+    // === Basic wide char (returns 1-5) ===
     // Wide char literal has type wchar_t (int on Unix)
-    int wc = L'A';
+    wc = L'A';
     if (wc != 65) return 1;
 
     wc = L'Z';
@@ -1010,50 +934,30 @@ int main(void) {
     wc = L'0';
     if (wc != 48) return 3;
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("wide_char_basic", code, &[]), 0);
-}
-
-#[test]
-fn wide_char_escape() {
-    let code = r#"
-int main(void) {
-    // Escape sequences in wide char
-    int wc = L'\n';
-    if (wc != 10) return 1;
+    // === Escape sequences (returns 101-105) ===
+    wc = L'\n';
+    if (wc != 10) return 101;
 
     wc = L'\t';
-    if (wc != 9) return 2;
+    if (wc != 9) return 102;
 
     wc = L'\0';
-    if (wc != 0) return 3;
+    if (wc != 0) return 103;
 
     wc = L'\\';
-    if (wc != 92) return 4;
+    if (wc != 92) return 104;
 
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("wide_char_escape", code, &[]), 0);
-}
-
-#[test]
-fn wide_char_hex_escape() {
-    let code = r#"
-int main(void) {
-    // Hex escape in wide char
-    int wc = L'\x41';
-    if (wc != 65) return 1;  // 'A'
+    // === Hex escape (returns 201-205) ===
+    wc = L'\x41';
+    if (wc != 65) return 201;  // 'A'
 
     wc = L'\x7F';
-    if (wc != 127) return 2;
+    if (wc != 127) return 202;
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("wide_char_hex", code, &[]), 0);
+    assert_eq!(compile_and_run("wide_char_tests", code, &[]), 0);
 }
 
 // ============================================================================

@@ -9,6 +9,10 @@
 // Tests for `int` and `unsigned int` data types with all applicable operators
 // Tests are aggregated by category to reduce compile/link overhead
 //
+// Return code convention:
+//   - int tests: return codes 1-99
+//   - unsigned int tests: return codes 101-199
+//
 
 use crate::common::compile_and_run;
 
@@ -17,52 +21,93 @@ use crate::common::compile_and_run;
 // ============================================================================
 
 #[test]
-fn int_arithmetic_operators() {
+fn integer_arithmetic_operators() {
     let code = r#"
 int main(void) {
-    int a, b, result;
+    // === int arithmetic (returns 1-20) ===
+    {
+        int a, b;
 
-    // Addition
-    a = 30; b = 12;
-    if (a + b != 42) return 1;
+        // Addition
+        a = 30; b = 12;
+        if (a + b != 42) return 1;
 
-    // Subtraction
-    a = 100; b = 58;
-    if (a - b != 42) return 2;
+        // Subtraction
+        a = 100; b = 58;
+        if (a - b != 42) return 2;
 
-    // Multiplication
-    a = 6; b = 7;
-    if (a * b != 42) return 3;
+        // Multiplication
+        a = 6; b = 7;
+        if (a * b != 42) return 3;
 
-    // Division
-    a = 84; b = 2;
-    if (a / b != 42) return 4;
+        // Division
+        a = 84; b = 2;
+        if (a / b != 42) return 4;
 
-    // Modulo
-    a = 47; b = 10;
-    if (a % b != 7) return 5;
+        // Modulo
+        a = 47; b = 10;
+        if (a % b != 7) return 5;
 
-    // Unary negation
-    a = -42;
-    if (-a != 42) return 6;
+        // Unary negation
+        a = -42;
+        if (-a != 42) return 6;
 
-    // Unary plus
-    a = 42;
-    if (+a != 42) return 7;
+        // Unary plus
+        a = 42;
+        if (+a != 42) return 7;
 
-    // Literal without suffix (default int)
-    if (100 + 23 != 123) return 8;
+        // Literal without suffix (default int)
+        if (100 + 23 != 123) return 8;
 
-    // Hex literal
-    if (0x10 + 0x20 != 0x30) return 9;
+        // Hex literal
+        if (0x10 + 0x20 != 0x30) return 9;
 
-    // Octal literal
-    if (010 + 010 != 020) return 10;
+        // Octal literal
+        if (010 + 010 != 020) return 10;
+    }
+
+    // === unsigned int arithmetic (returns 101-120) ===
+    {
+        unsigned int a, b;
+
+        // Addition
+        a = 30; b = 12;
+        if (a + b != 42) return 101;
+
+        // Subtraction
+        a = 100; b = 58;
+        if (a - b != 42) return 102;
+
+        // Multiplication
+        a = 6; b = 7;
+        if (a * b != 42) return 103;
+
+        // Division
+        a = 84; b = 2;
+        if (a / b != 42) return 104;
+
+        // Modulo
+        a = 47; b = 10;
+        if (a % b != 7) return 105;
+
+        // Unary plus
+        a = 42;
+        if (+a != 42) return 106;
+
+        // U suffix for unsigned int literals
+        if (100U + 23U != 123U) return 107;
+
+        // Hex with U suffix
+        if (0x10U + 0x20U != 0x30U) return 108;
+
+        // Mixed case suffix (u)
+        if (50u + 50u != 100u) return 109;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_arith", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_arith", code, &[]), 0);
 }
 
 // ============================================================================
@@ -70,71 +115,135 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_comparison_operators() {
+fn integer_comparison_operators() {
     let code = r#"
 int main(void) {
-    int a, b;
+    // === int comparison (returns 1-20) ===
+    {
+        int a, b;
 
-    // Equal - true
-    a = 42; b = 42;
-    if ((a == b) != 1) return 1;
+        // Equal - true
+        a = 42; b = 42;
+        if ((a == b) != 1) return 1;
 
-    // Equal - false
-    a = 42; b = 43;
-    if ((a == b) != 0) return 2;
+        // Equal - false
+        a = 42; b = 43;
+        if ((a == b) != 0) return 2;
 
-    // Not equal - true
-    a = 42; b = 43;
-    if ((a != b) != 1) return 3;
+        // Not equal - true
+        a = 42; b = 43;
+        if ((a != b) != 1) return 3;
 
-    // Not equal - false
-    a = 42; b = 42;
-    if ((a != b) != 0) return 4;
+        // Not equal - false
+        a = 42; b = 42;
+        if ((a != b) != 0) return 4;
 
-    // Less than - true
-    a = 10; b = 20;
-    if ((a < b) != 1) return 5;
+        // Less than - true
+        a = 10; b = 20;
+        if ((a < b) != 1) return 5;
 
-    // Less than - false
-    a = 20; b = 10;
-    if ((a < b) != 0) return 6;
+        // Less than - false
+        a = 20; b = 10;
+        if ((a < b) != 0) return 6;
 
-    // Less or equal - true (less)
-    a = 10; b = 20;
-    if ((a <= b) != 1) return 7;
+        // Less or equal - true (less)
+        a = 10; b = 20;
+        if ((a <= b) != 1) return 7;
 
-    // Less or equal - true (equal)
-    a = 20; b = 20;
-    if ((a <= b) != 1) return 8;
+        // Less or equal - true (equal)
+        a = 20; b = 20;
+        if ((a <= b) != 1) return 8;
 
-    // Less or equal - false
-    a = 30; b = 20;
-    if ((a <= b) != 0) return 9;
+        // Less or equal - false
+        a = 30; b = 20;
+        if ((a <= b) != 0) return 9;
 
-    // Greater than - true
-    a = 20; b = 10;
-    if ((a > b) != 1) return 10;
+        // Greater than - true
+        a = 20; b = 10;
+        if ((a > b) != 1) return 10;
 
-    // Greater than - false
-    a = 10; b = 20;
-    if ((a > b) != 0) return 11;
+        // Greater than - false
+        a = 10; b = 20;
+        if ((a > b) != 0) return 11;
 
-    // Greater or equal - true (greater)
-    a = 30; b = 20;
-    if ((a >= b) != 1) return 12;
+        // Greater or equal - true (greater)
+        a = 30; b = 20;
+        if ((a >= b) != 1) return 12;
 
-    // Greater or equal - true (equal)
-    a = 20; b = 20;
-    if ((a >= b) != 1) return 13;
+        // Greater or equal - true (equal)
+        a = 20; b = 20;
+        if ((a >= b) != 1) return 13;
 
-    // Greater or equal - false
-    a = 10; b = 20;
-    if ((a >= b) != 0) return 14;
+        // Greater or equal - false
+        a = 10; b = 20;
+        if ((a >= b) != 0) return 14;
+    }
+
+    // === unsigned int comparison (returns 101-120) ===
+    {
+        unsigned int a, b;
+
+        // Equal - true
+        a = 42; b = 42;
+        if ((a == b) != 1) return 101;
+
+        // Equal - false
+        a = 42; b = 43;
+        if ((a == b) != 0) return 102;
+
+        // Not equal - true
+        a = 42; b = 43;
+        if ((a != b) != 1) return 103;
+
+        // Not equal - false
+        a = 42; b = 42;
+        if ((a != b) != 0) return 104;
+
+        // Less than - true
+        a = 10; b = 20;
+        if ((a < b) != 1) return 105;
+
+        // Less than - false
+        a = 20; b = 10;
+        if ((a < b) != 0) return 106;
+
+        // Less or equal - true (less)
+        a = 10; b = 20;
+        if ((a <= b) != 1) return 107;
+
+        // Less or equal - true (equal)
+        a = 20; b = 20;
+        if ((a <= b) != 1) return 108;
+
+        // Less or equal - false
+        a = 30; b = 20;
+        if ((a <= b) != 0) return 109;
+
+        // Greater than - true
+        a = 20; b = 10;
+        if ((a > b) != 1) return 110;
+
+        // Greater than - false
+        a = 10; b = 20;
+        if ((a > b) != 0) return 111;
+
+        // Greater or equal - true (greater)
+        a = 30; b = 20;
+        if ((a >= b) != 1) return 112;
+
+        // Greater or equal - true (equal)
+        a = 20; b = 20;
+        if ((a >= b) != 1) return 113;
+
+        // Greater or equal - false
+        a = 10; b = 20;
+        if ((a >= b) != 0) return 114;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_cmp", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_cmp", code, &[]), 0);
 }
 
 // ============================================================================
@@ -142,47 +251,87 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_logical_operators() {
+fn integer_logical_operators() {
     let code = r#"
 int main(void) {
-    int a, b;
+    // === int logical (returns 1-10) ===
+    {
+        int a, b;
 
-    // Logical AND - true
-    a = 1; b = 1;
-    if ((a && b) != 1) return 1;
+        // Logical AND - true
+        a = 1; b = 1;
+        if ((a && b) != 1) return 1;
 
-    // Logical AND - false (left)
-    a = 0; b = 1;
-    if ((a && b) != 0) return 2;
+        // Logical AND - false (left)
+        a = 0; b = 1;
+        if ((a && b) != 0) return 2;
 
-    // Logical AND - false (right)
-    a = 1; b = 0;
-    if ((a && b) != 0) return 3;
+        // Logical AND - false (right)
+        a = 1; b = 0;
+        if ((a && b) != 0) return 3;
 
-    // Logical OR - true (left)
-    a = 1; b = 0;
-    if ((a || b) != 1) return 4;
+        // Logical OR - true (left)
+        a = 1; b = 0;
+        if ((a || b) != 1) return 4;
 
-    // Logical OR - true (right)
-    a = 0; b = 1;
-    if ((a || b) != 1) return 5;
+        // Logical OR - true (right)
+        a = 0; b = 1;
+        if ((a || b) != 1) return 5;
 
-    // Logical OR - false
-    a = 0; b = 0;
-    if ((a || b) != 0) return 6;
+        // Logical OR - false
+        a = 0; b = 0;
+        if ((a || b) != 0) return 6;
 
-    // Logical NOT - true (input 0)
-    a = 0;
-    if (!a != 1) return 7;
+        // Logical NOT - true (input 0)
+        a = 0;
+        if (!a != 1) return 7;
 
-    // Logical NOT - false (input non-zero)
-    a = 42;
-    if (!a != 0) return 8;
+        // Logical NOT - false (input non-zero)
+        a = 42;
+        if (!a != 0) return 8;
+    }
+
+    // === unsigned int logical (returns 101-110) ===
+    {
+        unsigned int a, b;
+
+        // Logical AND - true
+        a = 1; b = 1;
+        if ((a && b) != 1) return 101;
+
+        // Logical AND - false (left)
+        a = 0; b = 1;
+        if ((a && b) != 0) return 102;
+
+        // Logical AND - false (right)
+        a = 1; b = 0;
+        if ((a && b) != 0) return 103;
+
+        // Logical OR - true (left)
+        a = 1; b = 0;
+        if ((a || b) != 1) return 104;
+
+        // Logical OR - true (right)
+        a = 0; b = 1;
+        if ((a || b) != 1) return 105;
+
+        // Logical OR - false
+        a = 0; b = 0;
+        if ((a || b) != 0) return 106;
+
+        // Logical NOT - true (input 0)
+        a = 0;
+        if (!a != 1) return 107;
+
+        // Logical NOT - false (input non-zero)
+        a = 42;
+        if (!a != 0) return 108;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_logical", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_logical", code, &[]), 0);
 }
 
 // ============================================================================
@@ -190,39 +339,71 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_bitwise_operators() {
+fn integer_bitwise_operators() {
     let code = r#"
 int main(void) {
-    int a, b;
+    // === int bitwise (returns 1-10) ===
+    {
+        int a, b;
 
-    // Bitwise AND
-    a = 0xFF; b = 0x0F;
-    if ((a & b) != 0x0F) return 1;
+        // Bitwise AND
+        a = 0xFF; b = 0x0F;
+        if ((a & b) != 0x0F) return 1;
 
-    // Bitwise OR
-    a = 0xF0; b = 0x0F;
-    if ((a | b) != 0xFF) return 2;
+        // Bitwise OR
+        a = 0xF0; b = 0x0F;
+        if ((a | b) != 0xFF) return 2;
 
-    // Bitwise XOR
-    a = 0xFF; b = 0xF0;
-    if ((a ^ b) != 0x0F) return 3;
+        // Bitwise XOR
+        a = 0xFF; b = 0xF0;
+        if ((a ^ b) != 0x0F) return 3;
 
-    // Bitwise NOT
-    a = 0;
-    if (~a != -1) return 4;
+        // Bitwise NOT
+        a = 0;
+        if (~a != -1) return 4;
 
-    // Left shift
-    a = 1;
-    if ((a << 4) != 16) return 5;
+        // Left shift
+        a = 1;
+        if ((a << 4) != 16) return 5;
 
-    // Right shift
-    a = 64;
-    if ((a >> 2) != 16) return 6;
+        // Right shift
+        a = 64;
+        if ((a >> 2) != 16) return 6;
+    }
+
+    // === unsigned int bitwise (returns 101-110) ===
+    {
+        unsigned int a, b;
+
+        // Bitwise AND
+        a = 0xFF; b = 0x0F;
+        if ((a & b) != 0x0F) return 101;
+
+        // Bitwise OR
+        a = 0xF0; b = 0x0F;
+        if ((a | b) != 0xFF) return 102;
+
+        // Bitwise XOR
+        a = 0xFF; b = 0xF0;
+        if ((a ^ b) != 0x0F) return 103;
+
+        // Bitwise NOT - check low byte is 0xFF when input is 0xFFFFFF00
+        a = 0xFFFFFF00;
+        if ((~a & 0xFF) != 0xFF) return 104;
+
+        // Left shift
+        a = 1;
+        if ((a << 4) != 16) return 105;
+
+        // Right shift (logical for unsigned)
+        a = 64;
+        if ((a >> 2) != 16) return 106;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_bitwise", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_bitwise", code, &[]), 0);
 }
 
 // ============================================================================
@@ -230,69 +411,131 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_assignment_operators() {
+fn integer_assignment_operators() {
     let code = r#"
 int main(void) {
-    int a;
+    // === int assignment (returns 1-15) ===
+    {
+        int a;
 
-    // Simple assignment
-    a = 42;
-    if (a != 42) return 1;
+        // Simple assignment
+        a = 42;
+        if (a != 42) return 1;
 
-    // Add assign
-    a = 40;
-    a += 2;
-    if (a != 42) return 2;
+        // Add assign
+        a = 40;
+        a += 2;
+        if (a != 42) return 2;
 
-    // Sub assign
-    a = 50;
-    a -= 8;
-    if (a != 42) return 3;
+        // Sub assign
+        a = 50;
+        a -= 8;
+        if (a != 42) return 3;
 
-    // Mul assign
-    a = 21;
-    a *= 2;
-    if (a != 42) return 4;
+        // Mul assign
+        a = 21;
+        a *= 2;
+        if (a != 42) return 4;
 
-    // Div assign
-    a = 84;
-    a /= 2;
-    if (a != 42) return 5;
+        // Div assign
+        a = 84;
+        a /= 2;
+        if (a != 42) return 5;
 
-    // Mod assign
-    a = 50;
-    a %= 8;
-    if (a != 2) return 6;
+        // Mod assign
+        a = 50;
+        a %= 8;
+        if (a != 2) return 6;
 
-    // And assign
-    a = 0xFF;
-    a &= 0x0F;
-    if (a != 15) return 7;
+        // And assign
+        a = 0xFF;
+        a &= 0x0F;
+        if (a != 15) return 7;
 
-    // Or assign
-    a = 0xF0;
-    a |= 0x0F;
-    if (a != 255) return 8;
+        // Or assign
+        a = 0xF0;
+        a |= 0x0F;
+        if (a != 255) return 8;
 
-    // Xor assign
-    a = 0xFF;
-    a ^= 0xF0;
-    if (a != 15) return 9;
+        // Xor assign
+        a = 0xFF;
+        a ^= 0xF0;
+        if (a != 15) return 9;
 
-    // Shl assign
-    a = 1;
-    a <<= 4;
-    if (a != 16) return 10;
+        // Shl assign
+        a = 1;
+        a <<= 4;
+        if (a != 16) return 10;
 
-    // Shr assign
-    a = 64;
-    a >>= 2;
-    if (a != 16) return 11;
+        // Shr assign
+        a = 64;
+        a >>= 2;
+        if (a != 16) return 11;
+    }
+
+    // === unsigned int assignment (returns 101-115) ===
+    {
+        unsigned int a;
+
+        // Simple assignment
+        a = 42;
+        if (a != 42) return 101;
+
+        // Add assign
+        a = 40;
+        a += 2;
+        if (a != 42) return 102;
+
+        // Sub assign
+        a = 50;
+        a -= 8;
+        if (a != 42) return 103;
+
+        // Mul assign
+        a = 21;
+        a *= 2;
+        if (a != 42) return 104;
+
+        // Div assign
+        a = 84;
+        a /= 2;
+        if (a != 42) return 105;
+
+        // Mod assign
+        a = 50;
+        a %= 8;
+        if (a != 2) return 106;
+
+        // And assign
+        a = 0xFF;
+        a &= 0x0F;
+        if (a != 15) return 107;
+
+        // Or assign
+        a = 0xF0;
+        a |= 0x0F;
+        if (a != 255) return 108;
+
+        // Xor assign
+        a = 0xFF;
+        a ^= 0xF0;
+        if (a != 15) return 109;
+
+        // Shl assign
+        a = 1;
+        a <<= 4;
+        if (a != 16) return 110;
+
+        // Shr assign
+        a = 64;
+        a >>= 2;
+        if (a != 16) return 111;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_assign", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_assign", code, &[]), 0);
 }
 
 // ============================================================================
@@ -300,43 +543,79 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_increment_decrement_operators() {
+fn integer_increment_decrement_operators() {
     let code = r#"
 int main(void) {
-    int a, b;
+    // === int increment/decrement (returns 1-10) ===
+    {
+        int a, b;
 
-    // Pre-increment
-    a = 41;
-    if (++a != 42) return 1;
+        // Pre-increment
+        a = 41;
+        if (++a != 42) return 1;
 
-    // Post-increment (returns original)
-    a = 42;
-    b = a++;
-    if (b != 42) return 2;
+        // Post-increment (returns original)
+        a = 42;
+        b = a++;
+        if (b != 42) return 2;
 
-    // Post-increment (side effect)
-    a = 41;
-    a++;
-    if (a != 42) return 3;
+        // Post-increment (side effect)
+        a = 41;
+        a++;
+        if (a != 42) return 3;
 
-    // Pre-decrement
-    a = 43;
-    if (--a != 42) return 4;
+        // Pre-decrement
+        a = 43;
+        if (--a != 42) return 4;
 
-    // Post-decrement (returns original)
-    a = 42;
-    b = a--;
-    if (b != 42) return 5;
+        // Post-decrement (returns original)
+        a = 42;
+        b = a--;
+        if (b != 42) return 5;
 
-    // Post-decrement (side effect)
-    a = 43;
-    a--;
-    if (a != 42) return 6;
+        // Post-decrement (side effect)
+        a = 43;
+        a--;
+        if (a != 42) return 6;
+    }
+
+    // === unsigned int increment/decrement (returns 101-110) ===
+    {
+        unsigned int a, b;
+
+        // Pre-increment
+        a = 41;
+        if (++a != 42) return 101;
+
+        // Post-increment (returns original)
+        a = 42;
+        b = a++;
+        if (b != 42) return 102;
+
+        // Post-increment (side effect)
+        a = 41;
+        a++;
+        if (a != 42) return 103;
+
+        // Pre-decrement
+        a = 43;
+        if (--a != 42) return 104;
+
+        // Post-decrement (returns original)
+        a = 42;
+        b = a--;
+        if (b != 42) return 105;
+
+        // Post-decrement (side effect)
+        a = 43;
+        a--;
+        if (a != 42) return 106;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_incdec", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_incdec", code, &[]), 0);
 }
 
 // ============================================================================
@@ -344,28 +623,49 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_ternary_comma_operators() {
+fn integer_ternary_comma_operators() {
     let code = r#"
 int main(void) {
-    int a, b;
+    // === int ternary/comma (returns 1-5) ===
+    {
+        int a, b;
 
-    // Ternary - true branch
-    a = 1;
-    if ((a ? 42 : 0) != 42) return 1;
+        // Ternary - true branch
+        a = 1;
+        if ((a ? 42 : 0) != 42) return 1;
 
-    // Ternary - false branch
-    a = 0;
-    if ((a ? 0 : 42) != 42) return 2;
+        // Ternary - false branch
+        a = 0;
+        if ((a ? 0 : 42) != 42) return 2;
 
-    // Comma operator
-    a = 1;
-    b = (a = 10, a + 32);
-    if (b != 42) return 3;
+        // Comma operator
+        a = 1;
+        b = (a = 10, a + 32);
+        if (b != 42) return 3;
+    }
+
+    // === unsigned int ternary/comma (returns 101-105) ===
+    {
+        unsigned int a, b;
+
+        // Ternary - true branch
+        a = 1;
+        if ((a ? 42 : 0) != 42) return 101;
+
+        // Ternary - false branch
+        a = 0;
+        if ((a ? 0 : 42) != 42) return 102;
+
+        // Comma operator
+        a = 1;
+        b = (a = 10, a + 32);
+        if (b != 42) return 103;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_ternary_comma", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_ternary_comma", code, &[]), 0);
 }
 
 // ============================================================================
@@ -373,415 +673,51 @@ int main(void) {
 // ============================================================================
 
 #[test]
-fn int_complex_expressions() {
+fn integer_complex_expressions() {
     let code = r#"
 int main(void) {
-    int a, b, c, result;
+    // === int complex expressions (returns 1-5) ===
+    {
+        int a, b, c, result;
 
-    // Mixed arithmetic with precedence
-    a = 10; b = 5; c = 2;
-    result = a + b * c - 3;  // 10 + 10 - 3 = 17
-    if (result != 17) return 1;
+        // Mixed arithmetic with precedence
+        a = 10; b = 5; c = 2;
+        result = a + b * c - 3;  // 10 + 10 - 3 = 17
+        if (result != 17) return 1;
 
-    // Chained comparison
-    a = 5; b = 10; c = 15;
-    if (((a < b) && (b < c)) != 1) return 2;
+        // Chained comparison
+        a = 5; b = 10; c = 15;
+        if (((a < b) && (b < c)) != 1) return 2;
 
-    // Mixed bitwise and arithmetic
-    a = 8; b = 3;
-    result = ((a | b) & 0x0F) + (a >> 1);  // (11 & 15) + 4 = 15
-    if (result != 15) return 3;
+        // Mixed bitwise and arithmetic
+        a = 8; b = 3;
+        result = ((a | b) & 0x0F) + (a >> 1);  // (11 & 15) + 4 = 15
+        if (result != 15) return 3;
+    }
+
+    // === unsigned int complex expressions (returns 101-105) ===
+    {
+        unsigned int a, b, c, result;
+
+        // Mixed arithmetic with precedence
+        a = 10; b = 5; c = 2;
+        result = a + b * c - 3;  // 10 + 10 - 3 = 17
+        if (result != 17) return 101;
+
+        // Chained comparison
+        a = 5; b = 10; c = 15;
+        if (((a < b) && (b < c)) != 1) return 102;
+
+        // Mixed bitwise and arithmetic
+        a = 8; b = 3;
+        result = ((a | b) & 0x0F) + (a >> 1);  // (11 & 15) + 4 = 15
+        if (result != 15) return 103;
+    }
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("int_complex", code, &[]), 0);
-}
-
-// ############################################################################
-// UNSIGNED INT TESTS
-// ############################################################################
-
-// ============================================================================
-// Unsigned Int: Arithmetic Operators (add, sub, mul, div, mod, unary plus)
-// ============================================================================
-
-#[test]
-fn uint_arithmetic_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b;
-
-    // Addition
-    a = 30; b = 12;
-    if (a + b != 42) return 1;
-
-    // Subtraction
-    a = 100; b = 58;
-    if (a - b != 42) return 2;
-
-    // Multiplication
-    a = 6; b = 7;
-    if (a * b != 42) return 3;
-
-    // Division
-    a = 84; b = 2;
-    if (a / b != 42) return 4;
-
-    // Modulo
-    a = 47; b = 10;
-    if (a % b != 7) return 5;
-
-    // Unary plus
-    a = 42;
-    if (+a != 42) return 6;
-
-    // U suffix for unsigned int literals
-    if (100U + 23U != 123U) return 7;
-
-    // Hex with U suffix
-    if (0x10U + 0x20U != 0x30U) return 8;
-
-    // Mixed case suffix (u)
-    if (50u + 50u != 100u) return 9;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_arith", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Comparison Operators (==, !=, <, <=, >, >=)
-// ============================================================================
-
-#[test]
-fn uint_comparison_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b;
-
-    // Equal - true
-    a = 42; b = 42;
-    if ((a == b) != 1) return 1;
-
-    // Equal - false
-    a = 42; b = 43;
-    if ((a == b) != 0) return 2;
-
-    // Not equal - true
-    a = 42; b = 43;
-    if ((a != b) != 1) return 3;
-
-    // Not equal - false
-    a = 42; b = 42;
-    if ((a != b) != 0) return 4;
-
-    // Less than - true
-    a = 10; b = 20;
-    if ((a < b) != 1) return 5;
-
-    // Less than - false
-    a = 20; b = 10;
-    if ((a < b) != 0) return 6;
-
-    // Less or equal - true (less)
-    a = 10; b = 20;
-    if ((a <= b) != 1) return 7;
-
-    // Less or equal - true (equal)
-    a = 20; b = 20;
-    if ((a <= b) != 1) return 8;
-
-    // Less or equal - false
-    a = 30; b = 20;
-    if ((a <= b) != 0) return 9;
-
-    // Greater than - true
-    a = 20; b = 10;
-    if ((a > b) != 1) return 10;
-
-    // Greater than - false
-    a = 10; b = 20;
-    if ((a > b) != 0) return 11;
-
-    // Greater or equal - true (greater)
-    a = 30; b = 20;
-    if ((a >= b) != 1) return 12;
-
-    // Greater or equal - true (equal)
-    a = 20; b = 20;
-    if ((a >= b) != 1) return 13;
-
-    // Greater or equal - false
-    a = 10; b = 20;
-    if ((a >= b) != 0) return 14;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_cmp", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Logical Operators (&&, ||, !)
-// ============================================================================
-
-#[test]
-fn uint_logical_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b;
-
-    // Logical AND - true
-    a = 1; b = 1;
-    if ((a && b) != 1) return 1;
-
-    // Logical AND - false (left)
-    a = 0; b = 1;
-    if ((a && b) != 0) return 2;
-
-    // Logical AND - false (right)
-    a = 1; b = 0;
-    if ((a && b) != 0) return 3;
-
-    // Logical OR - true (left)
-    a = 1; b = 0;
-    if ((a || b) != 1) return 4;
-
-    // Logical OR - true (right)
-    a = 0; b = 1;
-    if ((a || b) != 1) return 5;
-
-    // Logical OR - false
-    a = 0; b = 0;
-    if ((a || b) != 0) return 6;
-
-    // Logical NOT - true (input 0)
-    a = 0;
-    if (!a != 1) return 7;
-
-    // Logical NOT - false (input non-zero)
-    a = 42;
-    if (!a != 0) return 8;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_logical", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Bitwise Operators (&, |, ^, ~, <<, >>)
-// ============================================================================
-
-#[test]
-fn uint_bitwise_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b;
-
-    // Bitwise AND
-    a = 0xFF; b = 0x0F;
-    if ((a & b) != 0x0F) return 1;
-
-    // Bitwise OR
-    a = 0xF0; b = 0x0F;
-    if ((a | b) != 0xFF) return 2;
-
-    // Bitwise XOR
-    a = 0xFF; b = 0xF0;
-    if ((a ^ b) != 0x0F) return 3;
-
-    // Bitwise NOT - check low byte is 0xFF when input is 0xFFFFFF00
-    a = 0xFFFFFF00;
-    if ((~a & 0xFF) != 0xFF) return 4;
-
-    // Left shift
-    a = 1;
-    if ((a << 4) != 16) return 5;
-
-    // Right shift (logical for unsigned)
-    a = 64;
-    if ((a >> 2) != 16) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_bitwise", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Assignment Operators (=, +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=)
-// ============================================================================
-
-#[test]
-fn uint_assignment_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a;
-
-    // Simple assignment
-    a = 42;
-    if (a != 42) return 1;
-
-    // Add assign
-    a = 40;
-    a += 2;
-    if (a != 42) return 2;
-
-    // Sub assign
-    a = 50;
-    a -= 8;
-    if (a != 42) return 3;
-
-    // Mul assign
-    a = 21;
-    a *= 2;
-    if (a != 42) return 4;
-
-    // Div assign
-    a = 84;
-    a /= 2;
-    if (a != 42) return 5;
-
-    // Mod assign
-    a = 50;
-    a %= 8;
-    if (a != 2) return 6;
-
-    // And assign
-    a = 0xFF;
-    a &= 0x0F;
-    if (a != 15) return 7;
-
-    // Or assign
-    a = 0xF0;
-    a |= 0x0F;
-    if (a != 255) return 8;
-
-    // Xor assign
-    a = 0xFF;
-    a ^= 0xF0;
-    if (a != 15) return 9;
-
-    // Shl assign
-    a = 1;
-    a <<= 4;
-    if (a != 16) return 10;
-
-    // Shr assign
-    a = 64;
-    a >>= 2;
-    if (a != 16) return 11;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_assign", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Increment/Decrement Operators (++a, a++, --a, a--)
-// ============================================================================
-
-#[test]
-fn uint_increment_decrement_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b;
-
-    // Pre-increment
-    a = 41;
-    if (++a != 42) return 1;
-
-    // Post-increment (returns original)
-    a = 42;
-    b = a++;
-    if (b != 42) return 2;
-
-    // Post-increment (side effect)
-    a = 41;
-    a++;
-    if (a != 42) return 3;
-
-    // Pre-decrement
-    a = 43;
-    if (--a != 42) return 4;
-
-    // Post-decrement (returns original)
-    a = 42;
-    b = a--;
-    if (b != 42) return 5;
-
-    // Post-decrement (side effect)
-    a = 43;
-    a--;
-    if (a != 42) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_incdec", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Ternary and Comma Operators
-// ============================================================================
-
-#[test]
-fn uint_ternary_comma_operators() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b;
-
-    // Ternary - true branch
-    a = 1;
-    if ((a ? 42 : 0) != 42) return 1;
-
-    // Ternary - false branch
-    a = 0;
-    if ((a ? 0 : 42) != 42) return 2;
-
-    // Comma operator
-    a = 1;
-    b = (a = 10, a + 32);
-    if (b != 42) return 3;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_ternary_comma", code, &[]), 0);
-}
-
-// ============================================================================
-// Unsigned Int: Complex Expressions
-// ============================================================================
-
-#[test]
-fn uint_complex_expressions() {
-    let code = r#"
-int main(void) {
-    unsigned int a, b, c, result;
-
-    // Mixed arithmetic with precedence
-    a = 10; b = 5; c = 2;
-    result = a + b * c - 3;  // 10 + 10 - 3 = 17
-    if (result != 17) return 1;
-
-    // Chained comparison
-    a = 5; b = 10; c = 15;
-    if (((a < b) && (b < c)) != 1) return 2;
-
-    // Mixed bitwise and arithmetic
-    a = 8; b = 3;
-    result = ((a | b) & 0x0F) + (a >> 1);  // (11 & 15) + 4 = 15
-    if (result != 15) return 3;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("uint_complex", code, &[]), 0);
+    assert_eq!(compile_and_run("integer_complex", code, &[]), 0);
 }
 
 // ============================================================================

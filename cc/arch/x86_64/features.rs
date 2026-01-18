@@ -156,46 +156,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Helper for emit_va_arg: stores int value to destination
-    pub(super) fn emit_va_arg_store_int(
-        &mut self,
-        dst_loc: &Loc,
-        src_reg: Reg,
-        arg_size: OperandSize,
-    ) {
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Mov {
-                    size: arg_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: src_reg,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
-            Loc::Stack(dst_offset) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: src_reg,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R11),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *dst_offset,
-                    }),
-                });
-            }
-            _ => {}
-        }
-    }
-
     /// Helper for emit_va_arg: emit integer path for va_arg
     pub(super) fn emit_va_arg_int(
         &mut self,
@@ -257,7 +217,38 @@ impl X86_64CodeGen {
             dst: Reg::Rax,
         });
 
-        self.emit_va_arg_store_int(dst_loc, Reg::Rax, lir_arg_size);
+        // Store value from [Rax] to destination
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Mov {
+                    size: lir_arg_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rax,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(*r),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rax,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
 
         // Increment gp_offset by 8 and store back
         self.push_lir(X86Inst::Add {

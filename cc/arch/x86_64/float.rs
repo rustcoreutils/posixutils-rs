@@ -925,30 +925,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Helper for emit_va_arg: stores float value from XMM15 to destination
-    pub(super) fn emit_va_arg_store_float(&mut self, dst_loc: &Loc, fp_size: FpSize) {
-        match dst_loc {
-            Loc::Xmm(x) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Reg(*x),
-                });
-            }
-            Loc::Stack(dst_offset) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *dst_offset,
-                    }),
-                });
-            }
-            _ => {}
-        }
-    }
-
     /// Helper for emit_va_arg: emit float path for va_arg
     /// ap_base: base register for va_list access
     /// ap_base_offset: added to all va_list field offsets (0 for Reg, ap_offset for Stack)
@@ -1022,7 +998,28 @@ impl X86_64CodeGen {
             }),
             dst: XmmOperand::Reg(XmmReg::Xmm15),
         });
-        self.emit_va_arg_store_float(dst_loc, lir_fp_size);
+
+        // Store XMM15 to destination
+        match dst_loc {
+            Loc::Xmm(x) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: lir_fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Reg(*x),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: lir_fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
 
         // Increment fp_offset by 16 (XMM slot size)
         self.push_lir(X86Inst::Add {
@@ -1061,7 +1058,28 @@ impl X86_64CodeGen {
             }),
             dst: XmmOperand::Reg(XmmReg::Xmm15),
         });
-        self.emit_va_arg_store_float(dst_loc, lir_fp_size);
+
+        // Store XMM15 to destination
+        match dst_loc {
+            Loc::Xmm(x) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: lir_fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Reg(*x),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: lir_fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
 
         // Advance overflow_arg_area by 8
         self.push_lir(X86Inst::Add {

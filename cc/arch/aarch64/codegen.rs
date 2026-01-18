@@ -1234,13 +1234,8 @@ impl Aarch64CodeGen {
                 self.emit_alloca(insn, *total_frame);
             }
 
-            Opcode::Fabs32 => {
-                self.emit_fabs32(insn, *total_frame, types);
-            }
-
-            Opcode::Fabs64 => {
-                self.emit_fabs64(insn, *total_frame, types);
-            }
+            Opcode::Fabs32 => self.emit_fabs(insn, *total_frame, types, false),
+            Opcode::Fabs64 => self.emit_fabs(insn, *total_frame, types, true),
 
             Opcode::Unreachable => {
                 // Emit brk #1 instruction - software breakpoint that traps
@@ -2611,125 +2606,23 @@ impl Aarch64CodeGen {
 
     /// Emit atomic fetch-and-AND using LL/SC
     fn emit_atomic_fetch_and(&mut self, insn: &Instruction, total_frame: i32) {
-        let target = insn.target.expect("atomic fetch_and needs target");
-        let addr = insn.src[0];
-        let value = insn.src[1];
-        let size = insn.size;
-        let op_size = OperandSize::from_bits(size);
-
-        let addr_loc = self.get_location(addr);
-        let value_loc = self.get_location(value);
-
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
-
-        // Load mask value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // LL/SC loop for fetch_and
-        let loop_label = self.next_unique_label("fand_loop");
-
-        // Loop label
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
-            loop_label.clone(),
-        )));
-
-        // LDAXR: Load-acquire exclusive old value into X1
-        self.push_lir(Aarch64Inst::Ldaxr {
-            size: op_size,
-            addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X1,
-        });
-
-        // AND: X2 = X1 (old) & X0 (mask)
-        self.push_lir(Aarch64Inst::And {
-            size: op_size,
-            src1: Reg::X1,
-            src2: GpOperand::Reg(Reg::X0),
-            dst: Reg::X2,
-        });
-
-        // STLXR: Try to store X2 (new value), status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
-            size: op_size,
-            src: Reg::X2,
-            addr: MemAddr::Base(Reg::X10),
-            status: Reg::X8,
-        });
-
-        // CBNZ: Retry if store failed
-        self.push_lir(Aarch64Inst::Cbnz {
-            size: OperandSize::B32,
-            src: Reg::X8,
-            target: loop_label,
-        });
-
-        // Result: X1 = old value
-        self.locations.insert(target, Loc::Reg(Reg::X1));
+        self.emit_atomic_fetch_bitop(insn, total_frame, AtomicBitOp::And);
     }
 
     /// Emit atomic fetch-and-OR using LL/SC
     fn emit_atomic_fetch_or(&mut self, insn: &Instruction, total_frame: i32) {
-        let target = insn.target.expect("atomic fetch_or needs target");
-        let addr = insn.src[0];
-        let value = insn.src[1];
-        let size = insn.size;
-        let op_size = OperandSize::from_bits(size);
-
-        let addr_loc = self.get_location(addr);
-        let value_loc = self.get_location(value);
-
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
-
-        // Load OR value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
-
-        // LL/SC loop for fetch_or
-        let loop_label = self.next_unique_label("for_loop");
-
-        // Loop label
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
-            loop_label.clone(),
-        )));
-
-        // LDAXR: Load-acquire exclusive old value into X1
-        self.push_lir(Aarch64Inst::Ldaxr {
-            size: op_size,
-            addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X1,
-        });
-
-        // ORR: X2 = X1 (old) | X0 (bits to set)
-        self.push_lir(Aarch64Inst::Orr {
-            size: op_size,
-            src1: Reg::X1,
-            src2: GpOperand::Reg(Reg::X0),
-            dst: Reg::X2,
-        });
-
-        // STLXR: Try to store X2 (new value), status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
-            size: op_size,
-            src: Reg::X2,
-            addr: MemAddr::Base(Reg::X10),
-            status: Reg::X8,
-        });
-
-        // CBNZ: Retry if store failed
-        self.push_lir(Aarch64Inst::Cbnz {
-            size: OperandSize::B32,
-            src: Reg::X8,
-            target: loop_label,
-        });
-
-        // Result: X1 = old value
-        self.locations.insert(target, Loc::Reg(Reg::X1));
+        self.emit_atomic_fetch_bitop(insn, total_frame, AtomicBitOp::Or);
     }
 
     /// Emit atomic fetch-and-XOR using LL/SC
     fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, total_frame: i32) {
-        let target = insn.target.expect("atomic fetch_xor needs target");
+        self.emit_atomic_fetch_bitop(insn, total_frame, AtomicBitOp::Xor);
+    }
+
+    /// Helper for atomic fetch bitwise operations (AND, OR, XOR)
+    /// Uses LL/SC loop with LDAXR/STLXR
+    fn emit_atomic_fetch_bitop(&mut self, insn: &Instruction, total_frame: i32, op: AtomicBitOp) {
+        let target = insn.target.expect("atomic fetch bitop needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
         let size = insn.size;
@@ -2741,11 +2634,11 @@ impl Aarch64CodeGen {
         // Load pointer into X10 FIRST (before value, in case addr is in X0)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64, total_frame);
 
-        // Load XOR value into X0
+        // Load operand value into X0
         self.emit_mov_to_reg(value_loc, Reg::X0, size, total_frame);
 
-        // LL/SC loop for fetch_xor
-        let loop_label = self.next_unique_label("fxor_loop");
+        // LL/SC loop
+        let loop_label = self.next_unique_label("atomic_bitop");
 
         // Loop label
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
@@ -2759,13 +2652,33 @@ impl Aarch64CodeGen {
             dst: Reg::X1,
         });
 
-        // EOR: X2 = X1 (old) ^ X0 (bits to toggle)
-        self.push_lir(Aarch64Inst::Eor {
-            size: op_size,
-            src1: Reg::X1,
-            src2: GpOperand::Reg(Reg::X0),
-            dst: Reg::X2,
-        });
+        // Apply bitwise operation: X2 = X1 (old) op X0 (operand)
+        match op {
+            AtomicBitOp::And => {
+                self.push_lir(Aarch64Inst::And {
+                    size: op_size,
+                    src1: Reg::X1,
+                    src2: GpOperand::Reg(Reg::X0),
+                    dst: Reg::X2,
+                });
+            }
+            AtomicBitOp::Or => {
+                self.push_lir(Aarch64Inst::Orr {
+                    size: op_size,
+                    src1: Reg::X1,
+                    src2: GpOperand::Reg(Reg::X0),
+                    dst: Reg::X2,
+                });
+            }
+            AtomicBitOp::Xor => {
+                self.push_lir(Aarch64Inst::Eor {
+                    size: op_size,
+                    src1: Reg::X1,
+                    src2: GpOperand::Reg(Reg::X0),
+                    dst: Reg::X2,
+                });
+            }
+        }
 
         // STLXR: Try to store X2 (new value), status in W8
         self.push_lir(Aarch64Inst::Stlxr {
@@ -3089,4 +3002,12 @@ impl CodeGenerator for Aarch64CodeGen {
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
     }
+}
+
+/// Helper enum for atomic bitwise operations
+#[derive(Clone, Copy)]
+enum AtomicBitOp {
+    And,
+    Or,
+    Xor,
 }

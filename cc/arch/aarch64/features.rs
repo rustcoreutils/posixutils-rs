@@ -854,8 +854,14 @@ impl Aarch64CodeGen {
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64, frame_size);
     }
 
-    /// Emit __builtin_fabsf - absolute value of float
-    pub(super) fn emit_fabs32(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    /// Emit __builtin_fabsf/__builtin_fabs - absolute value of float/double
+    pub(super) fn emit_fabs(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+        is_double: bool,
+    ) {
         let arg = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -865,40 +871,22 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // Load argument into V0 (first FP argument register, single precision)
-        self.emit_fp_move(arg, VReg::V0, None, 32, frame_size, types);
+        let (size, func_name) = if is_double {
+            (64, "fabs")
+        } else {
+            (32, "fabsf")
+        };
 
-        // Call fabsf from libc
+        // Load argument into V0 (first FP argument register)
+        self.emit_fp_move(arg, VReg::V0, None, size, frame_size, types);
+
+        // Call fabs/fabsf from libc
         self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("fabsf")),
+            target: CallTarget::Direct(Symbol::global(func_name)),
         });
 
         // Result is in V0, store to target
         let dst_loc = self.get_location(target);
-        self.emit_fp_move_to_loc(VReg::V0, &dst_loc, None, 32, frame_size, types);
-    }
-
-    /// Emit __builtin_fabs - absolute value of double
-    pub(super) fn emit_fabs64(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into V0 (first FP argument register, double precision)
-        self.emit_fp_move(arg, VReg::V0, None, 64, frame_size, types);
-
-        // Call fabs from libc
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("fabs")),
-        });
-
-        // Result is in V0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_to_loc(VReg::V0, &dst_loc, None, 64, frame_size, types);
+        self.emit_fp_move_to_loc(VReg::V0, &dst_loc, None, size, frame_size, types);
     }
 }

@@ -404,25 +404,6 @@ impl Type {
         Self::enum_type(CompositeType::incomplete(Some(tag)))
     }
 
-    /// Find a member in a struct/union type
-    /// Returns MemberInfo with full bitfield details if found
-    pub fn find_member(&self, name: StringId) -> Option<MemberInfo> {
-        if let Some(ref composite) = self.composite {
-            for member in &composite.members {
-                if member.name == name {
-                    return Some(MemberInfo {
-                        offset: member.offset,
-                        typ: member.typ, // TypeId is Copy, no clone needed
-                        bit_offset: member.bit_offset,
-                        bit_width: member.bit_width,
-                        storage_unit_size: member.storage_unit_size,
-                    });
-                }
-            }
-        }
-        None
-    }
-
     /// Check if two types are compatible (for __builtin_types_compatible_p)
     /// This ignores top-level qualifiers (const, volatile, restrict)
     /// but otherwise requires types to be identical.
@@ -1113,9 +1094,60 @@ impl TypeTable {
         8 // All supported platforms use 8-byte alignment for va_list
     }
 
-    /// Find a member in a struct/union type
+    /// Find a member in a struct/union type, including anonymous struct/union members
+    /// C11 6.7.2.1p13: "An unnamed member of structure type with no tag is called an
+    /// anonymous structure; an unnamed member of union type with no tag is called an
+    /// anonymous union. The members of an anonymous structure or union are considered
+    /// to be members of the containing structure or union."
     pub fn find_member(&self, id: TypeId, name: StringId) -> Option<MemberInfo> {
-        self.get(id).find_member(name)
+        self.find_member_recursive(id, name, 0)
+    }
+
+    /// Recursive helper for find_member that tracks base offset for anonymous members
+    fn find_member_recursive(
+        &self,
+        id: TypeId,
+        name: StringId,
+        base_offset: usize,
+    ) -> Option<MemberInfo> {
+        let typ = self.get(id);
+        if let Some(ref composite) = typ.composite {
+            for member in &composite.members {
+                if member.name == name {
+                    // Found the member directly
+                    return Some(MemberInfo {
+                        offset: base_offset + member.offset,
+                        typ: member.typ,
+                        bit_offset: member.bit_offset,
+                        bit_width: member.bit_width,
+                        storage_unit_size: member.storage_unit_size,
+                    });
+                }
+
+                // Check if this is an anonymous struct/union (name is empty, no tag)
+                // and search recursively in it
+                if member.name == StringId::EMPTY {
+                    let member_type = self.get(member.typ);
+                    let is_anon_aggregate =
+                        matches!(member_type.kind, TypeKind::Struct | TypeKind::Union)
+                            && member_type
+                                .composite
+                                .as_ref()
+                                .is_some_and(|c| c.tag.is_none());
+
+                    if is_anon_aggregate {
+                        if let Some(found) = self.find_member_recursive(
+                            member.typ,
+                            name,
+                            base_offset + member.offset,
+                        ) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Check if two types are compatible (for __builtin_types_compatible_p)

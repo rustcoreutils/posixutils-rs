@@ -12,7 +12,7 @@
 
 use super::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitDeclarator, Parameter, Stmt, TranslationUnit, UnaryOp,
+    FunctionDef, InitDeclarator, OffsetOfPath, Parameter, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::diag;
 use crate::strings::StringId;
@@ -1283,6 +1283,8 @@ impl Parser<'_> {
                     | "register"
                     | "typedef"
                     | "inline"
+                    | "__inline"
+                    | "__inline__"
                     | "_Noreturn"
                     | "__noreturn__"
                     | "struct"
@@ -1316,6 +1318,8 @@ impl Parser<'_> {
     pub(crate) fn parse_declaration(&mut self) -> ParseResult<Declaration> {
         // Parse type specifiers
         let base_type = self.parse_type_specifier()?;
+        // Skip __attribute__ between type and declarator (GCC extension)
+        self.skip_extensions();
         let base_type_id = self.types.intern(base_type);
 
         // Parse declarators
@@ -1452,6 +1456,8 @@ impl Parser<'_> {
 
         // Parse type specifiers
         let base_type = self.parse_type_specifier()?;
+        // Skip __attribute__ between type and declarator (GCC extension)
+        self.skip_extensions();
 
         // Check for forbidden storage class specifiers in for-init context
         if forbid_storage_class {
@@ -1650,7 +1656,7 @@ impl Parser<'_> {
                     self.advance();
                     modifiers |= TypeModifiers::THREAD_LOCAL;
                 }
-                "inline" => {
+                "inline" | "__inline" | "__inline__" => {
                     self.advance();
                     modifiers |= TypeModifiers::INLINE;
                 }
@@ -2946,6 +2952,8 @@ impl Parser<'_> {
         let decl_pos = self.current_pos();
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;
+        // Skip __attribute__ between type and declarator (GCC extension)
+        self.skip_extensions();
         // Check modifiers before interning (storage class specifiers)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
         // Extract storage class specifiers (not stored in type system)
@@ -3156,6 +3164,10 @@ impl Parser<'_> {
                 typ_id = self.types.intern(typ);
             }
         }
+
+        // Skip __attribute__ after pointer declarator (GCC extension)
+        // Handles: void * __attribute__((malloc)) func(...)
+        self.skip_extensions();
 
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
         // Also handles: char *(name)(params) for function type
@@ -3696,6 +3708,41 @@ impl Parser<'_> {
                 self.eval_const_expr(inner)
             }
 
+            // __builtin_offsetof(type, member-designator) - compile-time constant
+            ExprKind::OffsetOf { type_id, path } => {
+                let mut offset: i64 = 0;
+                let mut current_type = *type_id;
+
+                for element in path {
+                    match element {
+                        OffsetOfPath::Field(field_id) => {
+                            // Look up the field in the current struct type
+                            // find_member handles recursive lookup through anonymous members
+                            if let Some(member_info) =
+                                self.types.find_member(current_type, *field_id)
+                            {
+                                offset += member_info.offset as i64;
+                                current_type = member_info.typ;
+                            } else {
+                                return None; // Field not found
+                            }
+                        }
+                        OffsetOfPath::Index(index) => {
+                            // Array indexing: offset += index * sizeof(element)
+                            if let Some(elem_type) = self.types.base_type(current_type) {
+                                let elem_size = self.types.size_bytes(elem_type);
+                                offset += *index * (elem_size as i64);
+                                current_type = elem_type;
+                            } else {
+                                return None; // Not an array type
+                            }
+                        }
+                    }
+                }
+
+                Some(offset)
+            }
+
             _ => None,
         }
     }
@@ -3722,10 +3769,16 @@ impl Parser<'_> {
     /// allowed to have zero width for alignment purposes).
     fn validate_bitfield(&self, typ_id: TypeId, width: u32, is_named: bool) -> ParseResult<()> {
         // Check allowed types: _Bool, int, unsigned int (and their signed/unsigned variants)
+        // Also allow long long since GCC/Clang support it
         let kind = self.types.kind(typ_id);
         let valid_type = matches!(
             kind,
-            TypeKind::Bool | TypeKind::Int | TypeKind::Char | TypeKind::Short | TypeKind::Long
+            TypeKind::Bool
+                | TypeKind::Int
+                | TypeKind::Char
+                | TypeKind::Short
+                | TypeKind::Long
+                | TypeKind::LongLong
         );
 
         if !valid_type {

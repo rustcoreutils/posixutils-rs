@@ -505,15 +505,9 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::keyword_alias("__restrict", "restrict"));
         self.define_macro(Macro::keyword_alias("__restrict__", "restrict"));
 
-        // C99/C11 boolean type support (normally from <stdbool.h>)
-        // Pre-define these for compatibility with code that uses bool without including stdbool.h
-        self.define_macro(Macro::keyword_alias("bool", "_Bool"));
-        self.define_macro(Macro::predefined("true", Some("1")));
-        self.define_macro(Macro::predefined("false", Some("0")));
-        self.define_macro(Macro::predefined(
-            "__bool_true_false_are_defined",
-            Some("1"),
-        ));
+        // Note: C99/C11 bool, true, false are NOT pre-defined here.
+        // They should only be available after #include <stdbool.h>.
+        // This matches GCC/Clang behavior. _Bool is the builtin type.
 
         // C11 atomic memory order constants (GCC-compatible for <stdatomic.h>)
         self.define_macro(Macro::predefined("__ATOMIC_RELAXED", Some("0")));
@@ -1862,11 +1856,79 @@ impl<'a> Preprocessor<'a> {
                 }
 
                 // The #define must define the same macro as the #ifndef
-                if define_name == macro_name {
-                    return Some(macro_name);
+                if define_name != macro_name {
+                    return None;
                 }
 
-                return None;
+                // Check for conditional default definition pattern:
+                //   #ifndef MACRO
+                //   #define MACRO [value]
+                //   #endif
+                //   ... more content ...  <-- content AFTER #endif = NOT a guard
+                //
+                // vs true include guard:
+                //   #ifndef MACRO
+                //   #define MACRO
+                //   ... guarded content ...
+                //   #endif
+                //   [end of file or just whitespace/comments]
+
+                // Skip to end of #define line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Check if next thing is #endif followed by more content
+                if chars.peek() == Some(&'#') {
+                    let mut check_chars = chars.clone();
+                    check_chars.next(); // consume #
+                                        // Skip whitespace after #
+                    while check_chars
+                        .peek()
+                        .map(|c| *c == ' ' || *c == '\t')
+                        .unwrap_or(false)
+                    {
+                        check_chars.next();
+                    }
+                    // Collect directive name
+                    let mut next_dir = String::new();
+                    while check_chars
+                        .peek()
+                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                        .unwrap_or(false)
+                    {
+                        next_dir.push(check_chars.next().unwrap());
+                    }
+                    if next_dir == "endif" {
+                        // Found #endif immediately after #define
+                        // Now check if there's more content after the #endif
+                        // Skip to end of #endif line
+                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                            check_chars.next();
+                        }
+                        if check_chars.peek() == Some(&'\n') {
+                            check_chars.next();
+                        }
+                        // Skip whitespace and comments after #endif
+                        skip_ws_and_comments(&mut check_chars);
+                        // If there's more content after #endif, this is NOT a guard
+                        if check_chars.peek().is_some() {
+                            return None;
+                        }
+                        // Otherwise it's a valid (empty) include guard
+                    }
+                }
+
+                // Looks like a valid include guard
+                return Some(macro_name);
             }
             "if" => {
                 // Check for !defined(MACRO) pattern
@@ -2009,11 +2071,69 @@ impl<'a> Preprocessor<'a> {
                 }
 
                 // The #define must define the same macro as the #if !defined
-                if define_name == macro_name {
-                    return Some(macro_name);
+                if define_name != macro_name {
+                    return None;
                 }
 
-                return None;
+                // Same check as for #ifndef case:
+                // Check for conditional default definition pattern
+
+                // Skip to end of #define line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Check if next thing is #endif followed by more content
+                if chars.peek() == Some(&'#') {
+                    let mut check_chars = chars.clone();
+                    check_chars.next(); // consume #
+                                        // Skip whitespace after #
+                    while check_chars
+                        .peek()
+                        .map(|c| *c == ' ' || *c == '\t')
+                        .unwrap_or(false)
+                    {
+                        check_chars.next();
+                    }
+                    // Collect directive name
+                    let mut next_dir = String::new();
+                    while check_chars
+                        .peek()
+                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                        .unwrap_or(false)
+                    {
+                        next_dir.push(check_chars.next().unwrap());
+                    }
+                    if next_dir == "endif" {
+                        // Found #endif immediately after #define
+                        // Now check if there's more content after the #endif
+                        // Skip to end of #endif line
+                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                            check_chars.next();
+                        }
+                        if check_chars.peek() == Some(&'\n') {
+                            check_chars.next();
+                        }
+                        // Skip whitespace and comments after #endif
+                        skip_ws_and_comments(&mut check_chars);
+                        // If there's more content after #endif, this is NOT a guard
+                        if check_chars.peek().is_some() {
+                            return None;
+                        }
+                        // Otherwise it's a valid (empty) include guard
+                    }
+                }
+
+                // Looks like a valid include guard
+                return Some(macro_name);
             }
             _ => {}
         }
@@ -4583,41 +4703,58 @@ PASTE(foo, bar)
         assert_eq!(Preprocessor::detect_include_guard(content), None);
     }
 
+    #[test]
+    fn test_detect_include_guard_conditional_default_with_content() {
+        // NOT a guard - conditional default definition followed by more content
+        // This pattern: #ifndef X / #define X default / #endif / more macros
+        let content = b"#ifndef FOO\n#define FOO 1\n#endif\n#define BAR 2\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
+    #[test]
+    fn test_detect_include_guard_if_defined_conditional_default() {
+        // NOT a guard - #if !defined() pattern with content after #endif
+        let content =
+            b"#if !defined(DEFAULT_VAL)\n#define DEFAULT_VAL 42\n#endif\n#define OTHER 1\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
     // ========================================================================
     // bool/true/false predefined macro tests
     // ========================================================================
 
     #[test]
-    fn test_bool_macro_expands_to_bool() {
-        // bool should expand to _Bool
-        let (tokens, idents) = preprocess_str("bool x;");
+    fn test_bool_macro_expands_to_bool_with_stdbool() {
+        // bool should expand to _Bool after including stdbool.h
+        let (tokens, idents) = preprocess_str("#include <stdbool.h>\nbool x;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"_Bool".to_string()));
-        assert!(!strs.contains(&"bool".to_string()));
     }
 
     #[test]
-    fn test_true_macro_expands_to_1() {
-        // true should expand to 1
-        let (tokens, idents) = preprocess_str("int x = true;");
+    fn test_true_macro_expands_to_1_with_stdbool() {
+        // true should expand to 1 after including stdbool.h
+        let (tokens, idents) = preprocess_str("#include <stdbool.h>\nint x = true;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"1".to_string()));
     }
 
     #[test]
-    fn test_false_macro_expands_to_0() {
-        // false should expand to 0
-        let (tokens, idents) = preprocess_str("int x = false;");
+    fn test_false_macro_expands_to_0_with_stdbool() {
+        // false should expand to 0 after including stdbool.h
+        let (tokens, idents) = preprocess_str("#include <stdbool.h>\nint x = false;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"0".to_string()));
     }
 
     #[test]
-    fn test_bool_true_false_are_defined() {
-        // __bool_true_false_are_defined should be defined as 1
-        let (tokens, idents) = preprocess_str("int x = __bool_true_false_are_defined;");
+    fn test_bool_not_predefined_without_stdbool() {
+        // bool should NOT be predefined without stdbool.h (matches GCC/Clang)
+        let (tokens, idents) = preprocess_str("bool x;");
         let strs = get_token_strings(&tokens, &idents);
-        assert!(strs.contains(&"1".to_string()));
+        // bool should remain unexpanded (as an identifier)
+        assert!(strs.contains(&"bool".to_string()));
+        assert!(!strs.contains(&"_Bool".to_string()));
     }
 
     // ========================================================================

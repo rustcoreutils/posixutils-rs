@@ -240,8 +240,30 @@ impl<'a> Parser<'a> {
             let else_expr = self.parse_conditional_expr()?;
 
             // The result type is the common type of then and else branches
-            // For simplicity, use then_expr's type (proper impl would need type promotion)
-            let typ = then_expr.typ.unwrap_or(self.types.int_id);
+            // Apply array-to-pointer and function-to-pointer decay (C99 6.3.2.1)
+            let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
+            let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
+
+            // Decay arrays to pointers
+            let then_decayed = if self.types.kind(then_typ) == TypeKind::Array {
+                let elem = self.types.base_type(then_typ).unwrap_or(self.types.char_id);
+                self.types.pointer_to(elem)
+            } else if self.types.kind(then_typ) == TypeKind::Function {
+                self.types.pointer_to(then_typ)
+            } else {
+                then_typ
+            };
+            let _else_decayed = if self.types.kind(else_typ) == TypeKind::Array {
+                let elem = self.types.base_type(else_typ).unwrap_or(self.types.char_id);
+                self.types.pointer_to(elem)
+            } else if self.types.kind(else_typ) == TypeKind::Function {
+                self.types.pointer_to(else_typ)
+            } else {
+                else_typ
+            };
+
+            // Use decayed then type (for now; proper impl would compute common type)
+            let typ = then_decayed;
 
             let pos = cond.pos;
             Ok(Self::typed_expr(
@@ -1288,15 +1310,29 @@ impl<'a> Parser<'a> {
                 );
             } else if self.is_special(b'.') {
                 // Member access
+                let dot_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
                 // Get member type from struct type, resolving incomplete types first
-                let member_type = expr
-                    .typ
-                    .map(|t| self.resolve_struct_type(t))
-                    .and_then(|t| self.types.find_member(t, member))
-                    .map(|info| info.typ)
-                    .unwrap_or(self.types.int_id);
+                let member_type = if let Some(t) = expr.typ {
+                    let resolved = self.resolve_struct_type(t);
+                    let kind = self.types.kind(resolved);
+                    if kind != TypeKind::Struct && kind != TypeKind::Union {
+                        diag::error(
+                            dot_pos,
+                            "request for member in something not a structure or union",
+                        );
+                        self.types.int_id
+                    } else if let Some(info) = self.types.find_member(resolved, member) {
+                        info.typ
+                    } else {
+                        let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
+                        diag::error(dot_pos, &format!("has no member named '{}'", member_name));
+                        self.types.int_id
+                    }
+                } else {
+                    self.types.int_id
+                };
                 expr = Self::typed_expr(
                     ExprKind::Member {
                         expr: Box::new(expr),
@@ -1307,16 +1343,36 @@ impl<'a> Parser<'a> {
                 );
             } else if self.is_special_token(SpecialToken::Arrow) {
                 // Pointer member access
+                let arrow_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
                 // Get member type: dereference pointer to get struct, resolve if incomplete, then find member
-                let member_type = expr
-                    .typ
-                    .and_then(|t| self.types.base_type(t))
-                    .map(|struct_type| self.resolve_struct_type(struct_type))
-                    .and_then(|struct_type| self.types.find_member(struct_type, member))
-                    .map(|info| info.typ)
-                    .unwrap_or(self.types.int_id);
+                let member_type = if let Some(t) = expr.typ {
+                    if let Some(struct_type) = self.types.base_type(t) {
+                        let resolved = self.resolve_struct_type(struct_type);
+                        let kind = self.types.kind(resolved);
+                        if kind != TypeKind::Struct && kind != TypeKind::Union {
+                            diag::error(
+                                arrow_pos,
+                                "request for member in something not a structure or union",
+                            );
+                            self.types.int_id
+                        } else if let Some(info) = self.types.find_member(resolved, member) {
+                            info.typ
+                        } else {
+                            let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
+                            diag::error(
+                                arrow_pos,
+                                &format!("has no member named '{}'", member_name),
+                            );
+                            self.types.int_id
+                        }
+                    } else {
+                        self.types.int_id
+                    }
+                } else {
+                    self.types.int_id
+                };
                 expr = Self::typed_expr(
                     ExprKind::Arrow {
                         expr: Box::new(expr),
@@ -2000,6 +2056,37 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        // Signbit builtins - test sign bit of floats
+                        "__builtin_signbit" => {
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Signbit { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_signbitf" => {
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Signbitf { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_signbitl" => {
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Signbitl { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
                         "__builtin_unreachable" => {
                             // __builtin_unreachable() - marks code as unreachable
                             // Takes no arguments, returns void
@@ -2036,6 +2123,48 @@ impl<'a> Parser<'a> {
                             let _expected = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
                             return Ok(expr);
+                        }
+                        "__builtin_assume_aligned" => {
+                            // __builtin_assume_aligned(ptr, align) or
+                            // __builtin_assume_aligned(ptr, align, offset)
+                            // Returns ptr, hints that ptr is aligned to align bytes
+                            // We just return ptr since we don't do alignment optimization
+                            self.expect_special(b'(')?;
+                            let ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let _align = self.parse_assignment_expr()?;
+                            // Optional third argument (offset)
+                            if self.peek_special() == Some(b',' as u32) {
+                                self.expect_special(b',')?;
+                                let _offset = self.parse_assignment_expr()?;
+                            }
+                            self.expect_special(b')')?;
+                            return Ok(ptr);
+                        }
+                        "__builtin_prefetch" => {
+                            // __builtin_prefetch(addr) or
+                            // __builtin_prefetch(addr, rw) or
+                            // __builtin_prefetch(addr, rw, locality)
+                            // Prefetch data at addr into cache - no-op for correctness
+                            self.expect_special(b'(')?;
+                            let _addr = self.parse_assignment_expr()?;
+                            // Optional rw argument (0=read, 1=write)
+                            if self.peek_special() == Some(b',' as u32) {
+                                self.expect_special(b',')?;
+                                let _rw = self.parse_assignment_expr()?;
+                                // Optional locality argument (0-3)
+                                if self.peek_special() == Some(b',' as u32) {
+                                    self.expect_special(b',')?;
+                                    let _locality = self.parse_assignment_expr()?;
+                                }
+                            }
+                            self.expect_special(b')')?;
+                            // Returns void - just return a void expression
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(0),
+                                self.types.void_id,
+                                token_pos,
+                            ));
                         }
                         "__builtin_types_compatible_p" => {
                             // __builtin_types_compatible_p(type1, type2) - returns 1 if types are compatible
@@ -2539,10 +2668,17 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    // String literal type is char*
+                    // String literal type is char[N] where N includes the null terminator
+                    // (C11 6.4.5: "type is array of char" not "pointer to char")
+                    // The array-to-pointer decay happens when used in most contexts,
+                    // but sizeof("hello") needs to return 6, not sizeof(char*).
+                    let array_size = parsed.len() + 1; // +1 for null terminator
+                    let str_type = self
+                        .types
+                        .intern(Type::array(self.types.char_id, array_size));
                     Ok(Self::typed_expr(
                         ExprKind::StringLit(parsed),
-                        self.types.char_ptr_id,
+                        str_type,
                         token_pos,
                     ))
                 } else {
@@ -2565,11 +2701,15 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    // Wide string literal type is wchar_t* (wchar_t is int on this platform)
-                    let wchar_ptr_id = self.types.intern(Type::pointer(self.types.int_id));
+                    // Wide string literal type is wchar_t[N] (wchar_t is int on this platform)
+                    // The array size includes the null terminator
+                    let array_size = parsed.chars().count() + 1; // +1 for null terminator
+                    let wstr_type = self
+                        .types
+                        .intern(Type::array(self.types.int_id, array_size));
                     Ok(Self::typed_expr(
                         ExprKind::WideStringLit(parsed),
-                        wchar_ptr_id,
+                        wstr_type,
                         token_pos,
                     ))
                 } else {

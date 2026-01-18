@@ -104,6 +104,44 @@ int main(void) {
         if (ff < 2.4f || ff > 2.6f) return 64;
     }
 
+    // ========== __BUILTIN_SIGNBIT (returns 80-99) ==========
+    {
+        // signbit returns non-zero for negative, zero for non-negative
+        // Test double (signbit)
+        double neg_d = -1.0;
+        double pos_d = 1.0;
+        double zero_d = 0.0;
+        double neg_zero_d = -0.0;
+
+        if (!__builtin_signbit(neg_d)) return 80;
+        if (__builtin_signbit(pos_d)) return 81;
+        if (__builtin_signbit(zero_d)) return 82;
+        if (!__builtin_signbit(neg_zero_d)) return 83;  // -0.0 has sign bit set
+
+        // Test float (signbitf)
+        float neg_f = -2.5f;
+        float pos_f = 2.5f;
+        float zero_f = 0.0f;
+        float neg_zero_f = -0.0f;
+
+        if (!__builtin_signbitf(neg_f)) return 84;
+        if (__builtin_signbitf(pos_f)) return 85;
+        if (__builtin_signbitf(zero_f)) return 86;
+        if (!__builtin_signbitf(neg_zero_f)) return 87;
+
+        // Test with infinity
+        double neg_inf = -__builtin_inf();
+        double pos_inf = __builtin_inf();
+        if (!__builtin_signbit(neg_inf)) return 88;
+        if (__builtin_signbit(pos_inf)) return 89;
+
+        // Test result is usable as int
+        int sb = __builtin_signbit(-5.0);
+        if (sb == 0) return 90;
+        sb = __builtin_signbit(5.0);
+        if (sb != 0) return 91;
+    }
+
     return 0;
 }
 "#;

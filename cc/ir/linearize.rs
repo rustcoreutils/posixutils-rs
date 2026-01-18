@@ -815,42 +815,116 @@ impl<'a> Linearizer<'a> {
                 let resolved_size = (self.types.size_bits(resolved_typ) / 8) as usize;
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members = &composite.members;
-                    let mut init_fields = Vec::new();
+                    // Collect field initializations with bitfield info:
+                    // (offset, field_size, init, bit_offset, bit_width, storage_unit_size)
+                    #[allow(clippy::type_complexity)]
+                    let mut raw_fields: Vec<(
+                        usize,
+                        usize,
+                        Initializer,
+                        Option<u32>,
+                        Option<u32>,
+                        Option<u32>,
+                    )> = Vec::new();
                     let mut current_field_idx = 0;
 
                     for element in elements {
                         // Find the field (by designator or position)
-                        let member = if let Some(Designator::Field(name)) =
-                            element.designators.first()
-                        {
-                            // Designated initializer: .field = value
-                            let found = members.iter().enumerate().find(|(_, m)| &m.name == name);
-                            if let Some((idx, m)) = found {
-                                current_field_idx = idx + 1;
-                                Some(m)
+                        // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
+                        let member_info =
+                            if let Some(Designator::Field(name)) = element.designators.first() {
+                                // Designated initializer: .field = value
+                                // First try direct member lookup to update position counter
+                                if let Some((idx, _)) =
+                                    members.iter().enumerate().find(|(_, m)| &m.name == name)
+                                {
+                                    current_field_idx = idx + 1;
+                                }
+                                // Use find_member which handles anonymous struct/union members
+                                self.types.find_member(resolved_typ, *name)
+                            } else if current_field_idx < members.len() {
+                                // Positional initializer - direct member only
+                                let m = &members[current_field_idx];
+                                current_field_idx += 1;
+                                Some(crate::types::MemberInfo {
+                                    offset: m.offset,
+                                    typ: m.typ,
+                                    bit_offset: m.bit_offset,
+                                    bit_width: m.bit_width,
+                                    storage_unit_size: m.storage_unit_size,
+                                })
                             } else {
                                 None
-                            }
-                        } else if current_field_idx < members.len() {
-                            // Positional initializer
-                            let m = &members[current_field_idx];
-                            current_field_idx += 1;
-                            Some(m)
-                        } else {
-                            None
-                        };
+                            };
 
-                        if let Some(member) = member {
+                        if let Some(member) = member_info {
                             let offset = member.offset;
                             let field_size = (self.types.size_bits(member.typ) / 8) as usize;
                             let field_init = self.ast_init_to_ir(&element.value, member.typ);
-                            init_fields.push((offset, field_size, field_init));
+                            raw_fields.push((
+                                offset,
+                                field_size,
+                                field_init,
+                                member.bit_offset,
+                                member.bit_width,
+                                member.storage_unit_size,
+                            ));
                         }
                     }
 
                     // Sort fields by offset to ensure proper emission order
                     // (designated initializers can be in any order)
-                    init_fields.sort_by_key(|(offset, _, _)| *offset);
+                    raw_fields.sort_by_key(|(offset, _, _, _, _, _)| *offset);
+
+                    // Now pack bitfields that share the same storage unit
+                    let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
+                    let mut i = 0;
+                    while i < raw_fields.len() {
+                        let (offset, field_size, init, bit_offset, bit_width, storage_unit_size) =
+                            &raw_fields[i];
+
+                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
+                            (bit_offset, bit_width, storage_unit_size)
+                        {
+                            // This is a bitfield - pack all bitfields at this offset together
+                            let mut packed_value: u64 = 0;
+
+                            // Extract the integer value and pack it
+                            if let Initializer::Int(v) = init {
+                                let mask = (1u64 << bit_w) - 1;
+                                packed_value |= ((*v as u64) & mask) << bit_off;
+                            }
+
+                            // Look ahead for more bitfields at the same offset
+                            let mut j = i + 1;
+                            while j < raw_fields.len() {
+                                let (next_off, _, next_init, next_bit_off, next_bit_w, _) =
+                                    &raw_fields[j];
+                                if *next_off != *offset {
+                                    break;
+                                }
+                                if let (Some(nb_off), Some(nb_w)) = (next_bit_off, next_bit_w) {
+                                    if let Initializer::Int(v) = next_init {
+                                        let mask = (1u64 << nb_w) - 1;
+                                        packed_value |= ((*v as u64) & mask) << nb_off;
+                                    }
+                                }
+                                j += 1;
+                            }
+
+                            // Emit packed value with storage unit size
+                            init_fields.push((
+                                *offset,
+                                *storage_size as usize,
+                                Initializer::Int(packed_value as i64),
+                            ));
+                            i = j; // Skip all bitfields we just packed
+                        } else {
+                            // Regular field - emit as-is
+                            init_fields.push((*offset, *field_size, init.clone()));
+                            i += 1;
+                        }
+                    }
 
                     Initializer::Struct {
                         total_size: resolved_size,
@@ -1897,18 +1971,27 @@ impl<'a> Linearizer<'a> {
 
                     for (idx, element) in elements.iter().enumerate() {
                         // Find the field (by designator or position)
-                        let member =
+                        // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
+                        let member_info =
                             if let Some(Designator::Field(name)) = element.designators.first() {
                                 // Designated initializer: .field = value
-                                members.iter().find(|m| &m.name == name)
+                                // find_member handles anonymous struct/union members
+                                self.types.find_member(resolved_typ, *name)
                             } else if idx < members.len() {
-                                // Positional initializer
-                                Some(&members[idx])
+                                // Positional initializer - direct member only
+                                let m = &members[idx];
+                                Some(crate::types::MemberInfo {
+                                    offset: m.offset,
+                                    typ: m.typ,
+                                    bit_offset: m.bit_offset,
+                                    bit_width: m.bit_width,
+                                    storage_unit_size: m.storage_unit_size,
+                                })
                             } else {
                                 None // Too many initializers
                             };
 
-                        let Some(member) = member else {
+                        let Some(member) = member_info else {
                             continue;
                         };
 
@@ -2992,7 +3075,10 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::Fabs { arg }
             | ExprKind::Fabsf { arg }
-            | ExprKind::Fabsl { arg } => self.is_pure_expr(arg),
+            | ExprKind::Fabsl { arg }
+            | ExprKind::Signbit { arg }
+            | ExprKind::Signbitf { arg }
+            | ExprKind::Signbitl { arg } => self.is_pure_expr(arg),
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
@@ -5397,6 +5483,46 @@ impl<'a> Linearizer<'a> {
                     .with_src(arg_val)
                     .with_size(128) // long double is 128-bit on our targets
                     .with_type(self.types.longdouble_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Signbit { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Signbit64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Signbitf { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Signbit32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Signbitl { arg } => {
+                // Long double signbit - use 64-bit version
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Signbit64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(128) // long double is 128-bit on our targets
+                    .with_type(self.types.int_id);
                 self.emit(insn);
                 result
             }

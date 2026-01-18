@@ -1355,4 +1355,52 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, 64);
     }
+
+    /// Emit __builtin_signbitf - test sign bit of float
+    pub(super) fn emit_signbit32(&mut self, insn: &Instruction) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into XMM0 (first FP argument register)
+        self.emit_fp_move(arg, XmmReg::Xmm0, 32);
+
+        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("__signbitf".to_string())),
+        });
+
+        // Result is in EAX (integer return), store to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+    }
+
+    /// Emit __builtin_signbit - test sign bit of double
+    pub(super) fn emit_signbit64(&mut self, insn: &Instruction) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into XMM0 (first FP argument register)
+        self.emit_fp_move(arg, XmmReg::Xmm0, 64);
+
+        // Call __signbit from libc (C99: signbit is a macro that calls __signbit)
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("__signbit".to_string())),
+        });
+
+        // Result is in EAX (integer return), store to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+    }
 }

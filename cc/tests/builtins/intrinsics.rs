@@ -112,6 +112,74 @@ int main(void) {
         if (result != 42) return 44;
     }
 
+    // ========== __BUILTIN_ASSUME_ALIGNED (returns 60-69) ==========
+    {
+        // assume_aligned returns the pointer unchanged (hint for optimizer)
+        int arr[16];
+        int *p = arr;
+
+        // Two-arg form: __builtin_assume_aligned(ptr, alignment)
+        int *aligned = __builtin_assume_aligned(p, 4);
+        if (aligned != p) return 60;
+
+        // Should work with larger alignments
+        aligned = __builtin_assume_aligned(p, 16);
+        if (aligned != p) return 61;
+
+        // Three-arg form: __builtin_assume_aligned(ptr, alignment, offset)
+        aligned = __builtin_assume_aligned(p, 16, 0);
+        if (aligned != p) return 62;
+
+        aligned = __builtin_assume_aligned(p + 1, 4, 0);
+        if (aligned != p + 1) return 63;
+
+        // Works with void*
+        void *vp = arr;
+        void *valigned = __builtin_assume_aligned(vp, 8);
+        if (valigned != vp) return 64;
+    }
+
+    // ========== __BUILTIN_PREFETCH (returns 70-79) ==========
+    {
+        // prefetch is a no-op hint - just verify it compiles and doesn't crash
+        int arr[100];
+        for (int i = 0; i < 100; i++) arr[i] = i;
+
+        // One-arg form: prefetch for read
+        __builtin_prefetch(&arr[0]);
+        __builtin_prefetch(&arr[50]);
+
+        // Two-arg form: rw (0=read, 1=write)
+        __builtin_prefetch(&arr[10], 0);  // prefetch for read
+        __builtin_prefetch(&arr[20], 1);  // prefetch for write
+
+        // Three-arg form: rw, locality (0-3, higher = more temporal locality)
+        __builtin_prefetch(&arr[30], 0, 0);  // read, no locality
+        __builtin_prefetch(&arr[40], 0, 3);  // read, high locality
+        __builtin_prefetch(&arr[60], 1, 1);  // write, some locality
+
+        // Verify array wasn't corrupted
+        if (arr[0] != 0) return 70;
+        if (arr[50] != 50) return 71;
+        if (arr[99] != 99) return 72;
+    }
+
+    // ========== STRING LITERAL SIZEOF (returns 80-89) ==========
+    {
+        // String literals have type char[N], not char*
+        // sizeof should return array size including null terminator
+        if (sizeof("") != 1) return 80;           // just null
+        if (sizeof("a") != 2) return 81;          // 'a' + null
+        if (sizeof("hello") != 6) return 82;      // 5 chars + null
+        if (sizeof("hello world") != 12) return 83;
+
+        // Wide string literals have type wchar_t[N]
+        // wchar_t is 4 bytes on Linux
+        if (sizeof(L"") != 4) return 84;          // just null (4 bytes)
+        if (sizeof(L"a") != 8) return 85;         // 'a' + null (2 * 4)
+        if (sizeof(L"hello") != 24) return 86;    // 6 wchars * 4 bytes
+    }
+
     return 0;
 }
 "#;

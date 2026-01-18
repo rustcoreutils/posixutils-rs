@@ -150,6 +150,75 @@ int main(void) {
         if (main_fp == 0) return 55;
     }
 
+    // ========== ANONYMOUS STRUCT/UNION (C11 6.7.2.1p13) (returns 60-79) ==========
+    {
+        // Anonymous struct inside struct
+        struct WithAnonStruct {
+            int x;
+            struct {
+                int a;
+                int b;
+            };  // anonymous struct - members promoted to parent
+            int y;
+        };
+        struct WithAnonStruct s1;
+        s1.x = 1;
+        s1.a = 2;  // access anonymous struct member directly
+        s1.b = 3;
+        s1.y = 4;
+        if (s1.x != 1) return 60;
+        if (s1.a != 2) return 61;
+        if (s1.b != 3) return 62;
+        if (s1.y != 4) return 63;
+
+        // Anonymous union inside struct
+        struct WithAnonUnion {
+            int type;
+            union {
+                int i;
+                float f;
+            };  // anonymous union - members promoted to parent
+        };
+        struct WithAnonUnion u1;
+        u1.type = 1;
+        u1.i = 42;  // access anonymous union member directly
+        if (u1.type != 1) return 64;
+        if (u1.i != 42) return 65;
+        u1.f = 3.14f;
+        // Can't check u1.i now since union was overwritten
+
+        // Nested anonymous structs
+        struct Nested {
+            int outer;
+            struct {
+                int mid;
+                struct {
+                    int inner;
+                };
+            };
+        };
+        struct Nested n;
+        n.outer = 10;
+        n.mid = 20;
+        n.inner = 30;
+        if (n.outer != 10) return 66;
+        if (n.mid != 20) return 67;
+        if (n.inner != 30) return 68;
+
+        // Anonymous struct in initializer
+        struct WithAnonStruct s2 = { .x = 100, .a = 200, .b = 300, .y = 400 };
+        if (s2.x != 100) return 69;
+        if (s2.a != 200) return 70;
+        if (s2.b != 300) return 71;
+        if (s2.y != 400) return 72;
+
+        // offsetof with anonymous struct members
+        if (__builtin_offsetof(struct WithAnonStruct, x) != 0) return 73;
+        if (__builtin_offsetof(struct WithAnonStruct, a) != 4) return 74;
+        if (__builtin_offsetof(struct WithAnonStruct, b) != 8) return 75;
+        if (__builtin_offsetof(struct WithAnonStruct, y) != 12) return 76;
+    }
+
     return 0;
 }
 "#;

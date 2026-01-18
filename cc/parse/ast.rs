@@ -479,6 +479,21 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
+    /// __builtin_signbit(x) - test sign bit of double, returns non-zero if negative
+    Signbit {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_signbitf(x) - test sign bit of float, returns non-zero if negative
+    Signbitf {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_signbitl(x) - test sign bit of long double, returns non-zero if negative
+    Signbitl {
+        arg: Box<Expr>,
+    },
+
     // =========================================================================
     // Optimization hints
     // =========================================================================

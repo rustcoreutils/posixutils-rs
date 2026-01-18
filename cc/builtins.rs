@@ -59,6 +59,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_fabs",
     "__builtin_fabsf",
     "__builtin_fabsl",
+    // Floating-point sign bit testing
+    "__builtin_signbit",
+    "__builtin_signbitf",
+    "__builtin_signbitl",
     // NaN constants
     "__builtin_nan",
     "__builtin_nanf",
@@ -68,6 +72,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_nansl",
     // Branch prediction
     "__builtin_expect",
+    // Pointer alignment hints
+    "__builtin_assume_aligned",
+    // Cache/memory prefetch
+    "__builtin_prefetch",
     // Floating-point rounding mode
     "__builtin_flt_rounds",
     // Frame/return address introspection

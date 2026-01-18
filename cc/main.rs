@@ -132,8 +132,9 @@ struct Args {
     output: Option<String>,
 
     /// Generate debug information (DWARF)
-    #[arg(short = 'g', help = gettext("Generate debug information"))]
-    debug: bool,
+    /// Allow multiple -g flags (common in build systems)
+    #[arg(short = 'g', action = clap::ArgAction::Count, help = gettext("Generate debug information"))]
+    debug: u8,
 
     /// Disable CFI unwind tables (enabled by default)
     #[arg(long = "fno-unwind-tables", help = gettext("Disable CFI unwind table generation"))]
@@ -332,8 +333,23 @@ fn process_file(
                 if let Some(next) = iter.peek() {
                     if next.pos.newline {
                         println!();
-                    } else if next.pos.whitespace {
-                        print!(" ");
+                    } else {
+                        // Need a space if:
+                        // 1. Original had whitespace, OR
+                        // 2. Adjacent tokens would merge (both alphanumeric/underscore)
+                        let next_text = show_token(next, &strings);
+                        let needs_space = next.pos.whitespace
+                            || (text
+                                .chars()
+                                .last()
+                                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                                && next_text
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_alphanumeric() || c == '_'));
+                        if needs_space {
+                            print!(" ");
+                        }
                     }
                 }
             }
@@ -376,7 +392,8 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module = ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug);
+    let mut module =
+        ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug > 0);
 
     // Print compilation statistics if requested
     if args.stats {
@@ -448,7 +465,7 @@ fn process_file(
         let obj_file = args.output.clone().unwrap_or_else(|| format!("{}.o", stem));
 
         let mut as_cmd = Command::new("as");
-        if args.debug {
+        if args.debug > 0 {
             as_cmd.arg("-g");
         }
         let status = as_cmd.args(["-o", &obj_file, &temp_asm]).status()?;
@@ -472,7 +489,7 @@ fn process_file(
     // Assemble
     let temp_obj = format!("/tmp/pcc_{}.o", std::process::id());
     let mut as_cmd = Command::new("as");
-    if args.debug {
+    if args.debug > 0 {
         as_cmd.arg("-g");
     }
     let status = as_cmd.args(["-o", &temp_obj, &temp_asm]).status()?;
@@ -525,11 +542,24 @@ fn preprocess_args() -> Vec<String> {
     let raw_args: Vec<String> = std::env::args().collect();
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
+    let mut seen_o = false;
+    let mut seen_fpic = false;
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
 
         if arg == "-O" {
+            // Deduplicate -O flags
+            if seen_o {
+                // Skip this duplicate, also skip the level arg if present
+                if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            seen_o = true;
             // Standalone -O: check if next arg is a valid optimization level
             if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
                 // Next arg is a level like "1", "2", etc. - merge them
@@ -541,8 +571,11 @@ fn preprocess_args() -> Vec<String> {
             result.push("-O1".to_string());
             i += 1;
         } else if arg.starts_with("-O") && arg.len() > 2 {
-            // -O0, -O1, -O2, -O3, -Os, -Oz, -Ofast, -Og - pass through
-            result.push(arg.clone());
+            // -O0, -O1, -O2, -O3, -Os, -Oz, -Ofast, -Og - pass through (first one only)
+            if !seen_o {
+                result.push(arg.clone());
+                seen_o = true;
+            }
             i += 1;
         } else if arg.starts_with("-W") && arg.len() > 2 {
             // -Wall → -W all, -Wextra → -W extra, etc.
@@ -563,8 +596,11 @@ fn preprocess_args() -> Vec<String> {
             // -std=c99, -std=c11, etc. - ignore (pcc is C99)
             i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
-            // -fPIC / -fpic → --pcc-fpic (internal flag)
-            result.push("--pcc-fpic".to_string());
+            // -fPIC / -fpic → --pcc-fpic (internal flag) (first one only)
+            if !seen_fpic {
+                result.push("--pcc-fpic".to_string());
+                seen_fpic = true;
+            }
             i += 1;
         } else if arg == "-shared" {
             // -shared → --shared
@@ -602,6 +638,12 @@ fn preprocess_args() -> Vec<String> {
 /// Check if a file is a C source file (by extension)
 fn is_source_file(path: &str) -> bool {
     path.ends_with(".c") || path.ends_with(".i") || path == "-"
+}
+
+/// Check if a file is an assembly file (by extension)
+/// .s = pure assembly, .S = assembly with C preprocessor directives
+fn is_asm_file(path: &str) -> bool {
+    path.ends_with(".s") || path.ends_with(".S")
 }
 
 /// Check if a file is an object file or library (by extension)
@@ -655,19 +697,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => RuntimeLib::default_for_target(&target),
     };
 
-    // Separate source files from object files
+    // Separate source files, assembly files, and object files
     let source_files: Vec<&String> = args.files.iter().filter(|f| is_source_file(f)).collect();
+    let asm_files: Vec<&String> = args.files.iter().filter(|f| is_asm_file(f)).collect();
     let object_files: Vec<&String> = args.files.iter().filter(|f| is_object_file(f)).collect();
 
     // Warn about unrecognized file types
     for file in &args.files {
-        if !is_source_file(file) && !is_object_file(file) {
+        if !is_source_file(file) && !is_asm_file(file) && !is_object_file(file) {
             eprintln!("pcc: warning: unrecognized file type: {}", file);
         }
     }
 
-    // If we only have object files and an output is specified, just link them
-    if source_files.is_empty() && !object_files.is_empty() && args.output.is_some() {
+    // Process assembly files: preprocess .S files, then assemble both .s and .S to .o
+    let mut asm_objects: Vec<String> = Vec::new();
+    for asm_path in &asm_files {
+        let stem = Path::new(asm_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("out");
+        let obj_file = if args.compile_only {
+            args.output.clone().unwrap_or_else(|| format!("{}.o", stem))
+        } else {
+            format!("/tmp/pcc_{}_{}.o", std::process::id(), stem)
+        };
+
+        // .S files need preprocessing, .s files don't
+        let asm_to_assemble = if asm_path.ends_with(".S") {
+            // Preprocess with cpp
+            let temp_s = format!("/tmp/pcc_{}_{}.s", std::process::id(), stem);
+            let mut cpp_cmd = Command::new("cpp");
+            // Add include paths
+            for inc in &args.include_paths {
+                cpp_cmd.arg(format!("-I{}", inc));
+            }
+            // Add defines
+            for def in &args.defines {
+                cpp_cmd.arg(format!("-D{}", def));
+            }
+            if args.no_std_inc {
+                cpp_cmd.arg("-nostdinc");
+            }
+            cpp_cmd.args(["-o", &temp_s, asm_path]);
+            let status = cpp_cmd.status()?;
+            if !status.success() {
+                eprintln!("pcc: preprocessor failed for {}", asm_path);
+                std::process::exit(1);
+            }
+            temp_s
+        } else {
+            (*asm_path).clone()
+        };
+
+        // Assemble
+        let mut as_cmd = Command::new("as");
+        if args.debug > 0 {
+            as_cmd.arg("-g");
+        }
+        as_cmd.args(["-o", &obj_file, &asm_to_assemble]);
+        let status = as_cmd.status()?;
+
+        // Clean up temp preprocessed file
+        if asm_path.ends_with(".S") {
+            let _ = std::fs::remove_file(&asm_to_assemble);
+        }
+
+        if !status.success() {
+            eprintln!("pcc: assembler failed for {}", asm_path);
+            std::process::exit(1);
+        }
+
+        if !args.compile_only {
+            asm_objects.push(obj_file);
+        }
+    }
+
+    // If we only have object files (including from assembly) and an output is specified, just link them
+    let all_objects: Vec<&String> = object_files
+        .iter()
+        .copied()
+        .chain(asm_objects.iter())
+        .collect();
+    if source_files.is_empty() && !all_objects.is_empty() && args.output.is_some() {
         let exe_file = args.output.clone().unwrap();
         let mut link_cmd = Command::new("cc");
         // Pass -shared flag for shared library creation
@@ -675,7 +786,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             link_cmd.arg("-shared");
         }
         link_cmd.args(["-o", &exe_file]);
-        for obj in &object_files {
+        for obj in &all_objects {
             link_cmd.arg(*obj);
         }
         // Add library search paths
@@ -687,12 +798,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             link_cmd.arg(format!("-l{}", lib));
         }
         let status = link_cmd.status()?;
+        // Clean up temp assembly objects
+        for obj in &asm_objects {
+            let _ = std::fs::remove_file(obj);
+        }
         if !status.success() {
             eprintln!("pcc: linker failed");
             std::process::exit(1);
         }
         if args.verbose {
-            eprintln!("Linked {} object files to {}", object_files.len(), exe_file);
+            eprintln!("Linked {} object files to {}", all_objects.len(), exe_file);
         }
         return Ok(());
     }

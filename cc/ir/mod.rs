@@ -200,8 +200,10 @@ pub enum Opcode {
     Memmove, // memmove(dest, src, n) - copy overlapping memory
 
     // Floating-point builtins
-    Fabs32, // Absolute value of float
-    Fabs64, // Absolute value of double
+    Fabs32,    // Absolute value of float
+    Fabs64,    // Absolute value of double
+    Signbit32, // Test sign bit of float (returns int)
+    Signbit64, // Test sign bit of double (returns int)
 
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
@@ -361,6 +363,8 @@ impl Opcode {
             Opcode::Memmove => "memmove",
             Opcode::Fabs32 => "fabs32",
             Opcode::Fabs64 => "fabs64",
+            Opcode::Signbit32 => "signbit32",
+            Opcode::Signbit64 => "signbit64",
             Opcode::Unreachable => "unreachable",
             Opcode::FrameAddress => "frame_address",
             Opcode::ReturnAddress => "return_address",

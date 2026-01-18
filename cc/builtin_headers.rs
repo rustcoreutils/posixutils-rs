@@ -31,6 +31,15 @@ pub const STDATOMIC_H: &str = include_str!("include/stdatomic.h");
 /// Builtin float.h - floating-point characteristics
 pub const FLOAT_H: &str = include_str!("include/float.h");
 
+/// Builtin cpuid.h - CPU feature detection (x86/x64)
+pub const CPUID_H: &str = include_str!("include/cpuid.h");
+
+/// Builtin xmmintrin.h - SSE intrinsics
+pub const XMMINTRIN_H: &str = include_str!("include/xmmintrin.h");
+
+/// Builtin emmintrin.h - SSE2 intrinsics
+pub const EMMINTRIN_H: &str = include_str!("include/emmintrin.h");
+
 /// Look up a builtin header by name
 ///
 /// Returns the header content if found, None otherwise.
@@ -43,6 +52,9 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "limits.h" => Some(LIMITS_H),
         "stdatomic.h" => Some(STDATOMIC_H),
         "float.h" => Some(FLOAT_H),
+        "cpuid.h" => Some(CPUID_H),
+        "xmmintrin.h" => Some(XMMINTRIN_H),
+        "emmintrin.h" => Some(EMMINTRIN_H),
         _ => None,
     }
 }

@@ -4093,11 +4093,14 @@ fn test_wide_string_literal_basic() {
         }
         _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
     }
-    // Type should be wchar_t* (int* on this platform)
+    // Type should be wchar_t[N] (int[N] on this platform), not wchar_t*
+    // C11 6.4.5: "wide string literal has type wchar_t[N]"
     let typ = expr.typ.unwrap();
-    assert_eq!(types.kind(typ), TypeKind::Pointer);
-    let pointee = types.get(typ).base.unwrap();
-    assert_eq!(types.kind(pointee), TypeKind::Int);
+    assert_eq!(types.kind(typ), TypeKind::Array);
+    let elem_type = types.get(typ).base.unwrap();
+    assert_eq!(types.kind(elem_type), TypeKind::Int);
+    // Array size should be 6 (5 chars + null terminator)
+    assert_eq!(types.array_size(typ), Some(6));
 }
 
 #[test]

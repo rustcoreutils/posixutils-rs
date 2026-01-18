@@ -294,15 +294,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             }
             Initializer::String(s) => {
                 // Emit string as .ascii (without null terminator)
-                // The array size will include space for null if needed
+                // Then zero-fill the remaining bytes (which includes the null terminator)
                 self.push_directive(Directive::Ascii(escape_string(s)));
-                // Zero-fill remaining bytes if array is larger than string
-                let string_len = s.len() + 1; // +1 for null terminator
-                if size > string_len {
-                    self.push_directive(Directive::Zero((size - string_len) as u32));
-                } else if size > s.len() {
-                    // Need null terminator
-                    self.push_directive(Directive::Byte(0));
+                // .ascii emits s.len() bytes; fill remaining with zeros
+                let bytes_emitted = s.len();
+                if size > bytes_emitted {
+                    self.push_directive(Directive::Zero((size - bytes_emitted) as u32));
                 }
             }
             Initializer::WideString(s) => {

@@ -13,6 +13,7 @@
 
 use crate::common::{compile_and_run_optimized, create_c_file};
 use plib::testing::run_test_base;
+use std::io::Write;
 use std::process::Command;
 
 // ============================================================================
@@ -371,5 +372,160 @@ int main() {
     assert!(
         !asm.contains(".loc 1"),
         "Unexpected .loc directive without -g"
+    );
+}
+
+// ============================================================================
+// Assembly file compilation tests (.s and .S)
+// ============================================================================
+
+/// Create a temporary assembly file
+fn create_asm_file(name: &str, content: &str, extension: &str) -> tempfile::NamedTempFile {
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!("pcc_test_{}_", name))
+        .suffix(extension)
+        .tempfile()
+        .expect("failed to create temp file");
+    file.write_all(content.as_bytes())
+        .expect("failed to write test file");
+    file
+}
+
+#[test]
+fn codegen_asm_file_support() {
+    // Test .s file (pure assembly) and .S file (assembly with preprocessor)
+    // Tests compile-only (-c) mode which fully works. Mixing C + asm in one
+    // invocation requires passing asm objects to C file's link step (future work).
+
+    // Assembly function that returns 42
+    let asm_content = r#"
+    .text
+    .globl get_value
+    .type get_value, @function
+get_value:
+    movl $42, %eax
+    ret
+    .size get_value, .-get_value
+"#;
+
+    // Assembly with preprocessor directives (.S)
+    let asm_s_content = r#"
+#define RETURN_VALUE 99
+    .text
+    .globl get_value_s
+    .type get_value_s, @function
+get_value_s:
+    movl $RETURN_VALUE, %eax
+    ret
+    .size get_value_s, .-get_value_s
+"#;
+
+    // C main that calls both functions
+    let c_content = r#"
+extern int get_value(void);
+extern int get_value_s(void);
+
+int main(void) {
+    if (get_value() != 42) return 1;
+    if (get_value_s() != 99) return 2;
+    return 0;
+}
+"#;
+
+    let asm_file = create_asm_file("asm_test", asm_content, ".s");
+    let asm_s_file = create_asm_file("asm_s_test", asm_s_content, ".S");
+    let c_file = create_c_file("asm_main", c_content);
+
+    let obj_s = std::env::temp_dir().join(format!("pcc_asm_{}.o", std::process::id()));
+    let obj_s_upper = std::env::temp_dir().join(format!("pcc_asm_s_{}.o", std::process::id()));
+    let obj_c = std::env::temp_dir().join(format!("pcc_asm_c_{}.o", std::process::id()));
+    let exe_path = std::env::temp_dir().join(format!("pcc_asm_test_{}", std::process::id()));
+
+    // Step 1: Compile .s to .o
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-c".to_string(),
+            "-o".to_string(),
+            obj_s.to_string_lossy().to_string(),
+            asm_file.path().to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc -c .s failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 2: Compile .S to .o (with preprocessing)
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-c".to_string(),
+            "-o".to_string(),
+            obj_s_upper.to_string_lossy().to_string(),
+            asm_s_file.path().to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc -c .S failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 3: Compile C to .o
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-c".to_string(),
+            "-o".to_string(),
+            obj_c.to_string_lossy().to_string(),
+            c_file.path().to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc -c .c failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 4: Link all .o files
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-o".to_string(),
+            exe_path.to_string_lossy().to_string(),
+            obj_c.to_string_lossy().to_string(),
+            obj_s.to_string_lossy().to_string(),
+            obj_s_upper.to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc link failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run the executable
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("failed to run executable");
+
+    let exit_code = run_output.status.code().unwrap_or(-1);
+
+    // Cleanup
+    let _ = std::fs::remove_file(&obj_s);
+    let _ = std::fs::remove_file(&obj_s_upper);
+    let _ = std::fs::remove_file(&obj_c);
+    let _ = std::fs::remove_file(&exe_path);
+
+    assert_eq!(
+        exit_code, 0,
+        "Assembly file test failed with exit code {}",
+        exit_code
     );
 }

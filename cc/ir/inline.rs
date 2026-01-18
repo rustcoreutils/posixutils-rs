@@ -894,7 +894,7 @@ fn collect_func_refs_from_initializer(
 ) {
     use super::Initializer;
     match init {
-        Initializer::SymAddr(name) => {
+        Initializer::SymAddr(name) | Initializer::SymAddrOffset(name, _) => {
             // Check if this symbol is a function name
             if func_names.contains(name) {
                 address_taken.insert(name.clone());

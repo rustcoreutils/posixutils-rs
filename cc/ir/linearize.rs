@@ -679,15 +679,12 @@ impl<'a> Linearizer<'a> {
                 op: UnaryOp::AddrOf,
                 operand,
             } => {
-                if let ExprKind::Ident(symbol_id) = &operand.kind {
-                    let name_str = self.symbol_name(*symbol_id);
-                    // Check if this is a static local variable
-                    // Static locals have mangled names like "func_name.var_name.N"
-                    let key = format!("{}.{}", self.current_func_name, name_str);
-                    if let Some(static_info) = self.static_locals.get(&key) {
-                        Initializer::SymAddr(static_info.global_name.clone())
+                // Try to compute the address as symbol + offset
+                if let Some((name, offset)) = self.eval_static_address(operand) {
+                    if offset == 0 {
+                        Initializer::SymAddr(name)
                     } else {
-                        Initializer::SymAddr(name_str)
+                        Initializer::SymAddrOffset(name, offset)
                     }
                 } else {
                     Initializer::None
@@ -2462,6 +2459,98 @@ impl<'a> Linearizer<'a> {
             // Cast to integer type - evaluate inner expression
             ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
 
+            // __builtin_offsetof(type, member-designator) - compile-time constant
+            ExprKind::OffsetOf { type_id, path } => {
+                let mut offset: u64 = 0;
+                let mut current_type = *type_id;
+
+                for element in path {
+                    match element {
+                        OffsetOfPath::Field(field_id) => {
+                            let struct_type = self.resolve_struct_type(current_type);
+                            if let Some(member_info) =
+                                self.types.find_member(struct_type, *field_id)
+                            {
+                                offset += member_info.offset as u64;
+                                current_type = member_info.typ;
+                            } else {
+                                return None; // Field not found
+                            }
+                        }
+                        OffsetOfPath::Index(index) => {
+                            if let Some(elem_type) = self.types.base_type(current_type) {
+                                let elem_size = self.types.size_bytes(elem_type);
+                                offset += (*index as u64) * (elem_size as u64);
+                                current_type = elem_type;
+                            } else {
+                                return None; // Not an array type
+                            }
+                        }
+                    }
+                }
+
+                Some(offset as i64)
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Evaluate a static address expression (for initializers like `&symbol.field`)
+    ///
+    /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
+    /// or None if it can't be computed at compile time.
+    fn eval_static_address(&self, expr: &Expr) -> Option<(String, i64)> {
+        match &expr.kind {
+            // Simple identifier: &symbol
+            ExprKind::Ident(symbol_id) => {
+                let name_str = self.symbol_name(*symbol_id);
+                // Check if this is a static local variable
+                let key = format!("{}.{}", self.current_func_name, name_str);
+                if let Some(static_info) = self.static_locals.get(&key) {
+                    Some((static_info.global_name.clone(), 0))
+                } else {
+                    Some((name_str, 0))
+                }
+            }
+
+            // Member access: expr.member
+            ExprKind::Member { expr: base, member } => {
+                // Recursively evaluate the base address
+                let (name, base_offset) = self.eval_static_address(base)?;
+
+                // Get the offset of the member in the struct
+                let base_type = base.typ?;
+                let struct_type = self.resolve_struct_type(base_type);
+                let member_info = self.types.find_member(struct_type, *member)?;
+
+                Some((name, base_offset + member_info.offset as i64))
+            }
+
+            // Arrow access: expr->member (pointer dereference + member access)
+            // This cannot be a static address (involves runtime pointer)
+            ExprKind::Arrow { .. } => None,
+
+            // Array subscript: array[index]
+            ExprKind::Index { array, index } => {
+                // Recursively evaluate the base address
+                let (name, base_offset) = self.eval_static_address(array)?;
+
+                // Get the index as a constant
+                let idx = self.eval_const_expr(index)?;
+
+                // Get the element size
+                let array_type = array.typ?;
+                let elem_type = self.types.base_type(array_type)?;
+                let elem_size = self.types.size_bytes(elem_type) as i64;
+
+                Some((name, base_offset + idx * elem_size))
+            }
+
+            // Cast - evaluate the inner expression
+            ExprKind::Cast { expr: inner, .. } => self.eval_static_address(inner),
+
+            // Parenthesized expression (if there's such a variant)
             _ => None,
         }
     }

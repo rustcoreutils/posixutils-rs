@@ -507,6 +507,9 @@ pub enum Directive {
     /// .quad symbol - emit 64-bit symbol address (for relocations)
     QuadSym(Symbol),
 
+    /// .quad symbol+offset - emit 64-bit symbol address with offset (for member pointers)
+    QuadSymOffset(Symbol, i64),
+
     // ========================================================================
     // CFI (Call Frame Information) Directives
     // ========================================================================
@@ -772,6 +775,18 @@ impl EmitAsm for Directive {
             }
             Directive::QuadSym(sym) => {
                 let _ = writeln!(out, "    .quad {}", sym.format_for_target(target));
+            }
+            Directive::QuadSymOffset(sym, offset) => {
+                if *offset >= 0 {
+                    let _ = writeln!(
+                        out,
+                        "    .quad {}+{}",
+                        sym.format_for_target(target),
+                        offset
+                    );
+                } else {
+                    let _ = writeln!(out, "    .quad {}{}", sym.format_for_target(target), offset);
+                }
             }
 
             // CFI directives

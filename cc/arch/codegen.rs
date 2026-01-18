@@ -371,6 +371,14 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 };
                 self.push_directive(Directive::QuadSym(sym));
             }
+            Initializer::SymAddrOffset(name, offset) => {
+                let sym = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                self.push_directive(Directive::QuadSymOffset(sym, *offset));
+            }
         }
     }
 

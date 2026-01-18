@@ -1437,6 +1437,8 @@ pub enum Initializer {
     },
     /// Address of a symbol (for pointer initializers like `int *p = &x;`)
     SymAddr(String),
+    /// Address of a symbol plus offset (for pointer initializers like `int *p = &s.field;`)
+    SymAddrOffset(String, i64),
 }
 
 impl fmt::Display for Initializer {
@@ -1472,6 +1474,13 @@ impl fmt::Display for Initializer {
                 write!(f, " }}")
             }
             Initializer::SymAddr(name) => write!(f, "&{}", name),
+            Initializer::SymAddrOffset(name, offset) => {
+                if *offset >= 0 {
+                    write!(f, "&{}+{}", name, offset)
+                } else {
+                    write!(f, "&{}{}", name, offset)
+                }
+            }
         }
     }
 }

@@ -426,18 +426,21 @@ impl<'a> Parser<'a> {
             if let Some(ref composite) = typ.composite {
                 if let Some(tag) = composite.tag {
                     if let Some(existing) = self.symbols.lookup_tag(tag) {
-                        // Check if we need to preserve storage class modifiers
-                        let storage_class_mask = TypeModifiers::EXTERN
-                            | TypeModifiers::STATIC
-                            | TypeModifiers::TYPEDEF
-                            | TypeModifiers::REGISTER
-                            | TypeModifiers::AUTO
-                            | TypeModifiers::THREAD_LOCAL;
-                        let new_storage_class = typ.modifiers & storage_class_mask;
-                        if !new_storage_class.is_empty() {
-                            // Create a new type with the existing struct's data but new modifiers
+                        // Check if we need to preserve type qualifiers (not storage class)
+                        // Storage class (TYPEDEF, EXTERN, STATIC, etc.) is a property of
+                        // the declaration, not the type. TYPEDEF especially must NOT create
+                        // a new TypeId, otherwise "typedef struct Foo Foo;" creates a different
+                        // TypeId than the tag, and when "struct Foo { ... };" completes the tag,
+                        // the typedef still points to the incomplete type.
+                        let type_qualifier_mask = TypeModifiers::CONST
+                            | TypeModifiers::VOLATILE
+                            | TypeModifiers::RESTRICT
+                            | TypeModifiers::ATOMIC;
+                        let new_qualifiers = typ.modifiers & type_qualifier_mask;
+                        if !new_qualifiers.is_empty() {
+                            // Create a new type with the existing struct's data but new qualifiers
                             let mut existing_type = self.types.get(existing.typ).clone();
-                            existing_type.modifiers |= new_storage_class;
+                            existing_type.modifiers |= new_qualifiers;
                             return self.types.intern(existing_type);
                         }
                         return existing.typ;
@@ -1889,10 +1892,14 @@ impl<'a> Parser<'a> {
                                 }
                                 return Some(result_id);
                             }
-                            // Tag not found - return incomplete struct type
+                            // Tag not found - create incomplete struct type and register it
+                            // This ensures that when the struct is later defined, we can update
+                            // this same TypeId rather than creating a new one
                             let mut incomplete = Type::incomplete_struct(tag_name);
                             incomplete.modifiers |= self.consume_type_qualifiers();
                             let result_id = self.types.intern(incomplete);
+                            let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
+                            let _ = self.symbols.declare(sym);
                             return Some(self.parse_pointer_chain(result_id));
                         }
                     }
@@ -1948,10 +1955,14 @@ impl<'a> Parser<'a> {
                                 }
                                 return Some(result_id);
                             }
-                            // Tag not found - return incomplete union type
+                            // Tag not found - create incomplete union type and register it
+                            // This ensures that when the union is later defined, we can update
+                            // this same TypeId rather than creating a new one
                             let mut incomplete = Type::incomplete_union(tag_name);
                             incomplete.modifiers |= self.consume_type_qualifiers();
                             let result_id = self.types.intern(incomplete);
+                            let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
+                            let _ = self.symbols.declare(sym);
                             return Some(self.parse_pointer_chain(result_id));
                         }
                     }
@@ -2699,6 +2710,64 @@ impl<'a> Parser<'a> {
                             return Ok(Self::typed_expr(
                                 ExprKind::Alloca {
                                     size: Box::new(size),
+                                },
+                                self.types.void_ptr_id,
+                                token_pos,
+                            ));
+                        }
+                        // Memory builtins - generate calls to C library functions
+                        "__builtin_memset" => {
+                            // __builtin_memset(dest, c, n) - returns void*
+                            self.expect_special(b'(')?;
+                            let dest = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let c = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let n = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Memset {
+                                    dest: Box::new(dest),
+                                    c: Box::new(c),
+                                    n: Box::new(n),
+                                },
+                                self.types.void_ptr_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_memcpy" => {
+                            // __builtin_memcpy(dest, src, n) - returns void*
+                            self.expect_special(b'(')?;
+                            let dest = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let src = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let n = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Memcpy {
+                                    dest: Box::new(dest),
+                                    src: Box::new(src),
+                                    n: Box::new(n),
+                                },
+                                self.types.void_ptr_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_memmove" => {
+                            // __builtin_memmove(dest, src, n) - returns void*
+                            self.expect_special(b'(')?;
+                            let dest = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let src = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let n = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Memmove {
+                                    dest: Box::new(dest),
+                                    src: Box::new(src),
+                                    n: Box::new(n),
                                 },
                                 self.types.void_ptr_id,
                                 token_pos,
@@ -4249,6 +4318,7 @@ impl Parser<'_> {
                 declarators.push(InitDeclarator {
                     symbol,
                     typ,
+                    storage_class: TypeModifiers::empty(),
                     init,
                     vla_sizes,
                     explicit_align: validated_align,
@@ -4455,9 +4525,18 @@ impl Parser<'_> {
                 // Only add declarator if it has a symbol (named declaration)
                 // Nameless declarators like "int;" are allowed but produce no binding
                 if let Some(symbol) = symbol_id {
+                    // Extract storage class specifiers from base_type modifiers
+                    let storage_class_mask = TypeModifiers::EXTERN
+                        | TypeModifiers::STATIC
+                        | TypeModifiers::THREAD_LOCAL
+                        | TypeModifiers::TYPEDEF
+                        | TypeModifiers::AUTO
+                        | TypeModifiers::REGISTER;
+                    let storage_class = base_type.modifiers & storage_class_mask;
                     declarators.push(InitDeclarator {
                         symbol,
                         typ,
+                        storage_class,
                         init,
                         vla_sizes,
                         explicit_align: validated_align,
@@ -5404,10 +5483,12 @@ impl Parser<'_> {
         }
 
         // Determine which function parameters to return:
-        // - For grouped declarator with inner function: return inner_func_params
-        //   (those are the params of the outer function after type substitution)
+        // - For grouped declarator with inner function params: return inner_func_params
+        //   (e.g., int (*get_op(int which))(int) - inner has params)
+        // - For grouped declarator without inner params: return full_func_params
+        //   (e.g., int (name)(int lhs, int rhs) - parenthesized name followed by params)
         // - For simple declarator with function: return full_func_params
-        let returned_func_params = if inner_type_id.is_some() {
+        let returned_func_params = if inner_func_params.is_some() {
             inner_func_params
         } else {
             full_func_params
@@ -5835,6 +5916,14 @@ impl Parser<'_> {
         let base_type = self.parse_type_specifier()?;
         // Check modifiers before interning (storage class specifiers)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
+        // Extract storage class specifiers (not stored in type system)
+        let storage_class_mask = TypeModifiers::EXTERN
+            | TypeModifiers::STATIC
+            | TypeModifiers::THREAD_LOCAL
+            | TypeModifiers::TYPEDEF
+            | TypeModifiers::AUTO
+            | TypeModifiers::REGISTER;
+        let storage_class = base_type.modifiers & storage_class_mask;
         // For struct/union types with tags, use existing TypeId to preserve forward declarations
         let base_type_id = self.intern_type_with_tag(&base_type);
 
@@ -5873,12 +5962,13 @@ impl Parser<'_> {
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: int (*get_op(int which))(int, int) { ... }
                 if self.types.kind(typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type and storage class
+                    // Get the function's return type
+                    // Storage class (static, inline) comes from base_type, not the function type
                     let func_type = self.types.get(typ);
                     let return_type = func_type.base.unwrap();
                     let _is_variadic = func_type.variadic;
-                    let is_static = func_type.modifiers.contains(TypeModifiers::STATIC);
-                    let is_inline = func_type.modifiers.contains(TypeModifiers::INLINE);
+                    let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
@@ -5965,6 +6055,7 @@ impl Parser<'_> {
                     declarators: vec![InitDeclarator {
                         symbol,
                         typ,
+                        storage_class,
                         init,
                         vla_sizes: vec![],
                         explicit_align: validated_align,
@@ -6060,11 +6151,12 @@ impl Parser<'_> {
                 // Check if this is a function definition (function type followed by '{')
                 // This handles cases like: char *(*get_op(int which))(int, int) { ... }
                 if self.types.kind(full_typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type and storage class
+                    // Get the function's return type
+                    // Storage class (static, inline) comes from base_type, not the function type
                     let func_type = self.types.get(full_typ);
                     let return_type = func_type.base.unwrap();
-                    let is_static = func_type.modifiers.contains(TypeModifiers::STATIC);
-                    let is_inline = func_type.modifiers.contains(TypeModifiers::INLINE);
+                    let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
                     let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
@@ -6151,6 +6243,7 @@ impl Parser<'_> {
                     declarators: vec![InitDeclarator {
                         symbol,
                         typ: full_typ,
+                        storage_class,
                         init,
                         vla_sizes: vec![],
                         explicit_align: validated_align,
@@ -6174,17 +6267,18 @@ impl Parser<'_> {
             // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
             let attrs = self.parse_attributes();
             // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
-            let base_type = self.types.get(typ_id);
+            let typ_from_table = self.types.get(typ_id);
             let is_noreturn =
-                attrs.has_noreturn() || base_type.modifiers.contains(TypeModifiers::NORETURN);
+                attrs.has_noreturn() || typ_from_table.modifiers.contains(TypeModifiers::NORETURN);
             // Extract calling convention from attributes
             let calling_conv = attrs.calling_conv().unwrap_or_default();
 
             if self.is_special(b'{') {
                 // Function definition
-                // Extract storage class from base type
-                let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
-                let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
+                // Use storage_class extracted from original base_type at line 5926,
+                // not from typ_id which may have lost storage class for tagged structs
+                let is_static = storage_class.contains(TypeModifiers::STATIC);
+                let is_inline = storage_class.contains(TypeModifiers::INLINE);
 
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|(_, typ)| *typ).collect();
@@ -6259,6 +6353,7 @@ impl Parser<'_> {
                     declarators: vec![InitDeclarator {
                         symbol,
                         typ: func_type_id,
+                        storage_class,
                         init: None,
                         vla_sizes: vec![],
                         explicit_align: None, // Functions don't have _Alignas
@@ -6316,6 +6411,31 @@ impl Parser<'_> {
         // Skip any __attribute__ after variable name/array declarator
         self.skip_extensions();
 
+        // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+        let validated_align = self.validated_explicit_align(var_type_id)?;
+
+        // Bind variable to symbol table BEFORE parsing initializer.
+        // This ensures the variable is in scope for self-referential initializers.
+        // Per C99 6.2.1p7: "Any other identifier has scope that begins just
+        // after the completion of its declarator."
+        // For typedefs, we bind AFTER (since typedef initializers are forbidden anyway).
+        let mut symbol = if is_typedef {
+            None // Will be bound after initializer parsing
+        } else {
+            // Add global variable to symbol table so it can be referenced in initializer
+            let var_sym = Symbol::variable(name, var_type_id, self.symbols.depth())
+                .with_align(validated_align);
+            Some(match self.symbols.declare(var_sym) {
+                Ok(id) => id,
+                Err(_) => {
+                    // Extern declaration of existing variable - reuse existing symbol
+                    self.symbols
+                        .lookup_id(name, Namespace::Ordinary)
+                        .expect("redeclaration should find existing symbol")
+                }
+            })
+        };
+
         // Handle initializer (not allowed for typedef)
         let init = if self.is_special(b'=') {
             if is_typedef {
@@ -6335,37 +6455,23 @@ impl Parser<'_> {
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
         }
 
-        // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-        let validated_align = self.validated_explicit_align(var_type_id)?;
-
-        // Add to symbol table and capture SymbolId
-        // For extern declarations of already-defined variables, reuse existing symbol
-        let symbol = if is_typedef {
+        // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
+        if is_typedef {
             let sym = Symbol::typedef(name, var_type_id, self.symbols.depth());
-            match self.symbols.declare(sym) {
+            symbol = Some(match self.symbols.declare(sym) {
                 Ok(id) => id,
                 Err(_) => self
                     .symbols
                     .lookup_id(name, Namespace::Ordinary)
                     .expect("redeclaration should find existing symbol"),
-            }
-        } else {
-            // Add global variable to symbol table so it can be referenced by later code
-            let var_sym = Symbol::variable(name, var_type_id, self.symbols.depth())
-                .with_align(validated_align);
-            match self.symbols.declare(var_sym) {
-                Ok(id) => id,
-                Err(_) => {
-                    // Extern declaration of existing variable - reuse existing symbol
-                    self.symbols
-                        .lookup_id(name, Namespace::Ordinary)
-                        .expect("redeclaration should find existing symbol")
-                }
-            }
-        };
+            });
+        }
+
+        let symbol = symbol.expect("symbol should be bound");
         declarators.push(InitDeclarator {
             symbol,
             typ: var_type_id,
+            storage_class,
             init,
             vla_sizes: vec![],
             explicit_align: validated_align,
@@ -6374,7 +6480,7 @@ impl Parser<'_> {
         // Handle additional declarators
         while self.is_special(b',') {
             self.advance();
-            let (decl_name, decl_type, vla_sizes, _decl_func_params) =
+            let (decl_name, mut decl_type, vla_sizes, _decl_func_params) =
                 self.parse_declarator(base_type_id)?;
 
             // C99 6.7.5.2: VLAs must have block scope
@@ -6384,6 +6490,24 @@ impl Parser<'_> {
                     self.current_pos(),
                 ));
             }
+
+            // Validate explicit alignment for this declarator's type (C11 6.7.5)
+            let decl_validated_align = self.validated_explicit_align(decl_type)?;
+
+            // Bind variable to symbol table BEFORE parsing initializer (C99 6.2.1p7)
+            let mut decl_symbol = if is_typedef {
+                None // Will be bound after initializer parsing
+            } else {
+                let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth())
+                    .with_align(decl_validated_align);
+                Some(match self.symbols.declare(var_sym) {
+                    Ok(id) => id,
+                    Err(_) => self
+                        .symbols
+                        .lookup_id(decl_name, Namespace::Ordinary)
+                        .expect("redeclaration should find existing symbol"),
+                })
+            };
 
             let decl_init = if self.is_special(b'=') {
                 if is_typedef {
@@ -6398,34 +6522,27 @@ impl Parser<'_> {
                 None
             };
 
-            // Validate explicit alignment for this declarator's type (C11 6.7.5)
-            let decl_validated_align = self.validated_explicit_align(decl_type)?;
+            // For incomplete array types, infer size from initializer
+            if let Some(ref init_expr) = decl_init {
+                decl_type = self.infer_array_size_from_init(decl_type, init_expr);
+            }
 
-            // Add to symbol table and capture SymbolId
-            // For extern declarations of already-defined variables, reuse existing symbol
-            let decl_symbol = if is_typedef {
+            // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
+            if is_typedef {
                 let sym = Symbol::typedef(decl_name, decl_type, self.symbols.depth());
-                match self.symbols.declare(sym) {
+                decl_symbol = Some(match self.symbols.declare(sym) {
                     Ok(id) => id,
                     Err(_) => self
                         .symbols
                         .lookup_id(decl_name, Namespace::Ordinary)
                         .expect("redeclaration should find existing symbol"),
-                }
-            } else {
-                let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth())
-                    .with_align(decl_validated_align);
-                match self.symbols.declare(var_sym) {
-                    Ok(id) => id,
-                    Err(_) => self
-                        .symbols
-                        .lookup_id(decl_name, Namespace::Ordinary)
-                        .expect("redeclaration should find existing symbol"),
-                }
-            };
+                });
+            }
+
             declarators.push(InitDeclarator {
-                symbol: decl_symbol,
+                symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,
+                storage_class,
                 init: decl_init,
                 vla_sizes: vec![],
                 explicit_align: decl_validated_align,

@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+// Casts are necessary for cross-platform compatibility (libc types differ by platform)
+#![allow(clippy::unnecessary_cast)]
+
 use plib::testing::{run_test, TestPlan};
 use std::{
     ffi::{CStr, CString},

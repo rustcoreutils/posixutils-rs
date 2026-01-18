@@ -137,21 +137,12 @@ impl Aarch64CodeGen {
 
     /// Emit a global variable (delegates to base)
     #[inline]
-    fn emit_global(
-        &mut self,
-        name: &str,
-        typ: &TypeId,
-        init: &crate::ir::Initializer,
-        is_thread_local: bool,
-        explicit_align: Option<u32>,
-        types: &TypeTable,
-    ) {
+    fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         // Skip extern symbols - they're defined elsewhere
-        if self.extern_symbols.contains(name) {
+        if self.extern_symbols.contains(&global.name) {
             return;
         }
-        self.base
-            .emit_global(name, typ, init, is_thread_local, explicit_align, types);
+        self.base.emit_global(global, types);
     }
 
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
@@ -3022,14 +3013,7 @@ impl CodeGenerator for Aarch64CodeGen {
 
         // Emit globals
         for global in &module.globals {
-            self.emit_global(
-                &global.name,
-                &global.typ,
-                &global.init,
-                global.is_thread_local,
-                global.explicit_align,
-                types,
-            );
+            self.emit_global(global, types);
         }
 
         // Emit string literals

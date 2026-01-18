@@ -13,7 +13,7 @@
 use crate::diag::Position;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
-use crate::types::TypeId;
+use crate::types::{TypeId, TypeModifiers};
 
 // ============================================================================
 // Operators
@@ -435,6 +435,30 @@ pub enum ExprKind {
     Alloca {
         /// The size to allocate in bytes
         size: Box<Expr>,
+    },
+
+    // =========================================================================
+    // Memory builtins - generate calls to C library functions
+    // =========================================================================
+    /// __builtin_memset(dest, c, n) - calls memset
+    Memset {
+        dest: Box<Expr>,
+        c: Box<Expr>,
+        n: Box<Expr>,
+    },
+
+    /// __builtin_memcpy(dest, src, n) - calls memcpy
+    Memcpy {
+        dest: Box<Expr>,
+        src: Box<Expr>,
+        n: Box<Expr>,
+    },
+
+    /// __builtin_memmove(dest, src, n) - calls memmove
+    Memmove {
+        dest: Box<Expr>,
+        src: Box<Expr>,
+        n: Box<Expr>,
     },
 
     // =========================================================================
@@ -910,6 +934,9 @@ pub struct InitDeclarator {
     pub symbol: SymbolId,
     /// The complete type (after applying declarator modifiers) - interned TypeId
     pub typ: TypeId,
+    /// Storage class modifiers (extern, static, _Thread_local, etc.)
+    /// These are NOT part of the type but affect code generation
+    pub storage_class: TypeModifiers,
     /// Optional initializer
     pub init: Option<Expr>,
     /// For VLAs: runtime size expressions for each variable dimension
@@ -928,6 +955,7 @@ impl Declaration {
             declarators: vec![InitDeclarator {
                 symbol,
                 typ,
+                storage_class: TypeModifiers::empty(),
                 init,
                 vla_sizes: vec![],
                 explicit_align: None,

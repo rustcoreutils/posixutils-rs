@@ -254,3 +254,22 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("typedef_func", code, &[]), 0);
 }
+
+// ============================================================================
+// Typedef Forward Declaration with sizeof
+// ============================================================================
+
+#[test]
+fn typedef_forward_declaration_sizeof() {
+    let code = r#"
+typedef struct Node Node;
+struct Node { int value; Node *next; };
+
+int main(void) {
+    if (sizeof(Node) == 0) return 1;
+    if (sizeof(Node) != sizeof(struct Node)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("typedef_fwd_sizeof", code, &[]), 0);
+}

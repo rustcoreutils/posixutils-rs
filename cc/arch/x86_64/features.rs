@@ -1137,6 +1137,108 @@ impl X86_64CodeGen {
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
 
+    /// Emit __builtin_memset(dest, c, n) - calls memset
+    /// System V AMD64 ABI: dest in RDI, c in RSI, n in RDX, returns dest in RAX
+    pub(super) fn emit_memset(&mut self, insn: &Instruction) {
+        let dest = match insn.src.first() {
+            Some(&d) => d,
+            None => return,
+        };
+        let c = match insn.src.get(1) {
+            Some(&c) => c,
+            None => return,
+        };
+        let n = match insn.src.get(2) {
+            Some(&n) => n,
+            None => return,
+        };
+        let target = insn.target;
+
+        // Load arguments in reverse order to avoid clobbering
+        self.emit_move(n, Reg::Rdx, 64);
+        self.emit_move(c, Reg::Rsi, 32); // c is int (32-bit)
+        self.emit_move(dest, Reg::Rdi, 64);
+
+        // Call memset
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("memset".to_string())),
+        });
+
+        // Store result from RAX to target (returns dest)
+        if let Some(target) = target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        }
+    }
+
+    /// Emit __builtin_memcpy(dest, src, n) - calls memcpy
+    /// System V AMD64 ABI: dest in RDI, src in RSI, n in RDX, returns dest in RAX
+    pub(super) fn emit_memcpy(&mut self, insn: &Instruction) {
+        let dest = match insn.src.first() {
+            Some(&d) => d,
+            None => return,
+        };
+        let src = match insn.src.get(1) {
+            Some(&s) => s,
+            None => return,
+        };
+        let n = match insn.src.get(2) {
+            Some(&n) => n,
+            None => return,
+        };
+        let target = insn.target;
+
+        // Load arguments in reverse order to avoid clobbering
+        self.emit_move(n, Reg::Rdx, 64);
+        self.emit_move(src, Reg::Rsi, 64);
+        self.emit_move(dest, Reg::Rdi, 64);
+
+        // Call memcpy
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("memcpy".to_string())),
+        });
+
+        // Store result from RAX to target (returns dest)
+        if let Some(target) = target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        }
+    }
+
+    /// Emit __builtin_memmove(dest, src, n) - calls memmove
+    /// System V AMD64 ABI: dest in RDI, src in RSI, n in RDX, returns dest in RAX
+    pub(super) fn emit_memmove(&mut self, insn: &Instruction) {
+        let dest = match insn.src.first() {
+            Some(&d) => d,
+            None => return,
+        };
+        let src = match insn.src.get(1) {
+            Some(&s) => s,
+            None => return,
+        };
+        let n = match insn.src.get(2) {
+            Some(&n) => n,
+            None => return,
+        };
+        let target = insn.target;
+
+        // Load arguments in reverse order to avoid clobbering
+        self.emit_move(n, Reg::Rdx, 64);
+        self.emit_move(src, Reg::Rsi, 64);
+        self.emit_move(dest, Reg::Rdi, 64);
+
+        // Call memmove
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("memmove".to_string())),
+        });
+
+        // Store result from RAX to target (returns dest)
+        if let Some(target) = target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        }
+    }
+
     /// Emit __builtin_frame_address(level) - return frame pointer at given level
     pub(super) fn emit_frame_address(&mut self, insn: &Instruction) {
         let target = match insn.target {

@@ -578,7 +578,12 @@ fn preprocess_args() -> Vec<String> {
             result.push("--pcc-fno-builtin-func".to_string());
             result.push(func.to_string());
             i += 1;
-        } else if arg == "-fstrict-overflow" || arg == "-fno-strict-overflow" || arg == "-fwrapv" {
+        } else if arg == "-fstrict-overflow"
+            || arg == "-fno-strict-overflow"
+            || arg == "-fwrapv"
+            || arg == "-fstrict-aliasing"
+            || arg == "-fno-strict-aliasing"
+        {
             // GCC optimization flags - silently ignore (pcc doesn't have these optimizations)
             i += 1;
         } else if arg == "-p" || arg == "-pg" {

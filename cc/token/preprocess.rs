@@ -1931,9 +1931,89 @@ impl<'a> Preprocessor<'a> {
                 {
                     macro_name.push(chars.next().unwrap());
                 }
-                if !macro_name.is_empty() {
+                if macro_name.is_empty() {
+                    return None;
+                }
+                // Skip optional closing paren
+                if has_paren {
+                    while chars
+                        .peek()
+                        .map(|c| *c == ' ' || *c == '\t')
+                        .unwrap_or(false)
+                    {
+                        chars.next();
+                    }
+                    if chars.peek() == Some(&')') {
+                        chars.next();
+                    }
+                }
+
+                // Skip to end of line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments before next directive
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Now check for #define MACRO (second part of include guard pattern)
+                if chars.next() != Some('#') {
+                    return None;
+                }
+
+                // Skip whitespace after #
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+
+                // Collect directive name
+                let mut next_directive = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    next_directive.push(chars.next().unwrap());
+                }
+
+                if next_directive != "define" {
+                    return None;
+                }
+
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+
+                // Collect the defined macro name
+                let mut define_name = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    define_name.push(chars.next().unwrap());
+                }
+
+                // The #define must define the same macro as the #if !defined
+                if define_name == macro_name {
                     return Some(macro_name);
                 }
+
+                return None;
             }
             _ => {}
         }
@@ -2827,6 +2907,9 @@ impl<'a> Preprocessor<'a> {
                         | "__builtin_popcountll"
                         // Memory
                         | "__builtin_alloca"
+                        | "__builtin_memset"
+                        | "__builtin_memcpy"
+                        | "__builtin_memmove"
                         // Compile-time evaluation
                         | "__builtin_constant_p"
                         | "__builtin_types_compatible_p"
@@ -3336,6 +3419,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 | "__builtin_popcountll"
                 // Memory
                 | "__builtin_alloca"
+                | "__builtin_memset"
+                | "__builtin_memcpy"
+                | "__builtin_memmove"
                 // Compile-time evaluation
                 | "__builtin_constant_p"
                 | "__builtin_types_compatible_p"

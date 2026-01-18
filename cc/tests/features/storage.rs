@@ -182,3 +182,30 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("static_global_extern", code, &[]), 0);
 }
+
+// ============================================================================
+// Static variables with tagged struct typedef
+// ============================================================================
+
+#[test]
+fn static_variable_tagged_struct() {
+    let code = r#"
+typedef struct Config { int enabled; int value; } Config;
+
+static Config global_cfg = {1, 42};
+
+int get_value(void) {
+    static Config local_cfg = {0, 0};
+    if (!local_cfg.enabled) {
+        local_cfg = global_cfg;
+    }
+    return local_cfg.value;
+}
+
+int main(void) {
+    if (get_value() != 42) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_tagged_struct", code, &[]), 0);
+}

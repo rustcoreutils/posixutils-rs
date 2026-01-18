@@ -194,6 +194,11 @@ pub enum Opcode {
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
 
+    // Memory builtins - generate calls to C library functions
+    Memset,  // memset(dest, c, n) - set memory
+    Memcpy,  // memcpy(dest, src, n) - copy memory
+    Memmove, // memmove(dest, src, n) - copy overlapping memory
+
     // Floating-point builtins
     Fabs32, // Absolute value of float
     Fabs64, // Absolute value of double
@@ -257,6 +262,9 @@ impl Opcode {
                 | Opcode::VaCopy
                 | Opcode::VaArg
                 | Opcode::Alloca
+                | Opcode::Memset
+                | Opcode::Memcpy
+                | Opcode::Memmove
                 | Opcode::Setjmp
                 | Opcode::Longjmp
                 | Opcode::Asm
@@ -348,6 +356,9 @@ impl Opcode {
             Opcode::Popcount32 => "popcount32",
             Opcode::Popcount64 => "popcount64",
             Opcode::Alloca => "alloca",
+            Opcode::Memset => "memset",
+            Opcode::Memcpy => "memcpy",
+            Opcode::Memmove => "memmove",
             Opcode::Fabs32 => "fabs32",
             Opcode::Fabs64 => "fabs64",
             Opcode::Unreachable => "unreachable",
@@ -1480,6 +1491,8 @@ pub struct GlobalDef {
     pub init: Initializer,
     /// C11 _Thread_local / GCC __thread
     pub is_thread_local: bool,
+    /// Static storage class (internal linkage)
+    pub is_static: bool,
     /// Explicit alignment from _Alignas specifier (None = use natural alignment)
     pub explicit_align: Option<u32>,
 }
@@ -1492,6 +1505,7 @@ impl GlobalDef {
             typ,
             init,
             is_thread_local: false,
+            is_static: false,
             explicit_align: None,
         }
     }
@@ -1503,6 +1517,7 @@ impl GlobalDef {
             typ,
             init,
             is_thread_local: true,
+            is_static: false,
             explicit_align: None,
         }
     }
@@ -1510,6 +1525,12 @@ impl GlobalDef {
     /// Set explicit alignment from _Alignas specifier
     pub fn with_align(mut self, align: Option<u32>) -> Self {
         self.explicit_align = align;
+        self
+    }
+
+    /// Set static storage class (internal linkage)
+    pub fn with_static(mut self, is_static: bool) -> Self {
+        self.is_static = is_static;
         self
     }
 }
@@ -1536,6 +1557,9 @@ pub struct Module {
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// External thread-local symbols (declared extern _Thread_local but not defined)
+    /// These need TLS access pattern instead of GOT
+    pub extern_tls_symbols: HashSet<String>,
     /// Compilation directory (for DW_AT_comp_dir in DWARF)
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)
@@ -1553,6 +1577,7 @@ impl Module {
             debug: false,
             source_files: Vec::new(),
             extern_symbols: HashSet::new(),
+            extern_tls_symbols: HashSet::new(),
             comp_dir: None,
             source_name: None,
         }
@@ -1577,6 +1602,7 @@ impl Module {
         typ: TypeId,
         init: Initializer,
         align: Option<u32>,
+        is_static: bool,
     ) {
         let name = name.into();
         // Check for existing tentative definition
@@ -1594,11 +1620,15 @@ impl Module {
                 if align.is_some() {
                     existing.explicit_align = align;
                 }
+                existing.is_static = is_static;
                 return;
             }
         }
-        self.globals
-            .push(GlobalDef::new(name, typ, init).with_align(align));
+        self.globals.push(
+            GlobalDef::new(name, typ, init)
+                .with_align(align)
+                .with_static(is_static),
+        );
     }
 
     /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
@@ -1610,6 +1640,7 @@ impl Module {
         typ: TypeId,
         init: Initializer,
         align: Option<u32>,
+        is_static: bool,
     ) {
         let name = name.into();
         // Check for existing tentative definition
@@ -1625,14 +1656,18 @@ impl Module {
                 );
                 existing.init = init;
                 existing.is_thread_local = true;
+                existing.is_static = is_static;
                 if align.is_some() {
                     existing.explicit_align = align;
                 }
                 return;
             }
         }
-        self.globals
-            .push(GlobalDef::thread_local(name, typ, init).with_align(align));
+        self.globals.push(
+            GlobalDef::thread_local(name, typ, init)
+                .with_align(align)
+                .with_static(is_static),
+        );
     }
 
     /// Add a string literal and return its label
@@ -1977,12 +2012,12 @@ mod tests {
         let mut module = Module::new();
 
         // Add a tentative definition (no initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::None, None);
+        module.add_global_aligned("x", types.int_id, Initializer::None, None, false);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual definition - should replace the tentative one
-        module.add_global_aligned("x", types.int_id, Initializer::Int(42), Some(4));
+        module.add_global_aligned("x", types.int_id, Initializer::Int(42), Some(4), false);
         assert_eq!(module.globals.len(), 1); // Still only one global
         assert!(matches!(module.globals[0].init, Initializer::Int(42)));
         assert_eq!(module.globals[0].explicit_align, Some(4));
@@ -1994,11 +2029,11 @@ mod tests {
         let mut module = Module::new();
 
         // Add a real definition (with initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None);
+        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None, false);
         assert_eq!(module.globals.len(), 1);
 
         // Add another definition with same name - should NOT replace (adds new entry)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None);
+        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None, false);
         assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
     }
 
@@ -2008,12 +2043,18 @@ mod tests {
         let mut module = Module::new();
 
         // Add a TLS tentative definition
-        module.add_global_tls_aligned("tls_var", types.int_id, Initializer::None, None);
+        module.add_global_tls_aligned("tls_var", types.int_id, Initializer::None, None, false);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual TLS definition - should replace
-        module.add_global_tls_aligned("tls_var", types.int_id, Initializer::Int(100), Some(8));
+        module.add_global_tls_aligned(
+            "tls_var",
+            types.int_id,
+            Initializer::Int(100),
+            Some(8),
+            false,
+        );
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::Int(100)));
         assert!(module.globals[0].is_thread_local);

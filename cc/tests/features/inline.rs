@@ -189,3 +189,26 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("inline_types", code, &[]), 0);
 }
+
+// ============================================================================
+// Static inline with tagged struct typedef return type
+// ============================================================================
+
+#[test]
+fn static_inline_tagged_struct_return() {
+    let code = r#"
+typedef struct Point { int x; int y; } Point;
+
+static inline Point make_point(int x, int y) {
+    Point p = {x, y};
+    return p;
+}
+
+int main(void) {
+    Point p = make_point(10, 32);
+    if (p.x + p.y != 42) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_inline_tagged", code, &[]), 0);
+}

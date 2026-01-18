@@ -482,3 +482,56 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("has_builtin", code, &[]), 0);
 }
+
+// ============================================================================
+// Include guard pattern: #if !defined(MACRO)
+// ============================================================================
+
+#[test]
+fn preprocessor_if_not_defined() {
+    let code = r#"
+#if !defined(TEST_GUARD)
+#define TEST_GUARD
+int guard_works = 1;
+#else
+int guard_works = 0;
+#endif
+
+int main(void) {
+    if (!guard_works) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preproc_if_not_def", code, &[]), 0);
+}
+
+// ============================================================================
+// __has_builtin for memory builtins
+// ============================================================================
+
+#[test]
+fn has_builtin_memory_functions() {
+    let code = r#"
+int main(void) {
+    int has_memset = 0;
+    int has_memcpy = 0;
+    int has_memmove = 0;
+
+#if __has_builtin(__builtin_memset)
+    has_memset = 1;
+#endif
+#if __has_builtin(__builtin_memcpy)
+    has_memcpy = 1;
+#endif
+#if __has_builtin(__builtin_memmove)
+    has_memmove = 1;
+#endif
+
+    if (!has_memset) return 1;
+    if (!has_memcpy) return 2;
+    if (!has_memmove) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("has_builtin_mem", code, &[]), 0);
+}

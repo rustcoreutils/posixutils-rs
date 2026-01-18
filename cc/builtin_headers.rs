@@ -28,6 +28,9 @@ pub const LIMITS_H: &str = include_str!("include/limits.h");
 /// Builtin stdatomic.h - C11 atomic operations
 pub const STDATOMIC_H: &str = include_str!("include/stdatomic.h");
 
+/// Builtin float.h - floating-point characteristics
+pub const FLOAT_H: &str = include_str!("include/float.h");
+
 /// Look up a builtin header by name
 ///
 /// Returns the header content if found, None otherwise.
@@ -39,6 +42,7 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "stddef.h" => Some(STDDEF_H),
         "limits.h" => Some(LIMITS_H),
         "stdatomic.h" => Some(STDATOMIC_H),
+        "float.h" => Some(FLOAT_H),
         _ => None,
     }
 }
@@ -79,6 +83,15 @@ mod tests {
         assert!(header.unwrap().contains("atomic_int"));
         assert!(header.unwrap().contains("atomic_load"));
         assert!(header.unwrap().contains("memory_order"));
+    }
+
+    #[test]
+    fn test_float_exists() {
+        let header = get_builtin_header("float.h");
+        assert!(header.is_some());
+        assert!(header.unwrap().contains("FLT_MAX"));
+        assert!(header.unwrap().contains("DBL_MAX"));
+        assert!(header.unwrap().contains("LDBL_MAX"));
     }
 
     #[test]

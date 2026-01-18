@@ -540,11 +540,13 @@ impl<'a> Linearizer<'a> {
 
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
-            let modifiers = self.types.modifiers(declarator.typ);
+            // Use storage_class from declarator (extern, static, _Thread_local, etc.)
+            // These are NOT stored in the type system
+            let storage_class = declarator.storage_class;
             let name = self.symbol_name(declarator.symbol);
 
             // Skip typedef declarations - they don't define storage
-            if modifiers.contains(TypeModifiers::TYPEDEF) {
+            if storage_class.contains(TypeModifiers::TYPEDEF) {
                 continue;
             }
 
@@ -563,10 +565,14 @@ impl<'a> Linearizer<'a> {
             // Only add to extern_symbols if not already defined (handles both cases:
             // extern int x; int x = 1;  - x is defined, not extern
             // int x = 1; extern int x;  - x is defined, not extern)
-            if modifiers.contains(TypeModifiers::EXTERN) {
+            if storage_class.contains(TypeModifiers::EXTERN) {
                 // Check if this symbol is already defined in globals
                 if !self.module.globals.iter().any(|g| g.name == name) {
-                    self.module.extern_symbols.insert(name);
+                    self.module.extern_symbols.insert(name.clone());
+                    // Track extern thread-local symbols separately for TLS access
+                    if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
+                        self.module.extern_tls_symbols.insert(name);
+                    }
                 }
                 continue;
             }
@@ -576,7 +582,7 @@ impl<'a> Linearizer<'a> {
             });
 
             // Track file-scope static variables for inline semantic checks
-            if modifiers.contains(TypeModifiers::STATIC) {
+            if storage_class.contains(TypeModifiers::STATIC) {
                 self.file_scope_statics.insert(name.clone());
             }
 
@@ -585,12 +591,14 @@ impl<'a> Linearizer<'a> {
             self.module.extern_symbols.remove(&name);
 
             // Check for thread-local storage
-            if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+            let is_static = storage_class.contains(TypeModifiers::STATIC);
+            if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
                 self.module.add_global_tls_aligned(
                     &name,
                     declarator.typ,
                     init,
                     declarator.explicit_align,
+                    is_static,
                 );
             } else {
                 self.module.add_global_aligned(
@@ -598,6 +606,7 @@ impl<'a> Linearizer<'a> {
                     declarator.typ,
                     init,
                     declarator.explicit_align,
+                    is_static,
                 );
             }
         }
@@ -641,7 +650,8 @@ impl<'a> Linearizer<'a> {
                     Initializer::WideString(s.clone())
                 } else {
                     // Pointer - create a wide string constant and reference it
-                    let label = format!(".LC{}", self.module.wide_strings.len());
+                    // Use .LWC prefix to avoid collision with regular .LC string labels
+                    let label = format!(".LWC{}", self.module.wide_strings.len());
                     self.module.wide_strings.push((label.clone(), s.clone()));
                     Initializer::SymAddr(label)
                 }
@@ -1800,7 +1810,7 @@ impl<'a> Linearizer<'a> {
             self.ast_init_to_ir(e, declarator.typ)
         });
 
-        // Add as a global (type already has STATIC modifier which codegen uses)
+        // Add as a global - static locals always have internal linkage
         // Check for thread-local storage
         let modifiers = self.types.modifiers(declarator.typ);
         if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
@@ -1809,6 +1819,7 @@ impl<'a> Linearizer<'a> {
                 declarator.typ,
                 init,
                 declarator.explicit_align,
+                true, // static locals always have internal linkage
             );
         } else {
             self.module.add_global_aligned(
@@ -1816,6 +1827,7 @@ impl<'a> Linearizer<'a> {
                 declarator.typ,
                 init,
                 declarator.explicit_align,
+                true, // static locals always have internal linkage
             );
         }
     }
@@ -2895,6 +2907,9 @@ impl<'a> Linearizer<'a> {
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
+
+            // Memory builtins modify memory - not pure
+            ExprKind::Memset { .. } | ExprKind::Memcpy { .. } | ExprKind::Memmove { .. } => false,
 
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
@@ -4585,16 +4600,25 @@ impl<'a> Linearizer<'a> {
                         func.add_pseudo(pseudo);
                     }
                     let typ = static_info.typ;
+                    let type_kind = self.types.kind(typ);
+                    let size = self.types.size_bits(typ);
                     // Arrays decay to pointers - get address, not value
-                    if self.types.kind(typ) == TypeKind::Array {
+                    if type_kind == TypeKind::Array {
                         let result = self.alloc_pseudo();
                         let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                         let ptr_type = self.types.pointer_to(elem_type);
                         self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                         return result;
+                    } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                        && size > 64
+                    {
+                        // Large structs can't be loaded into registers - return address
+                        let result = self.alloc_pseudo();
+                        let ptr_type = self.types.pointer_to(typ);
+                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                        return result;
                     } else {
                         let result = self.alloc_pseudo();
-                        let size = self.types.size_bits(typ);
                         self.emit(Instruction::load(result, sym_id, 0, typ, size));
                         return result;
                     }
@@ -4607,13 +4631,18 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(pseudo);
             }
+            let type_kind = self.types.kind(local.typ);
+            let size = self.types.size_bits(local.typ);
             // Arrays decay to pointers - get address, not value
-            if self.types.kind(local.typ) == TypeKind::Array {
+            if type_kind == TypeKind::Array {
                 let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
                 self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+            } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
+                // Large structs can't be loaded into registers - return address
+                let ptr_type = self.types.pointer_to(local.typ);
+                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
             } else {
-                let size = self.types.size_bits(local.typ);
                 self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
             }
             result
@@ -4646,6 +4675,7 @@ impl<'a> Linearizer<'a> {
             }
             let typ = self.expr_type(expr);
             let type_kind = self.types.kind(typ);
+            let size = self.types.size_bits(typ);
             // Arrays decay to pointers - get address, not value
             if type_kind == TypeKind::Array {
                 let result = self.alloc_pseudo();
@@ -4654,15 +4684,17 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             }
-            // Functions decay to function pointers - get address, not value
-            else if type_kind == TypeKind::Function {
+            // Functions decay to function pointers, and large structs can't be loaded
+            // into registers - for both cases, return the address
+            else if type_kind == TypeKind::Function
+                || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
+            {
                 let result = self.alloc_pseudo();
                 let ptr_type = self.types.pointer_to(typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             } else {
                 let result = self.alloc_pseudo();
-                let size = self.types.size_bits(typ);
                 self.emit(Instruction::load(result, sym_id, 0, typ, size));
                 result
             }
@@ -4947,6 +4979,17 @@ impl<'a> Linearizer<'a> {
                     );
                 }
 
+                // For compound literals with partial initialization, C99 6.7.8p21 requires
+                // zero-initialization of all subobjects not explicitly initialized.
+                // Zero the entire compound literal first, then initialize specific members.
+                let type_kind = self.types.kind(*typ);
+                if type_kind == TypeKind::Struct
+                    || type_kind == TypeKind::Union
+                    || type_kind == TypeKind::Array
+                {
+                    self.emit_aggregate_zero(sym_id, *typ);
+                }
+
                 // Initialize using existing init list machinery
                 self.linearize_init_list(sym_id, *typ, elements);
 
@@ -4958,14 +5001,22 @@ impl<'a> Linearizer<'a> {
                     func.add_pseudo(pseudo);
                 }
 
-                if self.types.kind(*typ) == TypeKind::Array {
+                let type_kind = self.types.kind(*typ);
+                let size = self.types.size_bits(*typ);
+                if type_kind == TypeKind::Array {
                     // Array compound literal - decay to pointer to first element
                     let elem_type = self.types.base_type(*typ).unwrap_or(self.types.int_id);
                     let ptr_type = self.types.pointer_to(elem_type);
                     self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                    && size > 64
+                {
+                    // Large struct/union compound literal - return address
+                    // Large structs can't be "loaded" into registers; assignment handles copying
+                    let ptr_type = self.types.pointer_to(*typ);
+                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 } else {
-                    // Struct/scalar compound literal - load the value
-                    let size = self.types.size_bits(*typ);
+                    // Scalar or small struct compound literal - load the value
                     self.emit(Instruction::load(result, sym_id, 0, *typ, size));
                 }
                 result
@@ -5174,6 +5225,48 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Alloca)
                     .with_target(result)
                     .with_src(size_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Memset { dest, c, n } => {
+                let dest_val = self.linearize_expr(dest);
+                let c_val = self.linearize_expr(c);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Memset)
+                    .with_target(result)
+                    .with_src3(dest_val, c_val, n_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Memcpy { dest, src, n } => {
+                let dest_val = self.linearize_expr(dest);
+                let src_val = self.linearize_expr(src);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Memcpy)
+                    .with_target(result)
+                    .with_src3(dest_val, src_val, n_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Memmove { dest, src, n } => {
+                let dest_val = self.linearize_expr(dest);
+                let src_val = self.linearize_expr(src);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Memmove)
+                    .with_target(result)
+                    .with_src3(dest_val, src_val, n_val)
                     .with_type_and_size(self.types.void_ptr_id, 64);
                 self.emit(insn);
                 result

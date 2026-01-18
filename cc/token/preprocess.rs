@@ -2906,77 +2906,8 @@ impl<'a> Preprocessor<'a> {
                 )
             }
             BuiltinMacro::HasBuiltin => {
-                // Return true only for builtins actually implemented in the compiler
-                matches!(
-                    name.as_str(),
-                    // Variadic function support
-                    "__builtin_va_list"
-                        | "__builtin_va_start"
-                        | "__builtin_va_end"
-                        | "__builtin_va_arg"
-                        | "__builtin_va_copy"
-                        // Byte swap
-                        | "__builtin_bswap16"
-                        | "__builtin_bswap32"
-                        | "__builtin_bswap64"
-                        // Bit manipulation
-                        | "__builtin_ctz"
-                        | "__builtin_ctzl"
-                        | "__builtin_ctzll"
-                        | "__builtin_clz"
-                        | "__builtin_clzl"
-                        | "__builtin_clzll"
-                        | "__builtin_popcount"
-                        | "__builtin_popcountl"
-                        | "__builtin_popcountll"
-                        // Memory
-                        | "__builtin_alloca"
-                        | "__builtin_memset"
-                        | "__builtin_memcpy"
-                        | "__builtin_memmove"
-                        // Compile-time evaluation
-                        | "__builtin_constant_p"
-                        | "__builtin_types_compatible_p"
-                        | "__builtin_unreachable"
-                        | "__builtin_offsetof"
-                        | "offsetof"
-                        // Floating-point constants
-                        | "__builtin_inf"
-                        | "__builtin_inff"
-                        | "__builtin_infl"
-                        | "__builtin_huge_val"
-                        | "__builtin_huge_valf"
-                        | "__builtin_huge_vall"
-                        // Floating-point math
-                        | "__builtin_fabs"
-                        | "__builtin_fabsf"
-                        | "__builtin_fabsl"
-                        // NaN constants
-                        | "__builtin_nan"
-                        | "__builtin_nanf"
-                        | "__builtin_nanl"
-                        | "__builtin_nans"
-                        | "__builtin_nansf"
-                        | "__builtin_nansl"
-                        // Branch prediction
-                        | "__builtin_expect"
-                        // Floating-point rounding mode
-                        | "__builtin_flt_rounds"
-                        // Atomic builtins (C11 - Clang style)
-                        | "__c11_atomic_init"
-                        | "__c11_atomic_load"
-                        | "__c11_atomic_store"
-                        | "__c11_atomic_exchange"
-                        | "__c11_atomic_compare_exchange_strong"
-                        | "__c11_atomic_compare_exchange_weak"
-                        | "__c11_atomic_fetch_add"
-                        | "__c11_atomic_fetch_sub"
-                        | "__c11_atomic_fetch_and"
-                        | "__c11_atomic_fetch_or"
-                        | "__c11_atomic_fetch_xor"
-                        | "__c11_atomic_thread_fence"
-                        | "__c11_atomic_signal_fence"
-                )
+                // Use centralized builtin registry
+                crate::builtins::is_builtin(name.as_str())
             }
             BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
                 // Return true for features/extensions we implement
@@ -3449,82 +3380,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        // Return 1 for builtins actually implemented in the compiler
-        let supported = matches!(
-            name.as_str(),
-            // Variadic function support
-            "__builtin_va_list"
-                | "__builtin_va_start"
-                | "__builtin_va_end"
-                | "__builtin_va_arg"
-                | "__builtin_va_copy"
-                // Byte swap
-                | "__builtin_bswap16"
-                | "__builtin_bswap32"
-                | "__builtin_bswap64"
-                // Bit manipulation
-                | "__builtin_ctz"
-                | "__builtin_ctzl"
-                | "__builtin_ctzll"
-                | "__builtin_clz"
-                | "__builtin_clzl"
-                | "__builtin_clzll"
-                | "__builtin_popcount"
-                | "__builtin_popcountl"
-                | "__builtin_popcountll"
-                // Memory
-                | "__builtin_alloca"
-                | "__builtin_memset"
-                | "__builtin_memcpy"
-                | "__builtin_memmove"
-                // Compile-time evaluation
-                | "__builtin_constant_p"
-                | "__builtin_types_compatible_p"
-                | "__builtin_unreachable"
-                | "__builtin_offsetof"
-                | "offsetof"
-                // Floating-point constants
-                | "__builtin_inf"
-                | "__builtin_inff"
-                | "__builtin_infl"
-                | "__builtin_huge_val"
-                | "__builtin_huge_valf"
-                | "__builtin_huge_vall"
-                // Floating-point math
-                | "__builtin_fabs"
-                | "__builtin_fabsf"
-                | "__builtin_fabsl"
-                // NaN constants
-                | "__builtin_nan"
-                | "__builtin_nanf"
-                | "__builtin_nanl"
-                | "__builtin_nans"
-                | "__builtin_nansf"
-                | "__builtin_nansl"
-                // Branch prediction
-                | "__builtin_expect"
-                // Floating-point rounding mode
-                | "__builtin_flt_rounds"
-                // Frame/return address
-                | "__builtin_frame_address"
-                | "__builtin_return_address"
-                // Atomic builtins (C11 - Clang style)
-                | "__c11_atomic_init"
-                | "__c11_atomic_load"
-                | "__c11_atomic_store"
-                | "__c11_atomic_exchange"
-                | "__c11_atomic_compare_exchange_strong"
-                | "__c11_atomic_compare_exchange_weak"
-                | "__c11_atomic_fetch_add"
-                | "__c11_atomic_fetch_sub"
-                | "__c11_atomic_fetch_and"
-                | "__c11_atomic_fetch_or"
-                | "__c11_atomic_fetch_xor"
-                | "__c11_atomic_thread_fence"
-                | "__c11_atomic_signal_fence"
-        );
-
-        if supported {
+        // Use centralized builtin registry
+        if crate::builtins::is_builtin(name.as_str()) {
             1
         } else {
             0

@@ -12,6 +12,7 @@
 mod abi;
 mod arch;
 mod builtin_headers;
+mod builtins;
 mod diag;
 mod ir;
 mod opt;

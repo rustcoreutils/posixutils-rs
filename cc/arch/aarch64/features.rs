@@ -854,6 +854,64 @@ impl Aarch64CodeGen {
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64, frame_size);
     }
 
+    /// Emit __builtin_signbitf - test sign bit of float
+    pub(super) fn emit_signbit32(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into V0 (first FP argument register)
+        self.emit_fp_move(arg, VReg::V0, None, 32, frame_size, types);
+
+        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global("__signbitf")),
+        });
+
+        // Result is in W0 (integer return), store to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, 32, frame_size);
+    }
+
+    /// Emit __builtin_signbit - test sign bit of double
+    pub(super) fn emit_signbit64(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into V0 (first FP argument register)
+        self.emit_fp_move(arg, VReg::V0, None, 64, frame_size, types);
+
+        // Call __signbit from libc (C99: signbit is a macro that calls __signbit)
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global("__signbit")),
+        });
+
+        // Result is in W0 (integer return), store to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, 32, frame_size);
+    }
+
     /// Emit __builtin_fabsf/__builtin_fabs - absolute value of float/double
     pub(super) fn emit_fabs(
         &mut self,

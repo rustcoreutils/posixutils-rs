@@ -391,13 +391,14 @@ fn create_asm_file(name: &str, content: &str, extension: &str) -> tempfile::Name
     file
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_asm_file_support() {
     // Test .s file (pure assembly) and .S file (assembly with preprocessor)
     // Tests compile-only (-c) mode which fully works. Mixing C + asm in one
     // invocation requires passing asm objects to C file's link step (future work).
 
-    // Assembly function that returns 42
+    // Assembly function that returns 42 (x86_64)
     let asm_content = r#"
     .text
     .globl get_value
@@ -408,7 +409,7 @@ get_value:
     .size get_value, .-get_value
 "#;
 
-    // Assembly with preprocessor directives (.S)
+    // Assembly with preprocessor directives (.S) (x86_64)
     let asm_s_content = r#"
 #define RETURN_VALUE 99
     .text

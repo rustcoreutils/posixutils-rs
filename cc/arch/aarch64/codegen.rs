@@ -272,17 +272,34 @@ impl Aarch64CodeGen {
         let fp = Reg::fp();
         let lr = Reg::lr();
 
+        // AArch64 stp/ldp pre/post-indexed addressing has a limited offset range: [-512, 504]
+        // For large frames, we must use separate sub/add and stp/ldp instructions
+        const MAX_STP_OFFSET: i32 = 504;
+
         if total_frame > 0 {
-            // Combined push and allocate: stp x29, x30, [sp, #-N]!
-            self.push_lir(Aarch64Inst::Stp {
-                size: OperandSize::B64,
-                src1: fp,
-                src2: lr,
-                addr: MemAddr::PreIndex {
-                    base: Reg::SP,
-                    offset: -total_frame,
-                },
-            });
+            if total_frame <= MAX_STP_OFFSET {
+                // Combined push and allocate: stp x29, x30, [sp, #-N]!
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: fp,
+                    src2: lr,
+                    addr: MemAddr::PreIndex {
+                        base: Reg::SP,
+                        offset: -total_frame,
+                    },
+                });
+            } else {
+                // Large frame: separate sub and stp
+                // sub sp, sp, #total_frame
+                self.emit_sub_sp_imm(total_frame);
+                // stp x29, x30, [sp]
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: fp,
+                    src2: lr,
+                    addr: MemAddr::Base(Reg::SP),
+                });
+            }
             if self.base.emit_debug {
                 // CFA is now at sp + total_frame (previous SP value)
                 self.push_lir(Aarch64Inst::Directive(Directive::cfi_def_cfa(
@@ -345,6 +362,82 @@ impl Aarch64CodeGen {
                     "x29",
                 )));
             }
+        }
+    }
+
+    /// Emit sub sp, sp, #imm handling large immediates
+    fn emit_sub_sp_imm(&mut self, imm: i32) {
+        // AArch64 add/sub immediate can encode values up to 4095 (12 bits)
+        // For larger values, we need multiple instructions or use a register
+        const MAX_IMM12: i32 = 4095;
+
+        if imm <= MAX_IMM12 {
+            self.push_lir(Aarch64Inst::Sub {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm(imm as i64),
+                dst: Reg::SP,
+            });
+        } else if imm <= MAX_IMM12 * 2 {
+            // Two sub instructions for values up to 8190
+            self.push_lir(Aarch64Inst::Sub {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm(MAX_IMM12 as i64),
+                dst: Reg::SP,
+            });
+            self.push_lir(Aarch64Inst::Sub {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm((imm - MAX_IMM12) as i64),
+                dst: Reg::SP,
+            });
+        } else {
+            // For very large values, load into scratch register
+            let scratch = Reg::X9;
+            self.emit_mov_imm(scratch, imm as i64, 64);
+            self.push_lir(Aarch64Inst::Sub {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Reg(scratch),
+                dst: Reg::SP,
+            });
+        }
+    }
+
+    /// Emit add sp, sp, #imm handling large immediates
+    fn emit_add_sp_imm(&mut self, imm: i32) {
+        const MAX_IMM12: i32 = 4095;
+
+        if imm <= MAX_IMM12 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm(imm as i64),
+                dst: Reg::SP,
+            });
+        } else if imm <= MAX_IMM12 * 2 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm(MAX_IMM12 as i64),
+                dst: Reg::SP,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm((imm - MAX_IMM12) as i64),
+                dst: Reg::SP,
+            });
+        } else {
+            let scratch = Reg::X9;
+            self.emit_mov_imm(scratch, imm as i64, 64);
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Reg(scratch),
+                dst: Reg::SP,
+            });
         }
     }
 
@@ -813,16 +906,33 @@ impl Aarch64CodeGen {
         }
 
         // Restore fp/lr and deallocate stack
+        // AArch64 ldp post-indexed addressing has a limited offset range: [-512, 504]
+        const MAX_LDP_OFFSET: i32 = 504;
         let dealloc = if total_frame > 0 { total_frame } else { 16 };
-        self.push_lir(Aarch64Inst::Ldp {
-            size: OperandSize::B64,
-            addr: MemAddr::PostIndex {
-                base: Reg::sp(),
-                offset: dealloc,
-            },
-            dst1: Reg::fp(),
-            dst2: Reg::lr(),
-        });
+
+        if dealloc <= MAX_LDP_OFFSET {
+            // Combined restore and deallocate: ldp x29, x30, [sp], #N
+            self.push_lir(Aarch64Inst::Ldp {
+                size: OperandSize::B64,
+                addr: MemAddr::PostIndex {
+                    base: Reg::sp(),
+                    offset: dealloc,
+                },
+                dst1: Reg::fp(),
+                dst2: Reg::lr(),
+            });
+        } else {
+            // Large frame: separate ldp and add
+            // ldp x29, x30, [sp]
+            self.push_lir(Aarch64Inst::Ldp {
+                size: OperandSize::B64,
+                addr: MemAddr::Base(Reg::sp()),
+                dst1: Reg::fp(),
+                dst2: Reg::lr(),
+            });
+            // add sp, sp, #dealloc
+            self.emit_add_sp_imm(dealloc);
+        }
         self.push_lir(Aarch64Inst::Ret);
     }
 
@@ -1236,6 +1346,9 @@ impl Aarch64CodeGen {
 
             Opcode::Fabs32 => self.emit_fabs(insn, *total_frame, types, false),
             Opcode::Fabs64 => self.emit_fabs(insn, *total_frame, types, true),
+
+            Opcode::Signbit32 => self.emit_signbit32(insn, *total_frame, types),
+            Opcode::Signbit64 => self.emit_signbit64(insn, *total_frame, types),
 
             Opcode::Unreachable => {
                 // Emit brk #1 instruction - software breakpoint that traps

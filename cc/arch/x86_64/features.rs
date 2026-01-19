@@ -156,46 +156,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Helper for emit_va_arg: stores int value to destination
-    pub(super) fn emit_va_arg_store_int(
-        &mut self,
-        dst_loc: &Loc,
-        src_reg: Reg,
-        arg_size: OperandSize,
-    ) {
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Mov {
-                    size: arg_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: src_reg,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
-            Loc::Stack(dst_offset) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: src_reg,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R11),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *dst_offset,
-                    }),
-                });
-            }
-            _ => {}
-        }
-    }
-
     /// Helper for emit_va_arg: emit integer path for va_arg
     pub(super) fn emit_va_arg_int(
         &mut self,
@@ -257,7 +217,38 @@ impl X86_64CodeGen {
             dst: Reg::Rax,
         });
 
-        self.emit_va_arg_store_int(dst_loc, Reg::Rax, lir_arg_size);
+        // Store value from [Rax] to destination
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Mov {
+                    size: lir_arg_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rax,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(*r),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rax,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
 
         // Increment gp_offset by 8 and store back
         self.push_lir(X86Inst::Add {
@@ -278,6 +269,8 @@ impl X86_64CodeGen {
         });
 
         // Overflow path
+        // Bug fix: Load overflow_arg_area pointer into R11 FIRST, then load value into Rax.
+        // This prevents the pointer from being clobbered when storing to a register destination.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
@@ -285,20 +278,52 @@ impl X86_64CodeGen {
                 base: ap_base,
                 offset: ap_base_offset + 8,
             }),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        // Load value from [R11] into Rax, then store to destination
+        self.push_lir(X86Inst::Mov {
+            size: lir_arg_size,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset: 0,
+            }),
             dst: GpOperand::Reg(Reg::Rax),
         });
 
-        self.emit_va_arg_store_int(dst_loc, Reg::Rax, lir_arg_size);
+        // Store value from Rax to destination
+        match dst_loc {
+            Loc::Reg(r) => {
+                if *r != Reg::Rax {
+                    self.push_lir(X86Inst::Mov {
+                        size: lir_arg_size,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(*r),
+                    });
+                }
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::Mov {
+                    size: lir_arg_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *dst_offset,
+                    }),
+                });
+            }
+            _ => {}
+        }
 
-        // Advance overflow_arg_area
+        // Advance overflow_arg_area (using R11 which still has the original pointer)
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
             src: GpOperand::Imm(arg_bytes as i64),
-            dst: Reg::Rax,
+            dst: Reg::R11,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rax),
+            src: GpOperand::Reg(Reg::R11),
             dst: GpOperand::Mem(MemAddr::BaseOffset {
                 base: ap_base,
                 offset: ap_base_offset + 8,
@@ -1137,6 +1162,108 @@ impl X86_64CodeGen {
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
 
+    /// Emit __builtin_memset(dest, c, n) - calls memset
+    /// System V AMD64 ABI: dest in RDI, c in RSI, n in RDX, returns dest in RAX
+    pub(super) fn emit_memset(&mut self, insn: &Instruction) {
+        let dest = match insn.src.first() {
+            Some(&d) => d,
+            None => return,
+        };
+        let c = match insn.src.get(1) {
+            Some(&c) => c,
+            None => return,
+        };
+        let n = match insn.src.get(2) {
+            Some(&n) => n,
+            None => return,
+        };
+        let target = insn.target;
+
+        // Load arguments in reverse order to avoid clobbering
+        self.emit_move(n, Reg::Rdx, 64);
+        self.emit_move(c, Reg::Rsi, 32); // c is int (32-bit)
+        self.emit_move(dest, Reg::Rdi, 64);
+
+        // Call memset
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("memset".to_string())),
+        });
+
+        // Store result from RAX to target (returns dest)
+        if let Some(target) = target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        }
+    }
+
+    /// Emit __builtin_memcpy(dest, src, n) - calls memcpy
+    /// System V AMD64 ABI: dest in RDI, src in RSI, n in RDX, returns dest in RAX
+    pub(super) fn emit_memcpy(&mut self, insn: &Instruction) {
+        let dest = match insn.src.first() {
+            Some(&d) => d,
+            None => return,
+        };
+        let src = match insn.src.get(1) {
+            Some(&s) => s,
+            None => return,
+        };
+        let n = match insn.src.get(2) {
+            Some(&n) => n,
+            None => return,
+        };
+        let target = insn.target;
+
+        // Load arguments in reverse order to avoid clobbering
+        self.emit_move(n, Reg::Rdx, 64);
+        self.emit_move(src, Reg::Rsi, 64);
+        self.emit_move(dest, Reg::Rdi, 64);
+
+        // Call memcpy
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("memcpy".to_string())),
+        });
+
+        // Store result from RAX to target (returns dest)
+        if let Some(target) = target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        }
+    }
+
+    /// Emit __builtin_memmove(dest, src, n) - calls memmove
+    /// System V AMD64 ABI: dest in RDI, src in RSI, n in RDX, returns dest in RAX
+    pub(super) fn emit_memmove(&mut self, insn: &Instruction) {
+        let dest = match insn.src.first() {
+            Some(&d) => d,
+            None => return,
+        };
+        let src = match insn.src.get(1) {
+            Some(&s) => s,
+            None => return,
+        };
+        let n = match insn.src.get(2) {
+            Some(&n) => n,
+            None => return,
+        };
+        let target = insn.target;
+
+        // Load arguments in reverse order to avoid clobbering
+        self.emit_move(n, Reg::Rdx, 64);
+        self.emit_move(src, Reg::Rsi, 64);
+        self.emit_move(dest, Reg::Rdi, 64);
+
+        // Call memmove
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("memmove".to_string())),
+        });
+
+        // Store result from RAX to target (returns dest)
+        if let Some(target) = target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+        }
+    }
+
     /// Emit __builtin_frame_address(level) - return frame pointer at given level
     pub(super) fn emit_frame_address(&mut self, insn: &Instruction) {
         let target = match insn.target {
@@ -1227,5 +1354,55 @@ impl X86_64CodeGen {
         // Result is in XMM0, store to target
         let dst_loc = self.get_location(target);
         self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, 64);
+    }
+
+    /// Emit __builtin_signbitf - test sign bit of float
+    pub(super) fn emit_signbit32(&mut self, insn: &Instruction) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into XMM0 (first FP argument register)
+        self.emit_fp_move(arg, XmmReg::Xmm0, 32);
+
+        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("__signbitf".to_string())),
+        });
+
+        // Result is in EAX (integer return), store to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+    }
+
+    /// Emit __builtin_signbit - test sign bit of double
+    pub(super) fn emit_signbit64(&mut self, insn: &Instruction) {
+        let arg = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Load argument into XMM0 (first FP argument register)
+        self.emit_fp_move(arg, XmmReg::Xmm0, 64);
+
+        // Call signbit function from libc
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global(
+                self.base.target.os.signbit_double_fn().to_string(),
+            )),
+        });
+
+        // Result is in EAX (integer return), store to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
     }
 }

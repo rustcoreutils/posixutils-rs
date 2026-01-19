@@ -13,7 +13,7 @@
 use crate::diag::Position;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
-use crate::types::TypeId;
+use crate::types::{TypeId, TypeModifiers};
 
 // ============================================================================
 // Operators
@@ -438,6 +438,30 @@ pub enum ExprKind {
     },
 
     // =========================================================================
+    // Memory builtins - generate calls to C library functions
+    // =========================================================================
+    /// __builtin_memset(dest, c, n) - calls memset
+    Memset {
+        dest: Box<Expr>,
+        c: Box<Expr>,
+        n: Box<Expr>,
+    },
+
+    /// __builtin_memcpy(dest, src, n) - calls memcpy
+    Memcpy {
+        dest: Box<Expr>,
+        src: Box<Expr>,
+        n: Box<Expr>,
+    },
+
+    /// __builtin_memmove(dest, src, n) - calls memmove
+    Memmove {
+        dest: Box<Expr>,
+        src: Box<Expr>,
+        n: Box<Expr>,
+    },
+
+    // =========================================================================
     // Floating-point builtins
     // =========================================================================
     /// __builtin_fabs(x) - absolute value of double
@@ -452,6 +476,21 @@ pub enum ExprKind {
 
     /// __builtin_fabsl(x) - absolute value of long double
     Fabsl {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_signbit(x) - test sign bit of double, returns non-zero if negative
+    Signbit {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_signbitf(x) - test sign bit of float, returns non-zero if negative
+    Signbitf {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_signbitl(x) - test sign bit of long double, returns non-zero if negative
+    Signbitl {
         arg: Box<Expr>,
     },
 
@@ -910,6 +949,9 @@ pub struct InitDeclarator {
     pub symbol: SymbolId,
     /// The complete type (after applying declarator modifiers) - interned TypeId
     pub typ: TypeId,
+    /// Storage class modifiers (extern, static, _Thread_local, etc.)
+    /// These are NOT part of the type but affect code generation
+    pub storage_class: TypeModifiers,
     /// Optional initializer
     pub init: Option<Expr>,
     /// For VLAs: runtime size expressions for each variable dimension
@@ -928,6 +970,7 @@ impl Declaration {
             declarators: vec![InitDeclarator {
                 symbol,
                 typ,
+                storage_class: TypeModifiers::empty(),
                 init,
                 vla_sizes: vec![],
                 explicit_align: None,

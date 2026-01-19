@@ -1739,6 +1739,7 @@ fn test_linearize_for() {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     symbol: i_sym,
                     typ: int_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
                     init: Some(Expr::int(0, &ctx.types)),
                     vla_sizes: vec![],
                     explicit_align: None,
@@ -2015,6 +2016,7 @@ fn test_local_var_emits_load_store() {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     symbol: x_sym,
                     typ: int_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
                     init: Some(Expr::int(1, &ctx.types)),
                     vla_sizes: vec![],
                     explicit_align: None,
@@ -2072,6 +2074,7 @@ fn test_ssa_converts_local_to_phi() {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     symbol: x_sym,
                     typ: int_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
                     init: Some(Expr::int(1, &ctx.types)),
                     vla_sizes: vec![],
                     explicit_align: None,
@@ -2135,6 +2138,7 @@ fn test_ssa_loop_variable() {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     symbol: i_sym,
                     typ: int_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
                     init: Some(Expr::int(0, &ctx.types)),
                     vla_sizes: vec![],
                     explicit_align: None,
@@ -2608,6 +2612,7 @@ fn test_string_literal_char_array_init() {
                 declarators: vec![InitDeclarator {
                     symbol: arr_sym,
                     typ: char_arr_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
                     init: Some(Expr::typed(
                         ExprKind::StringLit("hello".to_string()),
                         ctx.types.char_ptr_id,
@@ -2658,6 +2663,7 @@ fn test_string_literal_char_pointer_init() {
                 declarators: vec![InitDeclarator {
                     symbol: p_sym,
                     typ: ctx.types.char_ptr_id,
+                    storage_class: crate::types::TypeModifiers::empty(),
                     init: Some(Expr::typed(
                         ExprKind::StringLit("hello".to_string()),
                         ctx.types.char_ptr_id,
@@ -2820,6 +2826,7 @@ fn test_incomplete_struct_type_resolution() {
             declarators: vec![InitDeclarator {
                 symbol: f_sym,
                 typ: incomplete_struct_type,
+                storage_class: crate::types::TypeModifiers::empty(),
                 init: Some(init_list),
                 vla_sizes: vec![],
                 explicit_align: None,
@@ -2885,6 +2892,7 @@ fn test_static_local_pre_increment() {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -2961,6 +2969,7 @@ fn test_static_local_pre_decrement() {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3030,6 +3039,7 @@ fn test_static_local_post_increment() {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3097,6 +3107,7 @@ fn test_static_local_post_decrement() {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3164,6 +3175,7 @@ fn test_static_local_compound_assignment() {
         declarators: vec![InitDeclarator {
             symbol: sum_sym,
             typ: static_int_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3450,6 +3462,7 @@ fn test_static_local_address_in_initializer() {
         declarators: vec![InitDeclarator {
             symbol: x_sym,
             typ: static_int_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3469,6 +3482,7 @@ fn test_static_local_address_in_initializer() {
         declarators: vec![InitDeclarator {
             symbol: p_sym,
             typ: static_int_ptr_type,
+            storage_class: crate::types::TypeModifiers::empty(),
             init: Some(addr_of_x),
             vla_sizes: vec![],
             explicit_align: None,

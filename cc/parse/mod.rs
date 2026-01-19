@@ -10,7 +10,11 @@
 //
 
 pub mod ast;
+mod expression;
 pub mod parser;
+
+#[cfg(test)]
+mod test_parser;
 
 // Re-export parser used by main.rs
 pub use parser::Parser;

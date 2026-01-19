@@ -8,12 +8,23 @@
 //
 // Integration test harness for pcc
 //
+// Test organization by C standard and feature category:
+// - c89/: C89 standard tests (datatypes, operators, control flow, functions, globals, storage)
+// - c99/: C99 extensions (types, features, initializers)
+// - c11/: C11 features (core, atomics)
+// - builtins/: Compiler builtins (bit_ops, memory, intrinsics, math, has_feature)
+// - codegen/: Code generation (regalloc, inline_asm, pic, misc)
+// - preprocessor/: Preprocessor (macros)
+// - misc/: Miscellaneous (setjmp, stmt_expr)
+// - tools/: Tool tests (cflow, ctags, cxref)
+//
 
-mod cflow;
+mod builtins;
+mod c11;
+mod c89;
+mod c99;
+mod codegen;
 mod common;
-mod ctags;
-mod cxref;
-mod datatypes;
-mod features;
-mod globals;
-mod pcc;
+mod misc;
+mod preprocessor;
+mod tools;

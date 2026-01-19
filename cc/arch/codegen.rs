@@ -13,7 +13,7 @@ use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
 use crate::target::Target;
-use crate::types::{TypeModifiers, TypeTable};
+use crate::types::TypeTable;
 
 // ============================================================================
 // Shared Helper Types
@@ -196,41 +196,34 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     }
 
     /// Emit a global variable definition
-    pub fn emit_global(
-        &mut self,
-        name: &str,
-        typ: &crate::types::TypeId,
-        init: &Initializer,
-        is_thread_local: bool,
-        explicit_align: Option<u32>,
-        types: &TypeTable,
-    ) {
-        let size = types.size_bits(*typ) / 8;
+    pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
+        let size = types.size_bits(global.typ) / 8;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
 
-        // Check storage class - skip .globl for static
-        let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
-
         // Get alignment: explicit _Alignas takes precedence over natural alignment
-        let mut align = explicit_align.unwrap_or_else(|| types.alignment(*typ) as u32);
+        let mut align = global
+            .explicit_align
+            .unwrap_or_else(|| types.alignment(global.typ) as u32);
         // Use 16-byte alignment for arrays >= 16 bytes (matches clang behavior for optimization)
-        if matches!(types.get(*typ).kind, crate::types::TypeKind::Array) && size >= 16 {
+        if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
             align = align.max(16);
         }
 
         // Use .comm for uninitialized external (non-static) non-TLS globals
         // TLS variables can't use .comm
-        let use_bss = matches!(init, Initializer::None) && !is_static && !is_thread_local;
+        let use_bss = matches!(global.init, Initializer::None)
+            && !global.is_static
+            && !global.is_thread_local;
 
         if use_bss {
             // Use .comm for uninitialized external globals
-            self.push_directive(Directive::comm(name, size, align));
+            self.push_directive(Directive::comm(&global.name, size, align));
             return;
         }
 
         // Select appropriate section for TLS vs regular data
-        if is_thread_local {
-            if matches!(init, Initializer::None) {
+        if global.is_thread_local {
+            if matches!(global.init, Initializer::None) {
                 // Uninitialized TLS: .tbss section
                 self.push_directive(Directive::Tbss);
             } else {
@@ -243,21 +236,21 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         // Check if this is a local symbol (starts with '.')
-        let is_local = name.starts_with('.');
+        let is_local = global.name.starts_with('.');
 
         // Global visibility (if not static and not local)
-        if !is_static && !is_local {
-            self.push_directive(Directive::global(name));
+        if !global.is_static && !is_local {
+            self.push_directive(Directive::global(&global.name));
         }
 
         // ELF-only type and size (handled by Directive::emit which skips on macOS)
         // TLS objects have TLS type instead of regular object type
-        if is_thread_local {
-            self.push_directive(Directive::type_tls_object(name));
+        if global.is_thread_local {
+            self.push_directive(Directive::type_tls_object(&global.name));
         } else {
-            self.push_directive(Directive::type_object(name));
+            self.push_directive(Directive::type_object(&global.name));
         }
-        self.push_directive(Directive::size(name, size));
+        self.push_directive(Directive::size(&global.name, size));
 
         // Alignment
         if align > 1 {
@@ -266,13 +259,13 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         // Label - use local_label for names starting with '.'
         if is_local {
-            self.push_directive(Directive::local_label(name));
+            self.push_directive(Directive::local_label(&global.name));
         } else {
-            self.push_directive(Directive::global_label(name));
+            self.push_directive(Directive::global_label(&global.name));
         }
 
         // Emit initializer
-        self.emit_initializer_data(init, size as usize);
+        self.emit_initializer_data(&global.init, size as usize);
     }
 
     /// Emit data for an initializer, recursively handling complex types
@@ -301,15 +294,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             }
             Initializer::String(s) => {
                 // Emit string as .ascii (without null terminator)
-                // The array size will include space for null if needed
+                // Then zero-fill the remaining bytes (which includes the null terminator)
                 self.push_directive(Directive::Ascii(escape_string(s)));
-                // Zero-fill remaining bytes if array is larger than string
-                let string_len = s.len() + 1; // +1 for null terminator
-                if size > string_len {
-                    self.push_directive(Directive::Zero((size - string_len) as u32));
-                } else if size > s.len() {
-                    // Need null terminator
-                    self.push_directive(Directive::Byte(0));
+                // .ascii emits s.len() bytes; fill remaining with zeros
+                let bytes_emitted = s.len();
+                if size > bytes_emitted {
+                    self.push_directive(Directive::Zero((size - bytes_emitted) as u32));
                 }
             }
             Initializer::WideString(s) => {
@@ -377,6 +367,14 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     Symbol::global(name.clone())
                 };
                 self.push_directive(Directive::QuadSym(sym));
+            }
+            Initializer::SymAddrOffset(name, offset) => {
+                let sym = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                self.push_directive(Directive::QuadSymOffset(sym, *offset));
             }
         }
     }

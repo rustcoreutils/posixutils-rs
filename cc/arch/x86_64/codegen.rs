@@ -117,6 +117,9 @@ impl X86_64CodeGen {
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
                     GpOperand::Mem(MemAddr::TlsIE(symbol))
                 } else {
+                    // Note: For GOT access (PIC mode/external symbols), special handling
+                    // is needed - see emit_global_load* and emit_global_store* functions
+                    // which generate the two-instruction GOT sequence
                     GpOperand::Mem(MemAddr::RipRelative(symbol))
                 }
             }
@@ -124,15 +127,20 @@ impl X86_64CodeGen {
     }
 
     /// Check if a symbol needs GOT access
-    /// - In PIC mode: all external symbols need GOT access
+    /// - In PIC mode: all non-local symbols need GOT access (interposition)
     /// - On macOS: external symbols always need GOT access (even without PIC)
     #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
+        // In PIC mode, all non-local symbols need GOT access because they
+        // could be interposed at runtime (the default for global symbols).
+        // Local symbols (starting with '.') don't need GOT access since
+        // they can't be interposed.
+        if self.pic_mode && !name.starts_with('.') {
+            return true;
+        }
         // External symbols always need GOT access:
         // - On macOS: required for dynamic linking
         // - On Linux: required for PIE (default) and when linking with shared libs
-        // - In PIC mode: always required
-        // Using GOT unconditionally for external symbols is safe and matches GCC/Clang behavior
         self.extern_symbols.contains(name)
     }
 
@@ -150,21 +158,12 @@ impl X86_64CodeGen {
 
     /// Emit a global variable (delegates to base)
     #[inline]
-    fn emit_global(
-        &mut self,
-        name: &str,
-        typ: &TypeId,
-        init: &crate::ir::Initializer,
-        is_thread_local: bool,
-        explicit_align: Option<u32>,
-        types: &TypeTable,
-    ) {
+    fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         // Skip extern symbols - they're defined elsewhere
-        if self.extern_symbols.contains(name) {
+        if self.extern_symbols.contains(&global.name) {
             return;
         }
-        self.base
-            .emit_global(name, typ, init, is_thread_local, explicit_align, types);
+        self.base.emit_global(global, types);
     }
 
     /// Emit long double constants collected during codegen
@@ -1279,12 +1278,32 @@ impl X86_64CodeGen {
                 self.emit_alloca(insn);
             }
 
+            Opcode::Memset => {
+                self.emit_memset(insn);
+            }
+
+            Opcode::Memcpy => {
+                self.emit_memcpy(insn);
+            }
+
+            Opcode::Memmove => {
+                self.emit_memmove(insn);
+            }
+
             Opcode::Fabs32 => {
                 self.emit_fabs32(insn);
             }
 
             Opcode::Fabs64 => {
                 self.emit_fabs64(insn);
+            }
+
+            Opcode::Signbit32 => {
+                self.emit_signbit32(insn);
+            }
+
+            Opcode::Signbit64 => {
+                self.emit_signbit64(insn);
             }
 
             Opcode::Unreachable => {
@@ -1482,12 +1501,31 @@ impl X86_64CodeGen {
                         dst: GpOperand::Reg(dst),
                     });
                 } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
-                    // Thread-local storage: use FS segment (initial-exec model)
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Mem(MemAddr::TlsIE(symbol)),
-                        dst: GpOperand::Reg(dst),
-                    });
+                    // Thread-local storage: use FS segment
+                    let is_extern_tls = self.extern_symbols.contains(&name);
+                    let use_ie_model = is_extern_tls || self.pic_mode;
+
+                    if use_ie_model {
+                        // Initial Exec: load offset from GOT, then load via FS segment
+                        let temp_reg = if dst == Reg::R11 { Reg::R10 } else { Reg::R11 };
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                            dst: GpOperand::Reg(temp_reg),
+                        });
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Mem(MemAddr::FsBase(temp_reg)),
+                            dst: GpOperand::Reg(dst),
+                        });
+                    } else {
+                        // Local Exec: direct access via %fs:symbol@TPOFF
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                            dst: GpOperand::Reg(dst),
+                        });
+                    }
                 } else {
                     // Regular RIP-relative access
                     self.push_lir(X86Inst::Mov {
@@ -1812,7 +1850,85 @@ impl X86_64CodeGen {
             Loc::Global(name) => {
                 // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
                 let is_local_label = name.starts_with('.');
-                if self.needs_got_access(&name) {
+                let symbol = if is_local_label {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+
+                // Check TLS first - TLS symbols need special access pattern even for external symbols
+                if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                    // Check if this is an external TLS variable (needs Initial Exec model)
+                    // or if we're in PIC mode (shared libraries also need IE model)
+                    // Only non-PIC local TLS can use Local Exec model
+                    let is_extern_tls = self.extern_symbols.contains(&name);
+                    let use_ie_model = is_extern_tls || self.pic_mode;
+
+                    if use_ie_model {
+                        // Initial Exec TLS model for external symbols:
+                        // movq symbol@GOTTPOFF(%rip), %r11  ; load TLS offset from GOT
+                        // movl %fs:(%r11), %dst             ; load from thread-local storage
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol.clone())),
+                            dst: GpOperand::Reg(Reg::R11),
+                        });
+                        // Now load from %fs:(%r11) with appropriate sign/zero extension
+                        if mem_size <= 16 {
+                            let src_size = OperandSize::from_bits(mem_size);
+                            if is_unsigned {
+                                self.push_lir(X86Inst::Movzx {
+                                    src_size,
+                                    dst_size: OperandSize::B32,
+                                    src: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
+                                    dst: dst_reg,
+                                });
+                            } else {
+                                self.push_lir(X86Inst::Movsx {
+                                    src_size,
+                                    dst_size: OperandSize::B32,
+                                    src: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
+                                    dst: dst_reg,
+                                });
+                            }
+                        } else {
+                            let op_size = OperandSize::from_bits(reg_size);
+                            self.push_lir(X86Inst::Mov {
+                                size: op_size,
+                                src: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
+                                dst: GpOperand::Reg(dst_reg),
+                            });
+                        }
+                    } else {
+                        // Local Exec TLS model for local symbols: %fs:symbol@TPOFF
+                        let mem_addr = MemAddr::TlsIE(symbol);
+                        if mem_size <= 16 {
+                            let src_size = OperandSize::from_bits(mem_size);
+                            if is_unsigned {
+                                self.push_lir(X86Inst::Movzx {
+                                    src_size,
+                                    dst_size: OperandSize::B32,
+                                    src: GpOperand::Mem(mem_addr.clone()),
+                                    dst: dst_reg,
+                                });
+                            } else {
+                                self.push_lir(X86Inst::Movsx {
+                                    src_size,
+                                    dst_size: OperandSize::B32,
+                                    src: GpOperand::Mem(mem_addr.clone()),
+                                    dst: dst_reg,
+                                });
+                            }
+                        } else {
+                            let op_size = OperandSize::from_bits(reg_size);
+                            self.push_lir(X86Inst::Mov {
+                                size: op_size,
+                                src: GpOperand::Mem(mem_addr),
+                                dst: GpOperand::Reg(dst_reg),
+                            });
+                        }
+                    }
+                } else if self.needs_got_access(&name) {
                     // External symbols on macOS: load address from GOT, then load value
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
@@ -1854,18 +1970,8 @@ impl X86_64CodeGen {
                         });
                     }
                 } else {
-                    let symbol = if is_local_label {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
-                    // Choose addressing mode: TLS or RIP-relative
-                    let mem_addr =
-                        if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
-                            MemAddr::TlsIE(symbol)
-                        } else {
-                            MemAddr::RipRelative(symbol)
-                        };
+                    // Regular global: RIP-relative addressing
+                    let mem_addr = MemAddr::RipRelative(symbol);
                     if mem_size <= 16 {
                         // LIR: sign/zero extending load from global
                         let src_size = OperandSize::from_bits(mem_size);
@@ -2068,12 +2174,31 @@ impl X86_64CodeGen {
                         }),
                     });
                 } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
-                    // Thread-local storage: use FS segment (initial-exec model)
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(MemAddr::TlsIE(symbol)),
-                    });
+                    // Thread-local storage: use FS segment
+                    // In PIC mode or for external TLS, use Initial Exec model
+                    let is_extern_tls = self.extern_symbols.contains(&name);
+                    let use_ie_model = is_extern_tls || self.pic_mode;
+
+                    if use_ie_model {
+                        // Initial Exec: load offset from GOT, then store via FS segment
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                            dst: GpOperand::Reg(Reg::R11),
+                        });
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Reg(value_reg),
+                            dst: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
+                        });
+                    } else {
+                        // Local Exec: direct access via %fs:symbol@TPOFF
+                        self.push_lir(X86Inst::Mov {
+                            size: op_size,
+                            src: GpOperand::Reg(value_reg),
+                            dst: GpOperand::Mem(MemAddr::TlsIE(symbol)),
+                        });
+                    }
                 } else {
                     // LIR: store to global via RIP-relative
                     self.push_lir(X86Inst::Mov {
@@ -2856,7 +2981,15 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                if self.needs_got_access(name) {
+                // Check TLS before GOT - TLS symbols need special access pattern
+                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                    // Thread-local storage: use %fs:symbol@TPOFF
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movl %fs:{}@TPOFF, %{}",
+                        self.format_symbol_name(name),
+                        self.sized_reg_name(dest_reg, 'k')
+                    ))));
+                } else if self.needs_got_access(name) {
                     // External symbols on macOS: load address from GOT, then load value
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
@@ -2906,7 +3039,15 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                if self.needs_got_access(name) {
+                // Check TLS before GOT - TLS symbols need special access pattern
+                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                    // Thread-local storage: use %fs:symbol@TPOFF
+                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                        "movl %{}, %fs:{}@TPOFF",
+                        src_name,
+                        self.format_symbol_name(name)
+                    ))));
+                } else if self.needs_got_access(name) {
                     // External symbols on macOS: load address from GOT, then store
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
@@ -3610,12 +3751,13 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
 
-        // Collect thread-local storage symbols
+        // Collect thread-local storage symbols (both defined and extern)
         self.tls_symbols = module
             .globals
             .iter()
             .filter(|g| g.is_thread_local)
             .map(|g| g.name.clone())
+            .chain(module.extern_tls_symbols.iter().cloned())
             .collect();
 
         // Emit file header
@@ -3637,14 +3779,7 @@ impl CodeGenerator for X86_64CodeGen {
 
         // Emit globals
         for global in &module.globals {
-            self.emit_global(
-                &global.name,
-                &global.typ,
-                &global.init,
-                global.is_thread_local,
-                global.explicit_align,
-                types,
-            );
+            self.emit_global(global, types);
         }
 
         // Emit string literals

@@ -36,9 +36,17 @@ pub enum MemAddr {
     /// symbol@GOTPCREL(%rip) - GOT-relative addressing for external symbols on macOS
     GotPcrel(Symbol),
 
-    /// %fs:symbol@TPOFF - Thread-local storage initial-exec model (Linux x86-64)
-    /// Uses FS segment register to access thread-local variables
+    /// %fs:symbol@TPOFF - Thread-local storage Local Exec model (Linux x86-64)
+    /// Uses FS segment register to access thread-local variables defined in same executable
     TlsIE(Symbol),
+
+    /// symbol@GOTTPOFF(%rip) - Thread-local storage Initial Exec model (Linux x86-64)
+    /// For external TLS variables: load offset from GOT, then access %fs:(offset)
+    TlsGottpoff(Symbol),
+
+    /// %fs:(base) - Thread-local storage access through base register
+    /// Used with @GOTTPOFF: first load offset into register, then access %fs:(reg)
+    FsBase(Reg),
 }
 
 impl MemAddr {
@@ -59,8 +67,17 @@ impl MemAddr {
                 format!("{}@GOTPCREL(%rip)", sym.format_for_target(target))
             }
             MemAddr::TlsIE(sym) => {
-                // Thread-local storage initial-exec model: %fs:symbol@TPOFF
+                // Thread-local storage Local Exec model: %fs:symbol@TPOFF
                 format!("%fs:{}@TPOFF", sym.format_for_target(target))
+            }
+            MemAddr::TlsGottpoff(sym) => {
+                // Thread-local storage Initial Exec model: symbol@GOTTPOFF(%rip)
+                // This loads the TLS offset into a register; actual access is %fs:(reg)
+                format!("{}@GOTTPOFF(%rip)", sym.format_for_target(target))
+            }
+            MemAddr::FsBase(base) => {
+                // Thread-local storage access through base register: %fs:(reg)
+                format!("%fs:({})", base.name64())
             }
         }
     }

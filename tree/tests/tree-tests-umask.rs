@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+// Casts are necessary for cross-platform compatibility (libc types differ by platform)
+#![allow(clippy::unnecessary_cast)]
+
 //! The use of `libc::umask` in these tests interferes with the permissions of newly created files
 //! in `tree-tests.rs`. They are located here in `tree-tests-umask.rs` so that they can have a
 //! different per-process umask than those in `tree-tests.rs`.

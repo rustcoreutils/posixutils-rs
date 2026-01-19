@@ -540,11 +540,13 @@ impl<'a> Linearizer<'a> {
 
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
-            let modifiers = self.types.modifiers(declarator.typ);
+            // Use storage_class from declarator (extern, static, _Thread_local, etc.)
+            // These are NOT stored in the type system
+            let storage_class = declarator.storage_class;
             let name = self.symbol_name(declarator.symbol);
 
             // Skip typedef declarations - they don't define storage
-            if modifiers.contains(TypeModifiers::TYPEDEF) {
+            if storage_class.contains(TypeModifiers::TYPEDEF) {
                 continue;
             }
 
@@ -563,10 +565,14 @@ impl<'a> Linearizer<'a> {
             // Only add to extern_symbols if not already defined (handles both cases:
             // extern int x; int x = 1;  - x is defined, not extern
             // int x = 1; extern int x;  - x is defined, not extern)
-            if modifiers.contains(TypeModifiers::EXTERN) {
+            if storage_class.contains(TypeModifiers::EXTERN) {
                 // Check if this symbol is already defined in globals
                 if !self.module.globals.iter().any(|g| g.name == name) {
-                    self.module.extern_symbols.insert(name);
+                    self.module.extern_symbols.insert(name.clone());
+                    // Track extern thread-local symbols separately for TLS access
+                    if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
+                        self.module.extern_tls_symbols.insert(name);
+                    }
                 }
                 continue;
             }
@@ -576,7 +582,7 @@ impl<'a> Linearizer<'a> {
             });
 
             // Track file-scope static variables for inline semantic checks
-            if modifiers.contains(TypeModifiers::STATIC) {
+            if storage_class.contains(TypeModifiers::STATIC) {
                 self.file_scope_statics.insert(name.clone());
             }
 
@@ -585,12 +591,14 @@ impl<'a> Linearizer<'a> {
             self.module.extern_symbols.remove(&name);
 
             // Check for thread-local storage
-            if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+            let is_static = storage_class.contains(TypeModifiers::STATIC);
+            if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
                 self.module.add_global_tls_aligned(
                     &name,
                     declarator.typ,
                     init,
                     declarator.explicit_align,
+                    is_static,
                 );
             } else {
                 self.module.add_global_aligned(
@@ -598,6 +606,7 @@ impl<'a> Linearizer<'a> {
                     declarator.typ,
                     init,
                     declarator.explicit_align,
+                    is_static,
                 );
             }
         }
@@ -641,7 +650,8 @@ impl<'a> Linearizer<'a> {
                     Initializer::WideString(s.clone())
                 } else {
                     // Pointer - create a wide string constant and reference it
-                    let label = format!(".LC{}", self.module.wide_strings.len());
+                    // Use .LWC prefix to avoid collision with regular .LC string labels
+                    let label = format!(".LWC{}", self.module.wide_strings.len());
                     self.module.wide_strings.push((label.clone(), s.clone()));
                     Initializer::SymAddr(label)
                 }
@@ -669,15 +679,12 @@ impl<'a> Linearizer<'a> {
                 op: UnaryOp::AddrOf,
                 operand,
             } => {
-                if let ExprKind::Ident(symbol_id) = &operand.kind {
-                    let name_str = self.symbol_name(*symbol_id);
-                    // Check if this is a static local variable
-                    // Static locals have mangled names like "func_name.var_name.N"
-                    let key = format!("{}.{}", self.current_func_name, name_str);
-                    if let Some(static_info) = self.static_locals.get(&key) {
-                        Initializer::SymAddr(static_info.global_name.clone())
+                // Try to compute the address as symbol + offset
+                if let Some((name, offset)) = self.eval_static_address(operand) {
+                    if offset == 0 {
+                        Initializer::SymAddr(name)
                     } else {
-                        Initializer::SymAddr(name_str)
+                        Initializer::SymAddrOffset(name, offset)
                     }
                 } else {
                     Initializer::None
@@ -808,42 +815,116 @@ impl<'a> Linearizer<'a> {
                 let resolved_size = (self.types.size_bits(resolved_typ) / 8) as usize;
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members = &composite.members;
-                    let mut init_fields = Vec::new();
+                    // Collect field initializations with bitfield info:
+                    // (offset, field_size, init, bit_offset, bit_width, storage_unit_size)
+                    #[allow(clippy::type_complexity)]
+                    let mut raw_fields: Vec<(
+                        usize,
+                        usize,
+                        Initializer,
+                        Option<u32>,
+                        Option<u32>,
+                        Option<u32>,
+                    )> = Vec::new();
                     let mut current_field_idx = 0;
 
                     for element in elements {
                         // Find the field (by designator or position)
-                        let member = if let Some(Designator::Field(name)) =
-                            element.designators.first()
-                        {
-                            // Designated initializer: .field = value
-                            let found = members.iter().enumerate().find(|(_, m)| &m.name == name);
-                            if let Some((idx, m)) = found {
-                                current_field_idx = idx + 1;
-                                Some(m)
+                        // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
+                        let member_info =
+                            if let Some(Designator::Field(name)) = element.designators.first() {
+                                // Designated initializer: .field = value
+                                // First try direct member lookup to update position counter
+                                if let Some((idx, _)) =
+                                    members.iter().enumerate().find(|(_, m)| &m.name == name)
+                                {
+                                    current_field_idx = idx + 1;
+                                }
+                                // Use find_member which handles anonymous struct/union members
+                                self.types.find_member(resolved_typ, *name)
+                            } else if current_field_idx < members.len() {
+                                // Positional initializer - direct member only
+                                let m = &members[current_field_idx];
+                                current_field_idx += 1;
+                                Some(crate::types::MemberInfo {
+                                    offset: m.offset,
+                                    typ: m.typ,
+                                    bit_offset: m.bit_offset,
+                                    bit_width: m.bit_width,
+                                    storage_unit_size: m.storage_unit_size,
+                                })
                             } else {
                                 None
-                            }
-                        } else if current_field_idx < members.len() {
-                            // Positional initializer
-                            let m = &members[current_field_idx];
-                            current_field_idx += 1;
-                            Some(m)
-                        } else {
-                            None
-                        };
+                            };
 
-                        if let Some(member) = member {
+                        if let Some(member) = member_info {
                             let offset = member.offset;
                             let field_size = (self.types.size_bits(member.typ) / 8) as usize;
                             let field_init = self.ast_init_to_ir(&element.value, member.typ);
-                            init_fields.push((offset, field_size, field_init));
+                            raw_fields.push((
+                                offset,
+                                field_size,
+                                field_init,
+                                member.bit_offset,
+                                member.bit_width,
+                                member.storage_unit_size,
+                            ));
                         }
                     }
 
                     // Sort fields by offset to ensure proper emission order
                     // (designated initializers can be in any order)
-                    init_fields.sort_by_key(|(offset, _, _)| *offset);
+                    raw_fields.sort_by_key(|(offset, _, _, _, _, _)| *offset);
+
+                    // Now pack bitfields that share the same storage unit
+                    let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
+                    let mut i = 0;
+                    while i < raw_fields.len() {
+                        let (offset, field_size, init, bit_offset, bit_width, storage_unit_size) =
+                            &raw_fields[i];
+
+                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
+                            (bit_offset, bit_width, storage_unit_size)
+                        {
+                            // This is a bitfield - pack all bitfields at this offset together
+                            let mut packed_value: u64 = 0;
+
+                            // Extract the integer value and pack it
+                            if let Initializer::Int(v) = init {
+                                let mask = (1u64 << bit_w) - 1;
+                                packed_value |= ((*v as u64) & mask) << bit_off;
+                            }
+
+                            // Look ahead for more bitfields at the same offset
+                            let mut j = i + 1;
+                            while j < raw_fields.len() {
+                                let (next_off, _, next_init, next_bit_off, next_bit_w, _) =
+                                    &raw_fields[j];
+                                if *next_off != *offset {
+                                    break;
+                                }
+                                if let (Some(nb_off), Some(nb_w)) = (next_bit_off, next_bit_w) {
+                                    if let Initializer::Int(v) = next_init {
+                                        let mask = (1u64 << nb_w) - 1;
+                                        packed_value |= ((*v as u64) & mask) << nb_off;
+                                    }
+                                }
+                                j += 1;
+                            }
+
+                            // Emit packed value with storage unit size
+                            init_fields.push((
+                                *offset,
+                                *storage_size as usize,
+                                Initializer::Int(packed_value as i64),
+                            ));
+                            i = j; // Skip all bitfields we just packed
+                        } else {
+                            // Regular field - emit as-is
+                            init_fields.push((*offset, *field_size, init.clone()));
+                            i += 1;
+                        }
+                    }
 
                     Initializer::Struct {
                         total_size: resolved_size,
@@ -1800,7 +1881,7 @@ impl<'a> Linearizer<'a> {
             self.ast_init_to_ir(e, declarator.typ)
         });
 
-        // Add as a global (type already has STATIC modifier which codegen uses)
+        // Add as a global - static locals always have internal linkage
         // Check for thread-local storage
         let modifiers = self.types.modifiers(declarator.typ);
         if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
@@ -1809,6 +1890,7 @@ impl<'a> Linearizer<'a> {
                 declarator.typ,
                 init,
                 declarator.explicit_align,
+                true, // static locals always have internal linkage
             );
         } else {
             self.module.add_global_aligned(
@@ -1816,6 +1898,7 @@ impl<'a> Linearizer<'a> {
                 declarator.typ,
                 init,
                 declarator.explicit_align,
+                true, // static locals always have internal linkage
             );
         }
     }
@@ -1888,18 +1971,27 @@ impl<'a> Linearizer<'a> {
 
                     for (idx, element) in elements.iter().enumerate() {
                         // Find the field (by designator or position)
-                        let member =
+                        // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
+                        let member_info =
                             if let Some(Designator::Field(name)) = element.designators.first() {
                                 // Designated initializer: .field = value
-                                members.iter().find(|m| &m.name == name)
+                                // find_member handles anonymous struct/union members
+                                self.types.find_member(resolved_typ, *name)
                             } else if idx < members.len() {
-                                // Positional initializer
-                                Some(&members[idx])
+                                // Positional initializer - direct member only
+                                let m = &members[idx];
+                                Some(crate::types::MemberInfo {
+                                    offset: m.offset,
+                                    typ: m.typ,
+                                    bit_offset: m.bit_offset,
+                                    bit_width: m.bit_width,
+                                    storage_unit_size: m.storage_unit_size,
+                                })
                             } else {
                                 None // Too many initializers
                             };
 
-                        let Some(member) = member else {
+                        let Some(member) = member_info else {
                             continue;
                         };
 
@@ -2450,6 +2542,98 @@ impl<'a> Linearizer<'a> {
             // Cast to integer type - evaluate inner expression
             ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
 
+            // __builtin_offsetof(type, member-designator) - compile-time constant
+            ExprKind::OffsetOf { type_id, path } => {
+                let mut offset: u64 = 0;
+                let mut current_type = *type_id;
+
+                for element in path {
+                    match element {
+                        OffsetOfPath::Field(field_id) => {
+                            let struct_type = self.resolve_struct_type(current_type);
+                            if let Some(member_info) =
+                                self.types.find_member(struct_type, *field_id)
+                            {
+                                offset += member_info.offset as u64;
+                                current_type = member_info.typ;
+                            } else {
+                                return None; // Field not found
+                            }
+                        }
+                        OffsetOfPath::Index(index) => {
+                            if let Some(elem_type) = self.types.base_type(current_type) {
+                                let elem_size = self.types.size_bytes(elem_type);
+                                offset += (*index as u64) * (elem_size as u64);
+                                current_type = elem_type;
+                            } else {
+                                return None; // Not an array type
+                            }
+                        }
+                    }
+                }
+
+                Some(offset as i64)
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Evaluate a static address expression (for initializers like `&symbol.field`)
+    ///
+    /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
+    /// or None if it can't be computed at compile time.
+    fn eval_static_address(&self, expr: &Expr) -> Option<(String, i64)> {
+        match &expr.kind {
+            // Simple identifier: &symbol
+            ExprKind::Ident(symbol_id) => {
+                let name_str = self.symbol_name(*symbol_id);
+                // Check if this is a static local variable
+                let key = format!("{}.{}", self.current_func_name, name_str);
+                if let Some(static_info) = self.static_locals.get(&key) {
+                    Some((static_info.global_name.clone(), 0))
+                } else {
+                    Some((name_str, 0))
+                }
+            }
+
+            // Member access: expr.member
+            ExprKind::Member { expr: base, member } => {
+                // Recursively evaluate the base address
+                let (name, base_offset) = self.eval_static_address(base)?;
+
+                // Get the offset of the member in the struct
+                let base_type = base.typ?;
+                let struct_type = self.resolve_struct_type(base_type);
+                let member_info = self.types.find_member(struct_type, *member)?;
+
+                Some((name, base_offset + member_info.offset as i64))
+            }
+
+            // Arrow access: expr->member (pointer dereference + member access)
+            // This cannot be a static address (involves runtime pointer)
+            ExprKind::Arrow { .. } => None,
+
+            // Array subscript: array[index]
+            ExprKind::Index { array, index } => {
+                // Recursively evaluate the base address
+                let (name, base_offset) = self.eval_static_address(array)?;
+
+                // Get the index as a constant
+                let idx = self.eval_const_expr(index)?;
+
+                // Get the element size
+                let array_type = array.typ?;
+                let elem_type = self.types.base_type(array_type)?;
+                let elem_size = self.types.size_bytes(elem_type) as i64;
+
+                Some((name, base_offset + idx * elem_size))
+            }
+
+            // Cast - evaluate the inner expression
+            ExprKind::Cast { expr: inner, .. } => self.eval_static_address(inner),
+
+            // Parenthesized expression (if there's such a variant)
             _ => None,
         }
     }
@@ -2891,10 +3075,16 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::Fabs { arg }
             | ExprKind::Fabsf { arg }
-            | ExprKind::Fabsl { arg } => self.is_pure_expr(arg),
+            | ExprKind::Fabsl { arg }
+            | ExprKind::Signbit { arg }
+            | ExprKind::Signbitf { arg }
+            | ExprKind::Signbitl { arg } => self.is_pure_expr(arg),
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
+
+            // Memory builtins modify memory - not pure
+            ExprKind::Memset { .. } | ExprKind::Memcpy { .. } | ExprKind::Memmove { .. } => false,
 
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
@@ -4585,16 +4775,25 @@ impl<'a> Linearizer<'a> {
                         func.add_pseudo(pseudo);
                     }
                     let typ = static_info.typ;
+                    let type_kind = self.types.kind(typ);
+                    let size = self.types.size_bits(typ);
                     // Arrays decay to pointers - get address, not value
-                    if self.types.kind(typ) == TypeKind::Array {
+                    if type_kind == TypeKind::Array {
                         let result = self.alloc_pseudo();
                         let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                         let ptr_type = self.types.pointer_to(elem_type);
                         self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                         return result;
+                    } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                        && size > 64
+                    {
+                        // Large structs can't be loaded into registers - return address
+                        let result = self.alloc_pseudo();
+                        let ptr_type = self.types.pointer_to(typ);
+                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                        return result;
                     } else {
                         let result = self.alloc_pseudo();
-                        let size = self.types.size_bits(typ);
                         self.emit(Instruction::load(result, sym_id, 0, typ, size));
                         return result;
                     }
@@ -4607,13 +4806,18 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(pseudo);
             }
+            let type_kind = self.types.kind(local.typ);
+            let size = self.types.size_bits(local.typ);
             // Arrays decay to pointers - get address, not value
-            if self.types.kind(local.typ) == TypeKind::Array {
+            if type_kind == TypeKind::Array {
                 let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
                 self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+            } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
+                // Large structs can't be loaded into registers - return address
+                let ptr_type = self.types.pointer_to(local.typ);
+                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
             } else {
-                let size = self.types.size_bits(local.typ);
                 self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
             }
             result
@@ -4646,6 +4850,7 @@ impl<'a> Linearizer<'a> {
             }
             let typ = self.expr_type(expr);
             let type_kind = self.types.kind(typ);
+            let size = self.types.size_bits(typ);
             // Arrays decay to pointers - get address, not value
             if type_kind == TypeKind::Array {
                 let result = self.alloc_pseudo();
@@ -4654,15 +4859,17 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             }
-            // Functions decay to function pointers - get address, not value
-            else if type_kind == TypeKind::Function {
+            // Functions decay to function pointers, and large structs can't be loaded
+            // into registers - for both cases, return the address
+            else if type_kind == TypeKind::Function
+                || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
+            {
                 let result = self.alloc_pseudo();
                 let ptr_type = self.types.pointer_to(typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             } else {
                 let result = self.alloc_pseudo();
-                let size = self.types.size_bits(typ);
                 self.emit(Instruction::load(result, sym_id, 0, typ, size));
                 result
             }
@@ -4947,6 +5154,17 @@ impl<'a> Linearizer<'a> {
                     );
                 }
 
+                // For compound literals with partial initialization, C99 6.7.8p21 requires
+                // zero-initialization of all subobjects not explicitly initialized.
+                // Zero the entire compound literal first, then initialize specific members.
+                let type_kind = self.types.kind(*typ);
+                if type_kind == TypeKind::Struct
+                    || type_kind == TypeKind::Union
+                    || type_kind == TypeKind::Array
+                {
+                    self.emit_aggregate_zero(sym_id, *typ);
+                }
+
                 // Initialize using existing init list machinery
                 self.linearize_init_list(sym_id, *typ, elements);
 
@@ -4958,14 +5176,22 @@ impl<'a> Linearizer<'a> {
                     func.add_pseudo(pseudo);
                 }
 
-                if self.types.kind(*typ) == TypeKind::Array {
+                let type_kind = self.types.kind(*typ);
+                let size = self.types.size_bits(*typ);
+                if type_kind == TypeKind::Array {
                     // Array compound literal - decay to pointer to first element
                     let elem_type = self.types.base_type(*typ).unwrap_or(self.types.int_id);
                     let ptr_type = self.types.pointer_to(elem_type);
                     self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                    && size > 64
+                {
+                    // Large struct/union compound literal - return address
+                    // Large structs can't be "loaded" into registers; assignment handles copying
+                    let ptr_type = self.types.pointer_to(*typ);
+                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 } else {
-                    // Struct/scalar compound literal - load the value
-                    let size = self.types.size_bits(*typ);
+                    // Scalar or small struct compound literal - load the value
                     self.emit(Instruction::load(result, sym_id, 0, *typ, size));
                 }
                 result
@@ -5179,6 +5405,48 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::Memset { dest, c, n } => {
+                let dest_val = self.linearize_expr(dest);
+                let c_val = self.linearize_expr(c);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Memset)
+                    .with_target(result)
+                    .with_src3(dest_val, c_val, n_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Memcpy { dest, src, n } => {
+                let dest_val = self.linearize_expr(dest);
+                let src_val = self.linearize_expr(src);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Memcpy)
+                    .with_target(result)
+                    .with_src3(dest_val, src_val, n_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Memmove { dest, src, n } => {
+                let dest_val = self.linearize_expr(dest);
+                let src_val = self.linearize_expr(src);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Memmove)
+                    .with_target(result)
+                    .with_src3(dest_val, src_val, n_val)
+                    .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
             ExprKind::Fabs { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -5215,6 +5483,46 @@ impl<'a> Linearizer<'a> {
                     .with_src(arg_val)
                     .with_size(128) // long double is 128-bit on our targets
                     .with_type(self.types.longdouble_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Signbit { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Signbit64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Signbitf { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Signbit32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Signbitl { arg } => {
+                // Long double signbit - use 64-bit version
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Signbit64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(128) // long double is 128-bit on our targets
+                    .with_type(self.types.int_id);
                 self.emit(insn);
                 result
             }

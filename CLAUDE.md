@@ -20,7 +20,15 @@ cargo clippy                    # Lint (required)
 cargo fmt --all -- --check      # Format check (required)
 ```
 
+## Git
+
 NEVER amend git commits.
+
+Pre-commit checks,
+- First re-review `git diff HEAD` in totality
+- Passes `cargo clippy --all-targets` with zero warnings (pre-existing warnings MUST be fixed)
+- Changes to (cc/token/ cc/partse/ cc/ir/) have associated unit tests?
+- New features And bug fixes have associated integration tests? (cc/tests/)
 
 ## Architecture
 

@@ -48,6 +48,17 @@ impl fmt::Display for Os {
     }
 }
 
+impl Os {
+    /// Returns the libc function name for signbit(double)
+    /// macOS/Darwin uses __signbitd, Linux/glibc and FreeBSD use __signbit
+    pub fn signbit_double_fn(&self) -> &'static str {
+        match self {
+            Os::MacOS => "__signbitd",
+            Os::Linux | Os::FreeBSD => "__signbit",
+        }
+    }
+}
+
 /// Target configuration
 #[derive(Debug, Clone)]
 pub struct Target {

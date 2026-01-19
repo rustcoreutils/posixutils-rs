@@ -505,15 +505,9 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::keyword_alias("__restrict", "restrict"));
         self.define_macro(Macro::keyword_alias("__restrict__", "restrict"));
 
-        // C99/C11 boolean type support (normally from <stdbool.h>)
-        // Pre-define these for compatibility with code that uses bool without including stdbool.h
-        self.define_macro(Macro::keyword_alias("bool", "_Bool"));
-        self.define_macro(Macro::predefined("true", Some("1")));
-        self.define_macro(Macro::predefined("false", Some("0")));
-        self.define_macro(Macro::predefined(
-            "__bool_true_false_are_defined",
-            Some("1"),
-        ));
+        // Note: C99/C11 bool, true, false are NOT pre-defined here.
+        // They should only be available after #include <stdbool.h>.
+        // This matches GCC/Clang behavior. _Bool is the builtin type.
 
         // C11 atomic memory order constants (GCC-compatible for <stdatomic.h>)
         self.define_macro(Macro::predefined("__ATOMIC_RELAXED", Some("0")));
@@ -1862,11 +1856,79 @@ impl<'a> Preprocessor<'a> {
                 }
 
                 // The #define must define the same macro as the #ifndef
-                if define_name == macro_name {
-                    return Some(macro_name);
+                if define_name != macro_name {
+                    return None;
                 }
 
-                return None;
+                // Check for conditional default definition pattern:
+                //   #ifndef MACRO
+                //   #define MACRO [value]
+                //   #endif
+                //   ... more content ...  <-- content AFTER #endif = NOT a guard
+                //
+                // vs true include guard:
+                //   #ifndef MACRO
+                //   #define MACRO
+                //   ... guarded content ...
+                //   #endif
+                //   [end of file or just whitespace/comments]
+
+                // Skip to end of #define line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Check if next thing is #endif followed by more content
+                if chars.peek() == Some(&'#') {
+                    let mut check_chars = chars.clone();
+                    check_chars.next(); // consume #
+                                        // Skip whitespace after #
+                    while check_chars
+                        .peek()
+                        .map(|c| *c == ' ' || *c == '\t')
+                        .unwrap_or(false)
+                    {
+                        check_chars.next();
+                    }
+                    // Collect directive name
+                    let mut next_dir = String::new();
+                    while check_chars
+                        .peek()
+                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                        .unwrap_or(false)
+                    {
+                        next_dir.push(check_chars.next().unwrap());
+                    }
+                    if next_dir == "endif" {
+                        // Found #endif immediately after #define
+                        // Now check if there's more content after the #endif
+                        // Skip to end of #endif line
+                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                            check_chars.next();
+                        }
+                        if check_chars.peek() == Some(&'\n') {
+                            check_chars.next();
+                        }
+                        // Skip whitespace and comments after #endif
+                        skip_ws_and_comments(&mut check_chars);
+                        // If there's more content after #endif, this is NOT a guard
+                        if check_chars.peek().is_some() {
+                            return None;
+                        }
+                        // Otherwise it's a valid (empty) include guard
+                    }
+                }
+
+                // Looks like a valid include guard
+                return Some(macro_name);
             }
             "if" => {
                 // Check for !defined(MACRO) pattern
@@ -1931,9 +1993,147 @@ impl<'a> Preprocessor<'a> {
                 {
                     macro_name.push(chars.next().unwrap());
                 }
-                if !macro_name.is_empty() {
-                    return Some(macro_name);
+                if macro_name.is_empty() {
+                    return None;
                 }
+                // Skip optional closing paren
+                if has_paren {
+                    while chars
+                        .peek()
+                        .map(|c| *c == ' ' || *c == '\t')
+                        .unwrap_or(false)
+                    {
+                        chars.next();
+                    }
+                    if chars.peek() == Some(&')') {
+                        chars.next();
+                    }
+                }
+
+                // Skip to end of line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments before next directive
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Now check for #define MACRO (second part of include guard pattern)
+                if chars.next() != Some('#') {
+                    return None;
+                }
+
+                // Skip whitespace after #
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+
+                // Collect directive name
+                let mut next_directive = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    next_directive.push(chars.next().unwrap());
+                }
+
+                if next_directive != "define" {
+                    return None;
+                }
+
+                // Skip whitespace
+                while chars
+                    .peek()
+                    .map(|c| *c == ' ' || *c == '\t')
+                    .unwrap_or(false)
+                {
+                    chars.next();
+                }
+
+                // Collect the defined macro name
+                let mut define_name = String::new();
+                while chars
+                    .peek()
+                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .unwrap_or(false)
+                {
+                    define_name.push(chars.next().unwrap());
+                }
+
+                // The #define must define the same macro as the #if !defined
+                if define_name != macro_name {
+                    return None;
+                }
+
+                // Same check as for #ifndef case:
+                // Check for conditional default definition pattern
+
+                // Skip to end of #define line
+                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+
+                // Skip whitespace and comments
+                if !skip_ws_and_comments(&mut chars) {
+                    return None;
+                }
+
+                // Check if next thing is #endif followed by more content
+                if chars.peek() == Some(&'#') {
+                    let mut check_chars = chars.clone();
+                    check_chars.next(); // consume #
+                                        // Skip whitespace after #
+                    while check_chars
+                        .peek()
+                        .map(|c| *c == ' ' || *c == '\t')
+                        .unwrap_or(false)
+                    {
+                        check_chars.next();
+                    }
+                    // Collect directive name
+                    let mut next_dir = String::new();
+                    while check_chars
+                        .peek()
+                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
+                        .unwrap_or(false)
+                    {
+                        next_dir.push(check_chars.next().unwrap());
+                    }
+                    if next_dir == "endif" {
+                        // Found #endif immediately after #define
+                        // Now check if there's more content after the #endif
+                        // Skip to end of #endif line
+                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                            check_chars.next();
+                        }
+                        if check_chars.peek() == Some(&'\n') {
+                            check_chars.next();
+                        }
+                        // Skip whitespace and comments after #endif
+                        skip_ws_and_comments(&mut check_chars);
+                        // If there's more content after #endif, this is NOT a guard
+                        if check_chars.peek().is_some() {
+                            return None;
+                        }
+                        // Otherwise it's a valid (empty) include guard
+                    }
+                }
+
+                // Looks like a valid include guard
+                return Some(macro_name);
             }
             _ => {}
         }
@@ -2799,85 +2999,50 @@ impl<'a> Preprocessor<'a> {
         match builtin {
             BuiltinMacro::HasAttribute => {
                 // Return true for attributes we actually implement
-                matches!(name.as_str(), "noreturn" | "__noreturn__")
-            }
-            BuiltinMacro::HasBuiltin => {
-                // Return true only for builtins actually implemented in the compiler
                 matches!(
                     name.as_str(),
-                    // Variadic function support
-                    "__builtin_va_list"
-                        | "__builtin_va_start"
-                        | "__builtin_va_end"
-                        | "__builtin_va_arg"
-                        | "__builtin_va_copy"
-                        // Byte swap
-                        | "__builtin_bswap16"
-                        | "__builtin_bswap32"
-                        | "__builtin_bswap64"
-                        // Bit manipulation
-                        | "__builtin_ctz"
-                        | "__builtin_ctzl"
-                        | "__builtin_ctzll"
-                        | "__builtin_clz"
-                        | "__builtin_clzl"
-                        | "__builtin_clzll"
-                        | "__builtin_popcount"
-                        | "__builtin_popcountl"
-                        | "__builtin_popcountll"
-                        // Memory
-                        | "__builtin_alloca"
-                        // Compile-time evaluation
-                        | "__builtin_constant_p"
-                        | "__builtin_types_compatible_p"
-                        | "__builtin_unreachable"
-                        | "__builtin_offsetof"
-                        | "offsetof"
-                        // Floating-point constants
-                        | "__builtin_inf"
-                        | "__builtin_inff"
-                        | "__builtin_infl"
-                        | "__builtin_huge_val"
-                        | "__builtin_huge_valf"
-                        | "__builtin_huge_vall"
-                        // Floating-point math
-                        | "__builtin_fabs"
-                        | "__builtin_fabsf"
-                        | "__builtin_fabsl"
-                        // NaN constants
-                        | "__builtin_nan"
-                        | "__builtin_nanf"
-                        | "__builtin_nanl"
-                        | "__builtin_nans"
-                        | "__builtin_nansf"
-                        | "__builtin_nansl"
-                        // Branch prediction
-                        | "__builtin_expect"
-                        // Floating-point rounding mode
-                        | "__builtin_flt_rounds"
-                        // Atomic builtins (C11 - Clang style)
-                        | "__c11_atomic_init"
-                        | "__c11_atomic_load"
-                        | "__c11_atomic_store"
-                        | "__c11_atomic_exchange"
-                        | "__c11_atomic_compare_exchange_strong"
-                        | "__c11_atomic_compare_exchange_weak"
-                        | "__c11_atomic_fetch_add"
-                        | "__c11_atomic_fetch_sub"
-                        | "__c11_atomic_fetch_and"
-                        | "__c11_atomic_fetch_or"
-                        | "__c11_atomic_fetch_xor"
-                        | "__c11_atomic_thread_fence"
-                        | "__c11_atomic_signal_fence"
+                    "noreturn"
+                        | "__noreturn__"
+                        | "unused"
+                        | "__unused__"
+                        | "aligned"
+                        | "__aligned__"
+                        | "packed"
+                        | "__packed__"
+                        | "deprecated"
+                        | "__deprecated__"
+                        | "weak"
+                        | "__weak__"
+                        | "section"
+                        | "__section__"
+                        | "visibility"
+                        | "__visibility__"
+                        | "constructor"
+                        | "__constructor__"
+                        | "destructor"
+                        | "__destructor__"
+                        | "used"
+                        | "__used__"
                 )
             }
-            BuiltinMacro::HasFeature => {
-                // Return true for GNU extensions we implement
-                matches!(name.as_str(), "statement_expressions")
+            BuiltinMacro::HasBuiltin => {
+                // Use centralized builtin registry
+                crate::builtins::is_builtin(name.as_str())
             }
-            BuiltinMacro::HasExtension => {
-                // Return true for GNU extensions we implement
-                matches!(name.as_str(), "statement_expressions")
+            BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
+                // Return true for features/extensions we implement
+                matches!(
+                    name.as_str(),
+                    // GNU extensions
+                    "statement_expressions" |
+                    "statement_expressions_in_macros" |
+                    "gnu_asm" |
+                    // C11 features
+                    "c_atomic" |
+                    "c_static_assert" |
+                    "c_alignof" |
+                    "c_thread_local"
+                )
             }
             _ => false,
         }
@@ -3296,7 +3461,31 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         };
 
         // Return 1 for attributes we actually implement
-        let supported = matches!(name.as_str(), "noreturn" | "__noreturn__");
+        let supported = matches!(
+            name.as_str(),
+            "noreturn"
+                | "__noreturn__"
+                | "unused"
+                | "__unused__"
+                | "aligned"
+                | "__aligned__"
+                | "packed"
+                | "__packed__"
+                | "deprecated"
+                | "__deprecated__"
+                | "weak"
+                | "__weak__"
+                | "section"
+                | "__section__"
+                | "visibility"
+                | "__visibility__"
+                | "constructor"
+                | "__constructor__"
+                | "destructor"
+                | "__destructor__"
+                | "used"
+                | "__used__"
+        );
         if supported {
             1
         } else {
@@ -3311,79 +3500,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        // Return 1 for builtins actually implemented in the compiler
-        let supported = matches!(
-            name.as_str(),
-            // Variadic function support
-            "__builtin_va_list"
-                | "__builtin_va_start"
-                | "__builtin_va_end"
-                | "__builtin_va_arg"
-                | "__builtin_va_copy"
-                // Byte swap
-                | "__builtin_bswap16"
-                | "__builtin_bswap32"
-                | "__builtin_bswap64"
-                // Bit manipulation
-                | "__builtin_ctz"
-                | "__builtin_ctzl"
-                | "__builtin_ctzll"
-                | "__builtin_clz"
-                | "__builtin_clzl"
-                | "__builtin_clzll"
-                | "__builtin_popcount"
-                | "__builtin_popcountl"
-                | "__builtin_popcountll"
-                // Memory
-                | "__builtin_alloca"
-                // Compile-time evaluation
-                | "__builtin_constant_p"
-                | "__builtin_types_compatible_p"
-                | "__builtin_unreachable"
-                | "__builtin_offsetof"
-                | "offsetof"
-                // Floating-point constants
-                | "__builtin_inf"
-                | "__builtin_inff"
-                | "__builtin_infl"
-                | "__builtin_huge_val"
-                | "__builtin_huge_valf"
-                | "__builtin_huge_vall"
-                // Floating-point math
-                | "__builtin_fabs"
-                | "__builtin_fabsf"
-                | "__builtin_fabsl"
-                // NaN constants
-                | "__builtin_nan"
-                | "__builtin_nanf"
-                | "__builtin_nanl"
-                | "__builtin_nans"
-                | "__builtin_nansf"
-                | "__builtin_nansl"
-                // Branch prediction
-                | "__builtin_expect"
-                // Floating-point rounding mode
-                | "__builtin_flt_rounds"
-                // Frame/return address
-                | "__builtin_frame_address"
-                | "__builtin_return_address"
-                // Atomic builtins (C11 - Clang style)
-                | "__c11_atomic_init"
-                | "__c11_atomic_load"
-                | "__c11_atomic_store"
-                | "__c11_atomic_exchange"
-                | "__c11_atomic_compare_exchange_strong"
-                | "__c11_atomic_compare_exchange_weak"
-                | "__c11_atomic_fetch_add"
-                | "__c11_atomic_fetch_sub"
-                | "__c11_atomic_fetch_and"
-                | "__c11_atomic_fetch_or"
-                | "__c11_atomic_fetch_xor"
-                | "__c11_atomic_thread_fence"
-                | "__c11_atomic_signal_fence"
-        );
-
-        if supported {
+        // Use centralized builtin registry
+        if crate::builtins::is_builtin(name.as_str()) {
             1
         } else {
             0
@@ -3397,10 +3515,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        // Return 1 for GNU extensions we implement
+        // Return 1 for features/extensions we implement
         let supported = matches!(
             name.as_str(),
-            "statement_expressions" // GNU ({ }) extension
+            // GNU extensions
+            "statement_expressions" | // GNU ({ }) extension
+            "statement_expressions_in_macros" |
+            "gnu_asm" |
+            // C11 features
+            "c_atomic" |
+            "c_static_assert" |
+            "c_alignof" |
+            "c_thread_local"
         );
 
         if supported {
@@ -4577,41 +4703,58 @@ PASTE(foo, bar)
         assert_eq!(Preprocessor::detect_include_guard(content), None);
     }
 
+    #[test]
+    fn test_detect_include_guard_conditional_default_with_content() {
+        // NOT a guard - conditional default definition followed by more content
+        // This pattern: #ifndef X / #define X default / #endif / more macros
+        let content = b"#ifndef FOO\n#define FOO 1\n#endif\n#define BAR 2\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
+    #[test]
+    fn test_detect_include_guard_if_defined_conditional_default() {
+        // NOT a guard - #if !defined() pattern with content after #endif
+        let content =
+            b"#if !defined(DEFAULT_VAL)\n#define DEFAULT_VAL 42\n#endif\n#define OTHER 1\n";
+        assert_eq!(Preprocessor::detect_include_guard(content), None);
+    }
+
     // ========================================================================
     // bool/true/false predefined macro tests
     // ========================================================================
 
     #[test]
-    fn test_bool_macro_expands_to_bool() {
-        // bool should expand to _Bool
-        let (tokens, idents) = preprocess_str("bool x;");
+    fn test_bool_macro_expands_to_bool_with_stdbool() {
+        // bool should expand to _Bool after including stdbool.h
+        let (tokens, idents) = preprocess_str("#include <stdbool.h>\nbool x;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"_Bool".to_string()));
-        assert!(!strs.contains(&"bool".to_string()));
     }
 
     #[test]
-    fn test_true_macro_expands_to_1() {
-        // true should expand to 1
-        let (tokens, idents) = preprocess_str("int x = true;");
+    fn test_true_macro_expands_to_1_with_stdbool() {
+        // true should expand to 1 after including stdbool.h
+        let (tokens, idents) = preprocess_str("#include <stdbool.h>\nint x = true;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"1".to_string()));
     }
 
     #[test]
-    fn test_false_macro_expands_to_0() {
-        // false should expand to 0
-        let (tokens, idents) = preprocess_str("int x = false;");
+    fn test_false_macro_expands_to_0_with_stdbool() {
+        // false should expand to 0 after including stdbool.h
+        let (tokens, idents) = preprocess_str("#include <stdbool.h>\nint x = false;");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"0".to_string()));
     }
 
     #[test]
-    fn test_bool_true_false_are_defined() {
-        // __bool_true_false_are_defined should be defined as 1
-        let (tokens, idents) = preprocess_str("int x = __bool_true_false_are_defined;");
+    fn test_bool_not_predefined_without_stdbool() {
+        // bool should NOT be predefined without stdbool.h (matches GCC/Clang)
+        let (tokens, idents) = preprocess_str("bool x;");
         let strs = get_token_strings(&tokens, &idents);
-        assert!(strs.contains(&"1".to_string()));
+        // bool should remain unexpanded (as an identifier)
+        assert!(strs.contains(&"bool".to_string()));
+        assert!(!strs.contains(&"_Bool".to_string()));
     }
 
     // ========================================================================

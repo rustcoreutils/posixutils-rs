@@ -902,9 +902,9 @@ impl Aarch64CodeGen {
         // Load argument into V0 (first FP argument register)
         self.emit_fp_move(arg, VReg::V0, None, 64, frame_size, types);
 
-        // Call __signbit from libc (C99: signbit is a macro that calls __signbit)
+        // Call signbit function from libc
         self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("__signbit")),
+            target: CallTarget::Direct(Symbol::global(self.base.target.os.signbit_double_fn())),
         });
 
         // Result is in W0 (integer return), store to target

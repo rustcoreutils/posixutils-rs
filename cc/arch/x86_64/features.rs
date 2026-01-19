@@ -1394,9 +1394,11 @@ impl X86_64CodeGen {
         // Load argument into XMM0 (first FP argument register)
         self.emit_fp_move(arg, XmmReg::Xmm0, 64);
 
-        // Call __signbit from libc (C99: signbit is a macro that calls __signbit)
+        // Call signbit function from libc
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("__signbit".to_string())),
+            target: CallTarget::Direct(Symbol::global(
+                self.base.target.os.signbit_double_fn().to_string(),
+            )),
         });
 
         // Result is in EAX (integer return), store to target

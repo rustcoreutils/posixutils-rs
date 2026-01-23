@@ -399,6 +399,17 @@ fn codegen_asm_file_support() {
     // invocation requires passing asm objects to C file's link step (future work).
 
     // Assembly function that returns 42 (x86_64)
+    // Note: macOS Mach-O uses underscore prefix and has no .type/.size directives
+    #[cfg(target_os = "macos")]
+    let asm_content = r#"
+    .text
+    .globl _get_value
+_get_value:
+    movl $42, %eax
+    ret
+"#;
+
+    #[cfg(not(target_os = "macos"))]
     let asm_content = r#"
     .text
     .globl get_value
@@ -410,6 +421,17 @@ get_value:
 "#;
 
     // Assembly with preprocessor directives (.S) (x86_64)
+    #[cfg(target_os = "macos")]
+    let asm_s_content = r#"
+#define RETURN_VALUE 99
+    .text
+    .globl _get_value_s
+_get_value_s:
+    movl $RETURN_VALUE, %eax
+    ret
+"#;
+
+    #[cfg(not(target_os = "macos"))]
     let asm_s_content = r#"
 #define RETURN_VALUE 99
     .text

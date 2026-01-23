@@ -724,9 +724,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // .S files need preprocessing, .s files don't
         let asm_to_assemble = if asm_path.ends_with(".S") {
-            // Preprocess with cpp
+            // Preprocess with cc -E (more portable than cpp which has issues on macOS)
             let temp_s = format!("/tmp/pcc_{}_{}.s", std::process::id(), stem);
-            let mut cpp_cmd = Command::new("cpp");
+            let mut cpp_cmd = Command::new("cc");
+            cpp_cmd.arg("-E");
             // Add include paths
             for inc in &args.include_paths {
                 cpp_cmd.arg(format!("-I{}", inc));

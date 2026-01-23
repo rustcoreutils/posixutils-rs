@@ -28,7 +28,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          # First pass: show all warnings (don't fail)
+          cargo clippy --all-targets 2>&1 || true
+          # Second pass: fail if any warnings exist
+          cargo clippy --all-targets -- -D warnings
 
   linux-ubuntu:
     needs: lint

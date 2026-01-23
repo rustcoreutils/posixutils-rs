@@ -3032,14 +3032,9 @@ impl Editor {
 
             if line_num <= self.buffer.line_count() {
                 if let Some(line) = self.buffer.line(line_num) {
-                    // Expand tabs and truncate
+                    // Expand tabs and truncate (expand_line already caps at max_cols)
                     let content = self.screen.expand_line(line.content(), size.cols as usize);
-                    let display = if content.len() > size.cols as usize {
-                        &content[..size.cols as usize]
-                    } else {
-                        &content
-                    };
-                    self.terminal.write_str(display)?;
+                    self.terminal.write_str(&content)?;
                 }
             } else {
                 self.terminal.write_str("~")?;

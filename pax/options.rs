@@ -540,8 +540,7 @@ pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
         if c == '%' {
             match chars.next() {
                 Some(spec) => {
-                    if let Some((_, handler)) =
-                        FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec)
+                    if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec)
                     {
                         result.push_str(&handler(info));
                     } else {

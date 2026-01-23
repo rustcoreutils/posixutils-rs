@@ -1,5 +1,6 @@
 //! Screen buffer for efficient display updates.
 
+use super::display::truncate_to_width;
 use super::terminal::{Terminal, TerminalSize};
 use crate::buffer::Buffer;
 use crate::error::Result;
@@ -101,6 +102,11 @@ impl Screen {
             self.tabstop = tabstop.max(1);
             self.mark_all_dirty();
         }
+    }
+
+    /// Get tab stop width.
+    pub fn tabstop(&self) -> usize {
+        self.tabstop
     }
 
     /// Mark all rows as dirty.
@@ -229,13 +235,10 @@ impl Screen {
         output.push_str(&format!("\x1b[{};1H", status_row));
         output.push_str("\x1b[K");
         if !self.message.is_empty() {
-            // Truncate message to fit
+            // Truncate message to fit (using UTF-8 safe truncation)
             let max_len = self.size.cols as usize;
-            if self.message.len() > max_len {
-                output.push_str(&self.message[..max_len]);
-            } else {
-                output.push_str(&self.message);
-            }
+            let msg = truncate_to_width(&self.message, max_len, self.tabstop);
+            output.push_str(&msg);
         }
 
         // Position cursor

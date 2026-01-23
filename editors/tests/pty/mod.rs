@@ -225,3 +225,50 @@ fn test_pty_vi_delete_and_save() {
     assert_eq!(lines[0], "Line1");
     assert_eq!(lines[1], "Line3");
 }
+
+/// Test: UTF-8 display with multibyte characters in narrow terminal.
+/// Regression test for issue #536 - vi panics on UTF-8 char boundary.
+#[test]
+fn test_pty_vi_utf8_display() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test_utf8.txt");
+    // Cyrillic text "Привет мир" = "Hello world" - each Cyrillic char is 2 bytes
+    std::fs::write(&file_path, "Привет мир\n").unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 10,
+            cols: 20, // Narrow terminal to force truncation
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    let _reader_thread = spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    // Wait for vi startup
+    thread::sleep(Duration::from_millis(500));
+
+    // Move cursor right a few times (exercises display with UTF-8)
+    write_keys(&mut writer, "lll");
+    thread::sleep(Duration::from_millis(100));
+
+    // Quit without saving
+    write_keys(&mut writer, ":q!\r");
+
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    // If we got here without panic, the test passed
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "Привет мир\n");
+}

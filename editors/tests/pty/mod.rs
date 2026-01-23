@@ -5,6 +5,7 @@
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -41,6 +42,61 @@ fn wait_with_timeout(child: &mut Box<dyn portable_pty::Child + Send + Sync>, tim
     }
 }
 
+/// Helper struct for PTY-based vi tests.
+struct ViPtySession {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    #[allow(dead_code)]
+    reader_thread: thread::JoinHandle<()>,
+}
+
+impl ViPtySession {
+    /// Spawn vi with the given file in a PTY of the specified size.
+    fn new(file_path: &Path, rows: u16, cols: u16) -> Self {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+        cmd.arg(file_path);
+        cmd.env("TERM", "vt100");
+
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let reader = pair.master.try_clone_reader().unwrap();
+        let reader_thread = spawn_reader_drain(reader);
+        let writer = pair.master.take_writer().unwrap();
+
+        Self {
+            child,
+            writer,
+            reader_thread,
+        }
+    }
+
+    /// Send key sequence to vi.
+    fn keys(&mut self, s: &str) {
+        write_keys(&mut self.writer, s);
+    }
+
+    /// Sleep for the given number of milliseconds.
+    fn sleep_ms(&self, ms: u64) {
+        thread::sleep(Duration::from_millis(ms));
+    }
+
+    /// Wait for vi to exit with a timeout.
+    fn wait(mut self) {
+        wait_with_timeout(&mut self.child, Duration::from_secs(5));
+    }
+}
+
 /// Test: Insert text and save file.
 #[test]
 fn test_pty_vi_insert_and_save() {
@@ -48,40 +104,12 @@ fn test_pty_vi_insert_and_save() {
     let file_path = td.path().join("test.txt");
     std::fs::write(&file_path, "").unwrap();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 25,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
-    cmd.arg(&file_path);
-    cmd.env("TERM", "vt100");
-
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let _reader_thread = spawn_reader_drain(reader);
-    let mut writer = pair.master.take_writer().unwrap();
-
-    // Wait for vi startup
-    thread::sleep(Duration::from_millis(500));
-
-    // Insert "Hello" and save
-    write_keys(&mut writer, "i");
-    thread::sleep(Duration::from_millis(50));
-    write_keys(&mut writer, "Hello");
-    thread::sleep(Duration::from_millis(50));
-    write_keys(&mut writer, "\x1b"); // ESC
-    thread::sleep(Duration::from_millis(100));
-    write_keys(&mut writer, ":wq\r");
-
-    wait_with_timeout(&mut child, Duration::from_secs(5));
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("iHello\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
 
     let contents = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(contents.trim(), "Hello");
@@ -94,36 +122,12 @@ fn test_pty_vi_quit_no_save() {
     let file_path = td.path().join("test.txt");
     std::fs::write(&file_path, "original\n").unwrap();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 25,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
-    cmd.arg(&file_path);
-    cmd.env("TERM", "vt100");
-
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let _reader_thread = spawn_reader_drain(reader);
-    let mut writer = pair.master.take_writer().unwrap();
-
-    // Wait for vi startup
-    thread::sleep(Duration::from_millis(500));
-
-    // Delete line and quit without saving
-    write_keys(&mut writer, "dd");
-    thread::sleep(Duration::from_millis(100));
-    write_keys(&mut writer, ":q!\r");
-
-    wait_with_timeout(&mut child, Duration::from_secs(5));
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("dd");
+    vi.sleep_ms(100);
+    vi.keys(":q!\r");
+    vi.wait();
 
     let contents = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(contents, "original\n");
@@ -136,40 +140,12 @@ fn test_pty_vi_multiple_lines() {
     let file_path = td.path().join("test.txt");
     std::fs::write(&file_path, "").unwrap();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 25,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
-    cmd.arg(&file_path);
-    cmd.env("TERM", "vt100");
-
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let _reader_thread = spawn_reader_drain(reader);
-    let mut writer = pair.master.take_writer().unwrap();
-
-    // Wait for vi startup
-    thread::sleep(Duration::from_millis(500));
-
-    // Insert three lines
-    write_keys(&mut writer, "i");
-    thread::sleep(Duration::from_millis(50));
-    write_keys(&mut writer, "Line1\rLine2\rLine3");
-    thread::sleep(Duration::from_millis(50));
-    write_keys(&mut writer, "\x1b"); // ESC
-    thread::sleep(Duration::from_millis(100));
-    write_keys(&mut writer, ":wq\r");
-
-    wait_with_timeout(&mut child, Duration::from_secs(5));
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("iLine1\rLine2\rLine3\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
 
     let contents = std::fs::read_to_string(&file_path).unwrap();
     let lines: Vec<&str> = contents.lines().collect();
@@ -186,38 +162,10 @@ fn test_pty_vi_delete_and_save() {
     let file_path = td.path().join("test.txt");
     std::fs::write(&file_path, "Line1\nLine2\nLine3\n").unwrap();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 25,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
-    cmd.arg(&file_path);
-    cmd.env("TERM", "vt100");
-
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let _reader_thread = spawn_reader_drain(reader);
-    let mut writer = pair.master.take_writer().unwrap();
-
-    // Wait for vi startup
-    thread::sleep(Duration::from_millis(500));
-
-    // Move down one line (j), delete line (dd), save and quit
-    write_keys(&mut writer, "j");
-    thread::sleep(Duration::from_millis(50));
-    write_keys(&mut writer, "dd");
-    thread::sleep(Duration::from_millis(100));
-    write_keys(&mut writer, ":wq\r");
-
-    wait_with_timeout(&mut child, Duration::from_secs(5));
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("jdd:wq\r");
+    vi.wait();
 
     let contents = std::fs::read_to_string(&file_path).unwrap();
     let lines: Vec<&str> = contents.lines().collect();
@@ -235,38 +183,12 @@ fn test_pty_vi_utf8_display() {
     // Cyrillic text "Привет мир" = "Hello world" - each Cyrillic char is 2 bytes
     std::fs::write(&file_path, "Привет мир\n").unwrap();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 10,
-            cols: 20, // Narrow terminal to force truncation
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
-    cmd.arg(&file_path);
-    cmd.env("TERM", "vt100");
-
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let _reader_thread = spawn_reader_drain(reader);
-    let mut writer = pair.master.take_writer().unwrap();
-
-    // Wait for vi startup
-    thread::sleep(Duration::from_millis(500));
-
-    // Move cursor right a few times (exercises display with UTF-8)
-    write_keys(&mut writer, "lll");
-    thread::sleep(Duration::from_millis(100));
-
-    // Quit without saving
-    write_keys(&mut writer, ":q!\r");
-
-    wait_with_timeout(&mut child, Duration::from_secs(5));
+    let mut vi = ViPtySession::new(&file_path, 10, 20); // Narrow terminal to force truncation
+    vi.sleep_ms(500);
+    vi.keys("lll");
+    vi.sleep_ms(100);
+    vi.keys(":q!\r");
+    vi.wait();
 
     // If we got here without panic, the test passed
     let contents = std::fs::read_to_string(&file_path).unwrap();
@@ -281,46 +203,16 @@ fn test_pty_vi_set_number() {
     let file_path = td.path().join("test_number.txt");
     std::fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 25,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
-    cmd.arg(&file_path);
-    cmd.env("TERM", "vt100");
-
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let _reader_thread = spawn_reader_drain(reader);
-    let mut writer = pair.master.take_writer().unwrap();
-
-    // Wait for vi startup
-    thread::sleep(Duration::from_millis(500));
-
-    // Enable line numbers
-    write_keys(&mut writer, ":set number\r");
-    thread::sleep(Duration::from_millis(200));
-
-    // Move cursor to verify positioning works with line numbers
-    write_keys(&mut writer, "jjk");
-    thread::sleep(Duration::from_millis(100));
-
-    // Disable line numbers
-    write_keys(&mut writer, ":set nonumber\r");
-    thread::sleep(Duration::from_millis(100));
-
-    // Quit without saving
-    write_keys(&mut writer, ":q!\r");
-
-    wait_with_timeout(&mut child, Duration::from_secs(5));
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys(":set number\r");
+    vi.sleep_ms(200);
+    vi.keys("jjk");
+    vi.sleep_ms(100);
+    vi.keys(":set nonumber\r");
+    vi.sleep_ms(100);
+    vi.keys(":q!\r");
+    vi.wait();
 
     // File should be unchanged
     let contents = std::fs::read_to_string(&file_path).unwrap();

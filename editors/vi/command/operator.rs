@@ -2,7 +2,7 @@
 //!
 //! Operators work on text ranges defined by motions or text objects.
 
-use crate::buffer::{Buffer, BufferMode, Position, Range};
+use crate::buffer::{char_index_at_byte, Buffer, BufferMode, Position, Range};
 use crate::error::{Result, ViError};
 use crate::register::{RegisterContent, Registers};
 
@@ -319,13 +319,7 @@ fn put_chars_after(buffer: &mut Buffer, text: &str, count: usize) -> Result<Posi
         if !line.is_empty() {
             let content = line.content();
             let chars: Vec<(usize, char)> = content.char_indices().collect();
-            let mut idx = 0;
-            for (i, (byte_idx, _)) in chars.iter().enumerate() {
-                if *byte_idx >= pos.column {
-                    idx = i;
-                    break;
-                }
-            }
+            let idx = char_index_at_byte(content, pos.column);
             if idx + 1 < chars.len() {
                 buffer.set_column(chars[idx + 1].0);
             } else {

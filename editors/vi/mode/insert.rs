@@ -6,7 +6,7 @@
 //! - Cursor positioning based on insert kind
 
 use super::mode::InsertKind;
-use crate::buffer::{Buffer, Position};
+use crate::buffer::{char_index_at_byte, Buffer, Position};
 use crate::error::{Result, ViError};
 use crate::input::Key;
 
@@ -59,15 +59,7 @@ pub fn enter_insert_mode(buffer: &mut Buffer, kind: InsertKind) -> Result<Insert
                 if !line.is_empty() {
                     let content = line.content();
                     let chars: Vec<(usize, char)> = content.char_indices().collect();
-
-                    // Find current char index
-                    let mut idx = 0;
-                    for (i, (byte_idx, _)) in chars.iter().enumerate() {
-                        if *byte_idx >= pos.column {
-                            idx = i;
-                            break;
-                        }
-                    }
+                    let idx = char_index_at_byte(content, pos.column);
 
                     // Move one position forward if not at end
                     if idx + 1 < chars.len() {
@@ -386,14 +378,7 @@ fn finalize_insert(buffer: &mut Buffer, state: &mut InsertState) {
                     buffer.set_column(chars.last().map(|(idx, _)| *idx).unwrap_or(0));
                 } else {
                     // Find current char index and move back one
-                    let mut idx = 0;
-                    for (i, (byte_idx, _)) in chars.iter().enumerate() {
-                        if *byte_idx >= pos.column {
-                            idx = i;
-                            break;
-                        }
-                    }
-
+                    let idx = char_index_at_byte(content, pos.column);
                     if idx > 0 {
                         buffer.set_column(chars[idx - 1].0);
                     }

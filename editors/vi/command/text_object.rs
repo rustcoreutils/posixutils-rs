@@ -1,6 +1,6 @@
 //! Text object definitions (word, bigword, sentence, paragraph, section).
 
-use crate::buffer::{Buffer, Position};
+use crate::buffer::{char_index_at_byte, Buffer, Position};
 
 /// Check if a character is a word character (alphanumeric or underscore).
 pub fn is_word_char(c: char) -> bool {
@@ -169,14 +169,8 @@ pub fn prev_word_start(buffer: &Buffer, pos: Position) -> Option<Position> {
         if line_num == pos.line && col > 0 {
             // Move back one position first
             let chars: Vec<_> = content.char_indices().collect();
-            let mut idx = chars.len();
-            for (i, (byte_idx, _)) in chars.iter().enumerate() {
-                if *byte_idx >= col {
-                    idx = i;
-                    break;
-                }
-            }
-            idx = idx.saturating_sub(1);
+            let idx_at_col = char_index_at_byte(content, col);
+            let mut idx = idx_at_col.saturating_sub(1);
 
             // Skip blanks
             while idx > 0 && is_blank(chars[idx].1) {
@@ -254,14 +248,7 @@ pub fn next_word_end(buffer: &Buffer, pos: Position) -> Option<Position> {
     if let Some(line) = buffer.line(line_num) {
         let content = line.content();
         let chars: Vec<_> = content.char_indices().collect();
-
-        let mut idx = 0;
-        for (i, (byte_idx, _)) in chars.iter().enumerate() {
-            if *byte_idx >= col {
-                idx = i;
-                break;
-            }
-        }
+        let idx = char_index_at_byte(content, col);
 
         if idx + 1 < chars.len() {
             col = chars[idx + 1].0;
@@ -282,14 +269,7 @@ pub fn next_word_end(buffer: &Buffer, pos: Position) -> Option<Position> {
         }
 
         let chars: Vec<_> = content.char_indices().collect();
-
-        let mut idx = 0;
-        for (i, (byte_idx, _)) in chars.iter().enumerate() {
-            if *byte_idx >= col {
-                idx = i;
-                break;
-            }
-        }
+        let mut idx = char_index_at_byte(content, col);
 
         // Skip blanks
         while idx < chars.len() && is_blank(chars[idx].1) {
@@ -377,18 +357,7 @@ pub fn prev_bigword_start(buffer: &Buffer, pos: Position) -> Option<Position> {
         }
 
         let search_end = if line_num == pos.line {
-            let mut idx = chars.len();
-            for (i, (byte_idx, _)) in chars.iter().enumerate() {
-                if *byte_idx >= col {
-                    idx = i;
-                    break;
-                }
-            }
-            if idx > 0 {
-                idx - 1
-            } else {
-                0
-            }
+            char_index_at_byte(content, col).saturating_sub(1)
         } else {
             chars.len() - 1
         };
@@ -428,14 +397,7 @@ pub fn next_bigword_end(buffer: &Buffer, pos: Position) -> Option<Position> {
     if let Some(line) = buffer.line(line_num) {
         let content = line.content();
         let chars: Vec<_> = content.char_indices().collect();
-
-        let mut idx = 0;
-        for (i, (byte_idx, _)) in chars.iter().enumerate() {
-            if *byte_idx >= col {
-                idx = i;
-                break;
-            }
-        }
+        let idx = char_index_at_byte(content, col);
 
         if idx + 1 < chars.len() {
             col = chars[idx + 1].0;
@@ -457,20 +419,11 @@ pub fn next_bigword_end(buffer: &Buffer, pos: Position) -> Option<Position> {
 
         let chars: Vec<_> = content.char_indices().collect();
 
-        let start = if line_num == pos.line {
-            let mut idx = 0;
-            for (i, (byte_idx, _)) in chars.iter().enumerate() {
-                if *byte_idx >= col {
-                    idx = i;
-                    break;
-                }
-            }
-            idx
+        let mut idx = if line_num == pos.line {
+            char_index_at_byte(content, col)
         } else {
             0
         };
-
-        let mut idx = start;
 
         // Skip blanks
         while idx < chars.len() && is_blank(chars[idx].1) {

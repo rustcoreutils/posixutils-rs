@@ -4,7 +4,7 @@ use super::text_object::{
     next_bigword_end, next_bigword_start, next_paragraph_start, next_word_end, next_word_start,
     prev_bigword_start, prev_paragraph_start, prev_word_start,
 };
-use crate::buffer::{Buffer, BufferMode, Position, Range};
+use crate::buffer::{char_index_at_byte, Buffer, BufferMode, Position, Range};
 use crate::error::{Result, ViError};
 
 /// Result of a motion command.
@@ -65,17 +65,9 @@ pub fn move_left(buffer: &Buffer, count: usize) -> Result<MotionResult> {
 
     let line = buffer.line(pos.line).ok_or(ViError::EmptyBuffer)?;
     let content = line.content();
-
-    // Find the position 'count' characters back
     let chars: Vec<(usize, char)> = content.char_indices().collect();
-    let mut current_idx = 0;
-    for (i, (byte_idx, _)) in chars.iter().enumerate() {
-        if *byte_idx >= pos.column {
-            current_idx = i;
-            break;
-        }
-    }
 
+    let current_idx = char_index_at_byte(content, pos.column);
     let new_idx = current_idx.saturating_sub(count);
     let new_col = chars.get(new_idx).map(|(idx, _)| *idx).unwrap_or(0);
 
@@ -100,14 +92,7 @@ pub fn move_right(buffer: &Buffer, count: usize) -> Result<MotionResult> {
     let content = line.content();
     let chars: Vec<(usize, char)> = content.char_indices().collect();
 
-    let mut current_idx = 0;
-    for (i, (byte_idx, _)) in chars.iter().enumerate() {
-        if *byte_idx >= pos.column {
-            current_idx = i;
-            break;
-        }
-    }
-
+    let current_idx = char_index_at_byte(content, pos.column);
     if current_idx + 1 >= chars.len() {
         return Err(ViError::MotionFailed("Already at end of line".to_string()));
     }
@@ -244,118 +229,72 @@ pub fn move_to_line(buffer: &Buffer, line_num: Option<usize>) -> Result<MotionRe
         .with_first_non_blank())
 }
 
-/// Move to next word start (w command).
-pub fn move_word_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
+/// Helper for forward word/bigword motions (w, W, e, E commands).
+fn move_forward_by<F>(buffer: &Buffer, count: usize, finder: F) -> Result<MotionResult>
+where
+    F: Fn(&Buffer, Position) -> Option<Position>,
+{
     let mut pos = buffer.cursor();
-
     for _ in 0..count {
-        match next_word_start(buffer, pos) {
+        match finder(buffer, pos) {
             Some(new_pos) => pos = new_pos,
             None => break,
         }
     }
-
     if pos == buffer.cursor() {
         return Err(ViError::MotionFailed("At end of buffer".to_string()));
     }
-
     let range = Range::chars(buffer.cursor(), pos);
     Ok(MotionResult::with_range(pos, range))
+}
+
+/// Helper for backward word/bigword motions (b, B commands).
+fn move_backward_by<F>(buffer: &Buffer, count: usize, finder: F) -> Result<MotionResult>
+where
+    F: Fn(&Buffer, Position) -> Option<Position>,
+{
+    let mut pos = buffer.cursor();
+    for _ in 0..count {
+        match finder(buffer, pos) {
+            Some(new_pos) => pos = new_pos,
+            None => break,
+        }
+    }
+    if pos == buffer.cursor() {
+        return Err(ViError::MotionFailed("At start of buffer".to_string()));
+    }
+    let range = Range::chars(pos, buffer.cursor());
+    Ok(MotionResult::with_range(pos, range))
+}
+
+/// Move to next word start (w command).
+pub fn move_word_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
+    move_forward_by(buffer, count, next_word_start)
 }
 
 /// Move to previous word start (b command).
 pub fn move_word_backward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match prev_word_start(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    if pos == buffer.cursor() {
-        return Err(ViError::MotionFailed("At start of buffer".to_string()));
-    }
-
-    let range = Range::chars(pos, buffer.cursor());
-    Ok(MotionResult::with_range(pos, range))
+    move_backward_by(buffer, count, prev_word_start)
 }
 
 /// Move to word end (e command).
 pub fn move_word_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match next_word_end(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    if pos == buffer.cursor() {
-        return Err(ViError::MotionFailed("At end of buffer".to_string()));
-    }
-
-    let range = Range::chars(buffer.cursor(), pos);
-    Ok(MotionResult::with_range(pos, range))
+    move_forward_by(buffer, count, next_word_end)
 }
 
 /// Move to next bigword start (W command).
 pub fn move_bigword_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match next_bigword_start(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    if pos == buffer.cursor() {
-        return Err(ViError::MotionFailed("At end of buffer".to_string()));
-    }
-
-    let range = Range::chars(buffer.cursor(), pos);
-    Ok(MotionResult::with_range(pos, range))
+    move_forward_by(buffer, count, next_bigword_start)
 }
 
 /// Move to previous bigword start (B command).
 pub fn move_bigword_backward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match prev_bigword_start(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    if pos == buffer.cursor() {
-        return Err(ViError::MotionFailed("At start of buffer".to_string()));
-    }
-
-    let range = Range::chars(pos, buffer.cursor());
-    Ok(MotionResult::with_range(pos, range))
+    move_backward_by(buffer, count, prev_bigword_start)
 }
 
 /// Move to bigword end (E command).
 pub fn move_bigword_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match next_bigword_end(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    if pos == buffer.cursor() {
-        return Err(ViError::MotionFailed("At end of buffer".to_string()));
-    }
-
-    let range = Range::chars(buffer.cursor(), pos);
-    Ok(MotionResult::with_range(pos, range))
+    move_forward_by(buffer, count, next_bigword_end)
 }
 
 /// Move to next paragraph ({ command).
@@ -517,14 +456,7 @@ pub fn till_char_forward(buffer: &Buffer, c: char, count: usize) -> Result<Motio
     let content = line.content();
     let chars: Vec<(usize, char)> = content.char_indices().collect();
 
-    let mut idx = 0;
-    for (i, (byte_idx, _)) in chars.iter().enumerate() {
-        if *byte_idx >= result.position.column {
-            idx = i;
-            break;
-        }
-    }
-
+    let idx = char_index_at_byte(content, result.position.column);
     if idx == 0 {
         return Err(ViError::MotionFailed("Character at cursor".to_string()));
     }
@@ -547,14 +479,7 @@ pub fn till_char_backward(buffer: &Buffer, c: char, count: usize) -> Result<Moti
     let content = line.content();
     let chars: Vec<(usize, char)> = content.char_indices().collect();
 
-    let mut idx = 0;
-    for (i, (byte_idx, _)) in chars.iter().enumerate() {
-        if *byte_idx >= result.position.column {
-            idx = i;
-            break;
-        }
-    }
-
+    let idx = char_index_at_byte(content, result.position.column);
     if idx + 1 >= chars.len() {
         return Err(ViError::MotionFailed(
             "No character after found".to_string(),

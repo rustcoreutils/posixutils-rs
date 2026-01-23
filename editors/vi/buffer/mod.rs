@@ -8,5 +8,5 @@ mod line;
 mod position;
 
 pub use buffer::Buffer;
-pub use line::Line;
+pub use line::{char_index_at_byte, Line};
 pub use position::{BufferMode, Position, Range};

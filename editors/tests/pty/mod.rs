@@ -272,3 +272,57 @@ fn test_pty_vi_utf8_display() {
     let contents = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(contents, "Привет мир\n");
 }
+
+/// Test: `:set number` displays line numbers without panic.
+/// Regression test for issue #530.
+#[test]
+fn test_pty_vi_set_number() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test_number.txt");
+    std::fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    let _reader_thread = spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    // Wait for vi startup
+    thread::sleep(Duration::from_millis(500));
+
+    // Enable line numbers
+    write_keys(&mut writer, ":set number\r");
+    thread::sleep(Duration::from_millis(200));
+
+    // Move cursor to verify positioning works with line numbers
+    write_keys(&mut writer, "jjk");
+    thread::sleep(Duration::from_millis(100));
+
+    // Disable line numbers
+    write_keys(&mut writer, ":set nonumber\r");
+    thread::sleep(Duration::from_millis(100));
+
+    // Quit without saving
+    write_keys(&mut writer, ":q!\r");
+
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    // File should be unchanged
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "line1\nline2\nline3\n");
+}

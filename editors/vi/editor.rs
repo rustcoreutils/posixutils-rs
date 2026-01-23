@@ -3013,6 +3013,8 @@ impl Editor {
 
     /// Refresh the screen.
     fn refresh_screen(&mut self) -> Result<()> {
+        const LINE_NUMBER_WIDTH: usize = 8; // "%6d  " format
+
         let size = self.terminal.size();
         self.screen.resize(size);
         self.screen
@@ -3032,8 +3034,17 @@ impl Editor {
 
             if line_num <= self.buffer.line_count() {
                 if let Some(line) = self.buffer.line(line_num) {
+                    // Line number prefix when option set
+                    if self.options.number {
+                        self.terminal.write_str(&format!("{:6}  ", line_num))?;
+                    }
+                    let avail_cols = if self.options.number {
+                        (size.cols as usize).saturating_sub(LINE_NUMBER_WIDTH)
+                    } else {
+                        size.cols as usize
+                    };
                     // Expand tabs and truncate (expand_line already caps at max_cols)
-                    let content = self.screen.expand_line(line.content(), size.cols as usize);
+                    let content = self.screen.expand_line(line.content(), avail_cols);
                     self.terminal.write_str(&content)?;
                 }
             } else {
@@ -3058,6 +3069,12 @@ impl Editor {
             cursor.column,
         ) as u16
             + 1;
+        // Add line number offset
+        let display_col = if self.options.number {
+            display_col + LINE_NUMBER_WIDTH as u16
+        } else {
+            display_col
+        };
 
         if self.mode == Mode::Ex {
             // Cursor at command line

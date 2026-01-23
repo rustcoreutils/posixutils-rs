@@ -17,9 +17,27 @@
 //! The `:=` form is used for per-file options (pax format),
 //! while `=` is used for global options.
 
+use crate::archive::EntryType;
 use crate::error::{PaxError, PaxResult};
 use crate::pattern::Pattern;
 use std::collections::HashMap;
+
+/// Information about an archive entry for list formatting
+#[derive(Debug, Clone)]
+pub struct ListEntryInfo<'a> {
+    pub path: &'a str,
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub uname: Option<&'a str>,
+    pub gname: Option<&'a str>,
+    pub link_target: Option<&'a str>,
+    pub entry_type: EntryType,
+    pub devmajor: u32,
+    pub devminor: u32,
+}
 
 /// Action to take when a filename contains invalid characters
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -381,19 +399,7 @@ fn expand_global_header_template(template: &str, sequence: u64) -> String {
 /// - `%G` - group gid
 /// - `%n` - newline
 /// - `%%` - literal %
-#[allow(clippy::too_many_arguments)]
-pub fn format_list_entry(
-    format: &str,
-    path: &str,
-    mode: u32,
-    size: u64,
-    mtime: u64,
-    uid: u32,
-    gid: u32,
-    uname: Option<&str>,
-    gname: Option<&str>,
-    link_target: Option<&str>,
-) -> String {
+pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
     let mut result = String::new();
     let mut chars = format.chars().peekable();
 
@@ -402,57 +408,61 @@ pub fn format_list_entry(
             match chars.next() {
                 Some('f') => {
                     // Filename (basename)
-                    let name = std::path::Path::new(path)
+                    let name = std::path::Path::new(info.path)
                         .file_name()
                         .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.to_string());
+                        .unwrap_or_else(|| info.path.to_string());
                     result.push_str(&name);
                 }
                 Some('F') => {
                     // Full path
-                    result.push_str(path);
+                    result.push_str(info.path);
                 }
                 Some('l') => {
                     // Link target
-                    if let Some(target) = link_target {
+                    if let Some(target) = info.link_target {
                         result.push_str(target);
                     }
                 }
                 Some('m') => {
                     // Mode (octal)
-                    result.push_str(&format!("{:o}", mode & 0o7777));
+                    result.push_str(&format!("{:o}", info.mode & 0o7777));
                 }
                 Some('M') => {
                     // Mode (symbolic)
-                    result.push_str(&format_mode_symbolic(mode));
+                    result.push_str(&format_mode_symbolic(info.mode, info.entry_type));
+                }
+                Some('D') => {
+                    // Device major,minor (for block/char special files)
+                    result.push_str(&format!("{},{}", info.devmajor, info.devminor));
                 }
                 Some('s') => {
                     // Size
-                    result.push_str(&size.to_string());
+                    result.push_str(&info.size.to_string());
                 }
                 Some('t') => {
                     // Modification time (traditional format)
-                    result.push_str(&format_time_traditional(mtime));
+                    result.push_str(&format_time_traditional(info.mtime));
                 }
                 Some('T') => {
                     // Modification time (ISO format)
-                    result.push_str(&format_time_iso(mtime));
+                    result.push_str(&format_time_iso(info.mtime));
                 }
                 Some('u') => {
                     // Username
-                    result.push_str(uname.unwrap_or(&uid.to_string()));
+                    result.push_str(info.uname.unwrap_or(&info.uid.to_string()));
                 }
                 Some('g') => {
                     // Group name
-                    result.push_str(gname.unwrap_or(&gid.to_string()));
+                    result.push_str(info.gname.unwrap_or(&info.gid.to_string()));
                 }
                 Some('U') => {
                     // UID
-                    result.push_str(&uid.to_string());
+                    result.push_str(&info.uid.to_string());
                 }
                 Some('G') => {
                     // GID
-                    result.push_str(&gid.to_string());
+                    result.push_str(&info.gid.to_string());
                 }
                 Some('n') => {
                     // Newline
@@ -480,20 +490,19 @@ pub fn format_list_entry(
 }
 
 /// Format mode as symbolic string (like ls -l)
-fn format_mode_symbolic(mode: u32) -> String {
+fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
     let mut s = String::with_capacity(10);
 
-    // File type
-    let file_type = (mode >> 12) & 0xF;
-    s.push(match file_type {
-        0o12 => 'l', // symlink
-        0o04 => 'd', // directory
-        0o10 => '-', // regular
-        0o01 => 'p', // fifo
-        0o06 => 'b', // block
-        0o02 => 'c', // char
-        0o14 => 's', // socket
-        _ => '?',
+    // File type (from entry_type, not mode bits - tar stores type separately)
+    s.push(match entry_type {
+        EntryType::Regular => '-',
+        EntryType::Directory => 'd',
+        EntryType::Symlink => 'l',
+        EntryType::Hardlink => 'h',
+        EntryType::BlockDevice => 'b',
+        EntryType::CharDevice => 'c',
+        EntryType::Fifo => 'p',
+        EntryType::Socket => 's',
     });
 
     // Owner permissions
@@ -720,47 +729,155 @@ mod tests {
 
     #[test]
     fn test_format_list_entry_basic() {
-        let result = format_list_entry(
-            "%F",
-            "path/to/file.txt",
-            0o100644,
-            1234,
-            0,
-            1000,
-            1000,
-            Some("user"),
-            Some("group"),
-            None,
-        );
+        let info = ListEntryInfo {
+            path: "path/to/file.txt",
+            mode: 0o644,
+            size: 1234,
+            mtime: 0,
+            uid: 1000,
+            gid: 1000,
+            uname: Some("user"),
+            gname: Some("group"),
+            link_target: None,
+            entry_type: EntryType::Regular,
+            devmajor: 0,
+            devminor: 0,
+        };
+        let result = format_list_entry("%F", &info);
         assert_eq!(result, "path/to/file.txt");
     }
 
     #[test]
     fn test_format_list_entry_complex() {
-        let result = format_list_entry(
-            "%M %u %g %s %f",
-            "dir/file.txt",
-            0o100755,
-            4096,
-            0,
-            1000,
-            1000,
-            Some("alice"),
-            Some("users"),
-            None,
-        );
+        let info = ListEntryInfo {
+            path: "dir/file.txt",
+            mode: 0o755,
+            size: 4096,
+            mtime: 0,
+            uid: 1000,
+            gid: 1000,
+            uname: Some("alice"),
+            gname: Some("users"),
+            link_target: None,
+            entry_type: EntryType::Regular,
+            devmajor: 0,
+            devminor: 0,
+        };
+        let result = format_list_entry("%M %u %g %s %f", &info);
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
     }
 
     #[test]
     fn test_format_mode_symbolic() {
-        assert_eq!(format_mode_symbolic(0o100644), "-rw-r--r--");
-        assert_eq!(format_mode_symbolic(0o100755), "-rwxr-xr-x");
-        assert_eq!(format_mode_symbolic(0o040755), "drwxr-xr-x");
-        assert_eq!(format_mode_symbolic(0o120777), "lrwxrwxrwx");
-        assert_eq!(format_mode_symbolic(0o104755), "-rwsr-xr-x"); // setuid
-        assert_eq!(format_mode_symbolic(0o102755), "-rwxr-sr-x"); // setgid
-        assert_eq!(format_mode_symbolic(0o101755), "-rwxr-xr-t"); // sticky
+        // Regular file with various permissions
+        assert_eq!(
+            format_mode_symbolic(0o644, EntryType::Regular),
+            "-rw-r--r--"
+        );
+        assert_eq!(
+            format_mode_symbolic(0o755, EntryType::Regular),
+            "-rwxr-xr-x"
+        );
+        // Directory
+        assert_eq!(
+            format_mode_symbolic(0o755, EntryType::Directory),
+            "drwxr-xr-x"
+        );
+        // Symlink
+        assert_eq!(
+            format_mode_symbolic(0o777, EntryType::Symlink),
+            "lrwxrwxrwx"
+        );
+        // Special bits
+        assert_eq!(
+            format_mode_symbolic(0o4755, EntryType::Regular),
+            "-rwsr-xr-x"
+        ); // setuid
+        assert_eq!(
+            format_mode_symbolic(0o2755, EntryType::Regular),
+            "-rwxr-sr-x"
+        ); // setgid
+        assert_eq!(
+            format_mode_symbolic(0o1755, EntryType::Regular),
+            "-rwxr-xr-t"
+        ); // sticky
+           // Block and char devices
+        assert_eq!(
+            format_mode_symbolic(0o660, EntryType::BlockDevice),
+            "brw-rw----"
+        );
+        assert_eq!(
+            format_mode_symbolic(0o660, EntryType::CharDevice),
+            "crw-rw----"
+        );
+        // Other types
+        assert_eq!(format_mode_symbolic(0o644, EntryType::Fifo), "prw-r--r--");
+        assert_eq!(format_mode_symbolic(0o755, EntryType::Socket), "srwxr-xr-x");
+        assert_eq!(
+            format_mode_symbolic(0o644, EntryType::Hardlink),
+            "hrw-r--r--"
+        );
+    }
+
+    #[test]
+    fn test_format_list_entry_device() {
+        // Test %D format specifier for device major,minor
+        let info = ListEntryInfo {
+            path: "/dev/sda",
+            mode: 0o660,
+            size: 0,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            uname: Some("root"),
+            gname: Some("disk"),
+            link_target: None,
+            entry_type: EntryType::BlockDevice,
+            devmajor: 8,
+            devminor: 0,
+        };
+        let result = format_list_entry("%M %D %f", &info);
+        assert_eq!(result, "brw-rw---- 8,0 sda");
+    }
+
+    #[test]
+    fn test_format_list_entry_different_types() {
+        // Test that %M correctly uses entry_type for file type character
+        // Directory
+        let info = ListEntryInfo {
+            path: "mydir",
+            mode: 0o755,
+            size: 0,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            uname: None,
+            gname: None,
+            link_target: None,
+            entry_type: EntryType::Directory,
+            devmajor: 0,
+            devminor: 0,
+        };
+        let result = format_list_entry("%M", &info);
+        assert_eq!(result, "drwxr-xr-x");
+
+        // Symlink
+        let info = ListEntryInfo {
+            path: "mylink",
+            mode: 0o777,
+            size: 0,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            uname: None,
+            gname: None,
+            link_target: Some("target"),
+            entry_type: EntryType::Symlink,
+            devmajor: 0,
+            devminor: 0,
+        };
+        let result = format_list_entry("%M", &info);
+        assert_eq!(result, "lrwxrwxrwx");
     }
 
     #[test]

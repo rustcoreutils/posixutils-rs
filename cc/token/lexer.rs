@@ -806,11 +806,10 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 }
             }
             LexerMode::Assembly => {
-                // Assembly mode: ; comments only
-                if first == b';' {
-                    self.skip_line_comment();
-                    return None; // No token, continue tokenizing
-                }
+                // Assembly mode: do not treat ';' as a line comment delimiter.
+                // Different assemblers (e.g., GAS, Apple as) use ';' with different
+                // meanings (statement separator vs. comment). Comment handling is
+                // left to the assembler.
             }
         }
 
@@ -1079,14 +1078,23 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
 /// Used for outputting preprocessed assembly files.
 pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
     let mut result = String::new();
+    let mut last_stream: u16 = 0;
     let mut last_line: u32 = 1;
-    let mut need_space = false;
+    let mut last_char: Option<char> = None;
 
     for token in tokens {
         // Skip stream markers
         match token.typ {
             TokenType::StreamBegin | TokenType::StreamEnd => continue,
             _ => {}
+        }
+
+        // Detect stream changes (e.g., entering/leaving #include files)
+        // When stream changes, line numbers reset, so we need to handle this
+        let stream_changed = token.pos.stream != last_stream;
+        if stream_changed {
+            last_stream = token.pos.stream;
+            last_line = token.pos.line.saturating_sub(1); // Allow line sync below
         }
 
         // Handle newlines: if token is on a new line, add newline(s)
@@ -1096,17 +1104,27 @@ pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
                 result.push('\n');
                 last_line += 1;
             }
-            // After newline, first token doesn't need leading space
-        } else if token.pos.whitespace && need_space {
-            // Add space between tokens on the same line
-            result.push(' ');
+        } else if !result.is_empty() {
+            // Determine if space is needed between tokens on the same line
+            let text = show_token(token, strings);
+            let first_char = text.chars().next();
+
+            // Need space if:
+            // 1. Original had whitespace, OR
+            // 2. Adjacent tokens would merge (both alphanumeric/underscore)
+            let would_merge = last_char.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && first_char.is_some_and(|c| c.is_alphanumeric() || c == '_');
+
+            if token.pos.whitespace || would_merge {
+                result.push(' ');
+            }
         }
 
         // Output the token content
         let text = show_token(token, strings);
+        last_char = text.chars().last();
         result.push_str(&text);
         last_line = token.pos.line;
-        need_space = true;
     }
 
     // Ensure file ends with newline
@@ -1869,15 +1887,19 @@ mod tests {
     }
 
     #[test]
-    fn test_asm_semicolon_comment() {
-        // In assembly mode, `;` starts a line comment
+    fn test_asm_semicolon_not_comment() {
+        // In assembly mode, `;` is NOT treated as comment (it's a statement
+        // separator in GAS/AT&T syntax). Comment handling is left to the assembler.
         let (tokens, idents) = tokenize_asm("mov eax, ebx ; move register");
-        // Should get: mov, eax, ,, ebx (comment and rest are skipped)
+        // Should get full line tokenized, including ; and subsequent identifiers
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        assert_eq!(toks, vec!["mov", "eax", ",", "ebx"]);
+        assert_eq!(
+            toks,
+            vec!["mov", "eax", ",", "ebx", ";", "move", "register"]
+        );
     }
 
     #[test]

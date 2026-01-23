@@ -16,9 +16,9 @@ fn write_keys<W: Write>(w: &mut W, s: &str) {
     w.flush().unwrap();
 }
 
-/// Spawn a thread to continuously drain output from reader.
-/// Returns a join handle. The thread runs until the reader returns EOF or error.
-fn spawn_reader_drain<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<()> {
+/// Spawn a detached thread to continuously drain output from reader.
+/// The thread runs until the reader returns EOF or error.
+fn spawn_reader_drain<R: Read + Send + 'static>(mut reader: R) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -28,7 +28,7 @@ fn spawn_reader_drain<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHa
                 Err(_) => break,
             }
         }
-    })
+    });
 }
 
 /// Wait for child process to exit with timeout.
@@ -46,8 +46,6 @@ fn wait_with_timeout(child: &mut Box<dyn portable_pty::Child + Send + Sync>, tim
 struct ViPtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
-    #[allow(dead_code)]
-    reader_thread: thread::JoinHandle<()>,
 }
 
 impl ViPtySession {
@@ -71,14 +69,10 @@ impl ViPtySession {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().unwrap();
-        let reader_thread = spawn_reader_drain(reader);
+        spawn_reader_drain(reader);
         let writer = pair.master.take_writer().unwrap();
 
-        Self {
-            child,
-            writer,
-            reader_thread,
-        }
+        Self { child, writer }
     }
 
     /// Send key sequence to vi.

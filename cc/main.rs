@@ -741,6 +741,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_std_inc: args.no_std_inc,
             };
             let preprocessed = preprocess_asm_file(&content, &target, asm_path, &asm_config);
+            // Check for preprocessor errors (e.g., #error directive, missing include)
+            if diag::has_error() != 0 {
+                eprintln!("pcc: preprocessing failed for {}", asm_path);
+                std::process::exit(1);
+            }
             if let Err(e) = std::fs::write(&temp_s, &preprocessed) {
                 eprintln!("pcc: cannot write '{}': {}", temp_s, e);
                 std::process::exit(1);

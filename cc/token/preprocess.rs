@@ -17,7 +17,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue, Tokenizer};
+use super::lexer::{
+    tokens_to_text, IdentTable, LexerMode, Position, SpecialToken, Token, TokenType, TokenValue,
+    Tokenizer,
+};
 use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
@@ -3625,6 +3628,104 @@ pub fn preprocess_with_defines(
     }
 
     pp.preprocess(tokens, idents)
+}
+
+// ============================================================================
+// Assembly File Preprocessing
+// ============================================================================
+
+/// Configuration for assembly file preprocessing
+#[derive(Debug, Clone, Default)]
+pub struct AsmPreprocessConfig<'a> {
+    /// Command-line -D defines
+    pub defines: &'a [String],
+    /// Command-line -U undefines
+    pub undefines: &'a [String],
+    /// Command-line -I include paths
+    pub include_paths: &'a [String],
+    /// If true, disable system include paths (-nostdinc)
+    pub no_std_inc: bool,
+}
+
+/// Preprocess an assembly file (.S) and return the preprocessed text.
+///
+/// This uses the same preprocessor as C files but with assembly-specific
+/// comment syntax (`;` for line comments, no `//` or `/* */`).
+///
+/// # Arguments
+/// * `content` - Raw bytes of the assembly source file
+/// * `target` - Target platform configuration
+/// * `filename` - Name of the source file (for `__FILE__` and diagnostics)
+/// * `config` - Preprocessing configuration (defines, undefines, include paths)
+///
+/// # Returns
+/// The preprocessed assembly text as a string
+pub fn preprocess_asm_file(
+    content: &[u8],
+    target: &Target,
+    filename: &str,
+    config: &AsmPreprocessConfig<'_>,
+) -> String {
+    // Create string table for tokenization
+    let mut strings = IdentTable::new();
+
+    // Initialize stream for this file
+    let stream_id = diag::init_stream(filename);
+
+    // Tokenize with assembly mode (`;` comments)
+    let tokens = {
+        let mut tokenizer =
+            Tokenizer::new_with_mode(content, stream_id, &mut strings, LexerMode::Assembly);
+        tokenizer.tokenize()
+    };
+
+    // Create preprocessor with assembly-specific predefined macros
+    let mut pp = Preprocessor::new(target, filename);
+
+    // Undefine C-specific macros that don't apply to assembly
+    pp.undef_macro("__STDC__");
+    pp.undef_macro("__STDC_VERSION__");
+    pp.undef_macro("__STDC_HOSTED__");
+
+    // Define __ASSEMBLER__ (GCC-compatible, indicates assembly preprocessing)
+    pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
+
+    // Handle -nostdinc flag
+    if config.no_std_inc {
+        pp.use_system_headers = false;
+        pp.use_builtin_headers = false;
+    }
+
+    // Add -I include paths
+    for path in config.include_paths {
+        pp.quote_include_paths.push(path.clone());
+    }
+
+    // Process -D defines
+    for def in config.defines {
+        if let Some(eq_pos) = def.find('=') {
+            // -DNAME=VALUE
+            let name = &def[..eq_pos];
+            let value = &def[eq_pos + 1..];
+            let mac = Macro::from_cmdline_define(name, value);
+            pp.define_macro(mac);
+        } else {
+            // -DNAME (define to 1)
+            let mac = Macro::predefined(def, Some("1"));
+            pp.define_macro(mac);
+        }
+    }
+
+    // Process -U undefines
+    for undef in config.undefines {
+        pp.undef_macro(undef);
+    }
+
+    // Preprocess
+    let preprocessed = pp.preprocess(tokens, &mut strings);
+
+    // Convert tokens back to text
+    tokens_to_text(&preprocessed, &strings)
 }
 
 // ============================================================================

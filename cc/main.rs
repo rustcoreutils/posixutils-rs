@@ -38,7 +38,8 @@ use symbol::SymbolTable;
 use target::Os;
 use target::Target;
 use token::{
-    preprocess_with_defines, show_token, token_type_name, PreprocessConfig, StreamTable, Tokenizer,
+    preprocess_asm_file, preprocess_with_defines, show_token, token_type_name, AsmPreprocessConfig,
+    PreprocessConfig, StreamTable, Tokenizer,
 };
 
 // ============================================================================
@@ -724,24 +725,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // .S files need preprocessing, .s files don't
         let asm_to_assemble = if asm_path.ends_with(".S") {
-            // Preprocess with cpp
+            // Preprocess with internal preprocessor (assembly mode)
             let temp_s = format!("/tmp/pcc_{}_{}.s", std::process::id(), stem);
-            let mut cpp_cmd = Command::new("cpp");
-            // Add include paths
-            for inc in &args.include_paths {
-                cpp_cmd.arg(format!("-I{}", inc));
+            let content = match std::fs::read(asm_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("pcc: cannot read '{}': {}", asm_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let asm_config = AsmPreprocessConfig {
+                defines: &args.defines,
+                undefines: &args.undefines,
+                include_paths: &args.include_paths,
+                no_std_inc: args.no_std_inc,
+            };
+            let preprocessed = preprocess_asm_file(&content, &target, asm_path, &asm_config);
+            // Check for preprocessor errors (e.g., #error directive, missing include)
+            if diag::has_error() != 0 {
+                eprintln!("pcc: preprocessing failed for {}", asm_path);
+                std::process::exit(1);
             }
-            // Add defines
-            for def in &args.defines {
-                cpp_cmd.arg(format!("-D{}", def));
-            }
-            if args.no_std_inc {
-                cpp_cmd.arg("-nostdinc");
-            }
-            cpp_cmd.args(["-o", &temp_s, asm_path]);
-            let status = cpp_cmd.status()?;
-            if !status.success() {
-                eprintln!("pcc: preprocessor failed for {}", asm_path);
+            if let Err(e) = std::fs::write(&temp_s, &preprocessed) {
+                eprintln!("pcc: cannot write '{}': {}", temp_s, e);
                 std::process::exit(1);
             }
             temp_s

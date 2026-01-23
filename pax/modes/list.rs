@@ -12,7 +12,7 @@
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
-use crate::options::{format_list_entry, FormatOptions};
+use crate::options::{format_list_entry, FormatOptions, ListEntryInfo};
 use crate::pattern::{find_matching_pattern, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
@@ -174,22 +174,26 @@ fn print_entry<W: Write>(
 ) -> PaxResult<()> {
     // Check for custom list format (listopt)
     if let Some(ref format) = options.format_options.list_format {
+        let path_str = entry.path.to_string_lossy();
         let link_target_str = entry
             .link_target
             .as_ref()
             .map(|p| p.to_string_lossy().to_string());
-        let output = format_list_entry(
-            format,
-            &entry.path.to_string_lossy(),
-            entry.mode,
-            entry.size,
-            entry.mtime,
-            entry.uid,
-            entry.gid,
-            entry.uname.as_deref(),
-            entry.gname.as_deref(),
-            link_target_str.as_deref(),
-        );
+        let info = ListEntryInfo {
+            path: &path_str,
+            mode: entry.mode,
+            size: entry.size,
+            mtime: entry.mtime,
+            uid: entry.uid,
+            gid: entry.gid,
+            uname: entry.uname.as_deref(),
+            gname: entry.gname.as_deref(),
+            link_target: link_target_str.as_deref(),
+            entry_type: entry.entry_type,
+            devmajor: entry.devmajor,
+            devminor: entry.devminor,
+        };
+        let output = format_list_entry(format, &info);
         write!(writer, "{}", output)?;
         // Add newline if format doesn't end with one
         if !output.ends_with('\n') {

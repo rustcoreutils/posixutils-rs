@@ -1,5 +1,20 @@
 //! Line abstraction for the edit buffer.
 
+/// Find character index for byte offset in string.
+///
+/// Returns the index of the first character whose byte offset is >= the given byte offset,
+/// or the total character count if byte_offset is past the end.
+pub fn char_index_at_byte(content: &str, byte_offset: usize) -> usize {
+    let mut char_index = 0usize;
+    for (b, _) in content.char_indices() {
+        if b >= byte_offset {
+            return char_index;
+        }
+        char_index += 1;
+    }
+    char_index
+}
+
 /// A single line in the edit buffer.
 ///
 /// Lines do NOT include the trailing newline character.
@@ -79,6 +94,14 @@ impl Line {
         self.content[..byte_offset.min(self.content.len())]
             .chars()
             .count()
+    }
+
+    /// Find character index for byte offset in line content.
+    ///
+    /// Returns the index of the first character whose byte offset is >= the given byte offset,
+    /// or the total character count if byte_offset is past the end.
+    pub fn char_index_at_byte(&self, byte_offset: usize) -> usize {
+        char_index_at_byte(&self.content, byte_offset)
     }
 
     /// Count characters in the line.
@@ -306,5 +329,23 @@ mod tests {
         assert_eq!(line.len(), 6); // 'é' is 2 bytes in UTF-8
         assert_eq!(line.char_at(0), Some('h'));
         assert_eq!(line.char_at(1), Some('é'));
+    }
+
+    #[test]
+    fn test_char_index_at_byte() {
+        // ASCII string
+        assert_eq!(char_index_at_byte("hello", 0), 0);
+        assert_eq!(char_index_at_byte("hello", 2), 2);
+        assert_eq!(char_index_at_byte("hello", 5), 5); // past end
+
+        // UTF-8 string: "héllo" where 'é' is 2 bytes
+        // Byte layout: h(0), é(1-2), l(3), l(4), o(5)
+        let s = "héllo";
+        assert_eq!(char_index_at_byte(s, 0), 0); // 'h' at byte 0
+        assert_eq!(char_index_at_byte(s, 1), 1); // 'é' starts at byte 1
+        assert_eq!(char_index_at_byte(s, 3), 2); // 'l' at byte 3
+
+        // Empty string
+        assert_eq!(char_index_at_byte("", 0), 0);
     }
 }

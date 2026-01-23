@@ -128,6 +128,11 @@ impl ExtendedHeader {
         let mut pos = 0;
 
         while pos < data.len() {
+            // Stop at null bytes (padding from some tar implementations)
+            if data[pos] == 0 {
+                break;
+            }
+
             // Find the space after length
             let space_pos = data[pos..].iter().position(|&b| b == b' ').ok_or_else(|| {
                 PaxError::InvalidHeader("invalid extended header format".to_string())
@@ -156,16 +161,27 @@ impl ExtendedHeader {
                 continue;
             }
 
-            let record = std::str::from_utf8(&data[record_start..record_end]).map_err(|_| {
-                PaxError::InvalidHeader("invalid UTF-8 in extended header".to_string())
-            })?;
+            let record_data = &data[record_start..record_end];
 
-            // Find the '=' separator
-            if let Some(eq_pos) = record.find('=') {
-                let keyword = &record[..eq_pos];
-                let value = &record[eq_pos + 1..];
+            // Find the '=' separator in raw bytes
+            if let Some(eq_pos) = record_data.iter().position(|&b| b == b'=') {
+                // Keyword must be valid UTF-8
+                let keyword = std::str::from_utf8(&record_data[..eq_pos]).map_err(|_| {
+                    PaxError::InvalidHeader("invalid UTF-8 in extended header keyword".to_string())
+                })?;
 
-                header.set_keyword(keyword, value)?;
+                // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
+                // For binary-capable keywords, skip if not valid UTF-8
+                let value_bytes = &record_data[eq_pos + 1..];
+                if let Ok(value) = std::str::from_utf8(value_bytes) {
+                    header.set_keyword(keyword, value)?;
+                } else if keyword.starts_with("SCHILY.xattr.") {
+                    // Binary extended attributes - skip silently (we don't support xattrs)
+                } else {
+                    // Other keywords with invalid UTF-8 - try lossy conversion
+                    let value = String::from_utf8_lossy(value_bytes);
+                    header.set_keyword(keyword, &value)?;
+                }
             }
 
             pos += record_len;

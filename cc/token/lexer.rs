@@ -17,6 +17,20 @@ use crate::strings::{StringId, StringTable};
 pub use crate::diag::Position;
 
 // ============================================================================
+// Lexer Mode
+// ============================================================================
+
+/// Lexer mode - controls comment syntax recognition
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LexerMode {
+    /// C mode: // and /* */ comments
+    #[default]
+    C,
+    /// Assembly mode: ; comments (no // or /* */)
+    Assembly,
+}
+
+// ============================================================================
 // Token Types
 // ============================================================================
 
@@ -243,10 +257,23 @@ pub struct Tokenizer<'a, 'b> {
 
     // Interning - shared string table
     strings: &'b mut StringTable,
+
+    // Lexer mode (C vs Assembly)
+    mode: LexerMode,
 }
 
 impl<'a, 'b> Tokenizer<'a, 'b> {
     pub fn new(buffer: &'a [u8], stream_id: u16, strings: &'b mut StringTable) -> Self {
+        Self::new_with_mode(buffer, stream_id, strings, LexerMode::C)
+    }
+
+    /// Create a tokenizer with a specific lexer mode
+    pub fn new_with_mode(
+        buffer: &'a [u8],
+        stream_id: u16,
+        strings: &'b mut StringTable,
+        mode: LexerMode,
+    ) -> Self {
         Self {
             buffer,
             offset: 0,
@@ -256,6 +283,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             newline: true,
             whitespace: false,
             strings,
+            mode,
         }
     }
 
@@ -759,18 +787,29 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
-        // Check for comments
-        if first == b'/' {
-            let next = self.peekchar();
-            if next == b'/' as i32 {
-                self.nextchar();
-                self.skip_line_comment();
-                return None; // No token, continue tokenizing
+        // Check for comments (mode-dependent)
+        match self.mode {
+            LexerMode::C => {
+                // C mode: // and /* */ comments
+                if first == b'/' {
+                    let next = self.peekchar();
+                    if next == b'/' as i32 {
+                        self.nextchar();
+                        self.skip_line_comment();
+                        return None; // No token, continue tokenizing
+                    }
+                    if next == b'*' as i32 {
+                        self.nextchar();
+                        self.skip_block_comment();
+                        return None; // No token, continue tokenizing
+                    }
+                }
             }
-            if next == b'*' as i32 {
-                self.nextchar();
-                self.skip_block_comment();
-                return None; // No token, continue tokenizing
+            LexerMode::Assembly => {
+                // Assembly mode: do not treat ';' as a line comment delimiter.
+                // Different assemblers (e.g., GAS, Apple as) use ';' with different
+                // meanings (statement separator vs. comment). Comment handling is
+                // left to the assembler.
             }
         }
 
@@ -1027,6 +1066,73 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
         TokenType::StreamBegin => "STREAM_BEGIN",
         TokenType::StreamEnd => "STREAM_END",
     }
+}
+
+// ============================================================================
+// Token to Text Conversion (for preprocessing output)
+// ============================================================================
+
+/// Convert preprocessed tokens back to text output.
+///
+/// This function handles whitespace/newline preservation based on token positions.
+/// Used for outputting preprocessed assembly files.
+pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
+    let mut result = String::new();
+    let mut last_stream: u16 = 0;
+    let mut last_line: u32 = 1;
+    let mut last_char: Option<char> = None;
+
+    for token in tokens {
+        // Skip stream markers
+        match token.typ {
+            TokenType::StreamBegin | TokenType::StreamEnd => continue,
+            _ => {}
+        }
+
+        // Detect stream changes (e.g., entering/leaving #include files)
+        // When stream changes, line numbers reset, so we need to handle this
+        let stream_changed = token.pos.stream != last_stream;
+        if stream_changed {
+            last_stream = token.pos.stream;
+            last_line = token.pos.line.saturating_sub(1); // Allow line sync below
+        }
+
+        // Handle newlines: if token is on a new line, add newline(s)
+        if token.pos.newline && !result.is_empty() {
+            // Output newlines to get to the current line
+            while last_line < token.pos.line {
+                result.push('\n');
+                last_line += 1;
+            }
+        } else if !result.is_empty() {
+            // Determine if space is needed between tokens on the same line
+            let text = show_token(token, strings);
+            let first_char = text.chars().next();
+
+            // Need space if:
+            // 1. Original had whitespace, OR
+            // 2. Adjacent tokens would merge (both alphanumeric/underscore)
+            let would_merge = last_char.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && first_char.is_some_and(|c| c.is_alphanumeric() || c == '_');
+
+            if token.pos.whitespace || would_merge {
+                result.push(' ');
+            }
+        }
+
+        // Output the token content
+        let text = show_token(token, strings);
+        last_char = text.chars().last();
+        result.push_str(&text);
+        last_line = token.pos.line;
+    }
+
+    // Ensure file ends with newline
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+
+    result
 }
 
 // ============================================================================
@@ -1766,5 +1872,117 @@ mod tests {
             !tokens[2].pos.newline,
             "token after multiline comment should not have newline flag"
         );
+    }
+
+    // ========================================================================
+    // Assembly mode tests
+    // ========================================================================
+
+    fn tokenize_asm(input: &str) -> (Vec<Token>, StringTable) {
+        let mut strings = StringTable::new();
+        let mut tokenizer =
+            Tokenizer::new_with_mode(input.as_bytes(), 0, &mut strings, LexerMode::Assembly);
+        let tokens = tokenizer.tokenize();
+        (tokens, strings)
+    }
+
+    #[test]
+    fn test_asm_semicolon_not_comment() {
+        // In assembly mode, `;` is NOT treated as comment (it's a statement
+        // separator in GAS/AT&T syntax). Comment handling is left to the assembler.
+        let (tokens, idents) = tokenize_asm("mov eax, ebx ; move register");
+        // Should get full line tokenized, including ; and subsequent identifiers
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(
+            toks,
+            vec!["mov", "eax", ",", "ebx", ";", "move", "register"]
+        );
+    }
+
+    #[test]
+    fn test_asm_double_slash_not_comment() {
+        // In assembly mode, `//` is NOT a comment - just two `/` operators
+        let (tokens, idents) = tokenize_asm("a // b");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        // Should tokenize as: a, /, /, b (no comment skipping)
+        assert_eq!(toks, vec!["a", "/", "/", "b"]);
+    }
+
+    #[test]
+    fn test_asm_block_comment_not_comment() {
+        // In assembly mode, `/* */` is NOT a comment
+        let (tokens, idents) = tokenize_asm("a /* b */ c");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        // Should tokenize as individual tokens, not as comment
+        assert_eq!(toks, vec!["a", "/", "*", "b", "*", "/", "c"]);
+    }
+
+    #[test]
+    fn test_asm_semicolon_at_start_of_line() {
+        // Semicolon comment at start of line
+        let (tokens, _) = tokenize_asm("; This is a full line comment\nmov eax, 1");
+        // First line should be completely ignored
+        assert!(tokens.len() >= 4); // StreamBegin, mov, eax, ..., StreamEnd
+    }
+
+    #[test]
+    fn test_asm_mode_preserves_preprocessor_directives() {
+        // Assembly preprocessing should still handle # directives
+        let (tokens, idents) = tokenize_asm("#define FOO 1\nmov eax, FOO");
+        // Should tokenize the # directive
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert!(toks.contains(&"#".to_string()));
+        assert!(toks.contains(&"define".to_string()));
+    }
+
+    #[test]
+    fn test_c_mode_semicolon_not_comment() {
+        // In C mode, `;` is a statement terminator, not a comment
+        let (tokens, idents) = tokenize_str("int x; int y");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(toks, vec!["int", "x", ";", "int", "y"]);
+    }
+
+    // ========================================================================
+    // tokens_to_text tests
+    // ========================================================================
+
+    #[test]
+    fn test_tokens_to_text_simple() {
+        let (tokens, strings) = tokenize_str("int x = 42;");
+        let text = tokens_to_text(&tokens, &strings);
+        // Note: semicolon doesn't have whitespace flag set, so no space before it
+        assert_eq!(text.trim(), "int x = 42;");
+    }
+
+    #[test]
+    fn test_tokens_to_text_multiline() {
+        let (tokens, strings) = tokenize_str("int x;\nint y;");
+        let text = tokens_to_text(&tokens, &strings);
+        // Should preserve the newline between statements
+        assert!(text.contains('\n'));
+        assert!(text.contains("int"));
+    }
+
+    #[test]
+    fn test_tokens_to_text_ends_with_newline() {
+        let (tokens, strings) = tokenize_str("x");
+        let text = tokens_to_text(&tokens, &strings);
+        assert!(text.ends_with('\n'));
     }
 }

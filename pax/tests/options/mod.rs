@@ -505,6 +505,159 @@ fn test_option_multiple_combined() {
     assert!(content.contains("Combined options test"));
 }
 
+/// Test that %M shows correct file type character for regular files (issue #531)
+/// Previously showed `?rw-r--r--` instead of `-rw-r--r--` because tar stores
+/// file type in typeflag, not in mode bits.
+#[test]
+fn test_option_listopt_mode_symbolic_regular_file() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    // Create a regular file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("regular.txt")).unwrap();
+    writeln!(f, "Regular file test").unwrap();
+
+    // Create archive
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    // List with %M - should show '-' for regular file, not '?'
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "-o", "listopt=%M %f"]);
+    assert_success(&output, "pax list with listopt=%M");
+
+    let listing = stdout_str(&output);
+    // Regular file should start with '-', not '?'
+    assert!(
+        listing.contains("-rw") || listing.contains("-r-"),
+        "Regular file mode should start with '-', not '?'. Got: {}",
+        listing
+    );
+    assert!(
+        !listing.contains("?rw") && !listing.contains("?r-"),
+        "Regular file mode should NOT start with '?'. Got: {}",
+        listing
+    );
+}
+
+/// Test that %M shows correct file type character for directories (issue #531)
+#[test]
+fn test_option_listopt_mode_symbolic_directory() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    // Create a directory structure
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(src_dir.join("subdir")).unwrap();
+    let mut f = File::create(src_dir.join("subdir").join("file.txt")).unwrap();
+    writeln!(f, "test").unwrap();
+
+    // Create archive
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    // List with %M - should show 'd' for directory
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "-o", "listopt=%M %f"]);
+    assert_success(&output, "pax list with listopt=%M for directory");
+
+    let listing = stdout_str(&output);
+    // Directory should start with 'd'
+    assert!(
+        listing.contains("drwx") || listing.contains("dr-x"),
+        "Directory mode should start with 'd'. Got: {}",
+        listing
+    );
+}
+
+/// Test that %D format specifier works (issue #531)
+/// Previously showed literal `%D` instead of device major,minor
+#[test]
+fn test_option_listopt_device_specifier() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    // Create a regular file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("device_test.txt")).unwrap();
+    writeln!(f, "Device test").unwrap();
+
+    // Create archive
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    // List with %D - should show "major,minor" format, not literal "%D"
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "-o", "listopt=%D %f"]);
+    assert_success(&output, "pax list with listopt=%D");
+
+    let listing = stdout_str(&output);
+    // For regular files, devmajor and devminor are 0, so should show "0,0"
+    assert!(
+        listing.contains("0,0"),
+        "Device specifier should show 'major,minor' format (0,0 for regular files), not literal '%D'. Got: {}",
+        listing
+    );
+    assert!(
+        !listing.contains("%D"),
+        "Should NOT show literal '%D'. Got: {}",
+        listing
+    );
+}
+
+/// Test %M and %D together in a format string (issue #531)
+#[test]
+fn test_option_listopt_mode_and_device_combined() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    // Create a regular file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("combined.txt")).unwrap();
+    writeln!(f, "Combined test").unwrap();
+
+    // Create archive
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    // List with %M %D %s %f - comprehensive format
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "-o", "listopt=%M %D %s %f"]);
+    assert_success(&output, "pax list with listopt=%M %D %s %f");
+
+    let listing = stdout_str(&output);
+
+    // Should have correct mode (- for regular file)
+    assert!(
+        listing.contains("-rw") || listing.contains("-r-"),
+        "Should show '-' for regular file mode. Got: {}",
+        listing
+    );
+
+    // Should have device info (0,0 for regular files)
+    assert!(
+        listing.contains("0,0"),
+        "Should show device info. Got: {}",
+        listing
+    );
+
+    // Should have size and filename
+    assert!(
+        listing.contains("combined.txt"),
+        "Should show filename. Got: {}",
+        listing
+    );
+}
+
 #[test]
 fn test_first_match_option() {
     // Test -n flag: select only the first archive member that matches each pattern

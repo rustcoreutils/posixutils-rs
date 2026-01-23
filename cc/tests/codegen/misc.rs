@@ -399,6 +399,17 @@ fn codegen_asm_file_support() {
     // invocation requires passing asm objects to C file's link step (future work).
 
     // Assembly function that returns 42 (x86_64)
+    // Note: macOS Mach-O uses underscore prefix and has no .type/.size directives
+    #[cfg(target_os = "macos")]
+    let asm_content = r#"
+    .text
+    .globl _get_value
+_get_value:
+    movl $42, %eax
+    ret
+"#;
+
+    #[cfg(not(target_os = "macos"))]
     let asm_content = r#"
     .text
     .globl get_value
@@ -410,6 +421,17 @@ get_value:
 "#;
 
     // Assembly with preprocessor directives (.S) (x86_64)
+    #[cfg(target_os = "macos")]
+    let asm_s_content = r#"
+#define RETURN_VALUE 99
+    .text
+    .globl _get_value_s
+_get_value_s:
+    movl $RETURN_VALUE, %eax
+    ret
+"#;
+
+    #[cfg(not(target_os = "macos"))]
     let asm_s_content = r#"
 #define RETURN_VALUE 99
     .text
@@ -527,6 +549,131 @@ int main(void) {
     assert_eq!(
         exit_code, 0,
         "Assembly file test failed with exit code {}",
+        exit_code
+    );
+}
+
+/// Test that __ASSEMBLER__ is defined when preprocessing .S files
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_asm_assembler_macro() {
+    // Test that __ASSEMBLER__ is defined in .S files and that
+    // #ifdef __ASSEMBLER__ conditional compilation works
+
+    // Assembly with __ASSEMBLER__ conditional
+    #[cfg(target_os = "macos")]
+    let asm_s_content = r#"
+#ifdef __ASSEMBLER__
+#define RETURN_VALUE 77
+#else
+#error "__ASSEMBLER__ should be defined"
+#endif
+    .text
+    .globl _get_asm_value
+_get_asm_value:
+    movl $RETURN_VALUE, %eax
+    ret
+"#;
+
+    #[cfg(not(target_os = "macos"))]
+    let asm_s_content = r#"
+#ifdef __ASSEMBLER__
+#define RETURN_VALUE 77
+#else
+#error "__ASSEMBLER__ should be defined"
+#endif
+    .text
+    .globl get_asm_value
+    .type get_asm_value, @function
+get_asm_value:
+    movl $RETURN_VALUE, %eax
+    ret
+    .size get_asm_value, .-get_asm_value
+"#;
+
+    // C main that calls the asm function
+    let c_content = r#"
+extern int get_asm_value(void);
+
+int main(void) {
+    if (get_asm_value() != 77) return 1;
+    return 0;
+}
+"#;
+
+    let asm_s_file = create_asm_file("asm_assembler_test", asm_s_content, ".S");
+    let c_file = create_c_file("asm_assembler_main", c_content);
+
+    let obj_asm = std::env::temp_dir().join(format!("pcc_asm_macro_{}.o", std::process::id()));
+    let obj_c = std::env::temp_dir().join(format!("pcc_asm_macro_c_{}.o", std::process::id()));
+    let exe_path = std::env::temp_dir().join(format!("pcc_asm_macro_test_{}", std::process::id()));
+
+    // Step 1: Compile .S to .o (with preprocessing, should have __ASSEMBLER__ defined)
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-c".to_string(),
+            "-o".to_string(),
+            obj_asm.to_string_lossy().to_string(),
+            asm_s_file.path().to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc -c .S with __ASSEMBLER__ failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 2: Compile C to .o
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-c".to_string(),
+            "-o".to_string(),
+            obj_c.to_string_lossy().to_string(),
+            c_file.path().to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc -c .c failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 3: Link
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-o".to_string(),
+            exe_path.to_string_lossy().to_string(),
+            obj_c.to_string_lossy().to_string(),
+            obj_asm.to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "pcc link failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run the executable
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("failed to run executable");
+
+    let exit_code = run_output.status.code().unwrap_or(-1);
+
+    // Cleanup
+    let _ = std::fs::remove_file(&obj_asm);
+    let _ = std::fs::remove_file(&obj_c);
+    let _ = std::fs::remove_file(&exe_path);
+
+    assert_eq!(
+        exit_code, 0,
+        "__ASSEMBLER__ macro test failed with exit code {}",
         exit_code
     );
 }

@@ -55,17 +55,22 @@ pub enum InvalidAction {
     Binary,
 }
 
+/// String to InvalidAction mapping table
+const INVALID_ACTION_MAP: &[(&str, InvalidAction)] = &[
+    ("bypass", InvalidAction::Bypass),
+    ("rename", InvalidAction::Rename),
+    ("write", InvalidAction::Write),
+    ("UTF-8", InvalidAction::Utf8),
+    ("binary", InvalidAction::Binary),
+];
+
 impl InvalidAction {
     /// Parse from string value
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "bypass" => Some(InvalidAction::Bypass),
-            "rename" => Some(InvalidAction::Rename),
-            "write" => Some(InvalidAction::Write),
-            "UTF-8" => Some(InvalidAction::Utf8),
-            "binary" => Some(InvalidAction::Binary),
-            _ => None,
-        }
+        INVALID_ACTION_MAP
+            .iter()
+            .find(|(name, _)| *name == s)
+            .map(|(_, action)| *action)
     }
 }
 
@@ -95,6 +100,29 @@ pub struct FormatOptions {
     /// Action to take for invalid filenames
     pub invalid_action: InvalidAction,
 }
+
+/// Known option identifiers for table-driven parsing
+#[derive(Clone, Copy)]
+enum KnownOption {
+    Times,
+    LinkData,
+    ListFormat,
+    ExthdrName,
+    GlobexthdrName,
+    Delete,
+    Invalid,
+}
+
+/// Known option keywords and their identifiers
+const KNOWN_OPTIONS: &[(&str, KnownOption)] = &[
+    ("listopt", KnownOption::ListFormat),
+    ("delete", KnownOption::Delete),
+    ("times", KnownOption::Times),
+    ("linkdata", KnownOption::LinkData),
+    ("exthdr.name", KnownOption::ExthdrName),
+    ("globexthdr.name", KnownOption::GlobexthdrName),
+    ("invalid", KnownOption::Invalid),
+];
 
 impl FormatOptions {
     /// Create new empty options
@@ -153,6 +181,8 @@ impl FormatOptions {
 
     /// Parse a single option (keyword[[:]=value])
     fn parse_single_option(&mut self, opt: &str) -> PaxResult<()> {
+        use KnownOption::*;
+
         if opt.is_empty() {
             return Ok(());
         }
@@ -171,63 +201,51 @@ impl FormatOptions {
             (opt.trim(), None, false)
         };
 
-        // Handle known keywords
-        match keyword {
-            "listopt" => {
-                self.list_format = value.map(|s| s.to_string());
-            }
-            "delete" => {
-                if let Some(pattern) = value {
-                    // Pre-compile pattern for efficient matching
-                    match Pattern::new(pattern) {
-                        Ok(compiled) => {
-                            self.delete_patterns.push(pattern.to_string());
-                            self.delete_patterns_compiled.push(compiled);
+        // Look up keyword in known options table
+        if let Some((_, known_opt)) = KNOWN_OPTIONS.iter().find(|(k, _)| *k == keyword) {
+            match known_opt {
+                Times => self.include_times = true,
+                LinkData => self.link_data = true,
+                ListFormat => self.list_format = value.map(|s| s.to_string()),
+                ExthdrName => self.exthdr_name = value.map(|s| s.to_string()),
+                GlobexthdrName => self.globexthdr_name = value.map(|s| s.to_string()),
+                Delete => {
+                    if let Some(pattern) = value {
+                        match Pattern::new(pattern) {
+                            Ok(compiled) => {
+                                self.delete_patterns.push(pattern.to_string());
+                                self.delete_patterns_compiled.push(compiled);
+                            }
+                            Err(e) => {
+                                return Err(PaxError::PatternError(format!(
+                                    "invalid delete pattern '{}': {}",
+                                    pattern, e
+                                )));
+                            }
                         }
-                        Err(e) => {
-                            return Err(PaxError::PatternError(format!(
-                                "invalid delete pattern '{}': {}",
-                                pattern, e
+                    }
+                }
+                Invalid => {
+                    if let Some(v) = value {
+                        if let Some(action) = InvalidAction::from_str(v) {
+                            self.invalid_action = action;
+                        } else {
+                            return Err(PaxError::InvalidFormat(format!(
+                                "invalid value for 'invalid' option: {}",
+                                v
                             )));
                         }
                     }
                 }
             }
-            "times" => {
-                self.include_times = true;
-            }
-            "linkdata" => {
-                self.link_data = true;
-            }
-            // Extended header name templates
-            "exthdr.name" => {
-                self.exthdr_name = value.map(|s| s.to_string());
-            }
-            "globexthdr.name" => {
-                self.globexthdr_name = value.map(|s| s.to_string());
-            }
-            // Invalid action handling
-            "invalid" => {
-                if let Some(v) = value {
-                    if let Some(action) = InvalidAction::from_str(v) {
-                        self.invalid_action = action;
-                    } else {
-                        return Err(PaxError::InvalidFormat(format!(
-                            "invalid value for 'invalid' option: {}",
-                            v
-                        )));
-                    }
-                }
-            }
-            // Store any other options for format-specific handling
-            _ => {
-                if is_per_file {
-                    self.per_file
-                        .insert(keyword.to_string(), value.unwrap_or("").to_string());
-                } else {
-                    self.global
-                        .insert(keyword.to_string(), value.unwrap_or("").to_string());
-                }
+        } else {
+            // Store unknown options for format-specific handling
+            if is_per_file {
+                self.per_file
+                    .insert(keyword.to_string(), value.unwrap_or("").to_string());
+            } else {
+                self.global
+                    .insert(keyword.to_string(), value.unwrap_or("").to_string());
             }
         }
 
@@ -318,33 +336,50 @@ impl FormatOptions {
     }
 }
 
-/// Expand template for per-file extended header names
-fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64) -> String {
+/// Context for template expansion
+struct TemplateContext<'a> {
+    dirname: Option<&'a str>,
+    filename: Option<&'a str>,
+    pid: u32,
+    sequence: u64,
+}
+
+/// Type alias for template specifier handler
+type TemplateHandler = fn(&TemplateContext) -> Option<String>;
+
+/// Template specifier handlers
+const TEMPLATE_SPECIFIERS: &[(char, TemplateHandler)] = &[
+    ('d', |ctx| ctx.dirname.map(|s| s.to_string())),
+    ('f', |ctx| ctx.filename.map(|s| s.to_string())),
+    ('p', |ctx| Some(ctx.pid.to_string())),
+    ('n', |ctx| Some(ctx.sequence.to_string())),
+    ('%', |_| Some("%".to_string())),
+];
+
+/// Unified template expansion function
+fn expand_template(template: &str, ctx: &TemplateContext) -> String {
     let mut result = String::new();
     let mut chars = template.chars().peekable();
-    let pid = std::process::id();
-
-    // Extract directory and filename from path
-    let dirname = path
-        .parent()
-        .map(|p| p.to_string_lossy())
-        .unwrap_or_default();
-    let filename = path
-        .file_name()
-        .map(|f| f.to_string_lossy())
-        .unwrap_or_default();
 
     while let Some(c) = chars.next() {
         if c == '%' {
             match chars.next() {
-                Some('d') => result.push_str(&dirname),
-                Some('f') => result.push_str(&filename),
-                Some('p') => result.push_str(&pid.to_string()),
-                Some('n') => result.push_str(&sequence.to_string()),
-                Some('%') => result.push('%'),
-                Some(other) => {
-                    result.push('%');
-                    result.push(other);
+                Some(spec) => {
+                    if let Some((_, handler)) =
+                        TEMPLATE_SPECIFIERS.iter().find(|(ch, _)| *ch == spec)
+                    {
+                        if let Some(value) = handler(ctx) {
+                            result.push_str(&value);
+                        } else {
+                            // Specifier not available in this context - pass through
+                            result.push('%');
+                            result.push(spec);
+                        }
+                    } else {
+                        // Unknown specifier - include literally
+                        result.push('%');
+                        result.push(spec);
+                    }
                 }
                 None => result.push('%'),
             }
@@ -354,33 +389,131 @@ fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64)
     }
 
     result
+}
+
+/// Expand template for per-file extended header names
+fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64) -> String {
+    // Use empty string as fallback (matching original behavior with unwrap_or_default)
+    let dirname_owned = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let filename_owned = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let ctx = TemplateContext {
+        dirname: Some(dirname_owned.as_str()),
+        filename: Some(filename_owned.as_str()),
+        pid: std::process::id(),
+        sequence,
+    };
+
+    expand_template(template, &ctx)
 }
 
 /// Expand template for global extended header names
 fn expand_global_header_template(template: &str, sequence: u64) -> String {
-    let mut result = String::new();
-    let mut chars = template.chars().peekable();
-    let pid = std::process::id();
+    let ctx = TemplateContext {
+        dirname: None,
+        filename: None,
+        pid: std::process::id(),
+        sequence,
+    };
 
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.next() {
-                Some('n') => result.push_str(&sequence.to_string()),
-                Some('p') => result.push_str(&pid.to_string()),
-                Some('%') => result.push('%'),
-                Some(other) => {
-                    result.push('%');
-                    result.push(other);
-                }
-                None => result.push('%'),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
+    expand_template(template, &ctx)
 }
+
+// Format specifier handlers for list entry formatting
+fn fmt_basename(info: &ListEntryInfo) -> String {
+    std::path::Path::new(info.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| info.path.to_string())
+}
+
+fn fmt_fullpath(info: &ListEntryInfo) -> String {
+    info.path.to_string()
+}
+
+fn fmt_link_target(info: &ListEntryInfo) -> String {
+    info.link_target.unwrap_or("").to_string()
+}
+
+fn fmt_mode_octal(info: &ListEntryInfo) -> String {
+    format!("{:o}", info.mode & 0o7777)
+}
+
+fn fmt_mode_symbolic(info: &ListEntryInfo) -> String {
+    format_mode_symbolic(info.mode, info.entry_type)
+}
+
+fn fmt_device(info: &ListEntryInfo) -> String {
+    format!("{},{}", info.devmajor, info.devminor)
+}
+
+fn fmt_size(info: &ListEntryInfo) -> String {
+    info.size.to_string()
+}
+
+fn fmt_mtime_trad(info: &ListEntryInfo) -> String {
+    format_time_traditional(info.mtime)
+}
+
+fn fmt_mtime_iso(info: &ListEntryInfo) -> String {
+    format_time_iso(info.mtime)
+}
+
+fn fmt_username(info: &ListEntryInfo) -> String {
+    info.uname
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| info.uid.to_string())
+}
+
+fn fmt_groupname(info: &ListEntryInfo) -> String {
+    info.gname
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| info.gid.to_string())
+}
+
+fn fmt_uid(info: &ListEntryInfo) -> String {
+    info.uid.to_string()
+}
+
+fn fmt_gid(info: &ListEntryInfo) -> String {
+    info.gid.to_string()
+}
+
+fn fmt_newline(_info: &ListEntryInfo) -> String {
+    "\n".to_string()
+}
+
+fn fmt_percent(_info: &ListEntryInfo) -> String {
+    "%".to_string()
+}
+
+/// Type alias for format specifier handler
+type FormatHandler = fn(&ListEntryInfo) -> String;
+
+/// Table of format specifiers and their handler functions
+const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
+    ('f', fmt_basename),
+    ('F', fmt_fullpath),
+    ('l', fmt_link_target),
+    ('m', fmt_mode_octal),
+    ('M', fmt_mode_symbolic),
+    ('D', fmt_device),
+    ('s', fmt_size),
+    ('t', fmt_mtime_trad),
+    ('T', fmt_mtime_iso),
+    ('u', fmt_username),
+    ('g', fmt_groupname),
+    ('U', fmt_uid),
+    ('G', fmt_gid),
+    ('n', fmt_newline),
+    ('%', fmt_percent),
+];
 
 /// Parse list format specification and format an entry
 ///
@@ -406,76 +539,16 @@ pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
     while let Some(c) = chars.next() {
         if c == '%' {
             match chars.next() {
-                Some('f') => {
-                    // Filename (basename)
-                    let name = std::path::Path::new(info.path)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| info.path.to_string());
-                    result.push_str(&name);
-                }
-                Some('F') => {
-                    // Full path
-                    result.push_str(info.path);
-                }
-                Some('l') => {
-                    // Link target
-                    if let Some(target) = info.link_target {
-                        result.push_str(target);
+                Some(spec) => {
+                    if let Some((_, handler)) =
+                        FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec)
+                    {
+                        result.push_str(&handler(info));
+                    } else {
+                        // Unknown specifier - include literally
+                        result.push('%');
+                        result.push(spec);
                     }
-                }
-                Some('m') => {
-                    // Mode (octal)
-                    result.push_str(&format!("{:o}", info.mode & 0o7777));
-                }
-                Some('M') => {
-                    // Mode (symbolic)
-                    result.push_str(&format_mode_symbolic(info.mode, info.entry_type));
-                }
-                Some('D') => {
-                    // Device major,minor (for block/char special files)
-                    result.push_str(&format!("{},{}", info.devmajor, info.devminor));
-                }
-                Some('s') => {
-                    // Size
-                    result.push_str(&info.size.to_string());
-                }
-                Some('t') => {
-                    // Modification time (traditional format)
-                    result.push_str(&format_time_traditional(info.mtime));
-                }
-                Some('T') => {
-                    // Modification time (ISO format)
-                    result.push_str(&format_time_iso(info.mtime));
-                }
-                Some('u') => {
-                    // Username
-                    result.push_str(info.uname.unwrap_or(&info.uid.to_string()));
-                }
-                Some('g') => {
-                    // Group name
-                    result.push_str(info.gname.unwrap_or(&info.gid.to_string()));
-                }
-                Some('U') => {
-                    // UID
-                    result.push_str(&info.uid.to_string());
-                }
-                Some('G') => {
-                    // GID
-                    result.push_str(&info.gid.to_string());
-                }
-                Some('n') => {
-                    // Newline
-                    result.push('\n');
-                }
-                Some('%') => {
-                    // Literal %
-                    result.push('%');
-                }
-                Some(other) => {
-                    // Unknown specifier - include literally
-                    result.push('%');
-                    result.push(other);
                 }
                 None => {
                     result.push('%');
@@ -489,66 +562,88 @@ pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
     result
 }
 
+/// Entry type to file type character mapping for symbolic mode display
+const ENTRY_TYPE_CHARS: &[(EntryType, char)] = &[
+    (EntryType::Regular, '-'),
+    (EntryType::Directory, 'd'),
+    (EntryType::Symlink, 'l'),
+    (EntryType::Hardlink, 'h'),
+    (EntryType::BlockDevice, 'b'),
+    (EntryType::CharDevice, 'c'),
+    (EntryType::Fifo, 'p'),
+    (EntryType::Socket, 's'),
+];
+
+/// Get file type character for an entry type
+fn entry_type_char(entry_type: EntryType) -> char {
+    ENTRY_TYPE_CHARS
+        .iter()
+        .find(|(et, _)| *et == entry_type)
+        .map(|(_, c)| *c)
+        .unwrap_or('-')
+}
+
+/// Permission triplet definition for table-driven mode formatting
+struct PermTriplet {
+    read: u32,
+    write: u32,
+    exec: u32,
+    special: u32,
+    set_char: char,   // char when special+exec (e.g., 's' for setuid/setgid)
+    unset_char: char, // char when special but no exec (e.g., 'S')
+}
+
+/// Permission triplets: owner, group, other
+const PERM_TRIPLETS: &[PermTriplet] = &[
+    PermTriplet {
+        read: 0o400,
+        write: 0o200,
+        exec: 0o100,
+        special: 0o4000,
+        set_char: 's',
+        unset_char: 'S',
+    },
+    PermTriplet {
+        read: 0o040,
+        write: 0o020,
+        exec: 0o010,
+        special: 0o2000,
+        set_char: 's',
+        unset_char: 'S',
+    },
+    PermTriplet {
+        read: 0o004,
+        write: 0o002,
+        exec: 0o001,
+        special: 0o1000,
+        set_char: 't',
+        unset_char: 'T',
+    },
+];
+
 /// Format mode as symbolic string (like ls -l)
 fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
     let mut s = String::with_capacity(10);
 
     // File type (from entry_type, not mode bits - tar stores type separately)
-    s.push(match entry_type {
-        EntryType::Regular => '-',
-        EntryType::Directory => 'd',
-        EntryType::Symlink => 'l',
-        EntryType::Hardlink => 'h',
-        EntryType::BlockDevice => 'b',
-        EntryType::CharDevice => 'c',
-        EntryType::Fifo => 'p',
-        EntryType::Socket => 's',
-    });
+    s.push(entry_type_char(entry_type));
 
-    // Owner permissions
-    s.push(if mode & 0o400 != 0 { 'r' } else { '-' });
-    s.push(if mode & 0o200 != 0 { 'w' } else { '-' });
-    s.push(if mode & 0o4000 != 0 {
-        if mode & 0o100 != 0 {
-            's'
+    // Process each permission triplet (owner, group, other)
+    for triplet in PERM_TRIPLETS {
+        s.push(if mode & triplet.read != 0 { 'r' } else { '-' });
+        s.push(if mode & triplet.write != 0 { 'w' } else { '-' });
+        s.push(if mode & triplet.special != 0 {
+            if mode & triplet.exec != 0 {
+                triplet.set_char
+            } else {
+                triplet.unset_char
+            }
+        } else if mode & triplet.exec != 0 {
+            'x'
         } else {
-            'S'
-        }
-    } else if mode & 0o100 != 0 {
-        'x'
-    } else {
-        '-'
-    });
-
-    // Group permissions
-    s.push(if mode & 0o040 != 0 { 'r' } else { '-' });
-    s.push(if mode & 0o020 != 0 { 'w' } else { '-' });
-    s.push(if mode & 0o2000 != 0 {
-        if mode & 0o010 != 0 {
-            's'
-        } else {
-            'S'
-        }
-    } else if mode & 0o010 != 0 {
-        'x'
-    } else {
-        '-'
-    });
-
-    // Other permissions
-    s.push(if mode & 0o004 != 0 { 'r' } else { '-' });
-    s.push(if mode & 0o002 != 0 { 'w' } else { '-' });
-    s.push(if mode & 0o1000 != 0 {
-        if mode & 0o001 != 0 {
-            't'
-        } else {
-            'T'
-        }
-    } else if mode & 0o001 != 0 {
-        'x'
-    } else {
-        '-'
-    });
+            '-'
+        });
+    }
 
     s
 }

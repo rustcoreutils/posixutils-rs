@@ -5,12 +5,14 @@
 /// Returns the index of the first character whose byte offset is >= the given byte offset,
 /// or the total character count if byte_offset is past the end.
 pub fn char_index_at_byte(content: &str, byte_offset: usize) -> usize {
-    content
-        .char_indices()
-        .enumerate()
-        .find(|(_, (b, _))| *b >= byte_offset)
-        .map(|(i, _)| i)
-        .unwrap_or_else(|| content.chars().count())
+    let mut char_index = 0usize;
+    for (b, _) in content.char_indices() {
+        if b >= byte_offset {
+            return char_index;
+        }
+        char_index += 1;
+    }
+    char_index
 }
 
 /// A single line in the edit buffer.

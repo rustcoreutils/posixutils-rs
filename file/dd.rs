@@ -622,7 +622,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Install SIGINT handler
     unsafe {
-        libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();

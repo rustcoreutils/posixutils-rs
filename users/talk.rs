@@ -1821,7 +1821,7 @@ pub fn register_signals() {
 
         // Register the `handle_signals` function for each signal
         for &sig in signals {
-            if signal(sig, handle_signals as usize) == libc::SIG_ERR {
+            if signal(sig, handle_signals as *const () as usize) == libc::SIG_ERR {
                 eprintln!("Failed to register signal handler for signal {}", sig);
             }
         }

@@ -966,7 +966,7 @@ fn write_dfa_state<W: Write>(
     // If this is an accepting state, save marker position and state info
     // When start conditions are in use, only update YYMARKER if the rule is valid
     // for the current start condition. This prevents incorrect backtracking.
-    if state.accepting.is_some() {
+    if let Some(accepting_rule) = state.accepting {
         if flags.has_start_conditions {
             if state.accepting_rules.len() == 1 {
                 // Optimized path: single accepting rule - no loop needed
@@ -1071,7 +1071,7 @@ fn write_dfa_state<W: Write>(
             }
         } else {
             // No start conditions - use original unconditional behavior
-            let rule = state.accepting.unwrap();
+            let rule = accepting_rule;
             writeln!(output, "    /* Accepting state for rule {} */", rule)?;
             writeln!(output, "    YYMARKER = YYCURSOR;")?;
             writeln!(output, "    yyaccept = {};", rule)?;

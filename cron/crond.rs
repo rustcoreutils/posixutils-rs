@@ -240,10 +240,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // extern "C" function handlers. All handlers are async-signal-safe
     // (they only perform atomic stores or call async-signal-safe functions).
     unsafe {
-        libc::signal(libc::SIGHUP, handle_sighup as usize);
-        libc::signal(libc::SIGCHLD, handle_sigchld as usize);
-        libc::signal(libc::SIGTERM, handle_shutdown as usize);
-        libc::signal(libc::SIGINT, handle_shutdown as usize);
+        libc::signal(libc::SIGHUP, handle_sighup as *const () as usize);
+        libc::signal(libc::SIGCHLD, handle_sigchld as *const () as usize);
+        libc::signal(libc::SIGTERM, handle_shutdown as *const () as usize);
+        libc::signal(libc::SIGINT, handle_shutdown as *const () as usize);
     }
 
     // Run @reboot jobs at startup

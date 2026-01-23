@@ -4,15 +4,44 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  linux-ubuntu:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: |
+          # First pass: show all warnings (don't fail)
+          cargo clippy --all-targets 2>&1 || true
+          # Second pass: fail if any warnings exist
+          cargo clippy --all-targets -- -D warnings
+
+  linux-ubuntu:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: System info
         run: |
           echo "=== Architecture ==="
@@ -30,27 +59,15 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
-      - name: Run fmt check
-        run: cargo fmt --all -- --check
 
   macos-homebrew:
+    needs: lint
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: sfackler/actions/rustup@master
-      - run: echo "version=$(rustc --version)" >> $GITHUB_OUTPUT
-        id: rust-version
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index
-          key: index-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            index-${{ runner.os }}-
-      - run: cargo generate-lockfile
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/cache
-          key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: System info
         run: |
           echo "=== Architecture ==="

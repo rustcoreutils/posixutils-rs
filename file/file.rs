@@ -80,20 +80,22 @@ fn get_magic_files(args: &Args) -> Vec<PathBuf> {
     if let Some(test_file2) = &args.test_file2 {
         magic_files.push(test_file2.clone());
 
-        if args.default_tests && args.test_file1.is_some() {
-            let raw_args: Vec<String> = std::env::args().collect();
-            let m_index = raw_args.iter().position(|x| x == "-m");
-            let h_index = raw_args.iter().position(|x| x == "-h");
+        if let Some(test_file1) = &args.test_file1 {
+            if args.default_tests {
+                let raw_args: Vec<String> = std::env::args().collect();
+                let m_index = raw_args.iter().position(|x| x == "-m");
+                let h_index = raw_args.iter().position(|x| x == "-h");
 
-            if m_index > h_index {
-                magic_files.push(args.test_file1.as_ref().unwrap().clone());
-                magic_files.push(default_magic_file);
+                if m_index > h_index {
+                    magic_files.push(test_file1.clone());
+                    magic_files.push(default_magic_file);
+                } else {
+                    magic_files.push(default_magic_file);
+                    magic_files.push(test_file1.clone());
+                }
             } else {
-                magic_files.push(default_magic_file);
-                magic_files.push(args.test_file1.as_ref().unwrap().clone());
+                magic_files.push(test_file1.clone());
             }
-        } else if args.test_file1.is_some() {
-            magic_files.push(args.test_file1.as_ref().unwrap().clone());
         } else if args.default_tests {
             magic_files.push(default_magic_file);
         }

@@ -270,8 +270,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.lines = Some(1000);
     }
 
-    if args.lines.is_some() {
-        split_by_lines(&args, args.lines.unwrap())?;
+    if let Some(lines) = args.lines {
+        split_by_lines(&args, lines)?;
     } else {
         split_by_bytes(&args, args.bytes.clone().unwrap())?;
     }

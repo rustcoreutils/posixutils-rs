@@ -55,10 +55,16 @@ fn setup_signals() {
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
 
         // SIGINT: Set flag to be checked in main loop
-        libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
 
         // SIGHUP: Set flag to save buffer and exit
-        libc::signal(libc::SIGHUP, sighup_handler as libc::sighandler_t);
+        libc::signal(
+            libc::SIGHUP,
+            sighup_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 

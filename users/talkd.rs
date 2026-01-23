@@ -494,9 +494,18 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
 fn register_signals(socket_path: &Path) {
     unsafe {
         SOCKET_PATH = Some(socket_path.to_path_buf());
-        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGQUIT, handle_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGQUIT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 

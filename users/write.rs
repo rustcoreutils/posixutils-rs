@@ -249,7 +249,11 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
 /// Register signal handler for SIGINT
 fn register_sigint_handler() {
     unsafe {
-        if libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t) == libc::SIG_ERR {
+        if libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
             eprintln!("{}", gettext("Failed to register signal handler"));
         }
     }

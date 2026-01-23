@@ -363,6 +363,9 @@ pub struct Preprocessor<'a> {
     /// Index of current file's system include path (for #include_next)
     /// None if current file is not from a system include path
     current_include_path_index: Option<usize>,
+
+    /// Lexer mode for tokenizing included files (C or Assembly)
+    lexer_mode: LexerMode,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -463,6 +466,7 @@ impl<'a> Preprocessor<'a> {
             use_builtin_headers: true,
             use_system_headers: true,
             current_include_path_index: None,
+            lexer_mode: LexerMode::C,
         };
 
         // Initialize predefined macros
@@ -2230,8 +2234,10 @@ impl<'a> Preprocessor<'a> {
         // Tokenize the included file using the same shared string table
         // Since we use the same StringTable, all StringIds are consistent
         // and no ID remapping is needed.
+        // Use the same lexer mode as the main file (C or Assembly).
         let tokens = {
-            let mut tokenizer = Tokenizer::new(&content, stream_id, idents);
+            let mut tokenizer =
+                Tokenizer::new_with_mode(&content, stream_id, idents, self.lexer_mode);
             tokenizer.tokenize()
         };
 
@@ -3681,6 +3687,9 @@ pub fn preprocess_asm_file(
 
     // Create preprocessor with assembly-specific predefined macros
     let mut pp = Preprocessor::new(target, filename);
+
+    // Use assembly lexer mode for included files as well
+    pp.lexer_mode = LexerMode::Assembly;
 
     // Undefine C-specific macros that don't apply to assembly
     pp.undef_macro("__STDC__");

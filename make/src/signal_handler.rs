@@ -37,9 +37,9 @@ pub fn handle_signals(signal_code: libc::c_int) {
 
 pub fn register_signals() {
     unsafe {
-        signal(SIGINT, handle_signals as usize);
-        signal(SIGQUIT, handle_signals as usize);
-        signal(SIGTERM, handle_signals as usize);
-        signal(SIGHUP, handle_signals as usize);
+        signal(SIGINT, handle_signals as *const () as usize);
+        signal(SIGQUIT, handle_signals as *const () as usize);
+        signal(SIGTERM, handle_signals as *const () as usize);
+        signal(SIGHUP, handle_signals as *const () as usize);
     }
 }

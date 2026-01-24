@@ -1375,6 +1375,11 @@ fn test_mv_i_link_no() {
     ignore
 )]
 fn test_mv_sticky_to_xpart() {
+    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
+        eprintln!("Skipping: NON_ROOT_USERNAME not set");
+        return;
+    };
+
     let test_name = "test_mv_sticky_to_xpart";
     let test_dir = &format!("{}/{test_name}", env!("CARGO_TARGET_TMPDIR"));
     let t = &format!("{test_dir}/t");
@@ -1402,11 +1407,6 @@ fn test_mv_sticky_to_xpart() {
         option_env!("OTHER_PARTITION_TMPDIR").unwrap_or("/dev/shm")
     );
     fs::create_dir(other_dir).unwrap();
-
-    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
-        eprintln!("Skipping: NON_ROOT_USERNAME not set");
-        return;
-    };
 
     unsafe {
         let non_root_cstr = CString::new(non_root).unwrap();

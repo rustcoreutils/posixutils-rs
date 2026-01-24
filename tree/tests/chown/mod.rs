@@ -59,6 +59,11 @@ fn current_user_group_ids() -> &'static Vec<libc::gid_t> {
     ignore
 )]
 fn test_chown_ownergroup_spec() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root");
+        return;
+    }
+
     let test_dir = &format!("{}/test_chown_ownergroup_spec", env!("CARGO_TARGET_TMPDIR"));
     let f = &format!("{test_dir}/f");
 
@@ -86,6 +91,11 @@ fn test_chown_ownergroup_spec() {
     ignore
 )]
 fn test_chown_change_owner() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root");
+        return;
+    }
+
     let test_dir = &format!("{}/test_chown_change_owner", env!("CARGO_TARGET_TMPDIR"));
     let f = &format!("{test_dir}/f");
 
@@ -116,7 +126,10 @@ fn test_chown_change_owner_without_root() {
         return;
     }
 
-    let test_dir = &format!("{}/test_chown_change_owner", env!("CARGO_TARGET_TMPDIR"));
+    let test_dir = &format!(
+        "{}/test_chown_change_owner_without_root",
+        env!("CARGO_TARGET_TMPDIR")
+    );
     let f = &format!("{test_dir}/f");
 
     fs::create_dir(test_dir).unwrap();
@@ -140,6 +153,11 @@ fn test_chown_change_owner_without_root() {
     ignore
 )]
 fn test_chown_change_owner_and_group() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root");
+        return;
+    }
+
     let test_dir = &format!(
         "{}/test_chown_change_owner_and_group",
         env!("CARGO_TARGET_TMPDIR")

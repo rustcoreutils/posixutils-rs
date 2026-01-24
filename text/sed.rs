@@ -2217,6 +2217,10 @@ impl Sed {
             || wfile.exists())
         {
             wfile = get_tmp_path(wfile);
+            // Ensure tmp directory exists
+            if let Some(parent) = wfile.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
         }
 
         let _ = match std::fs::OpenOptions::new()

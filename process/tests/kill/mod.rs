@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -43,29 +43,7 @@ fn run_kill_test_exact(
 
 // Helper to get the test binary path
 fn get_kill_binary_path() -> std::path::PathBuf {
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(format!("{}/{}/kill", target_dir, profile))
+    get_binary_path("kill")
 }
 
 // ============================================

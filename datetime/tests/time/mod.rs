@@ -7,60 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{
-    io::Write,
-    process::{Command, Output, Stdio},
-};
+use std::process::Output;
 
-use plib::testing::TestPlan;
-
-fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
-    let test_bin_path = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join(relpath); // Adjust the path to the binary
-
-    let mut command = Command::new(test_bin_path);
-    let mut child = command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn head");
-
-    let stdin = child.stdin.as_mut().expect("failed to get stdin");
-    stdin
-        .write_all(stdin_data)
-        .expect("failed to write to stdin");
-
-    child.wait_with_output().expect("failed to wait for child")
-}
+use plib::testing::{run_test_base, TestPlan};
 
 fn get_output(plan: TestPlan) -> Output {
-    let output = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
-
-    output
+    run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes())
 }
 
 fn run_test_time(

@@ -8,9 +8,50 @@
 //
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
+
+/// Get the target directory for built binaries.
+///
+/// Handles cargo-llvm-cov which uses a custom target directory.
+pub fn get_target_dir() -> String {
+    std::env::var("CARGO_TARGET_DIR")
+        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
+        .unwrap_or_else(|_| {
+            if cfg!(coverage) {
+                String::from("target/llvm-cov-target")
+            } else {
+                String::from("target")
+            }
+        })
+}
+
+/// Get the current build profile ("debug" or "release").
+pub fn get_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+/// Get the full path to a built binary.
+///
+/// This assumes the current directory is within a workspace member crate
+/// and navigates up to the workspace root to find the binary.
+pub fn get_binary_path(cmd: &str) -> PathBuf {
+    let target_dir = get_target_dir();
+    let profile = get_profile();
+    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
+
+    std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap() // Move up to the workspace root from the current package directory
+        .join(relpath)
+}
 
 pub struct TestPlan {
     pub cmd: String,
@@ -40,30 +81,7 @@ pub fn run_test_base_with_env(
     stdin_data: &[u8],
     env_vars: &[(&str, &str)],
 ) -> Output {
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
-    let test_bin_path = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join(relpath); // Adjust the path to the binary
+    let test_bin_path = get_binary_path(cmd);
 
     let mut command = Command::new(test_bin_path);
     command

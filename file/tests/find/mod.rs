@@ -2,7 +2,7 @@ use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{get_binary_path, run_test, TestPlan};
 
 fn run_test_find(
     args: &[&str],
@@ -29,24 +29,7 @@ fn run_test_find_sorted(
     expected_error: &str,
     expected_exit_code: i32,
 ) {
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let find_path = format!("{}/../{}/{}/find", project_root, target_dir, profile);
+    let find_path = get_binary_path("find");
 
     let output = Command::new(&find_path)
         .args(args)
@@ -276,24 +259,7 @@ fn find_newer_test() {
 
 /// Run find and compare null-delimited output (for -print0 testing)
 fn run_test_find_print0_sorted(args: &[&str], expected_paths: &[&str], expected_exit_code: i32) {
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let find_path = format!("{}/../{}/{}/find", project_root, target_dir, profile);
+    let find_path = get_binary_path("find");
 
     let output = Command::new(&find_path)
         .args(args)

@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use plib::testing::get_binary_path;
 use sysinfo::System;
 
 pub struct TestPlan {
@@ -27,30 +28,7 @@ pub struct TestPlan {
 }
 
 fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i32) {
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
-    let test_bin_path = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join(relpath); // Adjust the path to the binary
+    let test_bin_path = get_binary_path(cmd);
 
     let mut command = Command::new(test_bin_path);
     let mut child = command

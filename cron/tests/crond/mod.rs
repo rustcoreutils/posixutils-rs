@@ -11,64 +11,18 @@ mod pid;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use cron::job::Database;
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use plib::testing::{get_binary_path, run_test_base};
+use std::process::Output;
 use std::str::FromStr;
-use std::thread;
-use std::time::Duration;
 
-fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
-    let relpath = if cfg!(debug_assertions) {
-        format!("target/debug/{}", cmd)
-    } else {
-        format!("target/release/{}", cmd)
-    };
-    let test_bin_path = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join(relpath); // Adjust the path to the binary
-
-    let mut command = Command::new(test_bin_path);
-    let mut child = command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|_| panic!("failed to spawn command {}", cmd));
-
-    // Separate the mutable borrow of stdin from the child process
-    if let Some(mut stdin) = child.stdin.take() {
-        let chunk_size = 1024; // Arbitrary chunk size, adjust if needed
-        for chunk in stdin_data.chunks(chunk_size) {
-            // Write each chunk
-            if let Err(e) = stdin.write_all(chunk) {
-                eprintln!("Error writing to stdin: {}", e);
-                break;
-            }
-            // Flush after writing each chunk
-            if let Err(e) = stdin.flush() {
-                eprintln!("Error flushing stdin: {}", e);
-                break;
-            }
-
-            // Sleep briefly to avoid CPU spinning
-            thread::sleep(Duration::from_millis(10));
-        }
-        // Explicitly drop stdin to close the pipe
-        drop(stdin);
-    }
-
-    // Ensure we wait for the process to complete after writing to stdin
-
-    child.wait_with_output().expect("failed to wait for child")
+fn run_crond_test(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
+    run_test_base(cmd, args, stdin_data)
 }
 
 #[test]
 fn no_args() {
     std::env::set_var("LOGNAME", "root");
-    let output = run_test_base("crond", &vec![], b"");
+    let output = run_crond_test("crond", &vec![], b"");
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -226,10 +180,14 @@ fn test_signal() {
     #[cfg(target_os = "macos")]
     let file = format!("/var/at/tabs/{logname}");
 
-    let output = run_test_base("crond", &vec![], b"");
+    let output = run_crond_test("crond", &vec![], b"");
     assert_eq!(output.status.code(), Some(0));
 
-    let pids = pid::get_pids("target/debug/crond").unwrap();
+    // Get the binary path string for process matching
+    let bin_path = get_binary_path("crond");
+    let bin_path_str = bin_path.to_string_lossy();
+
+    let pids = pid::get_pids(&bin_path_str).unwrap();
 
     if std::path::PathBuf::from_str(&file).unwrap().exists() {
         assert!(!pids.is_empty());
@@ -242,13 +200,13 @@ fn test_signal() {
     }
 
     let mut old_pids = pids;
-    let mut pids = pid::get_pids("target/debug/crond").unwrap();
+    let mut pids = pid::get_pids(&bin_path_str).unwrap();
 
     pids.sort();
     old_pids.sort();
     assert!(pids == old_pids || !pids.is_empty());
 
-    pid::kill("target/debug/crond").unwrap();
+    pid::kill(&bin_path_str).unwrap();
 }
 
 // Tests for @-prefix special time specifications

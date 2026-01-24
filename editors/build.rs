@@ -33,10 +33,9 @@ fn create_ex_symlink() {
     // We need to go up to: <target_dir>/<profile>/
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let bin_dir = PathBuf::from(&out_dir)
-        .parent() // out
-        .and_then(|p| p.parent()) // <crate>-<hash>
-        .and_then(|p| p.parent()) // build
-        .and_then(|p| p.parent()) // <profile>
+        .parent() // out -> <crate>-<hash>
+        .and_then(|p| p.parent()) // <crate>-<hash> -> build
+        .and_then(|p| p.parent()) // build -> <profile> (e.g., debug)
         .map(|p| p.to_path_buf())
         .expect("Could not determine target directory from OUT_DIR");
 

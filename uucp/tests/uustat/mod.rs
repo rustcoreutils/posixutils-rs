@@ -135,9 +135,16 @@ impl SpoolEnv {
 
     fn run_uucp(&self, args: &[&str]) -> std::process::Output {
         // Determine the target directory - cargo-llvm-cov uses a custom target dir
+        // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-            .unwrap_or_else(|_| String::from("target"));
+            .unwrap_or_else(|_| {
+                if cfg!(coverage) {
+                    String::from("target/llvm-cov-target")
+                } else {
+                    String::from("target")
+                }
+            });
         let profile = if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -160,9 +167,16 @@ impl SpoolEnv {
 
     fn run_uustat(&self, args: &[&str]) -> std::process::Output {
         // Determine the target directory - cargo-llvm-cov uses a custom target dir
+        // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-            .unwrap_or_else(|_| String::from("target"));
+            .unwrap_or_else(|_| {
+                if cfg!(coverage) {
+                    String::from("target/llvm-cov-target")
+                } else {
+                    String::from("target")
+                }
+            });
         let profile = if cfg!(debug_assertions) {
             "debug"
         } else {

@@ -591,6 +591,10 @@ mod ipc_resource_tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Find the line with our shm_id
             for line in stdout.lines() {
+                // Skip header lines - shm_id might coincidentally match date/timestamp
+                if line.starts_with("IPC status") || line.trim().is_empty() {
+                    continue;
+                }
                 if line.contains(&shm_id.to_string()) {
                     // Mode string should be 11 characters matching pattern
                     // [S-][RC-][rwa][rwa][rwa]

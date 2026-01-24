@@ -853,6 +853,11 @@ fn test_cp_proc_short_read() {
     ignore
 )]
 fn test_cp_special_bits() {
+    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
+        eprintln!("Skipping: NON_ROOT_USERNAME not set");
+        return;
+    };
+
     let test_dir = &format!("{}/test_cp_special_bits", env!("CARGO_TARGET_TMPDIR"));
     let a = &format!("{test_dir}/a");
     let b = &format!("{test_dir}/b");
@@ -883,11 +888,6 @@ fn test_cp_special_bits() {
     #[allow(clippy::unnecessary_cast)]
     let mode_c = 0o554 | libc::S_ISUID as u32 | libc::S_ISGID as u32;
     fs::set_permissions(c, fs::Permissions::from_mode(mode_c)).unwrap();
-
-    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
-        eprintln!("Skipping: NON_ROOT_USERNAME not set");
-        return;
-    };
 
     unsafe {
         let non_root_cstr = CString::new(non_root).unwrap();

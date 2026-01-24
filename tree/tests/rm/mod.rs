@@ -1073,16 +1073,16 @@ fn test_rm_unreadable() {
     ignore
 )]
 fn test_rm_fail_2eperm() {
+    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
+        eprintln!("Skipping: NON_ROOT_USERNAME not set");
+        return;
+    };
+
     let test_dir = &format!("{}/test_rm_fail_2eperm", env!("CARGO_TARGET_TMPDIR"));
     let a = &format!("{test_dir}/a");
     let a_b = &format!("{test_dir}/a/b");
 
     fs::create_dir(test_dir).unwrap();
-
-    let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
-        eprintln!("Skipping: NON_ROOT_USERNAME not set");
-        return;
-    };
 
     // chown $NON_ROOT_USERNAME $test_dir
     unsafe {
@@ -1145,17 +1145,16 @@ fn test_rm_fail_2eperm() {
     ignore
 )]
 fn test_rm_no_give_up() {
-    let test_dir = &format!("{}/test_rm_no_give_up", env!("CARGO_TARGET_TMPDIR"));
-    let d = &format!("{test_dir}/d");
-    let d_f = &format!("{test_dir}/d/f");
-
-    fs::create_dir(test_dir).unwrap();
-
     let Some(non_root) = option_env!("NON_ROOT_USERNAME") else {
         eprintln!("Skipping: NON_ROOT_USERNAME not set");
         return;
     };
 
+    let test_dir = &format!("{}/test_rm_no_give_up", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/d");
+    let d_f = &format!("{test_dir}/d/f");
+
+    fs::create_dir(test_dir).unwrap();
     fs::create_dir(d).unwrap();
     fs::File::create(d_f).unwrap();
 

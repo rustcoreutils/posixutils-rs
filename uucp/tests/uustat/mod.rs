@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{get_binary_path, run_test_with_checker, TestPlan};
 use std::fs;
 use std::process::Output;
 
@@ -134,28 +134,7 @@ impl SpoolEnv {
     }
 
     fn run_uucp(&self, args: &[&str]) -> std::process::Output {
-        // Determine the target directory - cargo-llvm-cov uses a custom target dir
-        // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-        let target_dir = std::env::var("CARGO_TARGET_DIR")
-            .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-            .unwrap_or_else(|_| {
-                if cfg!(coverage) {
-                    String::from("target/llvm-cov-target")
-                } else {
-                    String::from("target")
-                }
-            });
-        let profile = if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        };
-        let relpath = format!("{}/{}/uucp", target_dir, profile);
-        let test_bin_path = std::env::current_dir()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(relpath);
+        let test_bin_path = get_binary_path("uucp");
 
         std::process::Command::new(test_bin_path)
             .args(args)
@@ -166,28 +145,7 @@ impl SpoolEnv {
     }
 
     fn run_uustat(&self, args: &[&str]) -> std::process::Output {
-        // Determine the target directory - cargo-llvm-cov uses a custom target dir
-        // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-        let target_dir = std::env::var("CARGO_TARGET_DIR")
-            .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-            .unwrap_or_else(|_| {
-                if cfg!(coverage) {
-                    String::from("target/llvm-cov-target")
-                } else {
-                    String::from("target")
-                }
-            });
-        let profile = if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        };
-        let relpath = format!("{}/{}/uustat", target_dir, profile);
-        let test_bin_path = std::env::current_dir()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(relpath);
+        let test_bin_path = get_binary_path("uustat");
 
         std::process::Command::new(test_bin_path)
             .args(args)

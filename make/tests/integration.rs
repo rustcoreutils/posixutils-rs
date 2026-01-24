@@ -12,7 +12,7 @@ use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
-use plib::testing::{run_test, run_test_base, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_base, TestPlan};
 
 use posixutils_make::error_code::ErrorCode;
 
@@ -96,32 +96,7 @@ fn run_test_helper_with_setup_and_destruct(
 }
 
 fn manual_test_helper(args: &[&str]) -> Child {
-    // Determine the target directory - cargo-llvm-cov uses a custom target dir
-    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .or_else(|_| env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        });
-
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let relpath = format!("{}/{}/{}", target_dir, profile, "make");
-
-    // Build the full path to the binary
-    let test_bin_path = env::current_dir()
-        .expect("failed to get current directory")
-        .parent()
-        .expect("failed to get parent directory")
-        .join(relpath);
+    let test_bin_path = get_binary_path("make");
 
     // Create and spawn the command
     Command::new(test_bin_path)

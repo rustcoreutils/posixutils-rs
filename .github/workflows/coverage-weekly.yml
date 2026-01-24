@@ -55,7 +55,4 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: true
-          # For public OSS + Codecov GitHub App, leave token unset.
-          # If Codecov ever complains "token required", add CODECOV_TOKEN
-          # in GitHub Secrets and uncomment:
-          # token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ secrets.CODECOV_TOKEN }}

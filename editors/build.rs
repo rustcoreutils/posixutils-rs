@@ -28,24 +28,17 @@ fn main() {
 
 #[cfg(unix)]
 fn create_ex_symlink() {
-    // Get the target directory from environment
-    // CARGO_TARGET_DIR or default to "target"
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .or_else(|_| env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| String::from("target"));
-
-    // Get the profile (debug or release)
-    let profile = env::var("PROFILE").unwrap_or_else(|_| String::from("debug"));
-
-    // Get the workspace root (CARGO_MANIFEST_DIR points to editors/, go up one level)
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let workspace_root = PathBuf::from(&manifest_dir)
-        .parent()
-        .expect("Could not find workspace root")
-        .to_path_buf();
-
-    // Build path to target directory
-    let bin_dir = workspace_root.join(&target_dir).join(&profile);
+    // Use OUT_DIR to determine the actual target directory
+    // OUT_DIR is like: <target_dir>/<profile>/build/<crate>-<hash>/out
+    // We need to go up to: <target_dir>/<profile>/
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let bin_dir = PathBuf::from(&out_dir)
+        .parent() // out
+        .and_then(|p| p.parent()) // <crate>-<hash>
+        .and_then(|p| p.parent()) // build
+        .and_then(|p| p.parent()) // <profile>
+        .map(|p| p.to_path_buf())
+        .expect("Could not determine target directory from OUT_DIR");
 
     // Create the target directory if it doesn't exist
     // (it may not exist on first build)

@@ -31,9 +31,16 @@ fn run_test_find_sorted(
 ) {
     let project_root = env!("CARGO_MANIFEST_DIR");
     // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| String::from("target"));
+        .unwrap_or_else(|_| {
+            if cfg!(coverage) {
+                String::from("target/llvm-cov-target")
+            } else {
+                String::from("target")
+            }
+        });
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
@@ -271,9 +278,16 @@ fn find_newer_test() {
 fn run_test_find_print0_sorted(args: &[&str], expected_paths: &[&str], expected_exit_code: i32) {
     let project_root = env!("CARGO_MANIFEST_DIR");
     // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| String::from("target"));
+        .unwrap_or_else(|_| {
+            if cfg!(coverage) {
+                String::from("target/llvm-cov-target")
+            } else {
+                String::from("target")
+            }
+        });
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {

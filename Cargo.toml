@@ -56,5 +56,7 @@ thiserror = "1"
 pest = { version = "2", default-features = false }
 pest_derive = "2"
 
-[workspace.lints]
+[workspace.lints.rust]
+# Allow `cfg(coverage)` which is set by cargo-llvm-cov during coverage builds
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 

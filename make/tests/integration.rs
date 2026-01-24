@@ -97,9 +97,16 @@ fn run_test_helper_with_setup_and_destruct(
 
 fn manual_test_helper(args: &[&str]) -> Child {
     // Determine the target directory - cargo-llvm-cov uses a custom target dir
+    // When built with cargo-llvm-cov, cfg(coverage) is set and target is in llvm-cov-target subdir
     let target_dir = env::var("CARGO_TARGET_DIR")
         .or_else(|_| env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| String::from("target"));
+        .unwrap_or_else(|_| {
+            if cfg!(coverage) {
+                String::from("target/llvm-cov-target")
+            } else {
+                String::from("target")
+            }
+        });
 
     let profile = if cfg!(debug_assertions) {
         "debug"

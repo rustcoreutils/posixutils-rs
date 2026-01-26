@@ -151,6 +151,7 @@ impl Screen {
     }
 
     /// Expand tabs and control characters for display.
+    /// Returns the expanded string, potentially longer than max_cols.
     pub fn expand_line(&self, line: &str, max_cols: usize) -> String {
         let mut result = String::new();
         let mut col = 0;
@@ -189,23 +190,94 @@ impl Screen {
         result
     }
 
+    /// Expand and wrap a line into multiple display rows.
+    /// Returns a vector of strings, each representing one wrapped display row.
+    fn expand_and_wrap_line(&self, line: &str, max_cols: usize) -> Vec<String> {
+        if max_cols == 0 {
+            return vec![String::new()];
+        }
+
+        let mut wrapped_rows = Vec::new();
+        let mut current_row = String::new();
+        let mut col = 0;
+
+        for c in line.chars() {
+            let char_width = match c {
+                '\t' => self.tabstop - (col % self.tabstop),
+                c if c.is_control() => 2, // ^X format
+                _ => 1,
+            };
+
+            // If adding this character would exceed the line width, wrap
+            if col + char_width > max_cols && col > 0 {
+                wrapped_rows.push(current_row.clone());
+                current_row.clear();
+                col = 0;
+            }
+
+            // Add the character to the current row
+            match c {
+                '\t' => {
+                    let spaces = self.tabstop - (col % self.tabstop);
+                    for _ in 0..spaces {
+                        current_row.push(' ');
+                    }
+                    col += spaces;
+                }
+                c if c.is_control() => {
+                    current_row.push('^');
+                    current_row.push((c as u8 ^ 0x40) as char);
+                    col += 2;
+                }
+                c => {
+                    current_row.push(c);
+                    col += 1;
+                }
+            }
+        }
+
+        // Add the final row if it has content
+        if !current_row.is_empty() || wrapped_rows.is_empty() {
+            wrapped_rows.push(current_row);
+        }
+
+        wrapped_rows
+    }
+
     /// Update the screen from the buffer.
+    /// Handles line wrapping per POSIX requirements.
     pub fn update_from_buffer(&mut self, buffer: &Buffer) {
         let text_rows = self.text_rows();
         let cols = self.size.cols as usize;
 
-        for row in 0..text_rows {
-            let buffer_line = self.top_line + row;
+        let mut screen_row = 0;
+        let mut buffer_line = self.top_line;
+
+        while screen_row < text_rows {
             if buffer_line <= buffer.line_count() {
                 if let Some(line) = buffer.line(buffer_line) {
-                    let content = self.expand_line(line.content(), cols);
-                    self.rows[row].set(&content);
+                    // Expand and wrap the line
+                    let wrapped = self.expand_and_wrap_line(line.content(), cols);
+
+                    // Display as many wrapped rows as will fit
+                    for wrapped_row in wrapped {
+                        if screen_row >= text_rows {
+                            break;
+                        }
+                        self.rows[screen_row].set(&wrapped_row);
+                        screen_row += 1;
+                    }
+                    buffer_line += 1;
                 } else {
-                    self.rows[row].set("~");
+                    self.rows[screen_row].set("~");
+                    screen_row += 1;
+                    buffer_line += 1;
                 }
             } else {
                 // Past end of buffer - show tilde
-                self.rows[row].set("~");
+                self.rows[screen_row].set("~");
+                screen_row += 1;
+                buffer_line += 1;
             }
         }
     }
@@ -360,5 +432,43 @@ mod tests {
         // Line 15 requires scrolling
         screen.scroll_to_line(15, 100);
         assert_eq!(screen.top_line(), 7); // 15 - 9 + 1 = 7
+    }
+
+    #[test]
+    fn test_expand_and_wrap_line_short() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 80 });
+        let wrapped = screen.expand_and_wrap_line("hello", 80);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], "hello");
+    }
+
+    #[test]
+    fn test_expand_and_wrap_line_long() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 10 });
+        let long_line = "this is a very long line that should wrap";
+        let wrapped = screen.expand_and_wrap_line(long_line, 10);
+        // Should wrap into multiple rows
+        assert!(wrapped.len() > 1);
+        // First row should be 10 chars
+        assert_eq!(wrapped[0], "this is a ");
+        assert_eq!(wrapped[1], "very long ");
+    }
+
+    #[test]
+    fn test_expand_and_wrap_line_with_tabs() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 10 });
+        let line_with_tabs = "ab\tcd\tef";
+        let wrapped = screen.expand_and_wrap_line(line_with_tabs, 10);
+        // Tab at position 2 expands to 6 spaces (to column 8)
+        // So: "ab      cd" (10 chars) wraps, then tab after "cd" continues
+        assert!(wrapped.len() >= 2);
+    }
+
+    #[test]
+    fn test_expand_and_wrap_empty_line() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 80 });
+        let wrapped = screen.expand_and_wrap_line("", 80);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], "");
     }
 }

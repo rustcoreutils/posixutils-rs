@@ -39,6 +39,23 @@ pub fn run_pax_with_stdin(args: &[&str], stdin_data: Option<&str>) -> Output {
     }
 }
 
+/// Run pax with given arguments and binary stdin data, return output
+pub fn run_pax_with_stdin_bytes(args: &[&str], stdin_data: &[u8]) -> Output {
+    use std::process::Stdio;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn pax");
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(stdin_data).expect("Failed to write stdin");
+    }
+
+    child.wait_with_output().expect("Failed to wait for pax")
+}
+
 /// Run pax with given arguments in a specific directory
 pub fn run_pax_in_dir(args: &[&str], dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_pax"))

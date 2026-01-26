@@ -176,6 +176,89 @@ fn test_option_listopt_with_literal() {
 }
 
 #[test]
+fn test_option_listopt_mode_precision() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("mode.txt")).unwrap();
+    writeln!(f, "Mode test").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    let output = run_pax(&["-f", archive.to_str().unwrap(), "-o", "listopt=%.1M"]);
+    assert_success(&output, "pax list with listopt=%.1M");
+
+    let listing = stdout_str(&output);
+    let lines: Vec<&str> = listing.lines().filter(|line| !line.is_empty()).collect();
+    assert!(!lines.is_empty(), "Listing should contain entries");
+    for line in lines {
+        assert_eq!(line.len(), 1, "Listing should be single char");
+        assert!(
+            matches!(
+                line.chars().next(),
+                Some('-')
+                    | Some('d')
+                    | Some('l')
+                    | Some('b')
+                    | Some('c')
+                    | Some('p')
+                    | Some('s')
+                    | Some('h')
+            ),
+            "Listing should be entry type character (got: {})",
+            line
+        );
+    }
+}
+
+#[test]
+fn test_option_listopt_mode_precision_stdin() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("mode_stdin.txt")).unwrap();
+    writeln!(f, "Mode stdin test").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    let archive_data = fs::read(&archive).expect("Failed to read archive");
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%.1M"], &archive_data);
+    assert_success(&output, "pax list with listopt=%.1M via stdin");
+
+    let listing = stdout_str(&output);
+    let lines: Vec<&str> = listing.lines().filter(|line| !line.is_empty()).collect();
+    assert!(!lines.is_empty(), "Listing should contain entries");
+    for line in lines {
+        assert_eq!(line.len(), 1, "Listing should be single char");
+        assert!(
+            matches!(
+                line.chars().next(),
+                Some('-')
+                    | Some('d')
+                    | Some('l')
+                    | Some('b')
+                    | Some('c')
+                    | Some('p')
+                    | Some('s')
+                    | Some('h')
+            ),
+            "Listing should be entry type character (got: {})",
+            line
+        );
+    }
+}
+
+#[test]
 fn test_option_cpio_format() {
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");

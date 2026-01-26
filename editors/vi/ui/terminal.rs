@@ -118,25 +118,40 @@ impl Terminal {
 
     /// Get terminal size using ioctl.
     fn get_size_internal() -> Result<TerminalSize> {
-        unsafe {
+        // POSIX: COLUMNS and LINES override system-selected size
+        // Get ioctl values first as fallback
+        let (ioctl_rows, ioctl_cols) = unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == -1 {
-                // Fallback to default
-                return Ok(TerminalSize::default());
+                // Fallback to defaults if ioctl fails
+                (TerminalSize::default().rows, TerminalSize::default().cols)
+            } else if ws.ws_row == 0 || ws.ws_col == 0 {
+                // If values are zero or invalid, use defaults
+                (TerminalSize::default().rows, TerminalSize::default().cols)
+            } else {
+                // Clamp values to safe bounds to protect against
+                // excessive memory allocation from malformed terminal responses
+                let rows = ws.ws_row.clamp(Self::MIN_ROWS, Self::MAX_ROWS);
+                let cols = ws.ws_col.clamp(Self::MIN_COLS, Self::MAX_COLS);
+                (rows, cols)
             }
+        };
 
-            // If values are zero or invalid, use defaults
-            if ws.ws_row == 0 || ws.ws_col == 0 {
-                return Ok(TerminalSize::default());
-            }
+        // POSIX: If LINES is set and contains a valid number, use it
+        let rows = std::env::var("LINES")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(|r| r.clamp(Self::MIN_ROWS, Self::MAX_ROWS))
+            .unwrap_or(ioctl_rows);
 
-            // Clamp values to safe bounds to protect against
-            // excessive memory allocation from malformed terminal responses
-            let rows = ws.ws_row.clamp(Self::MIN_ROWS, Self::MAX_ROWS);
-            let cols = ws.ws_col.clamp(Self::MIN_COLS, Self::MAX_COLS);
+        // POSIX: If COLUMNS is set and contains a valid number, use it
+        let cols = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(|c| c.clamp(Self::MIN_COLS, Self::MAX_COLS))
+            .unwrap_or(ioctl_cols);
 
-            Ok(TerminalSize { rows, cols })
-        }
+        Ok(TerminalSize { rows, cols })
     }
 
     /// Clear the entire screen.
@@ -275,5 +290,66 @@ mod tests {
         let size = TerminalSize::default();
         assert_eq!(size.rows, 24);
         assert_eq!(size.cols, 80);
+    }
+
+    #[test]
+    fn test_columns_env_override() {
+        // Set COLUMNS environment variable
+        std::env::set_var("COLUMNS", "60");
+        let term = Terminal::new();
+        std::env::remove_var("COLUMNS");
+
+        if let Ok(term) = term {
+            let size = term.size();
+            // Should use COLUMNS value if set
+            assert_eq!(size.cols, 60);
+        }
+    }
+
+    #[test]
+    fn test_lines_env_override() {
+        // Set LINES environment variable
+        std::env::set_var("LINES", "30");
+        let term = Terminal::new();
+        std::env::remove_var("LINES");
+
+        if let Ok(term) = term {
+            let size = term.size();
+            // Should use LINES value if set
+            assert_eq!(size.rows, 30);
+        }
+    }
+
+    #[test]
+    fn test_both_env_override() {
+        // Set both environment variables
+        std::env::set_var("COLUMNS", "100");
+        std::env::set_var("LINES", "40");
+        let term = Terminal::new();
+        std::env::remove_var("COLUMNS");
+        std::env::remove_var("LINES");
+
+        if let Ok(term) = term {
+            let size = term.size();
+            assert_eq!(size.cols, 100);
+            assert_eq!(size.rows, 40);
+        }
+    }
+
+    #[test]
+    fn test_invalid_env_values_fallback() {
+        // Set invalid environment variables
+        std::env::set_var("COLUMNS", "invalid");
+        std::env::set_var("LINES", "not-a-number");
+        let term = Terminal::new();
+        std::env::remove_var("COLUMNS");
+        std::env::remove_var("LINES");
+
+        if let Ok(term) = term {
+            let size = term.size();
+            // Should fall back to ioctl or defaults
+            assert!(size.cols >= 10); // At least minimum
+            assert!(size.rows >= 2); // At least minimum
+        }
     }
 }

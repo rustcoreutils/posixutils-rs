@@ -39,6 +39,10 @@ pub struct Screen {
     size: TerminalSize,
     /// First line of buffer shown on screen (1-indexed).
     top_line: usize,
+    /// Offset into wrapped rows of top_line (0-indexed).
+    /// When a buffer line wraps across multiple display rows,
+    /// this indicates which wrapped row to start displaying from.
+    top_line_offset: usize,
     /// Message to display on status line.
     message: String,
     /// Whether message is an error.
@@ -58,6 +62,7 @@ impl Screen {
             rows,
             size,
             top_line: 1,
+            top_line_offset: 0,
             message: String::new(),
             message_is_error: false,
             tabstop: 8,
@@ -83,10 +88,16 @@ impl Screen {
         self.top_line
     }
 
+    /// Get the wrapped row offset within the top line (0-indexed).
+    pub fn top_line_offset(&self) -> usize {
+        self.top_line_offset
+    }
+
     /// Set the top line.
     pub fn set_top_line(&mut self, line: usize) {
         if self.top_line != line {
             self.top_line = line.max(1);
+            self.top_line_offset = 0;
             self.mark_all_dirty();
         }
     }
@@ -128,29 +139,93 @@ impl Screen {
         self.message_is_error = false;
     }
 
-    /// Scroll to make a line visible.
-    pub fn scroll_to_line(&mut self, line: usize, buffer_lines: usize) {
+    /// Scroll to make a line visible, accounting for wrapped lines.
+    pub fn scroll_to_line(&mut self, line: usize, buffer: &Buffer) {
         let text_rows = self.text_rows();
         if text_rows == 0 {
             return;
         }
 
-        // If line is above the screen
+        let cols = self.size.cols as usize;
+
+        // If target line is above the current top line, scroll up to show it
         if line < self.top_line {
-            self.set_top_line(line);
-        }
-        // If line is below the screen
-        else if line >= self.top_line + text_rows {
-            self.set_top_line(line - text_rows + 1);
+            self.top_line = line;
+            self.top_line_offset = 0;
+            self.mark_all_dirty();
+            return;
         }
 
-        // Ensure we don't scroll past the end of the buffer
-        if buffer_lines > 0 && self.top_line > buffer_lines {
-            self.set_top_line(buffer_lines);
+        // Compute display row position of the target line relative to top_line
+        let mut display_row = 0;
+        let mut current_line = self.top_line;
+
+        // Skip wrapped rows from the top line offset
+        if let Some(top_content) = buffer.line(self.top_line) {
+            let wrapped_count = self.compute_wrapped_row_count(top_content.content(), cols);
+            if self.top_line_offset < wrapped_count {
+                display_row = wrapped_count - self.top_line_offset;
+            }
+            current_line += 1;
+        }
+
+        // Accumulate display rows until we reach the target line
+        while current_line < line && current_line <= buffer.line_count() {
+            if let Some(content) = buffer.line(current_line) {
+                display_row += self.compute_wrapped_row_count(content.content(), cols);
+            } else {
+                display_row += 1;
+            }
+            current_line += 1;
+        }
+
+        // Get wrapped row count for the target line
+        let target_wrapped_count = if let Some(content) = buffer.line(line) {
+            self.compute_wrapped_row_count(content.content(), cols)
+        } else {
+            1
+        };
+
+        // Check if the target line fits in the visible window
+        if display_row + target_wrapped_count <= text_rows {
+            // Target line is fully visible, no scroll needed
+            return;
+        }
+
+        // Target line is below the visible area; scroll down
+        // Position target line at the bottom of the screen
+        let mut new_top_line = line;
+        let mut new_top_offset = 0;
+        let mut rows_needed = target_wrapped_count;
+
+        // Walk backwards from target line to fill the screen
+        while rows_needed < text_rows && new_top_line > 1 {
+            let prev_line = new_top_line - 1;
+            if let Some(content) = buffer.line(prev_line) {
+                let prev_wrapped = self.compute_wrapped_row_count(content.content(), cols);
+                if rows_needed + prev_wrapped <= text_rows {
+                    rows_needed += prev_wrapped;
+                    new_top_line = prev_line;
+                } else {
+                    // This line doesn't fully fit; show partial
+                    new_top_offset = prev_wrapped - (text_rows - rows_needed);
+                    new_top_line = prev_line;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if self.top_line != new_top_line || self.top_line_offset != new_top_offset {
+            self.top_line = new_top_line.max(1);
+            self.top_line_offset = new_top_offset;
+            self.mark_all_dirty();
         }
     }
 
     /// Expand tabs and control characters for display.
+    /// Returns the expanded string, potentially longer than max_cols.
     pub fn expand_line(&self, line: &str, max_cols: usize) -> String {
         let mut result = String::new();
         let mut col = 0;
@@ -189,23 +264,128 @@ impl Screen {
         result
     }
 
+    /// Compute how many wrapped display rows a buffer line occupies.
+    fn compute_wrapped_row_count(&self, line: &str, max_cols: usize) -> usize {
+        if max_cols == 0 {
+            return 1;
+        }
+
+        let mut row_count = 0;
+        let mut col = 0;
+
+        for c in line.chars() {
+            let char_width = match c {
+                '\t' => self.tabstop - (col % self.tabstop),
+                c if c.is_control() => 2,
+                _ => 1,
+            };
+
+            // If adding this character would exceed the line width, wrap
+            if col + char_width > max_cols && col > 0 {
+                row_count += 1;
+                col = 0;
+            }
+
+            col += char_width;
+        }
+
+        // Count the final row
+        row_count + 1
+    }
+
+    /// Expand and wrap a line into multiple display rows.
+    /// Returns a vector of strings, each representing one wrapped display row.
+    fn expand_and_wrap_line(&self, line: &str, max_cols: usize) -> Vec<String> {
+        if max_cols == 0 {
+            return vec![String::new()];
+        }
+
+        let mut wrapped_rows = Vec::new();
+        let mut current_row = String::new();
+        let mut col = 0;
+
+        for c in line.chars() {
+            let char_width = match c {
+                '\t' => self.tabstop - (col % self.tabstop),
+                c if c.is_control() => 2, // ^X format
+                _ => 1,
+            };
+
+            // If adding this character would exceed the line width, wrap
+            if col + char_width > max_cols && col > 0 {
+                wrapped_rows.push(current_row.clone());
+                current_row.clear();
+                col = 0;
+            }
+
+            // Add the character to the current row
+            match c {
+                '\t' => {
+                    let spaces = self.tabstop - (col % self.tabstop);
+                    for _ in 0..spaces {
+                        current_row.push(' ');
+                    }
+                    col += spaces;
+                }
+                c if c.is_control() => {
+                    current_row.push('^');
+                    current_row.push((c as u8 ^ 0x40) as char);
+                    col += 2;
+                }
+                c => {
+                    current_row.push(c);
+                    col += 1;
+                }
+            }
+        }
+
+        // Add the final row if it has content
+        if !current_row.is_empty() || wrapped_rows.is_empty() {
+            wrapped_rows.push(current_row);
+        }
+
+        wrapped_rows
+    }
+
     /// Update the screen from the buffer.
+    /// Handles line wrapping per POSIX requirements.
     pub fn update_from_buffer(&mut self, buffer: &Buffer) {
         let text_rows = self.text_rows();
         let cols = self.size.cols as usize;
 
-        for row in 0..text_rows {
-            let buffer_line = self.top_line + row;
+        let mut screen_row = 0;
+        let mut buffer_line = self.top_line;
+        let mut skip_wrapped_rows = self.top_line_offset;
+
+        while screen_row < text_rows {
             if buffer_line <= buffer.line_count() {
                 if let Some(line) = buffer.line(buffer_line) {
-                    let content = self.expand_line(line.content(), cols);
-                    self.rows[row].set(&content);
+                    // Expand and wrap the line
+                    let wrapped = self.expand_and_wrap_line(line.content(), cols);
+
+                    // Skip wrapped rows if we're starting mid-line
+                    for wrapped_row in wrapped.iter() {
+                        if skip_wrapped_rows > 0 {
+                            skip_wrapped_rows -= 1;
+                            continue;
+                        }
+                        if screen_row >= text_rows {
+                            break;
+                        }
+                        self.rows[screen_row].set(wrapped_row);
+                        screen_row += 1;
+                    }
+                    buffer_line += 1;
                 } else {
-                    self.rows[row].set("~");
+                    self.rows[screen_row].set("~");
+                    screen_row += 1;
+                    buffer_line += 1;
                 }
             } else {
                 // Past end of buffer - show tilde
-                self.rows[row].set("~");
+                self.rows[screen_row].set("~");
+                screen_row += 1;
+                buffer_line += 1;
             }
         }
     }
@@ -350,15 +530,65 @@ mod tests {
 
     #[test]
     fn test_scroll_to_line() {
+        use crate::buffer::Buffer;
+
         let mut screen = Screen::new(TerminalSize { rows: 10, cols: 80 });
         // text_rows = 9 (minus status line)
 
+        // Create a buffer with 100 lines
+        let mut lines = String::new();
+        for i in 1..=100 {
+            if i > 1 {
+                lines.push('\n');
+            }
+            lines.push_str(&format!("Line {}", i));
+        }
+        let buffer = Buffer::from_text(&lines);
+
         // Line 5 should be visible without scrolling
-        screen.scroll_to_line(5, 100);
+        screen.scroll_to_line(5, &buffer);
         assert_eq!(screen.top_line(), 1);
 
         // Line 15 requires scrolling
-        screen.scroll_to_line(15, 100);
+        screen.scroll_to_line(15, &buffer);
         assert_eq!(screen.top_line(), 7); // 15 - 9 + 1 = 7
+    }
+
+    #[test]
+    fn test_expand_and_wrap_line_short() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 80 });
+        let wrapped = screen.expand_and_wrap_line("hello", 80);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], "hello");
+    }
+
+    #[test]
+    fn test_expand_and_wrap_line_long() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 10 });
+        let long_line = "this is a very long line that should wrap";
+        let wrapped = screen.expand_and_wrap_line(long_line, 10);
+        // Should wrap into multiple rows
+        assert!(wrapped.len() > 1);
+        // First row should be 10 chars
+        assert_eq!(wrapped[0], "this is a ");
+        assert_eq!(wrapped[1], "very long ");
+    }
+
+    #[test]
+    fn test_expand_and_wrap_line_with_tabs() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 10 });
+        let line_with_tabs = "ab\tcd\tef";
+        let wrapped = screen.expand_and_wrap_line(line_with_tabs, 10);
+        // Tab at position 2 expands to 6 spaces (to column 8)
+        // So: "ab      cd" (10 chars) wraps, then tab after "cd" continues
+        assert!(wrapped.len() >= 2);
+    }
+
+    #[test]
+    fn test_expand_and_wrap_empty_line() {
+        let screen = Screen::new(TerminalSize { rows: 24, cols: 80 });
+        let wrapped = screen.expand_and_wrap_line("", 80);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], "");
     }
 }

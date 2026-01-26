@@ -2830,8 +2830,7 @@ impl Editor {
         };
 
         self.buffer.set_cursor(pos);
-        self.screen
-            .scroll_to_line(pos.line, self.buffer.line_count());
+        self.screen.scroll_to_line(pos.line, &self.buffer);
 
         Ok(())
     }
@@ -3018,7 +3017,7 @@ impl Editor {
         let size = self.terminal.size();
         self.screen.resize(size);
         self.screen
-            .scroll_to_line(self.buffer.cursor().line, self.buffer.line_count());
+            .scroll_to_line(self.buffer.cursor().line, &self.buffer);
 
         self.terminal.hide_cursor()?;
         self.terminal.move_cursor_home()?;

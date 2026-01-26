@@ -538,20 +538,10 @@ pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
 
     while let Some(c) = chars.next() {
         if c == '%' {
-            match chars.next() {
-                Some(spec) => {
-                    if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec)
-                    {
-                        result.push_str(&handler(info));
-                    } else {
-                        // Unknown specifier - include literally
-                        result.push('%');
-                        result.push(spec);
-                    }
-                }
-                None => {
-                    result.push('%');
-                }
+            if let Some(spec) = parse_format_specifier(&mut chars) {
+                result.push_str(&format_with_spec(info, spec));
+            } else {
+                result.push('%');
             }
         } else {
             result.push(c);
@@ -559,6 +549,94 @@ pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
     }
 
     result
+}
+
+/// Maximum allowed width or precision for listopt format specifiers.
+/// This prevents unbounded memory allocation from malicious format strings.
+/// 4096 is chosen as a safe upper bound that accommodates legitimate use cases
+/// while preventing OOM attacks via enormous padding strings.
+const MAX_FORMAT_FIELD_SIZE: usize = 4096;
+
+#[derive(Default)]
+struct FormatSpec {
+    left_justify: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+    spec: char,
+}
+
+fn parse_format_specifier(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<FormatSpec> {
+    let mut spec = FormatSpec::default();
+
+    while let Some('-') = chars.peek().copied() {
+        spec.left_justify = true;
+        chars.next();
+    }
+
+    spec.width = parse_number(chars).map(|w| w.min(MAX_FORMAT_FIELD_SIZE));
+
+    if let Some('.') = chars.peek().copied() {
+        chars.next();
+        spec.precision = parse_number(chars)
+            .map(|p| p.min(MAX_FORMAT_FIELD_SIZE))
+            .or(Some(0));
+    }
+
+    spec.spec = chars.next()?;
+    Some(spec)
+}
+
+fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<usize> {
+    let mut value: usize = 0;
+    let mut seen = false;
+
+    while let Some(c) = chars.peek().copied() {
+        if let Some(digit) = c.to_digit(10) {
+            seen = true;
+            value = value.saturating_mul(10).saturating_add(digit as usize);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    if seen {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
+    let mut rendered =
+        if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
+            handler(info)
+        } else {
+            let mut literal = String::from("%");
+            literal.push(spec.spec);
+            literal
+        };
+
+    if let Some(precision) = spec.precision {
+        if rendered.len() > precision {
+            rendered.truncate(precision);
+        }
+    }
+
+    if let Some(width) = spec.width {
+        if rendered.len() < width {
+            let padding = width - rendered.len();
+            if spec.left_justify {
+                rendered.push_str(&" ".repeat(padding));
+            } else {
+                rendered = format!("{}{}", " ".repeat(padding), rendered);
+            }
+        }
+    }
+
+    rendered
 }
 
 /// Entry type to file type character mapping for symbolic mode display

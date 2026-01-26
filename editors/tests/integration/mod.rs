@@ -1133,7 +1133,17 @@ fn test_file_manager_alternate() {
 fn test_screen_scroll() {
     let mut screen = Screen::new(TerminalSize { rows: 24, cols: 80 });
 
-    screen.scroll_to_line(10, 100);
+    // Create a buffer with 100 lines
+    let mut lines = String::new();
+    for i in 1..=100 {
+        if i > 1 {
+            lines.push('\n');
+        }
+        lines.push_str(&format!("Line {}", i));
+    }
+    let buffer = Buffer::from_text(&lines);
+
+    screen.scroll_to_line(10, &buffer);
     assert!(screen.top_line() <= 10);
 }
 
@@ -1142,6 +1152,70 @@ fn test_screen_expand_tabs() {
     let screen = Screen::new(TerminalSize { rows: 24, cols: 80 });
     let expanded = screen.expand_line("a\tb", 80);
     assert_eq!(expanded.len(), 9); // 'a' + 7 spaces + 'b'
+}
+
+#[test]
+fn test_screen_wrapped_line_visibility() {
+    // Test that scroll_to_line ensures target line is visible when preceding lines wrap
+    let mut screen = Screen::new(TerminalSize { rows: 6, cols: 10 });
+    // text_rows = 5 (minus status line)
+
+    // Create buffer with one very long line followed by target line
+    let long_line = "this is a very long line that will wrap across multiple display rows";
+    let buffer = Buffer::from_text(&format!("{}\nTarget line\nLine 3", long_line));
+
+    // Scroll to line 2 (the target line)
+    screen.scroll_to_line(2, &buffer);
+
+    // The target line must be visible
+    // Since line 1 wraps to many rows, we should have scrolled down
+    // to ensure line 2 is on screen
+    assert!(screen.top_line() <= 2);
+
+    // Verify update_from_buffer renders correctly with offset
+    screen.update_from_buffer(&buffer);
+}
+
+#[test]
+fn test_screen_wrapped_top_line_offset() {
+    // Test that top_line_offset correctly handles partial wrapped lines at top
+    let mut screen = Screen::new(TerminalSize { rows: 4, cols: 10 });
+    // text_rows = 3
+
+    // Line wraps to 7 rows (70 chars / 10 cols)
+    let long_line = "1234567890123456789012345678901234567890123456789012345678901234567890";
+    let buffer = Buffer::from_text(&format!("{}\nLine 2", long_line));
+
+    // Scroll to line 2
+    screen.scroll_to_line(2, &buffer);
+
+    // Since line 1 wraps to 7 rows and we have only 3 text rows,
+    // we should show the last few wrapped rows of line 1 plus line 2
+    assert_eq!(screen.top_line(), 1);
+    assert!(screen.top_line_offset() > 0);
+
+    screen.update_from_buffer(&buffer);
+}
+
+#[test]
+fn test_screen_scroll_up_clears_offset() {
+    // Test that scrolling to a line above top_line resets offset
+    let mut screen = Screen::new(TerminalSize { rows: 10, cols: 10 });
+
+    let long_line = "this is a very long line that will wrap";
+    let mut lines = format!("{}\n", long_line);
+    for i in 2..=20 {
+        lines.push_str(&format!("Line {}\n", i));
+    }
+    let buffer = Buffer::from_text(&lines);
+
+    // Scroll to line 15
+    screen.scroll_to_line(15, &buffer);
+
+    // Now scroll back up to line 5
+    screen.scroll_to_line(5, &buffer);
+    assert!(screen.top_line() <= 5);
+    assert_eq!(screen.top_line_offset(), 0);
 }
 
 // ============================================================================

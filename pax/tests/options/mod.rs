@@ -259,6 +259,56 @@ fn test_option_listopt_mode_precision_stdin() {
 }
 
 #[test]
+fn test_option_listopt_oversized_width_precision() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("oversized.txt")).unwrap();
+    writeln!(f, "Oversized format test").unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src_dir,
+    );
+
+    // Test with extremely large width that would cause OOM without clamping
+    let output = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        "listopt=%9999999999999999p",
+    ]);
+    assert_success(&output, "pax list with oversized width should not OOM");
+
+    let listing = stdout_str(&output);
+    // Should complete without OOM and produce reasonable output
+    assert!(!listing.is_empty(), "Listing should not be empty");
+    // Width should be clamped to MAX_FORMAT_FIELD_SIZE (4096)
+    // Each line should not exceed 4096 + reasonable path length
+    for line in listing.lines().filter(|l| !l.is_empty()) {
+        assert!(
+            line.len() <= 8192,
+            "Line should not exceed reasonable length (got {})",
+            line.len()
+        );
+    }
+
+    // Test with extremely large precision
+    let output = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        "listopt=%.9999999999999999M",
+    ]);
+    assert_success(&output, "pax list with oversized precision should not OOM");
+
+    let listing = stdout_str(&output);
+    assert!(!listing.is_empty(), "Listing should not be empty");
+}
+
+#[test]
 fn test_option_cpio_format() {
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");

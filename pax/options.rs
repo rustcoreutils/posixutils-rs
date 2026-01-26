@@ -551,6 +551,12 @@ pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
     result
 }
 
+/// Maximum allowed width or precision for listopt format specifiers.
+/// This prevents unbounded memory allocation from malicious format strings.
+/// 4096 is chosen as a safe upper bound that accommodates legitimate use cases
+/// while preventing OOM attacks via enormous padding strings.
+const MAX_FORMAT_FIELD_SIZE: usize = 4096;
+
 #[derive(Default)]
 struct FormatSpec {
     left_justify: bool,
@@ -569,11 +575,13 @@ fn parse_format_specifier(
         chars.next();
     }
 
-    spec.width = parse_number(chars);
+    spec.width = parse_number(chars).map(|w| w.min(MAX_FORMAT_FIELD_SIZE));
 
     if let Some('.') = chars.peek().copied() {
         chars.next();
-        spec.precision = parse_number(chars).or(Some(0));
+        spec.precision = parse_number(chars)
+            .map(|p| p.min(MAX_FORMAT_FIELD_SIZE))
+            .or(Some(0));
     }
 
     spec.spec = chars.next()?;

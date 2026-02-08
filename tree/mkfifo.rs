@@ -33,9 +33,9 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
     // When mode is explicitly specified with -m, bypass umask per POSIX spec
     // When no mode is specified, let umask apply normally
     let old_umask = if explicit_mode {
-        unsafe { libc::umask(0) }
+        Some(unsafe { libc::umask(0) })
     } else {
-        0 // Dummy value, won't be used
+        None
     };
 
     let res = unsafe {
@@ -46,8 +46,8 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
     };
 
     // Restore the original umask if we changed it
-    if explicit_mode {
-        unsafe { libc::umask(old_umask) };
+    if let Some(umask) = old_umask {
+        unsafe { libc::umask(umask) };
     }
 
     if res < 0 {

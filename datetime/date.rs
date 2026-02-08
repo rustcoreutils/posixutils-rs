@@ -24,7 +24,7 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
     // Try to get TZ environment variable
     if let Ok(tz_str) = env::var("TZ") {
         // Handle special cases for UTC
-        if tz_str == "UTC" || tz_str == "UTC0" || tz_str.is_empty() {
+        if tz_str == "UTC" || tz_str == "UTC0" {
             return "UTC".to_string();
         }
         
@@ -80,9 +80,27 @@ fn parse_format_string_with_tz(formatstr: &str, tz_abbr: &str) -> String {
     result
 }
 
+/// Check if a format string contains an unescaped %Z
+fn contains_unescaped_tz(formatstr: &str) -> bool {
+    let mut chars = formatstr.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let Some(&next_ch) = chars.peek() {
+                if next_ch == 'Z' {
+                    return true;
+                } else if next_ch == '%' {
+                    // Skip escaped %%
+                    chars.next();
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Format a datetime string, replacing %Z with proper timezone abbreviation
 fn format_with_timezone_local(formatstr: &str, dt: &DateTime<Local>) -> String {
-    if formatstr.contains("%Z") {
+    if contains_unescaped_tz(formatstr) {
         let tz_abbr = get_timezone_abbreviation(dt);
         let modified_format = parse_format_string_with_tz(formatstr, &tz_abbr);
         dt.format(&modified_format).to_string()
@@ -93,7 +111,7 @@ fn format_with_timezone_local(formatstr: &str, dt: &DateTime<Local>) -> String {
 
 /// Format a datetime string for UTC, replacing %Z with "UTC"
 fn format_with_timezone_utc(formatstr: &str, dt: &DateTime<Utc>) -> String {
-    if formatstr.contains("%Z") {
+    if contains_unescaped_tz(formatstr) {
         let modified_format = parse_format_string_with_tz(formatstr, "UTC");
         dt.format(&modified_format).to_string()
     } else {

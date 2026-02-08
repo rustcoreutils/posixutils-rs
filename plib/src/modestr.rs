@@ -289,9 +289,11 @@ pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
                     if who_is_not_specified {
                         let umask = get_umask();
 
-                        user &= !(rwx << 6) & !umask;
-                        group &= !(rwx << 3) & !umask;
-                        others &= !rwx & !umask;
+                        // When who is not specified, umask protects bits from being removed
+                        // We remove bits in rwx, except those protected by umask
+                        user &= !(rwx << 6) | (umask & (S_IRWXU as u32));
+                        group &= !(rwx << 3) | (umask & (S_IRWXG as u32));
+                        others &= !rwx | (umask & (S_IRWXO as u32));
                     }
                 }
 

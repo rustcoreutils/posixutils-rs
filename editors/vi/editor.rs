@@ -3033,7 +3033,7 @@ impl Editor {
         while buffer_line < cursor_line && screen_row <= max_rows {
             if let Some(line) = self.buffer.line(buffer_line) {
                 let wrapped = self.screen.expand_and_wrap_line(line.content(), cols);
-                
+
                 // Skip wrapped rows from top_offset for the first line
                 if buffer_line == top_line && skip_wrapped_rows > 0 {
                     let visible_rows = wrapped.len().saturating_sub(skip_wrapped_rows);
@@ -3054,9 +3054,11 @@ impl Editor {
 
         // Now we're at the cursor line - find which wrapped row the cursor is on
         if let Some(line) = self.buffer.line(cursor_line) {
-            let display_col = self.screen.buffer_col_to_display_col(line.content(), cursor_col);
+            let display_col = self
+                .screen
+                .buffer_col_to_display_col(line.content(), cursor_col);
             let wrapped_row_index = display_col / cols;
-            
+
             // If this is the top line, account for offset
             if cursor_line == top_line {
                 if wrapped_row_index < skip_wrapped_rows {
@@ -3096,7 +3098,7 @@ impl Editor {
         } else {
             size.cols as usize
         };
-        
+
         // Guard against zero or very small terminal width
         if avail_cols == 0 {
             // Terminal too narrow to display content
@@ -3164,7 +3166,7 @@ impl Editor {
 
         // Position cursor
         let cursor = self.buffer.cursor();
-        
+
         // Calculate the actual screen row considering line wrapping
         let display_line = self.calculate_cursor_screen_row(
             cursor.line,
@@ -3174,19 +3176,19 @@ impl Editor {
             height,
             avail_cols,
         ) as u16;
-        
-        let cursor_line_content = self.buffer
+
+        let cursor_line_content = self
+            .buffer
             .line(cursor.line)
             .map(|l| l.content())
             .unwrap_or("");
-        let display_col_in_line = self.screen.buffer_col_to_display_col(
-            cursor_line_content,
-            cursor.column,
-        );
-        
+        let display_col_in_line = self
+            .screen
+            .buffer_col_to_display_col(cursor_line_content, cursor.column);
+
         // Which wrapped row of the cursor's line are we on?
         let display_col_in_wrapped_row = display_col_in_line % avail_cols;
-        
+
         // Add 1 for 1-indexed and add line number width if needed
         let display_col = if self.options.number {
             (display_col_in_wrapped_row + 1 + LINE_NUMBER_WIDTH) as u16

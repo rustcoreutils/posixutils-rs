@@ -219,28 +219,31 @@ fn test_pty_vi_set_number() {
 #[test]
 fn test_pty_vi_long_line_wrapping() {
     const TEST_LINE_LENGTH: usize = 100; // Create line with numbers 1-100 concatenated
-    
+
     let td = tempdir().unwrap();
     let file_path = td.path().join("test_wrap.txt");
-    
+
     // Create a single very long line (200+ characters)
-    let long_line = (1..=TEST_LINE_LENGTH).map(|n| n.to_string()).collect::<Vec<_>>().join("");
+    let long_line = (1..=TEST_LINE_LENGTH)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("");
     std::fs::write(&file_path, format!("{}\n", long_line)).unwrap();
 
     // Use narrow terminal (40 cols) to force wrapping
     let mut vi = ViPtySession::new(&file_path, 25, 40);
     vi.sleep_ms(500);
-    
+
     // Move cursor to the end of the line
     vi.keys("$");
     vi.sleep_ms(100);
-    
+
     // If wrapping works, we should be able to navigate without panic
     vi.keys("0"); // Go to start
     vi.sleep_ms(100);
     vi.keys("$"); // Go to end
     vi.sleep_ms(100);
-    
+
     // Quit without saving
     vi.keys(":q!\r");
     vi.wait();

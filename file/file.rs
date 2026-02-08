@@ -102,7 +102,7 @@ fn get_magic_files(args: &Args) -> Vec<PathBuf> {
     } else if let Some(test_file1) = &args.test_file1 {
         magic_files.push(test_file1.clone());
 
-        if args.test_file2.is_none() && !args.default_tests {
+        if args.default_tests {
             magic_files.push(default_magic_file);
         }
     } else {

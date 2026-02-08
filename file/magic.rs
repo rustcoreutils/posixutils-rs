@@ -18,8 +18,6 @@ use std::{
 };
 
 // Pre-compiled static regexes for performance
-static OCTAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\([0-7]{1,3})").expect("invalid regex"));
 static COMP_OP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[=<>&^x]").expect("invalid regex"));
 static HEX_RE: LazyLock<Regex> =
@@ -90,7 +88,7 @@ enum ComparisonOperator {
 
 #[derive(Debug)]
 enum Value {
-    String(String),
+    String(Vec<u8>), // Store raw bytes instead of String
     Number(ComparisonOperator, u64),
 }
 
@@ -98,38 +96,42 @@ impl Value {
     fn parse(mut input: String, _type: Type) -> Result<Value, RawMagicLineParseError> {
         match _type {
             Type::String => {
-                let mut result = String::new();
-                let mut chars = input.chars();
+                // First, replace hex escape sequences
+                let bytes = Self::replace_all_hex_sequences_with_their_coded_values(&input)?;
 
-                // replace character escape sequences with their characters
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            let replacement = match escaped {
-                                '\\' => '\\',
-                                'a' => '\x07', // alert
-                                'b' => '\x08', // backspace
-                                'f' => '\x0C', // form feed
-                                'n' => '\n',   // newline
-                                'r' => '\r',   // carriage return
-                                't' => '\t',   // horizontal tab
-                                'v' => '\x0B', // vertical tab
-                                ' ' => ' ',    // space
-                                _ => {
-                                    result.push('\\');
-                                    escaped
-                                } // Treat any other character as itself
-                            };
-                            result.push(replacement);
-                        } else {
-                            result.push('\\');
-                        }
+                // Then, replace octal escape sequences
+                let bytes =
+                    Self::replace_all_octal_sequences_with_their_coded_values_bytes(&bytes)?;
+
+                // Replace character escape sequences with their characters
+                let mut result = Vec::new();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        let replacement = match bytes[i + 1] {
+                            b'\\' => b'\\',
+                            b'a' => 0x07,  // alert
+                            b'b' => 0x08,  // backspace
+                            b'f' => 0x0C,  // form feed
+                            b'n' => b'\n', // newline
+                            b'r' => b'\r', // carriage return
+                            b't' => b'\t', // horizontal tab
+                            b'v' => 0x0B,  // vertical tab
+                            b' ' => b' ',  // space
+                            _ => {
+                                result.push(b'\\');
+                                result.push(bytes[i + 1]);
+                                i += 2;
+                                continue;
+                            }
+                        };
+                        result.push(replacement);
+                        i += 2;
                     } else {
-                        result.push(c);
+                        result.push(bytes[i]);
+                        i += 1;
                     }
                 }
-
-                result = Self::replace_all_octal_sequences_with_their_coded_values(&input)?;
 
                 Ok(Value::String(result))
             }
@@ -141,22 +143,102 @@ impl Value {
         }
     }
 
-    /// Replace the octal sequences in the string with the value they represent
-    /// in utf8
-    fn replace_all_octal_sequences_with_their_coded_values(
-        input: &str,
-    ) -> Result<String, RawMagicLineParseError> {
-        // replace octal sequences with specific coded values (using pre-compiled regex)
-        let result = OCTAL_RE
-            .replace_all(input, |capture: &regex::Captures| {
-                let mat = capture.get(1).unwrap().as_str();
+    /// Replace the octal sequences in the bytes with the value they represent
+    fn replace_all_octal_sequences_with_their_coded_values_bytes(
+        input: &[u8],
+    ) -> Result<Vec<u8>, RawMagicLineParseError> {
+        let mut result = Vec::new();
+        let mut i = 0;
 
-                let v = u32::from_str_radix(mat, 8).unwrap();
-                let c = char::from_u32(v).unwrap();
-                c.to_string()
-            })
-            .to_string();
+        while i < input.len() {
+            if input[i] == b'\\' && i + 1 < input.len() {
+                // Check if next characters are octal digits (1-3 digits)
+                let start = i + 1;
+                let mut end = start;
+                let mut count = 0;
+
+                while end < input.len() && count < 3 {
+                    if input[end] >= b'0' && input[end] <= b'7' {
+                        end += 1;
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if count > 0 {
+                    // Parse the octal number
+                    let octal_str = std::str::from_utf8(&input[start..end]).unwrap();
+                    if let Ok(byte_val) = u8::from_str_radix(octal_str, 8) {
+                        result.push(byte_val);
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+
+            result.push(input[i]);
+            i += 1;
+        }
+
         Ok(result)
+    }
+
+    /// Replace hex escape sequences (\xNN) with their byte values
+    fn replace_all_hex_sequences_with_their_coded_values(
+        input: &str,
+    ) -> Result<Vec<u8>, RawMagicLineParseError> {
+        let mut result_bytes = Vec::new();
+        let mut chars = input.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if chars.peek() == Some(&'x') {
+                    chars.next(); // consume 'x'
+
+                    // Collect hex digits (1-2 digits)
+                    let mut hex_str = String::new();
+                    for _ in 0..2 {
+                        if let Some(&ch) = chars.peek() {
+                            if ch.is_ascii_hexdigit() {
+                                hex_str.push(ch);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if !hex_str.is_empty() {
+                        // Parse hex value and add as raw byte
+                        if let Ok(byte_val) = u8::from_str_radix(&hex_str, 16) {
+                            result_bytes.push(byte_val);
+                        } else {
+                            // If parsing fails, keep the original sequence
+                            result_bytes.push(b'\\');
+                            result_bytes.push(b'x');
+                            result_bytes.extend_from_slice(hex_str.as_bytes());
+                        }
+                    } else {
+                        // No hex digits found, keep \x as is
+                        result_bytes.push(b'\\');
+                        result_bytes.push(b'x');
+                    }
+                } else {
+                    // Not a hex escape, keep the backslash
+                    result_bytes.push(b'\\');
+                }
+            } else {
+                // Regular character - encode as UTF-8 bytes
+                let mut buf = [0u8; 4];
+                let bytes = c.encode_utf8(&mut buf).as_bytes();
+                result_bytes.extend_from_slice(bytes);
+            }
+        }
+
+        Ok(result_bytes)
     }
 
     fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
@@ -430,9 +512,8 @@ impl RawMagicFileLine {
                 return false;
             }
 
-            if let Ok(tf_val) = String::from_utf8(buf.clone()) {
-                return tf_val.as_bytes() == val.as_bytes();
-            }
+            // Compare raw bytes directly
+            return buf == *val;
         }
         false
     }
@@ -505,4 +586,42 @@ fn parse_magic_file_and_test(
         ErrorKind::NotFound,
         "Couldn't match any magic number",
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_escape_replacement() {
+        let input = r"\x97JB2\x0D\x0A\x1A\x0A";
+        let result = Value::replace_all_hex_sequences_with_their_coded_values(input).unwrap();
+
+        // \x97 should become byte 0x97 (151 in decimal, 227 in octal)
+        // JB2 stays as is
+        // \x0D should become CR (13)
+        // \x0A should become LF (10)
+        // \x1A should become SUB (26)
+        // \x0A should become LF (10)
+
+        let expected_bytes: Vec<u8> = vec![0x97, b'J', b'B', b'2', 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(result, expected_bytes);
+    }
+}
+
+#[test]
+fn test_magic_line_parsing() {
+    let line = "0 string \\x97 MATCH_97";
+    let result = RawMagicFileLine::parse(line.to_string());
+    assert!(result.is_ok(), "Failed to parse magic line: {:?}", result);
+
+    let magic_line = result.unwrap();
+    assert_eq!(magic_line.offset.num, 0);
+    assert_eq!(magic_line.message, "MATCH_97");
+
+    if let Value::String(val) = magic_line.value {
+        assert_eq!(val, vec![0x97]);
+    } else {
+        panic!("Expected String value");
+    }
 }

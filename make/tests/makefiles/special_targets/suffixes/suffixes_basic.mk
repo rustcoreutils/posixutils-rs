@@ -1,7 +1,7 @@
-.SUFFIXES: .txt .out  
+.SUFFIXES: .sfx .xfo  
 
-.txt.out:
-	@echo "Converting copied.txt to copied.out" 
-	@cp copied.txt copied.out
+.sfx.xfo:
+	@echo "Converting suffixes_test.sfx to suffixes_test.xfo" 
+	@cp suffixes_test.sfx suffixes_test.xfo
 
 

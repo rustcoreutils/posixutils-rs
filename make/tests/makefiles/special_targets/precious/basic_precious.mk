@@ -1,5 +1,5 @@
-.PRECIOUS: 	
-text.txt:
+.PRECIOUS:
+precious_text.txt:
 	echo hello
 	mkdir preciousdir
 	touch preciousdir/some.txt

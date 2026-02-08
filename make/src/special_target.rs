@@ -200,6 +200,7 @@ impl Processor<'_> {
             self.make
                 .rules
                 .iter_mut()
+                .chain(self.make.inference_rules.iter_mut())
                 .filter(|r| r.targets().any(|t| t.as_ref() == prerequisite.as_ref()))
                 .for_each(f.clone());
         }
@@ -209,7 +210,11 @@ impl Processor<'_> {
     ///   specified.
     fn global(&mut self, f: impl FnMut(&mut Rule) + Clone) {
         if self.rule.prerequisites().count() == 0 {
-            self.make.rules.iter_mut().for_each(f);
+            self.make
+                .rules
+                .iter_mut()
+                .chain(self.make.inference_rules.iter_mut())
+                .for_each(f);
         }
     }
 }

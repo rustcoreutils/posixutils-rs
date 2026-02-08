@@ -27,7 +27,7 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
         if tz_str == "UTC" || tz_str == "UTC0" {
             return "UTC".to_string();
         }
-        
+
         // Try to parse it as a chrono-tz timezone
         if let Ok(tz) = tz_str.parse::<Tz>() {
             // Convert the local datetime to the specified timezone
@@ -39,14 +39,14 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
             }
         }
     }
-    
+
     // Fallback: if TZ is not set or invalid, try to detect system timezone
     // For now, check if offset is zero, then it's UTC
     let offset = dt.offset().local_minus_utc();
     if offset == 0 {
         return "UTC".to_string();
     }
-    
+
     // Otherwise, use the offset format as fallback
     dt.format("%:z").to_string()
 }
@@ -56,7 +56,7 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
 fn parse_format_string_with_tz(formatstr: &str, tz_abbr: &str) -> String {
     let mut result = String::new();
     let mut chars = formatstr.chars().peekable();
-    
+
     while let Some(ch) = chars.next() {
         if ch == '%' {
             if let Some(&next_ch) = chars.peek() {
@@ -76,7 +76,7 @@ fn parse_format_string_with_tz(formatstr: &str, tz_abbr: &str) -> String {
         }
         result.push(ch);
     }
-    
+
     result
 }
 

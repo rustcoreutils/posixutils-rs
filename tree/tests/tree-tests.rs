@@ -15,6 +15,7 @@ mod du;
 mod link;
 mod ls;
 mod mkdir;
+mod mkfifo;
 mod mv;
 mod readlink;
 mod rm;

@@ -15,8 +15,8 @@
 
 use super::*;
 use crate::parse::ast::{
-    AssignOp, BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator,
-    InitElement, Parameter, UnaryOp,
+    AssignOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, FunctionDef,
+    InitDeclarator, InitElement, Parameter, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
@@ -4126,5 +4126,253 @@ fn test_return_address_emits_opcode() {
     assert!(
         has_return_addr,
         "__builtin_return_address should emit ReturnAddress opcode"
+    );
+}
+
+// ============================================================================
+// Mixed designated + positional initializer field tracking
+// Regression test: positional fields after a designator must use the correct
+// field index (one past the designated field), not the element's enumeration index.
+// Bug: {.b = 20, 30, 40} stored 30 at offset 4 (b) instead of offset 8 (c).
+// ============================================================================
+
+#[test]
+fn test_mixed_designated_positional_struct_init() {
+    // Test: struct S { int a; int b; int c; int d; };
+    //       struct S s = {.b = 20, 30, 40};
+    // Expected stores: offset 4 = 20 (b), offset 8 = 30 (c), offset 12 = 40 (d)
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+
+    // Create field name StringIds
+    let a_id = ctx.str("a");
+    let b_id = ctx.str("b");
+    let c_id = ctx.str("c");
+    let d_id = ctx.str("d");
+
+    // Create struct S { int a; int b; int c; int d; }
+    let struct_composite = CompositeType {
+        tag: None,
+        members: vec![
+            StructMember {
+                name: a_id,
+                typ: int_type,
+                offset: 0,
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+                explicit_align: None,
+            },
+            StructMember {
+                name: b_id,
+                typ: int_type,
+                offset: 4,
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+                explicit_align: None,
+            },
+            StructMember {
+                name: c_id,
+                typ: int_type,
+                offset: 8,
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+                explicit_align: None,
+            },
+            StructMember {
+                name: d_id,
+                typ: int_type,
+                offset: 12,
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+                explicit_align: None,
+            },
+        ],
+        enum_constants: vec![],
+        size: 16,
+        align: 4,
+        is_complete: true,
+    };
+    let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
+    let s_sym = ctx.var("s", struct_type);
+
+    // Create init list: {.b = 20, 30, 40}
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![Designator::Field(b_id)],
+                    value: Box::new(Expr::int(20, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(30, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(40, &ctx.types)),
+                },
+            ],
+        },
+        struct_type,
+    );
+
+    // Function: int test() { struct S s = {.b = 20, 30, 40}; return 0; }
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: s_sym,
+                    typ: struct_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // Should have 3 stores for the 3 initialized fields (b, c, d)
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 3,
+        "Expected at least 3 stores for .b=20, c=30, d=40, got {}: {}",
+        store_count,
+        ir
+    );
+
+    // Verify stores go to distinct offsets (not the same offset twice)
+    // The bug caused 20 and 30 to both be stored at offset +4
+    // Extract all "+ N" store offsets from the IR
+    let store_lines: Vec<&str> = ir.lines().filter(|l| l.contains("store")).collect();
+
+    // Count unique offsets among store instructions
+    let mut offsets: Vec<&str> = store_lines
+        .iter()
+        .filter_map(|line| line.find("+ ").map(|pos| &line[pos..]))
+        .collect();
+    offsets.sort();
+    offsets.dedup();
+
+    // With the fix, we should have 3 distinct offsets (4, 8, 12)
+    // Without the fix, offset 4 appears twice and we'd only have 2 unique offsets
+    assert!(
+        offsets.len() >= 3,
+        "Expected 3 distinct store offsets for fields b(+4), c(+8), d(+12), \
+         got {} unique offsets {:?}. IR:\n{}",
+        offsets.len(),
+        offsets,
+        ir
+    );
+}
+
+#[test]
+fn test_mixed_designated_positional_array_init() {
+    // Test: int arr[5] = {[2] = 20, 30, 40};
+    // Expected stores: index 2 = 20, index 3 = 30, index 4 = 40
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+
+    let arr_type = ctx.types.intern(Type::array(int_type, 5));
+    let arr_sym = ctx.var("arr", arr_type);
+
+    // Create init list: {[2] = 20, 30, 40}
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![Designator::Index(2)],
+                    value: Box::new(Expr::int(20, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(30, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(40, &ctx.types)),
+                },
+            ],
+        },
+        arr_type,
+    );
+
+    // Function: int test() { int arr[5] = {[2] = 20, 30, 40}; return 0; }
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: arr_sym,
+                    typ: arr_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // Should have 3 stores for the 3 initialized elements
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 3,
+        "Expected at least 3 stores for [2]=20, [3]=30, [4]=40, got {}: {}",
+        store_count,
+        ir
+    );
+
+    // Verify stores go to distinct offsets
+    let store_lines: Vec<&str> = ir.lines().filter(|l| l.contains("store")).collect();
+    let mut offsets: Vec<&str> = store_lines
+        .iter()
+        .filter_map(|line| line.find("+ ").map(|pos| &line[pos..]))
+        .collect();
+    offsets.sort();
+    offsets.dedup();
+
+    // With the fix: 3 distinct offsets (8, 12, 16 for indices 2, 3, 4)
+    // Without the fix: offset 8 appears twice (indices 2 and "1" via enumerate)
+    assert!(
+        offsets.len() >= 3,
+        "Expected 3 distinct store offsets for arr[2](+8), arr[3](+12), arr[4](+16), \
+         got {} unique offsets {:?}. IR:\n{}",
+        offsets.len(),
+        offsets,
+        ir
     );
 }

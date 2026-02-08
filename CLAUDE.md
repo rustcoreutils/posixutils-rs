@@ -27,8 +27,6 @@ NEVER amend git commits.
 Pre-commit checks,
 - First re-review `git diff HEAD` in totality
 - Passes `cargo clippy --all-targets` with zero warnings (pre-existing warnings MUST be fixed)
-- Changes to (cc/token/ cc/partse/ cc/ir/) have associated unit tests?
-- New features And bug fixes have associated integration tests? (cc/tests/)
 
 ## Architecture
 
@@ -47,7 +45,7 @@ Other: `calc/`, `cc/`, `cron/`, `datetime/`, `dev/`, `display/`, `file/`, `m4/`,
 
 Debug protocol:
 Update EXISTING wrapper script in `/tmp/*.sh`, run via Bash tool.
-DO NOT (1) create file with cat, (2) run `bash` from Bash tool (run script directly, following Update).
+DO NOT (1) create file with cat, (2) run `bash` from Bash tool
 
 Integration tests use `plib::testing::TestPlan`. Test logic in `$crate/tests/$category/mod.rs`.
 

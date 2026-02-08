@@ -1920,17 +1920,22 @@ impl<'a> Linearizer<'a> {
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                 let elem_size = self.types.size_bits(elem_type) / 8;
+                let mut current_idx: i64 = 0;
 
-                for (idx, element) in elements.iter().enumerate() {
+                for element in elements.iter() {
                     // Calculate the actual index considering designators
                     let actual_idx = if element.designators.is_empty() {
-                        idx as i64
+                        let idx = current_idx;
+                        current_idx += 1;
+                        idx
                     } else {
                         // Use the first designator (should be Index for arrays)
-                        match &element.designators[0] {
+                        let idx = match &element.designators[0] {
                             Designator::Index(i) => *i,
-                            Designator::Field(_) => idx as i64, // Fall back for mismatched designator
-                        }
+                            Designator::Field(_) => current_idx, // Fall back for mismatched designator
+                        };
+                        current_idx = idx + 1;
+                        idx
                     };
 
                     let offset = base_offset + actual_idx * elem_size as i64;
@@ -1968,18 +1973,26 @@ impl<'a> Linearizer<'a> {
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     // Clone members to avoid borrow issues
                     let members: Vec<_> = composite.members.clone();
+                    let mut current_field_idx = 0;
 
-                    for (idx, element) in elements.iter().enumerate() {
+                    for element in elements.iter() {
                         // Find the field (by designator or position)
                         // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
                         let member_info =
                             if let Some(Designator::Field(name)) = element.designators.first() {
                                 // Designated initializer: .field = value
+                                // First try direct member lookup to update position counter
+                                if let Some((idx, _)) =
+                                    members.iter().enumerate().find(|(_, m)| &m.name == name)
+                                {
+                                    current_field_idx = idx + 1;
+                                }
                                 // find_member handles anonymous struct/union members
                                 self.types.find_member(resolved_typ, *name)
-                            } else if idx < members.len() {
+                            } else if current_field_idx < members.len() {
                                 // Positional initializer - direct member only
-                                let m = &members[idx];
+                                let m = &members[current_field_idx];
+                                current_field_idx += 1;
                                 Some(crate::types::MemberInfo {
                                     offset: m.offset,
                                     typ: m.typ,

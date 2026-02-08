@@ -1661,6 +1661,7 @@ name = "posixutils-datetime"
 version = "0.7.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "clap",
  "gettext-rs",
  "libc",

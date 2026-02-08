@@ -12,10 +12,56 @@
 //
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
+use chrono_tz::Tz;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use std::env;
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
+
+/// Get the timezone abbreviation for the given datetime
+fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
+    // Try to get TZ environment variable
+    if let Ok(tz_str) = env::var("TZ") {
+        // Handle special cases for UTC
+        if tz_str == "UTC" || tz_str == "UTC0" || tz_str.is_empty() {
+            return "UTC".to_string();
+        }
+        
+        // Try to parse it as a chrono-tz timezone
+        if let Ok(tz) = tz_str.parse::<Tz>() {
+            // Convert the local datetime to the specified timezone
+            if let Some(dt_tz) = tz.from_local_datetime(&dt.naive_local()).single() {
+                return dt_tz.format("%Z").to_string();
+            }
+        }
+    }
+    
+    // Fallback: if TZ is not set or invalid, try to detect system timezone
+    // For now, check if offset is zero, then it's UTC
+    let offset = dt.offset().local_minus_utc();
+    if offset == 0 {
+        return "UTC".to_string();
+    }
+    
+    // Otherwise, use the offset format as fallback
+    dt.format("%:z").to_string()
+}
+
+/// Format a datetime string, replacing %Z with proper timezone abbreviation
+fn format_with_timezone(formatstr: &str, dt: &DateTime<Local>) -> String {
+    if formatstr.contains("%Z") {
+        let tz_abbr = get_timezone_abbreviation(dt);
+        let formatted = dt.format(formatstr).to_string();
+        // Replace the offset (like +01:00) with the timezone abbreviation
+        // chrono uses %Z for offset, so we need to replace it
+        // The offset format from chrono with %Z is like "+01:00" or "+00:00"
+        let offset_pattern = dt.format("%Z").to_string();
+        formatted.replace(&offset_pattern, &tz_abbr)
+    } else {
+        dt.format(formatstr).to_string()
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about = gettext("date - write the date and time"))]
@@ -40,12 +86,19 @@ struct Args {
 
 fn show_time_local(formatstr: &str) -> String {
     let now = chrono::Local::now();
-    now.format(formatstr).to_string()
+    format_with_timezone(formatstr, &now)
 }
 
 fn show_time_utc(formatstr: &str) -> String {
     let now = chrono::Utc::now();
-    now.format(formatstr).to_string()
+    // For UTC, %Z should always be "UTC"
+    if formatstr.contains("%Z") {
+        let formatted = now.format(formatstr).to_string();
+        let offset_pattern = now.format("%Z").to_string();
+        formatted.replace(&offset_pattern, "UTC")
+    } else {
+        now.format(formatstr).to_string()
+    }
 }
 
 fn show_time(utc: bool, formatstr: &str) {

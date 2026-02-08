@@ -218,11 +218,13 @@ fn test_pty_vi_set_number() {
 /// rather than truncating them.
 #[test]
 fn test_pty_vi_long_line_wrapping() {
+    const TEST_LINE_LENGTH: usize = 100; // Create line with numbers 1-100 concatenated
+    
     let td = tempdir().unwrap();
     let file_path = td.path().join("test_wrap.txt");
     
     // Create a single very long line (200+ characters)
-    let long_line = (1..=100).map(|n| n.to_string()).collect::<Vec<_>>().join("");
+    let long_line = (1..=TEST_LINE_LENGTH).map(|n| n.to_string()).collect::<Vec<_>>().join("");
     std::fs::write(&file_path, format!("{}\n", long_line)).unwrap();
 
     // Use narrow terminal (40 cols) to force wrapping

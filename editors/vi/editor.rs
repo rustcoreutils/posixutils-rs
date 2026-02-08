@@ -3096,6 +3096,14 @@ impl Editor {
         } else {
             size.cols as usize
         };
+        
+        // Guard against zero or very small terminal width
+        if avail_cols == 0 {
+            // Terminal too narrow to display content
+            self.terminal.show_cursor()?;
+            self.terminal.flush()?;
+            return Ok(());
+        }
 
         let mut screen_row = 0;
         let mut buffer_line = top;
@@ -3128,8 +3136,8 @@ impl Editor {
                         if self.options.number && wrap_idx == 0 {
                             self.terminal.write_str(&format!("{:6}  ", buffer_line))?;
                         } else if self.options.number {
-                            // Indent continuation lines
-                            self.terminal.write_str("        ")?;
+                            // Indent continuation lines with same width as line numbers
+                            self.terminal.write_str(&" ".repeat(LINE_NUMBER_WIDTH))?;
                         }
 
                         self.terminal.write_str(wrapped_row)?;

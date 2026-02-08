@@ -4376,3 +4376,447 @@ fn test_mixed_designated_positional_array_init() {
         ir
     );
 }
+
+#[test]
+fn test_designator_chain_nested_struct_init() {
+    // struct { struct { int x; int y; } pt; int z; } s = { .pt.x = 10, .pt.y = 20, .z = 30 };
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+
+    let x_id = ctx.str("x");
+    let y_id = ctx.str("y");
+    let pt_members = vec![
+        StructMember {
+            name: x_id,
+            typ: ctx.int_type(),
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+        StructMember {
+            name: y_id,
+            typ: ctx.int_type(),
+            offset: 4,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+    ];
+    let pt_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: None,
+        members: pt_members,
+        enum_constants: vec![],
+        size: 8,
+        align: 4,
+        is_complete: true,
+    }));
+
+    let pt_id = ctx.str("pt");
+    let z_id = ctx.str("z");
+    let outer_members = vec![
+        StructMember {
+            name: pt_id,
+            typ: pt_type,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+        StructMember {
+            name: z_id,
+            typ: ctx.int_type(),
+            offset: 8,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+    ];
+    let outer_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: None,
+        members: outer_members,
+        enum_constants: vec![],
+        size: 12,
+        align: 4,
+        is_complete: true,
+    }));
+    let outer_sym = ctx.var("s", outer_type);
+
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![Designator::Field(pt_id), Designator::Field(x_id)],
+                    value: Box::new(Expr::int(10, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(pt_id), Designator::Field(y_id)],
+                    value: Box::new(Expr::int(20, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(z_id)],
+                    value: Box::new(Expr::int(30, &ctx.types)),
+                },
+            ],
+        },
+        outer_type,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: outer_sym,
+                    typ: outer_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 3,
+        "Expected stores for nested designators, got {}: {}",
+        store_count,
+        ir
+    );
+}
+
+#[test]
+fn test_designator_chain_array_member_init() {
+    // struct { int arr[3]; } s = { .arr[1] = 42 };
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let arr_type = ctx.types.intern(Type::array(int_type, 3));
+    let arr_id = ctx.str("arr");
+    let members = vec![StructMember {
+        name: arr_id,
+        typ: arr_type,
+        offset: 0,
+        bit_offset: None,
+        bit_width: None,
+        storage_unit_size: None,
+        explicit_align: None,
+    }];
+    let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: None,
+        members,
+        enum_constants: vec![],
+        size: 12,
+        align: 4,
+        is_complete: true,
+    }));
+    let s_sym = ctx.var("s", struct_type);
+
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![InitElement {
+                designators: vec![Designator::Field(arr_id), Designator::Index(1)],
+                value: Box::new(Expr::int(42, &ctx.types)),
+            }],
+        },
+        struct_type,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: s_sym,
+                    typ: struct_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 1,
+        "Expected store for array member designator, got {}: {}",
+        store_count,
+        ir
+    );
+}
+
+#[test]
+fn test_repeated_designator_last_wins_array() {
+    // int arr[2] = {[0] = 1, [0] = 2}; should store only last value
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let arr_type = ctx.types.intern(Type::array(int_type, 2));
+    let arr_sym = ctx.var("arr", arr_type);
+
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![Designator::Index(0)],
+                    value: Box::new(Expr::int(1, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Index(0)],
+                    value: Box::new(Expr::int(2, &ctx.types)),
+                },
+            ],
+        },
+        arr_type,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: arr_sym,
+                    typ: arr_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 1 && store_count <= 2,
+        "Expected one store for repeated designator, got {}: {}",
+        store_count,
+        ir
+    );
+}
+
+#[test]
+fn test_skip_unnamed_bitfield_positional_init() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let a_id = ctx.str("a");
+    let b_id = ctx.str("b");
+    let members = vec![
+        StructMember {
+            name: a_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+        StructMember {
+            name: StringId::EMPTY,
+            typ: int_type,
+            offset: 4,
+            bit_offset: Some(0),
+            bit_width: Some(8),
+            storage_unit_size: Some(4),
+            explicit_align: None,
+        },
+        StructMember {
+            name: b_id,
+            typ: int_type,
+            offset: 8,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+    ];
+    let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: None,
+        members,
+        enum_constants: vec![],
+        size: 12,
+        align: 4,
+        is_complete: true,
+    }));
+    let s_sym = ctx.var("s", struct_type);
+
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(10, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![],
+                    value: Box::new(Expr::int(20, &ctx.types)),
+                },
+            ],
+        },
+        struct_type,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: s_sym,
+                    typ: struct_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 2,
+        "Expected stores for named fields a/b, got {}: {}",
+        store_count,
+        ir
+    );
+}
+
+#[test]
+fn test_union_first_named_member_positional_init() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let a_id = ctx.str("a");
+    let members = vec![
+        StructMember {
+            name: StringId::EMPTY,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(0),
+            bit_width: Some(16),
+            storage_unit_size: Some(4),
+            explicit_align: None,
+        },
+        StructMember {
+            name: a_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+    ];
+    let union_type = ctx.types.intern(Type::union_type(CompositeType {
+        tag: None,
+        members,
+        enum_constants: vec![],
+        size: 4,
+        align: 4,
+        is_complete: true,
+    }));
+    let u_sym = ctx.var("u", union_type);
+
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![InitElement {
+                designators: vec![],
+                value: Box::new(Expr::int(42, &ctx.types)),
+            }],
+        },
+        union_type,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: u_sym,
+                    typ: union_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+    let store_count = ir.matches("store").count();
+    assert!(
+        store_count >= 1,
+        "Expected store for union first named member, got {}: {}",
+        store_count,
+        ir
+    );
+}

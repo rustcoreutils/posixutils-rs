@@ -542,3 +542,116 @@ int main(void) {
         0
     );
 }
+
+#[test]
+fn c99_initializers_cpython_llist_pattern() {
+    let code = r#"
+struct llist_node {
+    struct llist_node *next;
+    struct llist_node *prev;
+};
+
+#define LLIST_INIT(head) { &head, &head }
+
+struct llist_node my_list = LLIST_INIT(my_list);
+
+int main(void) {
+    if (my_list.next != &my_list) return 1;
+    if (my_list.prev != &my_list) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cpython_llist_init", code, &[]), 0);
+}
+
+#[test]
+fn c99_initializers_cpython_opcode_pattern() {
+    let code = r#"
+struct uop { int op; int arg; int off; };
+struct expansion { int nuops; struct uop uops[4]; };
+
+enum { OP_A = 5, OP_B = 10 };
+
+struct expansion table[16] = {
+    [OP_A] = { .nuops = 2, .uops = { {1, 2, 3}, {3, 4, 5} } },
+    [OP_B] = { .nuops = 1, .uops = { {5, 6, 7} } },
+};
+
+int main(void) {
+    if (table[OP_A].nuops != 2) return 1;
+    if (table[OP_A].uops[0].op != 1) return 2;
+    if (table[OP_A].uops[1].arg != 4) return 3;
+    if (table[OP_B].nuops != 1) return 4;
+    if (table[OP_B].uops[0].op != 5) return 5;
+    if (table[0].nuops != 0) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cpython_opcode_init", code, &[]), 0);
+}
+
+#[test]
+fn c99_initializers_cpython_pytypeobject_pattern() {
+    let code = r#"
+typedef void (*func_t)(void);
+struct PyTypeObject {
+    long ob_refcnt;
+    void *ob_type;
+    char *tp_name;
+    long tp_basicsize;
+    func_t tp_dealloc;
+    func_t tp_repr;
+    void *tp_as_number;
+    long tp_flags;
+    char *tp_doc;
+};
+
+void my_dealloc(void) {}
+
+struct PyTypeObject MyType = {
+    1,
+    0,
+    "MyType",
+    64,
+    my_dealloc,
+    0,
+    0,
+    .tp_flags = 0x1234,
+    .tp_doc = "doc",
+};
+
+int main(void) {
+    if (MyType.ob_refcnt != 1) return 1;
+    if (MyType.tp_basicsize != 64) return 2;
+    if (MyType.tp_dealloc != my_dealloc) return 3;
+    if (MyType.tp_flags != 0x1234) return 4;
+    if (MyType.tp_doc[0] != 'd') return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cpython_pytypeobject_init", code, &[]), 0);
+}
+
+#[test]
+fn c99_initializers_nested_designated_pattern() {
+    let code = r#"
+struct inner { int tag; int data; };
+struct outer {
+    void *type;
+    struct inner value;
+};
+
+struct outer obj = {
+    (void*)0x1234,
+    { .tag = 42, .data = 99 }
+};
+
+int main(void) {
+    if (obj.type != (void*)0x1234) return 1;
+    if (obj.value.tag != 42) return 2;
+    if (obj.value.data != 99) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nested_designated_init", code, &[]), 0);
+}

@@ -151,6 +151,60 @@ int main(void) {
 #if __has_attribute(nonexistent_attribute_xyz)
         return 75;
 #endif
+
+        // CPython-required attributes
+#if !__has_attribute(noinline)
+        return 76;
+#endif
+
+#if !__has_attribute(always_inline)
+        return 77;
+#endif
+
+#if !__has_attribute(hot)
+        return 78;
+#endif
+
+#if !__has_attribute(cold)
+        return 79;
+#endif
+
+#if !__has_attribute(warn_unused_result)
+        return 80;
+#endif
+
+#if !__has_attribute(format)
+        return 81;
+#endif
+
+#if !__has_attribute(fallthrough)
+        return 82;
+#endif
+
+#if !__has_attribute(malloc)
+        return 83;
+#endif
+
+#if !__has_attribute(pure)
+        return 84;
+#endif
+
+#if !__has_attribute(sentinel)
+        return 85;
+#endif
+
+#if !__has_attribute(no_sanitize_address)
+        return 86;
+#endif
+
+        // Double-underscore variants
+#if !__has_attribute(__noinline__)
+        return 87;
+#endif
+
+#if !__has_attribute(__always_inline__)
+        return 88;
+#endif
     }
 
     return 0;

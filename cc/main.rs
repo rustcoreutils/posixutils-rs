@@ -192,6 +192,10 @@ struct Args {
     /// Accepts -fno-builtin-FUNC format via preprocess_args
     #[arg(long = "pcc-fno-builtin-func", action = clap::ArgAction::Append, value_name = "func", hide = true)]
     fno_builtin_funcs: Vec<String>,
+
+    /// Extra flags to pass through to the linker (set by preprocess_args)
+    #[arg(long = "pcc-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
+    linker_flags: Vec<String>,
 }
 
 /// Print compilation statistics for capacity tuning
@@ -516,6 +520,10 @@ fn process_file(
     for lib in &args.libraries {
         link_cmd.arg(format!("-l{}", lib));
     }
+    // Add extra linker flags
+    for flag in &args.linker_flags {
+        link_cmd.arg(flag);
+    }
     let status = link_cmd.status()?;
 
     let _ = std::fs::remove_file(&temp_obj);
@@ -578,7 +586,7 @@ fn preprocess_args() -> Vec<String> {
                 seen_o = true;
             }
             i += 1;
-        } else if arg.starts_with("-W") && arg.len() > 2 {
+        } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
             // -Wall → -W all, -Wextra → -W extra, etc.
             result.push("-W".to_string());
             result.push(arg[2..].to_string());
@@ -624,8 +632,73 @@ fn preprocess_args() -> Vec<String> {
         {
             // GCC optimization flags - silently ignore (pcc doesn't have these optimizations)
             i += 1;
+        } else if arg.starts_with("-fvisibility")
+            || arg == "-fno-semantic-interposition"
+            || arg.starts_with("-fstack-protector")
+            || arg == "-fno-reorder-blocks-and-partition"
+            || arg == "-fno-plt"
+            || arg == "-fno-pie"
+            || arg == "-fpie"
+            || arg == "-fno-common"
+            || arg == "-fexceptions"
+            || arg == "-fno-exceptions"
+        {
+            // GCC flags - silently ignore
+            i += 1;
+        } else if arg.starts_with("-fsanitize") {
+            // Sanitizer flags - silently ignore (pcc doesn't support sanitizers)
+            i += 1;
+        } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
+            // Catch-all: silently ignore any other -f* flag we don't handle
+            i += 1;
         } else if arg == "-p" || arg == "-pg" {
             // Profiling flags - silently ignore (pcc doesn't support profiling)
+            i += 1;
+        } else if arg == "-pipe" || arg == "-pie" || arg.starts_with("-m") {
+            // Misc GCC flags and -m* machine flags - silently ignore
+            i += 1;
+        } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
+            // -Wl,flag1,flag2 -> pass each flag to linker
+            for flag in wl_args.split(',') {
+                result.push(format!("--pcc-linker-flag={}", flag));
+            }
+            i += 1;
+        } else if arg == "-Xlinker" {
+            // -Xlinker <arg> -> pass next arg to linker
+            if i + 1 < raw_args.len() {
+                result.push(format!("--pcc-linker-flag={}", raw_args[i + 1]));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if arg == "-pthread" {
+            // -pthread -> pass to linker and define _REENTRANT
+            result.push("--pcc-linker-flag=-pthread".to_string());
+            result.push("-D".to_string());
+            result.push("_REENTRANT".to_string());
+            i += 1;
+        } else if arg == "-rdynamic" {
+            // -rdynamic -> pass to linker
+            result.push("--pcc-linker-flag=-rdynamic".to_string());
+            i += 1;
+        } else if arg == "--print-multiarch" {
+            // GCC compatibility: print multiarch tuple and exit
+            let target = Target::host();
+            match (target.arch, target.os) {
+                (target::Arch::X86_64, Os::Linux) => println!("x86_64-linux-gnu"),
+                (target::Arch::Aarch64, Os::Linux) => println!("aarch64-linux-gnu"),
+                _ => {} // Empty output for unsupported platforms
+            }
+            std::process::exit(0);
+        } else if let Some(prog) = arg.strip_prefix("-print-prog-name=") {
+            // GCC compatibility: print program path and exit
+            // Just echo back the program name (like gcc does when it doesn't have a special path)
+            println!("{}", prog);
+            std::process::exit(0);
+        } else if arg == "-v" || arg == "--version" || arg == "-qversion" || arg == "-version" {
+            // Version query - handled by clap, but -v is also our verbose flag
+            // Let it pass through to clap
+            result.push(arg.clone());
             i += 1;
         } else {
             result.push(arg.clone());
@@ -803,6 +876,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for lib in &args.libraries {
             link_cmd.arg(format!("-l{}", lib));
         }
+        // Add extra linker flags
+        for flag in &args.linker_flags {
+            link_cmd.arg(flag);
+        }
         let status = link_cmd.status()?;
         // Clean up temp assembly objects
         for obj in &asm_objects {
@@ -913,34 +990,105 @@ mod tests {
     // ========================================================================
 
     fn run_preprocess(args: &[&str]) -> Vec<String> {
-        // We can't easily test preprocess_args() without modifying env::args,
-        // so we'll test the logic directly by simulating what it does
-        let input: Vec<String> = std::iter::once("pcc".to_string())
+        // Simulate preprocess_args logic with all flag handling
+        let raw_args: Vec<String> = std::iter::once("pcc".to_string())
             .chain(args.iter().map(|s| s.to_string()))
             .collect();
 
-        // Simulate preprocess_args logic
-        let mut result = vec![input[0].clone()];
-        let mut i = 1;
-        while i < input.len() {
-            let arg = &input[i];
-            if arg == "-fPIC" || arg == "-fpic" {
-                result.push("--pcc-fpic".to_string());
-            } else if arg == "-shared" {
-                result.push("--shared".to_string());
+        let mut result = Vec::with_capacity(raw_args.len());
+        let mut i = 0;
+        let mut seen_o = false;
+        let mut seen_fpic = false;
+
+        while i < raw_args.len() {
+            let arg = &raw_args[i];
+
+            if arg == "-O" {
+                if seen_o {
+                    if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                seen_o = true;
+                if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
+                    result.push(format!("-O{}", raw_args[i + 1]));
+                    i += 2;
+                    continue;
+                }
+                result.push("-O1".to_string());
+                i += 1;
+            } else if arg.starts_with("-O") && arg.len() > 2 {
+                if !seen_o {
+                    result.push(arg.clone());
+                    seen_o = true;
+                }
+                i += 1;
+            } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
+                result.push("-W".to_string());
+                result.push(arg[2..].to_string());
+                i += 1;
             } else if arg.starts_with("-L") && arg.len() > 2 {
                 result.push("-L".to_string());
                 result.push(arg[2..].to_string());
+                i += 1;
             } else if arg.starts_with("-l") && arg.len() > 2 {
                 result.push("-l".to_string());
                 result.push(arg[2..].to_string());
-            } else if arg.starts_with("-W") && arg.len() > 2 {
-                result.push("-W".to_string());
-                result.push(arg[2..].to_string());
+                i += 1;
+            } else if arg.starts_with("-std=") {
+                i += 1;
+            } else if arg == "-fPIC" || arg == "-fpic" {
+                if !seen_fpic {
+                    result.push("--pcc-fpic".to_string());
+                    seen_fpic = true;
+                }
+                i += 1;
+            } else if arg == "-shared" {
+                result.push("--shared".to_string());
+                i += 1;
+            } else if arg == "-fno-builtin" {
+                result.push("--fno-builtin".to_string());
+                i += 1;
+            } else if let Some(func) = arg.strip_prefix("-fno-builtin-") {
+                result.push("--pcc-fno-builtin-func".to_string());
+                result.push(func.to_string());
+                i += 1;
+            } else if (arg.starts_with("-f") && !arg.starts_with("-fno-builtin"))
+                || arg == "-p"
+                || arg == "-pg"
+                || arg == "-pipe"
+                || arg == "-pie"
+                || arg.starts_with("-m")
+            {
+                // Silently ignore -f* flags, profiling flags, -pipe, -pie, -m* machine flags
+                i += 1;
+            } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
+                for flag in wl_args.split(',') {
+                    result.push(format!("--pcc-linker-flag={}", flag));
+                }
+                i += 1;
+            } else if arg == "-Xlinker" {
+                if i + 1 < raw_args.len() {
+                    result.push(format!("--pcc-linker-flag={}", raw_args[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if arg == "-pthread" {
+                result.push("--pcc-linker-flag=-pthread".to_string());
+                result.push("-D".to_string());
+                result.push("_REENTRANT".to_string());
+                i += 1;
+            } else if arg == "-rdynamic" {
+                result.push("--pcc-linker-flag=-rdynamic".to_string());
+                i += 1;
             } else {
                 result.push(arg.clone());
+                i += 1;
             }
-            i += 1;
         }
         result
     }
@@ -995,5 +1143,134 @@ mod tests {
         assert!(result.contains(&"z".to_string()));
         assert!(result.contains(&"-L".to_string()));
         assert!(result.contains(&".".to_string()));
+    }
+
+    // ========================================================================
+    // Tests for silently-ignored flags
+    // ========================================================================
+
+    #[test]
+    fn test_preprocess_fvisibility_ignored() {
+        let result = run_preprocess(&["-fvisibility=hidden", "foo.c"]);
+        assert!(!result.contains(&"-fvisibility=hidden".to_string()));
+        assert!(result.contains(&"foo.c".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_fstack_protector_ignored() {
+        for flag in &[
+            "-fstack-protector",
+            "-fstack-protector-strong",
+            "-fstack-protector-all",
+        ] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(
+                !result.contains(&flag.to_string()),
+                "flag {} not ignored",
+                flag
+            );
+            assert!(result.contains(&"foo.c".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_preprocess_misc_f_flags_ignored() {
+        for flag in &[
+            "-fno-semantic-interposition",
+            "-fno-reorder-blocks-and-partition",
+            "-fno-plt",
+            "-fno-pie",
+            "-fpie",
+            "-fno-common",
+        ] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(
+                !result.contains(&flag.to_string()),
+                "flag {} not ignored",
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn test_preprocess_catchall_f_flags_ignored() {
+        // Unknown -f flags should be silently ignored
+        let result = run_preprocess(&["-funknown-flag", "foo.c"]);
+        assert!(!result.contains(&"-funknown-flag".to_string()));
+        assert!(result.contains(&"foo.c".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_pipe_ignored() {
+        let result = run_preprocess(&["-pipe", "foo.c"]);
+        assert!(!result.contains(&"-pipe".to_string()));
+        assert!(result.contains(&"foo.c".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_pie_ignored() {
+        let result = run_preprocess(&["-pie", "foo.c"]);
+        assert!(!result.contains(&"-pie".to_string()));
+        assert!(result.contains(&"foo.c".to_string()));
+    }
+
+    // ========================================================================
+    // Tests for linker passthrough flags
+    // ========================================================================
+
+    #[test]
+    fn test_preprocess_wl_flags() {
+        let result = run_preprocess(&["-Wl,-z,now", "foo.c"]);
+        assert!(result.contains(&"--pcc-linker-flag=-z".to_string()));
+        assert!(result.contains(&"--pcc-linker-flag=now".to_string()));
+        assert!(!result.contains(&"-Wl,-z,now".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_xlinker() {
+        let result = run_preprocess(&["-Xlinker", "--hash-style=gnu", "foo.c"]);
+        assert!(result.contains(&"--pcc-linker-flag=--hash-style=gnu".to_string()));
+        assert!(!result.contains(&"-Xlinker".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_pthread() {
+        let result = run_preprocess(&["-pthread", "foo.c"]);
+        assert!(result.contains(&"--pcc-linker-flag=-pthread".to_string()));
+        // Should also define _REENTRANT
+        assert!(result.contains(&"-D".to_string()));
+        assert!(result.contains(&"_REENTRANT".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_rdynamic() {
+        let result = run_preprocess(&["-rdynamic", "foo.c"]);
+        assert!(result.contains(&"--pcc-linker-flag=-rdynamic".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_cpython_flags_combined() {
+        // Simulate a typical CPython configure compiler probe
+        let result = run_preprocess(&[
+            "-fvisibility=hidden",
+            "-fno-semantic-interposition",
+            "-fstack-protector-strong",
+            "-fno-plt",
+            "-pipe",
+            "-pthread",
+            "-Wl,-z,now",
+            "-rdynamic",
+            "foo.c",
+        ]);
+        // Only foo.c and the passthrough flags should remain
+        assert!(result.contains(&"foo.c".to_string()));
+        // Silently-ignored flags should NOT appear
+        assert!(!result.contains(&"-fvisibility=hidden".to_string()));
+        assert!(!result.contains(&"-fno-semantic-interposition".to_string()));
+        assert!(!result.contains(&"-fstack-protector-strong".to_string()));
+        assert!(!result.contains(&"-fno-plt".to_string()));
+        assert!(!result.contains(&"-pipe".to_string()));
+        // Linker flags should be passed through
+        assert!(result.iter().any(|a| a.starts_with("--pcc-linker-flag=")));
     }
 }

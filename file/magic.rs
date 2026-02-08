@@ -597,7 +597,7 @@ mod tests {
         let input = r"\x97JB2\x0D\x0A\x1A\x0A";
         let result = Value::replace_all_hex_sequences_with_their_coded_values(input).unwrap();
 
-        // \x97 should become byte 0x97 (151 in decimal, 227 in octal)
+        // \x97 should become byte 0x97 (151 decimal, 0x97 hex)
         // JB2 stays as is
         // \x0D should become CR (13)
         // \x0A should become LF (10)
@@ -607,21 +607,21 @@ mod tests {
         let expected_bytes: Vec<u8> = vec![0x97, b'J', b'B', b'2', 0x0D, 0x0A, 0x1A, 0x0A];
         assert_eq!(result, expected_bytes);
     }
-}
 
-#[test]
-fn test_magic_line_parsing() {
-    let line = "0 string \\x97 MATCH_97";
-    let result = RawMagicFileLine::parse(line.to_string());
-    assert!(result.is_ok(), "Failed to parse magic line: {:?}", result);
+    #[test]
+    fn test_magic_line_parsing() {
+        let line = "0 string \\x97 MATCH_97";
+        let result = RawMagicFileLine::parse(line.to_string());
+        assert!(result.is_ok(), "Failed to parse magic line: {:?}", result);
 
-    let magic_line = result.unwrap();
-    assert_eq!(magic_line.offset.num, 0);
-    assert_eq!(magic_line.message, "MATCH_97");
+        let magic_line = result.unwrap();
+        assert_eq!(magic_line.offset.num, 0);
+        assert_eq!(magic_line.message, "MATCH_97");
 
-    if let Value::String(val) = magic_line.value {
-        assert_eq!(val, vec![0x97]);
-    } else {
-        panic!("Expected String value");
+        if let Value::String(val) = magic_line.value {
+            assert_eq!(val, vec![0x97]);
+        } else {
+            panic!("Expected String value");
+        }
     }
 }

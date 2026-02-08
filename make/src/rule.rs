@@ -66,6 +66,37 @@ impl Rule {
         self.recipes.iter()
     }
 
+    /// Runs an inference rule for a specific target (not a CWD scan).
+    ///
+    /// This is used when POSIX requires applying an inference rule to a specific
+    /// target that has no commands of its own. The internal macros ($<, $*, etc.)
+    /// are substituted based on the target name and the inference rule's suffixes.
+    pub fn run_for_target(
+        &self,
+        global_config: &GlobalConfig,
+        macros: &[VariableDefinition],
+        target: &Target,
+        up_to_date: bool,
+    ) -> Result<(), ErrorCode> {
+        // For an inference rule applied to a specific target, compute the
+        // input/output pair from the target name and the rule's suffixes.
+        let files = if let Some(Target::Inference { from, to, .. }) = self.targets().next() {
+            let target_name = target.as_ref();
+            let expected_suffix = format!(".{}", to);
+            if let Some(stem) = target_name.strip_suffix(&expected_suffix) {
+                let input = PathBuf::from(format!("{}.{}", stem, from));
+                let output = PathBuf::from(target_name);
+                vec![(input, output)]
+            } else {
+                vec![(PathBuf::from(""), PathBuf::from(""))]
+            }
+        } else {
+            vec![(PathBuf::from(""), PathBuf::from(""))]
+        };
+
+        self.run_with_files(global_config, macros, target, up_to_date, files)
+    }
+
     /// Runs the rule with the global config and macros passed in.
     ///
     /// Returns `Ok` on success and `Err` on any errors while running the rule.
@@ -75,6 +106,32 @@ impl Rule {
         macros: &[VariableDefinition],
         target: &Target,
         up_to_date: bool,
+    ) -> Result<(), ErrorCode> {
+        let files = match target {
+            Target::Inference { from, to, .. } => find_files_with_extension(from)?
+                .into_iter()
+                .map(|input| {
+                    let mut output = input.clone();
+                    output.set_extension(to);
+                    (input, output)
+                })
+                .collect::<Vec<_>>(),
+            _ => {
+                vec![(PathBuf::from(""), PathBuf::from(""))]
+            }
+        };
+
+        self.run_with_files(global_config, macros, target, up_to_date, files)
+    }
+
+    /// Internal helper: runs the rule's recipes for the given input/output file pairs.
+    fn run_with_files(
+        &self,
+        global_config: &GlobalConfig,
+        macros: &[VariableDefinition],
+        target: &Target,
+        up_to_date: bool,
+        files: Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), ErrorCode> {
         let GlobalConfig {
             ignore: global_ignore,
@@ -96,20 +153,6 @@ impl Rule {
             precious: rule_precious,
             phony: _,
         } = self.config;
-
-        let files = match target {
-            Target::Inference { from, to, .. } => find_files_with_extension(from)?
-                .into_iter()
-                .map(|input| {
-                    let mut output = input.clone();
-                    output.set_extension(to);
-                    (input, output)
-                })
-                .collect::<Vec<_>>(),
-            _ => {
-                vec![(PathBuf::from(""), PathBuf::from(""))]
-            }
-        };
 
         for inout in files {
             for recipe in self.recipes() {

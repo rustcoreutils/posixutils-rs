@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::env;
 use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -160,17 +159,6 @@ mod arguments {
             0,
         )
     }
-
-    #[test]
-    fn dash_r() {
-        run_test_helper(
-            &["-r"],
-            "",
-            "make: no makefile\n",
-            ErrorCode::NoMakefile.into(),
-        )
-    }
-
     #[test]
     fn dash_r_with_file() {
         run_test_helper_with_setup_and_destruct(
@@ -182,10 +170,20 @@ mod arguments {
                 File::create("testfile.txt").expect("failed to create file");
             },
             || {
-                remove_file("testfile.txt").expect("failed to remove file");
-                remove_file("testfile.out").expect("failed to remove file");
+                let _ = remove_file("testfile.txt");
+                let _ = remove_file("testfile.out");
             },
         );
+    }
+
+    #[test]
+    fn dash_r() {
+        run_test_helper(
+            &["-r"],
+            "",
+            "make: no makefile\n",
+            ErrorCode::NoMakefile.into(),
+        )
     }
 
     #[test]
@@ -449,6 +447,9 @@ mod target_behavior {
 
     #[test]
     fn async_events() {
+        // Clean up any leftover files from previous test runs
+        let _ = remove_file("text.txt");
+
         let args = [
             "-f",
             "tests/makefiles/target_behavior/async_events/signal.mk",
@@ -472,6 +473,10 @@ mod target_behavior {
         assert_eq!(stderr, "make: Interrupt\nmake: Deleting file 'text.txt'\n");
 
         assert_eq!(output.status.code(), Some(130));
+
+        // The makefile creates text.txt and the signal handler should delete it,
+        // but clean up anyway in case test fails
+        let _ = remove_file("text.txt");
     }
 }
 
@@ -624,6 +629,11 @@ mod special_targets {
 
     #[test]
     fn precious() {
+        // Clean up any leftover files from previous test runs
+        let _ = remove_file("precious_text.txt");
+        let _ = remove_file("preciousdir/some.txt");
+        let _ = remove_dir("preciousdir");
+
         let args = [
             "-f",
             "tests/makefiles/special_targets/precious/basic_precious.mk",
@@ -653,6 +663,7 @@ mod special_targets {
 
         assert_eq!(output.status.code(), Some(130));
 
+        let _ = remove_file("precious_text.txt");
         remove_file("preciousdir/some.txt").unwrap();
         remove_dir("preciousdir").unwrap();
     }
@@ -664,33 +675,23 @@ mod special_targets {
                 "-f",
                 "tests/makefiles/special_targets/suffixes/suffixes_basic.mk",
             ],
-            "Converting copied.txt to copied.out\n",
+            "Converting suffixes_test.sfx to suffixes_test.xfo\n",
             "",
             0,
-            create_txt,
+            create_file,
             remove_files,
         );
 
-        fn create_txt() {
-            let dir = env::current_dir().unwrap();
-            for file in dir.read_dir().unwrap().map(Result::unwrap) {
-                if !file.file_type().map(|x| x.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                if file.path().extension().map(|x| x == "txt").unwrap_or(false) {
-                    remove_file(file.path()).unwrap();
-                }
-            }
-
-            File::create("copied.txt")
+        fn create_file() {
+            File::create("suffixes_test.sfx")
                 .unwrap()
                 .write_all(b"some content")
                 .unwrap();
         }
 
         fn remove_files() {
-            remove_file("copied.txt").unwrap();
-            remove_file("copied.out").unwrap();
+            let _ = remove_file("suffixes_test.sfx");
+            let _ = remove_file("suffixes_test.xfo");
         }
     }
 
@@ -783,5 +784,68 @@ mod special_targets {
                 0,
             );
         }
+    }
+}
+
+mod inference_rules {
+    use super::*;
+
+    #[test]
+    fn dash_r_suffix_classification() {
+        // Test that -r flag + user-defined .SUFFIXES + inference rule works correctly.
+        // This directly tests the original bug: inference rules must be classified
+        // correctly even when -r clears built-in suffixes.
+        run_test_helper_with_setup_and_destruct(
+            &["-rf", "tests/makefiles/inference_rules/dash_r_suffix.mk"],
+            "Converting dash_r_test.txt to dash_r_test.out\n",
+            "",
+            0,
+            || {
+                File::create("dash_r_test.txt").expect("failed to create file");
+            },
+            || {
+                let _ = remove_file("dash_r_test.txt");
+                let _ = remove_file("dash_r_test.out");
+            },
+        );
+    }
+
+    #[test]
+    fn target_no_commands_uses_inference() {
+        // Test that a target rule with no commands triggers inference rule lookup.
+        // Per POSIX: "When no target rule with commands is found to update a
+        // target, the inference rules shall be checked."
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-sf",
+                "tests/makefiles/inference_rules/target_no_commands.mk",
+            ],
+            "Inference applied: inference_test.src -> inference_test.dst\n",
+            "",
+            0,
+            || {
+                File::create("inference_test.src").expect("failed to create file");
+            },
+            || {
+                let _ = remove_file("inference_test.src");
+                let _ = remove_file("inference_test.dst");
+            },
+        );
+    }
+
+    #[test]
+    fn inference_rule_not_default_target() {
+        // Test that inference rules are never selected as the default target.
+        // Per POSIX: "the first target that make encounters that is not a
+        // special target or an inference rule shall be used."
+        run_test_helper(
+            &[
+                "-sf",
+                "tests/makefiles/inference_rules/not_default_target.mk",
+            ],
+            "CORRECT: real target ran\n",
+            "",
+            0,
+        );
     }
 }

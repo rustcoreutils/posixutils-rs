@@ -31,7 +31,10 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
         // Try to parse it as a chrono-tz timezone
         if let Ok(tz) = tz_str.parse::<Tz>() {
             // Convert the local datetime to the specified timezone
-            if let Some(dt_tz) = tz.from_local_datetime(&dt.naive_local()).single() {
+            // Use earliest() to handle DST transitions consistently
+            let dt_tz = tz.from_local_datetime(&dt.naive_local()).earliest()
+                .or_else(|| tz.from_local_datetime(&dt.naive_local()).latest());
+            if let Some(dt_tz) = dt_tz {
                 return dt_tz.format("%Z").to_string();
             }
         }
@@ -49,15 +52,69 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
 }
 
 /// Format a datetime string, replacing %Z with proper timezone abbreviation
-fn format_with_timezone(formatstr: &str, dt: &DateTime<Local>) -> String {
+fn format_with_timezone_local(formatstr: &str, dt: &DateTime<Local>) -> String {
     if formatstr.contains("%Z") {
         let tz_abbr = get_timezone_abbreviation(dt);
-        let formatted = dt.format(formatstr).to_string();
-        // Replace the offset (like +01:00) with the timezone abbreviation
-        // chrono uses %Z for offset, so we need to replace it
-        // The offset format from chrono with %Z is like "+01:00" or "+00:00"
-        let offset_pattern = dt.format("%Z").to_string();
-        formatted.replace(&offset_pattern, &tz_abbr)
+        // Process the format string character by character to handle %Z properly
+        let mut result = String::new();
+        let mut chars = formatstr.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                if let Some(&next_ch) = chars.peek() {
+                    if next_ch == '%' {
+                        // %% should become % in the output - let chrono handle this
+                        result.push('%');
+                        result.push('%');
+                        chars.next(); // consume the second %
+                        continue;
+                    } else if next_ch == 'Z' {
+                        // Replace %Z with the timezone abbreviation
+                        result.push_str(&tz_abbr);
+                        chars.next(); // consume 'Z'
+                        continue;
+                    }
+                }
+            }
+            result.push(ch);
+        }
+        
+        // Format the modified format string
+        dt.format(&result).to_string()
+    } else {
+        dt.format(formatstr).to_string()
+    }
+}
+
+/// Format a datetime string for UTC, replacing %Z with "UTC"
+fn format_with_timezone_utc(formatstr: &str, dt: &DateTime<Utc>) -> String {
+    if formatstr.contains("%Z") {
+        // Process the format string character by character to handle %Z properly
+        let mut result = String::new();
+        let mut chars = formatstr.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                if let Some(&next_ch) = chars.peek() {
+                    if next_ch == '%' {
+                        // %% should become % in the output - let chrono handle this
+                        result.push('%');
+                        result.push('%');
+                        chars.next(); // consume the second %
+                        continue;
+                    } else if next_ch == 'Z' {
+                        // Replace %Z with "UTC"
+                        result.push_str("UTC");
+                        chars.next(); // consume 'Z'
+                        continue;
+                    }
+                }
+            }
+            result.push(ch);
+        }
+        
+        // Format the modified format string
+        dt.format(&result).to_string()
     } else {
         dt.format(formatstr).to_string()
     }
@@ -86,19 +143,12 @@ struct Args {
 
 fn show_time_local(formatstr: &str) -> String {
     let now = chrono::Local::now();
-    format_with_timezone(formatstr, &now)
+    format_with_timezone_local(formatstr, &now)
 }
 
 fn show_time_utc(formatstr: &str) -> String {
     let now = chrono::Utc::now();
-    // For UTC, %Z should always be "UTC"
-    if formatstr.contains("%Z") {
-        let formatted = now.format(formatstr).to_string();
-        let offset_pattern = now.format("%Z").to_string();
-        formatted.replace(&offset_pattern, "UTC")
-    } else {
-        now.format(formatstr).to_string()
-    }
+    format_with_timezone_utc(formatstr, &now)
 }
 
 fn show_time(utc: bool, formatstr: &str) {

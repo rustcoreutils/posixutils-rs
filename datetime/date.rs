@@ -31,9 +31,9 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
         // Try to parse it as a chrono-tz timezone
         if let Ok(tz) = tz_str.parse::<Tz>() {
             // Convert the local datetime to the specified timezone
-            // Use earliest() to handle DST transitions consistently
-            let dt_tz = tz.from_local_datetime(&dt.naive_local()).earliest()
-                .or_else(|| tz.from_local_datetime(&dt.naive_local()).latest());
+            // Use earliest() to handle DST transitions consistently, with latest() as fallback
+            let local_result = tz.from_local_datetime(&dt.naive_local());
+            let dt_tz = local_result.earliest().or_else(|| local_result.latest());
             if let Some(dt_tz) = dt_tz {
                 return dt_tz.format("%Z").to_string();
             }
@@ -51,36 +51,41 @@ fn get_timezone_abbreviation(dt: &DateTime<Local>) -> String {
     dt.format("%:z").to_string()
 }
 
+/// Parse a format string and replace %Z with the provided timezone abbreviation
+/// This function handles escaped %% sequences properly
+fn parse_format_string_with_tz(formatstr: &str, tz_abbr: &str) -> String {
+    let mut result = String::new();
+    let mut chars = formatstr.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let Some(&next_ch) = chars.peek() {
+                if next_ch == '%' {
+                    // Preserve %% so chrono can later convert it to a single %
+                    result.push('%');
+                    result.push('%');
+                    chars.next(); // consume the second %
+                    continue;
+                } else if next_ch == 'Z' {
+                    // Replace %Z with the timezone abbreviation
+                    result.push_str(tz_abbr);
+                    chars.next(); // consume 'Z'
+                    continue;
+                }
+            }
+        }
+        result.push(ch);
+    }
+    
+    result
+}
+
 /// Format a datetime string, replacing %Z with proper timezone abbreviation
 fn format_with_timezone_local(formatstr: &str, dt: &DateTime<Local>) -> String {
     if formatstr.contains("%Z") {
         let tz_abbr = get_timezone_abbreviation(dt);
-        // Process the format string character by character to handle %Z properly
-        let mut result = String::new();
-        let mut chars = formatstr.chars().peekable();
-        
-        while let Some(ch) = chars.next() {
-            if ch == '%' {
-                if let Some(&next_ch) = chars.peek() {
-                    if next_ch == '%' {
-                        // %% should become % in the output - let chrono handle this
-                        result.push('%');
-                        result.push('%');
-                        chars.next(); // consume the second %
-                        continue;
-                    } else if next_ch == 'Z' {
-                        // Replace %Z with the timezone abbreviation
-                        result.push_str(&tz_abbr);
-                        chars.next(); // consume 'Z'
-                        continue;
-                    }
-                }
-            }
-            result.push(ch);
-        }
-        
-        // Format the modified format string
-        dt.format(&result).to_string()
+        let modified_format = parse_format_string_with_tz(formatstr, &tz_abbr);
+        dt.format(&modified_format).to_string()
     } else {
         dt.format(formatstr).to_string()
     }
@@ -89,32 +94,8 @@ fn format_with_timezone_local(formatstr: &str, dt: &DateTime<Local>) -> String {
 /// Format a datetime string for UTC, replacing %Z with "UTC"
 fn format_with_timezone_utc(formatstr: &str, dt: &DateTime<Utc>) -> String {
     if formatstr.contains("%Z") {
-        // Process the format string character by character to handle %Z properly
-        let mut result = String::new();
-        let mut chars = formatstr.chars().peekable();
-        
-        while let Some(ch) = chars.next() {
-            if ch == '%' {
-                if let Some(&next_ch) = chars.peek() {
-                    if next_ch == '%' {
-                        // %% should become % in the output - let chrono handle this
-                        result.push('%');
-                        result.push('%');
-                        chars.next(); // consume the second %
-                        continue;
-                    } else if next_ch == 'Z' {
-                        // Replace %Z with "UTC"
-                        result.push_str("UTC");
-                        chars.next(); // consume 'Z'
-                        continue;
-                    }
-                }
-            }
-            result.push(ch);
-        }
-        
-        // Format the modified format string
-        dt.format(&result).to_string()
+        let modified_format = parse_format_string_with_tz(formatstr, "UTC");
+        dt.format(&modified_format).to_string()
     } else {
         dt.format(formatstr).to_string()
     }

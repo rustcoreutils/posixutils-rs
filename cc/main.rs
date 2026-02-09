@@ -146,6 +146,16 @@ struct Args {
     #[arg(long = "pcc-fpic", hide = true)]
     fpic: bool,
 
+    /// Generate position-independent executable code (PIE)
+    /// Set by preprocess_args() when -fPIE or -fpie is passed
+    #[arg(long = "pcc-fpie", action = clap::ArgAction::SetTrue, hide = true)]
+    fpie: bool,
+
+    /// Disable PIE code generation (GCC compatibility)
+    /// Set by preprocess_args() when -fno-pie is passed
+    #[arg(long = "pcc-fno-pie", action = clap::ArgAction::SetTrue, hide = true)]
+    fno_pie: bool,
+
     /// Produce a shared library
     #[arg(long = "shared", help = gettext("Produce a shared library"))]
     shared: bool,
@@ -196,6 +206,10 @@ struct Args {
     /// Extra flags to pass through to the linker (set by preprocess_args)
     #[arg(long = "pcc-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     linker_flags: Vec<String>,
+
+    /// Unsupported machine flags captured by preprocess_args
+    #[arg(long = "pcc-unsupported-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
+    unsupported_mflags: Vec<String>,
 }
 
 /// Print compilation statistics for capacity tuning
@@ -426,7 +440,11 @@ fn process_file(
 
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;
-    let mut codegen = arch::codegen::create_codegen(target.clone(), emit_unwind_tables, args.fpic);
+    let pie_mode = pie_enabled(args, target);
+    let pic_mode = args.fpic || args.shared || pie_mode;
+    let shared_mode = args.shared;
+    let mut codegen =
+        arch::codegen::create_codegen(target.clone(), emit_unwind_tables, pic_mode, shared_mode);
     let asm = codegen.generate(&module, &types);
 
     // Determine output file names
@@ -510,6 +528,10 @@ fn process_file(
     // Pass -shared flag for shared library creation
     if args.shared {
         link_cmd.arg("-shared");
+    } else if pie_mode {
+        link_cmd.arg("-pie");
+    } else {
+        link_cmd.arg("-no-pie");
     }
     link_cmd.args(["-o", &exe_file, &temp_obj]);
     // Add library search paths
@@ -611,6 +633,14 @@ fn preprocess_args() -> Vec<String> {
                 seen_fpic = true;
             }
             i += 1;
+        } else if arg == "-fPIE" || arg == "-fpie" {
+            // -fPIE / -fpie → --pcc-fpie (internal flag)
+            result.push("--pcc-fpie".to_string());
+            i += 1;
+        } else if arg == "-fno-pie" {
+            // -fno-pie → --pcc-fno-pie (internal flag)
+            result.push("--pcc-fno-pie".to_string());
+            i += 1;
         } else if arg == "-shared" {
             // -shared → --shared
             result.push("--shared".to_string());
@@ -632,13 +662,15 @@ fn preprocess_args() -> Vec<String> {
         {
             // GCC optimization flags - silently ignore (pcc doesn't have these optimizations)
             i += 1;
+        } else if arg.starts_with("-m") && arg.len() > 2 {
+            // Machine flags - unsupported (SIMD/arch not supported yet)
+            result.push(format!("--pcc-unsupported-mflag={}", arg));
+            i += 1;
         } else if arg.starts_with("-fvisibility")
             || arg == "-fno-semantic-interposition"
             || arg.starts_with("-fstack-protector")
             || arg == "-fno-reorder-blocks-and-partition"
             || arg == "-fno-plt"
-            || arg == "-fno-pie"
-            || arg == "-fpie"
             || arg == "-fno-common"
             || arg == "-fexceptions"
             || arg == "-fno-exceptions"
@@ -654,8 +686,18 @@ fn preprocess_args() -> Vec<String> {
         } else if arg == "-p" || arg == "-pg" {
             // Profiling flags - silently ignore (pcc doesn't support profiling)
             i += 1;
-        } else if arg == "-pipe" || arg == "-pie" || arg.starts_with("-m") {
-            // Misc GCC flags and -m* machine flags - silently ignore
+        } else if arg == "-pipe" {
+            // Misc GCC flags - silently ignore
+            i += 1;
+        } else if arg == "-pie" {
+            // -pie enables PIE link mode
+            result.push("--pcc-fpie".to_string());
+            result.push("--pcc-linker-flag=-pie".to_string());
+            i += 1;
+        } else if arg == "-no-pie" {
+            // -no-pie disables PIE link mode
+            result.push("--pcc-fno-pie".to_string());
+            result.push("--pcc-linker-flag=-no-pie".to_string());
             i += 1;
         } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
             // -Wl,flag1,flag2 -> pass each flag to linker
@@ -729,12 +771,31 @@ fn is_object_file(path: &str) -> bool {
         || path.contains(".so.") // versioned .so files like libz.so.1.3.1
 }
 
+/// Determine whether PIE should be enabled for this compilation.
+fn pie_enabled(args: &Args, target: &Target) -> bool {
+    if args.shared || args.fno_pie {
+        return false;
+    }
+    if args.fpie {
+        return true;
+    }
+    target.os == Os::Linux
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse_from(preprocess_args());
+
+    // Handle unsupported machine flags early
+    if !args.unsupported_mflags.is_empty() {
+        for flag in &args.unsupported_mflags {
+            eprintln!("pcc: unsupported machine flag: {}", flag);
+        }
+        std::process::exit(1);
+    }
 
     // Handle --print-targets
     if args.print_targets {
@@ -863,6 +924,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Pass -shared flag for shared library creation
         if args.shared {
             link_cmd.arg("-shared");
+        } else if pie_enabled(&args, &target) {
+            link_cmd.arg("-pie");
+        } else {
+            link_cmd.arg("-no-pie");
         }
         link_cmd.args(["-o", &exe_file]);
         for obj in &all_objects {
@@ -1046,6 +1111,12 @@ mod tests {
                     seen_fpic = true;
                 }
                 i += 1;
+            } else if arg == "-fPIE" || arg == "-fpie" {
+                result.push("--pcc-fpie".to_string());
+                i += 1;
+            } else if arg == "-fno-pie" {
+                result.push("--pcc-fno-pie".to_string());
+                i += 1;
             } else if arg == "-shared" {
                 result.push("--shared".to_string());
                 i += 1;
@@ -1056,14 +1127,24 @@ mod tests {
                 result.push("--pcc-fno-builtin-func".to_string());
                 result.push(func.to_string());
                 i += 1;
+            } else if arg.starts_with("-m") && arg.len() > 2 {
+                // Machine flags - unsupported (SIMD/arch not supported yet)
+                result.push(format!("--pcc-unsupported-mflag={}", arg));
+                i += 1;
             } else if (arg.starts_with("-f") && !arg.starts_with("-fno-builtin"))
                 || arg == "-p"
                 || arg == "-pg"
                 || arg == "-pipe"
-                || arg == "-pie"
-                || arg.starts_with("-m")
             {
-                // Silently ignore -f* flags, profiling flags, -pipe, -pie, -m* machine flags
+                // Silently ignore -f* flags, profiling flags, -pipe
+                i += 1;
+            } else if arg == "-pie" {
+                result.push("--pcc-fpie".to_string());
+                result.push("--pcc-linker-flag=-pie".to_string());
+                i += 1;
+            } else if arg == "-no-pie" {
+                result.push("--pcc-fno-pie".to_string());
+                result.push("--pcc-linker-flag=-no-pie".to_string());
                 i += 1;
             } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
                 for flag in wl_args.split(',') {
@@ -1179,8 +1260,6 @@ mod tests {
             "-fno-semantic-interposition",
             "-fno-reorder-blocks-and-partition",
             "-fno-plt",
-            "-fno-pie",
-            "-fpie",
             "-fno-common",
         ] {
             let result = run_preprocess(&[flag, "foo.c"]);
@@ -1201,6 +1280,13 @@ mod tests {
     }
 
     #[test]
+    fn test_preprocess_m_flags_unsupported() {
+        let result = run_preprocess(&["-msse2", "foo.c"]);
+        assert!(result.contains(&"--pcc-unsupported-mflag=-msse2".to_string()));
+        assert!(result.contains(&"foo.c".to_string()));
+    }
+
+    #[test]
     fn test_preprocess_pipe_ignored() {
         let result = run_preprocess(&["-pipe", "foo.c"]);
         assert!(!result.contains(&"-pipe".to_string()));
@@ -1208,10 +1294,35 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_pie_ignored() {
+    fn test_preprocess_fpie() {
+        let result = run_preprocess(&["-fPIE", "foo.c"]);
+        assert!(result.contains(&"--pcc-fpie".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_fpie_lowercase() {
+        let result = run_preprocess(&["-fpie", "foo.c"]);
+        assert!(result.contains(&"--pcc-fpie".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_fno_pie() {
+        let result = run_preprocess(&["-fno-pie", "foo.c"]);
+        assert!(result.contains(&"--pcc-fno-pie".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_pie_linker_flag() {
         let result = run_preprocess(&["-pie", "foo.c"]);
-        assert!(!result.contains(&"-pie".to_string()));
-        assert!(result.contains(&"foo.c".to_string()));
+        assert!(result.contains(&"--pcc-fpie".to_string()));
+        assert!(result.contains(&"--pcc-linker-flag=-pie".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_no_pie_linker_flag() {
+        let result = run_preprocess(&["-no-pie", "foo.c"]);
+        assert!(result.contains(&"--pcc-fno-pie".to_string()));
+        assert!(result.contains(&"--pcc-linker-flag=-no-pie".to_string()));
     }
 
     // ========================================================================

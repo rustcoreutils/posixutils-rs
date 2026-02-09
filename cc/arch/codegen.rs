@@ -661,8 +661,13 @@ pub trait CodeGenerator {
     /// Set whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
     fn set_emit_unwind_tables(&mut self, emit: bool);
 
-    /// Set position-independent code mode (for shared libraries)
+    /// Set position-independent code mode (for shared libraries and PIE)
     fn set_pic_mode(&mut self, pic: bool);
+
+    /// Set shared library mode (for TLS model selection)
+    /// In shared library mode, TLS uses Initial Exec/General Dynamic model.
+    /// In PIE/executable mode, TLS uses Local Exec for local variables.
+    fn set_shared_mode(&mut self, shared: bool);
 }
 
 /// Create a code generator for the given target
@@ -670,6 +675,7 @@ pub fn create_codegen(
     target: Target,
     emit_unwind_tables: bool,
     pic_mode: bool,
+    shared_mode: bool,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -679,5 +685,6 @@ pub fn create_codegen(
     };
     codegen.set_emit_unwind_tables(emit_unwind_tables);
     codegen.set_pic_mode(pic_mode);
+    codegen.set_shared_mode(shared_mode);
     codegen
 }

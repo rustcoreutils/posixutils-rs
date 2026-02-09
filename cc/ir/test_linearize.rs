@@ -4820,3 +4820,182 @@ fn test_union_first_named_member_positional_init() {
         ir
     );
 }
+
+// ============================================================================
+// va_list parameter handling tests
+// ============================================================================
+// va_list parameter handling tests
+// ============================================================================
+
+#[test]
+fn test_valist_parameter_stored_as_pointer() {
+    // Test: va_list parameter is stored as 8-byte pointer (not 24-byte struct)
+    // because va_list decays to pointer at call site due to being an array type.
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+
+    // Create va_list type
+    let valist_type = ctx
+        .types
+        .intern(Type::basic(crate::types::TypeKind::VaList));
+
+    // Create symbol for parameter va
+    let va_sym = ctx.var("va", valist_type);
+
+    // Function: void test(va_list va) { }
+    let func = FunctionDef {
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(va_sym),
+            typ: valist_type,
+        }],
+        body: Stmt::Block(vec![]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // The va_list parameter should be stored with .64 (pointer size),
+    // not .192 (full va_list struct size of 24 bytes = 192 bits)
+    assert!(
+        ir.contains("store.64"),
+        "va_list parameter should be stored as 64-bit pointer, got: {}",
+        ir
+    );
+    assert!(
+        !ir.contains("store.192"),
+        "va_list parameter should NOT be stored as 192-bit struct, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_valist_local_not_indirect() {
+    // Test: va_list local declaration (not parameter) should be direct storage
+    // Only va_list parameters are indirect (holding a pointer).
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+
+    // Create va_list type
+    let valist_type = ctx
+        .types
+        .intern(Type::basic(crate::types::TypeKind::VaList));
+
+    // Create symbol for local va_list
+    let lva_sym = ctx.var("lva", valist_type);
+
+    // Function: void test(void) { va_list lva; }
+    let lva_decl = Declaration {
+        declarators: vec![InitDeclarator {
+            symbol: lva_sym,
+            typ: valist_type,
+            storage_class: crate::types::TypeModifiers::empty(),
+            init: None,
+            vla_sizes: vec![],
+            explicit_align: None,
+        }],
+    };
+
+    let func = FunctionDef {
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![BlockItem::Declaration(lva_decl)]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+
+    // Check that the function has a local for lva (may have suffix like ".0")
+    let test_func = module.functions.iter().find(|f| f.name == "test");
+    assert!(test_func.is_some(), "Should have function 'test'");
+
+    let func = test_func.unwrap();
+    let has_lva_local = func.locals.keys().any(|k| k.starts_with("lva"));
+    assert!(
+        has_lva_local,
+        "Should have local starting with 'lva'. Locals: {:?}",
+        func.locals.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_valist_expression_decay() {
+    // Test: va_list used in expression context should decay to pointer
+    // This is similar to array decay - va_list is __va_list_tag[1]
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+
+    // Create va_list and pointer types
+    let valist_type = ctx
+        .types
+        .intern(Type::basic(crate::types::TypeKind::VaList));
+    let uchar_ptr_type = ctx.types.pointer_to(ctx.types.uchar_id);
+
+    // Create symbols
+    let va_sym = ctx.var("va", valist_type);
+    let ptr_sym = ctx.var("ptr", uchar_ptr_type);
+
+    // va_list va (parameter)
+    // unsigned char *ptr = (unsigned char*)va;
+    let cast_expr = Expr::typed_unpositioned(
+        ExprKind::Cast {
+            cast_type: uchar_ptr_type,
+            expr: Box::new(Expr::var_typed(va_sym, valist_type)),
+        },
+        uchar_ptr_type,
+    );
+
+    let ptr_decl = Declaration {
+        declarators: vec![InitDeclarator {
+            symbol: ptr_sym,
+            typ: uchar_ptr_type,
+            storage_class: crate::types::TypeModifiers::empty(),
+            init: Some(cast_expr),
+            vla_sizes: vec![],
+            explicit_align: None,
+        }],
+    };
+
+    let func = FunctionDef {
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(va_sym),
+            typ: valist_type,
+        }],
+        body: Stmt::Block(vec![BlockItem::Declaration(ptr_decl)]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // The cast from va_list to pointer should involve loading the va pointer
+    // (since va is a parameter and is_indirect), not taking symaddr of va_list struct
+    assert!(
+        ir.contains("load.64"),
+        "Cast of va_list parameter should load the pointer value, got: {}",
+        ir
+    );
+}

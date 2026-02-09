@@ -214,3 +214,85 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_functions_mega", code, &[]), 0);
 }
+
+/// Test that return statements properly convert expression types to function return type
+/// This tests a bug where `return -1` in a `long long` function returned 0xFFFFFFFF instead of -1
+#[test]
+fn c89_functions_return_type_conversion() {
+    let code = r#"
+typedef long long Py_ssize_t;
+#define DKIX_EMPTY (-1)
+
+// Function returns 64-bit but expression is 32-bit int
+static Py_ssize_t return_minus_one(void) {
+    return -1;
+}
+
+// Function returns 64-bit via macro (still 32-bit int expression)
+static Py_ssize_t return_dkix_empty(void) {
+    return DKIX_EMPTY;
+}
+
+// More complex case - return from inside loop
+static Py_ssize_t return_from_loop(int condition) {
+    Py_ssize_t ix;
+    for (;;) {
+        ix = -1;
+        if (ix < 0) {
+            return DKIX_EMPTY;
+        }
+    }
+    return -100;
+}
+
+// Return smaller types that need sign extension
+static long long return_signed_char(void) {
+    return (signed char)-1;  // Should be -1, not 255
+}
+
+static long long return_short(void) {
+    return (short)-1;  // Should be -1, not 65535
+}
+
+static long long return_int(void) {
+    return (int)-1;  // Should be -1, not 0xFFFFFFFF
+}
+
+// Test with unsigned promotion
+static unsigned long long return_uint(void) {
+    return (unsigned int)0xFFFFFFFF;  // Should stay 0xFFFFFFFF
+}
+
+int main(void) {
+    // Test direct -1 return
+    Py_ssize_t r1 = return_minus_one();
+    if (r1 != -1) return 1;
+    // Check upper bits are set (sign extended)
+    if ((unsigned long long)r1 != 0xFFFFFFFFFFFFFFFFULL) return 2;
+
+    // Test macro return
+    Py_ssize_t r2 = return_dkix_empty();
+    if (r2 != -1) return 3;
+    if ((unsigned long long)r2 != 0xFFFFFFFFFFFFFFFFULL) return 4;
+
+    // Test return from loop
+    Py_ssize_t r3 = return_from_loop(1);
+    if (r3 != -1) return 5;
+    if ((unsigned long long)r3 != 0xFFFFFFFFFFFFFFFFULL) return 6;
+
+    // Test smaller signed types
+    if (return_signed_char() != -1) return 7;
+    if (return_short() != -1) return 8;
+    if (return_int() != -1) return 9;
+
+    // Test unsigned - should zero-extend, not sign-extend
+    if (return_uint() != 0xFFFFFFFFULL) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_functions_return_type_conversion", code, &[]),
+        0
+    );
+}

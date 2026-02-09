@@ -176,3 +176,35 @@ int main(void) {
         0
     );
 }
+
+/// Test PIE code generation (-fPIE / -fpie)
+#[test]
+fn codegen_pie_flags() {
+    let code = r#"
+int main(void) {
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("pie_uppercase", code, &["-fPIE".to_string()]),
+        0
+    );
+    assert_eq!(
+        compile_and_run("pie_lowercase", code, &["-fpie".to_string()]),
+        0
+    );
+}
+
+/// Test PIE disable flag (-fno-pie)
+#[test]
+fn codegen_pie_disable_flag() {
+    let code = r#"
+int main(void) {
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("pie_disable", code, &["-fno-pie".to_string()]),
+        0
+    );
+}

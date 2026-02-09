@@ -209,6 +209,51 @@ int main() {
     let _ = std::fs::remove_file(&obj_path);
 }
 
+/// Test that non-PIE code uses direct RIP-relative addressing for globals.
+/// With -fno-pie, local globals should use foo(%rip) not GOT.
+#[test]
+fn codegen_global_accesses_use_rip_relative() {
+    let c_file = create_c_file(
+        "global_access_rip",
+        r#"
+int foo = 3;
+
+int main(void) {
+    return foo;
+}
+"#,
+    );
+    let c_path = c_file.path().to_path_buf();
+
+    let output = run_test_base(
+        "pcc",
+        &vec![
+            "-fno-pie".to_string(),
+            "-S".to_string(),
+            "-o".to_string(),
+            "-".to_string(),
+            c_path.to_string_lossy().to_string(),
+        ],
+        &[],
+    );
+
+    assert!(
+        output.status.success(),
+        "pcc -S -o - failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let asm = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        asm.contains("foo(%rip)"),
+        "expected RIP-relative access in asm output"
+    );
+    assert!(
+        !asm.contains("@GOTPCREL"),
+        "unexpected GOTPCREL usage for local globals"
+    );
+}
+
 #[test]
 fn codegen_cfi_directives() {
     let c_file = create_c_file(
@@ -674,6 +719,158 @@ int main(void) {
     assert_eq!(
         exit_code, 0,
         "__ASSEMBLER__ macro test failed with exit code {}",
+        exit_code
+    );
+}
+
+// ============================================================================
+// Test: Large struct member copy from global variable
+// ============================================================================
+// Regression test for bug where accessing a large struct member (size > 64 bits)
+// from a global variable would generate an extra dereference, treating the
+// struct address as a pointer to dereference rather than the struct itself.
+#[test]
+fn codegen_large_struct_member_copy() {
+    let code = r#"
+typedef struct {
+    void *ctx;
+    void *malloc_fn;
+    void *calloc_fn;
+    void *realloc_fn;
+    void *free_fn;
+} Allocator;
+
+typedef struct {
+    Allocator raw;
+    Allocator mem;
+    Allocator obj;
+} StandardAllocators;
+
+typedef struct {
+    int use_hugepages;
+    StandardAllocators standard;
+} AllAllocators;
+
+typedef struct {
+    char padding[928];
+    AllAllocators allocators;
+} RuntimeState;
+
+RuntimeState _MyRuntime;
+
+#define _MyMem_Raw (_MyRuntime.allocators.standard.raw)
+
+void get_allocator(Allocator *result) {
+    *result = _MyMem_Raw;
+}
+
+int main(void) {
+    // Initialize the source struct
+    _MyMem_Raw.ctx = (void*)0x1234;
+    _MyMem_Raw.malloc_fn = (void*)0x5678;
+    _MyMem_Raw.calloc_fn = (void*)0x9abc;
+    _MyMem_Raw.realloc_fn = (void*)0xdef0;
+    _MyMem_Raw.free_fn = (void*)0x1111;
+
+    // Copy via function
+    Allocator a;
+    get_allocator(&a);
+
+    // Verify all fields were copied correctly
+    if (a.ctx != (void*)0x1234) return 1;
+    if (a.malloc_fn != (void*)0x5678) return 2;
+    if (a.calloc_fn != (void*)0x9abc) return 3;
+    if (a.realloc_fn != (void*)0xdef0) return 4;
+    if (a.free_fn != (void*)0x1111) return 5;
+
+    // Test direct assignment in main (not via function)
+    Allocator b = _MyMem_Raw;
+    if (b.ctx != (void*)0x1234) return 6;
+    if (b.malloc_fn != (void*)0x5678) return 7;
+
+    // Test arrow access (p->member.field pattern)
+    RuntimeState *rp = &_MyRuntime;
+    Allocator c = rp->allocators.standard.raw;
+    if (c.ctx != (void*)0x1234) return 8;
+    if (c.malloc_fn != (void*)0x5678) return 9;
+
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run_optimized("struct_member_copy", code);
+    assert_eq!(
+        exit_code, 0,
+        "Large struct member copy test failed with exit code {}",
+        exit_code
+    );
+}
+
+// Test for atomic compare-and-swap register clobbering bug.
+// The bug: when regalloc assigns CAS operands to registers R9/R10/R11/RAX,
+// loading one operand can clobber another before it's used.
+// This test uses inline functions to trigger the problematic register allocation.
+#[test]
+fn codegen_atomic_cas_register_clobbering() {
+    let code = r#"
+#include <stdint.h>
+#include <stdatomic.h>
+
+#define UNLOCKED 0
+#define LOCKED 1
+
+typedef struct { uintptr_t v; } RawMutex;
+
+__attribute__((always_inline))
+static inline int
+atomic_cas_uintptr(uintptr_t *obj, uintptr_t *expected, uintptr_t desired) {
+    return atomic_compare_exchange_strong((_Atomic(uintptr_t)*)obj, expected, desired);
+}
+
+__attribute__((always_inline))
+static inline int lock_mutex(RawMutex *m) {
+    uintptr_t unlocked = UNLOCKED;
+    return atomic_cas_uintptr(&m->v, &unlocked, LOCKED);
+}
+
+__attribute__((always_inline))
+static inline int unlock_mutex(RawMutex *m) {
+    uintptr_t locked = LOCKED;
+    return atomic_cas_uintptr(&m->v, &locked, UNLOCKED);
+}
+
+int main(void) {
+    RawMutex m = {0};
+
+    // Test 1: Lock should succeed (v: 0 -> 1)
+    if (m.v != 0) return 1;
+    if (!lock_mutex(&m)) return 2;  // Lock should succeed
+    if (m.v != 1) return 3;         // Value should be 1 after lock
+
+    // Test 2: Double-lock should fail (v is already 1)
+    if (lock_mutex(&m)) return 4;   // Second lock should fail
+    if (m.v != 1) return 5;         // Value should still be 1
+
+    // Test 3: Unlock should succeed (v: 1 -> 0)
+    if (!unlock_mutex(&m)) return 6;  // Unlock should succeed
+    if (m.v != 0) return 7;           // Value should be 0 after unlock
+
+    // Test 4: Double-unlock should fail (v is already 0)
+    if (unlock_mutex(&m)) return 8;   // Second unlock should fail
+    if (m.v != 0) return 9;           // Value should still be 0
+
+    // Test 5: Can lock again after unlock
+    if (!lock_mutex(&m)) return 10;
+    if (m.v != 1) return 11;
+
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run_optimized("atomic_cas_clobber", code);
+    assert_eq!(
+        exit_code, 0,
+        "Atomic CAS register clobbering test failed with exit code {}",
         exit_code
     );
 }

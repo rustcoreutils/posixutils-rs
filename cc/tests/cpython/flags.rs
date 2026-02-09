@@ -45,3 +45,22 @@ int main(void) {
     let extra = vec!["-pthread".to_string()];
     assert_eq!(compile_and_run("cpython_flags_pthread", code, &extra), 0);
 }
+
+#[test]
+fn cpython_flags_m_flags_unsupported() {
+    let code = r#"
+int main(void) {
+    return 0;
+}
+"#;
+    let extra = vec![
+        "-msse".to_string(),
+        "-msse2".to_string(),
+        "-mavx2".to_string(),
+        "-march=x86-64".to_string(),
+    ];
+    assert_ne!(
+        compile_and_run("cpython_flags_mflags_unsupported", code, &extra),
+        0
+    );
+}

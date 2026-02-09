@@ -655,3 +655,57 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("nested_designated_init", code, &[]), 0);
 }
+
+/// Test that sizeof works correctly for arrays with size inferred from initializer
+/// This tests the fix for GitHub issue where sizeof(arr) returned 0 for arr[] = {...}
+#[test]
+fn c99_initializers_sizeof_inferred_array() {
+    let code = r#"
+// Global arrays with inferred size
+int global_arr[] = {1, 2, 3, 4, 5};
+static int static_arr[] = {10, 20, 30, 40, 50, 60};
+
+// Array of structs
+struct Pair { int x; int y; };
+static struct Pair pairs[] = {{1, 2}, {3, 4}, {5, 6}};
+
+// Pointer array
+static int *ptrs[] = {0, 0, 0};
+
+int main(void) {
+    // Test global array
+    if (sizeof(global_arr) != 20) return 1;  // 5 * 4 bytes
+    if (sizeof(global_arr) / sizeof(global_arr[0]) != 5) return 2;
+
+    // Test static array
+    if (sizeof(static_arr) != 24) return 10;  // 6 * 4 bytes
+    if (sizeof(static_arr) / sizeof(static_arr[0]) != 6) return 11;
+
+    // Test local array with inferred size
+    int local_arr[] = {100, 200, 300};
+    if (sizeof(local_arr) != 12) return 20;  // 3 * 4 bytes
+    if (sizeof(local_arr) / sizeof(local_arr[0]) != 3) return 21;
+
+    // Test array of structs
+    if (sizeof(pairs) != 24) return 30;  // 3 * (4 + 4) bytes
+    if (sizeof(pairs) / sizeof(pairs[0]) != 3) return 31;
+
+    // Test pointer array
+    if (sizeof(ptrs) != 24) return 40;  // 3 * 8 bytes on 64-bit
+    if (sizeof(ptrs) / sizeof(ptrs[0]) != 3) return 41;
+
+    // Test complex pattern like CPython's static_types[]
+    typedef void *PyTypeObject;
+    static PyTypeObject types[] = {
+        (void*)1,
+        (void*)2,
+        (void*)3,
+        (void*)4,
+    };
+    if (sizeof(types) / sizeof(types[0]) != 4) return 50;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_inferred_array", code, &[]), 0);
+}

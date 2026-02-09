@@ -49,6 +49,9 @@ struct LocalVarInfo {
     /// For int arr[n][m], this contains [sym_for_n, sym_for_m]
     /// These are needed to compute runtime strides for outer dimension access.
     vla_dim_syms: Vec<PseudoId>,
+    /// True if this local holds a pointer to the actual data (e.g., va_list parameters).
+    /// When true, linearize_lvalue loads the pointer instead of taking the address.
+    is_indirect: bool,
 }
 
 struct ResolvedDesignator {
@@ -1246,6 +1249,9 @@ impl<'a> Linearizer<'a> {
         // Scalar parameters need local storage for SSA-correct reassignment handling
         let mut scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
+        // va_list parameters need special handling (pointer storage)
+        let mut valist_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
+            Vec::with_capacity(func.params.len());
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param
@@ -1262,7 +1268,12 @@ impl<'a> Linearizer<'a> {
             // For struct/union types, we'll copy to a local later
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
-            if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
+            if param_kind == TypeKind::VaList {
+                // va_list parameters are special: due to array-to-pointer decay at call site,
+                // the actual value passed is a pointer to the va_list struct, not the struct itself.
+                // We'll handle this after function setup.
+                valist_params.push((name, param.symbol, param.typ, pseudo_id));
+            } else if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
                 struct_params.push((name, param.symbol, param.typ, pseudo_id));
             } else if self.types.is_complex(param.typ) {
                 // Complex parameters: copy to local storage so real/imag access works
@@ -1285,6 +1296,36 @@ impl<'a> Linearizer<'a> {
 
         // Entry instruction
         self.emit(Instruction::new(Opcode::Entry));
+
+        // Handle va_list parameters: store the pointer value (not the struct)
+        for (name, symbol_id_opt, typ, arg_pseudo) in valist_params {
+            // va_list params are passed as pointers due to array decay at call site.
+            // Store the pointer value (8 bytes) to a local.
+            let ptr_type = self.types.pointer_to(typ);
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                func.add_local(&name, local_sym, ptr_type, false, false, None, None);
+            }
+            let ptr_size = self.types.size_bits(ptr_type);
+            self.emit(Instruction::store(
+                arg_pseudo, local_sym, 0, ptr_type, ptr_size,
+            ));
+            if let Some(symbol_id) = symbol_id_opt {
+                self.locals.insert(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ, // Keep original va_list type for type checking
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vla_dim_syms: vec![],
+                        is_indirect: true, // va_list param: local holds a pointer
+                    },
+                );
+            }
+        }
 
         // Copy struct parameters to local storage so member access works
         for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
@@ -1347,6 +1388,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vla_dim_syms: vec![],
+                        is_indirect: false,
                     },
                 );
             }
@@ -1380,6 +1422,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vla_dim_syms: vec![],
+                        is_indirect: false,
                     },
                 );
             }
@@ -1414,6 +1457,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vla_dim_syms: vec![],
+                        is_indirect: false,
                     },
                 );
             }
@@ -1586,25 +1630,43 @@ impl<'a> Linearizer<'a> {
 
             Stmt::Return(expr) => {
                 if let Some(e) = expr {
-                    let typ = self.expr_type(e);
+                    let expr_typ = self.expr_type(e);
+                    // Get the function's actual return type for proper conversion
+                    let func_ret_type = self
+                        .current_func
+                        .as_ref()
+                        .map(|f| f.return_type)
+                        .unwrap_or(expr_typ);
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, self.struct_return_size);
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
-                    } else if self.types.is_complex(typ) {
+                    } else if self.types.is_complex(expr_typ) {
                         let addr = self.linearize_lvalue(e);
-                        let typ_size = self.types.size_bits(typ);
-                        self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));
+                        let typ_size = self.types.size_bits(func_ret_type);
+                        self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
                     } else {
                         let val = self.linearize_expr(e);
+                        // Convert expression value to function's return type if needed
+                        let converted_val = if expr_typ != func_ret_type
+                            && self.types.kind(func_ret_type) != TypeKind::Void
+                        {
+                            self.emit_convert(val, expr_typ, func_ret_type)
+                        } else {
+                            val
+                        };
                         // Function types decay to pointers when returned
-                        let typ_size = if self.types.kind(typ) == TypeKind::Function {
+                        let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
                             self.target.pointer_width
                         } else {
-                            self.types.size_bits(typ)
+                            self.types.size_bits(func_ret_type)
                         };
-                        self.emit(Instruction::ret_typed(Some(val), typ, typ_size));
+                        self.emit(Instruction::ret_typed(
+                            Some(converted_val),
+                            func_ret_type,
+                            typ_size,
+                        ));
                     }
                 } else {
                     self.emit(Instruction::ret(None));
@@ -1735,6 +1797,7 @@ impl<'a> Linearizer<'a> {
                     vla_size_sym: None,
                     vla_elem_type: None,
                     vla_dim_syms: vec![],
+                    is_indirect: false,
                 },
             );
 
@@ -2019,6 +2082,7 @@ impl<'a> Linearizer<'a> {
                 vla_size_sym: Some(size_sym_id),
                 vla_elem_type: Some(elem_type),
                 vla_dim_syms,
+                is_indirect: false,
             },
         );
     }
@@ -2080,6 +2144,7 @@ impl<'a> Linearizer<'a> {
                 vla_size_sym: None,
                 vla_elem_type: None,
                 vla_dim_syms: vec![],
+                is_indirect: false,
             },
         );
 
@@ -3430,6 +3495,18 @@ impl<'a> Linearizer<'a> {
                             unreachable!("static local sentinel without static_locals entry");
                         }
                     }
+                    // Check if this local holds a pointer to the actual data
+                    // (e.g., va_list parameters due to array-to-pointer decay at call site).
+                    // If so, load the pointer instead of taking the address.
+                    if local.is_indirect {
+                        // The local stores a pointer; load and return it
+                        let ptr_type = self.types.pointer_to(local.typ);
+                        let result = self.alloc_pseudo();
+                        let size = self.types.size_bits(ptr_type);
+                        self.emit(Instruction::load(result, local.sym, 0, ptr_type, size));
+                        return result;
+                    }
+
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::sym_addr(
                         result,
@@ -3438,10 +3515,20 @@ impl<'a> Linearizer<'a> {
                     ));
                     result
                 } else if let Some(&param_pseudo) = self.var_map.get(&name_str) {
-                    // Parameter whose address is taken - spill to local storage
+                    // Parameter whose address is taken
+                    let param_type = self.expr_type(expr);
+                    let type_kind = self.types.kind(param_type);
+
+                    // va_list parameters are special: the parameter value IS already a pointer
+                    // to the va_list structure (due to array-to-pointer decay at call site).
+                    // Return the pointer value directly instead of spilling.
+                    if type_kind == TypeKind::VaList {
+                        return param_pseudo;
+                    }
+
+                    // For other parameters, spill to local storage.
                     // Parameters are pass-by-value in the IR (Arg pseudos), but if
                     // their address is taken, we need to copy to a stack slot first.
-                    let param_type = self.expr_type(expr);
                     let size = self.types.size_bits(param_type);
 
                     // Create a local variable to hold the parameter value
@@ -3480,6 +3567,7 @@ impl<'a> Linearizer<'a> {
                             vla_size_sym: None,
                             vla_elem_type: None,
                             vla_dim_syms: vec![],
+                            is_indirect: false,
                         },
                     );
 
@@ -3955,16 +4043,37 @@ impl<'a> Linearizer<'a> {
                 member_info.typ,
             )
         } else {
-            let result = self.alloc_pseudo();
             let size = self.types.size_bits(member_info.typ);
-            self.emit(Instruction::load(
-                result,
-                base,
-                member_info.offset as i64,
-                member_info.typ,
-                size,
-            ));
-            result
+            let member_kind = self.types.kind(member_info.typ);
+
+            // Large structs (size > 64) can't be loaded into registers - return address
+            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
+                if member_info.offset == 0 {
+                    base
+                } else {
+                    let result = self.alloc_pseudo();
+                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    self.emit(Instruction::binop(
+                        Opcode::Add,
+                        result,
+                        base,
+                        offset_val,
+                        self.types.long_id,
+                        64,
+                    ));
+                    result
+                }
+            } else {
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::load(
+                    result,
+                    base,
+                    member_info.offset as i64,
+                    member_info.typ,
+                    size,
+                ));
+                result
+            }
         }
     }
 
@@ -4025,16 +4134,37 @@ impl<'a> Linearizer<'a> {
                 member_info.typ,
             )
         } else {
-            let result = self.alloc_pseudo();
             let size = self.types.size_bits(member_info.typ);
-            self.emit(Instruction::load(
-                result,
-                ptr,
-                member_info.offset as i64,
-                member_info.typ,
-                size,
-            ));
-            result
+            let member_kind = self.types.kind(member_info.typ);
+
+            // Large structs (size > 64) can't be loaded into registers - return address
+            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
+                if member_info.offset == 0 {
+                    ptr
+                } else {
+                    let result = self.alloc_pseudo();
+                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    self.emit(Instruction::binop(
+                        Opcode::Add,
+                        result,
+                        ptr,
+                        offset_val,
+                        self.types.long_id,
+                        64,
+                    ));
+                    result
+                }
+            } else {
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::load(
+                    result,
+                    ptr,
+                    member_info.offset as i64,
+                    member_info.typ,
+                    size,
+                ));
+                result
+            }
         }
     }
 
@@ -5038,6 +5168,13 @@ impl<'a> Linearizer<'a> {
                         let ptr_type = self.types.pointer_to(elem_type);
                         self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                         return result;
+                    } else if type_kind == TypeKind::VaList {
+                        // va_list is defined as __va_list_tag[1] (an array type), so it decays to
+                        // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
+                        let result = self.alloc_pseudo();
+                        let ptr_type = self.types.pointer_to(typ);
+                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                        return result;
                     } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
                         && size > 64
                     {
@@ -5067,6 +5204,20 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
                 self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+            } else if type_kind == TypeKind::VaList {
+                // va_list is defined as __va_list_tag[1] (an array type), so it decays to
+                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
+                if local.is_indirect {
+                    // va_list parameter: local holds a pointer to the va_list struct
+                    // Load the pointer value (array decay already happened at call site)
+                    let ptr_type = self.types.pointer_to(local.typ);
+                    let ptr_size = self.types.size_bits(ptr_type);
+                    self.emit(Instruction::load(result, local.sym, 0, ptr_type, ptr_size));
+                } else {
+                    // Regular va_list local: take address (normal array decay)
+                    let ptr_type = self.types.pointer_to(local.typ);
+                    self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+                }
             } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
                 // Large structs can't be loaded into registers - return address
                 let ptr_type = self.types.pointer_to(local.typ);
@@ -5113,9 +5264,10 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             }
-            // Functions decay to function pointers, and large structs can't be loaded
-            // into registers - for both cases, return the address
+            // Functions decay to function pointers, va_list decays to pointer (C99 6.3.2.1, 7.15.1),
+            // and large structs can't be loaded into registers - for all cases, return the address
             else if type_kind == TypeKind::Function
+                || type_kind == TypeKind::VaList
                 || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
             {
                 let result = self.alloc_pseudo();

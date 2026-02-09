@@ -1583,7 +1583,16 @@ impl Parser<'_> {
 
                 // For incomplete array types, infer size from initializer
                 if let Some(ref init_expr) = init {
+                    let old_type = typ;
                     typ = self.infer_array_size_from_init(typ, init_expr);
+
+                    // If the type changed (array size was inferred), update the symbol's type
+                    // This is needed because the symbol was already added before parsing the initializer
+                    if typ != old_type {
+                        if let Some(sym_id) = symbol_id {
+                            self.symbols.get_mut(sym_id).typ = typ;
+                        }
+                    }
                 }
 
                 // Bind typedef to symbol table (after parsing initializer, which
@@ -3531,7 +3540,16 @@ impl Parser<'_> {
 
         // For incomplete array types, infer size from initializer
         if let Some(ref init_expr) = init {
+            let old_type = var_type_id;
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
+
+            // If the type changed (array size was inferred), update the symbol's type
+            // This is needed because the symbol was already added before parsing the initializer
+            if var_type_id != old_type {
+                if let Some(sym_id) = symbol {
+                    self.symbols.get_mut(sym_id).typ = var_type_id;
+                }
+            }
         }
 
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
@@ -3603,7 +3621,16 @@ impl Parser<'_> {
 
             // For incomplete array types, infer size from initializer
             if let Some(ref init_expr) = decl_init {
+                let old_type = decl_type;
                 decl_type = self.infer_array_size_from_init(decl_type, init_expr);
+
+                // If the type changed (array size was inferred), update the symbol's type
+                // This is needed because the symbol was already added before parsing the initializer
+                if decl_type != old_type {
+                    if let Some(sym_id) = decl_symbol {
+                        self.symbols.get_mut(sym_id).typ = decl_type;
+                    }
+                }
             }
 
             // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)

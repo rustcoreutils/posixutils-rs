@@ -350,6 +350,11 @@ impl SymbolTable {
         &self.symbols[id.0 as usize]
     }
 
+    /// Get a mutable reference to a symbol by its ID
+    pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
+        &mut self.symbols[id.0 as usize]
+    }
+
     /// Look up a tag (struct/union/enum) by name
     pub fn lookup_tag(&self, name: StringId) -> Option<&Symbol> {
         self.lookup(name, Namespace::Tag)

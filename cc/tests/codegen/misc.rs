@@ -211,6 +211,7 @@ int main() {
 
 /// Test that non-PIE code uses direct RIP-relative addressing for globals.
 /// With -fno-pie, local globals should use foo(%rip) not GOT.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_global_accesses_use_rip_relative() {
     let c_file = create_c_file(
@@ -950,9 +951,11 @@ int main(void) {
 #[test]
 fn codegen_compound_literal_zero_init() {
     let code = r#"
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
+typedef long int64_t;
+void *malloc(unsigned long);
+void free(void *);
+int printf(const char *, ...);
+#define NULL ((void*)0)
 
 typedef int (*func_ptr)(void);
 

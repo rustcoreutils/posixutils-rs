@@ -230,8 +230,9 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(dst_offset) => {
+                let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
+                    size: lir_arg_size,
                     src: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rax,
                         offset: 0,
@@ -239,11 +240,11 @@ impl X86_64CodeGen {
                     dst: GpOperand::Reg(Reg::R11),
                 });
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
+                    size: lir_arg_size,
                     src: GpOperand::Reg(Reg::R11),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: *dst_offset,
+                        offset: adjusted_offset,
                     }),
                 });
             }
@@ -303,12 +304,13 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Stack(dst_offset) => {
+                let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
                 self.push_lir(X86Inst::Mov {
                     size: lir_arg_size,
                     src: GpOperand::Reg(Reg::Rax),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: *dst_offset,
+                        offset: adjusted_offset,
                     }),
                 });
             }

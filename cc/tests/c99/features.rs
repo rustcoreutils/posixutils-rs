@@ -128,6 +128,28 @@ int sum_twice(int count, ...) {
     return sum1 + sum2;
 }
 
+// va_arg with string pointers (tests 64-bit loads)
+// This test ensures va_arg correctly loads 64-bit pointers, not 32-bit
+#include <string.h>
+
+static int process_strings(va_list *p_va, int count) {
+    int total_len = 0;
+    for (int i = 0; i < count; i++) {
+        const char *str = va_arg(*p_va, const char *);
+        if (str == (const char*)0) return -1;
+        total_len += strlen(str);
+    }
+    return total_len;
+}
+
+int test_va_arg_strings(int count, ...) {
+    va_list va;
+    va_start(va, count);
+    int result = process_strings(&va, count);
+    va_end(va);
+    return result;
+}
+
 // va_list cast to pointer test (C99 6.3.2.1 - array decay)
 // va_list is defined as __va_list_tag[1] and should decay to a pointer
 int test_va_cast(int count, ...) {
@@ -278,6 +300,14 @@ int main(void) {
         // va_list cast to pointer (tests array decay)
         if (test_va_cast(3, 10, 20, 12) != 42) return 69;
         if (test_va_cast(1, 42) != 42) return 70;
+
+        // va_arg with string pointers (tests 64-bit loads and stack spill)
+        // Tests: 1) va_arg correctly loads 64-bit pointers
+        //        2) va_list passed through pointer works correctly
+        //        3) stack spill offset is calculated correctly
+        if (test_va_arg_strings(1, "hello") != 5) return 71;
+        if (test_va_arg_strings(2, "hi", "there") != 7) return 72;  // 2 + 5
+        if (test_va_arg_strings(4, "a", "bb", "ccc", "dddd") != 10) return 73;  // 1+2+3+4
     }
 
     // ========== C99 FOR LOOP DECLARATIONS (returns 80-89) ==========

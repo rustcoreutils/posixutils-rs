@@ -51,8 +51,10 @@ pub struct X86_64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access via FS segment)
     pub(super) tls_symbols: HashSet<String>,
-    /// Position-independent code mode (for shared libraries)
+    /// Position-independent code mode (for shared libraries and PIE)
     pic_mode: bool,
+    /// Shared library mode (affects TLS model selection)
+    shared_mode: bool,
     /// Long double constants to emit (label_bits -> value_bits)
     pub(super) ld_constants: HashMap<u64, [u8; 16]>,
     /// Double constants to emit (label_bits -> f64 value)
@@ -74,6 +76,7 @@ impl X86_64CodeGen {
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,
+            shared_mode: false,
             ld_constants: HashMap::new(),
             double_constants: HashMap::new(),
         }
@@ -138,10 +141,11 @@ impl X86_64CodeGen {
         if self.pic_mode && !name.starts_with('.') {
             return true;
         }
-        // External symbols always need GOT access:
-        // - On macOS: required for dynamic linking
-        // - On Linux: required for PIE (default) and when linking with shared libs
-        self.extern_symbols.contains(name)
+        // External symbols need GOT access on macOS for dynamic linking.
+        if self.base.target.os == Os::MacOS {
+            return self.extern_symbols.contains(name);
+        }
+        false
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
@@ -1502,8 +1506,10 @@ impl X86_64CodeGen {
                     });
                 } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
                     // Thread-local storage: use FS segment
+                    // Use Initial Exec model for external TLS or when building shared libraries.
+                    // PIE executables can use Local Exec for their own TLS variables.
                     let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.pic_mode;
+                    let use_ie_model = is_extern_tls || self.shared_mode;
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then load via FS segment
@@ -1859,10 +1865,10 @@ impl X86_64CodeGen {
                 // Check TLS first - TLS symbols need special access pattern even for external symbols
                 if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
                     // Check if this is an external TLS variable (needs Initial Exec model)
-                    // or if we're in PIC mode (shared libraries also need IE model)
-                    // Only non-PIC local TLS can use Local Exec model
+                    // or if we're building a shared library (also needs IE model).
+                    // PIE executables can use Local Exec for their own TLS variables.
                     let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.pic_mode;
+                    let use_ie_model = is_extern_tls || self.shared_mode;
 
                     if use_ie_model {
                         // Initial Exec TLS model for external symbols:
@@ -2158,26 +2164,14 @@ impl X86_64CodeGen {
                     Symbol::global(name.clone())
                 };
 
-                if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then store
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: insn.offset as i32,
-                        }),
-                    });
-                } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                // Check TLS FIRST before GOT - TLS symbols need special access pattern
+                // and should not go through the GOT path even in PIC mode
+                if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
                     // Thread-local storage: use FS segment
-                    // In PIC mode or for external TLS, use Initial Exec model
+                    // Use Initial Exec model for external TLS or when building shared libraries.
+                    // PIE executables can use Local Exec for their own TLS variables.
                     let is_extern_tls = self.extern_symbols.contains(&name);
-                    let use_ie_model = is_extern_tls || self.pic_mode;
+                    let use_ie_model = is_extern_tls || self.shared_mode;
 
                     if use_ie_model {
                         // Initial Exec: load offset from GOT, then store via FS segment
@@ -2199,6 +2193,21 @@ impl X86_64CodeGen {
                             dst: GpOperand::Mem(MemAddr::TlsIE(symbol)),
                         });
                     }
+                } else if self.needs_got_access(&name) {
+                    // External symbols on macOS: load address from GOT, then store
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Reg(value_reg),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R11,
+                            offset: insn.offset as i32,
+                        }),
+                    });
                 } else {
                     // LIR: store to global via RIP-relative
                     self.push_lir(X86Inst::Mov {
@@ -3349,12 +3358,115 @@ impl X86_64CodeGen {
         let expected_loc = self.get_location(expected_ptr);
         let desired_loc = self.get_location(desired);
 
-        // Load expected_ptr (pointer to expected value) into R9
-        // We need this for later store-back on failure
-        self.emit_mov_to_reg(expected_loc, Reg::R9, 64);
+        // IMPORTANT: Regalloc may have assigned operands to any register including
+        // R9, R10, R11, or RAX. Loading one operand into a scratch register can
+        // clobber another operand.
+        //
+        // Strategy: We need to load three values into R9, R10, R11 (plus RAX for *expected).
+        // Any source could be in any of these registers. We use a dependency-aware load order:
+        //
+        // 1. Collect which sources are in which registers
+        // 2. Load into target registers in an order that doesn't clobber unread sources
+        //
+        // For simplicity, we use the red zone (128 bytes below RSP) as scratch space.
+        // We spill all three operands first, then load from there.
 
-        // Load address of atomic variable into R11
-        self.emit_mov_to_reg(addr_loc, Reg::R11, 64);
+        // Helper lambda to check if a location is a specific register
+        let is_reg = |loc: &Loc, r: Reg| -> bool { matches!(loc, Loc::Reg(x) if *x == r) };
+
+        // Use red zone for temporary storage at RSP-8, RSP-16, RSP-24
+        let addr_temp = MemAddr::BaseOffset {
+            base: Reg::Rsp,
+            offset: -8,
+        };
+        let expected_temp = MemAddr::BaseOffset {
+            base: Reg::Rsp,
+            offset: -16,
+        };
+        let desired_temp = MemAddr::BaseOffset {
+            base: Reg::Rsp,
+            offset: -24,
+        };
+
+        // Step 1: Spill all three operands to red zone.
+        // We need a temporary register that is NOT one of our targets (R9, R10, R11).
+        // Use RCX as temp since it's caller-saved and not involved here.
+
+        // Spill addr
+        if let Loc::Reg(r) = addr_loc {
+            // Already in a register, just store it
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(r),
+                dst: GpOperand::Mem(addr_temp.clone()),
+            });
+        } else {
+            self.emit_mov_to_reg(addr_loc, Reg::Rcx, 64);
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rcx),
+                dst: GpOperand::Mem(addr_temp.clone()),
+            });
+        }
+
+        // Spill expected_ptr
+        if let Loc::Reg(r) = expected_loc {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(r),
+                dst: GpOperand::Mem(expected_temp.clone()),
+            });
+        } else {
+            self.emit_mov_to_reg(expected_loc, Reg::Rcx, 64);
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rcx),
+                dst: GpOperand::Mem(expected_temp.clone()),
+            });
+        }
+
+        // Spill desired
+        if let Loc::Reg(r) = desired_loc {
+            self.push_lir(X86Inst::Mov {
+                size: op_size,
+                src: GpOperand::Reg(r),
+                dst: GpOperand::Mem(desired_temp.clone()),
+            });
+        } else {
+            self.emit_mov_to_reg(desired_loc, Reg::Rcx, size);
+            self.push_lir(X86Inst::Mov {
+                size: op_size,
+                src: GpOperand::Reg(Reg::Rcx),
+                dst: GpOperand::Mem(desired_temp.clone()),
+            });
+        }
+
+        // Step 2: Load from red zone into target registers.
+        // Now all values are safely on stack, order doesn't matter.
+
+        // Load addr into R11
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(addr_temp),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        // Load expected_ptr into R9
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(expected_temp),
+            dst: GpOperand::Reg(Reg::R9),
+        });
+
+        // Load desired into R10
+        self.push_lir(X86Inst::Mov {
+            size: op_size,
+            src: GpOperand::Mem(desired_temp),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+
+        // Suppress unused variable warnings
+        let _ = is_reg;
 
         // Load expected value from *expected_ptr (R9) into RAX
         self.push_lir(X86Inst::Mov {
@@ -3365,9 +3477,6 @@ impl X86_64CodeGen {
             }),
             dst: GpOperand::Reg(Reg::Rax),
         });
-
-        // Load desired value into R10
-        self.emit_mov_to_reg(desired_loc, Reg::R10, size);
 
         // LOCK CMPXCHG: if *addr == RAX, set *addr = R10 and ZF=1
         //               else RAX = *addr and ZF=0
@@ -3864,5 +3973,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
+    }
+
+    fn set_shared_mode(&mut self, shared: bool) {
+        self.shared_mode = shared;
     }
 }

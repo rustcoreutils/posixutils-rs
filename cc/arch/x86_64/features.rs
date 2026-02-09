@@ -230,8 +230,9 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(dst_offset) => {
+                let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
+                    size: lir_arg_size,
                     src: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rax,
                         offset: 0,
@@ -239,11 +240,11 @@ impl X86_64CodeGen {
                     dst: GpOperand::Reg(Reg::R11),
                 });
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
+                    size: lir_arg_size,
                     src: GpOperand::Reg(Reg::R11),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: *dst_offset,
+                        offset: adjusted_offset,
                     }),
                 });
             }
@@ -303,12 +304,13 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Stack(dst_offset) => {
+                let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
                 self.push_lir(X86Inst::Mov {
                     size: lir_arg_size,
                     src: GpOperand::Reg(Reg::Rax),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: *dst_offset,
+                        offset: adjusted_offset,
                     }),
                 });
             }
@@ -475,6 +477,14 @@ impl X86_64CodeGen {
             }
             (Loc::Reg(src_reg), Loc::Reg(dst_reg)) => {
                 // Both src and dest are in registers (containing addresses)
+                // Choose a temp register that doesn't conflict with src or dst
+                let temp = if *src_reg != Reg::Rax && *dst_reg != Reg::Rax {
+                    Reg::Rax
+                } else if *src_reg != Reg::Rdx && *dst_reg != Reg::Rdx {
+                    Reg::Rdx
+                } else {
+                    Reg::Rcx
+                };
                 // Copy gp_offset (4 bytes)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
@@ -482,11 +492,11 @@ impl X86_64CodeGen {
                         base: *src_reg,
                         offset: 0,
                     }),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(temp),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(temp),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: *dst_reg,
                         offset: 0,
@@ -499,11 +509,11 @@ impl X86_64CodeGen {
                         base: *src_reg,
                         offset: 4,
                     }),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(temp),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(temp),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: *dst_reg,
                         offset: 4,
@@ -516,11 +526,11 @@ impl X86_64CodeGen {
                         base: *src_reg,
                         offset: 8,
                     }),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(temp),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(temp),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: *dst_reg,
                         offset: 8,
@@ -533,11 +543,11 @@ impl X86_64CodeGen {
                         base: *src_reg,
                         offset: 16,
                     }),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(temp),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Reg(temp),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: *dst_reg,
                         offset: 16,

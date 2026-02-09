@@ -212,7 +212,7 @@ impl Aarch64CodeGen {
                     // FP-relative for alloca safety
                     let actual_offset = self.stack_offset(frame_size, *offset);
                     self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
+                        size: op_size,
                         src: scratch1,
                         addr: MemAddr::BaseOffset {
                             base: Reg::X29,

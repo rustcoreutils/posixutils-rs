@@ -3973,6 +3973,40 @@ fn test_incomplete_array_empty_string() {
     }
 }
 
+#[test]
+fn test_incomplete_array_designator_size() {
+    // int arr[] = {[10] = 1}; should infer size 11
+    let (tu, types, _, _) = parse_tu("int arr[] = {[10] = 1};").unwrap();
+    if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Array);
+        assert_eq!(
+            types.get(typ).array_size,
+            Some(11),
+            "Array size should be 11 for {{[10] = 1}}"
+        );
+    } else {
+        panic!("Expected Declaration");
+    }
+}
+
+#[test]
+fn test_incomplete_array_designator_sequence_size() {
+    // int arr[] = {1, 2, [5] = 5, 6}; should infer size 7
+    let (tu, types, _, _) = parse_tu("int arr[] = {1, 2, [5] = 5, 6};").unwrap();
+    if let ExternalDecl::Declaration(decl) = &tu.items[0] {
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.kind(typ), TypeKind::Array);
+        assert_eq!(
+            types.get(typ).array_size,
+            Some(7),
+            "Array size should be 7 for {{1,2,[5]=5,6}}"
+        );
+    } else {
+        panic!("Expected Declaration");
+    }
+}
+
 // ========================================================================
 // typeof operator tests (GCC extension)
 // ========================================================================

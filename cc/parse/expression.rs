@@ -2745,10 +2745,10 @@ impl<'a> Parser<'a> {
                             let final_typ = if self.types.kind(typ) == TypeKind::Array
                                 && self.types.get(typ).array_size == Some(0)
                             {
-                                // Array size should be determined from initializer element count
                                 let elem_type =
                                     self.types.base_type(typ).unwrap_or(self.types.int_id);
-                                self.types.intern(Type::array(elem_type, elements.len()))
+                                let array_size = self.array_size_from_elements(&elements);
+                                self.types.intern(Type::array(elem_type, array_size))
                             } else {
                                 typ
                             };

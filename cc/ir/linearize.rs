@@ -49,6 +49,26 @@ struct LocalVarInfo {
     /// For int arr[n][m], this contains [sym_for_n, sym_for_m]
     /// These are needed to compute runtime strides for outer dimension access.
     vla_dim_syms: Vec<PseudoId>,
+    /// True if this local holds a pointer to the actual data (e.g., va_list parameters).
+    /// When true, linearize_lvalue loads the pointer instead of taking the address.
+    is_indirect: bool,
+}
+
+struct ResolvedDesignator {
+    offset: usize,
+    typ: TypeId,
+    bit_offset: Option<u32>,
+    bit_width: Option<u32>,
+    storage_unit_size: Option<u32>,
+}
+
+struct RawFieldInit {
+    offset: usize,
+    field_size: usize,
+    init: Initializer,
+    bit_offset: Option<u32>,
+    bit_width: Option<u32>,
+    storage_unit_size: Option<u32>,
 }
 
 /// Information about a static local variable
@@ -773,31 +793,75 @@ impl<'a> Linearizer<'a> {
                 let elem_size = (self.types.size_bits(elem_type) / 8) as usize;
 
                 let mut init_elements = Vec::new();
+                let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
+                let mut element_indices: Vec<i64> = Vec::new();
                 let mut current_idx: i64 = 0;
 
                 for element in elements {
-                    // Calculate the actual index considering designators
-                    let actual_idx = if element.designators.is_empty() {
+                    let mut index = None;
+                    let mut index_pos = None;
+                    for (pos, designator) in element.designators.iter().enumerate() {
+                        if let Designator::Index(idx) = designator {
+                            index = Some(*idx);
+                            index_pos = Some(pos);
+                            break;
+                        }
+                    }
+
+                    let element_index = if let Some(idx) = index {
+                        current_idx = idx + 1;
+                        idx
+                    } else {
                         let idx = current_idx;
                         current_idx += 1;
                         idx
-                    } else {
-                        // Use the first designator (should be Index for arrays)
-                        let idx = match &element.designators[0] {
-                            Designator::Index(i) => *i,
-                            Designator::Field(_) => current_idx, // Fallback
-                        };
-                        current_idx = idx + 1;
-                        idx
                     };
 
-                    let offset = (actual_idx as usize) * elem_size;
-                    let elem_init = self.ast_init_to_ir(&element.value, elem_type);
+                    let remaining_designators = match index_pos {
+                        Some(pos) => element.designators[pos + 1..].to_vec(),
+                        None => element.designators.clone(),
+                    };
+
+                    let entry = element_lists.entry(element_index).or_insert_with(|| {
+                        element_indices.push(element_index);
+                        Vec::new()
+                    });
+
+                    if remaining_designators.is_empty() {
+                        if let ExprKind::InitList {
+                            elements: nested_elements,
+                        } = &element.value.kind
+                        {
+                            entry.extend(nested_elements.clone());
+                            continue;
+                        }
+                    }
+
+                    entry.push(InitElement {
+                        designators: remaining_designators,
+                        value: element.value.clone(),
+                    });
+                }
+
+                element_indices.sort();
+                for element_index in element_indices {
+                    let Some(list) = element_lists.get(&element_index) else {
+                        continue;
+                    };
+                    let offset = (element_index as usize) * elem_size;
+                    let elem_init = if matches!(
+                        self.types.kind(elem_type),
+                        TypeKind::Array | TypeKind::Struct | TypeKind::Union
+                    ) {
+                        self.ast_init_list_to_ir(list, elem_type)
+                    } else if let Some(last) = list.last() {
+                        self.ast_init_to_ir(&last.value, elem_type)
+                    } else {
+                        Initializer::None
+                    };
                     init_elements.push((offset, elem_init));
                 }
 
-                // Sort elements by offset to ensure proper emission order
-                // (designated initializers can be in any order)
                 init_elements.sort_by_key(|(offset, _)| *offset);
 
                 Initializer::Array {
@@ -815,73 +879,106 @@ impl<'a> Linearizer<'a> {
                 let resolved_size = (self.types.size_bits(resolved_typ) / 8) as usize;
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members = &composite.members;
+                    let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
                     // Collect field initializations with bitfield info:
                     // (offset, field_size, init, bit_offset, bit_width, storage_unit_size)
-                    #[allow(clippy::type_complexity)]
-                    let mut raw_fields: Vec<(
-                        usize,
-                        usize,
-                        Initializer,
-                        Option<u32>,
-                        Option<u32>,
-                        Option<u32>,
-                    )> = Vec::new();
+                    let mut raw_fields: Vec<RawFieldInit> = Vec::new();
                     let mut current_field_idx = 0;
 
                     for element in elements {
-                        // Find the field (by designator or position)
-                        // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
-                        let member_info =
-                            if let Some(Designator::Field(name)) = element.designators.first() {
-                                // Designated initializer: .field = value
-                                // First try direct member lookup to update position counter
-                                if let Some((idx, _)) =
-                                    members.iter().enumerate().find(|(_, m)| &m.name == name)
-                                {
-                                    current_field_idx = idx + 1;
-                                }
-                                // Use find_member which handles anonymous struct/union members
-                                self.types.find_member(resolved_typ, *name)
-                            } else if current_field_idx < members.len() {
-                                // Positional initializer - direct member only
-                                let m = &members[current_field_idx];
-                                current_field_idx += 1;
-                                Some(crate::types::MemberInfo {
-                                    offset: m.offset,
-                                    typ: m.typ,
-                                    bit_offset: m.bit_offset,
-                                    bit_width: m.bit_width,
-                                    storage_unit_size: m.storage_unit_size,
-                                })
-                            } else {
-                                None
+                        if element.designators.is_empty() {
+                            let Some(member) = self.next_positional_member(
+                                members,
+                                is_union,
+                                &mut current_field_idx,
+                            ) else {
+                                continue;
                             };
-
-                        if let Some(member) = member_info {
-                            let offset = member.offset;
                             let field_size = (self.types.size_bits(member.typ) / 8) as usize;
                             let field_init = self.ast_init_to_ir(&element.value, member.typ);
-                            raw_fields.push((
-                                offset,
+                            raw_fields.push(RawFieldInit {
+                                offset: member.offset,
                                 field_size,
-                                field_init,
-                                member.bit_offset,
-                                member.bit_width,
-                                member.storage_unit_size,
-                            ));
+                                init: field_init,
+                                bit_offset: member.bit_offset,
+                                bit_width: member.bit_width,
+                                storage_unit_size: member.storage_unit_size,
+                            });
+                            continue;
                         }
+
+                        let resolved =
+                            self.resolve_designator_chain(resolved_typ, 0, &element.designators);
+                        let Some(ResolvedDesignator {
+                            offset,
+                            typ: field_type,
+                            bit_offset,
+                            bit_width,
+                            storage_unit_size,
+                        }) = resolved
+                        else {
+                            continue;
+                        };
+                        if let Some(Designator::Field(name)) = element.designators.first() {
+                            if let Some(next_idx) = self.member_index_for_designator(members, *name)
+                            {
+                                current_field_idx = next_idx;
+                            }
+                        }
+                        let field_size = (self.types.size_bits(field_type) / 8) as usize;
+                        let field_init = self.ast_init_to_ir(&element.value, field_type);
+                        raw_fields.push(RawFieldInit {
+                            offset,
+                            field_size,
+                            init: field_init,
+                            bit_offset,
+                            bit_width,
+                            storage_unit_size,
+                        });
                     }
 
                     // Sort fields by offset to ensure proper emission order
                     // (designated initializers can be in any order)
-                    raw_fields.sort_by_key(|(offset, _, _, _, _, _)| *offset);
+                    // For bitfields, also sort by bit_offset to keep them together
+                    raw_fields.sort_by(|a, b| {
+                        a.offset
+                            .cmp(&b.offset)
+                            .then_with(|| a.bit_offset.unwrap_or(0).cmp(&b.bit_offset.unwrap_or(0)))
+                    });
+
+                    // Remove duplicate initializations (later one wins, per C semantics)
+                    // For regular fields: duplicate if same offset
+                    // For bitfields: duplicate if same offset AND same bit_offset
+                    let mut idx = 0;
+                    while idx + 1 < raw_fields.len() {
+                        let same_offset = raw_fields[idx].offset == raw_fields[idx + 1].offset;
+                        let both_bitfields = raw_fields[idx].bit_offset.is_some()
+                            && raw_fields[idx + 1].bit_offset.is_some();
+                        let same_bitfield = both_bitfields
+                            && raw_fields[idx].bit_offset == raw_fields[idx + 1].bit_offset;
+
+                        // Only remove if:
+                        // - Same offset for non-bitfields, OR
+                        // - Same offset AND same bit_offset for bitfields
+                        if same_offset && (!both_bitfields || same_bitfield) {
+                            raw_fields.remove(idx);
+                        } else {
+                            idx += 1;
+                        }
+                    }
 
                     // Now pack bitfields that share the same storage unit
                     let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
                     let mut i = 0;
                     while i < raw_fields.len() {
-                        let (offset, field_size, init, bit_offset, bit_width, storage_unit_size) =
-                            &raw_fields[i];
+                        let RawFieldInit {
+                            offset,
+                            field_size,
+                            init,
+                            bit_offset,
+                            bit_width,
+                            storage_unit_size,
+                        } = &raw_fields[i];
 
                         if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
                             (bit_offset, bit_width, storage_unit_size)
@@ -898,8 +995,13 @@ impl<'a> Linearizer<'a> {
                             // Look ahead for more bitfields at the same offset
                             let mut j = i + 1;
                             while j < raw_fields.len() {
-                                let (next_off, _, next_init, next_bit_off, next_bit_w, _) =
-                                    &raw_fields[j];
+                                let RawFieldInit {
+                                    offset: next_off,
+                                    init: next_init,
+                                    bit_offset: next_bit_off,
+                                    bit_width: next_bit_w,
+                                    ..
+                                } = &raw_fields[j];
                                 if *next_off != *offset {
                                     break;
                                 }
@@ -944,6 +1046,132 @@ impl<'a> Linearizer<'a> {
                 }
             }
         }
+    }
+
+    fn resolve_designator_chain(
+        &self,
+        base_type: TypeId,
+        base_offset: usize,
+        designators: &[Designator],
+    ) -> Option<ResolvedDesignator> {
+        let mut offset = base_offset;
+        let mut typ = base_type;
+        let mut bit_offset = None;
+        let mut bit_width = None;
+        let mut storage_unit_size = None;
+
+        for (idx, designator) in designators.iter().enumerate() {
+            match designator {
+                Designator::Field(name) => {
+                    let mut resolved = typ;
+                    if self.types.kind(resolved) == TypeKind::Array {
+                        resolved = self.types.base_type(resolved)?;
+                    }
+                    resolved = self.resolve_struct_type(resolved);
+                    let member = self.types.find_member(resolved, *name)?;
+                    offset += member.offset;
+                    typ = member.typ;
+                    if idx + 1 == designators.len() {
+                        bit_offset = member.bit_offset;
+                        bit_width = member.bit_width;
+                        storage_unit_size = member.storage_unit_size;
+                    } else {
+                        bit_offset = None;
+                        bit_width = None;
+                        storage_unit_size = None;
+                    }
+                }
+                Designator::Index(index) => {
+                    if self.types.kind(typ) != TypeKind::Array {
+                        return None;
+                    }
+                    let elem_type = self.types.base_type(typ)?;
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    offset += (*index as usize) * (elem_size as usize);
+                    typ = elem_type;
+                    bit_offset = None;
+                    bit_width = None;
+                    storage_unit_size = None;
+                }
+            }
+        }
+
+        Some(ResolvedDesignator {
+            offset,
+            typ,
+            bit_offset,
+            bit_width,
+            storage_unit_size,
+        })
+    }
+
+    fn next_positional_member(
+        &self,
+        members: &[crate::types::StructMember],
+        is_union: bool,
+        current_field_idx: &mut usize,
+    ) -> Option<MemberInfo> {
+        if is_union {
+            if *current_field_idx > 0 {
+                return None;
+            }
+            let member = members.iter().find(|m| m.name != StringId::EMPTY)?;
+            *current_field_idx = members.len();
+            return Some(MemberInfo {
+                offset: member.offset,
+                typ: member.typ,
+                bit_offset: member.bit_offset,
+                bit_width: member.bit_width,
+                storage_unit_size: member.storage_unit_size,
+            });
+        }
+
+        while *current_field_idx < members.len() {
+            let member = &members[*current_field_idx];
+            if member.name == StringId::EMPTY && member.bit_width.is_some() {
+                *current_field_idx += 1;
+                continue;
+            }
+            if member.name != StringId::EMPTY || member.bit_width.is_none() {
+                *current_field_idx += 1;
+                return Some(MemberInfo {
+                    offset: member.offset,
+                    typ: member.typ,
+                    bit_offset: member.bit_offset,
+                    bit_width: member.bit_width,
+                    storage_unit_size: member.storage_unit_size,
+                });
+            }
+            *current_field_idx += 1;
+        }
+
+        None
+    }
+
+    fn member_index_for_designator(
+        &self,
+        members: &[crate::types::StructMember],
+        name: StringId,
+    ) -> Option<usize> {
+        for (idx, member) in members.iter().enumerate() {
+            if member.name == name {
+                return Some(idx + 1);
+            }
+            if member.name == StringId::EMPTY {
+                let member_type = self.types.get(member.typ);
+                let is_anon_aggregate =
+                    matches!(member_type.kind, TypeKind::Struct | TypeKind::Union)
+                        && member_type
+                            .composite
+                            .as_ref()
+                            .is_some_and(|composite| composite.tag.is_none());
+                if is_anon_aggregate && self.types.find_member(member.typ, name).is_some() {
+                    return Some(idx + 1);
+                }
+            }
+        }
+
+        None
     }
 
     // ========================================================================
@@ -1039,6 +1267,9 @@ impl<'a> Linearizer<'a> {
         // Scalar parameters need local storage for SSA-correct reassignment handling
         let mut scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
+        // va_list parameters need special handling (pointer storage)
+        let mut valist_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
+            Vec::with_capacity(func.params.len());
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param
@@ -1055,7 +1286,12 @@ impl<'a> Linearizer<'a> {
             // For struct/union types, we'll copy to a local later
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
-            if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
+            if param_kind == TypeKind::VaList {
+                // va_list parameters are special: due to array-to-pointer decay at call site,
+                // the actual value passed is a pointer to the va_list struct, not the struct itself.
+                // We'll handle this after function setup.
+                valist_params.push((name, param.symbol, param.typ, pseudo_id));
+            } else if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
                 struct_params.push((name, param.symbol, param.typ, pseudo_id));
             } else if self.types.is_complex(param.typ) {
                 // Complex parameters: copy to local storage so real/imag access works
@@ -1078,6 +1314,36 @@ impl<'a> Linearizer<'a> {
 
         // Entry instruction
         self.emit(Instruction::new(Opcode::Entry));
+
+        // Handle va_list parameters: store the pointer value (not the struct)
+        for (name, symbol_id_opt, typ, arg_pseudo) in valist_params {
+            // va_list params are passed as pointers due to array decay at call site.
+            // Store the pointer value (8 bytes) to a local.
+            let ptr_type = self.types.pointer_to(typ);
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                func.add_local(&name, local_sym, ptr_type, false, false, None, None);
+            }
+            let ptr_size = self.types.size_bits(ptr_type);
+            self.emit(Instruction::store(
+                arg_pseudo, local_sym, 0, ptr_type, ptr_size,
+            ));
+            if let Some(symbol_id) = symbol_id_opt {
+                self.locals.insert(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ, // Keep original va_list type for type checking
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vla_dim_syms: vec![],
+                        is_indirect: true, // va_list param: local holds a pointer
+                    },
+                );
+            }
+        }
 
         // Copy struct parameters to local storage so member access works
         for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
@@ -1140,6 +1406,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vla_dim_syms: vec![],
+                        is_indirect: false,
                     },
                 );
             }
@@ -1173,6 +1440,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vla_dim_syms: vec![],
+                        is_indirect: false,
                     },
                 );
             }
@@ -1207,6 +1475,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vla_dim_syms: vec![],
+                        is_indirect: false,
                     },
                 );
             }
@@ -1379,25 +1648,43 @@ impl<'a> Linearizer<'a> {
 
             Stmt::Return(expr) => {
                 if let Some(e) = expr {
-                    let typ = self.expr_type(e);
+                    let expr_typ = self.expr_type(e);
+                    // Get the function's actual return type for proper conversion
+                    let func_ret_type = self
+                        .current_func
+                        .as_ref()
+                        .map(|f| f.return_type)
+                        .unwrap_or(expr_typ);
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, self.struct_return_size);
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
-                    } else if self.types.is_complex(typ) {
+                    } else if self.types.is_complex(expr_typ) {
                         let addr = self.linearize_lvalue(e);
-                        let typ_size = self.types.size_bits(typ);
-                        self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));
+                        let typ_size = self.types.size_bits(func_ret_type);
+                        self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
                     } else {
                         let val = self.linearize_expr(e);
+                        // Convert expression value to function's return type if needed
+                        let converted_val = if expr_typ != func_ret_type
+                            && self.types.kind(func_ret_type) != TypeKind::Void
+                        {
+                            self.emit_convert(val, expr_typ, func_ret_type)
+                        } else {
+                            val
+                        };
                         // Function types decay to pointers when returned
-                        let typ_size = if self.types.kind(typ) == TypeKind::Function {
+                        let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
                             self.target.pointer_width
                         } else {
-                            self.types.size_bits(typ)
+                            self.types.size_bits(func_ret_type)
                         };
-                        self.emit(Instruction::ret_typed(Some(val), typ, typ_size));
+                        self.emit(Instruction::ret_typed(
+                            Some(converted_val),
+                            func_ret_type,
+                            typ_size,
+                        ));
                     }
                 } else {
                     self.emit(Instruction::ret(None));
@@ -1528,6 +1815,7 @@ impl<'a> Linearizer<'a> {
                     vla_size_sym: None,
                     vla_elem_type: None,
                     vla_dim_syms: vec![],
+                    is_indirect: false,
                 },
             );
 
@@ -1636,13 +1924,27 @@ impl<'a> Linearizer<'a> {
                         val_imag, sym_id, base_bytes, base_typ, base_bits,
                     ));
                 } else {
-                    // Simple scalar initializer
-                    let val = self.linearize_expr(init);
-                    // Convert the value to the target type (important for _Bool normalization)
-                    let init_type = self.expr_type(init);
-                    let converted = self.emit_convert(val, init_type, typ);
-                    let size = self.types.size_bits(typ);
-                    self.emit(Instruction::store(converted, sym_id, 0, typ, size));
+                    // Check for large struct/union initialization (> 64 bits)
+                    // linearize_expr returns an address for large aggregates
+                    let type_kind = self.types.kind(typ);
+                    let type_size = self.types.size_bits(typ);
+                    if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                        && type_size > 64
+                    {
+                        // Large struct/union init - source is an address, do block copy
+                        let value_addr = self.linearize_expr(init);
+                        let type_size_bytes = type_size / 8;
+
+                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64);
+                    } else {
+                        // Simple scalar initializer
+                        let val = self.linearize_expr(init);
+                        // Convert the value to the target type (important for _Bool normalization)
+                        let init_type = self.expr_type(init);
+                        let converted = self.emit_convert(val, init_type, typ);
+                        let size = self.types.size_bits(typ);
+                        self.emit(Instruction::store(converted, sym_id, 0, typ, size));
+                    }
                 }
             }
         }
@@ -1812,6 +2114,7 @@ impl<'a> Linearizer<'a> {
                 vla_size_sym: Some(size_sym_id),
                 vla_elem_type: Some(elem_type),
                 vla_dim_syms,
+                is_indirect: false,
             },
         );
     }
@@ -1873,6 +2176,7 @@ impl<'a> Linearizer<'a> {
                 vla_size_sym: None,
                 vla_elem_type: None,
                 vla_dim_syms: vec![],
+                is_indirect: false,
             },
         );
 
@@ -1920,43 +2224,79 @@ impl<'a> Linearizer<'a> {
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                 let elem_size = self.types.size_bits(elem_type) / 8;
+                let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
+                let mut element_indices: Vec<i64> = Vec::new();
+                let mut current_idx: i64 = 0;
 
-                for (idx, element) in elements.iter().enumerate() {
-                    // Calculate the actual index considering designators
-                    let actual_idx = if element.designators.is_empty() {
-                        idx as i64
-                    } else {
-                        // Use the first designator (should be Index for arrays)
-                        match &element.designators[0] {
-                            Designator::Index(i) => *i,
-                            Designator::Field(_) => idx as i64, // Fall back for mismatched designator
+                for element in elements.iter() {
+                    let mut index = None;
+                    let mut index_pos = None;
+                    for (pos, designator) in element.designators.iter().enumerate() {
+                        if let Designator::Index(idx) = designator {
+                            index = Some(*idx);
+                            index_pos = Some(pos);
+                            break;
                         }
+                    }
+
+                    let element_index = if let Some(idx) = index {
+                        current_idx = idx + 1;
+                        idx
+                    } else {
+                        let idx = current_idx;
+                        current_idx += 1;
+                        idx
                     };
 
-                    let offset = base_offset + actual_idx * elem_size as i64;
+                    let remaining_designators = match index_pos {
+                        Some(pos) => element.designators[pos + 1..].to_vec(),
+                        None => element.designators.clone(),
+                    };
 
-                    // Handle nested initializer lists or scalar values
-                    if let ExprKind::InitList {
-                        elements: nested_elems,
-                    } = &element.value.kind
-                    {
-                        // Nested array/struct initialization - recurse with accumulated offset
-                        self.linearize_init_list_at_offset(
-                            base_sym,
-                            offset,
-                            elem_type,
-                            nested_elems,
-                        );
-                    } else {
-                        // Scalar value
-                        let val = self.linearize_expr(&element.value);
-                        let val_type = self.expr_type(&element.value);
-                        let converted = self.emit_convert(val, val_type, elem_type);
-                        let elem_size = self.types.size_bits(elem_type);
-                        self.emit(Instruction::store(
-                            converted, base_sym, offset, elem_type, elem_size,
-                        ));
+                    let entry = element_lists.entry(element_index).or_insert_with(|| {
+                        element_indices.push(element_index);
+                        Vec::new()
+                    });
+
+                    if remaining_designators.is_empty() {
+                        if let ExprKind::InitList {
+                            elements: nested_elements,
+                        } = &element.value.kind
+                        {
+                            entry.extend(nested_elements.clone());
+                            continue;
+                        }
                     }
+
+                    entry.push(InitElement {
+                        designators: remaining_designators,
+                        value: element.value.clone(),
+                    });
+                }
+
+                element_indices.sort();
+                for element_index in element_indices {
+                    let Some(list) = element_lists.get(&element_index) else {
+                        continue;
+                    };
+                    let offset = base_offset + element_index * elem_size as i64;
+                    if matches!(
+                        self.types.kind(elem_type),
+                        TypeKind::Array | TypeKind::Struct | TypeKind::Union
+                    ) {
+                        self.linearize_init_list_at_offset(base_sym, offset, elem_type, list);
+                        continue;
+                    }
+                    let Some(last) = list.last() else {
+                        continue;
+                    };
+                    let val = self.linearize_expr(&last.value);
+                    let val_type = self.expr_type(&last.value);
+                    let converted = self.emit_convert(val, val_type, elem_type);
+                    let elem_size = self.types.size_bits(elem_type);
+                    self.emit(Instruction::store(
+                        converted, base_sym, offset, elem_type, elem_size,
+                    ));
                 }
             }
             TypeKind::Struct | TypeKind::Union => {
@@ -1968,109 +2308,106 @@ impl<'a> Linearizer<'a> {
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     // Clone members to avoid borrow issues
                     let members: Vec<_> = composite.members.clone();
+                    let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
+                    let mut current_field_idx = 0;
 
-                    for (idx, element) in elements.iter().enumerate() {
-                        // Find the field (by designator or position)
-                        // Use find_member to support anonymous struct/union members (C11 6.7.2.1p13)
-                        let member_info =
-                            if let Some(Designator::Field(name)) = element.designators.first() {
-                                // Designated initializer: .field = value
-                                // find_member handles anonymous struct/union members
-                                self.types.find_member(resolved_typ, *name)
-                            } else if idx < members.len() {
-                                // Positional initializer - direct member only
-                                let m = &members[idx];
-                                Some(crate::types::MemberInfo {
-                                    offset: m.offset,
-                                    typ: m.typ,
-                                    bit_offset: m.bit_offset,
-                                    bit_width: m.bit_width,
-                                    storage_unit_size: m.storage_unit_size,
-                                })
-                            } else {
-                                None // Too many initializers
+                    for element in elements.iter() {
+                        if element.designators.is_empty() {
+                            let Some(member) = self.next_positional_member(
+                                &members,
+                                is_union,
+                                &mut current_field_idx,
+                            ) else {
+                                continue;
                             };
+                            let offset = base_offset + member.offset as i64;
+                            let field_type = member.typ;
 
-                        let Some(member) = member_info else {
+                            // Check if this is a bitfield
+                            if let (Some(bit_off), Some(bit_w), Some(storage_size)) = (
+                                member.bit_offset,
+                                member.bit_width,
+                                member.storage_unit_size,
+                            ) {
+                                let val = self.linearize_expr(&element.value);
+                                let val_type = self.expr_type(&element.value);
+                                let storage_type = match storage_size {
+                                    1 => self.types.uchar_id,
+                                    2 => self.types.ushort_id,
+                                    4 => self.types.uint_id,
+                                    8 => self.types.ulong_id,
+                                    _ => self.types.uint_id,
+                                };
+                                let converted = self.emit_convert(val, val_type, storage_type);
+                                self.emit_bitfield_store(
+                                    base_sym,
+                                    offset as usize,
+                                    bit_off,
+                                    bit_w,
+                                    storage_size,
+                                    converted,
+                                );
+                            } else {
+                                self.linearize_struct_field_init(
+                                    base_sym,
+                                    offset,
+                                    field_type,
+                                    &element.value,
+                                );
+                            }
+                            continue;
+                        }
+
+                        let resolved =
+                            self.resolve_designator_chain(resolved_typ, 0, &element.designators);
+                        let Some(ResolvedDesignator {
+                            offset,
+                            typ: field_type,
+                            bit_offset,
+                            bit_width,
+                            storage_unit_size,
+                        }) = resolved
+                        else {
                             continue;
                         };
+                        if let Some(Designator::Field(name)) = element.designators.first() {
+                            if let Some(next_idx) =
+                                self.member_index_for_designator(&members, *name)
+                            {
+                                current_field_idx = next_idx;
+                            }
+                        }
+                        let offset = base_offset + offset as i64;
 
-                        let offset = base_offset + member.offset as i64;
-                        let field_type = member.typ;
-
-                        // Handle nested initializer lists or scalar values
-                        if let ExprKind::InitList {
-                            elements: nested_elems,
-                        } = &element.value.kind
+                        // Check if this is a bitfield
+                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
+                            (bit_offset, bit_width, storage_unit_size)
                         {
-                            // Nested struct/array initialization - recurse with accumulated offset
-                            self.linearize_init_list_at_offset(
+                            let val = self.linearize_expr(&element.value);
+                            let val_type = self.expr_type(&element.value);
+                            let storage_type = match storage_size {
+                                1 => self.types.uchar_id,
+                                2 => self.types.ushort_id,
+                                4 => self.types.uint_id,
+                                8 => self.types.ulong_id,
+                                _ => self.types.uint_id,
+                            };
+                            let converted = self.emit_convert(val, val_type, storage_type);
+                            self.emit_bitfield_store(
+                                base_sym,
+                                offset as usize,
+                                bit_off,
+                                bit_w,
+                                storage_size,
+                                converted,
+                            );
+                        } else {
+                            self.linearize_struct_field_init(
                                 base_sym,
                                 offset,
                                 field_type,
-                                nested_elems,
+                                &element.value,
                             );
-                        } else if let ExprKind::StringLit(s) = &element.value.kind {
-                            // String literal initializing a char array field
-                            if self.types.kind(field_type) == TypeKind::Array {
-                                let elem_type = self
-                                    .types
-                                    .base_type(field_type)
-                                    .unwrap_or(self.types.char_id);
-                                let elem_size = self.types.size_bits(elem_type);
-
-                                // Copy each byte from string literal to the array field
-                                for (i, byte) in s.bytes().enumerate() {
-                                    let byte_val = self.emit_const(byte as i64, elem_type);
-                                    self.emit(Instruction::store(
-                                        byte_val,
-                                        base_sym,
-                                        offset + i as i64,
-                                        elem_type,
-                                        elem_size,
-                                    ));
-                                }
-                                // Store null terminator
-                                let null_val = self.emit_const(0, elem_type);
-                                self.emit(Instruction::store(
-                                    null_val,
-                                    base_sym,
-                                    offset + s.len() as i64,
-                                    elem_type,
-                                    elem_size,
-                                ));
-                            } else {
-                                // Pointer initialized with string literal - store the address
-                                let val = self.linearize_expr(&element.value);
-                                let val_type = self.expr_type(&element.value);
-                                let converted = self.emit_convert(val, val_type, field_type);
-                                let size = self.types.size_bits(field_type);
-                                self.emit(Instruction::store(
-                                    converted, base_sym, offset, field_type, size,
-                                ));
-                            }
-                        } else {
-                            // Scalar value
-                            // If the field is an array and we're initializing with a scalar,
-                            // initialize only the first element of the array (C99 6.7.8p14)
-                            let (actual_type, actual_size) =
-                                if self.types.kind(field_type) == TypeKind::Array {
-                                    let elem_type =
-                                        self.types.base_type(field_type).unwrap_or(field_type);
-                                    (elem_type, self.types.size_bits(elem_type))
-                                } else {
-                                    (field_type, self.types.size_bits(field_type))
-                                };
-                            let val = self.linearize_expr(&element.value);
-                            let val_type = self.expr_type(&element.value);
-                            let converted = self.emit_convert(val, val_type, actual_type);
-                            self.emit(Instruction::store(
-                                converted,
-                                base_sym,
-                                offset,
-                                actual_type,
-                                actual_size,
-                            ));
                         }
                     }
                 }
@@ -2091,6 +2428,73 @@ impl<'a> Linearizer<'a> {
                     ));
                 }
             }
+        }
+    }
+
+    fn linearize_struct_field_init(
+        &mut self,
+        base_sym: PseudoId,
+        offset: i64,
+        field_type: TypeId,
+        value: &Expr,
+    ) {
+        if let ExprKind::InitList {
+            elements: nested_elems,
+        } = &value.kind
+        {
+            self.linearize_init_list_at_offset(base_sym, offset, field_type, nested_elems);
+        } else if let ExprKind::StringLit(s) = &value.kind {
+            if self.types.kind(field_type) == TypeKind::Array {
+                let elem_type = self
+                    .types
+                    .base_type(field_type)
+                    .unwrap_or(self.types.char_id);
+                let elem_size = self.types.size_bits(elem_type);
+
+                for (i, byte) in s.bytes().enumerate() {
+                    let byte_val = self.emit_const(byte as i64, elem_type);
+                    self.emit(Instruction::store(
+                        byte_val,
+                        base_sym,
+                        offset + i as i64,
+                        elem_type,
+                        elem_size,
+                    ));
+                }
+                let null_val = self.emit_const(0, elem_type);
+                self.emit(Instruction::store(
+                    null_val,
+                    base_sym,
+                    offset + s.len() as i64,
+                    elem_type,
+                    elem_size,
+                ));
+            } else {
+                let val = self.linearize_expr(value);
+                let val_type = self.expr_type(value);
+                let converted = self.emit_convert(val, val_type, field_type);
+                let size = self.types.size_bits(field_type);
+                self.emit(Instruction::store(
+                    converted, base_sym, offset, field_type, size,
+                ));
+            }
+        } else {
+            let (actual_type, actual_size) = if self.types.kind(field_type) == TypeKind::Array {
+                let elem_type = self.types.base_type(field_type).unwrap_or(field_type);
+                (elem_type, self.types.size_bits(elem_type))
+            } else {
+                (field_type, self.types.size_bits(field_type))
+            };
+            let val = self.linearize_expr(value);
+            let val_type = self.expr_type(value);
+            let converted = self.emit_convert(val, val_type, actual_type);
+            self.emit(Instruction::store(
+                converted,
+                base_sym,
+                offset,
+                actual_type,
+                actual_size,
+            ));
         }
     }
 
@@ -2996,9 +3400,11 @@ impl<'a> Linearizer<'a> {
                 self.is_pure_expr(left) && self.is_pure_expr(right)
             }
 
-            // Unary ops are pure if operand is pure, except for pre-inc/dec
+            // Unary ops are pure if operand is pure, except for pre-inc/dec and dereference.
+            // Dereference (*ptr) can cause UB/crash if the pointer is NULL or invalid,
+            // so we must not eagerly evaluate it in conditional expressions.
             ExprKind::Unary { op, operand, .. } => match op {
-                UnaryOp::PreInc | UnaryOp::PreDec => false,
+                UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref => false,
                 _ => self.is_pure_expr(operand),
             },
 
@@ -3019,13 +3425,16 @@ impl<'a> Linearizer<'a> {
             // Function calls are never pure (may have side effects)
             ExprKind::Call { .. } => false,
 
-            // Member access is pure if the base expression is pure
-            ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => self.is_pure_expr(expr),
+            // Member access through struct value (.) is pure if the base is pure.
+            ExprKind::Member { expr, .. } => self.is_pure_expr(expr),
 
-            // Array indexing is pure if both parts are pure
-            ExprKind::Index { array, index } => {
-                self.is_pure_expr(array) && self.is_pure_expr(index)
-            }
+            // Arrow access (ptr->member) can cause UB/crash if ptr is NULL,
+            // so we must not eagerly evaluate it in conditional expressions.
+            ExprKind::Arrow { .. } => false,
+
+            // Array indexing can cause UB/crash if the pointer is invalid,
+            // so we must not eagerly evaluate it in conditional expressions.
+            ExprKind::Index { .. } => false,
 
             // Casts are pure if the operand is pure
             ExprKind::Cast { expr, .. } => self.is_pure_expr(expr),
@@ -3176,6 +3585,18 @@ impl<'a> Linearizer<'a> {
                             unreachable!("static local sentinel without static_locals entry");
                         }
                     }
+                    // Check if this local holds a pointer to the actual data
+                    // (e.g., va_list parameters due to array-to-pointer decay at call site).
+                    // If so, load the pointer instead of taking the address.
+                    if local.is_indirect {
+                        // The local stores a pointer; load and return it
+                        let ptr_type = self.types.pointer_to(local.typ);
+                        let result = self.alloc_pseudo();
+                        let size = self.types.size_bits(ptr_type);
+                        self.emit(Instruction::load(result, local.sym, 0, ptr_type, size));
+                        return result;
+                    }
+
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::sym_addr(
                         result,
@@ -3184,10 +3605,20 @@ impl<'a> Linearizer<'a> {
                     ));
                     result
                 } else if let Some(&param_pseudo) = self.var_map.get(&name_str) {
-                    // Parameter whose address is taken - spill to local storage
+                    // Parameter whose address is taken
+                    let param_type = self.expr_type(expr);
+                    let type_kind = self.types.kind(param_type);
+
+                    // va_list parameters are special: the parameter value IS already a pointer
+                    // to the va_list structure (due to array-to-pointer decay at call site).
+                    // Return the pointer value directly instead of spilling.
+                    if type_kind == TypeKind::VaList {
+                        return param_pseudo;
+                    }
+
+                    // For other parameters, spill to local storage.
                     // Parameters are pass-by-value in the IR (Arg pseudos), but if
                     // their address is taken, we need to copy to a stack slot first.
-                    let param_type = self.expr_type(expr);
                     let size = self.types.size_bits(param_type);
 
                     // Create a local variable to hold the parameter value
@@ -3226,6 +3657,7 @@ impl<'a> Linearizer<'a> {
                             vla_size_sym: None,
                             vla_elem_type: None,
                             vla_dim_syms: vec![],
+                            is_indirect: false,
                         },
                     );
 
@@ -3389,7 +3821,7 @@ impl<'a> Linearizer<'a> {
             }
             ExprKind::CompoundLiteral { typ, elements } => {
                 // Compound literal as lvalue: create it and return its address
-                // This is used for &(struct S){...}
+                // This is used for &(struct S){...} and large struct assignment like *p = (struct S){...}
                 let sym_id = self.alloc_pseudo();
                 let unique_name = format!(".compound_literal.{}", sym_id.0);
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
@@ -3405,6 +3837,18 @@ impl<'a> Linearizer<'a> {
                         None,
                     );
                 }
+
+                // For compound literals with partial initialization, C99 6.7.8p21 requires
+                // zero-initialization of all subobjects not explicitly initialized.
+                // Zero the entire compound literal first, then initialize specific members.
+                let type_kind = self.types.kind(*typ);
+                if type_kind == TypeKind::Struct
+                    || type_kind == TypeKind::Union
+                    || type_kind == TypeKind::Array
+                {
+                    self.emit_aggregate_zero(sym_id, *typ);
+                }
+
                 self.linearize_init_list(sym_id, *typ, elements);
 
                 // Return address of the compound literal
@@ -3701,16 +4145,37 @@ impl<'a> Linearizer<'a> {
                 member_info.typ,
             )
         } else {
-            let result = self.alloc_pseudo();
             let size = self.types.size_bits(member_info.typ);
-            self.emit(Instruction::load(
-                result,
-                base,
-                member_info.offset as i64,
-                member_info.typ,
-                size,
-            ));
-            result
+            let member_kind = self.types.kind(member_info.typ);
+
+            // Large structs (size > 64) can't be loaded into registers - return address
+            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
+                if member_info.offset == 0 {
+                    base
+                } else {
+                    let result = self.alloc_pseudo();
+                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    self.emit(Instruction::binop(
+                        Opcode::Add,
+                        result,
+                        base,
+                        offset_val,
+                        self.types.long_id,
+                        64,
+                    ));
+                    result
+                }
+            } else {
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::load(
+                    result,
+                    base,
+                    member_info.offset as i64,
+                    member_info.typ,
+                    size,
+                ));
+                result
+            }
         }
     }
 
@@ -3771,16 +4236,37 @@ impl<'a> Linearizer<'a> {
                 member_info.typ,
             )
         } else {
-            let result = self.alloc_pseudo();
             let size = self.types.size_bits(member_info.typ);
-            self.emit(Instruction::load(
-                result,
-                ptr,
-                member_info.offset as i64,
-                member_info.typ,
-                size,
-            ));
-            result
+            let member_kind = self.types.kind(member_info.typ);
+
+            // Large structs (size > 64) can't be loaded into registers - return address
+            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
+                if member_info.offset == 0 {
+                    ptr
+                } else {
+                    let result = self.alloc_pseudo();
+                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    self.emit(Instruction::binop(
+                        Opcode::Add,
+                        result,
+                        ptr,
+                        offset_val,
+                        self.types.long_id,
+                        64,
+                    ));
+                    result
+                }
+            } else {
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::load(
+                    result,
+                    ptr,
+                    member_info.offset as i64,
+                    member_info.typ,
+                    size,
+                ));
+                result
+            }
         }
     }
 
@@ -3913,13 +4399,20 @@ impl<'a> Linearizer<'a> {
         ));
 
         // If element type is an array, just return the address (arrays decay to pointers)
-        if self.types.kind(elem_type) == TypeKind::Array {
+        let elem_kind = self.types.kind(elem_type);
+        if elem_kind == TypeKind::Array {
             addr
         } else {
-            let result = self.alloc_pseudo();
             let size = self.types.size_bits(elem_type);
-            self.emit(Instruction::load(result, addr, 0, elem_type, size));
-            result
+            // Large structs/unions (> 64 bits) can't be loaded into registers - return address
+            // Assignment will handle the actual copy via emit_assign's large struct handling
+            if (elem_kind == TypeKind::Struct || elem_kind == TypeKind::Union) && size > 64 {
+                addr
+            } else {
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::load(result, addr, 0, elem_type, size));
+                result
+            }
         }
     }
 
@@ -4784,6 +5277,13 @@ impl<'a> Linearizer<'a> {
                         let ptr_type = self.types.pointer_to(elem_type);
                         self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                         return result;
+                    } else if type_kind == TypeKind::VaList {
+                        // va_list is defined as __va_list_tag[1] (an array type), so it decays to
+                        // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
+                        let result = self.alloc_pseudo();
+                        let ptr_type = self.types.pointer_to(typ);
+                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                        return result;
                     } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
                         && size > 64
                     {
@@ -4813,6 +5313,20 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
                 let ptr_type = self.types.pointer_to(elem_type);
                 self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+            } else if type_kind == TypeKind::VaList {
+                // va_list is defined as __va_list_tag[1] (an array type), so it decays to
+                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
+                if local.is_indirect {
+                    // va_list parameter: local holds a pointer to the va_list struct
+                    // Load the pointer value (array decay already happened at call site)
+                    let ptr_type = self.types.pointer_to(local.typ);
+                    let ptr_size = self.types.size_bits(ptr_type);
+                    self.emit(Instruction::load(result, local.sym, 0, ptr_type, ptr_size));
+                } else {
+                    // Regular va_list local: take address (normal array decay)
+                    let ptr_type = self.types.pointer_to(local.typ);
+                    self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+                }
             } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
                 // Large structs can't be loaded into registers - return address
                 let ptr_type = self.types.pointer_to(local.typ);
@@ -4859,9 +5373,10 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
             }
-            // Functions decay to function pointers, and large structs can't be loaded
-            // into registers - for both cases, return the address
+            // Functions decay to function pointers, va_list decays to pointer (C99 6.3.2.1, 7.15.1),
+            // and large structs can't be loaded into registers - for all cases, return the address
             else if type_kind == TypeKind::Function
+                || type_kind == TypeKind::VaList
                 || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
             {
                 let result = self.alloc_pseudo();
@@ -6027,6 +6542,57 @@ impl<'a> Linearizer<'a> {
                     ));
                 }
             }
+        }
+    }
+
+    /// Emit a block copy from src to dst using integer chunks.
+    fn emit_block_copy(&mut self, dst: PseudoId, src: PseudoId, size_bytes: i64) {
+        let mut offset: i64 = 0;
+
+        // Copy in 8-byte chunks
+        while offset + 8 <= size_bytes {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.ulong_id, 64));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                offset,
+                self.types.ulong_id,
+                64,
+            ));
+            offset += 8;
+        }
+
+        // Handle remaining bytes
+        let remaining = size_bytes - offset;
+        if remaining >= 4 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.uint_id, 32));
+            self.emit(Instruction::store(tmp, dst, offset, self.types.uint_id, 32));
+            offset += 4;
+        }
+        if remaining % 4 >= 2 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(
+                tmp,
+                src,
+                offset,
+                self.types.ushort_id,
+                16,
+            ));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                offset,
+                self.types.ushort_id,
+                16,
+            ));
+            offset += 2;
+        }
+        if remaining % 2 == 1 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
+            self.emit(Instruction::store(tmp, dst, offset, self.types.uchar_id, 8));
         }
     }
 
@@ -7489,6 +8055,24 @@ impl<'a> Linearizer<'a> {
             ));
 
             return real; // Return real part as the result value
+        }
+
+        // For large struct/union assignment (> 64 bits), do a block copy
+        // Similar to complex type handling - get addresses and copy in chunks
+        let target_kind = self.types.kind(target_typ);
+        let target_size = self.types.size_bits(target_typ);
+        if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
+            && target_size > 64
+            && op == AssignOp::Assign
+        {
+            let target_addr = self.linearize_lvalue(target);
+            let value_addr = self.linearize_lvalue(value);
+            let target_size_bytes = target_size / 8;
+
+            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64);
+
+            // Return the target address as the result
+            return target_addr;
         }
 
         let rhs = self.linearize_expr(value);

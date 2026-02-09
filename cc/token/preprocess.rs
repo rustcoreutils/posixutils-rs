@@ -368,6 +368,60 @@ pub struct Preprocessor<'a> {
     lexer_mode: LexerMode,
 }
 
+/// Check if an attribute name is supported by pcc
+fn is_supported_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "noreturn"
+            | "__noreturn__"
+            | "unused"
+            | "__unused__"
+            | "aligned"
+            | "__aligned__"
+            | "packed"
+            | "__packed__"
+            | "deprecated"
+            | "__deprecated__"
+            | "weak"
+            | "__weak__"
+            | "section"
+            | "__section__"
+            | "visibility"
+            | "__visibility__"
+            | "constructor"
+            | "__constructor__"
+            | "destructor"
+            | "__destructor__"
+            | "used"
+            | "__used__"
+            | "noinline"
+            | "__noinline__"
+            | "always_inline"
+            | "__always_inline__"
+            | "hot"
+            | "__hot__"
+            | "cold"
+            | "__cold__"
+            | "warn_unused_result"
+            | "__warn_unused_result__"
+            | "format"
+            | "__format__"
+            | "fallthrough"
+            | "__fallthrough__"
+            | "nonstring"
+            | "__nonstring__"
+            | "malloc"
+            | "__malloc__"
+            | "pure"
+            | "__pure__"
+            | "sentinel"
+            | "__sentinel__"
+            | "no_sanitize_memory"
+            | "no_sanitize_address"
+            | "no_sanitize_thread"
+    )
+}
+
 impl<'a> Preprocessor<'a> {
     /// Format the current time as C99 __DATE__ and __TIME__ strings
     /// Returns (date_string, time_string) where:
@@ -3006,34 +3060,7 @@ impl<'a> Preprocessor<'a> {
         };
 
         match builtin {
-            BuiltinMacro::HasAttribute => {
-                // Return true for attributes we actually implement
-                matches!(
-                    name.as_str(),
-                    "noreturn"
-                        | "__noreturn__"
-                        | "unused"
-                        | "__unused__"
-                        | "aligned"
-                        | "__aligned__"
-                        | "packed"
-                        | "__packed__"
-                        | "deprecated"
-                        | "__deprecated__"
-                        | "weak"
-                        | "__weak__"
-                        | "section"
-                        | "__section__"
-                        | "visibility"
-                        | "__visibility__"
-                        | "constructor"
-                        | "__constructor__"
-                        | "destructor"
-                        | "__destructor__"
-                        | "used"
-                        | "__used__"
-                )
-            }
+            BuiltinMacro::HasAttribute => is_supported_attribute(&name),
             BuiltinMacro::HasBuiltin => {
                 // Use centralized builtin registry
                 crate::builtins::is_builtin(name.as_str())
@@ -3469,33 +3496,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        // Return 1 for attributes we actually implement
-        let supported = matches!(
-            name.as_str(),
-            "noreturn"
-                | "__noreturn__"
-                | "unused"
-                | "__unused__"
-                | "aligned"
-                | "__aligned__"
-                | "packed"
-                | "__packed__"
-                | "deprecated"
-                | "__deprecated__"
-                | "weak"
-                | "__weak__"
-                | "section"
-                | "__section__"
-                | "visibility"
-                | "__visibility__"
-                | "constructor"
-                | "__constructor__"
-                | "destructor"
-                | "__destructor__"
-                | "used"
-                | "__used__"
-        );
-        if supported {
+        if is_supported_attribute(&name) {
             1
         } else {
             0

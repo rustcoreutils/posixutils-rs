@@ -3115,6 +3115,11 @@ impl CodeGenerator for Aarch64CodeGen {
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
     }
+
+    fn set_shared_mode(&mut self, _shared: bool) {
+        // AArch64 TLS model selection not yet implemented
+        // For now, this is a no-op
+    }
 }
 
 /// Helper enum for atomic bitwise operations

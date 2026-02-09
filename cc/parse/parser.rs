@@ -11,8 +11,9 @@
 //
 
 use super::ast::{
-    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitDeclarator, OffsetOfPath, Parameter, Stmt, TranslationUnit, UnaryOp,
+    AsmOperand, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl,
+    ForInit, FunctionDef, InitDeclarator, InitElement, OffsetOfPath, Parameter, Stmt,
+    TranslationUnit, UnaryOp,
 };
 use crate::diag;
 use crate::strings::StringId;
@@ -1406,7 +1407,7 @@ impl Parser<'_> {
         }
 
         let new_size = match &init.kind {
-            ExprKind::InitList { elements } => Some(elements.len()),
+            ExprKind::InitList { elements } => Some(self.array_size_from_elements(elements)),
             ExprKind::StringLit(s) => {
                 // For char array initialized with string literal,
                 // size is string length + 1 for null terminator
@@ -1430,6 +1431,40 @@ impl Parser<'_> {
             self.types.intern(arr_type)
         } else {
             typ
+        }
+    }
+
+    pub(crate) fn array_size_from_elements(&self, elements: &[InitElement]) -> usize {
+        let mut max_index: i64 = -1;
+        let mut current_index: i64 = 0;
+
+        for element in elements {
+            let mut designator_index = None;
+            for designator in &element.designators {
+                if let Designator::Index(index) = designator {
+                    designator_index = Some(*index);
+                    break;
+                }
+            }
+
+            let index = if let Some(explicit_index) = designator_index {
+                current_index = explicit_index + 1;
+                explicit_index
+            } else {
+                let idx = current_index;
+                current_index += 1;
+                idx
+            };
+
+            if index > max_index {
+                max_index = index;
+            }
+        }
+
+        if max_index < 0 {
+            0
+        } else {
+            (max_index + 1) as usize
         }
     }
 
@@ -1548,7 +1583,16 @@ impl Parser<'_> {
 
                 // For incomplete array types, infer size from initializer
                 if let Some(ref init_expr) = init {
+                    let old_type = typ;
                     typ = self.infer_array_size_from_init(typ, init_expr);
+
+                    // If the type changed (array size was inferred), update the symbol's type
+                    // This is needed because the symbol was already added before parsing the initializer
+                    if typ != old_type {
+                        if let Some(sym_id) = symbol_id {
+                            self.symbols.get_mut(sym_id).typ = typ;
+                        }
+                    }
                 }
 
                 // Bind typedef to symbol table (after parsing initializer, which
@@ -3496,7 +3540,16 @@ impl Parser<'_> {
 
         // For incomplete array types, infer size from initializer
         if let Some(ref init_expr) = init {
+            let old_type = var_type_id;
             var_type_id = self.infer_array_size_from_init(var_type_id, init_expr);
+
+            // If the type changed (array size was inferred), update the symbol's type
+            // This is needed because the symbol was already added before parsing the initializer
+            if var_type_id != old_type {
+                if let Some(sym_id) = symbol {
+                    self.symbols.get_mut(sym_id).typ = var_type_id;
+                }
+            }
         }
 
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
@@ -3568,7 +3621,16 @@ impl Parser<'_> {
 
             // For incomplete array types, infer size from initializer
             if let Some(ref init_expr) = decl_init {
+                let old_type = decl_type;
                 decl_type = self.infer_array_size_from_init(decl_type, init_expr);
+
+                // If the type changed (array size was inferred), update the symbol's type
+                // This is needed because the symbol was already added before parsing the initializer
+                if decl_type != old_type {
+                    if let Some(sym_id) = decl_symbol {
+                        self.symbols.get_mut(sym_id).typ = decl_type;
+                    }
+                }
             }
 
             // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)

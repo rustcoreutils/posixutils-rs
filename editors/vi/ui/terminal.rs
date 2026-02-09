@@ -284,6 +284,10 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global; serialize tests that modify COLUMNS/LINES
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_terminal_size_default() {
@@ -294,35 +298,33 @@ mod tests {
 
     #[test]
     fn test_columns_env_override() {
-        // Set COLUMNS environment variable
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("COLUMNS", "60");
         let term = Terminal::new();
         std::env::remove_var("COLUMNS");
 
         if let Ok(term) = term {
             let size = term.size();
-            // Should use COLUMNS value if set
             assert_eq!(size.cols, 60);
         }
     }
 
     #[test]
     fn test_lines_env_override() {
-        // Set LINES environment variable
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("LINES", "30");
         let term = Terminal::new();
         std::env::remove_var("LINES");
 
         if let Ok(term) = term {
             let size = term.size();
-            // Should use LINES value if set
             assert_eq!(size.rows, 30);
         }
     }
 
     #[test]
     fn test_both_env_override() {
-        // Set both environment variables
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("COLUMNS", "100");
         std::env::set_var("LINES", "40");
         let term = Terminal::new();
@@ -338,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_invalid_env_values_fallback() {
-        // Set invalid environment variables
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("COLUMNS", "invalid");
         std::env::set_var("LINES", "not-a-number");
         let term = Terminal::new();
@@ -347,9 +349,8 @@ mod tests {
 
         if let Ok(term) = term {
             let size = term.size();
-            // Should fall back to ioctl or defaults
-            assert!(size.cols >= 10); // At least minimum
-            assert!(size.rows >= 2); // At least minimum
+            assert!(size.cols >= 10);
+            assert!(size.rows >= 2);
         }
     }
 }

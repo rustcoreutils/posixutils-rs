@@ -874,3 +874,230 @@ int main(void) {
         exit_code
     );
 }
+
+// Regression test for bug where copying a large struct (> 64 bits) from an
+// array element would incorrectly dereference the first field as a pointer
+// instead of doing a proper block copy.
+// Bug: `struct pair item = array[0];` would crash when struct has 2+ pointers.
+#[test]
+fn codegen_large_struct_array_copy() {
+    let code = r#"
+#include <stdio.h>
+
+struct pair {
+    void *ptr;
+    const char *str;
+};
+
+static struct pair pairs[] = {
+    {(void*)0xDEADBEEF, "First"},
+    {(void*)0xCAFEBABE, "Second"},
+};
+
+int main(void) {
+    // Test: copy struct from array to local variable
+    // This was crashing because the code tried to dereference
+    // the first field (0xDEADBEEF) as a pointer to copy from
+    struct pair item = pairs[0];
+    
+    // Verify the copy was correct
+    if (item.ptr != (void*)0xDEADBEEF) {
+        printf("FAIL: item.ptr = %p, expected 0xDEADBEEF\n", item.ptr);
+        return 1;
+    }
+    if (item.str[0] != 'F' || item.str[1] != 'i') {
+        printf("FAIL: item.str = %s, expected First\n", item.str);
+        return 2;
+    }
+    
+    // Test: copy second element
+    struct pair item2 = pairs[1];
+    if (item2.ptr != (void*)0xCAFEBABE) {
+        printf("FAIL: item2.ptr = %p, expected 0xCAFEBABE\n", item2.ptr);
+        return 3;
+    }
+    if (item2.str[0] != 'S') {
+        printf("FAIL: item2.str = %s, expected Second\n", item2.str);
+        return 4;
+    }
+    
+    // Test: copy in a loop (dynamic index)
+    for (int i = 0; i < 2; i++) {
+        struct pair p = pairs[i];
+        if (i == 0 && p.ptr != (void*)0xDEADBEEF) return 5;
+        if (i == 1 && p.ptr != (void*)0xCAFEBABE) return 6;
+    }
+    
+    printf("OK\n");
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run_optimized("struct_array_copy", code);
+    assert_eq!(
+        exit_code, 0,
+        "Large struct array copy test failed with exit code {}",
+        exit_code
+    );
+}
+
+// ============================================================================
+// Compound literal zero-initialization test
+// ============================================================================
+// C99 6.7.8p21: Fields not explicitly initialized in a compound literal
+// must be zero-initialized. Bug: *p = (struct S){.a = val} left .b and .c
+// as garbage instead of zero.
+#[test]
+fn codegen_compound_literal_zero_init() {
+    let code = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+typedef int (*func_ptr)(void);
+
+struct cached_m_dict {
+    void *copied;
+    int64_t extra;
+};
+
+typedef struct cached_m_dict *cached_m_dict_t;
+
+typedef enum {
+    ORIGIN_BUILTIN = 0,
+    ORIGIN_CORE = 1,
+    ORIGIN_DYNAMIC = 2
+} origin_t;
+
+struct extensions_cache_value {
+    void *def;                      // offset 0: 8 bytes
+    func_ptr m_init;                // offset 8: 8 bytes
+    int64_t m_index;                // offset 16: 8 bytes
+    cached_m_dict_t m_dict;         // offset 24: 8 bytes (pointer)
+    struct cached_m_dict _m_dict;   // offset 32: 16 bytes (embedded struct)
+    origin_t origin;                // offset 48: 4 bytes
+};
+
+int main(void) {
+    struct extensions_cache_value *v = malloc(sizeof(*v));
+    
+    // Fill with known non-zero pattern to detect failure to zero-init
+    v->def = (void*)0xAAAA;
+    v->m_init = (func_ptr)0xBBBB;
+    v->m_index = 0xCCCC;
+    v->m_dict = (cached_m_dict_t)0xDDDD;
+    v->_m_dict.copied = (void*)0xEEEE;
+    v->_m_dict.extra = 0xFFFF;
+    v->origin = ORIGIN_DYNAMIC;
+    
+    // Assign compound literal with partial initialization
+    // Only .def, .m_init, .m_index, and .origin are explicitly set
+    // .m_dict, ._m_dict.copied, ._m_dict.extra should become 0
+    *v = (struct extensions_cache_value){
+        .def = (void*)0x1234,
+        .m_init = NULL,
+        .m_index = 1,
+        .origin = ORIGIN_CORE,
+    };
+    
+    // Check explicitly initialized fields
+    if (v->def != (void*)0x1234) {
+        printf("FAIL: v->def = %p, expected 0x1234\n", v->def);
+        return 1;
+    }
+    if (v->m_init != NULL) {
+        printf("FAIL: v->m_init = %p, expected NULL\n", (void*)v->m_init);
+        return 2;
+    }
+    if (v->m_index != 1) {
+        printf("FAIL: v->m_index = %ld, expected 1\n", (long)v->m_index);
+        return 3;
+    }
+    if (v->origin != ORIGIN_CORE) {
+        printf("FAIL: v->origin = %d, expected 1\n", v->origin);
+        return 4;
+    }
+    
+    // Check implicitly zero-initialized fields (the bug was here!)
+    if (v->m_dict != NULL) {
+        printf("FAIL: v->m_dict = %p, expected NULL (should be zero-init)\n", 
+               (void*)v->m_dict);
+        return 5;
+    }
+    if (v->_m_dict.copied != NULL) {
+        printf("FAIL: v->_m_dict.copied = %p, expected NULL (should be zero-init)\n", 
+               v->_m_dict.copied);
+        return 6;
+    }
+    if (v->_m_dict.extra != 0) {
+        printf("FAIL: v->_m_dict.extra = %ld, expected 0 (should be zero-init)\n", 
+               (long)v->_m_dict.extra);
+        return 7;
+    }
+    
+    free(v);
+    printf("OK\n");
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run_optimized("compound_literal_zero", code);
+    assert_eq!(
+        exit_code, 0,
+        "Compound literal zero-init test failed with exit code {}",
+        exit_code
+    );
+}
+
+// ============================================================================
+// Ternary conditional expressions with pointer dereference must use short-circuit
+// evaluation. Bug: `value = ptr == NULL ? 0 : ptr->x` would evaluate `ptr->x`
+// unconditionally, causing a crash when `ptr` is NULL because the compiler
+// incorrectly used a select instruction (cmov) instead of proper branching.
+#[test]
+fn codegen_conditional_short_circuit() {
+    let code = r#"
+#include <stdio.h>
+#include <stddef.h>
+
+struct foo {
+    int x;
+};
+
+// Test function that uses ternary with pointer dereference
+int get_value(struct foo *entry) {
+    // This MUST use short-circuit evaluation (branching)
+    // If implemented incorrectly with select/cmov, it will crash when entry is NULL
+    return entry == NULL ? 0 : entry->x;
+}
+
+int main(void) {
+    struct foo f = { .x = 42 };
+    
+    // Test 1: non-NULL pointer should return the value
+    int result1 = get_value(&f);
+    if (result1 != 42) {
+        printf("FAIL: get_value(&f) = %d, expected 42\n", result1);
+        return 1;
+    }
+    
+    // Test 2: NULL pointer should return 0 without crashing
+    // This will CRASH if the compiler eagerly evaluates entry->x
+    int result2 = get_value(NULL);
+    if (result2 != 0) {
+        printf("FAIL: get_value(NULL) = %d, expected 0\n", result2);
+        return 2;
+    }
+    
+    printf("OK\n");
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run_optimized("conditional_short_circuit", code);
+    assert_eq!(
+        exit_code, 0,
+        "Conditional short-circuit test failed with exit code {} (likely crashed on NULL dereference)",
+        exit_code
+    );
+}

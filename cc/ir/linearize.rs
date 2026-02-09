@@ -939,10 +939,28 @@ impl<'a> Linearizer<'a> {
 
                     // Sort fields by offset to ensure proper emission order
                     // (designated initializers can be in any order)
-                    raw_fields.sort_by_key(|field| field.offset);
+                    // For bitfields, also sort by bit_offset to keep them together
+                    raw_fields.sort_by(|a, b| {
+                        a.offset
+                            .cmp(&b.offset)
+                            .then_with(|| a.bit_offset.unwrap_or(0).cmp(&b.bit_offset.unwrap_or(0)))
+                    });
+
+                    // Remove duplicate initializations (later one wins, per C semantics)
+                    // For regular fields: duplicate if same offset
+                    // For bitfields: duplicate if same offset AND same bit_offset
                     let mut idx = 0;
                     while idx + 1 < raw_fields.len() {
-                        if raw_fields[idx].offset == raw_fields[idx + 1].offset {
+                        let same_offset = raw_fields[idx].offset == raw_fields[idx + 1].offset;
+                        let both_bitfields = raw_fields[idx].bit_offset.is_some()
+                            && raw_fields[idx + 1].bit_offset.is_some();
+                        let same_bitfield = both_bitfields
+                            && raw_fields[idx].bit_offset == raw_fields[idx + 1].bit_offset;
+
+                        // Only remove if:
+                        // - Same offset for non-bitfields, OR
+                        // - Same offset AND same bit_offset for bitfields
+                        if same_offset && (!both_bitfields || same_bitfield) {
                             raw_fields.remove(idx);
                         } else {
                             idx += 1;
@@ -1906,13 +1924,27 @@ impl<'a> Linearizer<'a> {
                         val_imag, sym_id, base_bytes, base_typ, base_bits,
                     ));
                 } else {
-                    // Simple scalar initializer
-                    let val = self.linearize_expr(init);
-                    // Convert the value to the target type (important for _Bool normalization)
-                    let init_type = self.expr_type(init);
-                    let converted = self.emit_convert(val, init_type, typ);
-                    let size = self.types.size_bits(typ);
-                    self.emit(Instruction::store(converted, sym_id, 0, typ, size));
+                    // Check for large struct/union initialization (> 64 bits)
+                    // linearize_expr returns an address for large aggregates
+                    let type_kind = self.types.kind(typ);
+                    let type_size = self.types.size_bits(typ);
+                    if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                        && type_size > 64
+                    {
+                        // Large struct/union init - source is an address, do block copy
+                        let value_addr = self.linearize_expr(init);
+                        let type_size_bytes = type_size / 8;
+
+                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64);
+                    } else {
+                        // Simple scalar initializer
+                        let val = self.linearize_expr(init);
+                        // Convert the value to the target type (important for _Bool normalization)
+                        let init_type = self.expr_type(init);
+                        let converted = self.emit_convert(val, init_type, typ);
+                        let size = self.types.size_bits(typ);
+                        self.emit(Instruction::store(converted, sym_id, 0, typ, size));
+                    }
                 }
             }
         }
@@ -2291,12 +2323,38 @@ impl<'a> Linearizer<'a> {
                             let offset = base_offset + member.offset as i64;
                             let field_type = member.typ;
 
-                            self.linearize_struct_field_init(
-                                base_sym,
-                                offset,
-                                field_type,
-                                &element.value,
-                            );
+                            // Check if this is a bitfield
+                            if let (Some(bit_off), Some(bit_w), Some(storage_size)) = (
+                                member.bit_offset,
+                                member.bit_width,
+                                member.storage_unit_size,
+                            ) {
+                                let val = self.linearize_expr(&element.value);
+                                let val_type = self.expr_type(&element.value);
+                                let storage_type = match storage_size {
+                                    1 => self.types.uchar_id,
+                                    2 => self.types.ushort_id,
+                                    4 => self.types.uint_id,
+                                    8 => self.types.ulong_id,
+                                    _ => self.types.uint_id,
+                                };
+                                let converted = self.emit_convert(val, val_type, storage_type);
+                                self.emit_bitfield_store(
+                                    base_sym,
+                                    offset as usize,
+                                    bit_off,
+                                    bit_w,
+                                    storage_size,
+                                    converted,
+                                );
+                            } else {
+                                self.linearize_struct_field_init(
+                                    base_sym,
+                                    offset,
+                                    field_type,
+                                    &element.value,
+                                );
+                            }
                             continue;
                         }
 
@@ -2305,7 +2363,9 @@ impl<'a> Linearizer<'a> {
                         let Some(ResolvedDesignator {
                             offset,
                             typ: field_type,
-                            ..
+                            bit_offset,
+                            bit_width,
+                            storage_unit_size,
                         }) = resolved
                         else {
                             continue;
@@ -2318,12 +2378,37 @@ impl<'a> Linearizer<'a> {
                             }
                         }
                         let offset = base_offset + offset as i64;
-                        self.linearize_struct_field_init(
-                            base_sym,
-                            offset,
-                            field_type,
-                            &element.value,
-                        );
+
+                        // Check if this is a bitfield
+                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
+                            (bit_offset, bit_width, storage_unit_size)
+                        {
+                            let val = self.linearize_expr(&element.value);
+                            let val_type = self.expr_type(&element.value);
+                            let storage_type = match storage_size {
+                                1 => self.types.uchar_id,
+                                2 => self.types.ushort_id,
+                                4 => self.types.uint_id,
+                                8 => self.types.ulong_id,
+                                _ => self.types.uint_id,
+                            };
+                            let converted = self.emit_convert(val, val_type, storage_type);
+                            self.emit_bitfield_store(
+                                base_sym,
+                                offset as usize,
+                                bit_off,
+                                bit_w,
+                                storage_size,
+                                converted,
+                            );
+                        } else {
+                            self.linearize_struct_field_init(
+                                base_sym,
+                                offset,
+                                field_type,
+                                &element.value,
+                            );
+                        }
                     }
                 }
             }
@@ -3315,9 +3400,11 @@ impl<'a> Linearizer<'a> {
                 self.is_pure_expr(left) && self.is_pure_expr(right)
             }
 
-            // Unary ops are pure if operand is pure, except for pre-inc/dec
+            // Unary ops are pure if operand is pure, except for pre-inc/dec and dereference.
+            // Dereference (*ptr) can cause UB/crash if the pointer is NULL or invalid,
+            // so we must not eagerly evaluate it in conditional expressions.
             ExprKind::Unary { op, operand, .. } => match op {
-                UnaryOp::PreInc | UnaryOp::PreDec => false,
+                UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref => false,
                 _ => self.is_pure_expr(operand),
             },
 
@@ -3338,13 +3425,16 @@ impl<'a> Linearizer<'a> {
             // Function calls are never pure (may have side effects)
             ExprKind::Call { .. } => false,
 
-            // Member access is pure if the base expression is pure
-            ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => self.is_pure_expr(expr),
+            // Member access through struct value (.) is pure if the base is pure.
+            ExprKind::Member { expr, .. } => self.is_pure_expr(expr),
 
-            // Array indexing is pure if both parts are pure
-            ExprKind::Index { array, index } => {
-                self.is_pure_expr(array) && self.is_pure_expr(index)
-            }
+            // Arrow access (ptr->member) can cause UB/crash if ptr is NULL,
+            // so we must not eagerly evaluate it in conditional expressions.
+            ExprKind::Arrow { .. } => false,
+
+            // Array indexing can cause UB/crash if the pointer is invalid,
+            // so we must not eagerly evaluate it in conditional expressions.
+            ExprKind::Index { .. } => false,
 
             // Casts are pure if the operand is pure
             ExprKind::Cast { expr, .. } => self.is_pure_expr(expr),
@@ -3731,7 +3821,7 @@ impl<'a> Linearizer<'a> {
             }
             ExprKind::CompoundLiteral { typ, elements } => {
                 // Compound literal as lvalue: create it and return its address
-                // This is used for &(struct S){...}
+                // This is used for &(struct S){...} and large struct assignment like *p = (struct S){...}
                 let sym_id = self.alloc_pseudo();
                 let unique_name = format!(".compound_literal.{}", sym_id.0);
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
@@ -3747,6 +3837,18 @@ impl<'a> Linearizer<'a> {
                         None,
                     );
                 }
+
+                // For compound literals with partial initialization, C99 6.7.8p21 requires
+                // zero-initialization of all subobjects not explicitly initialized.
+                // Zero the entire compound literal first, then initialize specific members.
+                let type_kind = self.types.kind(*typ);
+                if type_kind == TypeKind::Struct
+                    || type_kind == TypeKind::Union
+                    || type_kind == TypeKind::Array
+                {
+                    self.emit_aggregate_zero(sym_id, *typ);
+                }
+
                 self.linearize_init_list(sym_id, *typ, elements);
 
                 // Return address of the compound literal
@@ -4297,13 +4399,20 @@ impl<'a> Linearizer<'a> {
         ));
 
         // If element type is an array, just return the address (arrays decay to pointers)
-        if self.types.kind(elem_type) == TypeKind::Array {
+        let elem_kind = self.types.kind(elem_type);
+        if elem_kind == TypeKind::Array {
             addr
         } else {
-            let result = self.alloc_pseudo();
             let size = self.types.size_bits(elem_type);
-            self.emit(Instruction::load(result, addr, 0, elem_type, size));
-            result
+            // Large structs/unions (> 64 bits) can't be loaded into registers - return address
+            // Assignment will handle the actual copy via emit_assign's large struct handling
+            if (elem_kind == TypeKind::Struct || elem_kind == TypeKind::Union) && size > 64 {
+                addr
+            } else {
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::load(result, addr, 0, elem_type, size));
+                result
+            }
         }
     }
 
@@ -6436,6 +6545,57 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Emit a block copy from src to dst using integer chunks.
+    fn emit_block_copy(&mut self, dst: PseudoId, src: PseudoId, size_bytes: i64) {
+        let mut offset: i64 = 0;
+
+        // Copy in 8-byte chunks
+        while offset + 8 <= size_bytes {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.ulong_id, 64));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                offset,
+                self.types.ulong_id,
+                64,
+            ));
+            offset += 8;
+        }
+
+        // Handle remaining bytes
+        let remaining = size_bytes - offset;
+        if remaining >= 4 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.uint_id, 32));
+            self.emit(Instruction::store(tmp, dst, offset, self.types.uint_id, 32));
+            offset += 4;
+        }
+        if remaining % 4 >= 2 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(
+                tmp,
+                src,
+                offset,
+                self.types.ushort_id,
+                16,
+            ));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                offset,
+                self.types.ushort_id,
+                16,
+            ));
+            offset += 2;
+        }
+        if remaining % 2 == 1 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
+            self.emit(Instruction::store(tmp, dst, offset, self.types.uchar_id, 8));
+        }
+    }
+
     /// Emit code to load a bitfield value
     /// Returns the loaded value as a PseudoId
     fn emit_bitfield_load(
@@ -7895,6 +8055,24 @@ impl<'a> Linearizer<'a> {
             ));
 
             return real; // Return real part as the result value
+        }
+
+        // For large struct/union assignment (> 64 bits), do a block copy
+        // Similar to complex type handling - get addresses and copy in chunks
+        let target_kind = self.types.kind(target_typ);
+        let target_size = self.types.size_bits(target_typ);
+        if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
+            && target_size > 64
+            && op == AssignOp::Assign
+        {
+            let target_addr = self.linearize_lvalue(target);
+            let value_addr = self.linearize_lvalue(value);
+            let target_size_bytes = target_size / 8;
+
+            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64);
+
+            // Return the target address as the result
+            return target_addr;
         }
 
         let rhs = self.linearize_expr(value);

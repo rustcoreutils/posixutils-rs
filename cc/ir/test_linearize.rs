@@ -15,13 +15,13 @@
 
 use super::*;
 use crate::parse::ast::{
-    AssignOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, FunctionDef,
+    AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, FunctionDef,
     InitDeclarator, InitElement, Parameter, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
 use crate::target::Target;
-use crate::types::{CompositeType, StructMember, Type};
+use crate::types::{CompositeType, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
 fn test_pos() -> Position {
@@ -4632,7 +4632,7 @@ fn test_repeated_designator_last_wins_array() {
     let ir = format!("{}", module);
     let store_count = ir.matches("store").count();
     assert!(
-        store_count >= 1 && store_count <= 2,
+        (1..=2).contains(&store_count),
         "Expected one store for repeated designator, got {}: {}",
         store_count,
         ir
@@ -4996,6 +4996,714 @@ fn test_valist_expression_decay() {
     assert!(
         ir.contains("load.64"),
         "Cast of va_list parameter should load the pointer value, got: {}",
+        ir
+    );
+}
+
+/// Test that multiple bitfields at the same offset are all initialized
+/// when using designated initializers (static local case, which uses same path as globals).
+/// This tests the fix for the bug where only the last bitfield was initialized
+/// due to incorrect deduplication of fields sharing the same offset.
+#[test]
+fn test_bitfield_designated_init_multiple_same_offset() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+
+    // Create a struct with multiple bitfields sharing the same storage unit
+    // Similar to CPython's PyASCIIObject state field
+    let kind_id = ctx.str("kind");
+    let compact_id = ctx.str("compact");
+    let ascii_id = ctx.str("ascii");
+    let static_alloc_id = ctx.str("statically_allocated");
+
+    let members = vec![
+        StructMember {
+            name: kind_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(0),
+            bit_width: Some(3),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+        StructMember {
+            name: compact_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(3),
+            bit_width: Some(1),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+        StructMember {
+            name: ascii_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(4),
+            bit_width: Some(1),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+        StructMember {
+            name: static_alloc_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(5),
+            bit_width: Some(1),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+    ];
+
+    // Create a static struct type (type must have STATIC modifier for static locals)
+    let struct_type = ctx.types.intern(Type {
+        kind: crate::types::TypeKind::Struct,
+        modifiers: TypeModifiers::STATIC,
+        composite: Some(Box::new(CompositeType {
+            tag: None,
+            members,
+            enum_constants: vec![],
+            size: 1,
+            align: 1,
+            is_complete: true,
+        })),
+        base: None,
+        array_size: None,
+        params: None,
+        noreturn: false,
+        variadic: false,
+    });
+
+    let s_sym = ctx.var("s", struct_type);
+
+    // Create init list: { .kind = 1, .compact = 1, .ascii = 1, .statically_allocated = 1 }
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![Designator::Field(kind_id)],
+                    value: Box::new(Expr::int(1, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(compact_id)],
+                    value: Box::new(Expr::int(1, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(ascii_id)],
+                    value: Box::new(Expr::int(1, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(static_alloc_id)],
+                    value: Box::new(Expr::int(1, &ctx.types)),
+                },
+            ],
+        },
+        struct_type,
+    );
+
+    // Create a function with static local declaration
+    let decl = Declaration {
+        declarators: vec![InitDeclarator {
+            symbol: s_sym,
+            typ: struct_type,
+            storage_class: crate::types::TypeModifiers::empty(),
+            init: Some(init_list),
+            vla_sizes: vec![],
+            explicit_align: None,
+        }],
+    };
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(decl),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+
+    let module = ctx.linearize(&tu);
+
+    // Check that the static local initializer has the correct packed value
+    // kind=1 (bits 0-2), compact=1 (bit 3), ascii=1 (bit 4), static_alloc=1 (bit 5)
+    // Expected: 1 | (1 << 3) | (1 << 4) | (1 << 5) = 1 + 8 + 16 + 32 = 57
+    let global_names: Vec<_> = module.globals.iter().map(|g| &g.name).collect();
+    let global = module
+        .globals
+        .iter()
+        .find(|g| g.name.contains("s"))
+        .unwrap_or_else(|| panic!("Should have static local 's', found: {:?}", global_names));
+
+    if let crate::ir::Initializer::Struct { fields, .. } = &global.init {
+        // Should have one field (the packed bitfield value)
+        assert_eq!(fields.len(), 1, "Should pack all bitfields into one field");
+        let (offset, size, init) = &fields[0];
+        assert_eq!(*offset, 0, "Packed field should be at offset 0");
+        assert_eq!(*size, 1, "Storage unit size should be 1 byte");
+        if let crate::ir::Initializer::Int(val) = init {
+            // All four bitfields set to 1 should give: 1 + 8 + 16 + 32 = 57
+            assert_eq!(
+                *val, 57,
+                "Packed value should be 57 (all four bitfields set)"
+            );
+        } else {
+            panic!("Expected Int initializer, got {:?}", init);
+        }
+    } else {
+        panic!("Expected Struct initializer, got {:?}", global.init);
+    }
+}
+
+/// Test that multiple bitfields are correctly initialized with read-modify-write
+/// when using designated initializers for local variables.
+#[test]
+fn test_bitfield_designated_init_local_var() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+
+    // Create a struct with multiple bitfields
+    let a_id = ctx.str("a");
+    let b_id = ctx.str("b");
+    let c_id = ctx.str("c");
+
+    let members = vec![
+        StructMember {
+            name: a_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(0),
+            bit_width: Some(4),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+        StructMember {
+            name: b_id,
+            typ: int_type,
+            offset: 0,
+            bit_offset: Some(4),
+            bit_width: Some(4),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+        StructMember {
+            name: c_id,
+            typ: int_type,
+            offset: 1,
+            bit_offset: Some(0),
+            bit_width: Some(8),
+            storage_unit_size: Some(1),
+            explicit_align: None,
+        },
+    ];
+
+    let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: None,
+        members,
+        enum_constants: vec![],
+        size: 2,
+        align: 1,
+        is_complete: true,
+    }));
+
+    let s_sym = ctx.var("s", struct_type);
+
+    // Create init list: { .a = 5, .b = 10, .c = 255 }
+    let init_list = Expr::typed_unpositioned(
+        ExprKind::InitList {
+            elements: vec![
+                InitElement {
+                    designators: vec![Designator::Field(a_id)],
+                    value: Box::new(Expr::int(5, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(b_id)],
+                    value: Box::new(Expr::int(10, &ctx.types)),
+                },
+                InitElement {
+                    designators: vec![Designator::Field(c_id)],
+                    value: Box::new(Expr::int(255, &ctx.types)),
+                },
+            ],
+        },
+        struct_type,
+    );
+
+    let func = FunctionDef {
+        return_type: ctx.types.int_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: s_sym,
+                    typ: struct_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(init_list),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // For local variables, each bitfield should use read-modify-write pattern
+    // So we should see multiple load and store pairs for the bitfield operations
+    // Count the number of load and store operations
+    let load_count = ir.matches("load.8").count();
+    let store_count = ir.matches("store.8").count();
+
+    // We have 3 bitfields: a, b at offset 0, c at offset 1
+    // Each bitfield init should do read-modify-write, so we expect:
+    // - At least 3 loads (one per bitfield)
+    // - At least 3 stores (one per bitfield)
+    // Plus the zero initialization stores
+    assert!(
+        load_count >= 3,
+        "Expected at least 3 loads for bitfield read-modify-write, got {}: {}",
+        load_count,
+        ir
+    );
+    assert!(
+        store_count >= 3,
+        "Expected at least 3 stores for bitfield initialization, got {}: {}",
+        store_count,
+        ir
+    );
+
+    // Also verify the AND operations for masking (part of read-modify-write)
+    // In IR format it appears as "and.8" (with type suffix)
+    let and_count = ir.matches("and.8").count();
+    assert!(
+        and_count >= 3,
+        "Expected at least 3 AND operations for bitfield masking, got {}: {}",
+        and_count,
+        ir
+    );
+}
+
+/// Test that large struct (> 64 bits) copy from array element works correctly.
+/// This was a bug where copying a struct from an array would incorrectly
+/// dereference the first field as a pointer instead of doing a proper memcpy-style copy.
+/// Bug manifested when struct size > 64 bits (e.g., struct with two pointers = 128 bits).
+#[test]
+fn test_large_struct_copy_from_array() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let ptr_type = ctx.types.void_ptr_id;
+
+    // Create a struct with two pointers (128 bits on 64-bit systems)
+    // struct pair { void *ptr; const char *str; };
+    let ptr_id = ctx.str("ptr");
+    let str_id = ctx.str("str");
+
+    let members = vec![
+        StructMember {
+            name: ptr_id,
+            typ: ptr_type,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+        StructMember {
+            name: str_id,
+            typ: ptr_type,
+            offset: 8,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+    ];
+
+    let struct_type = ctx.types.intern(Type {
+        kind: crate::types::TypeKind::Struct,
+        modifiers: TypeModifiers::empty(),
+        composite: Some(Box::new(CompositeType {
+            tag: None,
+            members,
+            enum_constants: vec![],
+            size: 16,
+            align: 8,
+            is_complete: true,
+        })),
+        base: None,
+        array_size: None,
+        params: None,
+        noreturn: false,
+        variadic: false,
+    });
+
+    // Create array type: struct pair[2]
+    let array_type = ctx.types.intern(Type::array(struct_type, 2));
+
+    // Create global array variable
+    let arr_sym = ctx.var("arr", array_type);
+
+    // Create local variable to copy into
+    let item_sym = ctx.var("item", struct_type);
+
+    // Create function: void test(void) { struct pair item = arr[0]; }
+    let func = FunctionDef {
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![],
+        body: Stmt::Block(vec![
+            BlockItem::Declaration(Declaration {
+                declarators: vec![InitDeclarator {
+                    symbol: item_sym,
+                    typ: struct_type,
+                    storage_class: crate::types::TypeModifiers::empty(),
+                    init: Some(Expr::typed_unpositioned(
+                        ExprKind::Index {
+                            array: Box::new(Expr::typed_unpositioned(
+                                ExprKind::Ident(arr_sym),
+                                array_type,
+                            )),
+                            index: Box::new(Expr::int(0, &ctx.types)),
+                        },
+                        struct_type,
+                    )),
+                    vla_sizes: vec![],
+                    explicit_align: None,
+                }],
+            }),
+            BlockItem::Statement(Stmt::Return(None)),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // For large struct copy (128 bits), we should see:
+    // - Multiple 64-bit load/store pairs (at least 2 for a 128-bit struct)
+    // The loads should NOT be dereferencing the struct's first field as a pointer
+    // Instead they should be copying the struct content directly
+
+    // Count 64-bit loads and stores
+    let load64_count = ir.matches("load.64").count();
+    let store64_count = ir.matches("store.64").count();
+
+    // We need at least 2 loads and 2 stores for a 128-bit struct copy
+    assert!(
+        load64_count >= 2,
+        "Expected at least 2 64-bit loads for struct copy, got {}: {}",
+        load64_count,
+        ir
+    );
+    assert!(
+        store64_count >= 2,
+        "Expected at least 2 64-bit stores for struct copy, got {}: {}",
+        store64_count,
+        ir
+    );
+}
+
+/// Test that compound literals with designated initializers zero-initialize
+/// fields that are not explicitly set.
+/// This is required by C99 6.7.8p21: "If there are fewer initializers in a
+/// brace-enclosed list than there are elements or members of an aggregate,
+/// ... the remainder of the aggregate shall be initialized implicitly the same
+/// as objects that have static storage duration."
+/// Bug: When using `*p = (struct S){.field1 = val}`, fields not mentioned in
+/// the initializer would contain garbage instead of being zeroed.
+#[test]
+fn test_compound_literal_zero_init_lvalue() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let ptr_type = ctx.types.void_ptr_id;
+
+    // Create a struct with three pointer fields (192 bits)
+    // struct { void *a, *b, *c; };
+    let a_id = ctx.str("a");
+    let b_id = ctx.str("b");
+    let c_id = ctx.str("c");
+
+    let members = vec![
+        StructMember {
+            name: a_id,
+            typ: ptr_type,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+        StructMember {
+            name: b_id,
+            typ: ptr_type,
+            offset: 8,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+        StructMember {
+            name: c_id,
+            typ: ptr_type,
+            offset: 16,
+            bit_offset: None,
+            bit_width: None,
+            storage_unit_size: None,
+            explicit_align: None,
+        },
+    ];
+
+    let struct_type = ctx.types.intern(Type {
+        kind: crate::types::TypeKind::Struct,
+        modifiers: TypeModifiers::empty(),
+        composite: Some(Box::new(CompositeType {
+            tag: None,
+            members,
+            enum_constants: vec![],
+            size: 24,
+            align: 8,
+            is_complete: true,
+        })),
+        base: None,
+        array_size: None,
+        params: None,
+        noreturn: false,
+        variadic: false,
+    });
+
+    let struct_ptr_type = ctx.types.pointer_to(struct_type);
+
+    // Create parameter: struct S *p
+    let p_sym = ctx.var("p", struct_ptr_type);
+
+    // Create compound literal expression: (struct S){.a = (void*)0x1234}
+    // Only .a is set, .b and .c should be zero-initialized
+    let compound_literal = Expr::typed_unpositioned(
+        ExprKind::CompoundLiteral {
+            typ: struct_type,
+            elements: vec![InitElement {
+                designators: vec![Designator::Field(a_id)],
+                value: Box::new(Expr::typed_unpositioned(
+                    ExprKind::Cast {
+                        cast_type: ptr_type,
+                        expr: Box::new(Expr::int(0x1234, &ctx.types)),
+                    },
+                    ptr_type,
+                )),
+            }],
+        },
+        struct_type,
+    );
+
+    // Create assignment: *p = compound_literal
+    let assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Expr::typed_unpositioned(
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand: Box::new(Expr::typed_unpositioned(
+                        ExprKind::Ident(p_sym),
+                        struct_ptr_type,
+                    )),
+                },
+                struct_type,
+            )),
+            value: Box::new(compound_literal),
+        },
+        struct_type,
+    );
+
+    // Create function: void test(struct S *p) { *p = (struct S){.a = ...}; }
+    let func = FunctionDef {
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(p_sym),
+            typ: struct_ptr_type,
+        }],
+        body: Stmt::Block(vec![
+            BlockItem::Statement(Stmt::Expr(assign)),
+            BlockItem::Statement(Stmt::Return(None)),
+        ]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // The compound literal must be zero-initialized first, then the designated
+    // fields are set. The code will:
+    // 1. Zero all 3 fields (24 bytes at offsets 0, 8, 16)
+    // 2. Store the designated value to .a (offset 0)
+    // 3. Copy the compound literal to *p
+    //
+    // The zero-init may reuse the same register for all zero stores (optimization)
+    // so we count stores to the compound literal at different offsets.
+
+    // Verify that we have stores to the compound literal at offset +8 and +16
+    // These are the fields (.b and .c) that are not explicitly initialized
+    // and must be zero-initialized per C99 6.7.8p21
+    assert!(
+        ir.contains("+ 8") && ir.contains("+ 16"),
+        "Expected stores to offsets +8 and +16 for zero-init of fields b and c: {}",
+        ir
+    );
+
+    // Count store.64 operations - we need:
+    // - 3 stores for zero-init (offsets 0, 8, 16)
+    // - 1 store for designated init of .a (offset 0)
+    // - 3 stores for copying to *p (offsets 0, 8, 16)
+    // Plus some for parameter handling
+    let store64_count = ir.matches("store.64").count();
+    assert!(
+        store64_count >= 7,
+        "Expected at least 7 store.64 (3 zero-init + 1 designated + 3 copy), got {}: {}",
+        store64_count,
+        ir
+    );
+}
+
+/// Test that ternary conditional expressions with pointer dereference use
+/// short-circuit evaluation (control flow + phi) instead of Select instruction.
+///
+/// Bug: `value = entry == NULL ? 0 : entry->x` would evaluate `entry->x`
+/// unconditionally, causing a crash when `entry` is NULL. The is_pure_expr()
+/// function incorrectly considered Arrow expressions as "pure" when they can
+/// cause undefined behavior if the pointer is NULL.
+#[test]
+fn test_conditional_short_circuit_arrow() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let x_id = ctx.str("x");
+    let int_type = ctx.types.int_id;
+
+    // Create a struct with an int field: struct { int x; }
+    let members = vec![StructMember {
+        name: x_id,
+        typ: int_type,
+        offset: 0,
+        bit_offset: None,
+        bit_width: None,
+        storage_unit_size: None,
+        explicit_align: None,
+    }];
+    let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: None,
+        members,
+        enum_constants: vec![],
+        size: 4,
+        align: 4,
+        is_complete: true,
+    }));
+    let struct_ptr_type = ctx.types.intern(Type::pointer(struct_type));
+
+    // Create symbol for the parameter
+    let entry_sym = ctx.var("entry", struct_ptr_type);
+
+    // Create: entry == NULL ? 0 : entry->x
+    let entry_expr = Expr::typed_unpositioned(ExprKind::Ident(entry_sym), struct_ptr_type);
+    let null_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), int_type);
+    let zero_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), int_type);
+    let arrow_expr = Expr::typed_unpositioned(
+        ExprKind::Arrow {
+            expr: Box::new(entry_expr.clone()),
+            member: x_id,
+        },
+        int_type,
+    );
+    let cond_eq = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            left: Box::new(entry_expr),
+            op: BinaryOp::Eq,
+            right: Box::new(null_expr),
+        },
+        int_type,
+    );
+    let conditional = Expr::typed_unpositioned(
+        ExprKind::Conditional {
+            cond: Box::new(cond_eq),
+            then_expr: Box::new(zero_expr),
+            else_expr: Box::new(arrow_expr),
+        },
+        int_type,
+    );
+
+    // Create function: int test(struct S *entry) { return entry == NULL ? 0 : entry->x; }
+    let func = FunctionDef {
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(entry_sym),
+            typ: struct_ptr_type,
+        }],
+        body: Stmt::Block(vec![BlockItem::Statement(Stmt::Return(Some(conditional)))]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let ir = format!("{}", module);
+
+    // Verify that we use control flow (cbr + phi) instead of select instruction.
+    // Arrow expressions can cause UB if the pointer is NULL, so we must use
+    // short-circuit evaluation to avoid dereferencing NULL.
+
+    // Should have conditional branch (cbr) for proper short-circuit evaluation
+    assert!(
+        ir.contains("cbr "),
+        "Expected conditional branch (cbr) for short-circuit evaluation: {}",
+        ir
+    );
+
+    // Should have phi instruction to merge results from both branches
+    assert!(
+        ir.contains("phi."),
+        "Expected phi instruction for merging conditional results: {}",
+        ir
+    );
+
+    // Should NOT have select instruction (would mean eager evaluation of both branches)
+    assert!(
+        !ir.contains("select."),
+        "Should NOT use select instruction with pointer dereference (causes UB): {}",
         ir
     );
 }

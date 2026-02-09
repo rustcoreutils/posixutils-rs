@@ -709,3 +709,113 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("sizeof_inferred_array", code, &[]), 0);
 }
+
+/// Test designated initialization of multiple bitfields within the same storage unit
+/// This tests the fix for a bug where only the last bitfield was initialized
+/// (due to incorrect deduplication of fields at the same offset)
+#[test]
+fn c99_initializers_bitfield_designated() {
+    let code = r#"
+#include <stdio.h>
+
+// Bitfields all packed into a single storage unit (like CPython's PyASCIIObject state)
+struct state {
+    unsigned int interned:2;
+    unsigned int kind:3;
+    unsigned int compact:1;
+    unsigned int ascii:1;
+    unsigned int statically_allocated:1;
+};
+
+struct obj {
+    void *ptr;
+    long length;
+    long hash;
+    struct state state;
+};
+
+// Test global designated initializer with multiple bitfields
+struct obj test_obj = {
+    .ptr = (void*)0x12345678,
+    .length = 8,
+    .hash = -1,
+    .state = {
+        .kind = 1,
+        .compact = 1,
+        .ascii = 1,
+        .statically_allocated = 1,
+    },
+};
+
+// Test that all bitfields within the same byte can be initialized
+struct flags {
+    unsigned int a:1;
+    unsigned int b:1;
+    unsigned int c:1;
+    unsigned int d:1;
+    unsigned int e:1;
+    unsigned int f:1;
+    unsigned int g:1;
+    unsigned int h:1;
+};
+
+struct flags all_flags = {
+    .a = 1, .b = 1, .c = 1, .d = 1,
+    .e = 1, .f = 1, .g = 1, .h = 1,
+};
+
+struct flags some_flags = {
+    .b = 1, .d = 1, .f = 1, .h = 1,
+};
+
+int main(void) {
+    // Verify global struct with nested bitfield struct
+    if (test_obj.ptr != (void*)0x12345678) return 1;
+    if (test_obj.length != 8) return 2;
+    if (test_obj.hash != -1) return 3;
+    if (test_obj.state.interned != 0) return 4;
+    if (test_obj.state.kind != 1) return 5;
+    if (test_obj.state.compact != 1) return 6;
+    if (test_obj.state.ascii != 1) return 7;
+    if (test_obj.state.statically_allocated != 1) return 8;
+
+    // Verify all flags set
+    if (all_flags.a != 1) return 10;
+    if (all_flags.b != 1) return 11;
+    if (all_flags.c != 1) return 12;
+    if (all_flags.d != 1) return 13;
+    if (all_flags.e != 1) return 14;
+    if (all_flags.f != 1) return 15;
+    if (all_flags.g != 1) return 16;
+    if (all_flags.h != 1) return 17;
+
+    // Verify alternating flags
+    if (some_flags.a != 0) return 20;
+    if (some_flags.b != 1) return 21;
+    if (some_flags.c != 0) return 22;
+    if (some_flags.d != 1) return 23;
+    if (some_flags.e != 0) return 24;
+    if (some_flags.f != 1) return 25;
+    if (some_flags.g != 0) return 26;
+    if (some_flags.h != 1) return 27;
+
+    // Local variable with bitfield designated init
+    struct obj local_obj = {
+        .state = {
+            .interned = 2,
+            .kind = 5,
+            .compact = 0,
+            .ascii = 1,
+        },
+    };
+    if (local_obj.state.interned != 2) return 30;
+    if (local_obj.state.kind != 5) return 31;
+    if (local_obj.state.compact != 0) return 32;
+    if (local_obj.state.ascii != 1) return 33;
+    if (local_obj.state.statically_allocated != 0) return 34;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_designated_init", code, &[]), 0);
+}

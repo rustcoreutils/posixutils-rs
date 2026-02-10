@@ -295,7 +295,7 @@ impl Screen {
 
     /// Expand and wrap a line into multiple display rows.
     /// Returns a vector of strings, each representing one wrapped display row.
-    fn expand_and_wrap_line(&self, line: &str, max_cols: usize) -> Vec<String> {
+    pub fn expand_and_wrap_line(&self, line: &str, max_cols: usize) -> Vec<String> {
         if max_cols == 0 {
             return vec![String::new()];
         }

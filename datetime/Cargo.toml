@@ -11,6 +11,7 @@ rust-version.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

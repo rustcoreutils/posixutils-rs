@@ -17,17 +17,25 @@ use std::io;
 #[derive(Parser)]
 #[command(version, about = gettext("mkfifo - make FIFO special files"))]
 struct Args {
-    #[arg(short, long, help = gettext("Set the file permission bits of the newly-created FIFO to the specified mode value"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Set the file permission bits of the newly-created FIFO to the specified mode value"))]
     mode: Option<String>,
 
     #[arg(help = gettext("A pathname of the FIFO special file to be created"))]
     files: Vec<String>,
 }
 
-fn do_mkfifo(filename: &str, mode: &ChmodMode) -> io::Result<()> {
+fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Result<()> {
     let mode_val = match mode {
         ChmodMode::Absolute(mode, _) => *mode,
         ChmodMode::Symbolic(sym) => modestr::mutate(0o666, false, sym),
+    };
+
+    // When mode is explicitly specified with -m, bypass umask per POSIX spec
+    // When no mode is specified, let umask apply normally
+    let old_umask = if explicit_mode {
+        Some(unsafe { libc::umask(0) })
+    } else {
+        None
     };
 
     let res = unsafe {
@@ -36,6 +44,12 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode) -> io::Result<()> {
             mode_val as libc::mode_t,
         )
     };
+
+    // Restore the original umask if we changed it
+    if let Some(umask) = old_umask {
+        unsafe { libc::umask(umask) };
+    }
+
     if res < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -53,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     // parse the mode string
+    let explicit_mode = args.mode.is_some();
     let mode = match args.mode {
         Some(mode) => modestr::parse(&mode)?,
         None => ChmodMode::Absolute(0o666, 3),
@@ -60,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // apply the mode to each file
     for filename in &args.files {
-        if let Err(e) = do_mkfifo(filename, &mode) {
+        if let Err(e) = do_mkfifo(filename, &mode, explicit_mode) {
             exit_code = 1;
             eprintln!("{}: {}", filename, e);
         }

@@ -253,3 +253,26 @@ fn file_magic_file_priority_with_M_and_m_option_as_they_appear_using_cpio_archiv
         "",
     );
 }
+
+#[test]
+fn file_magic_with_hex_escape_sequences_jbig2() {
+    use std::env;
+    use std::path::PathBuf;
+
+    // Get the directory of the Cargo project
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    let jbig2_magic = cargo_manifest_dir.join("tests/file/jbig2.magic");
+    let test_jb2_file = cargo_manifest_dir.join("tests/file/test.jb2");
+
+    // Test that file recognizes JBIG2 image data using hex escape sequences in magic file
+    file_test(
+        &[
+            "-m",
+            jbig2_magic.to_str().unwrap(),
+            test_jb2_file.to_str().unwrap(),
+        ],
+        &format!("{}: JBIG2 image data\n", test_jb2_file.to_str().unwrap()),
+        "",
+    );
+}

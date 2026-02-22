@@ -18,6 +18,7 @@ plib = { path = "../plib" }
 [dev-dependencies]
 tempfile = "3"
 portable-pty = "0.9"
+serial_test = "3"
 
 [lints]
 workspace = true

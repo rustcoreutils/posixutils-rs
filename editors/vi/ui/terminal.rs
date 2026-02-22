@@ -284,6 +284,7 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_terminal_size_default() {
@@ -293,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_columns_env_override() {
         // Set COLUMNS environment variable
         std::env::set_var("COLUMNS", "60");
@@ -307,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_lines_env_override() {
         // Set LINES environment variable
         std::env::set_var("LINES", "30");
@@ -321,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_both_env_override() {
         // Set both environment variables
         std::env::set_var("COLUMNS", "100");
@@ -337,6 +341,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_invalid_env_values_fallback() {
         // Set invalid environment variables
         std::env::set_var("COLUMNS", "invalid");

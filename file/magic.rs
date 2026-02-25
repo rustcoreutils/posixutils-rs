@@ -18,8 +18,6 @@ use std::{
 };
 
 // Pre-compiled static regexes for performance
-static OCTAL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\([0-7]{1,3})").expect("invalid regex"));
 static COMP_OP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[=<>&^x]").expect("invalid regex"));
 static HEX_RE: LazyLock<Regex> =
@@ -90,7 +88,7 @@ enum ComparisonOperator {
 
 #[derive(Debug)]
 enum Value {
-    String(String),
+    String(Vec<u8>),
     Number(ComparisonOperator, u64),
 }
 
@@ -98,38 +96,73 @@ impl Value {
     fn parse(mut input: String, _type: Type) -> Result<Value, RawMagicLineParseError> {
         match _type {
             Type::String => {
-                let mut result = String::new();
-                let mut chars = input.chars();
+                let mut result = Vec::new();
+                let bytes = input.as_bytes();
+                let mut i = 0;
 
-                // replace character escape sequences with their characters
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            let replacement = match escaped {
-                                '\\' => '\\',
-                                'a' => '\x07', // alert
-                                'b' => '\x08', // backspace
-                                'f' => '\x0C', // form feed
-                                'n' => '\n',   // newline
-                                'r' => '\r',   // carriage return
-                                't' => '\t',   // horizontal tab
-                                'v' => '\x0B', // vertical tab
-                                ' ' => ' ',    // space
-                                _ => {
-                                    result.push('\\');
-                                    escaped
-                                } // Treat any other character as itself
-                            };
-                            result.push(replacement);
-                        } else {
-                            result.push('\\');
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i >= bytes.len() {
+                            result.push(b'\\');
+                            break;
                         }
+                        match bytes[i] {
+                            b'\\' => result.push(b'\\'),
+                            b'a' => result.push(0x07),
+                            b'b' => result.push(0x08),
+                            b'f' => result.push(0x0C),
+                            b'n' => result.push(b'\n'),
+                            b'r' => result.push(b'\r'),
+                            b't' => result.push(b'\t'),
+                            b'v' => result.push(0x0B),
+                            b' ' => result.push(b' '),
+                            b'x' => {
+                                // hex escape: \xNN (1-2 hex digits)
+                                i += 1;
+                                let start = i;
+                                while i < bytes.len()
+                                    && i - start < 2
+                                    && bytes[i].is_ascii_hexdigit()
+                                {
+                                    i += 1;
+                                }
+                                if i > start {
+                                    let hex_str = std::str::from_utf8(&bytes[start..i]).unwrap();
+                                    let val = u8::from_str_radix(hex_str, 16).unwrap();
+                                    result.push(val);
+                                } else {
+                                    result.push(b'\\');
+                                    result.push(b'x');
+                                }
+                                continue;
+                            }
+                            c if c.is_ascii_digit() && c < b'8' => {
+                                // octal escape: \NNN (1-3 octal digits)
+                                let start = i;
+                                while i < bytes.len()
+                                    && i - start < 3
+                                    && bytes[i] >= b'0'
+                                    && bytes[i] <= b'7'
+                                {
+                                    i += 1;
+                                }
+                                let oct_str = std::str::from_utf8(&bytes[start..i]).unwrap();
+                                let val = u8::from_str_radix(oct_str, 8).unwrap();
+                                result.push(val);
+                                continue;
+                            }
+                            other => {
+                                result.push(b'\\');
+                                result.push(other);
+                            }
+                        }
+                        i += 1;
                     } else {
-                        result.push(c);
+                        result.push(bytes[i]);
+                        i += 1;
                     }
                 }
-
-                result = Self::replace_all_octal_sequences_with_their_coded_values(&input)?;
 
                 Ok(Value::String(result))
             }
@@ -139,24 +172,6 @@ impl Value {
                 Ok(Value::Number(comp, num))
             }
         }
-    }
-
-    /// Replace the octal sequences in the string with the value they represent
-    /// in utf8
-    fn replace_all_octal_sequences_with_their_coded_values(
-        input: &str,
-    ) -> Result<String, RawMagicLineParseError> {
-        // replace octal sequences with specific coded values (using pre-compiled regex)
-        let result = OCTAL_RE
-            .replace_all(input, |capture: &regex::Captures| {
-                let mat = capture.get(1).unwrap().as_str();
-
-                let v = u32::from_str_radix(mat, 8).unwrap();
-                let c = char::from_u32(v).unwrap();
-                c.to_string()
-            })
-            .to_string();
-        Ok(result)
     }
 
     fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
@@ -235,7 +250,7 @@ enum Type {
 
 impl Type {
     fn parse(mut input: String) -> Result<Type, RawMagicLineParseError> {
-        Self::replace_verbose_type_string_with_short_ones(&mut input);
+        Self::normalize_type_aliases(&mut input);
 
         let tsc = Self::parse_type_specification_char(&mut input)
             .ok_or(RawMagicLineParseError::InvalidTypeFormat)?;
@@ -265,7 +280,7 @@ impl Type {
 
     /// As strings "byte", "short", "long" and "string" can also be represented by dC, dS, dL and s
     /// So, we'll replace the verbose ones with short ones
-    fn replace_verbose_type_string_with_short_ones(input: &mut String) {
+    fn normalize_type_aliases(input: &mut String) {
         if input.starts_with("byte") {
             input.replace_range(0..4, "dC");
         } else if input.starts_with("short") {
@@ -429,12 +444,10 @@ impl RawMagicFileLine {
             if tf_reader.read_exact(&mut buf).is_err() {
                 return false;
             }
-
-            if let Ok(tf_val) = String::from_utf8(buf.clone()) {
-                return tf_val.as_bytes() == val.as_bytes();
-            }
+            buf == *val
+        } else {
+            false
         }
-        false
     }
 
     fn number_test(&self, size: u64, mask: Option<u64>, tf_reader: &mut BufReader<File>) -> bool {

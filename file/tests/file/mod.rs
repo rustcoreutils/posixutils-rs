@@ -53,7 +53,7 @@ fn file_is_an_empty_file() {
 }
 
 #[test]
-fn file_with_i_flag_on_regular_file_with_no_further_classification() {
+fn file_i_flag_regular_no_classify() {
     let file = "tests/file/empty_file.txt";
 
     file_test(&[file, "-i"], &format!("{file}: regular file\n"), "");
@@ -128,7 +128,7 @@ fn file_file_is_a_broken_sym_link() {
 }
 
 #[test]
-fn file_symlink_with_h_flag_for_both_valid_and_broken_symlink() {
+fn file_h_flag_symlinks() {
     use std::env;
     use std::fs::{remove_file, symlink_metadata};
     use std::os::unix::fs::symlink;
@@ -172,7 +172,7 @@ fn file_symlink_with_h_flag_for_both_valid_and_broken_symlink() {
 }
 
 #[test]
-fn file_magic_file_priority_with_only_m_flag_using_cpio_archive() {
+fn file_magic_m_flag_cpio() {
     use std::env;
     use std::path::PathBuf;
 
@@ -199,7 +199,7 @@ fn file_magic_file_priority_with_only_m_flag_using_cpio_archive() {
 
 #[allow(non_snake_case)]
 #[test]
-fn file_magic_file_priority_with_only_M_flag_using_cpio_archive() {
+fn file_magic_M_flag_cpio() {
     use std::env;
     use std::path::PathBuf;
 
@@ -224,9 +224,30 @@ fn file_magic_file_priority_with_only_M_flag_using_cpio_archive() {
     );
 }
 
+#[test]
+fn file_magic_hex_escape_jbig2() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    let magic_file = cargo_manifest_dir.join("tests/file/jbig2.magic");
+    let test_file = cargo_manifest_dir.join("tests/file/test.jb2");
+
+    file_test(
+        &[
+            "-m",
+            magic_file.to_str().unwrap(),
+            test_file.to_str().unwrap(),
+        ],
+        &format!("{}: JBIG2 image data\n", test_file.to_str().unwrap(),),
+        "",
+    );
+}
+
 #[allow(non_snake_case)]
 #[test]
-fn file_magic_file_priority_with_M_and_m_option_as_they_appear_using_cpio_archive() {
+fn file_magic_M_and_m_flag_cpio() {
     use std::env;
     use std::path::PathBuf;
 

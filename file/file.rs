@@ -14,7 +14,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::{fs, io};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
@@ -67,57 +67,55 @@ struct Args {
     files: Vec<String>,
 }
 
-fn get_magic_files(args: &Args) -> Vec<PathBuf> {
-    // set priority according to the occurence of flags in the args lowest index will get highest priority
-    let mut magic_files: Vec<PathBuf> = Vec::new();
-
+fn get_magic_files(args: &Args, matches: &clap::ArgMatches) -> Vec<PathBuf> {
     if args.no_further_file_classification {
-        return magic_files;
+        return Vec::new();
     }
 
-    let default_magic_file = PathBuf::from(DEFAULT_MAGIC_FILE);
+    // Collect (index, path) for each present flag, then sort by CLI position
+    let mut indexed_files: Vec<(usize, PathBuf)> = Vec::new();
 
-    if let Some(test_file2) = &args.test_file2 {
-        magic_files.push(test_file2.clone());
-
-        if let Some(test_file1) = &args.test_file1 {
-            if args.default_tests {
-                let raw_args: Vec<String> = std::env::args().collect();
-                let m_index = raw_args.iter().position(|x| x == "-m");
-                let h_index = raw_args.iter().position(|x| x == "-h");
-
-                if m_index > h_index {
-                    magic_files.push(test_file1.clone());
-                    magic_files.push(default_magic_file);
-                } else {
-                    magic_files.push(default_magic_file);
-                    magic_files.push(test_file1.clone());
-                }
-            } else {
-                magic_files.push(test_file1.clone());
-            }
-        } else if args.default_tests {
-            magic_files.push(default_magic_file);
+    if let Some(ref path) = args.test_file2 {
+        if let Some(idx) = matches.index_of("test_file2") {
+            indexed_files.push((idx, path.clone()));
         }
-    } else if let Some(test_file1) = &args.test_file1 {
-        magic_files.push(test_file1.clone());
-
-        if args.test_file2.is_none() && !args.default_tests {
-            magic_files.push(default_magic_file);
+    }
+    if let Some(ref path) = args.test_file1 {
+        if let Some(idx) = matches.index_of("test_file1") {
+            indexed_files.push((idx, path.clone()));
         }
-    } else {
-        magic_files.push(default_magic_file);
+    }
+    if args.default_tests {
+        if let Some(idx) = matches.index_of("default_tests") {
+            indexed_files.push((idx, PathBuf::from(DEFAULT_MAGIC_FILE)));
+        }
+    }
+
+    indexed_files.sort_by_key(|(idx, _)| *idx);
+
+    let mut magic_files: Vec<PathBuf> = indexed_files.into_iter().map(|(_, p)| p).collect();
+
+    // Per POSIX: if only -m (no -M, no -d), append default magic file after
+    if args.test_file1.is_some() && args.test_file2.is_none() && !args.default_tests {
+        magic_files.push(PathBuf::from(DEFAULT_MAGIC_FILE));
+    }
+
+    // If nothing specified at all, use default magic file
+    if magic_files.is_empty() {
+        magic_files.push(PathBuf::from(DEFAULT_MAGIC_FILE));
     }
 
     magic_files
 }
 
-fn analyze_file(mut path: String, args: &Args, magic_files: &[PathBuf]) {
-    if path == "-" {
-        path = String::new();
-        io::stdin().read_line(&mut path).unwrap();
-        path = path.trim().to_string();
-    }
+fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
+    let path = if path == "-" {
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).unwrap();
+        buf.trim().to_string()
+    } else {
+        path.to_string()
+    };
 
     let met = match fs::symlink_metadata(&path) {
         Ok(met) => met,
@@ -138,12 +136,9 @@ fn analyze_file(mut path: String, args: &Args, magic_files: &[PathBuf]) {
             Ok(file_p) => {
                 // trace the file pointed by symbolic link
                 if file_p.exists() {
-                    println!("{path}: symbolic link to {}", file_p.to_str().unwrap());
+                    println!("{path}: symbolic link to {}", file_p.display());
                 } else {
-                    println!(
-                        "{path}: broken symbolic link to {}",
-                        file_p.to_str().unwrap()
-                    );
+                    println!("{path}: broken symbolic link to {}", file_p.display());
                 }
             }
             Err(_) => {
@@ -174,7 +169,7 @@ fn analyze_file(mut path: String, args: &Args, magic_files: &[PathBuf]) {
     }
     if file_type.is_file() {
         if args.no_further_file_classification {
-            assert!(magic_files.is_empty());
+            debug_assert!(magic_files.is_empty());
             println!("{path}: regular file");
             return;
         }
@@ -182,7 +177,7 @@ fn analyze_file(mut path: String, args: &Args, magic_files: &[PathBuf]) {
             println!("{path}: empty");
             return;
         }
-        match get_type_from_magic_file_dbs(&PathBuf::from(&path), magic_files) {
+        match get_type_from_magic_file_dbs(std::path::Path::new(&path), magic_files) {
             Some(f_type) => println!("{path}: {f_type}"),
             None => println!("{path}: data"),
         }
@@ -196,12 +191,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
 
-    let magic_files = get_magic_files(&args);
+    let magic_files = get_magic_files(&args, &matches);
 
     for file in &args.files {
-        analyze_file(file.clone(), &args, &magic_files);
+        analyze_file(file, &args, &magic_files);
     }
 
     Ok(())

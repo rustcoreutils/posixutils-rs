@@ -245,6 +245,55 @@ fn file_magic_hex_escape_jbig2() {
     );
 }
 
+#[test]
+fn file_malformed_magic_file_no_crash() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    let magic_file = cargo_manifest_dir.join("tests/file/malformed.magic");
+    let test_file = cargo_manifest_dir.join("tests/file/regular_file.txt");
+
+    // The utility should not crash on a malformed magic file.
+    // It should skip bad lines. The file has a valid "hello" entry that won't
+    // match regular_file.txt, so the output should be "data".
+    file_test(
+        &[
+            "-m",
+            magic_file.to_str().unwrap(),
+            test_file.to_str().unwrap(),
+        ],
+        &format!("{}: data\n", test_file.to_str().unwrap()),
+        "",
+    );
+}
+
+#[test]
+fn file_magic_octal_escape_packed_data() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    let magic_file = cargo_manifest_dir.join("tests/file/magic_file_a");
+
+    // Create a temp file starting with \037\036 (octal for 0x1F 0x1E) = "Packed data"
+    let tmp_dir = cargo_manifest_dir.join("tests/file");
+    let tmp_path = tmp_dir.join("packed_data_test_tmp");
+    std::fs::write(&tmp_path, [0o037, 0o036, 0x00, 0x00]).unwrap();
+
+    let tmp_str = tmp_path.to_str().unwrap();
+
+    file_test(
+        &["-m", magic_file.to_str().unwrap(), tmp_str],
+        &format!("{tmp_str}: Packed data\n"),
+        "",
+    );
+
+    std::fs::remove_file(&tmp_path).unwrap();
+}
+
 #[allow(non_snake_case)]
 #[test]
 fn file_magic_M_and_m_flag_cpio() {

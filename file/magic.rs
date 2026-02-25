@@ -11,7 +11,7 @@ use std::{
     error::Error,
     fmt,
     fs::File,
-    io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -27,9 +27,17 @@ pub fn get_type_from_magic_file_dbs(
     test_file: &Path,
     magic_file_dbs: &[PathBuf],
 ) -> Option<String> {
-    magic_file_dbs
-        .iter()
-        .find_map(|magic_file| parse_magic_file_and_test(magic_file, test_file).ok())
+    for magic_file in magic_file_dbs {
+        match parse_magic_file_and_test(magic_file, test_file) {
+            Ok(Some(result)) => return Some(result),
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("file: {}: {}", magic_file.display(), e);
+                continue;
+            }
+        }
+    }
+    None
 }
 
 /// Errors that can occur during parsing of a raw magic line.
@@ -426,16 +434,23 @@ impl RawMagicFileLine {
     }
 
     fn number_test(&self, size: u64, mask: Option<u64>, tf_reader: &mut BufReader<File>) -> bool {
-        let mut buf = vec![0; size as usize];
+        if size == 0 || size > 8 {
+            return false;
+        }
+
+        let size = size as usize;
+        let mut buf = vec![0; size];
         if tf_reader.read_exact(&mut buf).is_err() {
             return false;
         }
 
-        buf.reverse();
-
         let mut array_buf = [0u8; 8];
-        array_buf[(8 - buf.len())..8].copy_from_slice(&buf);
-        let mut tf_val = u64::from_be_bytes(array_buf);
+        if cfg!(target_endian = "little") {
+            array_buf[..size].copy_from_slice(&buf);
+        } else {
+            array_buf[(8 - size)..].copy_from_slice(&buf);
+        }
+        let mut tf_val = u64::from_ne_bytes(array_buf);
 
         if let Some(mask) = mask {
             tf_val &= mask;
@@ -468,7 +483,7 @@ impl RawMagicFileLine {
 fn parse_magic_file_and_test(
     magic_file: &Path,
     test_file: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, io::Error> {
     let mf_reader = BufReader::new(File::open(magic_file)?);
     let mut tf_reader = BufReader::new(File::open(test_file)?);
 
@@ -481,16 +496,13 @@ fn parse_magic_file_and_test(
                 if raw_magic_file_line.offset.is_continuation {
                     result = raw_magic_file_line.test(&mut tf_reader).or(Some(r.clone()));
                 } else {
-                    return Ok(result.unwrap());
+                    return Ok(result);
                 }
             }
         }
     }
 
-    result.ok_or(Box::new(io::Error::new(
-        ErrorKind::NotFound,
-        "Couldn't match any magic number",
-    )))
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -630,5 +642,30 @@ mod tests {
 
         // Invalid content
         assert!(RawMagicFileLine::parse("invalid line").is_err());
+    }
+
+    #[test]
+    fn test_number_test_size_too_large() {
+        // Construct a magic line with Unsigned(16, None) — size > 8 should not panic
+        let line = RawMagicFileLine {
+            offset: Offset {
+                num: 0,
+                is_continuation: false,
+            },
+            ty: Type::Unsigned(16, None),
+            value: Value::Number(ComparisonOperator::Equal, 0),
+            message: "should not match".to_string(),
+        };
+
+        // Create a temp file with some data
+        let tmp = std::env::temp_dir().join("posixutils_test_size_guard");
+        std::fs::write(&tmp, b"0123456789abcdef0123456789abcdef").unwrap();
+        let f = File::open(&tmp).unwrap();
+        let mut reader = BufReader::new(f);
+
+        // Should return None (no match), not panic
+        assert!(line.test(&mut reader).is_none());
+
+        std::fs::remove_file(&tmp).unwrap();
     }
 }

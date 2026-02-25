@@ -340,10 +340,10 @@ fn parse_offset(offset: &str) -> Result<u64, ParseIntError> {
 fn print_data<R: Read>(
     reader: &mut R,
     config: &Args,
-    bytes_that_will_be_skipped: usize,
+    bytes_that_will_be_skipped: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The bytes have been skipped now. The offset will be > 0 if skipping was performed.
-    let mut offset = bytes_that_will_be_skipped; // Initialize offset for printing addresses.
+    let mut offset: u64 = bytes_that_will_be_skipped; // Initialize offset for printing addresses.
 
     let mut buffer = [0; 16]; // Buffer to read data in chunks of 16 bytes.
     let mut previous_offset_string = String::new();
@@ -351,7 +351,7 @@ fn print_data<R: Read>(
 
     // Parse count limit from config, if specified.
     let count = if let Some(count) = config.count.as_ref() {
-        Some(parse_count::<usize>(count)?)
+        Some(parse_count::<u64>(count)?)
     } else {
         None
     };
@@ -374,9 +374,10 @@ fn print_data<R: Read>(
 
         // Truncate the buffer to the specified count, if provided.
         if let Some(count) = count {
-            let all_bytes = offset + bytes_read;
+            let all_bytes = offset + bytes_read as u64;
             if count < all_bytes {
-                local_buf = &buffer[..all_bytes - (all_bytes - count)];
+                let remaining = (count - offset) as usize;
+                local_buf = &buffer[..remaining];
                 bytes_read = local_buf.len();
                 run = false;
             }
@@ -559,7 +560,7 @@ fn print_data<R: Read>(
             }
         }
 
-        offset += bytes_read; // Move to the next line of bytes.
+        offset += bytes_read as u64; // Move to the next line of bytes.
     }
 
     // Print the final address in the specified base format.
@@ -1084,7 +1085,7 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         bytes_to_skip = parse_offset(offset)?; // Parse the offset option.
     }
 
-    let bytes_that_will_be_skipped = usize::try_from(bytes_to_skip)?;
+    let bytes_that_will_be_skipped = bytes_to_skip;
 
     let mut reader: Box<dyn Read> =
         if (args.files.len() == 1 && args.files[0].as_os_str() == "-") || args.files.is_empty() {

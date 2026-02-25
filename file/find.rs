@@ -845,7 +845,8 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
 
                     match Command::new(utility).args(&expanded_args).status() {
                         Ok(status) => EvalResult::new(status.success()),
-                        Err(_) => {
+                        Err(e) => {
+                            eprintln!("find: '{}': {}", utility, e);
                             state.had_error = true;
                             EvalResult::new(false)
                         }
@@ -888,7 +889,8 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
 
             match Command::new(utility).args(&expanded_args).status() {
                 Ok(status) => EvalResult::new(status.success()),
-                Err(_) => {
+                Err(e) => {
+                    eprintln!("find: '{}': {}", utility, e);
                     state.had_error = true;
                     EvalResult::new(false)
                 }

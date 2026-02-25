@@ -6,14 +6,13 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - add tests (how?)
-// - double-check that Rust stftime() is POSIX compliant
-//
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use std::ffi::CString;
+use std::mem::MaybeUninit;
+use std::process;
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
 
@@ -38,26 +37,62 @@ struct Args {
     timestr: Option<String>,
 }
 
-fn show_time_local(formatstr: &str) -> String {
-    let now = chrono::Local::now();
-    now.format(formatstr).to_string()
-}
-
-fn show_time_utc(formatstr: &str) -> String {
-    let now = chrono::Utc::now();
-    now.format(formatstr).to_string()
-}
-
 fn show_time(utc: bool, formatstr: &str) {
-    let timestr = {
-        if utc {
-            show_time_utc(formatstr)
-        } else {
-            show_time_local(formatstr)
+    if formatstr.is_empty() {
+        println!();
+        return;
+    }
+
+    let c_format = match CString::new(formatstr) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("date: format string contains NUL byte");
+            process::exit(1);
         }
     };
 
-    println!("{}", timestr);
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    if now == -1 {
+        eprintln!("date: failed to get current time");
+        process::exit(1);
+    }
+    let mut tm = MaybeUninit::<libc::tm>::uninit();
+
+    let tm_ptr = unsafe {
+        if utc {
+            libc::gmtime_r(&now, tm.as_mut_ptr())
+        } else {
+            libc::localtime_r(&now, tm.as_mut_ptr())
+        }
+    };
+
+    if tm_ptr.is_null() {
+        eprintln!("date: failed to get current time");
+        process::exit(1);
+    }
+
+    let tm = unsafe { tm.assume_init() };
+
+    // Try 256-byte buffer first, then 1024
+    for buf_size in [256, 1024] {
+        let mut buf = vec![0u8; buf_size];
+        let len = unsafe {
+            libc::strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                c_format.as_ptr(),
+                &tm,
+            )
+        };
+        if len > 0 {
+            let timestr = String::from_utf8_lossy(&buf[..len]);
+            println!("{}", timestr);
+            return;
+        }
+    }
+
+    eprintln!("date: format string produced no output");
+    process::exit(1);
 }
 
 fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {

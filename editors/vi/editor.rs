@@ -3010,6 +3010,73 @@ impl Editor {
         Ok(())
     }
 
+    /// Calculate which screen row the cursor should appear on, accounting for line wrapping.
+    /// Returns the screen row (1-indexed) or 0 if the cursor is not visible.
+    fn calculate_cursor_screen_row(
+        &self,
+        cursor_line: usize,
+        cursor_col: usize,
+        top_line: usize,
+        top_offset: usize,
+        max_rows: usize,
+        cols: usize,
+    ) -> usize {
+        if cursor_line < top_line {
+            return 0; // Cursor is above visible area
+        }
+
+        let mut screen_row = 1; // 1-indexed
+        let mut buffer_line = top_line;
+        let mut skip_wrapped_rows = top_offset;
+
+        // Walk through buffer lines until we reach the cursor line
+        while buffer_line < cursor_line && screen_row <= max_rows {
+            if let Some(line) = self.buffer.line(buffer_line) {
+                let wrapped = self.screen.expand_and_wrap_line(line.content(), cols);
+
+                // Skip wrapped rows from top_offset for the first line
+                if buffer_line == top_line && skip_wrapped_rows > 0 {
+                    let visible_rows = wrapped.len().saturating_sub(skip_wrapped_rows);
+                    screen_row += visible_rows;
+                    skip_wrapped_rows = 0;
+                } else {
+                    screen_row += wrapped.len();
+                }
+            } else {
+                screen_row += 1;
+            }
+            buffer_line += 1;
+        }
+
+        if buffer_line != cursor_line || screen_row > max_rows {
+            return 0; // Cursor line not reached or off-screen
+        }
+
+        // Now we're at the cursor line - find which wrapped row the cursor is on
+        if let Some(line) = self.buffer.line(cursor_line) {
+            let display_col = self
+                .screen
+                .buffer_col_to_display_col(line.content(), cursor_col);
+            let wrapped_row_index = display_col / cols;
+
+            // If this is the top line, account for offset
+            if cursor_line == top_line {
+                if wrapped_row_index < skip_wrapped_rows {
+                    return 0; // Cursor is in a wrapped row that's scrolled off
+                }
+                screen_row += wrapped_row_index - skip_wrapped_rows;
+            } else {
+                screen_row += wrapped_row_index;
+            }
+        }
+
+        if screen_row > max_rows {
+            0 // Off-screen
+        } else {
+            screen_row
+        }
+    }
+
     /// Refresh the screen.
     fn refresh_screen(&mut self) -> Result<()> {
         const LINE_NUMBER_WIDTH: usize = 8; // "%6d  " format
@@ -3022,32 +3089,72 @@ impl Editor {
         self.terminal.hide_cursor()?;
         self.terminal.move_cursor_home()?;
 
-        // Render buffer lines
+        // Render buffer lines with wrapping
         let top = self.screen.top_line();
+        let top_offset = self.screen.top_line_offset();
         let height = (size.rows as usize).saturating_sub(1); // Leave room for status
+        let avail_cols = if self.options.number {
+            (size.cols as usize).saturating_sub(LINE_NUMBER_WIDTH)
+        } else {
+            size.cols as usize
+        };
 
-        for screen_row in 0..height {
-            let line_num = top + screen_row;
+        // Guard against zero or very small terminal width
+        if avail_cols == 0 {
+            // Terminal too narrow to display content
+            self.terminal.show_cursor()?;
+            self.terminal.flush()?;
+            return Ok(());
+        }
+
+        let mut screen_row = 0;
+        let mut buffer_line = top;
+        let mut skip_wrapped_rows = top_offset;
+
+        while screen_row < height {
             self.terminal.move_cursor((screen_row + 1) as u16, 1)?;
             self.terminal.clear_line_to_end()?;
 
-            if line_num <= self.buffer.line_count() {
-                if let Some(line) = self.buffer.line(line_num) {
-                    // Line number prefix when option set
-                    if self.options.number {
-                        self.terminal.write_str(&format!("{:6}  ", line_num))?;
+            if buffer_line <= self.buffer.line_count() {
+                if let Some(line) = self.buffer.line(buffer_line) {
+                    // Wrap the line
+                    let wrapped = self.screen.expand_and_wrap_line(line.content(), avail_cols);
+
+                    // Skip wrapped rows if we're starting mid-line
+                    for (wrap_idx, wrapped_row) in wrapped.iter().enumerate() {
+                        if skip_wrapped_rows > 0 {
+                            skip_wrapped_rows -= 1;
+                            continue;
+                        }
+                        if screen_row >= height {
+                            break;
+                        }
+
+                        // Move to the correct position
+                        self.terminal.move_cursor((screen_row + 1) as u16, 1)?;
+                        self.terminal.clear_line_to_end()?;
+
+                        // Line number prefix when option set (only on first wrapped row)
+                        if self.options.number && wrap_idx == 0 {
+                            self.terminal.write_str(&format!("{:6}  ", buffer_line))?;
+                        } else if self.options.number {
+                            // Indent continuation lines with same width as line numbers
+                            self.terminal.write_str(&" ".repeat(LINE_NUMBER_WIDTH))?;
+                        }
+
+                        self.terminal.write_str(wrapped_row)?;
+                        screen_row += 1;
                     }
-                    let avail_cols = if self.options.number {
-                        (size.cols as usize).saturating_sub(LINE_NUMBER_WIDTH)
-                    } else {
-                        size.cols as usize
-                    };
-                    // Expand tabs and truncate (expand_line already caps at max_cols)
-                    let content = self.screen.expand_line(line.content(), avail_cols);
-                    self.terminal.write_str(&content)?;
+                    buffer_line += 1;
+                } else {
+                    self.terminal.write_str("~")?;
+                    screen_row += 1;
+                    buffer_line += 1;
                 }
             } else {
                 self.terminal.write_str("~")?;
+                screen_row += 1;
+                buffer_line += 1;
             }
         }
 
@@ -3059,20 +3166,34 @@ impl Editor {
 
         // Position cursor
         let cursor = self.buffer.cursor();
-        let display_line = (cursor.line - top + 1) as u16;
-        let display_col = self.screen.buffer_col_to_display_col(
-            self.buffer
-                .line(cursor.line)
-                .map(|l| l.content())
-                .unwrap_or(""),
+
+        // Calculate the actual screen row considering line wrapping
+        let display_line = self.calculate_cursor_screen_row(
+            cursor.line,
             cursor.column,
-        ) as u16
-            + 1;
-        // Add line number offset
+            top,
+            top_offset,
+            height,
+            avail_cols,
+        ) as u16;
+
+        let cursor_line_content = self
+            .buffer
+            .line(cursor.line)
+            .map(|l| l.content())
+            .unwrap_or("");
+        let display_col_in_line = self
+            .screen
+            .buffer_col_to_display_col(cursor_line_content, cursor.column);
+
+        // Which wrapped row of the cursor's line are we on?
+        let display_col_in_wrapped_row = display_col_in_line % avail_cols;
+
+        // Add 1 for 1-indexed and add line number width if needed
         let display_col = if self.options.number {
-            display_col + LINE_NUMBER_WIDTH as u16
+            (display_col_in_wrapped_row + 1 + LINE_NUMBER_WIDTH) as u16
         } else {
-            display_col
+            (display_col_in_wrapped_row + 1) as u16
         };
 
         if self.mode == Mode::Ex {

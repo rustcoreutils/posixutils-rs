@@ -52,6 +52,10 @@ fn show_time(utc: bool, formatstr: &str) {
     };
 
     let now = unsafe { libc::time(std::ptr::null_mut()) };
+    if now == -1 {
+        eprintln!("date: failed to get current time");
+        process::exit(1);
+    }
     let mut tm = MaybeUninit::<libc::tm>::uninit();
 
     let tm_ptr = unsafe {

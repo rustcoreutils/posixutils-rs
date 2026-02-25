@@ -76,21 +76,17 @@ fn test_format_year() {
 
 #[test]
 fn test_format_date() {
-    run_test_with_checker_and_env(
-        date_plan(&["+%Y-%m-%d"]),
-        &[("TZ", "UTC")],
-        |_, output| {
-            assert!(output.status.success());
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let date = stdout.trim();
-            // Match NNNN-NN-NN pattern
-            let parts: Vec<&str> = date.split('-').collect();
-            assert_eq!(parts.len(), 3, "Expected YYYY-MM-DD, got: '{}'", date);
-            assert_eq!(parts[0].len(), 4);
-            assert_eq!(parts[1].len(), 2);
-            assert_eq!(parts[2].len(), 2);
-        },
-    );
+    run_test_with_checker_and_env(date_plan(&["+%Y-%m-%d"]), &[("TZ", "UTC")], |_, output| {
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let date = stdout.trim();
+        // Match NNNN-NN-NN pattern
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.len(), 3, "Expected YYYY-MM-DD, got: '{}'", date);
+        assert_eq!(parts[0].len(), 4);
+        assert_eq!(parts[1].len(), 2);
+        assert_eq!(parts[2].len(), 2);
+    });
 }
 
 #[test]
@@ -104,4 +100,40 @@ fn test_default_format_utc() {
             stdout.trim()
         );
     });
+}
+
+#[test]
+fn test_locale_abbrev_weekday_and_month_c() {
+    run_test_with_checker_and_env(
+        date_plan(&["+%a %b"]),
+        &[("TZ", "UTC"), ("LANG", "C")],
+        |_, output| {
+            assert!(output.status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            assert_eq!(
+                parts.len(),
+                2,
+                "Expected '<weekday> <month>', got: '{}'",
+                trimmed
+            );
+            let weekday = parts[0];
+            let month = parts[1];
+            let valid_weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            let valid_months = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            assert!(
+                valid_weekdays.contains(&weekday),
+                "Expected weekday abbreviation per C locale, got: '{}'",
+                weekday
+            );
+            assert!(
+                valid_months.contains(&month),
+                "Expected month abbreviation per C locale, got: '{}'",
+                month
+            );
+        },
+    );
 }

@@ -627,11 +627,15 @@ fn test_awk_bugfix_fs_empty() {
 
 #[test]
 fn test_awk_bugfix_field_max_index() {
+    // Generate a record with exactly 1024 fields (MAX_FIELDS) to verify
+    // that accessing $1024 works after the off-by-one fix (0..MAX_FIELDS -> 0..=MAX_FIELDS)
+    let fields: Vec<String> = (1..=1024).map(|i| i.to_string()).collect();
+    let input = fields.join(" ") + "\n";
     run_test(TestPlan {
         cmd: String::from("awk"),
-        args: vec!["BEGIN { print \"ok\" }".to_string()],
-        stdin_data: String::new(),
-        expected_out: String::from("ok\n"),
+        args: vec!["{ print $1024 }".to_string()],
+        stdin_data: input,
+        expected_out: String::from("1024\n"),
         expected_err: String::from(""),
         expected_exit_code: 0,
     });
@@ -692,8 +696,6 @@ fn test_awk_paragraph_mode_newline_is_field_separator_ere_fs() {
     });
 }
 
-// POSIX: paragraph mode with default FS - newline is whitespace, so it
-// naturally acts as a field separator already.
 #[test]
 fn test_awk_bugfix_nextfile_nr() {
     test_awk!(

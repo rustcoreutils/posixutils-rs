@@ -519,6 +519,9 @@ struct GlobalEnv {
     nr: u32,
     fnr: u32,
     nf: usize,
+    /// Cached FS combined with newline for paragraph mode (RS="").
+    /// Invalidated when FS or RS changes.
+    paragraph_fs_cache: Option<FieldSeparator>,
 }
 
 impl GlobalEnv {
@@ -526,11 +529,17 @@ impl GlobalEnv {
         let as_string = |value: &mut AwkValue| value.clone().scalar_to_string(&self.convfmt);
         match var {
             SpecialVar::Convfmt => self.convfmt = as_string(value)?,
-            SpecialVar::Fs => self.fs = as_string(value)?.try_into()?,
+            SpecialVar::Fs => {
+                self.fs = as_string(value)?.try_into()?;
+                self.paragraph_fs_cache = None;
+            }
             SpecialVar::Ofmt => self.ofmt = as_string(value)?,
             SpecialVar::Ofs => self.ofs = as_string(value)?,
             SpecialVar::Ors => self.ors = as_string(value)?,
-            SpecialVar::Rs => self.rs = as_string(value)?.try_into()?,
+            SpecialVar::Rs => {
+                self.rs = as_string(value)?.try_into()?;
+                self.paragraph_fs_cache = None;
+            }
             SpecialVar::Nr => self.nr = value.scalar_as_f64() as u32,
             SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as u32,
             SpecialVar::Nf => self.nf = value.scalar_as_f64() as usize,
@@ -555,6 +564,45 @@ impl Default for GlobalEnv {
             nr: 1,
             fnr: 1,
             nf: 0,
+            paragraph_fs_cache: None,
+        }
+    }
+}
+
+impl GlobalEnv {
+    /// Returns the effective FS for the current record. In paragraph mode
+    /// (RS=""), newline is always a field separator per POSIX, so the FS is
+    /// combined with `\n`. The result is cached and only recomputed when
+    /// FS or RS changes.
+    fn effective_fs(&mut self) -> Result<&FieldSeparator, String> {
+        if !matches!(self.rs, RecordSeparator::Null) {
+            return Ok(&self.fs);
+        }
+        if let Some(ref cached) = self.paragraph_fs_cache {
+            return Ok(cached);
+        }
+        let combined = match &self.fs {
+            FieldSeparator::Default | FieldSeparator::Null => None,
+            FieldSeparator::Char(c) => {
+                let escaped = ere_escape_char(*c as char);
+                let pattern = format!("\n|{}", escaped);
+                Some(FieldSeparator::Ere(Rc::new(Regex::new(
+                    CString::new(pattern).map_err(|e| e.to_string())?,
+                )?)))
+            }
+            FieldSeparator::Ere(re) => {
+                let pattern = format!("\n|{}", re.pattern());
+                Some(FieldSeparator::Ere(Rc::new(Regex::new(
+                    CString::new(pattern).map_err(|e| e.to_string())?,
+                )?)))
+            }
+        };
+        match combined {
+            Some(fs) => {
+                self.paragraph_fs_cache = Some(fs);
+                Ok(self.paragraph_fs_cache.as_ref().unwrap())
+            }
+            None => Ok(&self.fs),
         }
     }
 }
@@ -1991,31 +2039,7 @@ pub fn interpret(
 
         global_env.fnr = 1;
         'record_loop: while let Some(record) = reader.read_next_record(&global_env.rs)? {
-            // POSIX: when RS is null, newline is always a field separator,
-            // no matter what the value of FS is. Combine FS with \n.
-            let paragraph_fs;
-            let fs = if matches!(global_env.rs, RecordSeparator::Null) {
-                match &global_env.fs {
-                    FieldSeparator::Default | FieldSeparator::Null => &global_env.fs,
-                    FieldSeparator::Char(c) => {
-                        let escaped = ere_escape_char(*c as char);
-                        let pattern = format!("\n|{}", escaped);
-                        paragraph_fs = FieldSeparator::Ere(Rc::new(Regex::new(
-                            CString::new(pattern).unwrap(),
-                        )?));
-                        &paragraph_fs
-                    }
-                    FieldSeparator::Ere(re) => {
-                        let pattern = format!("\n|{}", re.pattern());
-                        paragraph_fs = FieldSeparator::Ere(Rc::new(Regex::new(
-                            CString::new(pattern).unwrap(),
-                        )?));
-                        &paragraph_fs
-                    }
-                }
-            } else {
-                &global_env.fs
-            };
+            let fs = global_env.effective_fs()?;
             current_record.reset(record, fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.get_last_field() as f64).value;

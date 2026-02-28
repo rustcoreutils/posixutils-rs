@@ -6,8 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-
-use core::panic;
 use std::{
     collections::{hash_map::Entry, HashMap},
     ffi::CString,
@@ -54,18 +52,28 @@ macro_rules! read_iter_next {
     };
 }
 
+/// Try to find a regex match in the byte buffer. Returns the record before
+/// the match and the remainder after it, or None if no match found.
+fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, String> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let input = std::str::from_utf8(buf).map_err(|e| e.to_string())?;
+    if let Some(m) = re.find_first(input) {
+        let record = input[..m.start].to_string();
+        let remainder = buf[m.end..].to_vec();
+        Ok(Some((record, remainder)))
+    } else {
+        Ok(None)
+    }
+}
+
 pub trait RecordReader: Iterator<Item = ReadResult> {
     fn is_done(&self) -> bool;
 
-    fn buffered_records(&mut self) -> &mut Vec<String>;
+    fn ere_byte_buffer(&mut self) -> &mut Vec<u8>;
 
     fn read_next_record(&mut self, separator: &RecordSeparator) -> Result<Option<String>, String> {
-        // Check for buffered records from regex RS splitting
-        let buf = self.buffered_records();
-        if !buf.is_empty() {
-            return Ok(Some(buf.remove(0)));
-        }
-
         if self.is_done() {
             return Ok(None);
         }
@@ -83,33 +91,61 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 Ok(Some(String::from_utf8(buf).map_err(|e| e.to_string())?))
             }
             RecordSeparator::Ere(re) => {
-                // Read all remaining input
-                let mut all_bytes = Vec::new();
-                #[allow(clippy::while_let_on_iterator)]
-                while let Some(byte_result) = self.next() {
-                    all_bytes.push(byte_result?);
+                // Incremental matching: read bytes into a buffer and check
+                // for RS matches periodically to support streaming/interactive
+                // input without reading everything into memory at once.
+                let mut byte_buf = std::mem::take(self.ere_byte_buffer());
+
+                // Check existing buffer first (remainder from previous call)
+                if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
+                    *self.ere_byte_buffer() = remainder;
+                    return Ok(Some(record));
                 }
-                if all_bytes.is_empty() {
-                    return Ok(None);
+
+                // After a failed match at length L, skip newline-triggered checks
+                // until the buffer grows enough. This avoids O(n*m) worst-case
+                // when every newline triggers a futile re-scan of the whole buffer.
+                // Threshold starts at 0 so the first newline always triggers a check
+                // (important for interactive/streaming input).
+                let mut next_newline_check_len: usize = 0;
+                let mut bytes_since_check = 0usize;
+                loop {
+                    match self.next() {
+                        Some(byte_result) => {
+                            let byte = byte_result?;
+                            byte_buf.push(byte);
+                            bytes_since_check += 1;
+                            let check = if byte == b'\n' {
+                                byte_buf.len() >= next_newline_check_len
+                            } else {
+                                bytes_since_check >= 8192
+                            };
+                            if check {
+                                bytes_since_check = 0;
+                                if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
+                                    *self.ere_byte_buffer() = remainder;
+                                    return Ok(Some(record));
+                                }
+                                let len = byte_buf.len();
+                                next_newline_check_len = len + len.min(8192);
+                            }
+                        }
+                        None => {
+                            // EOF: check for final match, then return remainder
+                            if byte_buf.is_empty() {
+                                return Ok(None);
+                            }
+                            if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
+                                if !remainder.is_empty() {
+                                    *self.ere_byte_buffer() = remainder;
+                                }
+                                return Ok(Some(record));
+                            }
+                            let input = String::from_utf8(byte_buf).map_err(|e| e.to_string())?;
+                            return Ok(Some(input));
+                        }
+                    }
                 }
-                let input = String::from_utf8(all_bytes).map_err(|e| e.to_string())?;
-                let input_awk: AwkString = input.as_str().into();
-                let mut records = Vec::new();
-                let mut split_start = 0;
-                for m in re.match_locations(input_awk.try_into()?) {
-                    records.push(input[split_start..m.start].to_string());
-                    split_start = m.end;
-                }
-                let last = &input[split_start..];
-                if !last.is_empty() {
-                    records.push(last.to_string());
-                }
-                if records.is_empty() {
-                    return Ok(None);
-                }
-                let first = records.remove(0);
-                *self.buffered_records() = records;
-                Ok(Some(first))
             }
             RecordSeparator::Null => {
                 // Skip leading blank lines
@@ -173,7 +209,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
 pub struct FileStream {
     bytes: Bytes<BufReader<File>>,
     is_done: bool,
-    buffered_records: Vec<String>,
+    ere_byte_buffer: Vec<u8>,
 }
 
 impl FileStream {
@@ -183,7 +219,7 @@ impl FileStream {
         Ok(Self {
             bytes: reader.bytes(),
             is_done: false,
-            buffered_records: Vec::new(),
+            ere_byte_buffer: Vec::new(),
         })
     }
 }
@@ -205,11 +241,11 @@ impl Iterator for FileStream {
 
 impl RecordReader for FileStream {
     fn is_done(&self) -> bool {
-        self.is_done && self.buffered_records.is_empty()
+        self.is_done && self.ere_byte_buffer.is_empty()
     }
 
-    fn buffered_records(&mut self) -> &mut Vec<String> {
-        &mut self.buffered_records
+    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.ere_byte_buffer
     }
 }
 
@@ -217,7 +253,7 @@ impl RecordReader for FileStream {
 pub struct StringRecordReader {
     string: String,
     index: usize,
-    buffered_records: Vec<String>,
+    ere_byte_buffer: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -226,7 +262,7 @@ impl<S: Into<String>> From<S> for StringRecordReader {
         Self {
             string: value.into(),
             index: 0,
-            buffered_records: Vec::new(),
+            ere_byte_buffer: Vec::new(),
         }
     }
 }
@@ -249,17 +285,20 @@ impl Iterator for StringRecordReader {
 #[cfg(test)]
 impl RecordReader for StringRecordReader {
     fn is_done(&self) -> bool {
-        self.index == self.string.len() && self.buffered_records.is_empty()
+        self.index == self.string.len() && self.ere_byte_buffer.is_empty()
     }
 
-    fn buffered_records(&mut self) -> &mut Vec<String> {
-        &mut self.buffered_records
+    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.ere_byte_buffer
     }
 }
 
+/// A no-op record reader that immediately signals EOF.
+/// The `ere_byte_buffer` field exists solely to satisfy the `RecordReader` trait;
+/// `Vec::new()` (via `Default`) does not heap-allocate.
 #[derive(Default)]
 pub struct EmptyRecordReader {
-    buffered_records: Vec<String>,
+    ere_byte_buffer: Vec<u8>,
 }
 
 impl Iterator for EmptyRecordReader {
@@ -275,8 +314,8 @@ impl RecordReader for EmptyRecordReader {
         true
     }
 
-    fn buffered_records(&mut self) -> &mut Vec<String> {
-        &mut self.buffered_records
+    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.ere_byte_buffer
     }
 }
 
@@ -428,7 +467,7 @@ impl Drop for WritePipes {
 pub struct PipeRecordReader {
     pipe: *mut libc::FILE,
     is_done: bool,
-    buffered_records: Vec<String>,
+    ere_byte_buffer: Vec<u8>,
 }
 
 impl PipeRecordReader {
@@ -444,7 +483,7 @@ impl PipeRecordReader {
         Ok(Self {
             pipe: file,
             is_done: false,
-            buffered_records: Vec::new(),
+            ere_byte_buffer: Vec::new(),
         })
     }
 }
@@ -465,11 +504,11 @@ impl Iterator for PipeRecordReader {
 
 impl RecordReader for PipeRecordReader {
     fn is_done(&self) -> bool {
-        self.is_done && self.buffered_records.is_empty()
+        self.is_done && self.ere_byte_buffer.is_empty()
     }
 
-    fn buffered_records(&mut self) -> &mut Vec<String> {
-        &mut self.buffered_records
+    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.ere_byte_buffer
     }
 }
 
@@ -514,7 +553,7 @@ impl ReadPipes {
 #[derive(Default)]
 pub struct StdinRecordReader {
     is_done: bool,
-    buffered_records: Vec<String>,
+    ere_byte_buffer: Vec<u8>,
 }
 
 impl Iterator for StdinRecordReader {
@@ -535,11 +574,11 @@ impl Iterator for StdinRecordReader {
 
 impl RecordReader for StdinRecordReader {
     fn is_done(&self) -> bool {
-        self.is_done && self.buffered_records.is_empty()
+        self.is_done && self.ere_byte_buffer.is_empty()
     }
 
-    fn buffered_records(&mut self) -> &mut Vec<String> {
-        &mut self.buffered_records
+    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.ere_byte_buffer
     }
 }
 
@@ -562,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn split_records_with_default_separator() {
+    fn split_records_with_paragraph_separator() {
         let records = split_records("record1\nrecord2\n\nrecord3\n", RecordSeparator::Null);
         assert_eq!(records, vec!["record1\nrecord2", "record3"]);
     }

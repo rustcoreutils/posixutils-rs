@@ -457,7 +457,7 @@ impl Drop for WritePipes {
         for (_, file) in self.pipes.drain() {
             unsafe {
                 if libc::pclose(file) == -1 {
-                    panic!("failed to close pipe");
+                    eprintln!("awk: warning: failed to close write pipe");
                 };
             }
         }
@@ -516,7 +516,7 @@ impl Drop for PipeRecordReader {
     fn drop(&mut self) {
         unsafe {
             if libc::pclose(self.pipe) == -1 {
-                panic!("failed to close pipe");
+                eprintln!("awk: warning: failed to close read pipe");
             };
         }
     }

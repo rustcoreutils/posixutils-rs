@@ -705,6 +705,32 @@ fn test_awk_bugfix_nextfile_nr() {
     );
 }
 
+// fflush() with no args should flush all and return 0
+#[test]
+fn test_awk_fflush_no_args() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { print \"hello\"; ret = fflush(); print ret }".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("hello\n0\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// fflush("") should flush all and return 0
+#[test]
+fn test_awk_fflush_empty_string() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { print \"hello\"; ret = fflush(\"\"); print ret }".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("hello\n0\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
 // POSIX: paragraph mode with default FS - newline is whitespace, so it
 // naturally acts as a field separator already.
 #[test]

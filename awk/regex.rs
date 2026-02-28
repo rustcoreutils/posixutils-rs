@@ -80,6 +80,12 @@ impl Regex {
         })
     }
 
+    /// Returns the first match location in the string, or `None`.
+    /// Delegates to `PlibRegex::find` which handles CString conversion internally.
+    pub fn find_first(&self, string: &str) -> Option<RegexMatch> {
+        self.inner.find(string).map(RegexMatch::from)
+    }
+
     /// Returns an iterator over all match locations in the string.
     /// Takes ownership of the CString.
     pub fn match_locations(&self, string: CString) -> MatchIter<'_> {
@@ -89,6 +95,10 @@ impl Regex {
             regex: self,
             string: s,
         }
+    }
+
+    pub fn pattern(&self) -> &str {
+        &self.pattern_string
     }
 
     pub fn matches(&self, string: &CString) -> bool {

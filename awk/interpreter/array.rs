@@ -82,12 +82,16 @@ impl Array {
             Entry::Occupied(e) => Ok(ValueIndex { index: *e.get() }),
             Entry::Vacant(e) => {
                 if self.iterator_count == 0 {
+                    let reusing_slot = self.empty_slots > 0;
                     let pair_index = insert_pair(
                         key,
                         AwkValue::uninitialized_scalar(),
                         &mut self.pairs,
                         self.empty_slots == 0,
                     );
+                    if reusing_slot {
+                        self.empty_slots -= 1;
+                    }
                     e.insert(pair_index);
                     Ok(ValueIndex { index: pair_index })
                 } else {
@@ -120,8 +124,12 @@ impl Array {
                     Ok(ValueIndex { index: pair_index })
                 }
                 Entry::Vacant(e) => {
+                    let reusing_slot = self.empty_slots > 0;
                     let pair_index =
                         insert_pair(key, value, &mut self.pairs, self.empty_slots == 0);
+                    if reusing_slot {
+                        self.empty_slots -= 1;
+                    }
                     e.insert(pair_index);
                     Ok(ValueIndex { index: pair_index })
                 }
@@ -162,9 +170,9 @@ fn insert_pair(
     key: Key,
     value: AwkValue,
     pairs: &mut Vec<Option<KeyValuePair>>,
-    has_empty_slots: bool,
+    no_empty_slots: bool,
 ) -> usize {
-    if has_empty_slots {
+    if no_empty_slots {
         let index = pairs.len();
         pairs.push(Some((key, value)));
         index
@@ -172,7 +180,7 @@ fn insert_pair(
         let index = pairs
             .iter()
             .enumerate()
-            .filter_map(|(i, v)| v.as_ref().map(|_| i))
+            .filter_map(|(i, v)| if v.is_none() { Some(i) } else { None })
             .next()
             .expect("map has no empty key slots");
         pairs[index] = Some((key, value));
@@ -273,6 +281,40 @@ mod tests {
         assert_eq!(
             array.get_value("e".into()).cloned(),
             Ok(AwkValue::from(2.0))
+        );
+    }
+
+    #[test]
+    fn insert_after_delete_during_iteration_no_corruption() {
+        let mut array = Array::default();
+        array.set("a".to_string(), 1.0).unwrap();
+        array.set("b".to_string(), 2.0).unwrap();
+        array.set("c".to_string(), 3.0).unwrap();
+
+        // Start iterator, delete "b" during iteration
+        let mut iter = array.key_iter();
+        assert_eq!(array.key_iter_next(&mut iter), Some(Rc::from("a")));
+        array.delete("b");
+        assert_eq!(array.key_iter_next(&mut iter), Some(Rc::from("c")));
+        assert_eq!(array.key_iter_next(&mut iter), None);
+
+        // Now insert a new element — should reuse the tombstone slot
+        array.set("d".to_string(), 4.0).unwrap();
+
+        // Verify all values are correct and no corruption occurred
+        assert_eq!(array.len(), 3);
+        assert_eq!(
+            array.get_value("a".into()).cloned(),
+            Ok(AwkValue::from(1.0))
+        );
+        assert!(!array.contains("b"));
+        assert_eq!(
+            array.get_value("c".into()).cloned(),
+            Ok(AwkValue::from(3.0))
+        );
+        assert_eq!(
+            array.get_value("d".into()).cloned(),
+            Ok(AwkValue::from(4.0))
         );
     }
 

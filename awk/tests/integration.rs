@@ -567,3 +567,180 @@ fn test_awk_modifying_nf_recomputes_the_record() {
         "tests/awk/test_data.txt"
     );
 }
+
+// Bug fix regression tests
+
+#[test]
+fn test_awk_bugfix_atan2() {
+    test_awk!(bugfix_atan2);
+}
+
+#[test]
+fn test_awk_bugfix_printf_c() {
+    test_awk!(bugfix_printf_c);
+}
+
+#[test]
+fn test_awk_bugfix_string_as_regex() {
+    test_awk!(bugfix_string_as_regex);
+}
+
+#[test]
+fn test_awk_bugfix_escaped_backslash() {
+    test_awk!(bugfix_escaped_backslash);
+}
+
+#[test]
+fn test_awk_bugfix_line_continuation() {
+    test_awk!(bugfix_line_continuation);
+}
+
+#[test]
+fn test_awk_bugfix_field_numeric() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/bugfix_field_numeric.awk".to_string(),
+        ],
+        stdin_data: String::from("a 5\nb 30\nc 10\n"),
+        expected_out: String::from(include_str!("awk/bugfix_field_numeric.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_awk_bugfix_fs_empty() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/bugfix_fs_empty.awk".to_string(),
+        ],
+        stdin_data: String::from("abc\nhi\n"),
+        expected_out: String::from(include_str!("awk/bugfix_fs_empty.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_awk_bugfix_field_max_index() {
+    // Generate a record with exactly 1024 fields (MAX_FIELDS) to verify
+    // that accessing $1024 works after the off-by-one fix (0..MAX_FIELDS -> 0..=MAX_FIELDS)
+    let fields: Vec<String> = (1..=1024).map(|i| i.to_string()).collect();
+    let input = fields.join(" ") + "\n";
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["{ print $1024 }".to_string()],
+        stdin_data: input,
+        expected_out: String::from("1024\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_awk_bugfix_trailing_newline_program() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { print \"ok\" }\n".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("ok\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_awk_bugfix_multichar_rs() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-v".to_string(),
+            "RS=::".to_string(),
+            "{ print NR, $0 }".to_string(),
+        ],
+        stdin_data: String::from("one::two::three"),
+        expected_out: String::from("1 one\n2 two\n3 three\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// POSIX: when RS is null (paragraph mode), newline is always a field separator
+// regardless of FS value. Test with single-char FS.
+#[test]
+fn test_awk_paragraph_mode_newline_is_field_separator_char_fs() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN{RS=\"\"; FS=\":\"} {for(i=1;i<=NF;i++) print i, $i}".to_string()],
+        stdin_data: String::from("a:b\nc:d\n\ne:f\n"),
+        expected_out: String::from("1 a\n2 b\n3 c\n4 d\n1 e\n2 f\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// POSIX: paragraph mode with ERE FS - newline is also a field separator.
+#[test]
+fn test_awk_paragraph_mode_newline_is_field_separator_ere_fs() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN{RS=\"\"; FS=\":+\"} {for(i=1;i<=NF;i++) print i, $i}".to_string()],
+        stdin_data: String::from("a::b\nc::d\n\ne::f\n"),
+        expected_out: String::from("1 a\n2 b\n3 c\n4 d\n1 e\n2 f\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_awk_bugfix_nextfile_nr() {
+    test_awk!(
+        bugfix_nextfile_nr,
+        "tests/awk/test_data.txt",
+        "tests/awk/test_data2.txt"
+    );
+}
+
+// fflush() with no args should flush all and return 0
+#[test]
+fn test_awk_fflush_no_args() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { print \"hello\"; ret = fflush(); print ret }".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("hello\n0\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// fflush("") should flush all and return 0
+#[test]
+fn test_awk_fflush_empty_string() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { print \"hello\"; ret = fflush(\"\"); print ret }".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("hello\n0\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// POSIX: paragraph mode with default FS - newline is whitespace, so it
+// naturally acts as a field separator already.
+#[test]
+fn test_awk_paragraph_mode_default_fs() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN{RS=\"\"} {for(i=1;i<=NF;i++) print i, $i}".to_string()],
+        stdin_data: String::from("a b\nc d\n\ne f\n"),
+        expected_out: String::from("1 a\n2 b\n3 c\n4 d\n1 e\n2 f\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}

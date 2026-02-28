@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::hash::Hash;
 use std::rc::Rc;
-use std::str::Chars;
 use std::sync::LazyLock;
 
 struct BuiltinFunctionInfo {
@@ -255,61 +254,46 @@ fn is_octal_digit(c: char) -> bool {
     ('0'..='7').contains(&c)
 }
 
-/// parses an escape sequence
-/// # Arguments
-/// - `iter`: a character iterator placed after the '\' character in an escape sequence.
-/// # Returns
-/// a pair containing the escaped character and the next character in the iterator
-/// # Errors
-/// returns an error if the escape sequence is invalid
-fn parse_escape_sequence(iter: &mut Chars) -> Result<(char, Option<char>), String> {
-    let mut char_after_escape_sequence = None;
-    let next_char = iter.next().ok_or("invalid escape sequence".to_string())?;
-    let escaped_char = match next_char {
-        '"' => '"',
-        '/' => '/',
-        'a' => '\x07',
-        'b' => '\x08',
-        'f' => '\x0C',
-        'n' => '\n',
-        'r' => '\r',
-        't' => '\t',
-        'v' => '\x0B',
-        '\\' => '\\',
-        n if is_octal_digit(n) => {
-            let mut char_code = n.to_digit(8).unwrap();
-            for _ in 0..2 {
-                if let Some(c) = iter.next() {
-                    if is_octal_digit(c) {
-                        char_code = char_code * 8 + c.to_digit(8).unwrap();
-                    } else {
-                        char_after_escape_sequence = Some(c);
-                        break;
-                    }
-                }
-            }
-            if char_code == 0 {
-                return Err("invalid escape sequence: \\0".to_string());
-            }
-            char::from_u32(char_code).ok_or("invalid character")?
-        }
-        other => return Err(format!("invalid escape sequence: \\{}", other)),
-    };
-    let char_after_escape_sequence = char_after_escape_sequence.or_else(|| iter.next());
-    Ok((escaped_char, char_after_escape_sequence))
-}
-
 pub fn escape_string_contents(s: &str) -> Result<Rc<str>, String> {
     let mut result = String::new();
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                let (escaped_char, next) = parse_escape_sequence(&mut chars)?;
+                let next_char = chars.next().ok_or("invalid escape sequence".to_string())?;
+                let escaped_char = match next_char {
+                    '"' => '"',
+                    '/' => '/',
+                    'a' => '\x07',
+                    'b' => '\x08',
+                    'f' => '\x0C',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'v' => '\x0B',
+                    '\\' => '\\',
+                    n if is_octal_digit(n) => {
+                        let mut char_code = n.to_digit(8).unwrap();
+                        for _ in 0..2 {
+                            if let Some(&c) = chars.peek() {
+                                if is_octal_digit(c) {
+                                    char_code = char_code * 8 + c.to_digit(8).unwrap();
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if char_code == 0 {
+                            return Err("invalid escape sequence: \\0".to_string());
+                        }
+                        char::from_u32(char_code).ok_or("invalid character".to_string())?
+                    }
+                    other => {
+                        return Err(format!("invalid escape sequence: \\{}", other));
+                    }
+                };
                 result.push(escaped_char);
-                if let Some(next) = next {
-                    result.push(next);
-                }
             }
             other => result.push(other),
         }
@@ -1885,6 +1869,7 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
         .into_iter()
         .filter_map(|(k, v)| match v {
             GlobalName::Variable(id) => Some((k, id)),
+            GlobalName::SpecialVar(id) => Some((k, id)),
             _ => None,
         })
         .collect();

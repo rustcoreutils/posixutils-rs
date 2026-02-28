@@ -1,0 +1,4 @@
+NR=1 FNR=1 1 Jane janitor 30
+NR=2 FNR=2 2 Smith sailor 45
+NR=3 FNR=1 1 1 1
+NR=4 FNR=2 2 2 2

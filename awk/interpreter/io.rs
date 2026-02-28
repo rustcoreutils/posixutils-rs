@@ -17,25 +17,25 @@ use std::{
 };
 
 use super::string::AwkString;
+use crate::regex::Regex;
 
 pub enum RecordSeparator {
     Char(u8),
     Null,
+    Ere(Regex),
 }
 
 impl TryFrom<AwkString> for RecordSeparator {
     type Error = String;
 
     fn try_from(value: AwkString) -> Result<Self, Self::Error> {
-        let mut iter = value.bytes();
-        let result = match iter.next() {
-            Some(c) => RecordSeparator::Char(c),
-            None => RecordSeparator::Null,
-        };
-        if iter.next().is_some() {
-            Err("the record separator cannot contain more than one characters".to_string())
+        if value.is_empty() {
+            Ok(RecordSeparator::Null)
+        } else if value.len() == 1 {
+            Ok(RecordSeparator::Char(value.as_bytes()[0]))
         } else {
-            Ok(result)
+            let ere = Regex::new(value.try_into()?)?;
+            Ok(RecordSeparator::Ere(ere))
         }
     }
 }
@@ -57,40 +57,114 @@ macro_rules! read_iter_next {
 pub trait RecordReader: Iterator<Item = ReadResult> {
     fn is_done(&self) -> bool;
 
-    fn last_byte_read(&self) -> Option<u8>;
+    fn buffered_records(&mut self) -> &mut Vec<String>;
 
     fn read_next_record(&mut self, separator: &RecordSeparator) -> Result<Option<String>, String> {
+        // Check for buffered records from regex RS splitting
+        let buf = self.buffered_records();
+        if !buf.is_empty() {
+            return Ok(Some(buf.remove(0)));
+        }
+
         if self.is_done() {
             return Ok(None);
         }
         match separator {
             RecordSeparator::Char(sep) => {
-                let mut str = String::new();
+                let mut buf = Vec::new();
                 let mut next = read_iter_next!(self);
                 while next != *sep {
-                    str.push(next as char);
-                    next = read_iter_next!(self, Ok(Some(str)));
+                    buf.push(next);
+                    next = read_iter_next!(
+                        self,
+                        Ok(Some(String::from_utf8(buf).map_err(|e| e.to_string())?))
+                    );
                 }
-                Ok(Some(str))
+                Ok(Some(String::from_utf8(buf).map_err(|e| e.to_string())?))
+            }
+            RecordSeparator::Ere(re) => {
+                // Read all remaining input
+                let mut all_bytes = Vec::new();
+                #[allow(clippy::while_let_on_iterator)]
+                while let Some(byte_result) = self.next() {
+                    all_bytes.push(byte_result?);
+                }
+                if all_bytes.is_empty() {
+                    return Ok(None);
+                }
+                let input = String::from_utf8(all_bytes).map_err(|e| e.to_string())?;
+                let input_awk: AwkString = input.as_str().into();
+                let mut records = Vec::new();
+                let mut split_start = 0;
+                for m in re.match_locations(input_awk.try_into()?) {
+                    records.push(input[split_start..m.start].to_string());
+                    split_start = m.end;
+                }
+                let last = &input[split_start..];
+                if !last.is_empty() {
+                    records.push(last.to_string());
+                }
+                if records.is_empty() {
+                    return Ok(None);
+                }
+                let first = records.remove(0);
+                *self.buffered_records() = records;
+                Ok(Some(first))
             }
             RecordSeparator::Null => {
-                let mut next = if let Some(byte) = self.last_byte_read() {
-                    byte
-                } else {
-                    read_iter_next!(self)
-                };
-                while next.is_ascii_whitespace() {
-                    next = read_iter_next!(self);
+                // Skip leading blank lines
+                let mut line_buf = Vec::new();
+                loop {
+                    let next = read_iter_next!(self);
+                    if next == b'\n' {
+                        if line_buf.is_empty() {
+                            // blank line, keep skipping
+                            continue;
+                        }
+                        // non-blank line found, we have the first line
+                        break;
+                    }
+                    line_buf.push(next);
                 }
-                let mut str = String::new();
-                while next != b'\n' {
-                    str.push(next as char);
-                    next = read_iter_next!(self, Ok(Some(str)));
+
+                // line_buf has the first line (without newline)
+                let mut record_buf = line_buf;
+
+                // Accumulate subsequent lines until a blank line or EOF
+                loop {
+                    let mut line_buf = Vec::new();
+                    loop {
+                        match self.next() {
+                            Some(byte_result) => {
+                                let byte = byte_result?;
+                                if byte == b'\n' {
+                                    break;
+                                }
+                                line_buf.push(byte);
+                            }
+                            None => {
+                                // EOF: if this line has content, add it
+                                if !line_buf.is_empty() {
+                                    record_buf.push(b'\n');
+                                    record_buf.extend_from_slice(&line_buf);
+                                }
+                                return Ok(Some(
+                                    String::from_utf8(record_buf).map_err(|e| e.to_string())?,
+                                ));
+                            }
+                        }
+                    }
+                    if line_buf.is_empty() {
+                        // blank line: end of record
+                        break;
+                    }
+                    record_buf.push(b'\n');
+                    record_buf.extend_from_slice(&line_buf);
                 }
-                while next.is_ascii_whitespace() {
-                    next = read_iter_next!(self, Ok(Some(str)));
-                }
-                Ok(Some(str))
+
+                Ok(Some(
+                    String::from_utf8(record_buf).map_err(|e| e.to_string())?,
+                ))
             }
         }
     }
@@ -98,8 +172,8 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
 
 pub struct FileStream {
     bytes: Bytes<BufReader<File>>,
-    last_byte_read: Option<u8>,
     is_done: bool,
+    buffered_records: Vec<String>,
 }
 
 impl FileStream {
@@ -108,8 +182,8 @@ impl FileStream {
         let reader = BufReader::new(file);
         Ok(Self {
             bytes: reader.bytes(),
-            last_byte_read: None,
             is_done: false,
+            buffered_records: Vec::new(),
         })
     }
 }
@@ -119,10 +193,7 @@ impl Iterator for FileStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.bytes.next() {
-            Some(Ok(byte)) => {
-                self.last_byte_read = Some(byte);
-                Some(Ok(byte))
-            }
+            Some(Ok(byte)) => Some(Ok(byte)),
             Some(Err(e)) => Some(Err(e.to_string())),
             None => {
                 self.is_done = true;
@@ -134,11 +205,11 @@ impl Iterator for FileStream {
 
 impl RecordReader for FileStream {
     fn is_done(&self) -> bool {
-        self.is_done
+        self.is_done && self.buffered_records.is_empty()
     }
 
-    fn last_byte_read(&self) -> Option<u8> {
-        self.last_byte_read
+    fn buffered_records(&mut self) -> &mut Vec<String> {
+        &mut self.buffered_records
     }
 }
 
@@ -146,6 +217,7 @@ impl RecordReader for FileStream {
 pub struct StringRecordReader {
     string: String,
     index: usize,
+    buffered_records: Vec<String>,
 }
 
 #[cfg(test)]
@@ -154,6 +226,7 @@ impl<S: Into<String>> From<S> for StringRecordReader {
         Self {
             string: value.into(),
             index: 0,
+            buffered_records: Vec::new(),
         }
     }
 }
@@ -176,27 +249,34 @@ impl Iterator for StringRecordReader {
 #[cfg(test)]
 impl RecordReader for StringRecordReader {
     fn is_done(&self) -> bool {
-        self.index == self.string.len()
+        self.index == self.string.len() && self.buffered_records.is_empty()
     }
 
-    fn last_byte_read(&self) -> Option<u8> {
-        if self.index == 0 {
-            None
-        } else {
-            Some(self.string.as_bytes()[self.index - 1])
-        }
+    fn buffered_records(&mut self) -> &mut Vec<String> {
+        &mut self.buffered_records
     }
 }
 
-pub type EmptyRecordReader = std::iter::Empty<ReadResult>;
+#[derive(Default)]
+pub struct EmptyRecordReader {
+    buffered_records: Vec<String>,
+}
+
+impl Iterator for EmptyRecordReader {
+    type Item = ReadResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
 
 impl RecordReader for EmptyRecordReader {
     fn is_done(&self) -> bool {
         true
     }
 
-    fn last_byte_read(&self) -> Option<u8> {
-        None
+    fn buffered_records(&mut self) -> &mut Vec<String> {
+        &mut self.buffered_records
     }
 }
 
@@ -347,8 +427,8 @@ impl Drop for WritePipes {
 
 pub struct PipeRecordReader {
     pipe: *mut libc::FILE,
-    last_byte_read: Option<u8>,
     is_done: bool,
+    buffered_records: Vec<String>,
 }
 
 impl PipeRecordReader {
@@ -363,8 +443,8 @@ impl PipeRecordReader {
         };
         Ok(Self {
             pipe: file,
-            last_byte_read: None,
             is_done: false,
+            buffered_records: Vec::new(),
         })
     }
 }
@@ -378,7 +458,6 @@ impl Iterator for PipeRecordReader {
             self.is_done = true;
             None
         } else {
-            self.last_byte_read = Some(result as u8);
             Some(Ok(result as u8))
         }
     }
@@ -386,11 +465,11 @@ impl Iterator for PipeRecordReader {
 
 impl RecordReader for PipeRecordReader {
     fn is_done(&self) -> bool {
-        self.is_done
+        self.is_done && self.buffered_records.is_empty()
     }
 
-    fn last_byte_read(&self) -> Option<u8> {
-        self.last_byte_read
+    fn buffered_records(&mut self) -> &mut Vec<String> {
+        &mut self.buffered_records
     }
 }
 
@@ -434,8 +513,8 @@ impl ReadPipes {
 
 #[derive(Default)]
 pub struct StdinRecordReader {
-    last_byte_read: Option<u8>,
     is_done: bool,
+    buffered_records: Vec<String>,
 }
 
 impl Iterator for StdinRecordReader {
@@ -444,10 +523,7 @@ impl Iterator for StdinRecordReader {
     fn next(&mut self) -> Option<Self::Item> {
         let next = std::io::stdin().lock().bytes().next();
         match next {
-            Some(Ok(byte)) => {
-                self.last_byte_read = Some(byte);
-                Some(Ok(byte))
-            }
+            Some(Ok(byte)) => Some(Ok(byte)),
             Some(Err(e)) => Some(Err(e.to_string())),
             None => {
                 self.is_done = true;
@@ -459,11 +535,11 @@ impl Iterator for StdinRecordReader {
 
 impl RecordReader for StdinRecordReader {
     fn is_done(&self) -> bool {
-        self.is_done
+        self.is_done && self.buffered_records.is_empty()
     }
 
-    fn last_byte_read(&self) -> Option<u8> {
-        self.last_byte_read
+    fn buffered_records(&mut self) -> &mut Vec<String> {
+        &mut self.buffered_records
     }
 }
 
@@ -487,8 +563,8 @@ mod tests {
 
     #[test]
     fn split_records_with_default_separator() {
-        let records = split_records("record1\nrecord2\n  \t\nrecord3\n", RecordSeparator::Null);
-        assert_eq!(records, vec!["record1", "record2", "record3"]);
+        let records = split_records("record1\nrecord2\n\nrecord3\n", RecordSeparator::Null);
+        assert_eq!(records, vec!["record1\nrecord2", "record3"]);
     }
 
     #[test]

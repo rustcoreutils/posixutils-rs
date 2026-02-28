@@ -91,6 +91,10 @@ impl Regex {
         }
     }
 
+    pub fn pattern(&self) -> &str {
+        &self.pattern_string
+    }
+
     pub fn matches(&self, string: &CString) -> bool {
         let s = string.to_str().unwrap_or("");
         self.inner.is_match(s)

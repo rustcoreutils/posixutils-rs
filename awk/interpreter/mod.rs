@@ -168,10 +168,17 @@ fn sprintf(
                         let value = value.scalar_as_f64();
                         fmt_write_float_general(&mut result, value, specifier == 'g', &args);
                     }
-                    'c' => {
-                        let value = value.scalar_as_f64() as i64 as u8;
-                        result.push(value as char);
-                    }
+                    'c' => match &value.value {
+                        AwkValueVariant::String(s) if !s.is_empty() => {
+                            result.push(s.chars().next().unwrap());
+                        }
+                        _ => {
+                            let code = value.scalar_as_f64() as u32;
+                            if let Some(c) = char::from_u32(code) {
+                                result.push(c);
+                            }
+                        }
+                    },
                     's' => {
                         let value = value.scalar_to_string(float_format)?;
                         fmt_write_string(&mut result, &value, &args);
@@ -304,8 +311,8 @@ fn call_simple_builtin(
 ) -> Result<FieldsState, String> {
     match function {
         BuiltinFunction::Atan2 => {
-            let y = stack.pop_scalar_value()?.scalar_as_f64();
             let x = stack.pop_scalar_value()?.scalar_as_f64();
+            let y = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(y.atan2(x))?;
         }
         BuiltinFunction::Cos => {
@@ -437,6 +444,16 @@ enum FieldSeparator {
     Default,
     Char(u8),
     Ere(Rc<Regex>),
+    Null,
+}
+
+/// Escape a character for use in an ERE pattern.
+fn ere_escape_char(c: char) -> String {
+    if "\\^$.|?*+()[]{}".contains(c) {
+        format!("\\{}", c)
+    } else {
+        c.to_string()
+    }
 }
 
 /// Splits a record into fields and calls the provided closure for each field.
@@ -446,14 +463,7 @@ fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
     field_separator: &FieldSeparator,
     mut store_result: S,
 ) -> Result<(), String> {
-    let is_record_numeric = record.is_numeric;
-    let string = |s: &str| -> AwkString {
-        if is_record_numeric {
-            AwkString::numeric_string(s)
-        } else {
-            s.into()
-        }
-    };
+    let string = |s: &str| -> AwkString { maybe_numeric_string(s) };
     match field_separator {
         FieldSeparator::Default => record
             .trim_start()
@@ -474,6 +484,11 @@ fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
             }
             store_result(index, string(&record[split_start..]))
         }
+        FieldSeparator::Null => record.chars().enumerate().try_for_each(|(i, c)| {
+            let mut s = String::new();
+            s.push(c);
+            store_result(i, string(&s))
+        }),
     }
 }
 
@@ -481,7 +496,9 @@ impl TryFrom<AwkString> for FieldSeparator {
     type Error = String;
 
     fn try_from(value: AwkString) -> Result<Self, Self::Error> {
-        if value.as_str() == " " {
+        if value.is_empty() {
+            Ok(FieldSeparator::Null)
+        } else if value.as_str() == " " {
             Ok(FieldSeparator::Default)
         } else if value.len() == 1 {
             Ok(FieldSeparator::Char(*value.as_bytes().first().unwrap()))
@@ -652,7 +669,7 @@ impl Record {
 
 impl Default for Record {
     fn default() -> Self {
-        let fields = (0..Record::MAX_FIELDS)
+        let fields = (0..=Record::MAX_FIELDS)
             .map(|i| {
                 AwkValueRef::new(
                     AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(i as u16)),
@@ -812,6 +829,10 @@ impl AwkValue {
     fn into_ere(self) -> Result<Rc<Regex>, String> {
         match self.value {
             AwkValueVariant::Regex { ere, .. } => Ok(ere),
+            AwkValueVariant::String(s) => Ok(Rc::new(Regex::new(s.try_into()?)?)),
+            AwkValueVariant::UninitializedScalar => {
+                Ok(Rc::new(Regex::new(CString::new("").unwrap())?))
+            }
             _ => Err("expected extended regular expression".to_string()),
         }
     }
@@ -1970,7 +1991,32 @@ pub fn interpret(
 
         global_env.fnr = 1;
         'record_loop: while let Some(record) = reader.read_next_record(&global_env.rs)? {
-            current_record.reset(record, &global_env.fs)?;
+            // POSIX: when RS is null, newline is always a field separator,
+            // no matter what the value of FS is. Combine FS with \n.
+            let paragraph_fs;
+            let fs = if matches!(global_env.rs, RecordSeparator::Null) {
+                match &global_env.fs {
+                    FieldSeparator::Default | FieldSeparator::Null => &global_env.fs,
+                    FieldSeparator::Char(c) => {
+                        let escaped = ere_escape_char(*c as char);
+                        let pattern = format!("\n|{}", escaped);
+                        paragraph_fs = FieldSeparator::Ere(Rc::new(Regex::new(
+                            CString::new(pattern).unwrap(),
+                        )?));
+                        &paragraph_fs
+                    }
+                    FieldSeparator::Ere(re) => {
+                        let pattern = format!("\n|{}", re.pattern());
+                        paragraph_fs = FieldSeparator::Ere(Rc::new(Regex::new(
+                            CString::new(pattern).unwrap(),
+                        )?));
+                        &paragraph_fs
+                    }
+                }
+            } else {
+                &global_env.fs
+            };
+            current_record.reset(record, fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.get_last_field() as f64).value;
             global_env.nf = current_record.get_last_field();
@@ -2036,7 +2082,11 @@ pub fn interpret(
                     )?;
                     match rule_result {
                         ExecutionResult::Next => break,
-                        ExecutionResult::NextFile => break 'record_loop,
+                        ExecutionResult::NextFile => {
+                            global_env.fnr += 1;
+                            global_env.nr += 1;
+                            break 'record_loop;
+                        }
                         ExecutionResult::Exit(val) => {
                             return_value = val;
                             break 'file_loop;
@@ -3049,7 +3099,10 @@ mod tests {
     #[test]
     fn test_builtin_sprintf_char() {
         assert_eq!(test_sprintf("%c", vec![Constant::Number(55.0)]), "7");
-        assert_eq!(test_sprintf("%c", vec![Constant::Number(548.0)]), "$");
+        assert_eq!(
+            test_sprintf("%c", vec![Constant::Number(548.0)]),
+            "\u{0224}"
+        );
     }
 
     #[test]

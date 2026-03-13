@@ -339,6 +339,7 @@ impl WriteFiles {
                 let mut file = File::options()
                     .write(true)
                     .create(true)
+                    .truncate(!append)
                     .append(append)
                     .open(filename)
                     .map_err(|e| e.to_string())?;

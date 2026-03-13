@@ -167,7 +167,7 @@ pub(crate) fn gsub(
         if c == '\\' {
             match repl_iter.next() {
                 Some('\\') => current_repl_part.push('\\'),
-                Some('&') => current_repl_part.push_str(&in_str[last_match_end..]),
+                Some('&') => current_repl_part.push('&'),
                 Some(c) => {
                     current_repl_part.push('\\');
                     current_repl_part.push(c);
@@ -192,8 +192,8 @@ pub(crate) fn gsub(
         let replaced_string = &in_str[m.start..m.end];
         result.push_str(&repl_parts[0]);
         for part in repl_parts.iter().skip(1) {
-            result.push_str(part);
             result.push_str(replaced_string);
+            result.push_str(part);
         }
         last_match_end = m.end;
         num_replacements += 1;
@@ -357,9 +357,12 @@ pub(crate) fn call_simple_builtin(
                 .scalar_to_string(&global_env.convfmt)?
                 .try_into()?;
             let status = unsafe { libc::system(command.as_ptr()) };
-            if status == -1 {
-                return Err("system call failed".to_string());
-            }
+            let exit_code = if status == -1 {
+                -1
+            } else {
+                (status >> 8) & 0xff
+            };
+            stack.push_value(exit_code as f64)?;
         }
         BuiltinFunction::Print => {
             print!("{}", print_to_string(stack, argc, global_env)?);

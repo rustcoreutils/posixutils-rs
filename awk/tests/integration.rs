@@ -766,3 +766,69 @@ fn test_awk_bugfix_numstr_field_cmp() {
 fn test_awk_bugfix_gsub_multibyte() {
     test_awk!(bugfix_gsub_multibyte);
 }
+
+// Regression: default SUBSEP must be \034 (0x1c), not space
+#[test]
+fn test_awk_bugfix_subsep_default() {
+    test_awk!(bugfix_subsep_default);
+}
+
+// Regression: & in gsub replacement inserts matched text; \& inserts literal &
+#[test]
+fn test_awk_bugfix_gsub_ampersand() {
+    test_awk!(bugfix_gsub_ampersand);
+}
+
+// Regression: system() must return the command exit status
+#[test]
+fn test_awk_bugfix_system_return() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { ret = system(\"true\"); print ret }".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("0\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// Regression: NF = 0 must produce an empty record without panic
+#[test]
+fn test_awk_bugfix_nf_zero() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["-f".to_string(), "tests/awk/bugfix_nf_zero.awk".to_string()],
+        stdin_data: String::from("a b c\n"),
+        expected_out: String::from(include_str!("awk/bugfix_nf_zero.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// Regression: > redirect must truncate existing files
+#[test]
+fn test_awk_bugfix_redirect_truncate() {
+    let dir = std::env::temp_dir().join("awk_truncate_test");
+    let _ = std::fs::create_dir_all(&dir);
+    let outfile = dir.join("out.txt");
+    // Write a long initial content
+    std::fs::write(&outfile, "this is long initial content\n").unwrap();
+    let program = format!(
+        "BEGIN {{ print \"short\" > \"{}\" }}",
+        outfile.to_str().unwrap()
+    );
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![program],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+    let contents = std::fs::read_to_string(&outfile).unwrap();
+    assert_eq!(
+        contents, "short\n",
+        "file should be truncated on > redirect"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

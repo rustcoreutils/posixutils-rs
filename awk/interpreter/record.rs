@@ -118,8 +118,7 @@ impl Record {
             last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
             Ok(())
-        })
-        .expect("error splitting record");
+        })?;
         if last_field < previous_last_field {
             for field in &mut self.fields[last_field + 1..=previous_last_field] {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
@@ -154,6 +153,13 @@ impl Record {
         } else {
             self.last_field.borrow().max(last_field)
         };
+        if last_field == 0 {
+            let record_str = maybe_numeric_string(String::new());
+            *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
+            *self.record.borrow_mut() = record_str.try_into()?;
+            *self.last_field.borrow_mut() = 0;
+            return Ok(());
+        }
         let mut new_record = String::new();
         for field in self.fields.iter().skip(1).take(last_field - 1) {
             let field_str = (*field.get())
@@ -191,8 +197,7 @@ impl Record {
             last_field += 1;
             *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
             Ok(())
-        })
-        .expect("error splitting record");
+        })?;
         *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;

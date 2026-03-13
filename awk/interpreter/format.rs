@@ -315,7 +315,7 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
 
     result.width = parse_number(&mut next, iter)?;
 
-    result.precision = if next == decimal_point() {
+    result.precision = if next == '.' {
         next = iter_next(iter)?;
         Some(parse_number(&mut next, iter)?)
     } else {

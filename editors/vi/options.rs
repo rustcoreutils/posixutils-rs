@@ -394,15 +394,7 @@ impl Options {
         let defaults = Self::default();
         let mut changes = Vec::new();
 
-        if self.number != defaults.number {
-            changes.push(format!("{}number", if self.number { "" } else { "no" }));
-        }
-        if self.tabstop != defaults.tabstop {
-            changes.push(format!("tabstop={}", self.tabstop));
-        }
-        if self.shiftwidth != defaults.shiftwidth {
-            changes.push(format!("shiftwidth={}", self.shiftwidth));
-        }
+        // Boolean options (alphabetically)
         if self.autoindent != defaults.autoindent {
             changes.push(format!(
                 "{}autoindent",
@@ -415,23 +407,111 @@ impl Options {
                 if self.autoprint { "" } else { "no" }
             ));
         }
+        if self.autowrite != defaults.autowrite {
+            changes.push(format!(
+                "{}autowrite",
+                if self.autowrite { "" } else { "no" }
+            ));
+        }
+        if self.backup != defaults.backup {
+            changes.push(format!("{}backup", if self.backup { "" } else { "no" }));
+        }
+        if self.errorbells != defaults.errorbells {
+            changes.push(format!(
+                "{}errorbells",
+                if self.errorbells { "" } else { "no" }
+            ));
+        }
+        if self.expandtab != defaults.expandtab {
+            changes.push(format!(
+                "{}expandtab",
+                if self.expandtab { "" } else { "no" }
+            ));
+        }
+        if self.exrc != defaults.exrc {
+            changes.push(format!("{}exrc", if self.exrc { "" } else { "no" }));
+        }
+        if self.flash != defaults.flash {
+            changes.push(format!("{}flash", if self.flash { "" } else { "no" }));
+        }
         if self.ignorecase != defaults.ignorecase {
             changes.push(format!(
                 "{}ignorecase",
                 if self.ignorecase { "" } else { "no" }
             ));
         }
-        if self.report != defaults.report {
-            changes.push(format!("report={}", self.report));
+        if self.list != defaults.list {
+            changes.push(format!("{}list", if self.list { "" } else { "no" }));
         }
-        if self.exrc != defaults.exrc {
-            changes.push(format!("{}exrc", if self.exrc { "" } else { "no" }));
+        if self.magic != defaults.magic {
+            changes.push(format!("{}magic", if self.magic { "" } else { "no" }));
+        }
+        if self.number != defaults.number {
+            changes.push(format!("{}number", if self.number { "" } else { "no" }));
+        }
+        if self.readonly != defaults.readonly {
+            changes.push(format!("{}readonly", if self.readonly { "" } else { "no" }));
+        }
+        if self.showmatch != defaults.showmatch {
+            changes.push(format!(
+                "{}showmatch",
+                if self.showmatch { "" } else { "no" }
+            ));
+        }
+        if self.showmode != defaults.showmode {
+            changes.push(format!("{}showmode", if self.showmode { "" } else { "no" }));
         }
         if self.terse != defaults.terse {
             changes.push(format!("{}terse", if self.terse { "" } else { "no" }));
         }
+        if self.timeout != defaults.timeout {
+            changes.push(format!("{}timeout", if self.timeout { "" } else { "no" }));
+        }
+        if self.wrapscan != defaults.wrapscan {
+            changes.push(format!("{}wrapscan", if self.wrapscan { "" } else { "no" }));
+        }
+        if self.writeany != defaults.writeany {
+            changes.push(format!("{}writeany", if self.writeany { "" } else { "no" }));
+        }
+
+        // Numeric options
+        if self.report != defaults.report {
+            changes.push(format!("report={}", self.report));
+        }
+        if self.scroll != defaults.scroll {
+            changes.push(format!("scroll={}", self.scroll));
+        }
+        if self.shiftwidth != defaults.shiftwidth {
+            changes.push(format!("shiftwidth={}", self.shiftwidth));
+        }
+        if self.tabstop != defaults.tabstop {
+            changes.push(format!("tabstop={}", self.tabstop));
+        }
+        if self.taglength != defaults.taglength {
+            changes.push(format!("taglength={}", self.taglength));
+        }
+        if self.window != defaults.window {
+            changes.push(format!("window={}", self.window));
+        }
         if self.wrapmargin != defaults.wrapmargin {
             changes.push(format!("wrapmargin={}", self.wrapmargin));
+        }
+
+        // String options
+        if self.paragraphs != defaults.paragraphs {
+            changes.push(format!("paragraphs={}", self.paragraphs));
+        }
+        if self.sections != defaults.sections {
+            changes.push(format!("sections={}", self.sections));
+        }
+        if self.shell != defaults.shell {
+            changes.push(format!("shell={}", self.shell));
+        }
+        if self.tags != defaults.tags {
+            changes.push(format!("tags={}", self.tags));
+        }
+        if self.term != defaults.term {
+            changes.push(format!("term={}", self.term));
         }
 
         if changes.is_empty() {

@@ -331,43 +331,22 @@ fn test_ex_repeat_substitute() {
 // EXINIT and .exrc Tests
 // ============================================================================
 
-/// Helper to run ex with custom env, returning (stdout, stderr, exit_code).
-fn run_ex_with_env(stdin: &str, env_vars: &[(&str, &str)]) -> (String, String, i32) {
-    let bin = get_binary_path("ex");
-    let mut cmd = Command::new(bin);
-    cmd.arg("-s")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in env_vars {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().expect("failed to spawn ex");
-    if let Some(mut si) = child.stdin.take() {
-        si.write_all(stdin.as_bytes()).unwrap();
-        si.flush().unwrap();
-    }
-    let out = child.wait_with_output().expect("failed to wait");
-    (
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-        out.status.code().unwrap_or(-1),
-    )
-}
-
-/// Helper to run ex with custom env and working directory.
-fn run_ex_with_env_and_cwd(
+/// Helper to run ex with custom env and optional working directory,
+/// returning (stdout, stderr, exit_code).
+fn run_ex_with_env(
     stdin: &str,
     env_vars: &[(&str, &str)],
-    cwd: &std::path::Path,
+    cwd: Option<&std::path::Path>,
 ) -> (String, String, i32) {
     let bin = get_binary_path("ex");
     let mut cmd = Command::new(bin);
     cmd.arg("-s")
-        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     for (k, v) in env_vars {
         cmd.env(k, v);
     }
@@ -400,6 +379,7 @@ fn test_ex_exinit_basic() {
             ("EXINIT", "set number"),
             ("HOME", home.path().to_str().unwrap()),
         ],
+        None,
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "number");
@@ -415,6 +395,7 @@ fn test_ex_exinit_pipe() {
             ("EXINIT", "set number|set tabstop=4"),
             ("HOME", home.path().to_str().unwrap()),
         ],
+        None,
     );
     assert_eq!(code, 0);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -432,6 +413,7 @@ fn test_ex_home_exrc() {
     let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
         &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
+        None,
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "number");
@@ -450,6 +432,7 @@ fn test_ex_exinit_overrides_home_exrc() {
             ("EXINIT", "set number"),
             ("HOME", home.path().to_str().unwrap()),
         ],
+        None,
     );
     assert_eq!(code, 0);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -469,10 +452,10 @@ fn test_ex_local_exrc() {
     let local_exrc = cwd.path().join(".exrc");
     create_file_with_mode(&local_exrc, "set number\n", 0o600);
 
-    let (stdout, _stderr, code) = run_ex_with_env_and_cwd(
+    let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
         &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        cwd.path(),
+        Some(cwd.path()),
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "number");
@@ -490,10 +473,10 @@ fn test_ex_local_exrc_disabled() {
     let local_exrc = cwd.path().join(".exrc");
     create_file_with_mode(&local_exrc, "set number\n", 0o600);
 
-    let (stdout, _stderr, code) = run_ex_with_env_and_cwd(
+    let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
         &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        cwd.path(),
+        Some(cwd.path()),
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "nonumber"); // local .exrc was NOT sourced
@@ -509,13 +492,13 @@ fn test_ex_exrc_security() {
     let local_exrc = cwd.path().join(".exrc");
     create_file_with_mode(&local_exrc, "set number\n", 0o620);
 
-    let (stdout, _stderr, code) = run_ex_with_env_and_cwd(
+    let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
         &[
             ("EXINIT", "set exrc"),
             ("HOME", home.path().to_str().unwrap()),
         ],
-        cwd.path(),
+        Some(cwd.path()),
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "nonumber"); // unsafe .exrc was skipped
@@ -530,13 +513,13 @@ fn test_ex_exrc_security_other_writable() {
     let local_exrc = cwd.path().join(".exrc");
     create_file_with_mode(&local_exrc, "set number\n", 0o602);
 
-    let (stdout, _stderr, code) = run_ex_with_env_and_cwd(
+    let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
         &[
             ("EXINIT", "set exrc"),
             ("HOME", home.path().to_str().unwrap()),
         ],
-        cwd.path(),
+        Some(cwd.path()),
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "nonumber"); // unsafe .exrc was skipped
@@ -550,10 +533,10 @@ fn test_ex_exrc_same_file() {
     let exrc_path = home.path().join(".exrc");
     create_file_with_mode(&exrc_path, "set exrc\nset tabstop=4\n", 0o600);
 
-    let (stdout, _stderr, code) = run_ex_with_env_and_cwd(
+    let (stdout, _stderr, code) = run_ex_with_env(
         "set tabstop?\nq!\n",
         &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        home.path(),
+        Some(home.path()),
     );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "tabstop=4");

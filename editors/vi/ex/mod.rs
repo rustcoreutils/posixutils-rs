@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod command;
+pub mod executor;
 pub mod parser;
 
 pub use address::{Address, AddressRange};

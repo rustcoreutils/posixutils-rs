@@ -112,6 +112,9 @@ impl Record {
         let record = maybe_numeric_string(record);
         split_record(record.clone(), field_separator, |i, s| {
             let field_index = i + 1;
+            if field_index > Record::MAX_FIELDS {
+                return Ok(());
+            }
             last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
             Ok(())
@@ -182,6 +185,9 @@ impl Record {
             .scalar_to_string(&global_env.convfmt)?;
         split_record(record_str.clone(), &global_env.fs, |i, s| {
             let field_index = i + 1;
+            if field_index > Record::MAX_FIELDS {
+                return Ok(());
+            }
             last_field += 1;
             *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
             Ok(())

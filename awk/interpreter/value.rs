@@ -39,6 +39,12 @@ pub(crate) enum AwkRefType {
     SpecialGlobalVar(SpecialVar),
 }
 
+impl AwkRefType {
+    pub(crate) fn is_field(&self) -> bool {
+        matches!(self, AwkRefType::Field(_))
+    }
+}
+
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, PartialEq)]
 pub(crate) struct AwkValue {
@@ -64,7 +70,13 @@ impl AwkValue {
     pub(crate) fn scalar_as_bool(&self) -> bool {
         match &self.value {
             AwkValueVariant::Number(x) => *x != 0.0,
-            AwkValueVariant::String(s) => !s.is_empty(),
+            AwkValueVariant::String(s) => {
+                if s.is_numeric {
+                    self.scalar_as_f64() != 0.0
+                } else {
+                    !s.is_empty()
+                }
+            }
             AwkValueVariant::Regex { matches_record, .. } => *matches_record,
             AwkValueVariant::UninitializedScalar => false,
             AwkValueVariant::Array(_) | AwkValueVariant::Uninitialized => {

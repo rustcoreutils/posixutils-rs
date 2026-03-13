@@ -82,17 +82,24 @@ pub(crate) fn sprintf(
                         let value = value.scalar_as_f64();
                         fmt_write_float_general(&mut result, value, specifier == 'g', &args);
                     }
-                    'c' => match &value.value {
-                        AwkValueVariant::String(s) if !s.is_empty() => {
-                            result.push(s.chars().next().unwrap());
-                        }
-                        _ => {
-                            let code = value.scalar_as_f64() as u32;
-                            if let Some(c) = char::from_u32(code) {
-                                result.push(c);
+                    'c' => {
+                        let ch = match &value.value {
+                            AwkValueVariant::Number(n) => char::from_u32(*n as u32).unwrap_or('\0'),
+                            AwkValueVariant::String(s) if s.is_numeric => {
+                                let code = value.scalar_as_f64() as u32;
+                                char::from_u32(code).unwrap_or('\0')
                             }
-                        }
-                    },
+                            AwkValueVariant::String(s) if !s.is_empty() => {
+                                s.chars().next().unwrap()
+                            }
+                            _ => {
+                                let code = value.scalar_as_f64() as u32;
+                                char::from_u32(code).unwrap_or('\0')
+                            }
+                        };
+                        let ch_str = ch.to_string();
+                        fmt_write_string(&mut result, &ch_str, &args);
+                    }
                     's' => {
                         let value = value.scalar_to_string(float_format)?;
                         fmt_write_string(&mut result, &value, &args);
@@ -286,7 +293,13 @@ pub(crate) fn call_simple_builtin(
             let separator = if argc == 2 {
                 None
             } else {
-                Some(FieldSeparator::Ere(stack.pop_value().into_ere()?))
+                let sep_val = stack.pop_value();
+                if matches!(&sep_val.value, AwkValueVariant::Regex { .. }) {
+                    Some(FieldSeparator::Ere(sep_val.into_ere()?))
+                } else {
+                    let sep_str = sep_val.scalar_to_string(&global_env.convfmt)?;
+                    Some(FieldSeparator::try_from(sep_str)?)
+                }
             };
             let s = stack
                 .pop_scalar_value()?
@@ -294,11 +307,13 @@ pub(crate) fn call_simple_builtin(
             let array = stack.pop_ref().as_array()?;
             array.clear();
 
-            split_record(
-                s,
-                separator.iter().next().unwrap_or(&global_env.fs),
-                |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
-            )?;
+            if !s.is_empty() {
+                split_record(
+                    s,
+                    separator.iter().next().unwrap_or(&global_env.fs),
+                    |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
+                )?;
+            }
             let n = array.len();
             stack.push_value(n as f64)?;
         }

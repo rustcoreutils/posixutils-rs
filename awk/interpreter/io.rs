@@ -52,14 +52,24 @@ macro_rules! read_iter_next {
     };
 }
 
+/// Convert bytes to String, trying UTF-8 first, falling back to Latin-1.
+/// Latin-1 maps each byte 0x00-0xFF to the corresponding Unicode code point,
+/// so it preserves byte values faithfully for single-byte encodings.
+fn bytes_to_string(buf: Vec<u8>) -> String {
+    match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+    }
+}
+
 /// Try to find a regex match in the byte buffer. Returns the record before
 /// the match and the remainder after it, or None if no match found.
 fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, String> {
     if buf.is_empty() {
         return Ok(None);
     }
-    let input = std::str::from_utf8(buf).map_err(|e| e.to_string())?;
-    if let Some(m) = re.find_first(input) {
+    let input = String::from_utf8_lossy(buf);
+    if let Some(m) = re.find_first(&input) {
         let record = input[..m.start].to_string();
         let remainder = buf[m.end..].to_vec();
         Ok(Some((record, remainder)))
@@ -83,12 +93,9 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 let mut next = read_iter_next!(self);
                 while next != *sep {
                     buf.push(next);
-                    next = read_iter_next!(
-                        self,
-                        Ok(Some(String::from_utf8(buf).map_err(|e| e.to_string())?))
-                    );
+                    next = read_iter_next!(self, Ok(Some(bytes_to_string(buf))));
                 }
-                Ok(Some(String::from_utf8(buf).map_err(|e| e.to_string())?))
+                Ok(Some(bytes_to_string(buf)))
             }
             RecordSeparator::Ere(re) => {
                 // Incremental matching: read bytes into a buffer and check
@@ -141,7 +148,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                                 }
                                 return Ok(Some(record));
                             }
-                            let input = String::from_utf8(byte_buf).map_err(|e| e.to_string())?;
+                            let input = bytes_to_string(byte_buf);
                             return Ok(Some(input));
                         }
                     }
@@ -184,9 +191,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                                     record_buf.push(b'\n');
                                     record_buf.extend_from_slice(&line_buf);
                                 }
-                                return Ok(Some(
-                                    String::from_utf8(record_buf).map_err(|e| e.to_string())?,
-                                ));
+                                return Ok(Some(bytes_to_string(record_buf)));
                             }
                         }
                     }
@@ -198,9 +203,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                     record_buf.extend_from_slice(&line_buf);
                 }
 
-                Ok(Some(
-                    String::from_utf8(record_buf).map_err(|e| e.to_string())?,
-                ))
+                Ok(Some(bytes_to_string(record_buf)))
             }
         }
     }

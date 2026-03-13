@@ -89,6 +89,14 @@ impl StackValue {
             StackValue::Value(val) => val.into_inner(),
             StackValue::ValueRef(ref_val) => (*ref_val).clone().into_ref(AwkRefType::None),
             StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
+            StackValue::ArrayElementRef(array_element_ref) => {
+                let val = (*array_element_ref.array)
+                    .as_array()
+                    .expect("expected array")
+                    .index_to_value(array_element_ref.value_index)
+                    .expect("invalid array value index");
+                (*val).clone().into_ref(AwkRefType::None)
+            }
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -249,6 +257,14 @@ impl<'i, 's> Stack<'i, 's> {
     pub(crate) fn call_function(&mut self, function: &'i Function) {
         unsafe { assert!(self.sp.offset_from(self.bp) >= function.parameters_count as isize) };
         let new_bp = unsafe { self.sp.sub(function.parameters_count) };
+        // Convert UninitializedRef parameters to owned values to break aliasing
+        // between function parameters and the caller's variables
+        for i in 0..function.parameters_count {
+            let param = unsafe { &mut *new_bp.add(i) };
+            if let StackValue::UninitializedRef(_) = param {
+                *param = StackValue::Value(UnsafeCell::new(AwkValue::uninitialized()));
+            }
+        }
         let caller_frame = CallFrame {
             bp: self.bp,
             sp: new_bp,
@@ -341,11 +357,18 @@ macro_rules! compare_op {
                 	$stack.push_value(bool_to_f64(lhs.as_str() $op rhs.as_str()))?;
               	}
             }
-            (AwkValueVariant::Number(lhs), AwkValueVariant::UninitializedScalar) => {
-                $stack.push_value(bool_to_f64(*lhs $op 0.0))?;
+            (AwkValueVariant::UninitializedScalar, AwkValueVariant::UninitializedScalar) => {
+                $stack.push_value(bool_to_f64(0.0 $op 0.0))?;
             }
-            (AwkValueVariant::UninitializedScalar, AwkValueVariant::Number(rhs)) => {
-                $stack.push_value(bool_to_f64(0.0 $op *rhs))?;
+            (AwkValueVariant::Number(n), AwkValueVariant::UninitializedScalar)
+                if !lhs.ref_type.is_field() && !rhs.ref_type.is_field() =>
+            {
+                $stack.push_value(bool_to_f64(*n $op 0.0))?;
+            }
+            (AwkValueVariant::UninitializedScalar, AwkValueVariant::Number(n))
+                if !lhs.ref_type.is_field() && !rhs.ref_type.is_field() =>
+            {
+                $stack.push_value(bool_to_f64(0.0 $op *n))?;
             }
             (AwkValueVariant::String(s), AwkValueVariant::Number(x)) if s.is_numeric => {
                 $stack.push_value(bool_to_f64(lhs.scalar_as_f64() $op *x))?;

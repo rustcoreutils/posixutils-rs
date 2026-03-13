@@ -17,7 +17,7 @@ string_char     =  {
   | "\\\\" | "\\" ~ ("\"" | "/" | "a" | "b" | "f" | "n" | "r" | "t" | "v")
   | "\\" ~ ASCII_DIGIT{1, 3}
 }
-ere             =  { "/" ~ (("\\" ~ "/") | (!("/" | "\n") ~ ANY))* ~ "/" }
+ere             =  { "/" ~ (("\\" ~ ANY) | (!("/" | "\n") ~ ANY))* ~ "/" }
 number          = @{ decimal_float | integer }
 digit           =  { ('0'..'9') }
 integer         = @{ digit+ }
@@ -28,7 +28,7 @@ sign            =  { "+" | "-" }
 float_suffix    =  { "f" | "l" | "F" | "L" }
 
 letter    =  { ('a'..'z') | ('A'..'Z') }
-name      = @{ ((keyword | builtin_func) ~ (letter | "_" | digit)+) | (!(keyword | builtin_func) ~ (letter | "_") ~ (letter | "_" | digit)*) }
+name      = @{ !(keyword | builtin_func) ~ (letter | "_") ~ (letter | "_" | digit)* }
 func_name = @{ name ~ &"(" }
 
 builtin_func = _{
@@ -56,48 +56,48 @@ builtin_func = _{
   | system
 }
 
-atan2    = { "atan2" }
-cos      = { "cos" }
-sin      = { "sin" }
-exp      = { "exp" }
-log      = { "log" }
-sqrt     = { "sqrt" }
-int      = { "int" }
-rand     = { "rand" }
-srand    = { "srand" }
-gsub     = { "gsub" }
-index    = { "index" }
-length   = { "length" }
-match_fn = { "match" }
-split    = { "split" }
-sprintf  = { "sprintf" }
-sub      = { "sub" }
-substr   = { "substr" }
-tolower  = { "tolower" }
-toupper  = { "toupper" }
-close    = { "close" }
-fflush   = { "fflush" }
-system   = { "system" }
+atan2    = { "atan2" ~ !(letter | "_" | digit) }
+cos      = { "cos" ~ !(letter | "_" | digit) }
+sin      = { "sin" ~ !(letter | "_" | digit) }
+exp      = { "exp" ~ !(letter | "_" | digit) }
+log      = { "log" ~ !(letter | "_" | digit) }
+sqrt     = { "sqrt" ~ !(letter | "_" | digit) }
+int      = { "int" ~ !(letter | "_" | digit) }
+rand     = { "rand" ~ !(letter | "_" | digit) }
+srand    = { "srand" ~ !(letter | "_" | digit) }
+gsub     = { "gsub" ~ !(letter | "_" | digit) }
+index    = { "index" ~ !(letter | "_" | digit) }
+length   = { "length" ~ !(letter | "_" | digit) }
+match_fn = { "match" ~ !(letter | "_" | digit) }
+split    = { "split" ~ !(letter | "_" | digit) }
+sprintf  = { "sprintf" ~ !(letter | "_" | digit) }
+sub      = { "sub" ~ !(letter | "_" | digit) }
+substr   = { "substr" ~ !(letter | "_" | digit) }
+tolower  = { "tolower" ~ !(letter | "_" | digit) }
+toupper  = { "toupper" ~ !(letter | "_" | digit) }
+close    = { "close" ~ !(letter | "_" | digit) }
+fflush   = { "fflush" ~ !(letter | "_" | digit) }
+system   = { "system" ~ !(letter | "_" | digit) }
 
 keyword = {
-    "if"
-  | "else"
-  | "while"
-  | "for"
-  | "foreach"
-  | "next"
-  | "break"
-  | "continue"
-  | "do"
-  | "return"
-  | "exit"
-  | "print"
-  | "printf"
-  | "in"
-  | "begin"
-  | "end"
+    ("foreach"
   | "function"
+  | "continue"
   | "getline"
+  | "printf"
+  | "return"
+  | "while"
+  | "break"
+  | "begin"
+  | "else"
+  | "exit"
+  | "next"
+  | "print"
+  | "for"
+  | "end"
+  | "if"
+  | "do"
+  | "in") ~ !(letter | "_" | digit)
 }
 
 program = { SOI ~ opt_newline ~ (item ~ terminator)* ~ item? ~ opt_newline ~ EOI }
@@ -166,7 +166,7 @@ unterminated_statement = _{
 ut_if      = { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ (terminated_statement ~ "else" ~ opt_newline ~ unterminated_statement | unterminated_statement) }
 ut_while   = { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ unterminated_statement }
 ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ unterminated_statement }
-ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
+ut_foreach = { "for" ~ "(" ~ name ~ "in" ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
 
 terminatable_statement = _{
     nextfile
@@ -283,7 +283,7 @@ not_match  = { "!~" }
 and        = { "&&" }
 or         = { "||" }
 concat     = { "" }
-in_op      = { "in" }
+in_op      = @{ "in" ~ !(letter | "_" | digit) }
 
 comp_op = {
     le
@@ -345,16 +345,21 @@ lvalue = {
   | field_var
 }
 
-field_var = { "$" ~ primary }
+field_var = { "$" ~ prefix_op* ~ primary ~ postfix_op* }
 
 input_function = {
     getline_from_pipe
+  | getline_from_file_cmp
   | getline_from_file
   | simple_getline
 }
 
+getline_from_file_cmp = { "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr ~ comp_op ~ expr }
+
 simple_getline    = { "getline" ~ lvalue? }
-getline_from_file = { "getline" ~ lvalue? ~ "<" ~ expr }
+getline_from_file = { "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr }
+
+simple_getline_file_expr = { prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
 getline_from_pipe = { unpiped_expr ~ (piped_getline)+ }
 piped_getline     = { "|" ~ "getline" ~ lvalue? }
 

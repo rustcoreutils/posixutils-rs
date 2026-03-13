@@ -10,7 +10,7 @@
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::{
     fs::{self, remove_file, File},
-    io::Read,
+    io::{Read, Write},
     path::PathBuf,
 };
 
@@ -977,4 +977,134 @@ fn test_uncompress_gzip() {
     assert_eq!(original_content, decompressed_content);
 
     cleanup_file(&test_file);
+}
+
+// =============================================================================
+// Binary data tests - regression tests for panics and corruption on binary input
+// =============================================================================
+
+/// Generate deterministic pseudo-random binary data using a simple LCG
+fn generate_binary_data(size: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(size);
+    let mut state: u32 = 0xDEAD_BEEF;
+    for _ in 0..size {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        data.push((state >> 16) as u8);
+    }
+    data
+}
+
+/// Helper: compress binary data via file, decompress, and verify roundtrip
+fn binary_roundtrip_test(data: &[u8], label: &str) {
+    let test_dir = get_test_dir();
+    let test_file = test_dir.join(format!("binary_{label}.dat"));
+    let compressed_file = test_dir.join(format!("binary_{label}.dat.Z"));
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+
+    // Write binary data
+    {
+        let mut f = File::create(&test_file).unwrap();
+        f.write_all(data).unwrap();
+    }
+
+    // Compress with -f (binary data may expand)
+    run_test(TestPlan {
+        cmd: String::from("compress"),
+        args: vec!["-f".to_string(), test_file.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert!(
+        compressed_file.exists(),
+        "{label}: compressed file should exist"
+    );
+    assert!(
+        !test_file.exists(),
+        "{label}: original file should be removed"
+    );
+
+    // Decompress
+    run_test(TestPlan {
+        cmd: String::from("uncompress"),
+        args: vec![compressed_file.to_str().unwrap().to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert!(
+        test_file.exists(),
+        "{label}: decompressed file should exist"
+    );
+
+    // Verify content matches
+    let mut restored = Vec::new();
+    File::open(&test_file)
+        .unwrap()
+        .read_to_end(&mut restored)
+        .unwrap();
+    assert_eq!(
+        data,
+        restored.as_slice(),
+        "{label}: roundtrip data mismatch"
+    );
+
+    cleanup_file(&test_file);
+    cleanup_file(&compressed_file);
+}
+
+#[test]
+fn test_compress_binary_small() {
+    // 256 bytes - all byte values, no bit-width transition
+    let data: Vec<u8> = (0..=255).collect();
+    binary_roundtrip_test(&data, "small_256");
+}
+
+#[test]
+fn test_compress_binary_1kb() {
+    // 1KB - triggers 9->10 bit transition
+    let data = generate_binary_data(1024);
+    binary_roundtrip_test(&data, "1kb");
+}
+
+#[test]
+fn test_compress_binary_64kb() {
+    // 64KB - triggers multiple bit-width transitions
+    let data = generate_binary_data(65536);
+    binary_roundtrip_test(&data, "64kb");
+}
+
+#[test]
+fn test_compress_binary_1mb() {
+    // 1MB - the original bug report size, triggers CLEAR codes
+    let data = generate_binary_data(1_048_576);
+    binary_roundtrip_test(&data, "1mb");
+}
+
+#[test]
+fn test_compress_binary_all_zeros() {
+    // Highly compressible binary data
+    let data = vec![0u8; 100_000];
+    binary_roundtrip_test(&data, "zeros");
+}
+
+#[test]
+fn test_compress_binary_all_ff() {
+    // All 0xFF bytes
+    let data = vec![0xFFu8; 100_000];
+    binary_roundtrip_test(&data, "all_ff");
+}
+
+#[test]
+fn test_compress_binary_repeating_pattern() {
+    // Repeating 256-byte pattern (compresses well, exercises dictionary)
+    let pattern: Vec<u8> = (0..=255).collect();
+    let data: Vec<u8> = pattern.iter().cycle().take(100_000).copied().collect();
+    binary_roundtrip_test(&data, "repeating");
 }

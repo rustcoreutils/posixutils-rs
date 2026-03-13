@@ -55,6 +55,8 @@ pub struct Options {
     // File options
     /// Backup file extension (backup).
     pub backup: bool,
+    /// Source .exrc in current directory (exrc).
+    pub exrc: bool,
     /// Write any buffer (writeany/wa).
     pub writeany: bool,
 
@@ -117,6 +119,7 @@ impl Default for Options {
 
             // File
             backup: false,
+            exrc: false,
             writeany: false,
 
             // Reporting
@@ -205,6 +208,7 @@ impl Options {
             "errorbells" | "eb" => self.errorbells = value,
             "flash" => self.flash = value,
             "backup" => self.backup = value,
+            "exrc" => self.exrc = value,
             "writeany" | "wa" => self.writeany = value,
             "timeout" => self.timeout = value,
             _ => return Err(ViError::InvalidOption(name.to_string())),
@@ -285,6 +289,7 @@ impl Options {
             "errorbells" | "eb" => format!("{}errorbells", if self.errorbells { "" } else { "no" }),
             "flash" => format!("{}flash", if self.flash { "" } else { "no" }),
             "backup" => format!("{}backup", if self.backup { "" } else { "no" }),
+            "exrc" => format!("{}exrc", if self.exrc { "" } else { "no" }),
             "writeany" | "wa" => format!("{}writeany", if self.writeany { "" } else { "no" }),
             "paragraphs" => format!("paragraphs={}", self.paragraphs),
             "sections" => format!("sections={}", self.sections),
@@ -325,6 +330,7 @@ impl Options {
             "{}expandtab",
             if self.expandtab { "" } else { "no" }
         ));
+        items.push(format!("{}exrc", if self.exrc { "" } else { "no" }));
         items.push(format!("{}flash", if self.flash { "" } else { "no" }));
         items.push(format!(
             "{}ignorecase",
@@ -417,6 +423,9 @@ impl Options {
         }
         if self.report != defaults.report {
             changes.push(format!("report={}", self.report));
+        }
+        if self.exrc != defaults.exrc {
+            changes.push(format!("{}exrc", if self.exrc { "" } else { "no" }));
         }
         if self.terse != defaults.terse {
             changes.push(format!("{}terse", if self.terse { "" } else { "no" }));

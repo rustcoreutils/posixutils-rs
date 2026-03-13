@@ -1738,7 +1738,9 @@ impl Editor {
             }
             ExCommand::Set { args } => {
                 if let Some(msg) = self.options.set(&args)? {
-                    Ok(ExResult::Message(msg))
+                    // Route query/display output through Output so it prints in ex mode
+                    // (Message is for informational status, suppressed in -s mode)
+                    Ok(ExResult::Output(msg.lines().map(String::from).collect()))
                 } else {
                     Ok(ExResult::Continue)
                 }
@@ -1979,40 +1981,69 @@ impl Editor {
     /// Load startup configuration from EXINIT or .exrc.
     ///
     /// Per POSIX, the initialization sequence is:
-    /// 1. If EXINIT is set, execute its commands
-    /// 2. Otherwise, if $HOME/.exrc exists and passes security checks, source it
+    /// 1. If EXINIT is set, execute its commands; otherwise source $HOME/.exrc
+    /// 2. If the `exrc` option is set, source ./.exrc (unless same as $HOME/.exrc)
     ///
     /// Security requirements for .exrc:
     /// - Must be owned by the real user ID
     /// - Must NOT be writable by group or others
     pub fn load_startup_config(&mut self) -> Result<()> {
         // 1. Check EXINIT environment variable
-        if let Ok(exinit) = std::env::var("EXINIT") {
-            if !exinit.is_empty() {
-                // EXINIT uses '|' to separate multiple commands
-                for cmd in exinit.split('|') {
-                    let cmd = cmd.trim();
-                    if !cmd.is_empty() {
-                        // Ignore errors from individual commands
-                        let _ = self.execute_ex_input(cmd);
+        let exinit = std::env::var("EXINIT").unwrap_or_default();
+        if !exinit.is_empty() {
+            // EXINIT uses '|' to separate multiple commands
+            for cmd in exinit.split('|') {
+                let cmd = cmd.trim();
+                if !cmd.is_empty() {
+                    // Ignore errors from individual commands
+                    let _ = self.execute_ex_input(cmd);
+                }
+            }
+        } else {
+            // No EXINIT — check $HOME/.exrc
+            if let Ok(home) = std::env::var("HOME") {
+                if !home.is_empty() {
+                    let exrc_path = format!("{}/.exrc", home);
+                    if self.is_safe_exrc(&exrc_path) {
+                        let _ = self.execute_source(&exrc_path);
                     }
                 }
-                return Ok(());
             }
         }
 
-        // 2. Check $HOME/.exrc
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
-                let exrc_path = format!("{}/.exrc", home);
-                if self.is_safe_exrc(&exrc_path) {
-                    // Ignore errors from sourcing (file might not exist)
-                    let _ = self.execute_source(&exrc_path);
-                }
+        // 2. If exrc option is set, source ./.exrc in current directory
+        if self.options.exrc {
+            let local_exrc = ".exrc";
+            if self.is_safe_exrc(local_exrc) && !self.is_same_file_as_home_exrc(local_exrc) {
+                let _ = self.execute_source(local_exrc);
             }
         }
 
         Ok(())
+    }
+
+    /// Check if a path refers to the same file as $HOME/.exrc using inode/device comparison.
+    fn is_same_file_as_home_exrc(&self, path: &str) -> bool {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
+
+        let home = match std::env::var("HOME") {
+            Ok(h) if !h.is_empty() => h,
+            _ => return false,
+        };
+
+        let home_exrc = format!("{}/.exrc", home);
+        let meta_home = match fs::metadata(&home_exrc) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let meta_local = match fs::metadata(Path::new(path)) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        meta_home.dev() == meta_local.dev() && meta_home.ino() == meta_local.ino()
     }
 
     /// Check if an .exrc file is safe to source.

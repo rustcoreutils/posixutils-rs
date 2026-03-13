@@ -456,7 +456,11 @@ impl Iterator for MatchIter<'_, '_> {
         self.offset = if m.end > 0 {
             self.offset + m.end
         } else {
-            self.offset + 1
+            let mut next = self.offset + 1;
+            while next < self.text.len() && !self.text.is_char_boundary(next) {
+                next += 1;
+            }
+            next
         };
 
         Some(result)
@@ -625,6 +629,18 @@ mod tests {
         let matches: Vec<Match> = re.find_iter("").collect();
         assert_eq!(matches.len(), 1, "^$ should match empty string once");
         assert_eq!(matches[0], Match { start: 0, end: 0 });
+    }
+
+    #[test]
+    fn test_find_iter_multibyte_zero_width() {
+        // Regression test: zero-width match must not split multi-byte UTF-8 characters
+        // "aéb" — é is 2 bytes (U+00E9), so "a*" zero-width matches between bytes
+        // must skip to the next char boundary
+        let re = Regex::ere("a*").unwrap();
+        let matches: Vec<Match> = re.find_iter("aéb").collect();
+        // Expected: "a" at 0..1, "" at 1..1 (before é), "" at 3..3 (before b), "" at 4..4 (end)
+        assert_eq!(matches.len(), 4, "should produce 4 matches without panic");
+        assert_eq!(matches[0], Match { start: 0, end: 1 });
     }
 
     #[test]

@@ -744,3 +744,25 @@ fn test_awk_paragraph_mode_default_fs() {
         expected_exit_code: 0,
     });
 }
+
+// Regression: numeric strings from input should compare numerically (POSIX)
+#[test]
+fn test_awk_bugfix_numstr_field_cmp() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/bugfix_numstr_field_cmp.awk".to_string(),
+        ],
+        stdin_data: String::from("03 3\n"),
+        expected_out: String::from(include_str!("awk/bugfix_numstr_field_cmp.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+// Regression: gsub with zero-width match must not panic on multi-byte UTF-8
+#[test]
+fn test_awk_bugfix_gsub_multibyte() {
+    test_awk!(bugfix_gsub_multibyte);
+}

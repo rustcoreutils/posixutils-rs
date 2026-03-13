@@ -977,6 +977,23 @@ fn test_builtin_sprintf_float_general() {
         test_sprintf("%10.3g", vec![Constant::Number(255.34)]),
         "       255"
     );
+    // Zero-padded %g with and without sign
+    assert_eq!(
+        test_sprintf("%020g", vec![Constant::Number(100.0)]),
+        "00000000000000000100"
+    );
+    assert_eq!(
+        test_sprintf("%+020g", vec![Constant::Number(100.0)]),
+        "+0000000000000000100"
+    );
+    assert_eq!(
+        test_sprintf("%+020g", vec![Constant::Number(-1.5)]),
+        "-00000000000000001.5"
+    );
+    assert_eq!(
+        test_sprintf("%+020g", vec![Constant::Number(1.5)]),
+        "+00000000000000001.5"
+    );
 }
 
 #[test]

@@ -215,9 +215,16 @@ fn remove_trailing_zeros(
         }
     } else if zero_padded {
         // we need to rotate the removable chars after the sign
-        let first = write_starting_index + sign.is_empty() as usize;
+        let first = write_starting_index + sign.len();
         // safe: we only rotate ascii bytes (b'0' and b'.'), no multibyte chars are split
-        unsafe { target[first..].as_bytes_mut().rotate_right(removable) };
+        unsafe {
+            let bytes = target[first..].as_bytes_mut();
+            bytes.rotate_right(removable);
+            // Rotated chars may include '.', replace with '0' for correct zero-padding
+            for b in bytes[..removable].iter_mut() {
+                *b = b'0';
+            }
+        };
     } else {
         unsafe {
             let bytes = target[write_starting_index..].as_bytes_mut();

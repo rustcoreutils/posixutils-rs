@@ -67,7 +67,11 @@ impl Iterator for MatchIter<'_> {
         self.next_start = if m.end > 0 {
             self.next_start + m.end
         } else {
-            self.next_start + 1
+            let mut next = self.next_start + 1;
+            while next < self.string.len() && !self.string.is_char_boundary(next) {
+                next += 1;
+            }
+            next
         };
 
         Some(result)

@@ -4,15 +4,15 @@
 //! ex commands. These are split from `editor.rs` to reduce file size
 //! while remaining part of the same `Editor` type.
 
+use super::Editor;
 use crate::buffer::{Line, Position, Range};
-use crate::editor::Editor;
 use crate::error::{Result, ViError};
 use crate::ex::command::SubstituteFlags;
 use crate::ex::AddressRange;
 
 impl Editor {
     /// Execute :join command - join lines together.
-    pub(crate) fn execute_ex_join(
+    pub(super) fn execute_ex_join(
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
@@ -79,7 +79,7 @@ impl Editor {
     }
 
     /// Execute :put command - put text from register after line.
-    pub(crate) fn execute_ex_put(
+    pub(super) fn execute_ex_put(
         &mut self,
         line: Option<usize>,
         register: Option<char>,
@@ -101,7 +101,7 @@ impl Editor {
     }
 
     /// Execute :copy command - copy lines to destination.
-    pub(crate) fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+    pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.buffer, current)?;
 
@@ -128,7 +128,7 @@ impl Editor {
     }
 
     /// Execute :move command - move lines to destination.
-    pub(crate) fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+    pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.buffer, current)?;
 
@@ -174,7 +174,7 @@ impl Editor {
     }
 
     /// Execute :read command - read file into buffer.
-    pub(crate) fn execute_ex_read(
+    pub(super) fn execute_ex_read(
         &mut self,
         range: &AddressRange,
         file: Option<&str>,
@@ -213,7 +213,7 @@ impl Editor {
     }
 
     /// Execute :mark command - set a mark.
-    pub(crate) fn execute_ex_mark(&mut self, line: Option<usize>, name: char) -> Result<()> {
+    pub(super) fn execute_ex_mark(&mut self, line: Option<usize>, name: char) -> Result<()> {
         let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
 
         if !name.is_ascii_lowercase() {
@@ -226,7 +226,7 @@ impl Editor {
     }
 
     /// Execute :z command - adjust window display.
-    pub(crate) fn execute_ex_z(
+    pub(super) fn execute_ex_z(
         &mut self,
         line: Option<usize>,
         ztype: Option<char>,
@@ -302,7 +302,7 @@ impl Editor {
     }
 
     /// Execute :< command - shift lines left.
-    pub(crate) fn execute_ex_shift_left(
+    pub(super) fn execute_ex_shift_left(
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
@@ -335,7 +335,7 @@ impl Editor {
     }
 
     /// Execute :> command - shift lines right.
-    pub(crate) fn execute_ex_shift_right(
+    pub(super) fn execute_ex_shift_right(
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
@@ -360,14 +360,14 @@ impl Editor {
     }
 
     /// Execute := command - print line number.
-    pub(crate) fn execute_ex_line_number(&self, line: Option<usize>) -> Result<usize> {
+    pub(super) fn execute_ex_line_number(&self, line: Option<usize>) -> Result<usize> {
         // Default to last line in buffer
         let line_num = line.unwrap_or_else(|| self.buffer.line_count());
         Ok(line_num)
     }
 
     /// Execute :@ or :* command - execute buffer contents as ex commands.
-    pub(crate) fn execute_ex_execute(
+    pub(super) fn execute_ex_execute(
         &mut self,
         range: &AddressRange,
         buffer: Option<char>,
@@ -419,7 +419,7 @@ impl Editor {
     }
 
     /// Execute :& command - repeat last substitute.
-    pub(crate) fn execute_ex_repeat_substitute(
+    pub(super) fn execute_ex_repeat_substitute(
         &mut self,
         range: &AddressRange,
         flags: &SubstituteFlags,
@@ -435,12 +435,12 @@ impl Editor {
     }
 
     /// Resolve address range to line numbers.
-    pub(crate) fn resolve_range(&self, range: &AddressRange) -> Result<(usize, usize)> {
+    pub(super) fn resolve_range(&self, range: &AddressRange) -> Result<(usize, usize)> {
         range.resolve(&self.buffer, self.buffer.cursor().line)
     }
 
     /// Execute ex delete command (:d).
-    pub(crate) fn execute_ex_delete(
+    pub(super) fn execute_ex_delete(
         &mut self,
         range: &AddressRange,
         register: Option<char>,
@@ -471,7 +471,7 @@ impl Editor {
     }
 
     /// Execute ex yank command (:y).
-    pub(crate) fn execute_ex_yank(
+    pub(super) fn execute_ex_yank(
         &mut self,
         range: &AddressRange,
         register: Option<char>,

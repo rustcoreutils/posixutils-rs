@@ -348,7 +348,11 @@ fn run_ex_with_env(
         cmd.current_dir(dir);
     }
     for (k, v) in env_vars {
-        cmd.env(k, v);
+        if v.is_empty() {
+            cmd.env_remove(k);
+        } else {
+            cmd.env(k, v);
+        }
     }
     let mut child = cmd.spawn().expect("failed to spawn ex");
     if let Some(mut si) = child.stdin.take() {

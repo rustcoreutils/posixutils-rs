@@ -24,7 +24,7 @@ pub use command::{
     change, delete, put_after, put_before, shift_left, shift_right, yank, CommandParser,
     MotionCommand, MotionResult, OperatorResult, ParsedCommand, ParserState,
 };
-pub use editor::{Editor, ExInsertMode, FindCommand, LastCommand, LastSubstitution};
+pub use editor::{Editor, ExInsertMode, FindCommand, LastCommand};
 pub use error::{Result, ViError};
 pub use ex::{parse_ex_command, Address, AddressRange, ExCommand, ExResult};
 pub use file::{read_file, write_file, FileInfo, FileManager, WriteStats};

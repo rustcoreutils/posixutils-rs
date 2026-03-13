@@ -3,6 +3,8 @@
 //! This module contains the Editor struct which ties together all
 //! the components of the vi editor.
 
+mod executor;
+
 use crate::buffer::{Buffer, BufferMode, Position, Range};
 use crate::command::CommandParser;
 use crate::error::{Result, ViError};
@@ -90,7 +92,7 @@ pub enum ExInsertMode {
 /// The main editor state.
 pub struct Editor {
     /// Current buffer.
-    pub(crate) buffer: Buffer,
+    buffer: Buffer,
     /// Editor mode.
     mode: Mode,
     /// Command parser for normal mode.
@@ -100,17 +102,17 @@ pub struct Editor {
     /// Ex command line input.
     ex_input: String,
     /// Editor options.
-    pub(crate) options: Options,
+    options: Options,
     /// Register storage.
-    pub(crate) registers: Registers,
+    registers: Registers,
     /// Undo manager.
     undo: UndoManager,
     /// Search state.
     search: SearchState,
     /// File manager.
-    pub(crate) files: FileManager,
+    files: FileManager,
     /// Terminal interface.
-    pub(crate) terminal: Terminal,
+    terminal: Terminal,
     /// Screen renderer.
     screen: Screen,
     /// Status/error message.
@@ -118,7 +120,7 @@ pub struct Editor {
     /// Whether message is an error.
     is_error: bool,
     /// Marks (a-z for user, other for special).
-    pub(crate) marks: [Option<Position>; 26],
+    marks: [Option<Position>; 26],
     /// Whether editor should quit.
     should_quit: bool,
     /// Exit code.
@@ -130,11 +132,11 @@ pub struct Editor {
     /// Last f/F/t/T command for ; and , repeat.
     last_find: Option<FindCommand>,
     /// Last substitution for & command.
-    pub(crate) last_substitution: Option<LastSubstitution>,
+    last_substitution: Option<LastSubstitution>,
     /// Last command for . (dot) repeat.
     last_command: Option<LastCommand>,
     /// Last macro register for @@ repeat.
-    pub(crate) last_macro_register: Option<char>,
+    last_macro_register: Option<char>,
     /// Ex text input mode (:a, :i, :c).
     ex_insert_mode: Option<ExInsertMode>,
     /// Accumulated text for ex insert mode.
@@ -1628,7 +1630,7 @@ impl Editor {
     }
 
     /// Execute an ex command input string.
-    pub(crate) fn execute_ex_input(&mut self, input: &str) -> Result<()> {
+    fn execute_ex_input(&mut self, input: &str) -> Result<()> {
         // Handle search patterns
         if let Some(pattern) = input.strip_prefix('/') {
             self.search.update_options(&self.options);
@@ -1979,15 +1981,28 @@ impl Editor {
 
         for line in reader.lines() {
             let line = line.map_err(ViError::Io)?;
-            let line = line.trim();
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('"') {
-                continue;
-            }
-            // Execute the command
-            self.execute_ex_input(line)?;
+            self.execute_source_line(&line)?;
         }
 
+        Ok(())
+    }
+
+    /// Execute ex commands from a string (already-read file content).
+    fn execute_source_content(&mut self, content: &str) -> Result<()> {
+        for line in content.lines() {
+            self.execute_source_line(line)?;
+        }
+        Ok(())
+    }
+
+    /// Execute a single line from a source file.
+    fn execute_source_line(&mut self, line: &str) -> Result<()> {
+        let line = line.trim();
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('"') {
+            return Ok(());
+        }
+        self.execute_ex_input(line)?;
         Ok(())
     }
 
@@ -2002,23 +2017,26 @@ impl Editor {
     /// - Must NOT be writable by group or others
     pub fn load_startup_config(&mut self) -> Result<()> {
         // 1. Check EXINIT environment variable
-        let exinit = std::env::var("EXINIT").unwrap_or_default();
-        if !exinit.is_empty() {
-            // EXINIT uses '|' to separate multiple commands
-            for cmd in exinit.split('|') {
-                let cmd = cmd.trim();
-                if !cmd.is_empty() {
-                    // Ignore errors from individual commands
-                    let _ = self.execute_ex_input(cmd);
+        // Per POSIX: if EXINIT is set (even to empty), $HOME/.exrc is not sourced
+        if let Some(exinit_os) = std::env::var_os("EXINIT") {
+            let exinit = exinit_os.to_string_lossy();
+            if !exinit.is_empty() {
+                // EXINIT uses '|' to separate multiple commands
+                for cmd in exinit.split('|') {
+                    let cmd = cmd.trim();
+                    if !cmd.is_empty() {
+                        // Ignore errors from individual commands
+                        let _ = self.execute_ex_input(cmd);
+                    }
                 }
             }
         } else {
-            // No EXINIT — check $HOME/.exrc
+            // EXINIT not set — check $HOME/.exrc
             if let Ok(home) = std::env::var("HOME") {
                 if !home.is_empty() {
                     let exrc_path = format!("{}/.exrc", home);
-                    if crate::config::is_safe_exrc(&exrc_path) {
-                        let _ = self.execute_source(&exrc_path);
+                    if let Some(content) = crate::config::read_safe_exrc(&exrc_path) {
+                        let _ = self.execute_source_content(&content);
                     }
                 }
             }
@@ -2027,10 +2045,10 @@ impl Editor {
         // 2. If exrc option is set, source ./.exrc in current directory
         if self.options.exrc {
             let local_exrc = ".exrc";
-            if crate::config::is_safe_exrc(local_exrc)
-                && !crate::config::is_same_file_as_home_exrc(local_exrc)
-            {
-                let _ = self.execute_source(local_exrc);
+            if !crate::config::is_same_file_as_home_exrc(local_exrc) {
+                if let Some(content) = crate::config::read_safe_exrc(local_exrc) {
+                    let _ = self.execute_source_content(&content);
+                }
             }
         }
 
@@ -2446,7 +2464,7 @@ impl Editor {
     }
 
     /// Perform substitution.
-    pub(crate) fn substitute(
+    fn substitute(
         &mut self,
         range: &AddressRange,
         pattern: &str,
@@ -2805,13 +2823,13 @@ impl Editor {
     }
 
     /// Set a message.
-    pub(crate) fn set_message(&mut self, msg: &str) {
+    fn set_message(&mut self, msg: &str) {
         self.message = Some(msg.to_string());
         self.is_error = false;
     }
 
     /// Set an error message.
-    pub(crate) fn set_error(&mut self, msg: &str) {
+    fn set_error(&mut self, msg: &str) {
         self.message = Some(msg.to_string());
         self.is_error = true;
     }

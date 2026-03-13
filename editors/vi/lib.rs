@@ -5,6 +5,7 @@
 
 pub mod buffer;
 pub mod command;
+pub mod config;
 pub mod editor;
 pub mod error;
 pub mod ex;

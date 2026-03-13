@@ -242,12 +242,12 @@ pub enum ExResult {
     Edit(String),
     /// Quit editor (optionally with exit code).
     Quit(i32),
-    /// Message to display.
-    Message(String),
+    /// Status message to display (suppressed in silent/batch mode).
+    StatusMessage(String),
     /// Error message.
     Error(String),
-    /// Output to display (like :p output).
-    Output(Vec<String>),
+    /// Command output to display (always printed in ex mode, e.g. :p, :nu, :l).
+    CommandOutput(Vec<String>),
     /// Enter insert mode at position.
     Insert(usize, usize),
     /// Command needs more input (for :g).

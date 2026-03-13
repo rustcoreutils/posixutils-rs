@@ -163,7 +163,6 @@ impl UnixLZWReader {
         }
     }
 
-    #[allow(clippy::assign_op_pattern)]
     fn getcode(&mut self) -> i32 {
         if self.clear || self.roffset >= self.size || self.free_ent > self.maxcode {
             // as free_ent represents the index of the next available entry that can be made
@@ -205,23 +204,25 @@ impl UnixLZWReader {
         let mut bits = self.n_bits;
         let mut bp: usize = 0;
 
-        bp = bp + (r_off >> 3) as usize;
-        r_off = r_off & 7;
+        bp += (r_off >> 3) as usize;
+        r_off &= 7;
 
         let mut gcode: i32 = (self.gbuf[bp] as i32) >> r_off;
-        bp = bp + 1;
-        bits = bits - (8 - r_off) as u32;
+        bp += 1;
+        bits -= (8 - r_off) as u32;
         r_off = 8 - r_off;
 
         if bits >= 8 {
-            gcode = gcode | ((self.gbuf[bp] as i32) << r_off);
-            bp = bp + 1;
-            r_off = r_off + 8;
-            bits = bits - 8;
+            gcode |= (self.gbuf[bp] as i32) << r_off;
+            bp += 1;
+            r_off += 8;
+            bits -= 8;
         }
 
-        gcode = gcode | (((self.gbuf[bp] as i32) & RMASK[bits as usize]) << r_off);
-        self.roffset = self.roffset + self.n_bits as i32;
+        if bits > 0 {
+            gcode |= ((self.gbuf[bp] as i32) & RMASK[bits as usize]) << r_off;
+        }
+        self.roffset += self.n_bits as i32;
 
         gcode
     }
@@ -277,8 +278,7 @@ impl UnixLZWReader {
             }
 
             if self.block_compress {
-                // TODO: understand why we need to skip one index (i.e 256) (initial guess is that
-                // we need that index reserverd for CLEAR)
+                // Index 256 is reserved for the CLEAR code
                 self.free_ent = FIRST;
             } else {
                 self.free_ent = 256;
@@ -324,7 +324,13 @@ impl UnixLZWReader {
 
             self.incode = self.code;
 
-            if self.code >= self.free_ent {
+            // Reject codes beyond the next expected entry (corrupt/malicious input)
+            if self.code > self.free_ent {
+                return Err(Error::other("corrupt input: code beyond dictionary"));
+            }
+
+            // KwKwK case: code references the entry being defined
+            if self.code == self.free_ent {
                 stack.push(self.finchar as u8);
                 self.code = self.oldcode;
             }
@@ -393,22 +399,19 @@ pub struct UnixLZWWriter {
     /// Flag for block compression
     block_compress: bool,
 
-    /// Flag to clear the dictionary
-    clear_flg: bool,
-
-    ratio: i32,
+    ratio: i64,
 
     /// Next checkpoint for compression ratio
-    checkpoint: i32,
+    checkpoint: i64,
 
     /// Offset for current byte
     offset: u32,
 
-    in_count: i32,
+    in_count: i64,
 
-    bytes_out: i32,
+    bytes_out: i64,
 
-    out_count: i32,
+    out_count: i64,
 
     /// Buffer for output bytes
     buf: [u8; BITS as usize],
@@ -446,9 +449,8 @@ impl UnixLZWWriter {
             hsize: HSIZE as i32,
             free_ent: 0,
             block_compress: true,
-            clear_flg: false,
             ratio: 0,
-            checkpoint: CHECK_GAP as i32,
+            checkpoint: CHECK_GAP as i64,
             offset: 0,
             in_count: 0,
             bytes_out: 0,
@@ -463,26 +465,30 @@ impl UnixLZWWriter {
         }
     }
 
-    fn clear_block(&mut self) -> io::Result<()> {
-        self.checkpoint = self.in_count + CHECK_GAP as i32;
+    fn clear_block(&mut self, outbytes: &mut Vec<u8>) -> io::Result<()> {
+        self.checkpoint = self.in_count + CHECK_GAP as i64;
 
-        let rat = if self.in_count > 0x007fffff {
-            match self.bytes_out >> 8 {
+        let total_out = self.bytes_out + (self.offset >> 3) as i64;
+        let rat: i64 = if self.in_count > 0x007fffff {
+            match total_out >> 8 {
                 0 => 0x7fffffff,
-                _ => self.in_count / (self.bytes_out >> 8),
+                _ => self.in_count / (total_out >> 8),
             }
         } else {
-            (self.in_count << 8) / self.bytes_out
+            (self.in_count << 8) / total_out
         };
 
-        if rat > self.ratio {
+        if rat >= self.ratio {
             self.ratio = rat;
         } else {
             self.ratio = 0;
             self.clear_hash();
             self.free_ent = FIRST;
-            self.clear_flg = true;
-            self.output(CLEAR)?;
+            // Output CLEAR code with current n_bits, then flush and reset
+            outbytes.extend(self.output(CLEAR)?);
+            self.flush_partial(outbytes);
+            self.n_bits = INIT_BITS;
+            self.maxcode = max_code(INIT_BITS) as i32;
         }
         Ok(())
     }
@@ -491,6 +497,35 @@ impl UnixLZWWriter {
         self.htab.fill(-1)
     }
 
+    /// Flush the partial output buffer (pad to n_bits-byte boundary)
+    fn flush_partial(&mut self, outbytes: &mut Vec<u8>) {
+        if self.offset > 0 {
+            let temp_buf = &self.buf[..self.n_bits as usize];
+            outbytes.extend(temp_buf);
+            self.bytes_out += self.n_bits as i64;
+        }
+        self.offset = 0;
+        self.buf.fill(0);
+    }
+
+    /// Check if n_bits needs to increase and handle the transition.
+    /// Must be called BEFORE outputting the next code (per standard LZW format).
+    /// Uses maxcode+1 as threshold to match ncompress behavior: this ensures
+    /// transitions always fall on n_bits-byte buffer boundaries.
+    fn check_bits_transition(&mut self, outbytes: &mut Vec<u8>) {
+        if self.free_ent > self.maxcode + 1 {
+            self.flush_partial(outbytes);
+            self.n_bits += 1;
+            self.maxcode = if self.n_bits == self.maxbits {
+                self.maxmaxcode
+            } else {
+                max_code(self.n_bits) as i32
+            };
+        }
+    }
+
+    /// Pack a code into the output buffer using the current n_bits.
+    /// Returns any complete buffer that was flushed.
     fn output(&mut self, mut ocode: i32) -> io::Result<Vec<u8>> {
         let mut r_off = self.offset;
         let mut bits = self.n_bits;
@@ -522,40 +557,21 @@ impl UnixLZWWriter {
 
             if self.offset == (self.n_bits << 3) {
                 bits = self.n_bits;
-                self.bytes_out += bits as i32;
+                self.bytes_out += bits as i64;
                 let temp_buf = &self.buf[..bits as usize];
                 outbytes.extend(temp_buf);
                 self.offset = 0;
-            }
-
-            if self.free_ent > self.maxcode || self.clear_flg {
-                if self.offset > 0 {
-                    let temp_buf = &self.buf[..self.n_bits as usize];
-                    outbytes.extend(temp_buf);
-                    self.bytes_out += self.n_bits as i32;
-                }
-                self.offset = 0;
-
-                if self.clear_flg {
-                    self.maxcode = max_code(INIT_BITS) as i32;
-                    self.clear_flg = false;
-                } else {
-                    self.n_bits += 1;
-                    self.maxcode = if self.n_bits == self.maxbits {
-                        self.maxmaxcode
-                    } else {
-                        max_code(self.n_bits) as i32
-                    };
-                }
+                self.buf.fill(0);
             }
         } else {
             if self.offset > 0 {
                 self.offset = self.offset.div_ceil(8);
                 let temp_buf = &self.buf[..self.offset as usize];
                 outbytes.extend(temp_buf);
-                self.bytes_out += self.offset as i32;
+                self.bytes_out += self.offset as i64;
             }
             self.offset = 0;
+            self.buf.fill(0);
         }
 
         Ok(outbytes)
@@ -577,7 +593,6 @@ impl UnixLZWWriter {
             outbytes.push(tmp);
 
             self.bytes_out = 3;
-            self.clear_flg = false;
             self.in_count = 1;
             self.free_ent = if self.block_compress { FIRST } else { 256 };
 
@@ -632,6 +647,8 @@ impl UnixLZWWriter {
                 continue;
             }
 
+            // Check for bit-width transition BEFORE outputting the code
+            self.check_bits_transition(&mut outbytes);
             outbytes.extend(self.output(self.write_params.ent)?);
             self.out_count += 1;
             self.write_params.ent = c;
@@ -641,7 +658,7 @@ impl UnixLZWWriter {
                 self.free_ent += 1;
                 self.htab[i as usize] = self.write_params.fcode;
             } else if self.in_count >= self.checkpoint && self.block_compress {
-                self.clear_block()?;
+                self.clear_block(&mut outbytes)?;
             }
         }
         Ok(outbytes)
@@ -650,6 +667,7 @@ impl UnixLZWWriter {
     /// Return the remaining bytes which could not be written from close()
     pub fn close(&mut self) -> io::Result<Vec<u8>> {
         let mut outbytes: Vec<u8> = Vec::new();
+        self.check_bits_transition(&mut outbytes);
         outbytes.extend(self.output(self.write_params.ent)?);
         self.out_count += 1;
         outbytes.extend(self.output(-1)?);

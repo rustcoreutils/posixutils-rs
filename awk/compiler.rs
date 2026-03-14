@@ -1378,7 +1378,13 @@ impl Compiler {
         instructions.push(iter_var_get_stmt, iter_var.line_col());
         lvalue_to_scalar_ref(&mut instructions.opcodes);
 
-        let array_var = inner.next().unwrap();
+        // skip in_op node from grammar
+        let next = inner.next().unwrap();
+        let array_var = if next.as_rule() == Rule::in_op {
+            inner.next().unwrap()
+        } else {
+            next
+        };
         let array_var_line_col = array_var.line_col();
         let array_var_get_stmt = self
             .get_var(array_var.as_str(), locals)

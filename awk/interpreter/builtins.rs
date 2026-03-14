@@ -357,10 +357,14 @@ pub(crate) fn call_simple_builtin(
                 .scalar_to_string(&global_env.convfmt)?
                 .try_into()?;
             let status = unsafe { libc::system(command.as_ptr()) };
-            let exit_code = if status == -1 {
+            let exit_code: i32 = if status == -1 {
                 -1
+            } else if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
             } else {
-                (status >> 8) & 0xff
+                -1
             };
             stack.push_value(exit_code as f64)?;
         }

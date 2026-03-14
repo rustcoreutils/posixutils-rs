@@ -68,8 +68,8 @@ fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, St
     if buf.is_empty() {
         return Ok(None);
     }
-    let input = String::from_utf8_lossy(buf);
-    if let Some(m) = re.find_first(&input) {
+    let input = std::str::from_utf8(buf).map_err(|e| e.to_string())?;
+    if let Some(m) = re.find_first(input) {
         let record = input[..m.start].to_string();
         let remainder = buf[m.end..].to_vec();
         Ok(Some((record, remainder)))

@@ -45,13 +45,17 @@ pub struct MatchIter<'re> {
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_start >= self.string.len() {
+        if self.next_start > self.string.len() {
             return None;
         }
 
         // Find match starting from current offset
         let substring = &self.string[self.next_start..];
-        let m = self.regex.inner.find(substring)?;
+        let m = if self.next_start == 0 {
+            self.regex.inner.find(substring)?
+        } else {
+            self.regex.inner.find_notbol(substring)?
+        };
 
         let result = RegexMatch {
             start: self.next_start + m.start,
@@ -63,7 +67,11 @@ impl Iterator for MatchIter<'_> {
         self.next_start = if m.end > 0 {
             self.next_start + m.end
         } else {
-            self.next_start + 1
+            let mut next = self.next_start + 1;
+            while next < self.string.len() && !self.string.is_char_boundary(next) {
+                next += 1;
+            }
+            next
         };
 
         Some(result)

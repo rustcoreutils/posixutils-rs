@@ -185,7 +185,15 @@ fn remove_trailing_zeros(
         .skip(trailing_spaces)
         .take_while(|c| *c == '0')
         .count();
-    let final_number_length = target.len() - write_starting_index - trailing_zeros;
+
+    // Check if removing trailing zeros would leave a trailing decimal point
+    let dot_index = target.len() - trailing_spaces - trailing_zeros;
+    let has_trailing_dot =
+        dot_index > 0 && target.as_bytes()[dot_index - 1] == decimal_point() as u8;
+
+    // Total removable characters: trailing zeros plus the orphaned decimal point
+    let removable = trailing_zeros + has_trailing_dot as usize;
+    let final_number_length = target.len() - write_starting_index - removable;
 
     if final_number_length >= width {
         // the number cannot have trailing spaces and trailing zeros, otherwise it would mean that
@@ -193,37 +201,40 @@ fn remove_trailing_zeros(
         // chars mean that the number alone was not wide enough
         assert!(trailing_spaces == 0 || trailing_zeros == 0);
 
-        target.truncate(target.len() - trailing_zeros);
+        target.truncate(target.len() - removable);
     } else if left_justified {
-        let first_trailing_zero = target.len() - trailing_spaces - trailing_zeros;
+        let start_replace =
+            target.len() - trailing_spaces - trailing_zeros - has_trailing_dot as usize;
         // this is safe as we just swap ascii bytes for other ascii bytes. No multibyte chars
         // involved
         unsafe {
-            let bytes =
-                target[first_trailing_zero..first_trailing_zero + trailing_zeros].as_bytes_mut();
+            let bytes = target[start_replace..start_replace + removable].as_bytes_mut();
             for c in bytes {
                 *c = b' ';
             }
         }
     } else if zero_padded {
-        // we need to rotate the zeros after the sign
-        let first = write_starting_index + sign.is_empty() as usize;
-        // we know that the last `trailing_zeros` bytes of `target` are b'0',
-        // so it's safe to rotate them (no multibyte chars are split)
-        unsafe { target[first..].as_bytes_mut().rotate_right(trailing_zeros) };
+        // we need to rotate the removable chars after the sign
+        let first = write_starting_index + sign.len();
+        // safe: we only rotate ascii bytes (b'0' and b'.'), no multibyte chars are split
+        unsafe {
+            let bytes = target[first..].as_bytes_mut();
+            bytes.rotate_right(removable);
+            // Rotated chars may include '.', replace with '0' for correct zero-padding
+            for b in bytes[..removable].iter_mut() {
+                *b = b'0';
+            }
+        };
     } else {
         unsafe {
-            let bytes = target.as_bytes_mut();
+            let bytes = target[write_starting_index..].as_bytes_mut();
             // rotate is safe, see above
-            bytes.rotate_right(trailing_zeros);
-            // we just replace b'0' with b' '. No multibyte chars are involved
-            for b in bytes[..trailing_zeros].iter_mut() {
+            bytes.rotate_right(removable);
+            // we just replace b'0'/b'.' with b' '. No multibyte chars are involved
+            for b in bytes[..removable].iter_mut() {
                 *b = b' ';
             }
         }
-    }
-    if target.chars().last().is_some_and(|c| c == decimal_point()) {
-        target.pop();
     }
 }
 
@@ -304,7 +315,7 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
 
     result.width = parse_number(&mut next, iter)?;
 
-    result.precision = if next == decimal_point() {
+    result.precision = if next == '.' {
         next = iter_next(iter)?;
         Some(parse_number(&mut next, iter)?)
     } else {
@@ -411,6 +422,8 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
     let buffer_start = buffer.len() - buffer_length;
 
     let precision = args.precision.unwrap_or(1);
+    // Per C standard, precision overrides zero-flag for integer conversions
+    let zero_padded = args.zero_padded && args.precision.is_none();
 
     let sign = sign_str(value.is_negative(), args);
     let number_length = buffer_length.max(precision) + sign.len();
@@ -426,7 +439,7 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
         pad_target(target, precision.saturating_sub(buffer_length), b'0');
         copy_buffer_to_target(&buffer[buffer_start..], target);
         pad_target(target, args.width.saturating_sub(number_length), b' ');
-    } else if args.zero_padded {
+    } else if zero_padded {
         target.push_str(sign);
         pad_target(target, args.width.saturating_sub(number_length), b'0');
         pad_target(target, precision.saturating_sub(buffer_length), b'0');
@@ -612,7 +625,12 @@ pub fn fmt_write_scientific_float(
 
     let value = value.abs();
 
-    let exponent = value.log10().trunc();
+    // Special-case zero: log10(0) is -inf
+    let exponent = if value == 0.0 {
+        0.0
+    } else {
+        value.log10().trunc()
+    };
     let mut additional_exponent_length = 0;
     // if the exponent is not negative, we need to add a '+' sign to the exponent part
     if !exponent.is_sign_negative() {
@@ -660,12 +678,18 @@ pub fn fmt_write_float_general(
     }
 
     let abs_value = value.abs();
-    let exponent = abs_value.log10().trunc() as i64;
 
     // the POSIX standard doesn't specify a default value. Here we follow the C standard
     // which uses 6. This also matches other implementations
     // We also want to always print at least one digit
     let significant_digits = args.precision.unwrap_or(6).max(1);
+
+    // Special-case zero: log10(0) is -inf, so handle it as decimal notation
+    let exponent = if abs_value == 0.0 {
+        0
+    } else {
+        abs_value.log10().trunc() as i64
+    };
 
     if exponent < -4 || significant_digits <= exponent.max(0) as usize {
         // in scientific notation, the number of significant digits is the precision plus one

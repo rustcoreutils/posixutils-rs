@@ -947,13 +947,54 @@ impl Compiler {
                 instructions.push(OpCode::IndexArrayGetValue, line_col)
             }
             Rule::field_var => {
-                let primary = self.map_primary(first_child(lvalue), locals)?;
-                instructions.extend(primary.instructions);
+                let expr = self.compile_field_var_expr(lvalue, locals)?;
+                instructions.extend(expr.instructions);
                 instructions.push(OpCode::GetField, line_col);
             }
             _ => unreachable!("encountered {:?} while compiling lvalue", lvalue.as_rule()),
         }
         Ok(())
+    }
+
+    fn compile_field_var_expr(
+        &self,
+        field_var: Pair<Rule>,
+        locals: &LocalMap,
+    ) -> Result<Expr, PestError> {
+        let mut prefix_ops = Vec::new();
+        let mut primary_pair = None;
+        let mut postfix_ops = Vec::new();
+
+        for child in field_var.into_inner() {
+            match child.as_rule() {
+                Rule::pre_inc | Rule::pre_dec | Rule::not | Rule::unary_plus | Rule::negate => {
+                    if primary_pair.is_none() {
+                        prefix_ops.push(child);
+                    }
+                }
+                Rule::post_inc | Rule::post_dec => {
+                    postfix_ops.push(child);
+                }
+                _ => {
+                    primary_pair = Some(child);
+                }
+            }
+        }
+
+        let primary = primary_pair.expect("field_var missing primary");
+        let mut expr = self.map_primary(primary, locals)?;
+
+        // Apply postfix ops first (they bind tighter to the primary)
+        for op in postfix_ops {
+            expr = self.map_postfix(expr, op)?;
+        }
+
+        // Apply prefix ops in reverse order (innermost first)
+        for op in prefix_ops.into_iter().rev() {
+            expr = self.map_prefix(op, expr)?;
+        }
+
+        Ok(expr)
     }
 
     fn compile_array_index(
@@ -1043,7 +1084,8 @@ impl Compiler {
                     line_col,
                 );
             }
-            Rule::getline_from_file => {
+            Rule::getline_from_file | Rule::getline_from_file_cmp => {
+                let is_cmp = input_function.as_rule() == Rule::getline_from_file_cmp;
                 let mut inner = input_function.into_inner();
                 let lvalue = inner.next().unwrap();
                 let file = if lvalue.as_rule() == Rule::lvalue {
@@ -1057,7 +1099,8 @@ impl Compiler {
                     ));
                     lvalue
                 };
-                self.compile_expr(file, instructions, locals)?;
+                let file_expr = self.compile_simple_binary_expr(file.into_inner(), locals)?;
+                instructions.extend(file_expr.instructions);
                 instructions.push(
                     OpCode::CallBuiltin {
                         function: BuiltinFunction::GetLineFromFile,
@@ -1065,6 +1108,20 @@ impl Compiler {
                     },
                     line_col,
                 );
+                if is_cmp {
+                    let comp = first_child(inner.next().unwrap());
+                    self.compile_expr(inner.next().unwrap(), instructions, locals)?;
+                    let op = match comp.as_rule() {
+                        Rule::lt => OpCode::Lt,
+                        Rule::le => OpCode::Le,
+                        Rule::gt => OpCode::Gt,
+                        Rule::ge => OpCode::Ge,
+                        Rule::eq => OpCode::Eq,
+                        Rule::ne => OpCode::Ne,
+                        _ => unreachable!(),
+                    };
+                    instructions.push(op, comp.line_col());
+                }
             }
             Rule::getline_from_pipe => {
                 let mut inner = input_function.into_inner();
@@ -1109,7 +1166,7 @@ impl Compiler {
     ) -> Result<(), PestError> {
         let expr = first_child(expr);
         match expr.as_rule() {
-            Rule::assignment => {
+            Rule::assignment | Rule::print_assignment => {
                 let mut inner = expr.into_inner();
                 self.compile_lvalue(inner.next().unwrap(), instructions, locals)?;
                 lvalue_to_scalar_ref(&mut instructions.opcodes);
@@ -1321,7 +1378,13 @@ impl Compiler {
         instructions.push(iter_var_get_stmt, iter_var.line_col());
         lvalue_to_scalar_ref(&mut instructions.opcodes);
 
-        let array_var = inner.next().unwrap();
+        // skip in_op node from grammar
+        let next = inner.next().unwrap();
+        let array_var = if next.as_rule() == Rule::in_op {
+            inner.next().unwrap()
+        } else {
+            next
+        };
         let array_var_line_col = array_var.line_col();
         let array_var_get_stmt = self
             .get_var(array_var.as_str(), locals)
@@ -1341,8 +1404,9 @@ impl Compiler {
         let iter_deref_location = instructions.len();
         instructions.push(OpCode::Invalid, array_var_line_col);
 
-        let body = inner.next().unwrap();
-        self.compile_stmt(body, instructions, locals)?;
+        if let Some(body) = inner.next() {
+            self.compile_stmt(body, instructions, locals)?;
+        }
 
         instructions.push(
             OpCode::Jump(distance(instructions.len(), iter_deref_location)),
@@ -1415,8 +1479,9 @@ impl Compiler {
         let while_jump_index = instructions.len();
         instructions.push(OpCode::Invalid, condition_line_col);
 
-        let body = inner.next().unwrap();
-        self.compile_stmt(body, instructions, locals)?;
+        if let Some(body) = inner.next() {
+            self.compile_stmt(body, instructions, locals)?;
+        }
         instructions.push(
             OpCode::Jump(distance(instructions.len(), condition_start)),
             condition_line_col,

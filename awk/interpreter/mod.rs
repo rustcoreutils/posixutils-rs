@@ -601,16 +601,23 @@ impl Interpreter {
                             .scalar_to_string(&global_env.convfmt)?;
                         let var = stack.pop_ref();
                         let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
-                            self.read_files.read_next_record(filename, &global_env.rs)?
+                            self.read_files.read_next_record(filename, &global_env.rs)
                         } else {
-                            self.read_pipes.read_next_record(filename, &global_env.rs)?
+                            self.read_pipes.read_next_record(filename, &global_env.rs)
                         };
-                        if let Some(next_record) = maybe_next_record {
-                            fields_state =
-                                var.assign(maybe_numeric_string(next_record), global_env)?;
-                            stack.push_value(1.0)?;
-                        } else {
-                            stack.push_value(0.0)?;
+                        match maybe_next_record {
+                            Ok(Some(next_record)) => {
+                                fields_state =
+                                    var.assign(maybe_numeric_string(next_record), global_env)?;
+                                stack.push_value(1.0)?;
+                            }
+                            Ok(None) => {
+                                stack.push_value(0.0)?;
+                            }
+                            Err(_) => {
+                                // Per POSIX, getline returns -1 on error
+                                stack.push_value(-1.0)?;
+                            }
                         }
                     }
                     BuiltinFunction::Rand => {
@@ -746,7 +753,7 @@ impl Interpreter {
             AwkValue::from("\n".to_string()).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rs));
         *globals[SpecialVar::Rstart as usize].get_mut() =
             AwkValue::from(0.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rstart));
-        *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from(" ".to_string())
+        *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from("\x1c".to_string())
             .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
 
         Self {
@@ -943,7 +950,7 @@ pub fn interpret(
                         .expr_to_bool(),
                     Pattern::Range { start, end } => {
                         if range_pattern_started[i] {
-                            let should_end = !interpreter
+                            let end_matches = interpreter
                                 .run(
                                     end,
                                     &program.functions,
@@ -953,7 +960,9 @@ pub fn interpret(
                                     reader,
                                 )?
                                 .expr_to_bool();
-                            range_pattern_started[i] = should_end;
+                            if end_matches {
+                                range_pattern_started[i] = false;
+                            }
                             // range is inclusive
                             true
                         } else {
@@ -967,7 +976,21 @@ pub fn interpret(
                                     reader,
                                 )?
                                 .expr_to_bool();
-                            range_pattern_started[i] = should_start;
+                            if should_start {
+                                // Check if end also matches on the same line
+                                let end_matches = interpreter
+                                    .run(
+                                        end,
+                                        &program.functions,
+                                        &mut current_record,
+                                        &mut stack,
+                                        &mut global_env,
+                                        reader,
+                                    )?
+                                    .expr_to_bool();
+                                // If end matches on the same line, don't keep range open
+                                range_pattern_started[i] = !end_matches;
+                            }
                             should_start
                         }
                     }

@@ -82,17 +82,24 @@ pub(crate) fn sprintf(
                         let value = value.scalar_as_f64();
                         fmt_write_float_general(&mut result, value, specifier == 'g', &args);
                     }
-                    'c' => match &value.value {
-                        AwkValueVariant::String(s) if !s.is_empty() => {
-                            result.push(s.chars().next().unwrap());
-                        }
-                        _ => {
-                            let code = value.scalar_as_f64() as u32;
-                            if let Some(c) = char::from_u32(code) {
-                                result.push(c);
+                    'c' => {
+                        let ch = match &value.value {
+                            AwkValueVariant::Number(n) => char::from_u32(*n as u32).unwrap_or('\0'),
+                            AwkValueVariant::String(s) if s.is_numeric => {
+                                let code = value.scalar_as_f64() as u32;
+                                char::from_u32(code).unwrap_or('\0')
                             }
-                        }
-                    },
+                            AwkValueVariant::String(s) if !s.is_empty() => {
+                                s.chars().next().unwrap()
+                            }
+                            _ => {
+                                let code = value.scalar_as_f64() as u32;
+                                char::from_u32(code).unwrap_or('\0')
+                            }
+                        };
+                        let ch_str = ch.to_string();
+                        fmt_write_string(&mut result, &ch_str, &args);
+                    }
                     's' => {
                         let value = value.scalar_to_string(float_format)?;
                         fmt_write_string(&mut result, &value, &args);
@@ -160,7 +167,7 @@ pub(crate) fn gsub(
         if c == '\\' {
             match repl_iter.next() {
                 Some('\\') => current_repl_part.push('\\'),
-                Some('&') => current_repl_part.push_str(&in_str[last_match_end..]),
+                Some('&') => current_repl_part.push('&'),
                 Some(c) => {
                     current_repl_part.push('\\');
                     current_repl_part.push(c);
@@ -185,8 +192,8 @@ pub(crate) fn gsub(
         let replaced_string = &in_str[m.start..m.end];
         result.push_str(&repl_parts[0]);
         for part in repl_parts.iter().skip(1) {
-            result.push_str(part);
             result.push_str(replaced_string);
+            result.push_str(part);
         }
         last_match_end = m.end;
         num_replacements += 1;
@@ -286,7 +293,13 @@ pub(crate) fn call_simple_builtin(
             let separator = if argc == 2 {
                 None
             } else {
-                Some(FieldSeparator::Ere(stack.pop_value().into_ere()?))
+                let sep_val = stack.pop_value();
+                if matches!(&sep_val.value, AwkValueVariant::Regex { .. }) {
+                    Some(FieldSeparator::Ere(sep_val.into_ere()?))
+                } else {
+                    let sep_str = sep_val.scalar_to_string(&global_env.convfmt)?;
+                    Some(FieldSeparator::try_from(sep_str)?)
+                }
             };
             let s = stack
                 .pop_scalar_value()?
@@ -294,11 +307,13 @@ pub(crate) fn call_simple_builtin(
             let array = stack.pop_ref().as_array()?;
             array.clear();
 
-            split_record(
-                s,
-                separator.iter().next().unwrap_or(&global_env.fs),
-                |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
-            )?;
+            if !s.is_empty() {
+                split_record(
+                    s,
+                    separator.iter().next().unwrap_or(&global_env.fs),
+                    |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
+                )?;
+            }
             let n = array.len();
             stack.push_value(n as f64)?;
         }
@@ -342,9 +357,16 @@ pub(crate) fn call_simple_builtin(
                 .scalar_to_string(&global_env.convfmt)?
                 .try_into()?;
             let status = unsafe { libc::system(command.as_ptr()) };
-            if status == -1 {
-                return Err("system call failed".to_string());
-            }
+            let exit_code: i32 = if status == -1 {
+                -1
+            } else if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                -1
+            };
+            stack.push_value(exit_code as f64)?;
         }
         BuiltinFunction::Print => {
             print!("{}", print_to_string(stack, argc, global_env)?);

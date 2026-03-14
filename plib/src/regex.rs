@@ -27,7 +27,10 @@
 //! assert!(re.is_match("HELLOOO"));
 //! ```
 
-use libc::{regcomp, regex_t, regexec, regfree, regmatch_t, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
+use libc::{
+    regcomp, regex_t, regexec, regfree, regmatch_t, REG_EXTENDED, REG_ICASE, REG_NOMATCH,
+    REG_NOTBOL,
+};
 use std::ffi::CString;
 use std::io::{Error, ErrorKind};
 use std::ptr;
@@ -240,6 +243,36 @@ impl Regex {
         })
     }
 
+    /// Find the first match, treating the start of the string as NOT the beginning of a line.
+    /// This prevents `^` from matching at the start of `text`.
+    pub fn find_notbol(&self, text: &str) -> Option<Match> {
+        let c_text = CString::new(text).ok()?;
+
+        let mut pmatch = regmatch_t {
+            rm_so: -1,
+            rm_eo: -1,
+        };
+
+        let result = unsafe {
+            regexec(
+                &self.raw,
+                c_text.as_ptr(),
+                1,
+                &mut pmatch as *mut regmatch_t,
+                REG_NOTBOL,
+            )
+        };
+
+        if result == REG_NOMATCH || pmatch.rm_so < 0 {
+            return None;
+        }
+
+        Some(Match {
+            start: pmatch.rm_so as usize,
+            end: pmatch.rm_eo as usize,
+        })
+    }
+
     /// Find all capture groups in the input string.
     ///
     /// Group 0 is always the entire match. Groups 1-9 are the parenthesized
@@ -407,42 +440,30 @@ impl Iterator for MatchIter<'_, '_> {
         }
 
         let substring = &self.text[self.offset..];
-        let c_text = CString::new(substring).ok()?;
-
-        let mut pmatch = regmatch_t {
-            rm_so: -1,
-            rm_eo: -1,
+        let m = if self.offset == 0 {
+            self.regex.find(substring)?
+        } else {
+            self.regex.find_notbol(substring)?
         };
 
-        let result = unsafe {
-            regexec(
-                &self.regex.raw,
-                c_text.as_ptr(),
-                1,
-                &mut pmatch as *mut regmatch_t,
-                0,
-            )
-        };
-
-        if result == REG_NOMATCH || pmatch.rm_so < 0 {
-            self.offset = self.text.len(); // Stop iteration
-            return None;
-        }
-
-        let m = Match {
-            start: self.offset + pmatch.rm_so as usize,
-            end: self.offset + pmatch.rm_eo as usize,
+        let result = Match {
+            start: self.offset + m.start,
+            end: self.offset + m.end,
         };
 
         // Move past this match for next iteration
         // Ensure we make progress even on zero-width matches
-        self.offset = if pmatch.rm_eo as usize > 0 {
-            self.offset + pmatch.rm_eo as usize
+        self.offset = if m.end > 0 {
+            self.offset + m.end
         } else {
-            self.offset + 1
+            let mut next = self.offset + 1;
+            while next < self.text.len() && !self.text.is_char_boundary(next) {
+                next += 1;
+            }
+            next
         };
 
-        Some(m)
+        Some(result)
     }
 }
 
@@ -608,6 +629,18 @@ mod tests {
         let matches: Vec<Match> = re.find_iter("").collect();
         assert_eq!(matches.len(), 1, "^$ should match empty string once");
         assert_eq!(matches[0], Match { start: 0, end: 0 });
+    }
+
+    #[test]
+    fn test_find_iter_multibyte_zero_width() {
+        // Regression test: zero-width match must not split multi-byte UTF-8 characters
+        // "aéb" — é is 2 bytes (U+00E9), so "a*" zero-width matches between bytes
+        // must skip to the next char boundary
+        let re = Regex::ere("a*").unwrap();
+        let matches: Vec<Match> = re.find_iter("aéb").collect();
+        // Expected: "a" at 0..1, "" at 1..1 (before é), "" at 3..3 (before b), "" at 4..4 (end)
+        assert_eq!(matches.len(), 4, "should produce 4 matches without panic");
+        assert_eq!(matches[0], Match { start: 0, end: 1 });
     }
 
     #[test]

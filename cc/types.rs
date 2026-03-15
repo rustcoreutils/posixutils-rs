@@ -1169,7 +1169,11 @@ impl TypeTable {
 
     /// Compute struct layout with natural alignment
     /// Updates member offsets in place and returns (total_size, alignment)
-    pub fn compute_struct_layout(&self, members: &mut [StructMember]) -> (usize, usize) {
+    pub fn compute_struct_layout(
+        &self,
+        members: &mut [StructMember],
+        packed: bool,
+    ) -> (usize, usize) {
         let mut offset = 0usize;
         let mut max_align = 1usize;
         let mut current_bit_offset = 0u32;
@@ -1218,13 +1222,18 @@ impl TypeTable {
                     current_storage_unit_size = 0;
                 }
 
-                // Use explicit alignment from _Alignas if specified, otherwise natural alignment
-                let natural_align = self.alignment(member.typ);
+                // Use explicit alignment from _Alignas if specified, otherwise natural alignment.
+                // For packed structs, force alignment to 1 (no padding between members).
+                let natural_align = if packed {
+                    1
+                } else {
+                    self.alignment(member.typ)
+                };
                 let align = member
                     .explicit_align
                     .map(|a| a as usize)
                     .unwrap_or(natural_align);
-                max_align = max_align.max(align);
+                max_align = max_align.max(if packed { 1 } else { align });
 
                 offset = (offset + align - 1) & !(align - 1);
                 member.offset = offset;
@@ -1239,12 +1248,13 @@ impl TypeTable {
             offset += current_storage_unit_size as usize;
         }
 
-        let size = if max_align > 1 {
-            (offset + max_align - 1) & !(max_align - 1)
+        let final_align = if packed { 1 } else { max_align };
+        let size = if final_align > 1 {
+            (offset + final_align - 1) & !(final_align - 1)
         } else {
             offset
         };
-        (size, max_align)
+        (size, final_align)
     }
 
     /// Get the number of interned types

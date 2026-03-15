@@ -2044,16 +2044,18 @@ impl Parser<'_> {
     pub(crate) fn parse_struct_or_union_specifier(&mut self, is_union: bool) -> ParseResult<Type> {
         self.advance(); // consume 'struct' or 'union'
 
-        // Skip any __attribute__ between 'struct' and tag name
-        self.skip_extensions();
+        // Parse __attribute__ between 'struct' keyword and tag name
+        // (e.g., struct __attribute__((packed)) tagname { ... })
+        let early_attrs = self.parse_attributes();
+        let mut is_packed = early_attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
 
         // Optional tag name
         let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-            // Make sure it's not __attribute__
             if !self.is_attribute_keyword() {
                 Some(self.expect_identifier()?)
             } else {
-                self.skip_extensions();
+                let mid_attrs = self.parse_attributes();
+                is_packed = is_packed || mid_attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
                 if self.peek() == TokenType::Ident && !self.is_special(b'{') {
                     Some(self.expect_identifier()?)
                 } else {
@@ -2064,8 +2066,9 @@ impl Parser<'_> {
             None
         };
 
-        // Skip any __attribute__ after tag name but before '{'
-        self.skip_extensions();
+        // Parse __attribute__ after tag name but before '{'
+        let pre_attrs = self.parse_attributes();
+        is_packed = is_packed || pre_attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -2205,14 +2208,15 @@ impl Parser<'_> {
 
             self.expect_special(b'}')?;
 
-            // Skip any trailing __attribute__ (e.g., __attribute__((packed)))
-            self.skip_extensions();
+            // Parse trailing __attribute__ (e.g., __attribute__((packed)))
+            let attrs = self.parse_attributes();
+            is_packed = is_packed || attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
 
             // Compute layout
             let (size, align) = if is_union {
                 self.types.compute_union_layout(&mut members)
             } else {
-                self.types.compute_struct_layout(&mut members)
+                self.types.compute_struct_layout(&mut members, is_packed)
             };
 
             let composite = CompositeType {

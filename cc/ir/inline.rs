@@ -178,6 +178,11 @@ fn should_inline(candidate: &InlineCandidate, opt_level: u32, caller_size: usize
         if candidate.call_count == 1 && candidate.estimated_size <= MAX_INLINE_SIZE {
             return true;
         }
+
+        // Multiple call sites: be more conservative
+        if candidate.estimated_size <= ALWAYS_INLINE_SIZE * 2 {
+            return true;
+        }
     }
 
     // Check caller growth limit

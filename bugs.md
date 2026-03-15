@@ -33,12 +33,12 @@
 - **Fix:** When `is_two_reg_return`, generate two Store instructions (offset 0 and 8) instead of single Copy
 - **Test:** `codegen_inline_two_reg_struct_return` in `cc/tests/codegen/misc.rs`
 
-### BUG F: Inliner multi-call-site aggressive inlining — FIXED (workaround)
-- **File:** `cc/ir/inline.rs` — `should_inline()`
-- **Symptom:** CPython `_freeze_module` segfaulted at -O2/-O3; uninitialized stack values used as array indices in `_PySys_InitCore`
-- **Root cause:** The `ALWAYS_INLINE_SIZE * 2` multi-call-site inlining rule at -O2 inlined functions of size 11-20 (like `PyTuple_SET_ITEM`, size 19) into many callers. This triggered a latent bug — possibly in block reordering, register allocation liveness, or CFG connectivity after inlining — causing uninitialized stack values.
-- **Fix:** Removed the `ALWAYS_INLINE_SIZE * 2` multi-call-site rule. Functions with `inline` hint or single call sites are still aggressively inlined at O2. The underlying inliner bug remains for future investigation.
-- **Verified:** O2 SUCCESS, O3 SUCCESS, Valgrind 0 errors at O3.
+### BUG F: 32-bit Copy to stack leaves upper bytes uninitialized — FIXED
+- **File:** `cc/arch/x86_64/codegen.rs` — `emit_copy_with_type()`
+- **Symptom:** CPython `_freeze_module` segfaulted at -O2/-O3; `ob_item[pos]` used garbage index
+- **Root cause:** When `emit_copy_with_type` stores a 32-bit value to a stack slot (`copy.32`), it emitted `movl %r10d, offset(%rbp)` — writing only 4 bytes. A later 64-bit load (`movq offset(%rbp), %r10`) read the 4 written bytes plus 4 uninitialized bytes. This occurred when a C `int` value (e.g. `int pos`) was inlined into a context that reads it as `Py_ssize_t` (64-bit) via `PyTuple_SET_ITEM`'s `index` parameter.
+- **Fix:** In `emit_copy_with_type`, store 32-bit values to stack with 64-bit width (zero-extended by x86-64 `movl`→reg convention), ensuring full 8-byte slot is written.
+- **Verified:** CPython O0-O3 SUCCESS, Valgrind 0 errors at O3.
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)
 1. Silent `Initializer::None` → hard error + pointer arithmetic + array/pointer type handling

@@ -1,21 +1,21 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: _freeze_module clean (0 valgrind errors). _bootstrap_python executes bytecode but segfaults during opcode execution.
+## Status: _freeze_module clean. _bootstrap_python crashes — 4 specific files break it when pcc-compiled.
 
-### Bugs A-K: ALL FIXED (see git history)
+### Bugs A-L: ALL FIXED (see git history)
 
-### BUG L: Deref of small struct/union returns pointer instead of value — FIXED
-- **File:** `cc/ir/linearize.rs` — `UnaryOp::Deref` handler
-- **Root cause:** `linearize_expr` for Deref of struct/union ALWAYS returned the pointer (address), even for small types (<= 64 bits) that fit in a register. Callers that used the result as a VALUE (e.g., `_Py_CODEUNIT word = *next_instr`) stored the pointer instead of the pointed-to data — truncating a 64-bit pointer to a 16-bit field.
-- **Fix:** Only return the address for large structs (> 64 bits). For small structs/unions (<= 64 bits), emit a LOAD instruction to actually read the value through the pointer.
-- **Impact:** Fixed CPython's bytecode dispatch — the switch on `uint8_t opcode` now receives the correct opcode from `*next_instr` instead of garbage.
+### BUG L (revised): Deref of small UNION returns pointer instead of value — FIXED
+- **Fix revised:** Only UNION types <= 64 bits get the value-load treatment. STRUCT types still return addresses (needed for member-offset access). Large unions (> 64 bits) still return addresses.
 
-### DESIGN FIX: Stack frame zero-initialization — IMPLEMENTED
-- Zero all stack frames at function entry using `rep stosq`
-- Prevents ALL instances of stale upper bytes in stack slots
+### DESIGN FIX: Stack frame zero-initialization
+- All function prologues zero the stack frame using `rep stosq`
+- Saves/restores RDI+RCX around zeroing to preserve function arguments
 
-### BUG M: _bootstrap_python SIGSEGV during opcode execution — INVESTIGATING
-- **Symptom:** Crash in `_PyEval_EvalFrameDefault` during actual bytecode execution (no longer `__builtin_unreachable`)
-- **Progress:** The bytecode dispatch switch now works correctly. The crash is during opcode handler execution — a different and more specific bug.
+### BUG M: 4 specific files break _bootstrap_python — INVESTIGATING
+- **Files:** `pylifecycle.c`, `import.c`, `ceval.c`, `sysmodule.c`
+- **Other files (pystate.c, initconfig.c, marshal.c, Objects/*.c) work fine**
+- **Key observation:** `pylifecycle.c` has ZERO union usage — the bug is NOT related to Bug L
+- **Common trait:** All 4 files are in the init/execution path. They use `PyStatus` extensively (196 uses in pylifecycle.c alone) and make many function calls.
+- **Next step:** Compare pcc vs gcc assembly for a small function in pylifecycle.c to find the codegen difference.
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)

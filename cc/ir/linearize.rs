@@ -7451,14 +7451,17 @@ impl<'a> Linearizer<'a> {
                 if type_kind == TypeKind::Array {
                     return src;
                 }
-                // For large struct/union types (> 64 bits), return the address
-                // since they can't fit in registers. The Store instruction
-                // handles struct copies via emit_struct_store/emit_block_copy.
-                // For small struct/union types (<= 64 bits), LOAD the value
-                // so callers get a value, not a pointer.
-                if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                    && size > 64
-                {
+                // For struct types, always return the address — struct member
+                // access requires an address for offset-based field access.
+                if type_kind == TypeKind::Struct {
+                    return src;
+                }
+                // For large union types (> 64 bits), return the address.
+                // For small unions (<= 64 bits), LOAD the value — unions are
+                // accessed as whole values, not via member offsets, and
+                // returning the pointer causes callers to store the pointer
+                // instead of the union value (Bug L).
+                if type_kind == TypeKind::Union && size > 64 {
                     return src;
                 }
                 self.emit(Instruction::load(result, src, 0, typ, size));

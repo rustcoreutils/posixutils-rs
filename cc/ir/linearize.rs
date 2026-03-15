@@ -7447,12 +7447,17 @@ impl<'a> Linearizer<'a> {
             UnaryOp::Deref => {
                 // Dereferencing a pointer-to-array gives an array, which is just an address
                 // (arrays decay to their first element's address)
-                // For struct/union types, return the address since structs can't be loaded
-                // into registers - the Store instruction handles struct copies via emit_struct_store
                 let type_kind = self.types.kind(typ);
-                if type_kind == TypeKind::Array
-                    || type_kind == TypeKind::Struct
-                    || type_kind == TypeKind::Union
+                if type_kind == TypeKind::Array {
+                    return src;
+                }
+                // For large struct/union types (> 64 bits), return the address
+                // since they can't fit in registers. The Store instruction
+                // handles struct copies via emit_struct_store/emit_block_copy.
+                // For small struct/union types (<= 64 bits), LOAD the value
+                // so callers get a value, not a pointer.
+                if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
+                    && size > 64
                 {
                     return src;
                 }

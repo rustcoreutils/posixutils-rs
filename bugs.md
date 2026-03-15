@@ -33,15 +33,16 @@
 - **Fix:** When `is_two_reg_return`, generate two Store instructions (offset 0 and 8) instead of single Copy
 - **Test:** `codegen_inline_two_reg_struct_return` in `cc/tests/codegen/misc.rs`
 
-### BUG F: Inliner miscompilation of `PyTuple_SET_ITEM` (size 19, non-inline-hinted) — INVESTIGATING
+### BUG F: Inliner miscompilation of `PyTuple_SET_ITEM` — INVESTIGATING
 - **Symptom:** CPython `_freeze_module` segfaults at -O2/-O3; uninitialized stack values used as array indices
 - **Location:** Crash in `_PySys_InitCore` at `ob_item[pos]` where `pos` is garbage
-- **Isolated:** Skipping `PyTuple_SET_ITEM` inlining fixes the crash. Standalone test with same pattern passes — bug only manifests in complex CPython context with many other inlined functions.
-- **Pattern:** `PyTuple_SET_ITEM` is a void function (size 19 IR instructions, not declared `inline`) with locals for address-taken parameters and a cast local (`tuple.6`). Inlined via O2's `ALWAYS_INLINE_SIZE * 2` threshold.
-- **Not void return target:** Clearing return_target for void callees doesn't fix it.
-- **Full pcc -O0:** SUCCESS, **-O1:** SUCCESS, **-O2:** CRASH, **-O3:** CRASH
-- **Disabling inlining at -O2:** SUCCESS (confirms inliner bug)
-- **Next steps:** Compare caller IR before/after inlining in the complex CPython context to find the specific corruption pattern — likely a pseudo mapping or local variable conflict when many functions are inlined into the same caller.
+- **Isolated:** Skipping `PyTuple_SET_ITEM` inlining fixes the crash. Function is void, size 19 IR instructions, not declared `inline`, with address-taken parameters and a cast local (`tuple.6`).
+- **Key finding:** Inlining `PyTuple_SET_ITEM` into ANY SINGLE caller works. The crash only occurs when it's inlined into MULTIPLE callers across many files simultaneously. Standalone tests with identical patterns pass.
+- **Threshold:** O2's `ALWAYS_INLINE_SIZE * 2 = 20` threshold enables this (size 19 function, non-inline-hint, multiple call sites).
+- **Full pcc:** -O0 SUCCESS, -O1 SUCCESS, -O2 CRASH, -O3 CRASH. Disabling inlining at -O2: SUCCESS.
+- **Callers (35 total):** `set_flags_from_config` (18x), `wait_helper` (16x), `stringlib_partition` (12x), `PyFloat_GetInfo` (11x), `get_hash_info` (9x), etc.
+- **Not void return target:** Verified — void return_target is not the issue.
+- **Next steps:** The multi-caller requirement suggests the issue is in how inlining across different functions/files interacts — possibly `reorder_blocks_topologically()`, register allocator block ordering, or a cumulative effect of the module-level inlining pass. Need to dump IR of a file that has PyTuple_SET_ITEM inlined into multiple callers and compare with O1.
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)
 1. Silent `Initializer::None` → hard error + pointer arithmetic + array/pointer type handling

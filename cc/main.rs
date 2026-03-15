@@ -414,6 +414,14 @@ fn process_file(
     let mut module =
         ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug > 0);
 
+    // Check for errors during linearization (e.g., unsupported global initializers)
+    if diag::has_error() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compilation failed",
+        ));
+    }
+
     // Print compilation statistics if requested
     if args.stats {
         print_stats(path, &strings, &types, &symbols, &module);

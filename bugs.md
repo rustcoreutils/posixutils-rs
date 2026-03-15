@@ -1,21 +1,14 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: _freeze_module clean. _bootstrap_python crashes — 4 specific files break it when pcc-compiled.
+## Status: _freeze_module clean. Bug M root cause found: pcc silently produces corrupt .o files on unsupported expressions.
 
 ### Bugs A-L: ALL FIXED (see git history)
 
-### BUG L (revised): Deref of small UNION returns pointer instead of value — FIXED
-- **Fix revised:** Only UNION types <= 64 bits get the value-load treatment. STRUCT types still return addresses (needed for member-offset access). Large unions (> 64 bits) still return addresses.
-
-### DESIGN FIX: Stack frame zero-initialization
-- All function prologues zero the stack frame using `rep stosq`
-- Saves/restores RDI+RCX around zeroing to preserve function arguments
-
-### BUG M: 4 specific files break _bootstrap_python — INVESTIGATING
-- **Files:** `pylifecycle.c`, `import.c`, `ceval.c`, `sysmodule.c`
-- **Other files (pystate.c, initconfig.c, marshal.c, Objects/*.c) work fine**
-- **Key observation:** `pylifecycle.c` has ZERO union usage — the bug is NOT related to Bug L
-- **Common trait:** All 4 files are in the init/execution path. They use `PyStatus` extensively (196 uses in pylifecycle.c alone) and make many function calls.
-- **Next step:** Compare pcc vs gcc assembly for a small function in pylifecycle.c to find the codegen difference.
+### BUG M (root cause): pcc exits 0 on compilation errors, producing corrupt .o files — PARTIALLY FIXED
+- **Files:** `cc/main.rs` — missing error check after linearization
+- **Root cause:** pcc emits "error: unsupported expression in global initializer" during linearization but doesn't fail the compilation (exits 0). The error output goes to stderr but the .o file is created with corrupt/missing data.
+- **Fix:** Added `diag::has_error()` check after linearization in `process_file()`. pcc now correctly fails with non-zero exit on linearization errors.
+- **Remaining:** The "unsupported expression in global initializer" error itself needs to be fixed. The expression pattern is `Py_CLEAR(ptr->member)` which expands to `&((ptr)->member)` — an address-of on a member access through a pointer. This appears in `pycore_pyerrors.h` and is used by `pylifecycle.c`, `import.c`, `ceval.c`, `sysmodule.c`.
+- **Next step:** Fix `eval_static_address()` or `ast_init_to_ir()` to handle the `Member { Arrow { ... } }` pattern in the global initializer evaluator, OR properly detect that this expression is in a FUNCTION BODY (not a global initializer) and use the normal codegen path.
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)

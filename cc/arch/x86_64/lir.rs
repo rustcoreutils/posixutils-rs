@@ -344,6 +344,10 @@ pub enum X86Inst {
     /// RET - Return from function
     Ret,
 
+    /// REP STOSQ - Store RAX to [RDI], repeat RCX times, advancing RDI
+    /// Used for zero-initializing stack frames
+    RepStosq,
+
     /// UD2 - Undefined instruction (trap)
     /// Used for __builtin_unreachable() to signal unreachable code
     Ud2,
@@ -881,6 +885,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Ret => {
                 let _ = writeln!(out, "    ret");
+            }
+
+            X86Inst::RepStosq => {
+                let _ = writeln!(out, "    rep stosq");
             }
 
             X86Inst::Ud2 => {

@@ -39,6 +39,8 @@ pub struct X86_64CodeGen {
     callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
     pub(super) callee_saved_offset: i32,
+    /// Stack allocation size (for zero_stack_frame)
+    stack_alloc_size: i32,
     /// Offset from rbp to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
     /// Number of fixed GP parameters (for variadic functions)
@@ -69,6 +71,7 @@ impl X86_64CodeGen {
             pseudos: Vec::new(),
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
+            stack_alloc_size: 0,
             reg_save_area_offset: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
@@ -255,6 +258,12 @@ impl X86_64CodeGen {
         // Emit prologue (push rbp, callee-saved regs, allocate stack)
         self.emit_prologue(stack_size, reg_save_area_size);
 
+        // Zero-initialize the stack frame BEFORE storing any arguments.
+        // This ensures all 8-byte stack slots start as zero, so narrow
+        // writes (8/16/32-bit) leave zero in the unwritten upper bytes.
+        // Uses R10/R11 to save/restore RDI/RCX (which may hold arguments).
+        self.zero_stack_frame();
+
         // Store spilled arguments before any calls can clobber them
         self.store_spilled_args(&alloc);
 
@@ -350,15 +359,78 @@ impl X86_64CodeGen {
             stack_size + (self.callee_saved_regs.len() as i32 * 8) + reg_save_area_size;
         // Ensure 16-byte alignment
         let aligned_stack = (total_stack + 15) & !15;
-        if aligned_stack > self.callee_saved_regs.len() as i32 * 8 {
+        let alloc_size = aligned_stack - (self.callee_saved_regs.len() as i32 * 8);
+        if alloc_size > 0 {
             self.push_lir(X86Inst::Sub {
                 size: OperandSize::B64,
-                src: GpOperand::Imm(
-                    (aligned_stack - (self.callee_saved_regs.len() as i32 * 8)) as i64,
-                ),
+                src: GpOperand::Imm(alloc_size as i64),
                 dst: Reg::Rsp,
             });
         }
+        // Store alloc_size for use in zero_stack_frame()
+        self.stack_alloc_size = alloc_size;
+    }
+
+    /// Zero-initialize the stack frame AFTER argument registers have been
+    /// spilled to their stack slots. This prevents stale bytes from being
+    /// read when narrow values (8/16/32-bit) are stored to 8-byte stack
+    /// slots and later loaded at wider widths.
+    ///
+    /// Must be called after store_spilled_args() and emit_variadic_save_area()
+    /// because rep stosq clobbers RAX, RCX, RDI.
+    fn zero_stack_frame(&mut self) {
+        let alloc_size = self.stack_alloc_size;
+        if alloc_size <= 0 {
+            return;
+        }
+        let qwords = alloc_size / 8;
+        if qwords <= 0 {
+            return;
+        }
+        // Save RDI and RCX to scratch registers R10/R11 — they may hold
+        // function arguments (SysV ABI: RDI=arg0, RCX=arg3).
+        // R10 and R11 are caller-saved scratch, NOT used for arg passing.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rdi),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rcx),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        // RDI = RSP (start of stack frame to zero)
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rsp),
+            dst: GpOperand::Reg(Reg::Rdi),
+        });
+        // RCX = number of qwords
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(qwords as i64),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
+        // RAX = 0 (value to fill)
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: Reg::Rax,
+        });
+        // rep stosq: zero [RDI] for RCX qwords
+        self.push_lir(X86Inst::RepStosq);
+        // Restore RDI and RCX
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Reg(Reg::Rdi),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
     }
 
     /// Emit stores for arguments spilled from caller-saved registers to stack

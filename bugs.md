@@ -1,16 +1,17 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: _freeze_module clean. All .c files compile. _bootstrap_python crashes — systematic codegen issue.
+## Status: ROOT CAUSE of Bug N identified: ABI mismatch for large struct parameters.
 
 ### Bugs A-M: ALL FIXED (see git history)
 
-### BUG N: Systematic codegen issue — every file individually breaks _bootstrap_python — INVESTIGATING
-- **Pattern:** From a clean gcc baseline, swapping ANY single file to pcc (9/9 tested) causes _bootstrap_python to crash. This is the SAME pattern seen throughout this campaign.
-- **NOT stale stack bytes:** Stack zeroing with `rep stosq` doesn't fix it.
-- **NOT struct layout:** All struct sizes/offsets match gcc exactly.
-- **NOT the linker:** The issue persists with gcc linker.
-- **NOT pyconfig.h:** pyconfig.h differs only in GETPGRP_HAVE_ARG/SETPGRP_HAVE_ARG (posixmodule only).
-- **Key observation:** A clean `make clean && CC=gcc make _bootstrap_python` with the SAME pyconfig.h (pcc-compatible, 5 patches applied) works perfectly.
-- **Next step:** Compare pcc vs gcc assembly for a single small function in a breaking file (e.g., a simple function from initconfig.c). The systematic nature suggests a fundamental codegen pattern that's wrong — likely in how pcc handles common C constructs that appear in virtually every file.
+### BUG N ROOT CAUSE: Large struct parameters passed by pointer instead of by value — NOT YET FIXED
+- **Root cause confirmed:** pcc passes struct parameters > 16 bytes as hidden pointers (sret-style, in RDI), while the SysV AMD64 ABI requires them to be passed BY VALUE on the stack (MEMORY class). This is a fundamental ABI mismatch that breaks interop between pcc-compiled and gcc-compiled code.
+- **Evidence:** `PyStatus_Exception(PyStatus status)` — GCC reads from `16(%rbp)` (stack arg), PCC reads from `(%rdi)` (pointer deref). `PyStatus` = 32 bytes > 16 bytes.
+- **Impact:** Every file that passes/receives large structs has wrong calling convention. `PyStatus` (32 bytes) is used in 100+ functions throughout CPython.
+- **Fix required (DESIGN CHANGE):**
+  1. **`classify_param()` in `cc/abi/sysv_amd64.rs`:** Large aggregate parameters should NOT use `ArgClass::Indirect` (which means "pass pointer"). They need a MEMORY/stack classification.
+  2. **CALLER codegen (`cc/arch/x86_64/call.rs`):** Push struct bytes to the stack argument area (multiple `push` qwords) instead of passing pointer in register.
+  3. **CALLEE codegen (`cc/arch/x86_64/codegen.rs`):** Receive large struct params via `IncomingArg` (stack offset) instead of GP register. The struct starts at `rbp + return_addr_offset + stack_arg_offset`.
+  4. **CALLEE linearizer (`cc/ir/linearize.rs`):** Remove the "large struct param → pointer" conversion in `linearize_function_def`. Parameters should keep their struct type and be addressed via stack offsets.
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)

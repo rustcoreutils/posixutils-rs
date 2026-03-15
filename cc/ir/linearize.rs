@@ -872,6 +872,31 @@ impl<'a> Linearizer<'a> {
                 }
             }
 
+            // Compile-time ternary: cond ? then_expr : else_expr
+            // Used in CPython's _Py_LATIN1_CHR() macro for static initializers
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                if let Some(cond_val) = self.eval_const_expr(cond) {
+                    if cond_val != 0 {
+                        return self.ast_init_to_ir(then_expr, typ);
+                    } else {
+                        return self.ast_init_to_ir(else_expr, typ);
+                    }
+                }
+                // If condition isn't constant, fall through to error
+                error(
+                    self.current_pos.unwrap_or_default(),
+                    &format!(
+                        "non-constant condition in global initializer ternary: {:?}",
+                        cond.kind
+                    ),
+                );
+                Initializer::None
+            }
+
             // Other constant expressions
             // Try to evaluate as integer or float constant expression
             _ => {
@@ -879,6 +904,13 @@ impl<'a> Linearizer<'a> {
                     Initializer::Int(val)
                 } else if let Some(val) = self.eval_const_float_expr(expr) {
                     Initializer::Float(val)
+                } else if let Some((name, offset)) = self.eval_static_address(expr) {
+                    // Try as a static address (e.g., &global.field->subfield chains)
+                    if offset != 0 {
+                        Initializer::SymAddrOffset(name, offset)
+                    } else {
+                        Initializer::SymAddr(name)
+                    }
                 } else {
                     // Hard error for non-empty expressions we can't evaluate
                     error(

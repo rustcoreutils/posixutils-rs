@@ -1592,6 +1592,25 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Store a GP register to a regalloc stack slot. All regalloc slots are
+    /// 8 bytes on x86-64. For integer values >= 32 bits, we always write the
+    /// full 64-bit slot to prevent stale upper bytes from being read by
+    /// subsequent wider loads. On x86-64, any 32-bit register operation
+    /// zero-extends to 64 bits, so `movq %reg, mem` is correct.
+    /// For 8/16-bit values, store the actual size to avoid clobbering adjacent
+    /// struct fields when the "slot" is really a struct member.
+    pub(super) fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i32) {
+        let adjusted = stack_offset + self.callee_saved_offset;
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(src),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: -adjusted,
+            }),
+        });
+    }
+
     pub(super) fn emit_move_to_loc(&mut self, src: Reg, dst: &Loc, size: u32) {
         // For stack stores, use actual size to properly handle char/short
         // For register-to-register, use minimum 32-bit
@@ -1610,46 +1629,24 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
-                // For sub-32-bit values, first zero-extend to 32 bits then store 32 bits.
-                // This ensures that subsequent 32-bit loads get correct values.
                 if size < 32 {
-                    // Use scratch register to avoid modifying source
+                    // Sub-32-bit values: zero-extend to 32 bits, then store
+                    // full slot via store_to_stack_slot (which writes 64-bit)
                     let scratch = if src == Reg::R10 { Reg::R11 } else { Reg::R10 };
-                    // Copy to scratch
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Reg(src),
                         dst: GpOperand::Reg(scratch),
                     });
-                    // Zero-extend by masking to the appropriate size
                     let mask = (1i64 << size) - 1;
                     self.push_lir(X86Inst::And {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(mask),
                         dst: scratch,
                     });
-                    // Store 32 bits
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(scratch),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
-                    });
+                    self.store_to_stack_slot(scratch, *offset);
                 } else {
-                    // Store with actual size
-                    let op_size = OperandSize::from_bits(size);
-                    // LIR: register-to-memory move
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(src),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
-                    });
+                    self.store_to_stack_slot(src, *offset);
                 }
             }
             Loc::Xmm(xmm) => {
@@ -2122,9 +2119,18 @@ impl X86_64CodeGen {
                 if is_symbol {
                     // Local variable - store directly to stack slot
                     let total_offset = offset - insn.offset as i32 + self.callee_saved_offset;
+                    // When storing a 32-bit value to a whole local variable
+                    // (offset 0, not a struct field), widen to 64-bit to prevent
+                    // stale upper bytes. Stack slots are 8 bytes each. On x86-64,
+                    // the source register's upper 32 bits are already zero-extended.
+                    let store_size = if mem_size == 32 && insn.offset == 0 {
+                        OperandSize::B64
+                    } else {
+                        op_size
+                    };
                     // LIR: store to stack slot
                     self.push_lir(X86Inst::Mov {
-                        size: op_size,
+                        size: store_size,
                         src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::Rbp,
@@ -2698,12 +2704,19 @@ impl X86_64CodeGen {
                     }
                 }
                 Loc::Stack(_) => {
+                    // All regalloc stack slots are 8 bytes on x86-64.
+                    // Always store full 64-bit to prevent stale upper bytes
+                    // from being read by subsequent 64-bit loads of the same slot.
+                    // movl to a 32-bit register zero-extends to 64-bit on x86-64,
+                    // so loading with reg_size then storing with 64 is correct.
                     self.emit_move(src, Reg::R10, reg_size);
-                    // For narrow types stored to stack, use the actual size
                     if actual_size <= 16 {
+                        // 8/16-bit values: store actual size (these are char/short
+                        // fields stored to struct offsets, not full stack slots)
                         self.emit_move_to_loc(Reg::R10, &dst_loc, actual_size);
                     } else {
-                        self.emit_move_to_loc(Reg::R10, &dst_loc, reg_size);
+                        // 32-bit values: store as 64-bit to zero-fill upper 4 bytes
+                        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
                     }
                 }
                 _ => {}

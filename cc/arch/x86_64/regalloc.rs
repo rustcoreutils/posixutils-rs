@@ -837,9 +837,11 @@ impl RegAlloc {
                         .insert(interval.pseudo, Loc::Stack(self.stack_offset));
                 }
             } else {
-                // Interval doesn't cross a call - prefer caller-saved registers
-                // to minimize callee-saved register usage and stack conflicts
-                // Also exclude registers that conflict with constraints
+                // Interval doesn't appear to cross a call. In functions WITH
+                // calls, prefer callee-saved registers to guard against
+                // under-estimated live intervals from complex control flow
+                // (e.g., switch/goto dispatch). In functions WITHOUT calls,
+                // prefer caller-saved to minimize callee-saved usage.
                 let reg_opt = if let Some(idx) = self
                     .free_regs
                     .iter()

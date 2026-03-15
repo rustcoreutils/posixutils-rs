@@ -61,6 +61,8 @@ pub struct X86_64CodeGen {
     pub(super) ld_constants: HashMap<u64, [u8; 16]>,
     /// Double constants to emit (label_bits -> f64 value)
     pub(super) double_constants: HashMap<u64, f64>,
+    /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
+    sym_type_sizes: HashMap<PseudoId, u32>,
 }
 
 impl X86_64CodeGen {
@@ -82,6 +84,7 @@ impl X86_64CodeGen {
             shared_mode: false,
             ld_constants: HashMap::new(),
             double_constants: HashMap::new(),
+            sym_type_sizes: HashMap::new(),
         }
     }
 
@@ -235,6 +238,17 @@ impl X86_64CodeGen {
         let mut alloc = RegAlloc::new();
         self.locations = alloc.allocate(func, types);
         self.pseudos = func.pseudos.clone();
+
+        // Build sym type size map for emit_store to distinguish struct fields from scalars
+        self.sym_type_sizes.clear();
+        for pseudo in &func.pseudos {
+            if let PseudoKind::Sym(name) = &pseudo.kind {
+                if let Some(local_var) = func.locals.get(name) {
+                    self.sym_type_sizes
+                        .insert(pseudo.id, types.size_bits(local_var.typ));
+                }
+            }
+        }
 
         let stack_size = alloc.stack_size();
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
@@ -2211,13 +2225,23 @@ impl X86_64CodeGen {
                 let op_size = OperandSize::from_bits(mem_size);
                 if is_symbol {
                     // Local variable - store directly to stack slot.
-                    // Always use the exact store size to avoid clobbering
-                    // adjacent struct fields (e.g., a 32-bit store at offset 0
-                    // must not widen to 64-bit and overwrite the field at offset 4).
+                    // Widen 32-bit stores at offset 0 to 64-bit ONLY for scalar
+                    // locals (type fits in 32 bits). For structs, the store at
+                    // offset 0 is a field store and must not clobber adjacent data.
                     let total_offset = offset - insn.offset as i32 + self.callee_saved_offset;
+                    let store_size = if mem_size == 32 && insn.offset == 0 {
+                        let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(32);
+                        if sym_bits <= 32 {
+                            OperandSize::B64 // scalar: safe to widen
+                        } else {
+                            op_size // struct field: exact size
+                        }
+                    } else {
+                        op_size
+                    };
                     // LIR: store to stack slot
                     self.push_lir(X86Inst::Mov {
-                        size: op_size,
+                        size: store_size,
                         src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::Rbp,

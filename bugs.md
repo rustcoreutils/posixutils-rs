@@ -29,8 +29,9 @@
 - **Remaining:** There may be more codegen paths that bypass these functions. The _bootstrap_python still segfaults after the marshal fix.
 - **Ideal fix:** Propagate type info through all codegen paths; ensure all stack slot writes go through `store_to_stack_slot()`.
 
-### BUG J: _bootstrap_python segfaults after loading importlib — INVESTIGATING
-- **Symptom:** After fixing Bug H (Zext), _bootstrap_python gets past the marshal parsing but segfaults during importlib module execution
-- **Next step:** Use gdb/valgrind to find the new crash location
+### BUG J: _bootstrap_python crashes in _Py_Instrument during config init — INVESTIGATING
+- **Symptom:** After fixing Bug H, _bootstrap_python gets past marshal parsing and into importlib execution, but hits "Unreachable C code path reached" in `_PyEval_EvalFrameDefault` then crashes in `_Py_Instrument` → `config_init_stdio_encoding` → `config_parse_cmdline`
+- **Valgrind:** "Invalid read of size 2" at address 0x0 (NULL dereference)
+- **Next step:** Debug with gdb, compare assembly for the crashing function with gcc output
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)

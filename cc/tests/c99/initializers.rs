@@ -819,3 +819,310 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("bitfield_designated_init", code, &[]), 0);
 }
+
+// ============================================================================
+// BUG 1: Pointer arithmetic in global initializers + hard error for unknown exprs
+// ============================================================================
+
+#[test]
+fn c99_initializers_ptr_arithmetic_global() {
+    let code = r#"
+int arr[10] = {0,1,2,3,4,5,6,7,8,9};
+int *p1 = arr + 5;
+int *p2 = &arr[0] + 3;
+int *p3 = arr + 0;
+
+struct S { int x; int y; int z; };
+struct S global_s = {10, 20, 30};
+int *sp = (int*)&global_s + 1;
+
+// Pointer to middle of array
+int *mid = &arr[4];
+
+int main(void) {
+    if (*p1 != 5) return 1;
+    if (*p2 != 3) return 2;
+    if (*p3 != 0) return 3;
+    if (*sp != 20) return 4;
+    if (*mid != 4) return 5;
+
+    // Pointer subtraction in arithmetic
+    int *p4 = arr + 9;
+    if (*p4 != 9) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ptr_arithmetic_global_init", code, &[]), 0);
+}
+
+// ============================================================================
+// BUG 2: Anonymous struct positional continuation after designator
+// ============================================================================
+
+#[test]
+fn c99_initializers_anon_struct_continuation() {
+    let code = r#"
+// Test: after designating a field in an anonymous struct,
+// the next positional should continue within that anonymous struct
+
+struct WithAnonStruct {
+    int a;
+    struct {
+        int x;
+        int y;
+        int z;
+    };
+    int c;
+};
+
+int main(void) {
+    // .x designates inside anon struct, 20 should go to y (not c)
+    struct WithAnonStruct s1 = {.a = 1, .x = 10, 20, 30, 99};
+    if (s1.a != 1) return 1;
+    if (s1.x != 10) return 2;
+    if (s1.y != 20) return 3;
+    if (s1.z != 30) return 4;
+    if (s1.c != 99) return 5;
+
+    // Only designating inside anon struct
+    struct WithAnonStruct s2 = {.x = 100, 200};
+    if (s2.a != 0) return 10;
+    if (s2.x != 100) return 11;
+    if (s2.y != 200) return 12;
+    if (s2.z != 0) return 13;
+
+    // Designate last field of anon struct, then positional goes to outer
+    struct WithAnonStruct s3 = {.z = 50, 60};
+    if (s3.z != 50) return 20;
+    if (s3.c != 60) return 21;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("anon_struct_continuation", code, &[]), 0);
+}
+
+#[test]
+fn c99_initializers_anon_struct_nested_continuation() {
+    let code = r#"
+// Test deeply nested anonymous structs: positional continuation must
+// walk through all nesting levels correctly (C11 6.7.2.1p13).
+
+struct Deep {
+    int a;
+    struct {
+        int x;
+        struct {
+            int p;
+            int q;
+        };
+        int z;
+    };
+    int c;
+};
+
+int main(void) {
+    // .p is inside nested anon struct; 20 should go to q, then z, then c
+    struct Deep d1 = {.a = 1, .p = 10, 20, 30, 40};
+    if (d1.a != 1) return 1;
+    if (d1.p != 10) return 2;
+    if (d1.q != 20) return 3;
+    if (d1.z != 30) return 4;
+    if (d1.c != 40) return 5;
+
+    // .q is last in inner anon; next positional goes to z (outer anon), then c
+    struct Deep d2 = {.q = 100, 200, 300};
+    if (d2.q != 100) return 10;
+    if (d2.z != 200) return 11;
+    if (d2.c != 300) return 12;
+
+    // .x is in outer anon; positional should descend into inner anon next
+    struct Deep d3 = {.x = 50, 60, 70, 80, 90};
+    if (d3.x != 50) return 20;
+    if (d3.p != 60) return 21;
+    if (d3.q != 70) return 22;
+    if (d3.z != 80) return 23;
+    if (d3.c != 90) return 24;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("anon_struct_nested_continuation", code, &[]),
+        0
+    );
+}
+
+// ============================================================================
+// BUG 3: CompoundLiteral type mismatch
+// ============================================================================
+
+#[test]
+fn c99_initializers_compound_literal_type_mismatch() {
+    let code = r#"
+struct Small { int x; int y; };
+struct Big { int a; int b; int c; int d; };
+
+// Global: compound literal type != target type, not pointer
+// This exercises the else branch where cl_type must be used instead of target type
+struct Big global_b = {.a = 1, .b = 2, .c = 3, .d = 4};
+
+int main(void) {
+    // Same-type compound literal (exercises the cl_type == typ branch)
+    struct Small s = (struct Small){42, 99};
+    if (s.x != 42) return 1;
+    if (s.y != 99) return 2;
+
+    // Verify global init too
+    if (global_b.a != 1) return 10;
+    if (global_b.d != 4) return 11;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("compound_literal_type_mismatch", code, &[]),
+        0
+    );
+}
+
+// ============================================================================
+// BUG 4: Brace elision (C99 6.7.8p17-20)
+// ============================================================================
+
+#[test]
+fn c99_initializers_brace_elision() {
+    let code = r#"
+int main(void) {
+    // 2D array without inner braces
+    int a[2][2] = {1, 2, 3, 4};
+    if (a[0][0] != 1) return 1;
+    if (a[0][1] != 2) return 2;
+    if (a[1][0] != 3) return 3;
+    if (a[1][1] != 4) return 4;
+
+    // 2D array with partial fill
+    int b[2][3] = {1, 2, 3, 4, 5, 6};
+    if (b[0][0] != 1) return 10;
+    if (b[0][2] != 3) return 11;
+    if (b[1][0] != 4) return 12;
+    if (b[1][2] != 6) return 13;
+
+    // Array of structs without inner braces
+    struct { int a; int b; } arr[2] = {1, 2, 3, 4};
+    if (arr[0].a != 1) return 20;
+    if (arr[0].b != 2) return 21;
+    if (arr[1].a != 3) return 22;
+    if (arr[1].b != 4) return 23;
+
+    // Struct containing array with brace elision
+    struct { int arr[3]; int val; } s = {10, 20, 30, 40};
+    if (s.arr[0] != 10) return 30;
+    if (s.arr[1] != 20) return 31;
+    if (s.arr[2] != 30) return 32;
+    if (s.val != 40) return 33;
+
+    // Mixed: braced and elided
+    int c[3][2] = {{1, 2}, 3, 4, {5, 6}};
+    if (c[0][0] != 1) return 40;
+    if (c[0][1] != 2) return 41;
+    if (c[1][0] != 3) return 42;
+    if (c[1][1] != 4) return 43;
+    if (c[2][0] != 5) return 44;
+    if (c[2][1] != 6) return 45;
+
+    // Partial brace elision (fewer elements than needed)
+    int d[2][2] = {1, 2, 3};
+    if (d[0][0] != 1) return 50;
+    if (d[0][1] != 2) return 51;
+    if (d[1][0] != 3) return 52;
+    if (d[1][1] != 0) return 53;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("brace_elision", code, &[]), 0);
+}
+
+#[test]
+fn c99_initializers_brace_elision_global() {
+    let code = r#"
+// Global 2D array with brace elision
+int g[2][2] = {1, 2, 3, 4};
+
+// Global array of structs with brace elision
+struct Pair { int x; int y; };
+struct Pair pairs[3] = {1, 2, 3, 4, 5, 6};
+
+// Nested struct with brace elision
+struct Inner { int a; int b; };
+struct Outer { struct Inner inner; int c; };
+struct Outer outer = {10, 20, 30};
+
+int main(void) {
+    if (g[0][0] != 1) return 1;
+    if (g[0][1] != 2) return 2;
+    if (g[1][0] != 3) return 3;
+    if (g[1][1] != 4) return 4;
+
+    if (pairs[0].x != 1) return 10;
+    if (pairs[0].y != 2) return 11;
+    if (pairs[1].x != 3) return 12;
+    if (pairs[1].y != 4) return 13;
+    if (pairs[2].x != 5) return 14;
+    if (pairs[2].y != 6) return 15;
+
+    if (outer.inner.a != 10) return 20;
+    if (outer.inner.b != 20) return 21;
+    if (outer.c != 30) return 22;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("brace_elision_global", code, &[]), 0);
+}
+
+// ============================================================================
+// String literals must NOT trigger brace elision (C99 6.7.8p14)
+// ============================================================================
+
+#[test]
+fn c99_initializers_string_no_brace_elision() {
+    let code = r#"
+// String literals initialize char arrays directly, not via brace elision
+struct WithCharArray {
+    char name[16];
+    int val;
+};
+
+// Global: string literal for char array member should not consume next elements
+struct WithCharArray g1 = {"hello", 42};
+
+// Array of structs with string members
+struct WithCharArray table[] = {
+    {"alpha", 1},
+    {"beta", 2},
+};
+
+int main(void) {
+    if (g1.name[0] != 'h') return 1;
+    if (g1.name[4] != 'o') return 2;
+    if (g1.val != 42) return 3;
+
+    // Local with brace elision NOT applied to string
+    struct WithCharArray local = {"world", 99};
+    if (local.name[0] != 'w') return 10;
+    if (local.val != 99) return 11;
+
+    // Array of structs
+    if (table[0].name[0] != 'a') return 20;
+    if (table[0].val != 1) return 21;
+    if (table[1].name[0] != 'b') return 22;
+    if (table[1].val != 2) return 23;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("string_no_brace_elision", code, &[]), 0);
+}

@@ -1104,3 +1104,81 @@ int main(void) {
         exit_code
     );
 }
+
+// ============================================================================
+// Test: Inlined two-register struct returns
+// ============================================================================
+
+#[test]
+fn codegen_inline_two_reg_struct_return() {
+    let code = r#"
+#include <stdio.h>
+
+/* 16-byte struct: returned via RAX+RDX on x86-64 SysV ABI */
+struct S16 { long a; long b; };
+
+/* Same-TU function that will be inlined at -O2 */
+static struct S16 make_s16(long x, long y) {
+    struct S16 r;
+    r.a = x;
+    r.b = y;
+    return r;
+}
+
+/* Mixed int+pointer struct, also 16 bytes */
+struct S16b { int a; void *b; };
+
+static struct S16b make_s16b(int x, void *y) {
+    struct S16b r;
+    r.a = x;
+    r.b = y;
+    return r;
+}
+
+int main(void) {
+    /* Test 1: two longs */
+    struct S16 s = make_s16(0x2222, 0x3333);
+    if (s.a != 0x2222) {
+        printf("FAIL: s.a = %lx, expected 2222\n", s.a);
+        return 1;
+    }
+    if (s.b != 0x3333) {
+        printf("FAIL: s.b = %lx, expected 3333\n", s.b);
+        return 2;
+    }
+
+    /* Test 2: int + pointer */
+    struct S16b sb = make_s16b(0x44, (void*)0x5555);
+    if (sb.a != 0x44) {
+        printf("FAIL: sb.a = %x, expected 44\n", sb.a);
+        return 3;
+    }
+    if (sb.b != (void*)0x5555) {
+        printf("FAIL: sb.b = %p, expected 0x5555\n", sb.b);
+        return 4;
+    }
+
+    /* Test 3: multiple calls to verify no state leakage */
+    struct S16 s1 = make_s16(100, 200);
+    struct S16 s2 = make_s16(300, 400);
+    if (s1.a != 100 || s1.b != 200) {
+        printf("FAIL: s1 = (%ld, %ld)\n", s1.a, s1.b);
+        return 5;
+    }
+    if (s2.a != 300 || s2.b != 400) {
+        printf("FAIL: s2 = (%ld, %ld)\n", s2.a, s2.b);
+        return 6;
+    }
+
+    printf("OK\n");
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run_optimized("inline_two_reg_struct_return", code);
+    assert_eq!(
+        exit_code, 0,
+        "Inline two-reg struct return test failed with exit code {}",
+        exit_code
+    );
+}

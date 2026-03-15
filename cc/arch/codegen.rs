@@ -273,7 +273,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         match init {
             Initializer::None => {
                 // Zero-fill
-                self.push_directive(Directive::Zero(size as u32));
+                self.push_directive(Directive::Zero(size));
             }
             Initializer::Int(val) => match size {
                 1 => self.push_directive(Directive::Byte(*val)),
@@ -299,7 +299,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // .ascii emits s.len() bytes; fill remaining with zeros
                 let bytes_emitted = s.len();
                 if size > bytes_emitted {
-                    self.push_directive(Directive::Zero((size - bytes_emitted) as u32));
+                    self.push_directive(Directive::Zero(size - bytes_emitted));
                 }
             }
             Initializer::WideString(s) => {
@@ -313,7 +313,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // Zero-fill remaining bytes if array is larger than string
                 let wide_string_bytes = (char_count + 1) * 4; // +1 for null terminator, 4 bytes each
                 if size > wide_string_bytes {
-                    self.push_directive(Directive::Zero((size - wide_string_bytes) as u32));
+                    self.push_directive(Directive::Zero(size - wide_string_bytes));
                 }
             }
             Initializer::Array {
@@ -327,7 +327,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 for (offset, elem_init) in elements {
                     // Zero-fill gap before this element
                     if *offset > current_offset {
-                        self.push_directive(Directive::Zero((*offset - current_offset) as u32));
+                        self.push_directive(Directive::Zero(*offset - current_offset));
                     }
 
                     // Emit element
@@ -337,7 +337,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
                 // Zero-fill remaining space
                 if *total_size > current_offset {
-                    self.push_directive(Directive::Zero((*total_size - current_offset) as u32));
+                    self.push_directive(Directive::Zero(*total_size - current_offset));
                 }
             }
             Initializer::Struct { total_size, fields } => {
@@ -347,7 +347,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 for (offset, field_size, field_init) in fields {
                     // Zero-fill gap before this field
                     if *offset > current_offset {
-                        self.push_directive(Directive::Zero((*offset - current_offset) as u32));
+                        self.push_directive(Directive::Zero(*offset - current_offset));
                     }
 
                     // Emit field
@@ -357,7 +357,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
                 // Zero-fill remaining space
                 if *total_size > current_offset {
-                    self.push_directive(Directive::Zero((*total_size - current_offset) as u32));
+                    self.push_directive(Directive::Zero(*total_size - current_offset));
                 }
             }
             Initializer::SymAddr(name) => {

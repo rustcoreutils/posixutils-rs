@@ -1008,9 +1008,16 @@ impl TypeTable {
             TypeKind::Float16 => 16 * multiplier,
             TypeKind::Pointer => self.pointer_width,
             TypeKind::Array => {
-                let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0);
-                let count = typ.array_size.unwrap_or(0) as u32;
-                elem_size * count
+                let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
+                let count = typ.array_size.unwrap_or(0) as u64;
+                let total = elem_size.saturating_mul(count);
+                if total > u32::MAX as u64 {
+                    // Array too large for u32 size_bits; cap at u32::MAX
+                    // (size_bytes via size_bits/8 still works for reasonable sizes)
+                    u32::MAX
+                } else {
+                    total as u32
+                }
             }
             TypeKind::Struct | TypeKind::Union => {
                 (typ.composite.as_ref().map(|c| c.size).unwrap_or(0) * 8) as u32

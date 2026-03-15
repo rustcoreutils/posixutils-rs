@@ -71,6 +71,40 @@ struct RawFieldInit {
     storage_unit_size: Option<u32>,
 }
 
+/// Result from member_index_for_designator indicating where positional
+/// initialization should continue after a designated field.
+enum MemberDesignatorResult {
+    /// Field found directly at outer level; next positional index is the value.
+    Direct(usize),
+    /// Field found inside an anonymous struct/union at `outer_idx`.
+    /// `levels` is the stack of nesting from outermost to innermost.
+    Anonymous {
+        outer_idx: usize,
+        levels: Vec<AnonLevel>,
+    },
+}
+
+/// One level of anonymous struct nesting for positional continuation.
+struct AnonLevel {
+    /// Type of this anonymous struct/union
+    anon_type: TypeId,
+    /// Byte offset of this anonymous struct within the top-level struct
+    base_offset: usize,
+    /// Next member index to consume within this anonymous struct
+    inner_next_idx: usize,
+}
+
+/// Tracks continuation state when a designator targeted a field inside
+/// an anonymous struct/union. Supports arbitrary nesting depth.
+/// The next positional element should continue from the innermost level,
+/// popping up through parent anonymous structs when each level is exhausted.
+struct AnonContinuation {
+    /// Index of the outermost anonymous struct in the top-level members array.
+    outer_idx: usize,
+    /// Stack of nesting levels from outermost to innermost.
+    levels: Vec<AnonLevel>,
+}
+
 /// Information about a static local variable
 #[derive(Clone)]
 struct StaticLocalInfo {
@@ -739,8 +773,8 @@ impl<'a> Linearizer<'a> {
                     // Return address of the anonymous global
                     Initializer::SymAddr(anon_name)
                 } else {
-                    // Type mismatch - try to use the initializer list directly
-                    self.ast_init_list_to_ir(elements, typ)
+                    // Type mismatch - use the compound literal's own type
+                    self.ast_init_list_to_ir(elements, *cl_type)
                 }
             }
 
@@ -770,16 +804,186 @@ impl<'a> Linearizer<'a> {
                 }
             }
 
-            // Binary/unary expressions and other constant expressions
-            // Try to evaluate as integer constant expression
+            // Binary add/sub with pointer operand → SymAddrOffset
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                left,
+                right,
+            } => {
+                // Try pointer/array + int or int + pointer/array → symbol address with offset
+                let is_ptr_or_array =
+                    |t: TypeId| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array);
+                let (ptr_expr, int_expr, is_sub) = if left.typ.is_some_and(is_ptr_or_array) {
+                    (left.as_ref(), right.as_ref(), *op == BinaryOp::Sub)
+                } else if right.typ.is_some_and(is_ptr_or_array) && *op == BinaryOp::Add {
+                    (right.as_ref(), left.as_ref(), false)
+                } else {
+                    // Neither operand is pointer — try as integer constant
+                    if let Some(val) = self.eval_const_expr(expr) {
+                        return Initializer::Int(val);
+                    }
+                    error(
+                        self.current_pos.unwrap_or_default(),
+                        &format!(
+                            "unsupported expression in global initializer: {:?}",
+                            expr.kind
+                        ),
+                    );
+                    return Initializer::None;
+                };
+
+                // Evaluate the pointer side as a static address
+                if let Some((name, base_off)) = self.eval_static_address(ptr_expr) {
+                    // Evaluate the integer side as a constant
+                    if let Some(int_val) = self.eval_const_expr(int_expr) {
+                        // Get the pointee size for pointer arithmetic scaling
+                        let pointee_size = ptr_expr
+                            .typ
+                            .and_then(|t| self.types.base_type(t))
+                            .map(|t| self.types.size_bytes(t) as i64)
+                            .unwrap_or(1);
+                        let byte_offset = if is_sub {
+                            base_off - int_val * pointee_size
+                        } else {
+                            base_off + int_val * pointee_size
+                        };
+                        if byte_offset == 0 {
+                            Initializer::SymAddr(name)
+                        } else {
+                            Initializer::SymAddrOffset(name, byte_offset)
+                        }
+                    } else if let Some(val) = self.eval_const_expr(expr) {
+                        Initializer::Int(val)
+                    } else {
+                        error(
+                            self.current_pos.unwrap_or_default(),
+                            "non-constant offset in pointer arithmetic initializer",
+                        );
+                        Initializer::None
+                    }
+                } else if let Some(val) = self.eval_const_expr(expr) {
+                    Initializer::Int(val)
+                } else {
+                    error(
+                        self.current_pos.unwrap_or_default(),
+                        "non-constant pointer expression in global initializer",
+                    );
+                    Initializer::None
+                }
+            }
+
+            // Other constant expressions
+            // Try to evaluate as integer or float constant expression
             _ => {
                 if let Some(val) = self.eval_const_expr(expr) {
                     Initializer::Int(val)
+                } else if let Some(val) = self.eval_const_float_expr(expr) {
+                    Initializer::Float(val)
                 } else {
+                    // Hard error for non-empty expressions we can't evaluate
+                    error(
+                        self.current_pos.unwrap_or_default(),
+                        &format!(
+                            "unsupported expression in global initializer: {:?}",
+                            expr.kind
+                        ),
+                    );
                     Initializer::None
                 }
             }
         }
+    }
+
+    /// Count the number of scalar fields needed to fill an aggregate type
+    /// (for brace elision per C99 6.7.8p17-20).
+    fn count_scalar_fields(&self, typ: TypeId) -> usize {
+        match self.types.kind(typ) {
+            TypeKind::Array => {
+                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                let count = self.types.get(typ).array_size.unwrap_or(0);
+                count * self.count_scalar_fields(elem_type)
+            }
+            TypeKind::Struct => {
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                    composite
+                        .members
+                        .iter()
+                        // Skip unnamed bitfield padding
+                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                        .map(|m| self.count_scalar_fields(m.typ))
+                        .sum()
+                } else {
+                    1
+                }
+            }
+            TypeKind::Union => {
+                // Union only initializes first named member
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                    composite
+                        .members
+                        .iter()
+                        .find(|m| m.name != StringId::EMPTY)
+                        .map(|m| self.count_scalar_fields(m.typ))
+                        .unwrap_or(1)
+                } else {
+                    1
+                }
+            }
+            _ => 1,
+        }
+    }
+
+    /// Check if brace elision applies: the element is a positional scalar targeting
+    /// an aggregate member, and is NOT a string literal initializing a char array
+    /// (C99 6.7.8p14: string literals are a special case for char arrays).
+    fn is_brace_elision_candidate(&self, element: &InitElement, target_type: TypeId) -> bool {
+        if !element.designators.is_empty() {
+            return false;
+        }
+        let target_is_aggregate = matches!(
+            self.types.kind(target_type),
+            TypeKind::Array | TypeKind::Struct | TypeKind::Union
+        );
+        if !target_is_aggregate {
+            return false;
+        }
+        // String/wide string literals can directly initialize char/wchar_t arrays
+        // without brace elision (C99 6.7.8p14)
+        if matches!(
+            element.value.kind,
+            ExprKind::InitList { .. } | ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+        ) {
+            return false;
+        }
+        true
+    }
+
+    /// Consume elements from `elements[elem_idx..]` via brace elision to fill
+    /// an aggregate `target_type`. Returns the collected sub-elements.
+    /// Advances `elem_idx` past the consumed elements.
+    fn consume_brace_elision(
+        &self,
+        elements: &[InitElement],
+        elem_idx: &mut usize,
+        target_type: TypeId,
+    ) -> Vec<InitElement> {
+        let n = self.count_scalar_fields(target_type);
+        let mut sub_elements = Vec::new();
+        let mut consumed = 0;
+        while consumed < n && *elem_idx < elements.len() {
+            let e = &elements[*elem_idx];
+            // Stop at designated elements (they apply to the current aggregate level)
+            if consumed > 0 && !e.designators.is_empty() {
+                break;
+            }
+            sub_elements.push(InitElement {
+                designators: vec![],
+                value: e.value.clone(),
+            });
+            *elem_idx += 1;
+            consumed += 1;
+        }
+        sub_elements
     }
 
     /// Convert an AST initializer list to an IR Initializer
@@ -791,13 +995,19 @@ impl<'a> Linearizer<'a> {
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                 let elem_size = (self.types.size_bits(elem_type) / 8) as usize;
+                let elem_is_aggregate = matches!(
+                    self.types.kind(elem_type),
+                    TypeKind::Array | TypeKind::Struct | TypeKind::Union
+                );
 
                 let mut init_elements = Vec::new();
                 let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
                 let mut element_indices: Vec<i64> = Vec::new();
                 let mut current_idx: i64 = 0;
+                let mut elem_idx = 0;
 
-                for element in elements {
+                while elem_idx < elements.len() {
+                    let element = &elements[elem_idx];
                     let mut index = None;
                     let mut index_pos = None;
                     for (pos, designator) in element.designators.iter().enumerate() {
@@ -822,6 +1032,20 @@ impl<'a> Linearizer<'a> {
                         None => element.designators.clone(),
                     };
 
+                    // Brace elision (C99 6.7.8p20): positional scalar for aggregate element
+                    if remaining_designators.is_empty()
+                        && self.is_brace_elision_candidate(element, elem_type)
+                    {
+                        let sub_elements =
+                            self.consume_brace_elision(elements, &mut elem_idx, elem_type);
+                        let entry = element_lists.entry(element_index).or_insert_with(|| {
+                            element_indices.push(element_index);
+                            Vec::new()
+                        });
+                        entry.extend(sub_elements);
+                        continue;
+                    }
+
                     let entry = element_lists.entry(element_index).or_insert_with(|| {
                         element_indices.push(element_index);
                         Vec::new()
@@ -833,6 +1057,7 @@ impl<'a> Linearizer<'a> {
                         } = &element.value.kind
                         {
                             entry.extend(nested_elements.clone());
+                            elem_idx += 1;
                             continue;
                         }
                     }
@@ -841,6 +1066,7 @@ impl<'a> Linearizer<'a> {
                         designators: remaining_designators,
                         value: element.value.clone(),
                     });
+                    elem_idx += 1;
                 }
 
                 element_indices.sort();
@@ -849,10 +1075,7 @@ impl<'a> Linearizer<'a> {
                         continue;
                     };
                     let offset = (element_index as usize) * elem_size;
-                    let elem_init = if matches!(
-                        self.types.kind(elem_type),
-                        TypeKind::Array | TypeKind::Struct | TypeKind::Union
-                    ) {
+                    let elem_init = if elem_is_aggregate {
                         self.ast_init_list_to_ir(list, elem_type)
                     } else if let Some(last) = list.last() {
                         self.ast_init_to_ir(&last.value, elem_type)
@@ -884,18 +1107,43 @@ impl<'a> Linearizer<'a> {
                     // (offset, field_size, init, bit_offset, bit_width, storage_unit_size)
                     let mut raw_fields: Vec<RawFieldInit> = Vec::new();
                     let mut current_field_idx = 0;
+                    let mut anon_cont: Option<AnonContinuation> = None;
+                    let mut elem_idx = 0;
 
-                    for element in elements {
+                    while elem_idx < elements.len() {
+                        let element = &elements[elem_idx];
                         if element.designators.is_empty() {
-                            let Some(member) = self.next_positional_member(
-                                members,
-                                is_union,
-                                &mut current_field_idx,
-                            ) else {
+                            // Check if we're continuing inside an anonymous struct
+                            let mut member = None;
+                            if anon_cont.is_some() {
+                                member = self.get_anon_continuation_member(
+                                    &mut anon_cont,
+                                    members,
+                                    &mut current_field_idx,
+                                );
+                            }
+                            if member.is_none() {
+                                member = self.next_positional_member(
+                                    members,
+                                    is_union,
+                                    &mut current_field_idx,
+                                );
+                            }
+                            let Some(member) = member else {
+                                elem_idx += 1;
                                 continue;
                             };
                             let field_size = (self.types.size_bits(member.typ) / 8) as usize;
-                            let field_init = self.ast_init_to_ir(&element.value, member.typ);
+                            // Brace elision: scalar for aggregate member
+                            let field_init = if self.is_brace_elision_candidate(element, member.typ)
+                            {
+                                let sub_elements =
+                                    self.consume_brace_elision(elements, &mut elem_idx, member.typ);
+                                self.ast_init_list_to_ir(&sub_elements, member.typ)
+                            } else {
+                                elem_idx += 1;
+                                self.ast_init_to_ir(&element.value, member.typ)
+                            };
                             raw_fields.push(RawFieldInit {
                                 offset: member.offset,
                                 field_size,
@@ -917,12 +1165,21 @@ impl<'a> Linearizer<'a> {
                             storage_unit_size,
                         }) = resolved
                         else {
+                            elem_idx += 1;
                             continue;
                         };
                         if let Some(Designator::Field(name)) = element.designators.first() {
-                            if let Some(next_idx) = self.member_index_for_designator(members, *name)
-                            {
-                                current_field_idx = next_idx;
+                            if let Some(result) = self.member_index_for_designator(members, *name) {
+                                match result {
+                                    MemberDesignatorResult::Direct(next_idx) => {
+                                        current_field_idx = next_idx;
+                                        anon_cont = None;
+                                    }
+                                    MemberDesignatorResult::Anonymous { outer_idx, levels } => {
+                                        current_field_idx = outer_idx;
+                                        anon_cont = Some(AnonContinuation { outer_idx, levels });
+                                    }
+                                }
                             }
                         }
                         let field_size = (self.types.size_bits(field_type) / 8) as usize;
@@ -935,6 +1192,7 @@ impl<'a> Linearizer<'a> {
                             bit_width,
                             storage_unit_size,
                         });
+                        elem_idx += 1;
                     }
 
                     // Sort fields by offset to ensure proper emission order
@@ -1148,14 +1406,102 @@ impl<'a> Linearizer<'a> {
         None
     }
 
+    /// Get the next positional member from an anonymous struct continuation.
+    /// Walks the stack of anonymous struct levels from innermost to outermost.
+    /// If the innermost level is exhausted, pops it and tries the next outer level.
+    /// When all levels are exhausted, clears the continuation and returns None.
+    fn get_anon_continuation_member(
+        &self,
+        cont: &mut Option<AnonContinuation>,
+        _outer_members: &[crate::types::StructMember],
+        current_field_idx: &mut usize,
+    ) -> Option<MemberInfo> {
+        let c = cont.as_mut()?;
+
+        loop {
+            let Some(level) = c.levels.last() else {
+                // All levels exhausted
+                *current_field_idx = c.outer_idx + 1;
+                *cont = None;
+                return None;
+            };
+            let anon_type_id = level.anon_type;
+            let base_offset = level.base_offset;
+            let mut idx = level.inner_next_idx;
+
+            let anon_type = self.types.get(anon_type_id);
+            let Some(composite) = anon_type.composite.as_ref() else {
+                c.levels.pop();
+                continue;
+            };
+            let members = composite.members.clone();
+
+            // Scan members at this level
+            let mut found_member = None;
+            let mut descend_into = None;
+
+            while idx < members.len() {
+                let inner = &members[idx];
+                // Skip unnamed bitfield padding
+                if inner.name == StringId::EMPTY && inner.bit_width.is_some() {
+                    idx += 1;
+                    continue;
+                }
+                // Nested anonymous aggregate — descend into it
+                if inner.name == StringId::EMPTY && inner.bit_width.is_none() {
+                    let inner_type = self.types.get(inner.typ);
+                    let is_nested_anon =
+                        matches!(inner_type.kind, TypeKind::Struct | TypeKind::Union)
+                            && inner_type
+                                .composite
+                                .as_ref()
+                                .is_some_and(|comp| comp.tag.is_none());
+                    if is_nested_anon {
+                        descend_into = Some((inner.typ, base_offset + inner.offset, idx + 1));
+                        break;
+                    }
+                }
+                // Found a valid named member
+                found_member = Some((idx + 1, inner.clone()));
+                break;
+            }
+
+            if let Some((next_idx, inner)) = found_member {
+                // Update the current level's index
+                c.levels.last_mut().unwrap().inner_next_idx = next_idx;
+                return Some(MemberInfo {
+                    offset: base_offset + inner.offset,
+                    typ: inner.typ,
+                    bit_offset: inner.bit_offset,
+                    bit_width: inner.bit_width,
+                    storage_unit_size: inner.storage_unit_size,
+                });
+            }
+
+            if let Some((nested_type, nested_offset, next_idx)) = descend_into {
+                // Advance past the anon struct at this level, then descend
+                c.levels.last_mut().unwrap().inner_next_idx = next_idx;
+                c.levels.push(AnonLevel {
+                    anon_type: nested_type,
+                    base_offset: nested_offset,
+                    inner_next_idx: 0,
+                });
+                continue;
+            }
+
+            // This level is exhausted — pop it
+            c.levels.pop();
+        }
+    }
+
     fn member_index_for_designator(
         &self,
         members: &[crate::types::StructMember],
         name: StringId,
-    ) -> Option<usize> {
+    ) -> Option<MemberDesignatorResult> {
         for (idx, member) in members.iter().enumerate() {
             if member.name == name {
-                return Some(idx + 1);
+                return Some(MemberDesignatorResult::Direct(idx + 1));
             }
             if member.name == StringId::EMPTY {
                 let member_type = self.types.get(member.typ);
@@ -1165,13 +1511,76 @@ impl<'a> Linearizer<'a> {
                             .composite
                             .as_ref()
                             .is_some_and(|composite| composite.tag.is_none());
-                if is_anon_aggregate && self.types.find_member(member.typ, name).is_some() {
-                    return Some(idx + 1);
+                if is_anon_aggregate {
+                    // Recursively search for the field, building the nesting path
+                    let mut path = Vec::new();
+                    if self.find_anon_field_path(member.typ, member.offset, name, &mut path) {
+                        return Some(MemberDesignatorResult::Anonymous {
+                            outer_idx: idx,
+                            levels: path,
+                        });
+                    }
                 }
             }
         }
 
         None
+    }
+
+    /// Recursively search for `name` inside an anonymous aggregate, building
+    /// the path of `AnonLevel`s needed for positional continuation.
+    /// Returns true if the field was found.
+    fn find_anon_field_path(
+        &self,
+        anon_type: TypeId,
+        base_offset: usize,
+        name: StringId,
+        path: &mut Vec<AnonLevel>,
+    ) -> bool {
+        let typ = self.types.get(anon_type);
+        let Some(composite) = typ.composite.as_ref() else {
+            return false;
+        };
+        for (inner_idx, inner_member) in composite.members.iter().enumerate() {
+            if inner_member.name == name {
+                // Found it directly at this level
+                path.push(AnonLevel {
+                    anon_type,
+                    base_offset,
+                    inner_next_idx: inner_idx + 1,
+                });
+                return true;
+            }
+            // Check if this is a nested anonymous aggregate
+            if inner_member.name == StringId::EMPTY {
+                let inner_type = self.types.get(inner_member.typ);
+                let is_nested_anon = matches!(inner_type.kind, TypeKind::Struct | TypeKind::Union)
+                    && inner_type
+                        .composite
+                        .as_ref()
+                        .is_some_and(|c| c.tag.is_none());
+                if is_nested_anon {
+                    // Push this level pointing PAST the nested anon struct.
+                    // The inner level handles continuation within the nested anon;
+                    // when it's exhausted, this level continues from the next member.
+                    path.push(AnonLevel {
+                        anon_type,
+                        base_offset,
+                        inner_next_idx: inner_idx + 1,
+                    });
+                    if self.find_anon_field_path(
+                        inner_member.typ,
+                        base_offset + inner_member.offset,
+                        name,
+                        path,
+                    ) {
+                        return true;
+                    }
+                    path.pop(); // not found in this branch
+                }
+            }
+        }
+        false
     }
 
     // ========================================================================
@@ -2224,11 +2633,17 @@ impl<'a> Linearizer<'a> {
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
                 let elem_size = self.types.size_bits(elem_type) / 8;
+                let elem_is_aggregate = matches!(
+                    self.types.kind(elem_type),
+                    TypeKind::Array | TypeKind::Struct | TypeKind::Union
+                );
                 let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
                 let mut element_indices: Vec<i64> = Vec::new();
                 let mut current_idx: i64 = 0;
+                let mut elem_idx = 0;
 
-                for element in elements.iter() {
+                while elem_idx < elements.len() {
+                    let element = &elements[elem_idx];
                     let mut index = None;
                     let mut index_pos = None;
                     for (pos, designator) in element.designators.iter().enumerate() {
@@ -2253,6 +2668,20 @@ impl<'a> Linearizer<'a> {
                         None => element.designators.clone(),
                     };
 
+                    // Brace elision: positional scalar for aggregate element type
+                    if remaining_designators.is_empty()
+                        && self.is_brace_elision_candidate(element, elem_type)
+                    {
+                        let sub_elements =
+                            self.consume_brace_elision(elements, &mut elem_idx, elem_type);
+                        let entry = element_lists.entry(element_index).or_insert_with(|| {
+                            element_indices.push(element_index);
+                            Vec::new()
+                        });
+                        entry.extend(sub_elements);
+                        continue;
+                    }
+
                     let entry = element_lists.entry(element_index).or_insert_with(|| {
                         element_indices.push(element_index);
                         Vec::new()
@@ -2264,6 +2693,7 @@ impl<'a> Linearizer<'a> {
                         } = &element.value.kind
                         {
                             entry.extend(nested_elements.clone());
+                            elem_idx += 1;
                             continue;
                         }
                     }
@@ -2272,6 +2702,7 @@ impl<'a> Linearizer<'a> {
                         designators: remaining_designators,
                         value: element.value.clone(),
                     });
+                    elem_idx += 1;
                 }
 
                 element_indices.sort();
@@ -2280,10 +2711,7 @@ impl<'a> Linearizer<'a> {
                         continue;
                     };
                     let offset = base_offset + element_index * elem_size as i64;
-                    if matches!(
-                        self.types.kind(elem_type),
-                        TypeKind::Array | TypeKind::Struct | TypeKind::Union
-                    ) {
+                    if elem_is_aggregate {
                         self.linearize_init_list_at_offset(base_sym, offset, elem_type, list);
                         continue;
                     }
@@ -2310,18 +2738,47 @@ impl<'a> Linearizer<'a> {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
                     let mut current_field_idx = 0;
+                    let mut anon_cont: Option<AnonContinuation> = None;
+                    let mut elem_idx = 0;
 
-                    for element in elements.iter() {
+                    while elem_idx < elements.len() {
+                        let element = &elements[elem_idx];
                         if element.designators.is_empty() {
-                            let Some(member) = self.next_positional_member(
-                                &members,
-                                is_union,
-                                &mut current_field_idx,
-                            ) else {
+                            // Check if we're continuing inside an anonymous struct
+                            let mut member = None;
+                            if anon_cont.is_some() {
+                                member = self.get_anon_continuation_member(
+                                    &mut anon_cont,
+                                    &members,
+                                    &mut current_field_idx,
+                                );
+                            }
+                            if member.is_none() {
+                                member = self.next_positional_member(
+                                    &members,
+                                    is_union,
+                                    &mut current_field_idx,
+                                );
+                            }
+                            let Some(member) = member else {
+                                elem_idx += 1;
                                 continue;
                             };
                             let offset = base_offset + member.offset as i64;
                             let field_type = member.typ;
+
+                            // Brace elision: scalar for aggregate member
+                            if self.is_brace_elision_candidate(element, field_type) {
+                                let sub_elements =
+                                    self.consume_brace_elision(elements, &mut elem_idx, field_type);
+                                self.linearize_init_list_at_offset(
+                                    base_sym,
+                                    offset,
+                                    field_type,
+                                    &sub_elements,
+                                );
+                                continue;
+                            }
 
                             // Check if this is a bitfield
                             if let (Some(bit_off), Some(bit_w), Some(storage_size)) = (
@@ -2355,6 +2812,7 @@ impl<'a> Linearizer<'a> {
                                     &element.value,
                                 );
                             }
+                            elem_idx += 1;
                             continue;
                         }
 
@@ -2368,13 +2826,22 @@ impl<'a> Linearizer<'a> {
                             storage_unit_size,
                         }) = resolved
                         else {
+                            elem_idx += 1;
                             continue;
                         };
                         if let Some(Designator::Field(name)) = element.designators.first() {
-                            if let Some(next_idx) =
-                                self.member_index_for_designator(&members, *name)
+                            if let Some(result) = self.member_index_for_designator(&members, *name)
                             {
-                                current_field_idx = next_idx;
+                                match result {
+                                    MemberDesignatorResult::Direct(next_idx) => {
+                                        current_field_idx = next_idx;
+                                        anon_cont = None;
+                                    }
+                                    MemberDesignatorResult::Anonymous { outer_idx, levels } => {
+                                        current_field_idx = outer_idx;
+                                        anon_cont = Some(AnonContinuation { outer_idx, levels });
+                                    }
+                                }
                             }
                         }
                         let offset = base_offset + offset as i64;
@@ -2409,6 +2876,7 @@ impl<'a> Linearizer<'a> {
                                 &element.value,
                             );
                         }
+                        elem_idx += 1;
                     }
                 }
             }
@@ -2983,6 +3451,40 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Evaluate a constant floating-point expression at compile time.
+    /// Handles float literals, negation, and binary arithmetic on floats.
+    fn eval_const_float_expr(&self, expr: &Expr) -> Option<f64> {
+        match &expr.kind {
+            ExprKind::FloatLit(v) => Some(*v),
+            ExprKind::IntLit(v) => Some(*v as f64),
+            ExprKind::CharLit(c) => Some(*c as i64 as f64),
+
+            ExprKind::Unary { op, operand } => {
+                let val = self.eval_const_float_expr(operand)?;
+                match op {
+                    UnaryOp::Neg => Some(-val),
+                    _ => None,
+                }
+            }
+
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_const_float_expr(left)?;
+                let r = self.eval_const_float_expr(right)?;
+                match op {
+                    BinaryOp::Add => Some(l + r),
+                    BinaryOp::Sub => Some(l - r),
+                    BinaryOp::Mul => Some(l * r),
+                    BinaryOp::Div => Some(l / r),
+                    _ => None,
+                }
+            }
+
+            ExprKind::Cast { expr: inner, .. } => self.eval_const_float_expr(inner),
+
+            _ => None,
+        }
+    }
+
     /// Evaluate a static address expression (for initializers like `&symbol.field`)
     ///
     /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
@@ -3015,8 +3517,16 @@ impl<'a> Linearizer<'a> {
             }
 
             // Arrow access: expr->member (pointer dereference + member access)
-            // This cannot be a static address (involves runtime pointer)
-            ExprKind::Arrow { .. } => None,
+            // Can be a static address when the pointer is a static address-of expression
+            // (e.g., (&static_struct.field)->subfield in CPython macros)
+            ExprKind::Arrow { expr: base, member } => {
+                let (name, base_offset) = self.eval_static_address(base)?;
+                let ptr_type = base.typ?;
+                let pointee_type = self.types.base_type(ptr_type)?;
+                let struct_type = self.resolve_struct_type(pointee_type);
+                let member_info = self.types.find_member(struct_type, *member)?;
+                Some((name, base_offset + member_info.offset as i64))
+            }
 
             // Array subscript: array[index]
             ExprKind::Index { array, index } => {
@@ -3034,10 +3544,53 @@ impl<'a> Linearizer<'a> {
                 Some((name, base_offset + idx * elem_size))
             }
 
+            // Address-of: &expr → same as evaluating expr as static address
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => self.eval_static_address(operand),
+
             // Cast - evaluate the inner expression
             ExprKind::Cast { expr: inner, .. } => self.eval_static_address(inner),
 
-            // Parenthesized expression (if there's such a variant)
+            // Binary add/sub with pointer operand: ptr + int or ptr - int
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                left,
+                right,
+            } => {
+                // Determine which side is the pointer and which is the integer
+                let (ptr_expr, int_expr, is_sub) = if left.typ.is_some_and(|t| {
+                    self.types.kind(t) == TypeKind::Pointer || self.types.kind(t) == TypeKind::Array
+                }) {
+                    (left.as_ref(), right.as_ref(), *op == BinaryOp::Sub)
+                } else if right.typ.is_some_and(|t| {
+                    self.types.kind(t) == TypeKind::Pointer || self.types.kind(t) == TypeKind::Array
+                }) && *op == BinaryOp::Add
+                {
+                    (right.as_ref(), left.as_ref(), false)
+                } else {
+                    return None;
+                };
+
+                let (name, base_offset) = self.eval_static_address(ptr_expr)?;
+                let int_val = self.eval_const_expr(int_expr)?;
+
+                // Scale by pointee size for pointer arithmetic
+                let pointee_size = ptr_expr
+                    .typ
+                    .and_then(|t| self.types.base_type(t))
+                    .map(|t| self.types.size_bytes(t) as i64)
+                    .unwrap_or(1);
+                let byte_offset = if is_sub {
+                    base_offset - int_val * pointee_size
+                } else {
+                    base_offset + int_val * pointee_size
+                };
+
+                Some((name, byte_offset))
+            }
+
             _ => None,
         }
     }
@@ -3183,11 +3736,13 @@ impl<'a> Linearizer<'a> {
                     self.emit(Instruction::load(pseudo, addr, 0, typ, size));
                 }
 
-                // Also add as input, using the SAME pseudo
+                // Also add as input, using the SAME pseudo and marking as matching
+                // the output. Per GCC convention, '+' creates one operand number
+                // shared by both output and input.
                 ir_inputs.push(AsmConstraint {
                     pseudo, // Same pseudo as output - ensures same register
                     name: name.clone(),
-                    matching_output: None,
+                    matching_output: Some(ir_outputs.len()), // matches the output about to be pushed
                     constraint: op.constraint.clone(),
                 });
             }

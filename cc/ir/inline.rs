@@ -398,20 +398,38 @@ fn clone_instruction(
         // Entry instruction: skip (caller already has its own)
         Opcode::Entry => vec![],
 
-        // Return instruction: convert to copy + branch to continuation
+        // Return instruction: convert to copy/stores + branch to continuation
         Opcode::Ret => {
             let mut result = Vec::new();
 
             // If returning a value, copy to return target
             if let Some(ret_val) = insn.src.first() {
                 if let Some(target) = ctx.return_target {
-                    let remapped_val = ctx.remap_pseudo(*ret_val, callee_pseudos);
-                    let mut copy_insn = Instruction::new(Opcode::Copy);
-                    copy_insn.target = Some(target);
-                    copy_insn.src = vec![remapped_val];
-                    copy_insn.typ = insn.typ;
-                    copy_insn.size = insn.size;
-                    result.push(copy_insn);
+                    if insn.is_two_reg_return && insn.src.len() >= 2 {
+                        // Two-register struct return: store both halves to the
+                        // result local. The target is a __2reg_N local symbol;
+                        // low half goes at offset 0, high half at offset 8.
+                        let remapped_low = ctx.remap_pseudo(insn.src[0], callee_pseudos);
+                        let remapped_high = ctx.remap_pseudo(insn.src[1], callee_pseudos);
+
+                        let mut store_low =
+                            Instruction::store(remapped_low, target, 0, insn.typ.unwrap_or(super::TypeId::INVALID), 64);
+                        store_low.pos = insn.pos;
+                        result.push(store_low);
+
+                        let mut store_high =
+                            Instruction::store(remapped_high, target, 8, insn.typ.unwrap_or(super::TypeId::INVALID), 64);
+                        store_high.pos = insn.pos;
+                        result.push(store_high);
+                    } else {
+                        let remapped_val = ctx.remap_pseudo(*ret_val, callee_pseudos);
+                        let mut copy_insn = Instruction::new(Opcode::Copy);
+                        copy_insn.target = Some(target);
+                        copy_insn.src = vec![remapped_val];
+                        copy_insn.typ = insn.typ;
+                        copy_insn.size = insn.size;
+                        result.push(copy_insn);
+                    }
                 }
             }
 

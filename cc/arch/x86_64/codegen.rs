@@ -2791,6 +2791,8 @@ impl X86_64CodeGen {
                     output_moves.push((idx, specific_reg, loc));
                 }
             } else {
+                let requires_reg =
+                    Self::constraint_requires_register(&output.constraint);
                 // No specific register - use allocated location
                 match loc {
                     Loc::Reg(r) => {
@@ -2810,6 +2812,29 @@ impl X86_64CodeGen {
                             operand_mem.push(None);
                             used_regs.insert(r);
                         }
+                    }
+                    Loc::Imm(_) if requires_reg => {
+                        // Constant-propagated value used as asm output.
+                        // Allocate temp register; after asm, the register holds the
+                        // modified value — update the location map directly.
+                        let temp = find_temp_reg(&reserved_regs, &used_regs);
+                        used_regs.insert(temp);
+                        operand_regs.push(Some(temp));
+                        operand_mem.push(None);
+                        // Don't add to output_moves (can't store to Imm).
+                        // Instead, update the pseudo's location to the temp reg after asm.
+                        self.locations.insert(output.pseudo, Loc::Reg(temp));
+                        pseudo_to_temp.insert(output.pseudo, temp);
+                    }
+                    _ if requires_reg => {
+                        // Constraint requires register but value is on stack/memory.
+                        // Allocate a temp register; move from temp to actual loc after asm.
+                        let temp = find_temp_reg(&reserved_regs, &used_regs);
+                        used_regs.insert(temp);
+                        operand_regs.push(Some(temp));
+                        operand_mem.push(None);
+                        output_moves.push((idx, temp, loc.clone()));
+                        pseudo_to_temp.insert(output.pseudo, temp);
                     }
                     _ => {
                         // Memory or other location - emit as memory operand
@@ -2840,6 +2865,20 @@ impl X86_64CodeGen {
                 (self.get_location(input.pseudo), &input.constraint)
             };
 
+            // Matching inputs from '+' constraints share the output's operand number
+            // (GCC: "+r" counts as two operands but uses one %N number).
+            // We DON'T push a new operand slot — the output's slot is reused.
+            // But we DO need to load the initial value into the output's register.
+            if let Some(match_idx) = input.matching_output {
+                if match_idx < num_outputs {
+                    if let Some(reg) = operand_regs[match_idx] {
+                        // Load initial value into the register before asm
+                        input_moves.push((reg, loc));
+                    }
+                    continue; // Skip — don't add a new operand slot
+                }
+            }
+
             operand_names.push(input.name.clone());
 
             // Check for specific register constraint
@@ -2861,8 +2900,29 @@ impl X86_64CodeGen {
                     // Add setup move to load value into temp
                     remap_setup.push((temp, temp, loc.clone()));
                 } else {
+                    let requires_reg =
+                        Self::constraint_requires_register(constraint_for_reg);
+                    let requires_mem =
+                        Self::constraint_requires_memory(constraint_for_reg);
                     // No specific register - use allocated location
                     match loc {
+                        Loc::Imm(_) if requires_mem => {
+                            // Memory constraint with constant address (may be dead code
+                            // from unoptimized switch on constant ORDER in atomic macros).
+                            // Load address into temp reg and emit as indirect memory ref.
+                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            used_regs.insert(temp);
+                            input_moves.push((temp, loc.clone()));
+                            let mem_str = format!("(%{})", self.reg_name_64(temp));
+                            operand_regs.push(None);
+                            operand_mem.push(Some(mem_str));
+                        }
+                        Loc::Reg(r) if requires_mem => {
+                            // Memory constraint with value in register — emit as indirect
+                            let mem_str = format!("(%{})", self.reg_name_64(r));
+                            operand_regs.push(None);
+                            operand_mem.push(Some(mem_str));
+                        }
                         Loc::Reg(r) => {
                             // Check if allocated reg conflicts with reserved
                             if reserved_regs.contains(&r) {
@@ -2883,6 +2943,15 @@ impl X86_64CodeGen {
                             // Immediate value
                             operand_regs.push(None);
                             operand_mem.push(Some(format!("${}", v)));
+                        }
+                        _ if requires_reg => {
+                            // Constraint requires register but value is on stack/memory.
+                            // Allocate a temp register and load value before asm.
+                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            used_regs.insert(temp);
+                            operand_regs.push(Some(temp));
+                            operand_mem.push(None);
+                            input_moves.push((temp, loc.clone()));
                         }
                         _ => {
                             // Memory or other location
@@ -3074,6 +3143,10 @@ impl X86_64CodeGen {
                     ))));
                 }
             }
+            Loc::Imm(_) => {
+                // Can't store to an immediate — this is dead code from
+                // unoptimized switch branches. Skip the store.
+            }
             _ => {
                 // Other locations - use generic string
                 let loc_str = self.loc_to_asm_string(loc);
@@ -3157,6 +3230,31 @@ impl X86_64CodeGen {
             }
         }
         None
+    }
+
+    /// Check if an inline asm constraint requires a register (not memory).
+    /// 'r' = general register, specific letter = specific register.
+    fn constraint_requires_register(constraint: &str) -> bool {
+        for c in constraint.chars() {
+            match c {
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => return true,
+                '=' | '+' | '&' | '%' => continue, // skip modifiers
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Check if an inline asm constraint requires a memory operand.
+    fn constraint_requires_memory(constraint: &str) -> bool {
+        for c in constraint.chars() {
+            match c {
+                'm' | 'o' | 'V' => return true,
+                '=' | '+' | '&' | '%' => continue,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Substitute %0, %1, %[name], %l0, %l[name], etc. with actual operand strings

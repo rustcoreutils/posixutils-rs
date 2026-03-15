@@ -484,7 +484,7 @@ pub enum Directive {
     // Data Emission
     // ========================================================================
     /// .zero N - emit N zero bytes
-    Zero(u32),
+    Zero(usize),
 
     /// .byte value - emit 8-bit value
     Byte(i64),

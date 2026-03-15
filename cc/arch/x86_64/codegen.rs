@@ -996,10 +996,10 @@ impl X86_64CodeGen {
             Opcode::Switch => {
                 // Switch uses target as the value to switch on
                 if let Some(val) = insn.target {
-                    let size = insn.size.max(32);
-                    let op_size = OperandSize::from_bits(size);
-                    // Move switch value to R10 (scratch register)
-                    self.emit_move(val, Reg::R10, size);
+                    // Load at actual size so emit_move uses zero-extending load
+                    // for sub-32-bit types (e.g., uint8_t). Then compare at 32-bit.
+                    self.emit_move(val, Reg::R10, insn.size);
+                    let op_size = OperandSize::B32;
 
                     // Generate comparisons for each case
                     for (case_val, target_bb) in &insn.switch_cases {

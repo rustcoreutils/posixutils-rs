@@ -29,9 +29,9 @@
 - **Remaining:** There may be more codegen paths that bypass these functions. The _bootstrap_python still segfaults after the marshal fix.
 - **Ideal fix:** Propagate type info through all codegen paths; ensure all stack slot writes go through `store_to_stack_slot()`.
 
-### BUG J: _bootstrap_python crashes in _Py_Instrument during config init — INVESTIGATING
-- **Symptom:** After fixing Bug H, _bootstrap_python gets past marshal parsing and into importlib execution, but hits "Unreachable C code path reached" in `_PyEval_EvalFrameDefault` then crashes in `_Py_Instrument` → `config_init_stdio_encoding` → `config_parse_cmdline`
-- **Valgrind:** "Invalid read of size 2" at address 0x0 (NULL dereference)
-- **Next step:** Debug with gdb, compare assembly for the crashing function with gcc output
+### BUG J: _bootstrap_python segfaults in _PyDict_GetItemWithError during LOAD_BUILD_CLASS — INVESTIGATING
+- **Symptom:** After fixing Bugs H+I, _bootstrap_python loads frozen importlib, starts executing bytecode, then segfaults in `_PyDict_GetItemWithError(BUILTINS(), &_Py_ID(__build_class__))` from `LOAD_BUILD_CLASS` instruction at `bytecodes.c:989`
+- **Likely cause:** Dict or builtins pointer corruption from pcc codegen. May be another instance of Bug I (stale stack bytes) or a new type of codegen bug.
+- **Next step:** Check if `BUILTINS()` returns valid data; use valgrind to find the corruption source
 
 ### BUGs 1-6: Initializer bugs (ALL FIXED)

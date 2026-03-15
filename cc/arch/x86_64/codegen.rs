@@ -2698,22 +2698,12 @@ impl X86_64CodeGen {
                     }
                 }
                 Loc::Stack(_) => {
-                    // On x86-64, stack slots are 8 bytes. When storing a value
-                    // narrower than 64 bits, we must write the full 64-bit slot
-                    // to avoid leaving uninitialized upper bytes that could be
-                    // read by a subsequent 64-bit load (e.g., when a 32-bit int
-                    // value is later used as a 64-bit Py_ssize_t after inlining).
-                    //
-                    // movl %r10d, %r10d  zero-extends to 64-bit on x86-64,
-                    // so loading with reg_size and storing with 64 is correct.
                     self.emit_move(src, Reg::R10, reg_size);
-                    // For narrow types (8/16-bit), use actual size to avoid
-                    // clobbering adjacent stack data
+                    // For narrow types stored to stack, use the actual size
                     if actual_size <= 16 {
                         self.emit_move_to_loc(Reg::R10, &dst_loc, actual_size);
                     } else {
-                        // For 32-bit values, store as 64-bit to zero-fill upper bytes
-                        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+                        self.emit_move_to_loc(Reg::R10, &dst_loc, reg_size);
                     }
                 }
                 _ => {}

@@ -5130,13 +5130,23 @@ impl<'a> Linearizer<'a> {
             (result, Vec::new(), Vec::new())
         };
 
+        // Get formal parameter types for implicit widening conversions.
+        // When a narrow int (e.g., int) is passed to a wider parameter (e.g., long),
+        // C requires implicit promotion. This is transparent for non-inlined calls
+        // (the ABI handles it), but inlining exposes the mismatch since the argument
+        // pseudo is used directly without conversion.
+        let formal_param_types: Option<Vec<TypeId>> = func_expr.typ.and_then(|ft_id| {
+            let ft = self.types.get(ft_id);
+            ft.params.clone()
+        });
+
         // Linearize regular arguments
         // For large structs, pass by reference (address) instead of by value
         // Note: We pass structs > 64 bits by reference. While the ABI allows
         // two-register passing for 9-16 byte structs, we don't implement that yet.
         // For complex types, pass address so codegen can load real/imag into XMM registers
         // For arrays (including VLAs), decay to pointer
-        for a in args.iter() {
+        for (arg_idx, a) in args.iter().enumerate() {
             let arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
@@ -5169,8 +5179,31 @@ impl<'a> Linearizer<'a> {
                 arg_types_vec.push(self.types.pointer_to(arg_type));
                 self.linearize_expr(a)
             } else {
+                let mut val = self.linearize_expr(a);
+
+                // Implicit integer widening: if the actual argument is narrower
+                // than the formal parameter (e.g., int passed to Py_ssize_t/long),
+                // insert a sign/zero extension. This is needed for correct behavior
+                // when the function is later inlined — without it, the 32-bit pseudo
+                // would be used in 64-bit contexts with uninitialized upper bits.
+                if let Some(ref params) = formal_param_types {
+                    if arg_idx < params.len() {
+                        let param_type = params[arg_idx];
+                        let arg_size = self.types.size_bits(arg_type);
+                        let param_size = self.types.size_bits(param_type);
+                        if arg_size < param_size
+                            && arg_size <= 32
+                            && param_size <= 64
+                            && self.types.is_integer(arg_type)
+                            && self.types.is_integer(param_type)
+                        {
+                            val = self.emit_convert(val, arg_type, param_type);
+                        }
+                    }
+                }
+
                 arg_types_vec.push(arg_type);
-                self.linearize_expr(a)
+                val
             };
             arg_vals.push(arg_val);
         }
@@ -8612,12 +8645,13 @@ impl<'a> Linearizer<'a> {
             return real; // Return real part as the result value
         }
 
-        // For large struct/union assignment (> 64 bits), do a block copy
-        // Similar to complex type handling - get addresses and copy in chunks
+        // For struct/union assignment, do a block copy via addresses.
+        // Structs are not loaded into registers by linearize_expr — they return
+        // an address. So we must handle ALL struct sizes here, not just large ones.
         let target_kind = self.types.kind(target_typ);
         let target_size = self.types.size_bits(target_typ);
         if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
-            && target_size > 64
+            && target_size > 0
             && op == AssignOp::Assign
         {
             let target_addr = self.linearize_lvalue(target);

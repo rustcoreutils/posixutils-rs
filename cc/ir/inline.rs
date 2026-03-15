@@ -412,13 +412,23 @@ fn clone_instruction(
                         let remapped_low = ctx.remap_pseudo(insn.src[0], callee_pseudos);
                         let remapped_high = ctx.remap_pseudo(insn.src[1], callee_pseudos);
 
-                        let mut store_low =
-                            Instruction::store(remapped_low, target, 0, insn.typ.unwrap_or(super::TypeId::INVALID), 64);
+                        let mut store_low = Instruction::store(
+                            remapped_low,
+                            target,
+                            0,
+                            insn.typ.unwrap_or(super::TypeId::INVALID),
+                            64,
+                        );
                         store_low.pos = insn.pos;
                         result.push(store_low);
 
-                        let mut store_high =
-                            Instruction::store(remapped_high, target, 8, insn.typ.unwrap_or(super::TypeId::INVALID), 64);
+                        let mut store_high = Instruction::store(
+                            remapped_high,
+                            target,
+                            8,
+                            insn.typ.unwrap_or(super::TypeId::INVALID),
+                            64,
+                        );
                         store_high.pos = insn.pos;
                         result.push(store_high);
                     } else {

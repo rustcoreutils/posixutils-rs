@@ -11,7 +11,7 @@
 // Consolidates: optimization, debug tests
 //
 
-use crate::common::{compile_and_run_optimized, create_c_file};
+use crate::common::{compile_and_run, compile_and_run_optimized, create_c_file};
 use plib::testing::run_test_base;
 use std::io::Write;
 use std::process::Command;
@@ -1179,6 +1179,151 @@ int main(void) {
     assert_eq!(
         exit_code, 0,
         "Inline two-reg struct return test failed with exit code {}",
+        exit_code
+    );
+}
+
+// ============================================================================
+// Test: Large struct parameter ABI (> 16 bytes passed by value on stack)
+// ============================================================================
+
+#[test]
+fn codegen_large_struct_param_abi() {
+    let code = r#"
+#include <stdio.h>
+#include <string.h>
+
+/* 32-byte struct: must be passed by value on the stack per SysV AMD64 ABI */
+struct Big {
+    long a;
+    long b;
+    long c;
+    long d;
+};
+
+/* 24-byte struct */
+struct Medium {
+    long x;
+    long y;
+    long z;
+};
+
+/* 40-byte struct */
+struct Bigger {
+    long v[5];
+};
+
+/* --- Section 1: Basic large struct parameter passing --- */
+
+int check_big(struct Big s) {
+    if (s.a != 10) return 1;
+    if (s.b != 20) return 2;
+    if (s.c != 30) return 3;
+    if (s.d != 40) return 4;
+    return 0;
+}
+
+int check_medium(struct Medium s) {
+    if (s.x != 100) return 5;
+    if (s.y != 200) return 6;
+    if (s.z != 300) return 7;
+    return 0;
+}
+
+int check_bigger(struct Bigger s) {
+    if (s.v[0] != 1) return 8;
+    if (s.v[1] != 2) return 9;
+    if (s.v[2] != 3) return 10;
+    if (s.v[3] != 4) return 11;
+    if (s.v[4] != 5) return 12;
+    return 0;
+}
+
+/* --- Section 2: Large struct with other args (register pressure) --- */
+
+int check_big_with_int(int before, struct Big s, int after) {
+    if (before != 99) return 13;
+    if (s.a != 10) return 14;
+    if (s.b != 20) return 15;
+    if (s.c != 30) return 16;
+    if (s.d != 40) return 17;
+    if (after != 77) return 18;
+    return 0;
+}
+
+/* --- Section 3: Multiple large struct params --- */
+
+int check_two_bigs(struct Big s1, struct Big s2) {
+    if (s1.a != 1) return 19;
+    if (s1.d != 4) return 20;
+    if (s2.a != 5) return 21;
+    if (s2.d != 8) return 22;
+    return 0;
+}
+
+/* --- Section 4: Large struct return + parameter (sret + stack param) --- */
+
+struct Big make_and_check(struct Big input) {
+    struct Big result;
+    result.a = input.a + 1;
+    result.b = input.b + 1;
+    result.c = input.c + 1;
+    result.d = input.d + 1;
+    return result;
+}
+
+/* --- Section 5: Nested call with large struct --- */
+
+int nested_check(struct Big s) {
+    return check_big(s);
+}
+
+int main(void) {
+    int rc;
+
+    /* Section 1: Basic */
+    struct Big b = {10, 20, 30, 40};
+    rc = check_big(b);
+    if (rc) return rc;
+
+    struct Medium m = {100, 200, 300};
+    rc = check_medium(m);
+    if (rc) return rc;
+
+    struct Bigger bg = {{1, 2, 3, 4, 5}};
+    rc = check_bigger(bg);
+    if (rc) return rc;
+
+    /* Section 2: Mixed with int args */
+    rc = check_big_with_int(99, b, 77);
+    if (rc) return rc;
+
+    /* Section 3: Multiple large structs */
+    struct Big b1 = {1, 2, 3, 4};
+    struct Big b2 = {5, 6, 7, 8};
+    rc = check_two_bigs(b1, b2);
+    if (rc) return rc;
+
+    /* Section 4: Return + parameter */
+    struct Big b3 = make_and_check(b);
+    if (b3.a != 11) return 23;
+    if (b3.b != 21) return 24;
+    if (b3.c != 31) return 25;
+    if (b3.d != 41) return 26;
+
+    /* Section 5: Nested call */
+    rc = nested_check(b);
+    if (rc) return rc + 26;
+
+    printf("OK\n");
+    return 0;
+}
+"#;
+
+    let exit_code = compile_and_run("large_struct_param_abi", code, &[]);
+    assert_eq!(
+        exit_code, 0,
+        "Large struct param ABI test failed with exit code {}",
         exit_code
     );
 }

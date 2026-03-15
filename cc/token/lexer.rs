@@ -745,13 +745,13 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     /// Skip a block comment (/* ... */)
     fn skip_block_comment(&mut self) {
         let pos = self.pos(); // Save position for warning
-        // Save newline state before the comment and restore it after.
-        // This matches sparse's drop_stream_comment() behavior:
-        // a comment is transparent to newline tracking, so the token
-        // after the comment inherits the newline flag from before it.
-        // This prevents multi-line comments inside macros from breaking
-        // the EOL boundary, while also preserving start-of-line status
-        // for tokens that follow a comment at the beginning of a line.
+                              // Save newline state before the comment and restore it after.
+                              // This matches sparse's drop_stream_comment() behavior:
+                              // a comment is transparent to newline tracking, so the token
+                              // after the comment inherits the newline flag from before it.
+                              // This prevents multi-line comments inside macros from breaking
+                              // the EOL boundary, while also preserving start-of-line status
+                              // for tokens that follow a comment at the beginning of a line.
         let saved_newline = self.newline;
         let mut next = self.nextchar();
         loop {

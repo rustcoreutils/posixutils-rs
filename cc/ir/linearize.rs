@@ -1800,16 +1800,48 @@ impl<'a> Linearizer<'a> {
             }
 
             let typ_size = self.types.size_bits(typ);
-            // For large structs (> 64 bits), arg_pseudo is a pointer to the struct
-            // We need to copy the data from that pointer to local storage
-            // Note: We receive struct parameters > 64 bits as pointers, even though
-            // the ABI allows two-register passing for 9-16 byte structs.
-            if typ_size > 64 {
-                // arg_pseudo is a pointer - copy each 8-byte chunk
+            if typ_size > 128 {
+                // Large struct (> 16 bytes): passed by value on the stack per SysV AMD64 ABI.
+                // arg_pseudo is an IncomingArg pointing to the struct data on the stack.
+                // Use SymAddr to get the base address, then copy each 8-byte chunk.
+                let ptr_type = self.types.pointer_to(typ);
+                let addr_pseudo = self.alloc_pseudo();
+                let addr_pseudo_obj = Pseudo::reg(addr_pseudo, addr_pseudo.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(addr_pseudo_obj);
+                }
+                self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
+
                 let struct_size = typ_size / 8;
                 let mut offset = 0i64;
                 while offset < struct_size as i64 {
-                    // Load 8 bytes from arg_pseudo + offset
+                    let temp = self.alloc_pseudo();
+                    let temp_pseudo = Pseudo::reg(temp, temp.0);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(temp_pseudo);
+                    }
+                    self.emit(Instruction::load(
+                        temp,
+                        addr_pseudo,
+                        offset,
+                        self.types.long_id,
+                        64,
+                    ));
+                    self.emit(Instruction::store(
+                        temp,
+                        local_sym,
+                        offset,
+                        self.types.long_id,
+                        64,
+                    ));
+                    offset += 8;
+                }
+            } else if typ_size > 64 {
+                // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
+                // Copy each 8-byte chunk through pointer dereference.
+                let struct_size = typ_size / 8;
+                let mut offset = 0i64;
+                while offset < struct_size as i64 {
                     let temp = self.alloc_pseudo();
                     let temp_pseudo = Pseudo::reg(temp, temp.0);
                     if let Some(func) = &mut self.current_func {
@@ -1822,7 +1854,6 @@ impl<'a> Linearizer<'a> {
                         self.types.long_id,
                         64,
                     ));
-                    // Store to local_sym + offset
                     self.emit(Instruction::store(
                         temp,
                         local_sym,
@@ -5184,9 +5215,17 @@ impl<'a> Linearizer<'a> {
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
                 && self.types.size_bits(arg_type) > 64
             {
-                // Large struct: pass address instead of value
-                // The argument type becomes a pointer
-                arg_types_vec.push(self.types.pointer_to(arg_type));
+                let size_bits = self.types.size_bits(arg_type);
+                if size_bits > 128 {
+                    // Large struct (> 16 bytes): keep struct type so ABI classifies as
+                    // Indirect/MEMORY. The pseudo is still the struct's address;
+                    // codegen will copy bytes to the stack.
+                    arg_types_vec.push(arg_type);
+                } else {
+                    // Medium struct (9-16 bytes): pass as pointer
+                    // (2-register passing not yet implemented)
+                    arg_types_vec.push(self.types.pointer_to(arg_type));
+                }
                 self.linearize_lvalue(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers

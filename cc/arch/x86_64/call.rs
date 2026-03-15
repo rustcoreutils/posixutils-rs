@@ -35,6 +35,9 @@ impl X86_64CodeGen {
         let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
         let mut temp_int_idx = 0;
         let mut temp_fp_idx = 0;
+        // Track total stack qwords for correct 16-byte alignment calculation.
+        // Large structs and long doubles occupy multiple qwords.
+        let mut total_stack_qwords: usize = 0;
 
         let abi_info = insn
             .abi_info
@@ -50,8 +53,9 @@ impl X86_64CodeGen {
                 .is_some_and(|&ty| types.kind(ty) == TypeKind::LongDouble);
 
             if is_longdouble {
-                // Long double is always passed on the stack by value
+                // Long double is always passed on the stack by value (16 bytes = 2 qwords)
                 stack_arg_indices.push(i);
+                total_stack_qwords += 2;
                 continue;
             }
 
@@ -67,21 +71,23 @@ impl X86_64CodeGen {
 
                     if !has_gp || !has_fp {
                         stack_arg_indices.push(i);
+                        total_stack_qwords += 1;
                     }
                     temp_int_idx += gp_needed;
                     temp_fp_idx += fp_needed;
                 }
-                ArgClass::Indirect { .. } => {
-                    // Indirect arguments are passed as pointers (one GP register)
-                    if temp_int_idx >= int_arg_regs.len() {
-                        stack_arg_indices.push(i);
-                    }
-                    temp_int_idx += 1;
+                ArgClass::Indirect { size_bits, .. } => {
+                    // Large struct parameters (> 16 bytes): passed by value on the stack
+                    // per SysV AMD64 ABI MEMORY class. Always a stack arg — never in
+                    // a register. Don't consume a GP register.
+                    stack_arg_indices.push(i);
+                    total_stack_qwords += (*size_bits as usize).div_ceil(64);
                 }
                 ArgClass::Extend { .. } => {
                     // Extended small integers use one GP register
                     if temp_int_idx >= int_arg_regs.len() {
                         stack_arg_indices.push(i);
+                        total_stack_qwords += 1;
                     }
                     temp_int_idx += 1;
                 }
@@ -89,6 +95,7 @@ impl X86_64CodeGen {
                     // HFA uses FP registers (primarily AArch64, but handle for completeness)
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
                         stack_arg_indices.push(i);
+                        total_stack_qwords += 1;
                     }
                     temp_fp_idx += *count as usize;
                 }
@@ -103,7 +110,7 @@ impl X86_64CodeGen {
             }
         }
 
-        let needs_padding = stack_arg_indices.len() % 2 == 1;
+        let needs_padding = total_stack_qwords % 2 == 1;
 
         CallArgInfo {
             stack_arg_indices,
@@ -185,6 +192,34 @@ impl X86_64CodeGen {
                     }),
                 });
             } else {
+                // Check if this is a large struct arg (> 16 bytes, MEMORY class)
+                let is_large_struct = arg_type.is_some_and(|t| {
+                    let k = types.kind(t);
+                    (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) > 128
+                });
+                if is_large_struct {
+                    // Large struct: arg pseudo is the struct's ADDRESS. Copy all
+                    // qwords to the stack in reverse order (stack grows down).
+                    let struct_bytes =
+                        arg_type.map(|t| types.size_bits(t) / 8).unwrap_or(8) as usize;
+                    let num_qwords = struct_bytes.div_ceil(8);
+                    self.emit_move(arg, Reg::R11, 64); // Load struct base address
+                    for q in (0..num_qwords).rev() {
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::R11,
+                                offset: (q * 8) as i32,
+                            }),
+                            dst: GpOperand::Reg(Reg::Rax),
+                        });
+                        self.push_lir(X86Inst::Push {
+                            src: GpOperand::Reg(Reg::Rax),
+                        });
+                    }
+                    stack_args += num_qwords;
+                    continue;
+                }
                 let arg_size = if let Some(typ) = arg_type {
                     types.size_bits(typ).max(32)
                 } else {

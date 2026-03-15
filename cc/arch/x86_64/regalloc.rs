@@ -587,17 +587,30 @@ impl RegAlloc {
                             }
                             fp_arg_idx += 1;
                         } else {
-                            if int_arg_idx < int_arg_regs.len() {
+                            let type_size = types.size_bits(*typ);
+                            let is_large_struct = (types.kind(*typ)
+                                == crate::types::TypeKind::Struct
+                                || types.kind(*typ) == crate::types::TypeKind::Union)
+                                && type_size > 128;
+                            if is_large_struct {
+                                // Large struct (> 16 bytes): always passed on stack per
+                                // SysV AMD64 ABI. Advance by full struct size.
+                                self.locations
+                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                                stack_arg_offset += (type_size / 8) as i32;
+                                // Don't increment int_arg_idx — no GP register consumed
+                            } else if int_arg_idx < int_arg_regs.len() {
                                 self.locations
                                     .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
                                 self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
+                                int_arg_idx += 1;
                             } else {
                                 // Stack args are placed in parameter order per System V AMD64 ABI
                                 self.locations
                                     .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
                                 stack_arg_offset += 8;
+                                int_arg_idx += 1;
                             }
-                            int_arg_idx += 1;
                         }
                         break;
                     }

@@ -518,6 +518,17 @@ impl X86_64CodeGen {
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     if arg_idx == (i as u32) + arg_idx_offset {
+                        // Large struct params (> 16 bytes) are passed on the stack
+                        // and don't use GP registers — skip them entirely.
+                        let type_size_bits = types.size_bits(*typ);
+                        let is_large_struct_param = (types.kind(*typ)
+                            == crate::types::TypeKind::Struct
+                            || types.kind(*typ) == crate::types::TypeKind::Union)
+                            && type_size_bits > 128;
+                        if is_large_struct_param {
+                            break;
+                        }
+
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
                             // Still need to count this arg for register assignment tracking
@@ -1294,6 +1305,16 @@ impl X86_64CodeGen {
                                 addr: MemAddr::BaseOffset {
                                     base: Reg::Rbp,
                                     offset: -adjusted,
+                                },
+                                dst: dst_reg,
+                            });
+                        }
+                        Loc::IncomingArg(offset) => {
+                            // Get address of incoming stack argument (e.g., large struct param)
+                            self.push_lir(X86Inst::Lea {
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::Rbp,
+                                    offset,
                                 },
                                 dst: dst_reg,
                             });
@@ -2189,20 +2210,14 @@ impl X86_64CodeGen {
 
                 let op_size = OperandSize::from_bits(mem_size);
                 if is_symbol {
-                    // Local variable - store directly to stack slot
+                    // Local variable - store directly to stack slot.
+                    // Always use the exact store size to avoid clobbering
+                    // adjacent struct fields (e.g., a 32-bit store at offset 0
+                    // must not widen to 64-bit and overwrite the field at offset 4).
                     let total_offset = offset - insn.offset as i32 + self.callee_saved_offset;
-                    // When storing a 32-bit value to a whole local variable
-                    // (offset 0, not a struct field), widen to 64-bit to prevent
-                    // stale upper bytes. Stack slots are 8 bytes each. On x86-64,
-                    // the source register's upper 32 bits are already zero-extended.
-                    let store_size = if mem_size == 32 && insn.offset == 0 {
-                        OperandSize::B64
-                    } else {
-                        op_size
-                    };
                     // LIR: store to stack slot
                     self.push_lir(X86Inst::Mov {
-                        size: store_size,
+                        size: op_size,
                         src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::Rbp,
@@ -2876,8 +2891,7 @@ impl X86_64CodeGen {
                     output_moves.push((idx, specific_reg, loc));
                 }
             } else {
-                let requires_reg =
-                    Self::constraint_requires_register(&output.constraint);
+                let requires_reg = Self::constraint_requires_register(&output.constraint);
                 // No specific register - use allocated location
                 match loc {
                     Loc::Reg(r) => {
@@ -2985,10 +2999,8 @@ impl X86_64CodeGen {
                     // Add setup move to load value into temp
                     remap_setup.push((temp, temp, loc.clone()));
                 } else {
-                    let requires_reg =
-                        Self::constraint_requires_register(constraint_for_reg);
-                    let requires_mem =
-                        Self::constraint_requires_memory(constraint_for_reg);
+                    let requires_reg = Self::constraint_requires_register(constraint_for_reg);
+                    let requires_mem = Self::constraint_requires_memory(constraint_for_reg);
                     // No specific register - use allocated location
                     match loc {
                         Loc::Imm(_) if requires_mem => {

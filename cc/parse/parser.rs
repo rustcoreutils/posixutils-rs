@@ -2047,7 +2047,10 @@ impl Parser<'_> {
         // Parse __attribute__ between 'struct' keyword and tag name
         // (e.g., struct __attribute__((packed)) tagname { ... })
         let early_attrs = self.parse_attributes();
-        let mut is_packed = early_attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
+        let mut is_packed = early_attrs
+            .attrs
+            .iter()
+            .any(|a| a.name == "packed" || a.name == "__packed__");
 
         // Optional tag name
         let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
@@ -2055,7 +2058,11 @@ impl Parser<'_> {
                 Some(self.expect_identifier()?)
             } else {
                 let mid_attrs = self.parse_attributes();
-                is_packed = is_packed || mid_attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
+                is_packed = is_packed
+                    || mid_attrs
+                        .attrs
+                        .iter()
+                        .any(|a| a.name == "packed" || a.name == "__packed__");
                 if self.peek() == TokenType::Ident && !self.is_special(b'{') {
                     Some(self.expect_identifier()?)
                 } else {
@@ -2068,7 +2075,11 @@ impl Parser<'_> {
 
         // Parse __attribute__ after tag name but before '{'
         let pre_attrs = self.parse_attributes();
-        is_packed = is_packed || pre_attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
+        is_packed = is_packed
+            || pre_attrs
+                .attrs
+                .iter()
+                .any(|a| a.name == "packed" || a.name == "__packed__");
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -2210,7 +2221,11 @@ impl Parser<'_> {
 
             // Parse trailing __attribute__ (e.g., __attribute__((packed)))
             let attrs = self.parse_attributes();
-            is_packed = is_packed || attrs.attrs.iter().any(|a| a.name == "packed" || a.name == "__packed__");
+            is_packed = is_packed
+                || attrs
+                    .attrs
+                    .iter()
+                    .any(|a| a.name == "packed" || a.name == "__packed__");
 
             // Compute layout
             let (size, align) = if is_union {

@@ -14,7 +14,7 @@
 // Key rules:
 // - Arguments passed in RDI, RSI, RDX, RCX, R8, R9 (INTEGER) and XMM0-XMM7 (SSE)
 // - Return values in RAX, RDX (INTEGER) or XMM0, XMM1 (SSE)
-// - Structs > 16 bytes use sret (hidden pointer in RDI)
+// - Structs > 16 bytes: returned via sret (hidden pointer in RDI), passed by value on stack
 // - Structs 9-16 bytes may use two registers
 // - Each eightbyte is classified independently, then merged
 //

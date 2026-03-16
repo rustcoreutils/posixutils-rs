@@ -28,12 +28,11 @@
 - **Fix:** Caller pushes all qwords to stack. Callee receives via IncomingArg + SymAddr. Regalloc advances by full struct size. No GP register consumed.
 - **Also fixed:** 32→64 bit store widening at offset 0 clobbered adjacent struct fields (compound literal + designated init failures). Made struct-aware via sym_type_sizes map.
 
-### Bug R: CPython -O0 — regex parser + finalization crash — NOT YET FIXED
-- **Symptom 1:** `_bootstrap_python` crashes in `_PyArg_Fini()` during `Py_FinalizeEx()`. Misaligned pointer `0x555555887f17` in the `_PyArg_Parser` linked list. Output files ARE generated before the crash.
-- **Symptom 2:** Python regex patterns with parenthesized groups fail: `re.compile(r"(\w+)")` → `re.error: missing ), unterminated subpattern`. Simple patterns without groups work.
-- **Status:** The `_freeze_module` steps complete (output generated). The `deepfreeze.py` step fails because it imports `argparse` → `gettext` → `re` with grouped patterns.
-- **Possible root cause:** Another sign-extension or comparison bug in the bytecode interpreter affecting character/string comparisons. The regex parser is pure Python executing under pcc's compiled interpreter. Something in `ceval.c` or related C code at -O0 is mishandling integer comparisons that the regex parser relies on.
-- **Workaround:** Not yet found. The finalization crash can be masked (exit code), but the regex failure blocks `deepfreeze.py`.
+### Bug R: Multiple sign-extension and conditional bugs — MOSTLY FIXED
+- **R1 (FIXED):** Ternary `mode == 2 ? count : -1` didn't promote 32-bit `-1` to 64-bit result type. Broke `str.find()` (returned 0xFFFFFFFF instead of -1) → broke regex → blocked deepfreeze.
+- **R2 (FIXED):** `cbr` instructions used `testl` (32-bit) instead of `testq` (64-bit) for condition values. Broke UTF-8 decoder's `ascii_decode` fast path: `if (value & ASCII_CHAR_MASK)` failed to detect non-ASCII bytes in upper 32 bits of 8-byte chunk.
+- **R3 (NOT FIXED):** Finalization crash in `_PyArg_Fini()` — misaligned pointer in linked list. Output files generated before crash. Blocks `make` exit code check for `sysconfig --generate-posix-vars`.
+- **R4 (NOT FIXED):** Deepfreeze struct initializers produce wrong code objects (opcode 194). Workaround: disable deepfreeze (GET_CODE=NULL) and use marshal-based frozen loading.
 
 ### Bug O: Stale caller-saved register across call in goto-dispatch loops — NOT YET FIXED
 - **Symptom:** `_bootstrap_python` segfaults in `_PyEval_EvalFrameDefault` during `init_importlib`. NULL pointer dereference when reading bytecode (`movswl (%reg)` where reg=0).

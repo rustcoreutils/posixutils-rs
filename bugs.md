@@ -35,10 +35,17 @@
 - **R4 (WORKAROUND):** Deepfreeze struct initializers produce wrong code objects. Workaround: disable deepfreeze (GET_CODE=NULL) and use marshal-based frozen loading.
 - **R5 (NOT FIXED):** `str.format()` with named placeholders (`{name}`) interprets name as positional index. Likely another 32-bit truncation in the format parser C code.
 
+### Bug S: math module / floating-point codegen bugs — NOT YET FIXED
+- `math.exp(x)` returns same value for all inputs (argument ignored, uses cached XMM0)
+- `math.floor(2.7)` returns `2^63` (raw float bits returned as int instead of converted)
+- `2.0 ** 0.5` returns `-inf` (float power operator broken)
+- `math.log(1.0)` returns `log(0.5)` (argument shifted)
+- Root cause: pcc's floating-point argument passing or double-to-int conversion in extension modules (.so)
+
 ### CPython build status at -O0
-- **Build**: Compiles and links. Frozen modules generated. Deepfreeze disabled (workaround).
-- **Python binary**: Starts, runs Python code correctly, imports modules. Crashes during finalization (Bug R3).
-- **make test**: Blocked by finalization crash exit code (every test process exits 139).
+- **Build**: Compiles and links. Frozen modules generated. Deepfreeze disabled (workaround). Two files (signalmodule.c, getargs.c) compiled with gcc to avoid finalization crash.
+- **Python binary**: Starts, runs integer/string Python code correctly, exits cleanly.
+- **make test**: Test framework can't start because `random.py` module-level code calls `math.exp(-0.5)` which returns wrong value → triggers `math.sqrt` domain error. Need to fix Bug S first.
 
 ### Bug O: Stale caller-saved register across call in goto-dispatch loops — NOT YET FIXED
 - **Symptom:** `_bootstrap_python` segfaults in `_PyEval_EvalFrameDefault` during `init_importlib`. NULL pointer dereference when reading bytecode (`movswl (%reg)` where reg=0).

@@ -396,3 +396,28 @@ int main() {
         0
     );
 }
+
+/// Bug R (continued): conditional branch on 64-bit AND result must use testq, not testl.
+/// When `if (value & MASK)` where both are 64-bit (size_t), and the non-zero
+/// bits are only in the upper 32 bits, testl (32-bit test) would see zero
+/// and not take the branch.
+#[test]
+fn c89_functions_64bit_conditional() {
+    let code = r#"
+typedef unsigned long size_t;
+int main() {
+    /* Simulate: 8-byte chunk with 0xc2 in the high byte */
+    size_t value = 0xc261616161616161UL;
+    size_t mask  = 0x8080808080808080UL;
+    size_t result = value & mask;
+    if (!result) return 1;  /* result should be non-zero (0x8000000000000000) */
+    /* Also check conditional on the AND directly */
+    if (!(value & mask)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_functions_64bit_conditional", code, &[]),
+        0
+    );
+}

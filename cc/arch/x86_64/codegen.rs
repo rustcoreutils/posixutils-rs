@@ -981,7 +981,9 @@ impl X86_64CodeGen {
         };
 
         let loc = self.get_location(cond);
-        let size = insn.size.max(32);
+        // Use 64-bit test when insn.size is unset (0) to avoid truncating
+        // 64-bit condition values. cbr instructions often lack size info.
+        let size = if insn.size == 0 { 64 } else { insn.size.max(32) };
         let op_size = OperandSize::from_bits(size);
 
         match &loc {

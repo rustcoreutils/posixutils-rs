@@ -2227,16 +2227,25 @@ impl X86_64CodeGen {
                 let op_size = OperandSize::from_bits(mem_size);
                 if is_symbol {
                     // Local variable - store directly to stack slot.
-                    // Widen 32-bit stores at offset 0 to 64-bit ONLY for scalar
-                    // locals (type fits in 32 bits). For structs, the store at
-                    // offset 0 is a field store and must not clobber adjacent data.
+                    // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
+                    // upper bits when a 32-bit result is stored into a 64-bit
+                    // local (e.g., int-to-long, int-to-pointer assignments).
+                    // Exception: struct/union fields at offset 0 must use exact
+                    // size to avoid clobbering the adjacent field at offset 4.
                     let total_offset = offset - insn.offset as i32 + self.callee_saved_offset;
                     let store_size = if mem_size == 32 && insn.offset == 0 {
-                        let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(32);
-                        if sym_bits <= 32 {
-                            OperandSize::B64 // scalar: safe to widen
+                        let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
+                        if sym_bits > 32 {
+                            // Check if this is a struct/union (don't widen field stores)
+                            let is_struct = self.sym_type_sizes.contains_key(&addr)
+                                && sym_bits > 64;
+                            if is_struct {
+                                op_size // struct field: exact size
+                            } else {
+                                OperandSize::B64 // scalar/pointer: safe to widen
+                            }
                         } else {
-                            op_size // struct field: exact size
+                            OperandSize::B64 // small scalar: safe to widen
                         }
                     } else {
                         op_size

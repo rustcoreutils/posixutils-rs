@@ -6188,8 +6188,22 @@ impl<'a> Linearizer<'a> {
                     let cond_val = self.linearize_expr(cond);
                     let cond_typ = self.expr_type(cond);
                     let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
-                    let then_val = self.linearize_expr(then_expr);
-                    let else_val = self.linearize_expr(else_expr);
+                    let mut then_val = self.linearize_expr(then_expr);
+                    let mut else_val = self.linearize_expr(else_expr);
+
+                    // Promote narrower operands to the result type (usual arithmetic conversions).
+                    // E.g., `long_var ? long_count : -1` where -1 is int (32-bit).
+                    let then_typ = self.expr_type(then_expr);
+                    let else_typ = self.expr_type(else_expr);
+                    let then_size = self.types.size_bits(then_typ);
+                    let else_size = self.types.size_bits(else_typ);
+                    if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
+                        then_val = self.emit_convert(then_val, then_typ, result_typ);
+                    }
+                    if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+                        else_val = self.emit_convert(else_val, else_typ, result_typ);
+                    }
+
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::select(
                         result, cond_bool, then_val, else_val, result_typ, size,
@@ -6218,14 +6232,25 @@ impl<'a> Linearizer<'a> {
 
                     // Then branch: evaluate then_expr
                     self.switch_bb(then_bb);
-                    let then_val = self.linearize_expr(then_expr);
+                    let mut then_val = self.linearize_expr(then_expr);
+                    // Promote narrower operand to result type
+                    let then_typ = self.expr_type(then_expr);
+                    let then_size = self.types.size_bits(then_typ);
+                    if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
+                        then_val = self.emit_convert(then_val, then_typ, result_typ);
+                    }
                     let then_end_bb = self.current_bb.unwrap();
                     self.emit(Instruction::br(merge_bb));
                     self.link_bb(then_end_bb, merge_bb);
 
                     // Else branch: evaluate else_expr
                     self.switch_bb(else_bb);
-                    let else_val = self.linearize_expr(else_expr);
+                    let mut else_val = self.linearize_expr(else_expr);
+                    let else_typ = self.expr_type(else_expr);
+                    let else_size = self.types.size_bits(else_typ);
+                    if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+                        else_val = self.emit_convert(else_val, else_typ, result_typ);
+                    }
                     let else_end_bb = self.current_bb.unwrap();
                     self.emit(Instruction::br(merge_bb));
                     self.link_bb(else_end_bb, merge_bb);

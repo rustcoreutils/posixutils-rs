@@ -364,3 +364,35 @@ int main() {
         0
     );
 }
+
+/// Bug R (partial): ternary expression must promote narrower operand to result type.
+/// `long_val ? long_count : -1` where -1 is int (32-bit) must be sign-extended
+/// to Py_ssize_t (64-bit) before cmov/phi. Without fix, -1 becomes 0x00000000FFFFFFFF.
+#[test]
+fn c89_functions_ternary_int_promotion() {
+    let code = r#"
+typedef long Py_ssize_t;
+typedef unsigned char Py_UCS1;
+
+static Py_ssize_t default_find(const Py_UCS1 *s, Py_ssize_t n,
+    const Py_UCS1 *p, Py_ssize_t m, int mode) {
+    Py_ssize_t count = 0;
+    /* ... search logic would go here, but we simulate not-found ... */
+    (void)s; (void)n; (void)p; (void)m;
+    return mode == 2 ? count : -1;
+}
+
+int main() {
+    Py_ssize_t r = default_find((const Py_UCS1*)"ab", 2, (const Py_UCS1*)"xy", 2, 1);
+    if (r != -1L) return 1;
+    /* Also test the count path */
+    r = default_find((const Py_UCS1*)"ab", 2, (const Py_UCS1*)"xy", 2, 2);
+    if (r != 0) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_functions_ternary_int_promotion", code, &[]),
+        0
+    );
+}

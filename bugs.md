@@ -30,9 +30,15 @@
 
 ### Bug R: Multiple sign-extension and conditional bugs — MOSTLY FIXED
 - **R1 (FIXED):** Ternary `mode == 2 ? count : -1` didn't promote 32-bit `-1` to 64-bit result type. Broke `str.find()` (returned 0xFFFFFFFF instead of -1) → broke regex → blocked deepfreeze.
-- **R2 (FIXED):** `cbr` instructions used `testl` (32-bit) instead of `testq` (64-bit) for condition values. Broke UTF-8 decoder's `ascii_decode` fast path: `if (value & ASCII_CHAR_MASK)` failed to detect non-ASCII bytes in upper 32 bits of 8-byte chunk.
-- **R3 (NOT FIXED):** Finalization crash in `_PyArg_Fini()` — misaligned pointer in linked list. Output files generated before crash. Blocks `make` exit code check for `sysconfig --generate-posix-vars`.
-- **R4 (NOT FIXED):** Deepfreeze struct initializers produce wrong code objects (opcode 194). Workaround: disable deepfreeze (GET_CODE=NULL) and use marshal-based frozen loading.
+- **R2 (FIXED):** `cbr` instructions used `testl` (32-bit) instead of `testq` (64-bit) for condition values. Broke UTF-8 decoder's `ascii_decode` fast path.
+- **R3 (PARTIALLY FIXED):** Store-widening extended to widen 32→64 for all non-struct locals. But finalization crash persists: `_PySignal_Fini()` → `compare_handler()` → `Py_TYPE()` crash. Pointer `0x55555664e3e8` truncated to `0x5664e3e8` (lower 32 bits). Root cause: pointer stored through struct field (non-local) path uses exact store size from IR; the IR generates 32-bit store for a 64-bit pointer field. Needs IR-level fix for struct member stores.
+- **R4 (WORKAROUND):** Deepfreeze struct initializers produce wrong code objects. Workaround: disable deepfreeze (GET_CODE=NULL) and use marshal-based frozen loading.
+- **R5 (NOT FIXED):** `str.format()` with named placeholders (`{name}`) interprets name as positional index. Likely another 32-bit truncation in the format parser C code.
+
+### CPython build status at -O0
+- **Build**: Compiles and links. Frozen modules generated. Deepfreeze disabled (workaround).
+- **Python binary**: Starts, runs Python code correctly, imports modules. Crashes during finalization (Bug R3).
+- **make test**: Blocked by finalization crash exit code (every test process exits 139).
 
 ### Bug O: Stale caller-saved register across call in goto-dispatch loops — NOT YET FIXED
 - **Symptom:** `_bootstrap_python` segfaults in `_PyEval_EvalFrameDefault` during `init_importlib`. NULL pointer dereference when reading bytecode (`movswl (%reg)` where reg=0).

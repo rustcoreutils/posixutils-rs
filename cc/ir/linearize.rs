@@ -281,6 +281,38 @@ impl<'a> Linearizer<'a> {
         func.get_block_mut(id).unwrap()
     }
 
+    /// Emit a PhiSource instruction in a predecessor block.
+    /// Returns the PhiSource target pseudo.
+    fn emit_phi_source(
+        &mut self,
+        pred_bb: BasicBlockId,
+        value: PseudoId,
+        phi_target: PseudoId,
+        phi_bb: BasicBlockId,
+        typ: TypeId,
+        size: u32,
+    ) -> PseudoId {
+        let phisrc_pseudo = self.alloc_pseudo();
+        let pseudo = Pseudo::phi(phisrc_pseudo, phisrc_pseudo.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+
+        let mut phisrc = Instruction::phi_source(phisrc_pseudo, value, typ, size);
+        phisrc.phi_list = vec![(phi_bb, phi_target)];
+        if let Some(pos) = self.current_pos {
+            phisrc.pos = Some(pos);
+        }
+
+        if let Some(func) = &mut self.current_func {
+            if let Some(bb) = func.get_block_mut(pred_bb) {
+                bb.insert_before_terminator(phisrc);
+            }
+        }
+
+        phisrc_pseudo
+    }
+
     /// Add an instruction to the current basic block
     fn emit(&mut self, insn: Instruction) {
         if let Some(bb_id) = self.current_bb {
@@ -6204,8 +6236,24 @@ impl<'a> Linearizer<'a> {
                         func.add_pseudo(phi_pseudo);
                     }
                     let mut phi_insn = Instruction::phi(result, result_typ, size);
-                    phi_insn.phi_list.push((then_end_bb, then_val));
-                    phi_insn.phi_list.push((else_end_bb, else_val));
+                    let phisrc1 = self.emit_phi_source(
+                        then_end_bb,
+                        then_val,
+                        result,
+                        merge_bb,
+                        result_typ,
+                        size,
+                    );
+                    phi_insn.phi_list.push((then_end_bb, phisrc1));
+                    let phisrc2 = self.emit_phi_source(
+                        else_end_bb,
+                        else_val,
+                        result,
+                        merge_bb,
+                        result_typ,
+                        size,
+                    );
+                    phi_insn.phi_list.push((else_end_bb, phisrc2));
                     self.emit(phi_insn);
 
                     result
@@ -8617,8 +8665,11 @@ impl<'a> Linearizer<'a> {
             func.add_pseudo(phi_pseudo);
         }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
-        phi_insn.phi_list.push((lhs_end_bb, zero));
-        phi_insn.phi_list.push((rhs_end_bb, right_bool));
+        let phisrc1 = self.emit_phi_source(lhs_end_bb, zero, result, merge_bb, result_typ, 32);
+        phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
+        phi_insn.phi_list.push((rhs_end_bb, phisrc2));
         self.emit(phi_insn);
 
         result
@@ -8678,8 +8729,11 @@ impl<'a> Linearizer<'a> {
             func.add_pseudo(phi_pseudo);
         }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
-        phi_insn.phi_list.push((lhs_end_bb, one));
-        phi_insn.phi_list.push((rhs_end_bb, right_bool));
+        let phisrc1 = self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, 32);
+        phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
+        phi_insn.phi_list.push((rhs_end_bb, phisrc2));
         self.emit(phi_insn);
 
         result

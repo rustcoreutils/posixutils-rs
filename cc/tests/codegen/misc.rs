@@ -1327,3 +1327,334 @@ int main(void) {
         exit_code
     );
 }
+
+// ============================================================================
+// Regression test: SSA phi insertion in goto-dispatch pattern
+// ============================================================================
+// Tests that variables declared at function scope maintain correct values
+// across a goto-dispatch loop with a switch statement. This pattern is
+// used heavily by CPython's ceval.c bytecode interpreter.
+//
+// The bug: insert_phi_nodes() in ssa.rs had a filter that skipped phi node
+// insertion at IDF blocks not dominated by the variable's declaration block.
+// This caused function-scope variables to lose their values at the dispatch
+// label when connected by goto back-edges from case handlers.
+#[test]
+fn codegen_ssa_phi_goto_dispatch() {
+    let code = r#"
+/* Regression test for SSA phi insertion bug in goto-dispatch patterns.
+ *
+ * This mimics CPython's ceval.c pattern: a bytecode dispatch loop where
+ * a variable (accumulator) is modified by different opcode handlers and
+ * its value must survive across goto back-edges to the dispatch label.
+ */
+
+/* Opcodes for our mini interpreter */
+#define OP_LOAD_CONST  0
+#define OP_ADD         1
+#define OP_MUL         2
+#define OP_NEGATE      3
+#define OP_HALT        4
+
+struct instruction {
+    int opcode;
+    int operand;
+};
+
+/* A mini bytecode interpreter using goto-dispatch */
+int interpret(struct instruction *code, int n_insns) {
+    int accumulator = 0;   /* function-scope variable: the bug target */
+    int ip = 0;            /* instruction pointer */
+    int temp;
+
+    goto dispatch;
+
+dispatch:
+    if (ip >= n_insns)
+        return -1;  /* ran off the end */
+
+    switch (code[ip].opcode) {
+    case OP_LOAD_CONST:
+        goto do_load_const;
+    case OP_ADD:
+        goto do_add;
+    case OP_MUL:
+        goto do_mul;
+    case OP_NEGATE:
+        goto do_negate;
+    case OP_HALT:
+        goto do_halt;
+    default:
+        return -2;  /* unknown opcode */
+    }
+
+do_load_const:
+    accumulator = code[ip].operand;
+    ip++;
+    goto dispatch;
+
+do_add:
+    accumulator = accumulator + code[ip].operand;
+    ip++;
+    goto dispatch;
+
+do_mul:
+    accumulator = accumulator * code[ip].operand;
+    ip++;
+    goto dispatch;
+
+do_negate:
+    accumulator = -accumulator;
+    ip++;
+    goto dispatch;
+
+do_halt:
+    return accumulator;
+}
+
+int main(void) {
+    /* Test 1: LOAD_CONST 5, HALT -> expect 5 */
+    {
+        struct instruction prog[] = {
+            {OP_LOAD_CONST, 5},
+            {OP_HALT, 0}
+        };
+        int result = interpret(prog, 2);
+        if (result != 5) return 1;
+    }
+
+    /* Test 2: LOAD_CONST 3, ADD 7, HALT -> expect 10 */
+    {
+        struct instruction prog[] = {
+            {OP_LOAD_CONST, 3},
+            {OP_ADD, 7},
+            {OP_HALT, 0}
+        };
+        int result = interpret(prog, 3);
+        if (result != 10) return 2;
+    }
+
+    /* Test 3: LOAD_CONST 4, MUL 5, HALT -> expect 20 */
+    {
+        struct instruction prog[] = {
+            {OP_LOAD_CONST, 4},
+            {OP_MUL, 5},
+            {OP_HALT, 0}
+        };
+        int result = interpret(prog, 3);
+        if (result != 20) return 3;
+    }
+
+    /* Test 4: LOAD_CONST 7, NEGATE, HALT -> expect -7 */
+    {
+        struct instruction prog[] = {
+            {OP_LOAD_CONST, 7},
+            {OP_NEGATE, 0},
+            {OP_HALT, 0}
+        };
+        int result = interpret(prog, 3);
+        if (result != -7) return 4;
+    }
+
+    /* Test 5: Multi-step computation:
+     * LOAD_CONST 2, MUL 3, ADD 4, NEGATE, ADD 100, HALT
+     * -> ((2 * 3) + 4) = 10, negate = -10, + 100 = 90 */
+    {
+        struct instruction prog[] = {
+            {OP_LOAD_CONST, 2},
+            {OP_MUL, 3},
+            {OP_ADD, 4},
+            {OP_NEGATE, 0},
+            {OP_ADD, 100},
+            {OP_HALT, 0}
+        };
+        int result = interpret(prog, 6);
+        if (result != 90) return 5;
+    }
+
+    /* Test 6: Verify accumulator starts at 0 each call (no state leakage)
+     * ADD 42, HALT -> 0 + 42 = 42 */
+    {
+        struct instruction prog[] = {
+            {OP_ADD, 42},
+            {OP_HALT, 0}
+        };
+        int result = interpret(prog, 2);
+        if (result != 42) return 6;
+    }
+
+    return 0;
+}
+"#;
+
+    assert_eq!(compile_and_run("ssa_phi_goto_dispatch", code, &[]), 0);
+}
+
+// ============================================================================
+// PhiSource integration tests
+// ============================================================================
+
+#[test]
+fn codegen_phisource_ternary() {
+    let code = r#"
+int main(void) {
+    // Ternary produces phi with PhiSource in each branch
+    int x = 10;
+    int y = 20;
+    int a = (x > 5) ? x : y;
+    if (a != 10) return 1;
+
+    int b = (x < 5) ? x : y;
+    if (b != 20) return 2;
+
+    // Nested ternary
+    int c = (x > 5) ? ((y > 15) ? 100 : 200) : 300;
+    if (c != 100) return 3;
+
+    // Ternary with function calls and side effects
+    int d = (x > 0) ? x + y : x - y;
+    if (d != 30) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("phisource_ternary", code, &[]), 0);
+}
+
+#[test]
+fn codegen_phisource_logical_and_or() {
+    let code = r#"
+int side = 0;
+int inc(void) { side++; return side; }
+
+int main(void) {
+    // Logical AND produces phi via short-circuit
+    int a = (1 && 1);
+    if (a != 1) return 1;
+
+    int b = (1 && 0);
+    if (b != 0) return 2;
+
+    int c = (0 && 1);
+    if (c != 0) return 3;
+
+    // Logical OR produces phi via short-circuit
+    int d = (0 || 1);
+    if (d != 1) return 4;
+
+    int e = (0 || 0);
+    if (e != 0) return 5;
+
+    int f = (1 || 0);
+    if (f != 1) return 6;
+
+    // Chained: a && b && c
+    int g = (1 && 1 && 1);
+    if (g != 1) return 7;
+
+    int h = (1 && 0 && 1);
+    if (h != 0) return 8;
+
+    // Chained: a || b || c
+    int i = (0 || 0 || 1);
+    if (i != 1) return 9;
+
+    // Mixed: (a && b) || (c && d)
+    int j = (1 && 0) || (1 && 1);
+    if (j != 1) return 10;
+
+    // Short-circuit: side effects should not execute
+    side = 0;
+    int k = (0 && inc());
+    if (side != 0) return 11;  // inc() should NOT be called
+
+    side = 0;
+    int l = (1 || inc());
+    if (side != 0) return 12;  // inc() should NOT be called
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("phisource_logical", code, &[]), 0);
+}
+
+#[test]
+fn codegen_phisource_loop_phi() {
+    let code = r#"
+int main(void) {
+    // Simple loop with induction variable (SSA phi)
+    int sum = 0;
+    for (int i = 0; i < 10; i++) {
+        sum += i;
+    }
+    if (sum != 45) return 1;
+
+    // Nested loops
+    int total = 0;
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < 3; j++) {
+            total++;
+        }
+    }
+    if (total != 15) return 2;
+
+    // While loop with phi
+    int n = 100;
+    int count = 0;
+    while (n > 1) {
+        if (n % 2 == 0) {
+            n = n / 2;
+        } else {
+            n = 3 * n + 1;
+        }
+        count++;
+    }
+    // Collatz sequence for 100 has 25 steps
+    if (count != 25) return 3;
+
+    // Do-while with phi
+    int x = 0;
+    int iter = 0;
+    do {
+        x += iter * 2;
+        iter++;
+    } while (iter < 5);
+    // x = 0+2+4+6+8 = 20
+    if (x != 20) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("phisource_loop", code, &[]), 0);
+}
+
+#[test]
+fn codegen_phisource_optimized() {
+    let code = r#"
+int main(void) {
+    // Test PhiSource survives optimization passes (DCE, instcombine, inlining)
+    int x = 10;
+
+    // Ternary at -O2
+    int a = (x > 5) ? x + 1 : x - 1;
+    if (a != 11) return 1;
+
+    // Logical ops at -O2
+    int b = (x > 0 && x < 100);
+    if (b != 1) return 2;
+
+    int c = (x < 0 || x > 5);
+    if (c != 1) return 3;
+
+    // Loop at -O2
+    int sum = 0;
+    for (int i = 1; i <= 10; i++) {
+        sum += i;
+    }
+    if (sum != 55) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run_optimized("phisource_optimized", code), 0);
+}

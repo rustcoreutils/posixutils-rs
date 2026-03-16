@@ -15,7 +15,6 @@ use std::hash::Hash;
 
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
-const DEFAULT_PHI_TRACKING_CAPACITY: usize = 16;
 const DEFAULT_CALL_POS_CAPACITY: usize = 16;
 const DEFAULT_SMALL_VEC_CAPACITY: usize = 8;
 
@@ -188,12 +187,6 @@ where
         }
     }
 
-    // Collect phi sources and targets
-    let mut phi_sources: Vec<(BasicBlockId, PseudoId)> =
-        Vec::with_capacity(DEFAULT_PHI_TRACKING_CAPACITY);
-    let mut phi_targets: Vec<(BasicBlockId, PseudoId)> =
-        Vec::with_capacity(DEFAULT_PHI_TRACKING_CAPACITY);
-
     for block in &func.blocks {
         for insn in &block.insns {
             if let Some(target) = insn.target {
@@ -247,13 +240,6 @@ where
                 }
             }
 
-            for (src_bb, pseudo) in &insn.phi_list {
-                phi_sources.push((*src_bb, *pseudo));
-                if let Some(target) = insn.target {
-                    phi_targets.push((*src_bb, target));
-                }
-            }
-
             // Collect constraint points via the architecture-specific callback
             if let Some((clobbers, involved_pseudos)) = get_constraint_info(insn) {
                 constraint_points.push(ConstraintPoint {
@@ -264,46 +250,6 @@ where
             }
 
             pos += 1;
-        }
-    }
-
-    // Extend phi source intervals to end of their source block
-    for (src_bb, pseudo) in phi_sources {
-        if let Some(&end_pos) = block_end_pos.get(&src_bb) {
-            if let Some(info) = intervals.get_mut(&pseudo) {
-                info.last_use = info.last_use.max(end_pos);
-            } else {
-                intervals.insert(
-                    pseudo,
-                    IntervalInfo {
-                        pseudo,
-                        first_def: end_pos,
-                        last_def: end_pos,
-                        last_use: end_pos,
-                        in_loop: false,
-                    },
-                );
-            }
-        }
-    }
-
-    // Extend phi target intervals
-    for (src_bb, target) in phi_targets {
-        if let Some(&end_pos) = block_end_pos.get(&src_bb) {
-            if let Some(info) = intervals.get_mut(&target) {
-                info.last_def = info.last_def.max(end_pos);
-            } else {
-                intervals.insert(
-                    target,
-                    IntervalInfo {
-                        pseudo: target,
-                        first_def: end_pos,
-                        last_def: end_pos,
-                        last_use: end_pos,
-                        in_loop: false,
-                    },
-                );
-            }
         }
     }
 

@@ -498,6 +498,25 @@ fn clone_instruction(
             vec![new_insn]
         }
 
+        // PhiSource: remap target, src, and back-pointer
+        Opcode::PhiSource => {
+            let mut new_insn = Instruction::new(Opcode::PhiSource);
+            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_pseudos));
+            new_insn.src = insn
+                .src
+                .iter()
+                .map(|s| ctx.remap_pseudo(*s, callee_pseudos))
+                .collect();
+            new_insn.typ = insn.typ;
+            new_insn.size = insn.size;
+            new_insn.phi_list = insn
+                .phi_list
+                .iter()
+                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_pseudos)))
+                .collect();
+            vec![new_insn]
+        }
+
         // Call instructions: remap arguments but keep function name
         Opcode::Call => {
             let mut new_insn = insn.clone();
@@ -1363,5 +1382,80 @@ mod tests {
             module.functions.iter().any(|f| f.name == "arr_func"),
             "arr_func should be preserved - referenced in global array initializer"
         );
+    }
+
+    #[test]
+    fn test_clone_instruction_phisource() {
+        // Test that clone_instruction correctly remaps PhiSource's target, src,
+        // and phi_list (bb + pseudo back-pointer).
+        let types = TypeTable::new(&Target::host());
+
+        // Build a minimal callee function with a PhiSource instruction
+        let mut callee = Function::new("callee", types.int_id);
+        callee.pseudos.push(Pseudo::reg(PseudoId(0), 0)); // src
+        callee.pseudos.push(Pseudo::reg(PseudoId(1), 1)); // phisource target
+        callee.pseudos.push(Pseudo::phi(PseudoId(2), 0)); // phi target (back-pointer)
+
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        bb.insns.push(Instruction::ret(None));
+        callee.blocks.push(bb);
+        callee.entry = BasicBlockId(0);
+
+        // Build a minimal caller
+        let mut caller = Function::new("caller", types.int_id);
+        caller.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        let mut caller_bb = BasicBlock::new(BasicBlockId(0));
+        caller_bb.insns.push(Instruction::new(Opcode::Entry));
+        caller_bb.insns.push(Instruction::ret(None));
+        caller.blocks.push(caller_bb);
+        caller.entry = BasicBlockId(0);
+        caller.next_pseudo = 100;
+
+        // Create InlineContext
+        let mut ctx = InlineContext::new(
+            &caller,
+            &callee,
+            vec![],           // no call args
+            BasicBlockId(99), // return continuation
+            None,             // no return target
+        );
+
+        // Build a PhiSource instruction to clone:
+        // %1 = phisrc %0, back-pointer → (bb5, %2)
+        let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        phisrc.phi_list = vec![(BasicBlockId(5), PseudoId(2))];
+
+        let cloned = clone_instruction(&mut ctx, &phisrc, &callee.pseudos);
+
+        // Should produce exactly one instruction
+        assert_eq!(cloned.len(), 1);
+        let cloned_insn = &cloned[0];
+
+        // Verify opcode preserved
+        assert_eq!(cloned_insn.op, Opcode::PhiSource);
+
+        // Verify target was remapped (should differ from original)
+        let new_target = cloned_insn.target.expect("PhiSource should have target");
+        assert_ne!(new_target, PseudoId(1), "target should be remapped");
+
+        // Verify src was remapped
+        assert_eq!(cloned_insn.src.len(), 1);
+        let new_src = cloned_insn.src[0];
+        assert_ne!(new_src, PseudoId(0), "src should be remapped");
+
+        // Verify phi_list back-pointer was remapped (both bb and pseudo)
+        assert_eq!(cloned_insn.phi_list.len(), 1);
+        let (new_bb, new_pseudo) = cloned_insn.phi_list[0];
+        assert_ne!(new_bb, BasicBlockId(5), "phi_list bb should be remapped");
+        assert_ne!(
+            new_pseudo,
+            PseudoId(2),
+            "phi_list pseudo should be remapped"
+        );
+
+        // Verify type and size preserved
+        assert_eq!(cloned_insn.typ, Some(types.int_id));
+        assert_eq!(cloned_insn.size, 32);
     }
 }

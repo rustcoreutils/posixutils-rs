@@ -158,8 +158,9 @@ pub enum Opcode {
     Store, // Store to memory
 
     // SSA-specific
-    Phi,  // Phi node for SSA
-    Copy, // Copy (for out-of-SSA)
+    Phi,       // Phi node for SSA
+    PhiSource, // Phi source: explicit defining instruction for phi operand in predecessor block
+    Copy,      // Copy (for out-of-SSA)
 
     // Other
     SymAddr, // Get address of symbol
@@ -338,6 +339,7 @@ impl Opcode {
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::Phi => "phi",
+            Opcode::PhiSource => "phisrc",
             Opcode::Copy => "copy",
             Opcode::SymAddr => "symaddr",
             Opcode::Call => "call",
@@ -964,6 +966,15 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
+    /// Create a phi source instruction (placed in predecessor block).
+    /// Back-pointer to owning phi is stored in phi_list by the caller.
+    pub fn phi_source(target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
+        Self::new(Opcode::PhiSource)
+            .with_target(target)
+            .with_src(src)
+            .with_type_and_size(typ, size)
+    }
+
     /// Create a select (ternary) instruction for pure expressions
     /// Enables cmov/csel codegen instead of branches
     pub fn select(
@@ -1028,6 +1039,14 @@ impl fmt::Display for Instruction {
                         write!(f, ",")?;
                     }
                     write!(f, " {} ({})", pseudo, bb)?;
+                }
+            }
+            Opcode::PhiSource => {
+                if let Some(src) = self.src.first() {
+                    write!(f, " {}", src)?;
+                }
+                if let Some((bb, pseudo)) = self.phi_list.first() {
+                    write!(f, " (-> {}:{})", bb, pseudo)?;
                 }
             }
             Opcode::Call => {
@@ -1179,7 +1198,9 @@ impl BasicBlock {
         self.children.retain(|c| keep.contains(c));
     }
 
-    /// Remove phi entries for a specific predecessor
+    /// Remove phi entries for a specific predecessor.
+    /// Note: corresponding PhiSource instructions in the removed predecessor
+    /// block become dead and are cleaned up by a subsequent DCE pass.
     pub fn remove_phi_predecessor(&mut self, pred: BasicBlockId) {
         for insn in &mut self.insns {
             if insn.op == Opcode::Phi {
@@ -1366,6 +1387,7 @@ impl Function {
     }
 
     /// Check if block a dominates block b
+    #[cfg(test)]
     pub fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
         if a == b {
             return true;

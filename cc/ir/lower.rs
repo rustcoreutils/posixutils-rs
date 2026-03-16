@@ -25,83 +25,87 @@ const DEFAULT_COPY_CAPACITY: usize = 8;
 // Phi Elimination
 // ============================================================================
 
-/// Eliminate phi nodes by inserting copy instructions in predecessor blocks.
+/// Eliminate phi nodes by converting PhiSource instructions to Copy.
 ///
-/// SSA phi nodes like:
-///   %9 = phi.32 [.L0: %1], [.L2: %7]
-///
-/// Are converted to:
-///   - At end of .L0: %9 = copy %1
-///   - At end of .L2: %9 = copy %7
-///   - Original phi is converted to Nop
-///
-/// This is a standard "naive" phi elimination. For better code quality,
-/// a more sophisticated approach with parallel copies and coalescing
-/// could be used, but this works correctly for all cases.
+/// With PhiSource, every phi operand has an explicit PhiSource instruction
+/// in its predecessor block. This pass:
+/// 1. Scans PhiSource instructions and groups copies by block
+/// 2. Sequentializes parallel copies (handles the "lost copy" problem)
+/// 3. Replaces PhiSource instructions with Nop
+/// 4. Inserts sequentialized Copy instructions before block terminators
+/// 5. Converts Phi instructions to Nop
 pub fn eliminate_phi_nodes(func: &mut Function) {
-    // Collect all phi information first to avoid borrowing issues
-    // Map: predecessor_bb -> Vec<(target, source, size)>
     let mut copies_to_insert: HashMap<BasicBlockId, Vec<CopyInfo>> =
         HashMap::with_capacity(DEFAULT_COPY_CAPACITY);
+    let mut phisource_positions: Vec<(BasicBlockId, usize)> =
+        Vec::with_capacity(DEFAULT_COPY_CAPACITY);
     let mut phi_positions: Vec<(BasicBlockId, usize)> = Vec::with_capacity(DEFAULT_COPY_CAPACITY);
 
-    // Scan all blocks for phi nodes
+    // Scan all blocks for PhiSource and Phi instructions
     for bb in &func.blocks {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            if insn.op == Opcode::Phi {
-                if let Some(target) = insn.target {
-                    let size = insn.size;
+            match insn.op {
+                Opcode::PhiSource => {
+                    // PhiSource: target=phisrc_pseudo, src[0]=value,
+                    //            phi_list[0]=(phi_bb, phi_target)
+                    if !insn.phi_list.is_empty() && !insn.src.is_empty() {
+                        debug_assert_eq!(
+                            insn.phi_list.len(),
+                            1,
+                            "PhiSource must have exactly one back-pointer"
+                        );
+                        let (_phi_bb, phi_target) = insn.phi_list[0];
+                        let source = insn.src[0];
 
-                    // For each incoming edge in the phi
-                    for (pred_bb, src_pseudo) in &insn.phi_list {
-                        // Skip copies from undef sources - they represent uninitialized
-                        // values and copying from them would read garbage.
-                        // This is safe because if we reach this phi via the undef path,
-                        // the value is semantically undefined anyway.
+                        // Skip copies from undef sources
                         let is_undef = func
                             .pseudos
                             .iter()
-                            .find(|p| p.id == *src_pseudo)
+                            .find(|p| p.id == source)
                             .is_some_and(|p| matches!(p.kind, PseudoKind::Undef));
 
-                        if is_undef {
-                            continue;
+                        if !is_undef {
+                            copies_to_insert.entry(bb.id).or_default().push(CopyInfo {
+                                target: phi_target,
+                                source,
+                                size: insn.size,
+                                typ: insn.typ,
+                            });
                         }
-
-                        let copy_info = CopyInfo {
-                            target,
-                            source: *src_pseudo,
-                            size,
-                            typ: insn.typ,
-                        };
-
-                        copies_to_insert
-                            .entry(*pred_bb)
-                            .or_default()
-                            .push(copy_info);
                     }
-
-                    // Record phi position for later removal
+                    phisource_positions.push((bb.id, insn_idx));
+                }
+                Opcode::Phi => {
                     phi_positions.push((bb.id, insn_idx));
                 }
+                _ => {}
             }
         }
     }
 
-    // Insert copy instructions at the end of predecessor blocks
-    // Use parallel copy sequentialization to handle the "lost copy" problem
-    //
-    // First sequentialize all copies (may create temporaries), then insert
+    // Sequentialize parallel copies per block
     let mut sequenced_copies: HashMap<BasicBlockId, Vec<CopyInfo>> =
         HashMap::with_capacity(DEFAULT_COPY_CAPACITY);
-    for (pred_bb_id, copies) in copies_to_insert {
+    for (bb_id, copies) in copies_to_insert {
         let sequenced = sequentialize_copies(&copies, func);
-        sequenced_copies.insert(pred_bb_id, sequenced);
+        sequenced_copies.insert(bb_id, sequenced);
     }
 
-    // Now insert the sequenced copies into blocks
-    for (pred_bb_id, copies) in sequenced_copies {
-        if let Some(pred_bb) = func.get_block_mut(pred_bb_id) {
+    // Nop all PhiSource instructions
+    for (bb_id, insn_idx) in &phisource_positions {
+        if let Some(bb) = func.get_block_mut(*bb_id) {
+            if *insn_idx < bb.insns.len() {
+                bb.insns[*insn_idx].op = Opcode::Nop;
+                bb.insns[*insn_idx].src.clear();
+                bb.insns[*insn_idx].target = None;
+                bb.insns[*insn_idx].phi_list.clear();
+            }
+        }
+    }
+
+    // Insert sequentialized Copy instructions before terminator
+    for (bb_id, copies) in sequenced_copies {
+        if let Some(bb) = func.get_block_mut(bb_id) {
             for copy_info in copies {
                 let mut copy_insn = Instruction::new(Opcode::Copy)
                     .with_target(copy_info.target)
@@ -109,21 +113,19 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
                     .with_size(copy_info.size);
                 copy_insn.typ = copy_info.typ;
 
-                pred_bb.insert_before_terminator(copy_insn);
+                bb.insert_before_terminator(copy_insn);
             }
         }
     }
 
-    // Convert phi nodes to Nop (instead of removing to preserve indices)
-    // IMPORTANT: Keep phi_list AND target intact so codegen can use them for live interval computation.
-    // - phi_list contains which blocks phi sources come from (needed for back edges)
-    // - target is the phi target pseudo, which needs extended live intervals
+    // Convert Phi instructions to Nop (PhiSource is the source of truth now)
     for (bb_id, insn_idx) in phi_positions {
         if let Some(bb) = func.get_block_mut(bb_id) {
             if insn_idx < bb.insns.len() {
                 bb.insns[insn_idx].op = Opcode::Nop;
-                // Note: target and phi_list are intentionally NOT cleared - codegen needs them
                 bb.insns[insn_idx].src.clear();
+                bb.insns[insn_idx].target = None;
+                bb.insns[insn_idx].phi_list.clear();
             }
         }
     }
@@ -266,24 +268,25 @@ mod tests {
     use crate::types::TypeTable;
 
     fn make_loop_cfg() -> Function {
-        // Create a simple loop CFG:
+        // Create a simple loop CFG with PhiSource instructions:
         //
-        //     entry(0)
+        //     entry(0): setval %1; phisrc %5 <- %1 (-> .L1:%3); br .L1
         //        |
         //        v
-        //     cond(1) <--+
-        //      / \       |
-        //     v   v      |
-        //   body(2)  exit(3)
-        //     |
-        //     +----------+
-        //
-        // With phi node in cond block:
-        //   %3 = phi [.L0: %1], [.L2: %2]
+        //     cond(1): %3 = phi [.L0: %5], [.L2: %6]; cbr
+        //      / \
+        //     v   v
+        //   body(2): add %2; phisrc %6 <- %2 (-> .L1:%3); br .L1
+        //     |                              exit(3)
+        //     +------> cond(1)
 
         let types = TypeTable::new(&Target::host());
         let int_type = types.int_id;
         let mut func = Function::new("test", int_type);
+
+        // PhiSource pseudos
+        let phisrc1_id = PseudoId(5);
+        let phisrc2_id = PseudoId(6);
 
         // Entry block
         let mut entry = BasicBlock::new(BasicBlockId(0));
@@ -294,19 +297,20 @@ mod tests {
         setval.target = Some(PseudoId(1));
         setval.size = 32;
         entry.add_insn(setval);
+        // PhiSource: %5 = phisrc %1 (-> .L1:%3)
+        let mut phisrc1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
+        phisrc1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        entry.add_insn(phisrc1);
         entry.add_insn(Instruction::br(BasicBlockId(1)));
 
-        // Condition block with phi
+        // Condition block with phi (references PhiSource targets)
         let mut cond = BasicBlock::new(BasicBlockId(1));
         cond.parents = vec![BasicBlockId(0), BasicBlockId(2)];
         cond.children = vec![BasicBlockId(2), BasicBlockId(3)];
 
-        // Phi node: %3 = phi [.L0: %1], [.L2: %2]
+        // Phi node: %3 = phi [.L0: %5], [.L2: %6]
         let mut phi = Instruction::phi(PseudoId(3), int_type, 32);
-        phi.phi_list = vec![
-            (BasicBlockId(0), PseudoId(1)),
-            (BasicBlockId(2), PseudoId(2)),
-        ];
+        phi.phi_list = vec![(BasicBlockId(0), phisrc1_id), (BasicBlockId(2), phisrc2_id)];
         cond.add_insn(phi);
         cond.add_insn(Instruction::cbr(
             PseudoId(3),
@@ -328,6 +332,10 @@ mod tests {
             32,
         );
         body.add_insn(add);
+        // PhiSource: %6 = phisrc %2 (-> .L1:%3)
+        let mut phisrc2 = Instruction::phi_source(phisrc2_id, PseudoId(2), int_type, 32);
+        phisrc2.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        body.add_insn(phisrc2);
         body.add_insn(Instruction::br(BasicBlockId(1)));
 
         // Exit block
@@ -343,6 +351,8 @@ mod tests {
         func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
         func.add_pseudo(Pseudo::phi(PseudoId(3), 3));
         func.add_pseudo(Pseudo::val(PseudoId(4), 1)); // constant 1
+        func.add_pseudo(Pseudo::phi(phisrc1_id, 5));
+        func.add_pseudo(Pseudo::phi(phisrc2_id, 6));
 
         func
     }
@@ -351,11 +361,16 @@ mod tests {
     fn test_phi_elimination() {
         let mut func = make_loop_cfg();
 
-        // Verify phi exists before elimination
+        // Verify phi and phisource exist before elimination
         let cond_before = func.get_block(BasicBlockId(1)).unwrap();
         assert!(
             cond_before.insns.iter().any(|i| i.op == Opcode::Phi),
             "Should have phi before elimination"
+        );
+        let entry_before = func.get_block(BasicBlockId(0)).unwrap();
+        assert!(
+            entry_before.insns.iter().any(|i| i.op == Opcode::PhiSource),
+            "Entry should have PhiSource before elimination"
         );
 
         // Run phi elimination
@@ -370,6 +385,13 @@ mod tests {
         assert!(
             cond_after.insns.iter().any(|i| i.op == Opcode::Nop),
             "Should have Nop where phi was"
+        );
+
+        // Verify PhiSource instructions are now Nop
+        let entry_after = func.get_block(BasicBlockId(0)).unwrap();
+        assert!(
+            !entry_after.insns.iter().any(|i| i.op == Opcode::PhiSource),
+            "PhiSource should be Nop after elimination"
         );
 
         // Verify copies were inserted in predecessor blocks
@@ -578,5 +600,118 @@ mod tests {
         let result = sequentialize_copies(&copies, &mut func);
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_phisource_swap_problem() {
+        // Two phis that swap values: %a = phi %b, %b = phi %a
+        // PhiSource instructions in predecessor should produce correct copies
+        // after sequentialization (requires a temporary).
+        let types = TypeTable::new(&Target::host());
+        let int_type = types.int_id;
+        let mut func = Function::new("test", int_type);
+
+        // PhiSource pseudos
+        let phisrc1_id = PseudoId(10);
+        let phisrc2_id = PseudoId(11);
+        let phisrc3_id = PseudoId(12);
+        let phisrc4_id = PseudoId(13);
+
+        // entry(0): set %1, %2; phisrc for both phis; br cond(1)
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.children = vec![BasicBlockId(1)];
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        let mut sv1 = Instruction::new(Opcode::SetVal);
+        sv1.target = Some(PseudoId(1));
+        sv1.size = 32;
+        entry.add_insn(sv1);
+        let mut sv2 = Instruction::new(Opcode::SetVal);
+        sv2.target = Some(PseudoId(2));
+        sv2.size = 32;
+        entry.add_insn(sv2);
+        // PhiSource for phi_a (%3): src=%1
+        let mut ps1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
+        ps1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        entry.add_insn(ps1);
+        // PhiSource for phi_b (%4): src=%2
+        let mut ps2 = Instruction::phi_source(phisrc2_id, PseudoId(2), int_type, 32);
+        ps2.phi_list = vec![(BasicBlockId(1), PseudoId(4))];
+        entry.add_insn(ps2);
+        entry.add_insn(Instruction::br(BasicBlockId(1)));
+
+        // cond(1): %3=phi(swap a), %4=phi(swap b), cbr
+        let mut cond = BasicBlock::new(BasicBlockId(1));
+        cond.parents = vec![BasicBlockId(0), BasicBlockId(2)];
+        cond.children = vec![BasicBlockId(2), BasicBlockId(3)];
+        let mut phi_a = Instruction::phi(PseudoId(3), int_type, 32);
+        phi_a.phi_list = vec![
+            (BasicBlockId(0), phisrc1_id),
+            (BasicBlockId(2), phisrc3_id), // from body: was %4
+        ];
+        cond.add_insn(phi_a);
+        let mut phi_b = Instruction::phi(PseudoId(4), int_type, 32);
+        phi_b.phi_list = vec![
+            (BasicBlockId(0), phisrc2_id),
+            (BasicBlockId(2), phisrc4_id), // from body: was %3
+        ];
+        cond.add_insn(phi_b);
+        cond.add_insn(Instruction::cbr(
+            PseudoId(3),
+            BasicBlockId(2),
+            BasicBlockId(3),
+        ));
+
+        // body(2): swap - phisrc for %3 from %4, phisrc for %4 from %3
+        let mut body = BasicBlock::new(BasicBlockId(2));
+        body.parents = vec![BasicBlockId(1)];
+        body.children = vec![BasicBlockId(1)];
+        // PhiSource for phi_a (%3): src=%4 (the swap!)
+        let mut ps3 = Instruction::phi_source(phisrc3_id, PseudoId(4), int_type, 32);
+        ps3.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        body.add_insn(ps3);
+        // PhiSource for phi_b (%4): src=%3 (the swap!)
+        let mut ps4 = Instruction::phi_source(phisrc4_id, PseudoId(3), int_type, 32);
+        ps4.phi_list = vec![(BasicBlockId(1), PseudoId(4))];
+        body.add_insn(ps4);
+        body.add_insn(Instruction::br(BasicBlockId(1)));
+
+        // exit(3)
+        let mut exit = BasicBlock::new(BasicBlockId(3));
+        exit.parents = vec![BasicBlockId(1)];
+        exit.add_insn(Instruction::ret(Some(PseudoId(3))));
+
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry, cond, body, exit];
+
+        // Add pseudos
+        func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        func.add_pseudo(Pseudo::phi(PseudoId(3), 3));
+        func.add_pseudo(Pseudo::phi(PseudoId(4), 4));
+        func.add_pseudo(Pseudo::phi(phisrc1_id, 10));
+        func.add_pseudo(Pseudo::phi(phisrc2_id, 11));
+        func.add_pseudo(Pseudo::phi(phisrc3_id, 12));
+        func.add_pseudo(Pseudo::phi(phisrc4_id, 13));
+
+        eliminate_phi_nodes(&mut func);
+
+        // In body(2), the swap requires a temporary:
+        // The body block should have 3 copies (temp save + 2 actual copies)
+        let body_after = func.get_block(BasicBlockId(2)).unwrap();
+        let body_copies: Vec<_> = body_after
+            .insns
+            .iter()
+            .filter(|i| i.op == Opcode::Copy)
+            .collect();
+        assert_eq!(
+            body_copies.len(),
+            3,
+            "Swap requires 3 copies (temp + 2 actual)"
+        );
+
+        // Verify both phi targets are written to
+        let copy_targets: Vec<_> = body_copies.iter().filter_map(|c| c.target).collect();
+        assert!(copy_targets.contains(&PseudoId(3)), "Must write to %3");
+        assert!(copy_targets.contains(&PseudoId(4)), "Must write to %4");
     }
 }

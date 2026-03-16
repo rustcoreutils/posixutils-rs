@@ -538,10 +538,22 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // Deref produces the base type of the pointer
+            // Deref produces the base type of the pointer.
+            // Function types: *func is a no-op in C (6.5.3.2, 6.3.2.1).
+            // A function identifier has function type which decays to pointer-
+            // to-function in expression context; base_type of pointer-to-function
+            // is the function type.  But if the operand already has function type
+            // (not yet decayed), base_type would give the return type — wrong.
+            // In that case, keep the function type as-is.
             let typ = operand
                 .typ
-                .and_then(|t| self.types.base_type(t))
+                .map(|t| {
+                    if self.types.kind(t) == crate::types::TypeKind::Function {
+                        t // *func_name is a no-op; result is still function type
+                    } else {
+                        self.types.base_type(t).unwrap_or(self.types.int_id)
+                    }
+                })
                 .unwrap_or(self.types.int_id);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {

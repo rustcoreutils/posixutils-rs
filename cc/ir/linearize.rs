@@ -5242,7 +5242,7 @@ impl<'a> Linearizer<'a> {
         // For complex types, pass address so codegen can load real/imag into XMM registers
         // For arrays (including VLAs), decay to pointer
         for (arg_idx, a) in args.iter().enumerate() {
-            let arg_type = self.expr_type(a);
+            let mut arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
                 && self.types.size_bits(arg_type) > 64
@@ -5301,6 +5301,9 @@ impl<'a> Linearizer<'a> {
                             && self.types.is_integer(param_type)
                         {
                             val = self.emit_convert(val, arg_type, param_type);
+                            // Use the widened type so codegen emits a 64-bit
+                            // register move instead of a 32-bit one.
+                            arg_type = param_type;
                         }
                     }
                 }
@@ -7568,6 +7571,11 @@ impl<'a> Linearizer<'a> {
                 // (arrays decay to their first element's address)
                 let type_kind = self.types.kind(typ);
                 if type_kind == TypeKind::Array {
+                    return src;
+                }
+                // In C, dereferencing a function pointer is a no-op:
+                // *func_ptr == func_ptr (C99 6.5.3.2, 6.3.2.1)
+                if type_kind == TypeKind::Function {
                     return src;
                 }
                 // For struct types, always return the address — struct member

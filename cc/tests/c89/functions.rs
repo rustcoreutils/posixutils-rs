@@ -296,3 +296,71 @@ int main(void) {
         0
     );
 }
+
+/// Bug P: literal int -1 passed to long parameter must be sign-extended to 64 bits.
+/// Without the fix, -1 (int 0xFFFFFFFF) arrives as 0x00000000FFFFFFFF (positive)
+/// instead of 0xFFFFFFFFFFFFFFFF (-1L).
+#[test]
+fn c89_functions_int_arg_sign_extension() {
+    let code = r#"
+long check_long(long x) { return (x == -1L) ? 0 : 1; }
+long check_two(long a, long b) { return (a == -1L && b == 42L) ? 0 : 1; }
+typedef long ssize_t_like;
+ssize_t_like identity(ssize_t_like x) { return x; }
+
+int main() {
+    /* literal int -1 to long parameter */
+    if (check_long(-1)) return 1;
+    /* explicit cast (should always work) */
+    if (check_long((long)-1)) return 2;
+    /* local variable */
+    long v = -1;
+    if (check_long(v)) return 3;
+    /* mixed args: -1 and positive */
+    if (check_two(-1, 42)) return 4;
+    /* through a typedef */
+    if (identity(-1) != -1L) return 5;
+    /* -2 to long */
+    if (identity(-2) != -2L) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_functions_int_arg_sign_extension", code, &[]),
+        0
+    );
+}
+
+/// Bug Q: dereferencing a function pointer is a no-op in C (C99 6.5.3.2).
+/// *func_ptr == func_ptr. Without the fix, pcc emitted a load instruction
+/// that read the first byte of the function's code as a value.
+#[test]
+fn c89_functions_deref_funcptr_noop() {
+    let code = r#"
+int add_one(int x) { return x + 1; }
+typedef int (*func_t)(int);
+
+struct TypeObj { func_t fp; };
+
+int main() {
+    /* basic deref of function pointer */
+    func_t f = *add_one;
+    if (f(10) != 11) return 1;
+
+    /* deref through struct member */
+    struct TypeObj t;
+    t.fp = add_one;
+    func_t g = *t.fp;
+    if (g(20) != 21) return 2;
+
+    /* call via deref expression */
+    if ((*add_one)(40) != 41) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_functions_deref_funcptr_noop", code, &[]),
+        0
+    );
+}

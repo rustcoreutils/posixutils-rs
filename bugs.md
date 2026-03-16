@@ -42,10 +42,16 @@
 - `math.log(1.0)` returns `log(0.5)` (argument shifted)
 - Root cause: pcc's floating-point argument passing or double-to-int conversion in extension modules (.so)
 
+### Bug T: chr() for codepoints 128-255 produces UTF-8 encoded 2-char strings — NOT YET FIXED
+- `chr(128)` returns `'Â\x80'` (2 chars, UTF-8 of U+0080) instead of `'\x80'` (1 char)
+- Root cause: one of the many pcc-compiled .o files corrupts the Unicode latin-1 cache during initialization. With ALL .o files gcc-compiled, chr() works correctly.
+- Finding the specific culprit requires binary search across ~100 .o files.
+
 ### CPython build status at -O0
-- **Build**: Compiles and links. Frozen modules generated. Deepfreeze disabled (workaround). Two files (signalmodule.c, getargs.c) compiled with gcc to avoid finalization crash.
-- **Python binary**: Starts, runs integer/string Python code correctly, exits cleanly.
-- **make test**: Test framework can't start because `random.py` module-level code calls `math.exp(-0.5)` which returns wrong value → triggers `math.sqrt` domain error. Need to fix Bug S first.
+- **Build**: Compiles and links entirely by pcc (except linker wraps gcc).
+- **With gcc workarounds** (signalmodule.c, getargs.c, floatobject.c, pyhash.c, longobject.c, bltinmodule.c, ceval.c, specialize.c, unicodeobject.c): Python runs, `random` imports, math works.
+- **Remaining blockers for `make test`**: Bug T (chr 128-255), Bug S (need more gcc workaround files), deepfreeze disabled. With ALL .o files gcc-compiled and pcc linker only, most Python works but sysconfig needs proper Makefile integration.
+- **Fully pcc-compiled**: Python starts and runs basic integer/string code. Float comparison, hashing, chr(), and double-to-int broken.
 
 ### Bug O: Stale caller-saved register across call in goto-dispatch loops — NOT YET FIXED
 - **Symptom:** `_bootstrap_python` segfaults in `_PyEval_EvalFrameDefault` during `init_importlib`. NULL pointer dereference when reading bytecode (`movswl (%reg)` where reg=0).

@@ -1075,8 +1075,14 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::VReg(v) => {
+                let bit_size = if insn.size == 0 { 64 } else { insn.size };
+                let fp_size = if bit_size <= 32 {
+                    FpSize::Single
+                } else {
+                    FpSize::Double
+                };
                 self.push_lir(Aarch64Inst::FcmpZero {
-                    size: FpSize::Double,
+                    size: fp_size,
                     src: *v,
                 });
             }

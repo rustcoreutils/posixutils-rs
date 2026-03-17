@@ -2246,3 +2246,169 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("variadic_64bit_args", code, &[]), 0);
 }
+
+// ============================================================================
+// Regression: string literal bytes >= 0x80 must not be UTF-8 encoded
+// ============================================================================
+
+#[test]
+fn codegen_string_literal_high_bytes() {
+    let code = r#"
+#include <stdio.h>
+
+struct test {
+    int x;
+    char code[8];
+    int y;
+};
+
+static struct test t = {
+    .x = 42,
+    .code = "\x97\x00\x64\x00\xAA\xBB\xCC\xDD",
+    .y = 99,
+};
+
+int main(void) {
+    /* Verify struct fields are correct (not shifted by UTF-8 expansion) */
+    if (t.x != 42) return 1;
+    if (t.y != 99) return 2;
+
+    /* Verify each byte is stored as a raw byte, not UTF-8 encoded */
+    unsigned char *p = (unsigned char *)t.code;
+    if (p[0] != 0x97) return 10;
+    if (p[1] != 0x00) return 11;
+    if (p[2] != 0x64) return 12;
+    if (p[3] != 0x00) return 13;
+    if (p[4] != 0xAA) return 14;
+    if (p[5] != 0xBB) return 15;
+    if (p[6] != 0xCC) return 16;
+    if (p[7] != 0xDD) return 17;
+
+    /* Test string literals with various high bytes */
+    const char *s = "\x80\xFF\xFE\xC0\xC2\x97";
+    unsigned char *q = (unsigned char *)s;
+    if (q[0] != 0x80) return 20;
+    if (q[1] != 0xFF) return 21;
+    if (q[2] != 0xFE) return 22;
+    if (q[3] != 0xC0) return 23;
+    if (q[4] != 0xC2) return 24;
+    if (q[5] != 0x97) return 25;
+
+    /* sizeof must count C bytes, not UTF-8 encoded bytes */
+    if (sizeof("\x80") != 2) return 30;       /* 1 byte + null */
+    if (sizeof("\xc2\x80") != 3) return 31;   /* 2 bytes + null */
+    if (sizeof("\xff") != 2) return 32;        /* 1 byte + null */
+    if (sizeof("hello") != 6) return 33;      /* 5 bytes + null */
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("string_literal_high_bytes", code, &[]), 0);
+}
+
+// ============================================================================
+// Regression: XMM registers must be spilled across function calls
+// ============================================================================
+
+#[test]
+fn codegen_xmm_spill_across_calls() {
+    let code = r#"
+#include <math.h>
+#include <stdio.h>
+
+/* External function to force a real call (prevents inlining) */
+extern int check_type(void *ptr);
+
+struct obj {
+    int type_tag;
+    double value;
+};
+
+int check_type(void *ptr) {
+    struct obj *o = (struct obj *)ptr;
+    return o->type_tag == 1;
+}
+
+double get_value(struct obj *o) {
+    return o->value;
+}
+
+int main(void) {
+    struct obj a = { .type_tag = 1, .value = 1.5 };
+    struct obj b = { .type_tag = 1, .value = 2.5 };
+
+    /* Load a.value, then make a function call, then use a.value */
+    double va = get_value(&a);
+    int is_valid = check_type(&b);  /* call between load and use */
+    double vb = get_value(&b);
+
+    if (!is_valid) return 1;
+
+    /* va should still be 1.5, not clobbered by the call */
+    if (va != 1.5) return 10;
+    if (vb != 2.5) return 11;
+    if (va == vb) return 12;  /* they must not be equal */
+
+    /* Test with math library calls */
+    double x = exp(1.0);
+    double y = sqrt(4.0);  /* call between loads */
+    double z = exp(2.0);
+
+    /* x should still be e^1, not clobbered */
+    if (x < 2.71 || x > 2.72) return 20;
+    if (y < 1.99 || y > 2.01) return 21;
+    if (z < 7.38 || z > 7.40) return 22;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("xmm_spill_across_calls", code, &["-lm".to_string()]),
+        0
+    );
+}
+
+// ============================================================================
+// Regression: double-to-bool conversion must use ucomisd, not ucomiss
+// ============================================================================
+
+#[test]
+fn codegen_double_to_bool() {
+    let code = r#"
+int main(void) {
+    /* if(double) must compare as 64-bit, not truncate to 32-bit */
+    double m = 0.5;
+    if (!m) return 1;  /* 0.5 is truthy */
+
+    double z = 0.0;
+    if (z) return 2;  /* 0.0 is falsy */
+
+    /* while(double) */
+    double w = 0.25;
+    int count = 0;
+    while (w) {
+        count++;
+        w = 0.0;  /* exit after one iteration */
+    }
+    if (count != 1) return 3;
+
+    /* Values whose lower 32 bits are zero (only visible in 64-bit double) */
+    double tiny = 1e-40;  /* nonzero but lower float32 bits are zero */
+    if (!tiny) return 4;
+
+    /* Negative values */
+    double neg = -0.5;
+    if (!neg) return 5;
+
+    /* float should also work */
+    float f = 0.5f;
+    if (!f) return 6;
+
+    float fz = 0.0f;
+    if (fz) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("double_to_bool", code, &[]), 0);
+}

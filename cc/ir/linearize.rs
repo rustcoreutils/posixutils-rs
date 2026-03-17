@@ -2359,7 +2359,7 @@ impl<'a> Linearizer<'a> {
                         self.emit(Instruction::store(
                             null_val,
                             sym_id,
-                            s.len() as i64,
+                            s.chars().count() as i64,
                             elem_type,
                             elem_size,
                         ));
@@ -3035,7 +3035,7 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::store(
                     null_val,
                     base_sym,
-                    offset + s.len() as i64,
+                    offset + s.chars().count() as i64,
                     elem_type,
                     elem_size,
                 ));

@@ -2692,7 +2692,7 @@ impl<'a> Parser<'a> {
                     // (C11 6.4.5: "type is array of char" not "pointer to char")
                     // The array-to-pointer decay happens when used in most contexts,
                     // but sizeof("hello") needs to return 6, not sizeof(char*).
-                    let array_size = parsed.len() + 1; // +1 for null terminator
+                    let array_size = parsed.chars().count() + 1; // +1 for null terminator
                     let str_type = self
                         .types
                         .intern(Type::array(self.types.char_id, array_size));

@@ -87,9 +87,14 @@ pub fn escape_string(s: &str) -> String {
             '"' => result.push_str("\\\""),
             c if c.is_ascii_graphic() || c == ' ' => result.push(c),
             c => {
-                // Escape non-printable as octal bytes (handles UTF-8 correctly)
-                for byte in c.to_string().as_bytes() {
-                    result.push_str(&format!("\\{:03o}", byte));
+                // String literals represent raw byte values (0-255).
+                // Emit as single octal byte, not UTF-8 encoded.
+                if (c as u32) <= 255 {
+                    result.push_str(&format!("\\{:03o}", c as u8));
+                } else {
+                    for byte in c.to_string().as_bytes() {
+                        result.push_str(&format!("\\{:03o}", byte));
+                    }
                 }
             }
         }
@@ -296,8 +301,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // Emit string as .ascii (without null terminator)
                 // Then zero-fill the remaining bytes (which includes the null terminator)
                 self.push_directive(Directive::Ascii(escape_string(s)));
-                // .ascii emits s.len() bytes; fill remaining with zeros
-                let bytes_emitted = s.len();
+                // Each char in the parsed string represents one C byte (0-255).
+                // Use chars().count() not len() since len() counts UTF-8 bytes.
+                let bytes_emitted = s.chars().count();
                 if size > bytes_emitted {
                     self.push_directive(Directive::Zero(size - bytes_emitted));
                 }

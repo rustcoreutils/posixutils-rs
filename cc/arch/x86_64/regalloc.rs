@@ -369,7 +369,8 @@ impl XmmReg {
     }
 
     /// All allocatable XMM registers
-    /// XMM0-XMM7 are caller-saved (scratch), XMM8-XMM15 are callee-saved on Windows but not on System V
+    /// All XMM registers (XMM0-XMM15) are caller-saved on x86-64 SysV ABI.
+    /// Values in XMM registers are NOT preserved across function calls.
     /// XMM14 and XMM15 are reserved as scratch registers for codegen operations
     pub fn allocatable() -> &'static [XmmReg] {
         &[
@@ -803,6 +804,12 @@ impl RegAlloc {
                     // Align to 16-byte boundary for proper x87 access
                     self.stack_offset = (self.stack_offset + 15) & !15;
                     self.stack_offset += 16;
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                } else if crosses_call {
+                    // All XMM registers are caller-saved on x86-64 SysV ABI.
+                    // Values live across function calls must be spilled to stack.
+                    self.stack_offset += 8;
                     self.locations
                         .insert(interval.pseudo, Loc::Stack(self.stack_offset));
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {

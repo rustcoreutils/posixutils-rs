@@ -1045,9 +1045,14 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Xmm(x) => {
+                let fp_size = if size <= 32 {
+                    FpSize::Single
+                } else {
+                    FpSize::Double
+                };
                 self.push_lir(X86Inst::XorpsSelf { reg: XmmReg::Xmm15 });
                 self.push_lir(X86Inst::UComiFp {
-                    size: FpSize::Single,
+                    size: fp_size,
                     src: XmmOperand::Reg(*x),
                     dst: XmmReg::Xmm15,
                 });

@@ -228,6 +228,56 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Compute common type for ternary operator branches (C99 6.5.15, 6.3.1.8)
+    fn ternary_common_type(&mut self, then_typ: TypeId, else_typ: TypeId) -> TypeId {
+        let then_kind = self.types.kind(then_typ);
+        let else_kind = self.types.kind(else_typ);
+
+        // If either is a pointer, use pointer type
+        if then_kind == TypeKind::Pointer {
+            return then_typ;
+        }
+        if else_kind == TypeKind::Pointer {
+            return else_typ;
+        }
+
+        // If either is void, result is void
+        if then_kind == TypeKind::Void || else_kind == TypeKind::Void {
+            return self.types.void_id;
+        }
+
+        // Both arithmetic: apply usual arithmetic conversions
+        // Float types take precedence
+        if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
+            if then_kind == TypeKind::LongDouble || else_kind == TypeKind::LongDouble {
+                return self.types.longdouble_id;
+            }
+            if then_kind == TypeKind::Double || else_kind == TypeKind::Double {
+                return self.types.double_id;
+            }
+            return self.types.float_id;
+        }
+
+        // Integer types: promote both, then pick the wider/unsigned
+        let then_size = self.types.size_bits(then_typ).max(32); // integer promotion
+        let else_size = self.types.size_bits(else_typ).max(32);
+
+        // Pick the wider type, or int if both are narrow
+        if then_size >= else_size && then_size >= 32 {
+            if then_size == 32 {
+                return self.types.int_id;
+            }
+            return then_typ;
+        }
+        if else_size >= then_size && else_size >= 32 {
+            if else_size == 32 {
+                return self.types.int_id;
+            }
+            return else_typ;
+        }
+        self.types.int_id
+    }
+
     /// Parse a conditional (ternary) expression: cond ? then : else
     pub(crate) fn parse_conditional_expr(&mut self) -> ParseResult<Expr> {
         let cond = self.parse_logical_or_expr()?;
@@ -244,26 +294,26 @@ impl<'a> Parser<'a> {
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
-            // Decay arrays to pointers
+            // Decay arrays to pointers, functions to pointer-to-function
             let then_decayed = if self.types.kind(then_typ) == TypeKind::Array {
                 let elem = self.types.base_type(then_typ).unwrap_or(self.types.char_id);
-                self.types.pointer_to(elem)
+                self.types.intern(Type::pointer(elem))
             } else if self.types.kind(then_typ) == TypeKind::Function {
-                self.types.pointer_to(then_typ)
+                self.types.intern(Type::pointer(then_typ))
             } else {
                 then_typ
             };
-            let _else_decayed = if self.types.kind(else_typ) == TypeKind::Array {
+            let else_decayed = if self.types.kind(else_typ) == TypeKind::Array {
                 let elem = self.types.base_type(else_typ).unwrap_or(self.types.char_id);
-                self.types.pointer_to(elem)
+                self.types.intern(Type::pointer(elem))
             } else if self.types.kind(else_typ) == TypeKind::Function {
-                self.types.pointer_to(else_typ)
+                self.types.intern(Type::pointer(else_typ))
             } else {
                 else_typ
             };
 
-            // Use decayed then type (for now; proper impl would compute common type)
-            let typ = then_decayed;
+            // Compute common type of then and else branches (C99 6.5.15)
+            let typ = self.ternary_common_type(then_decayed, else_decayed);
 
             let pos = cond.pos;
             Ok(Self::typed_expr(

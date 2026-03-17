@@ -474,21 +474,31 @@ impl X86_64CodeGen {
         };
         // Use type-aware FP size determination
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let move_size = Self::size_from_type(insn.typ, insn.size, types);
+
+        // Check if src2 is in Xmm0 before we clobber it with src1.
+        // If so, move src2 to Xmm15 first to avoid losing its value.
+        let src2_loc = self.get_location(src2);
+        if matches!(src2_loc, Loc::Xmm(XmmReg::Xmm0)) {
+            self.push_lir(X86Inst::MovFp {
+                size: fp_size,
+                src: XmmOperand::Reg(XmmReg::Xmm0),
+                dst: XmmOperand::Reg(XmmReg::Xmm15),
+            });
+        }
 
         // Load first operand to XMM0
-        self.emit_fp_move(
-            src1,
-            XmmReg::Xmm0,
-            Self::size_from_type(insn.typ, insn.size, types),
-        );
+        self.emit_fp_move(src1, XmmReg::Xmm0, move_size);
 
         // Compare with second operand using ucomiss/ucomisd
+        // Re-read src2 location; if it was Xmm0, it's now in Xmm15.
         let src2_loc = self.get_location(src2);
         match src2_loc {
             Loc::Xmm(x) => {
+                let actual_reg = if x == XmmReg::Xmm0 { XmmReg::Xmm15 } else { x };
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
-                    src: XmmOperand::Reg(x),
+                    src: XmmOperand::Reg(actual_reg),
                     dst: XmmReg::Xmm0,
                 });
             }
@@ -504,11 +514,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, _) => {
-                self.emit_fp_imm_to_xmm(
-                    v,
-                    XmmReg::Xmm15,
-                    Self::size_from_type(insn.typ, insn.size, types),
-                );
+                self.emit_fp_imm_to_xmm(v, XmmReg::Xmm15, move_size);
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -516,11 +522,7 @@ impl X86_64CodeGen {
                 });
             }
             _ => {
-                self.emit_fp_move(
-                    src2,
-                    XmmReg::Xmm15,
-                    Self::size_from_type(insn.typ, insn.size, types),
-                );
+                self.emit_fp_move(src2, XmmReg::Xmm15, move_size);
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),

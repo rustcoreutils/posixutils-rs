@@ -2357,6 +2357,7 @@ impl Aarch64CodeGen {
         // We use the actual locations assigned by the register allocator
         // so that subsequent Store instructions work correctly.
         let mut operand_regs: Vec<Option<Reg>> = Vec::new();
+        let mut operand_sizes: Vec<u32> = Vec::new();
         let mut operand_mem: Vec<Option<String>> = Vec::new();
         let mut operand_names: Vec<Option<String>> = Vec::new();
 
@@ -2364,6 +2365,7 @@ impl Aarch64CodeGen {
         for output in &asm_data.outputs {
             let loc = self.get_location(output.pseudo);
             operand_names.push(output.name.clone());
+            operand_sizes.push(output.size);
             match loc {
                 Loc::Reg(r) => {
                     operand_regs.push(Some(r));
@@ -2394,6 +2396,7 @@ impl Aarch64CodeGen {
             };
 
             operand_names.push(input.name.clone());
+            operand_sizes.push(input.size);
             match loc {
                 Loc::Reg(r) => {
                     operand_regs.push(Some(r));
@@ -2428,6 +2431,7 @@ impl Aarch64CodeGen {
         let asm_output = self.substitute_asm_operands(
             &asm_data.template,
             &operand_regs,
+            &operand_sizes,
             &operand_mem,
             &operand_names,
             &goto_labels_formatted,
@@ -2491,6 +2495,7 @@ impl Aarch64CodeGen {
         &self,
         template: &str,
         operand_regs: &[Option<Reg>],
+        operand_sizes: &[u32],
         operand_mem: &[Option<String>],
         operand_names: &[Option<String>],
         goto_labels: &[(String, String)],
@@ -2499,6 +2504,7 @@ impl Aarch64CodeGen {
             self,
             template,
             operand_regs,
+            operand_sizes,
             operand_mem,
             operand_names,
             goto_labels,
@@ -3121,9 +3127,13 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
         }
     }
 
-    fn format_reg_default(&self, reg: Reg) -> String {
-        // AArch64 inline asm defaults to 64-bit
-        asm_reg_name_64(reg).to_string()
+    fn format_reg_default(&self, reg: Reg, size_bits: u32) -> String {
+        // Select register width matching the operand's declared size
+        if size_bits <= 32 {
+            asm_reg_name_32(reg).to_string()
+        } else {
+            asm_reg_name_64(reg).to_string()
+        }
     }
 }
 

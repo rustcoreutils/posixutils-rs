@@ -1707,12 +1707,10 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Xmm(x) => {
-                // Move from XMM to general-purpose register
-                // For Float16 (16-bit), XMM may have garbage in bits 16-31 from movss loads.
-                // We need to: 1) use movd (32-bit), 2) zero-extend from 16 to 32 if needed.
-                // LIR: XMM to GP move
+                // Move from XMM to general-purpose register.
+                // Use movd for ≤32-bit (float/float16) or movq for 64-bit (double).
                 self.push_lir(X86Inst::MovXmmGp {
-                    size: OperandSize::B32, // Use movd instead of movq
+                    size: op_size,
                     src: x,
                     dst,
                 });
@@ -2935,6 +2933,7 @@ impl X86_64CodeGen {
         // and emit mov instructions to/from the actual locations.
         let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
         let mut operand_regs: Vec<Option<Reg>> = Vec::with_capacity(operand_count);
+        let mut operand_sizes: Vec<u32> = Vec::with_capacity(operand_count);
         let mut operand_mem: Vec<Option<String>> = Vec::with_capacity(operand_count);
         let mut operand_names: Vec<Option<String>> = Vec::with_capacity(operand_count);
 
@@ -2976,6 +2975,7 @@ impl X86_64CodeGen {
             let loc = self.get_location(output.pseudo);
             let op_size = output.size;
             operand_names.push(output.name.clone());
+            operand_sizes.push(op_size);
 
             // Check for specific register constraint
             if let Some(specific_reg) = Self::constraint_to_specific_reg(&output.constraint) {
@@ -3077,6 +3077,7 @@ impl X86_64CodeGen {
             }
 
             operand_names.push(input.name.clone());
+            operand_sizes.push(op_size);
 
             // Check for specific register constraint
             if let Some(specific_reg) = Self::constraint_to_specific_reg(constraint_for_reg) {
@@ -3184,6 +3185,7 @@ impl X86_64CodeGen {
         let asm_output = self.substitute_asm_operands(
             &asm_data.template,
             &operand_regs,
+            &operand_sizes,
             &operand_mem,
             &operand_names,
             &goto_labels_formatted,
@@ -3480,11 +3482,12 @@ impl X86_64CodeGen {
         &self,
         template: &str,
         regs: &[Option<Reg>],
+        sizes: &[u32],
         mems: &[Option<String>],
         names: &[Option<String>],
         goto_labels: &[(String, String)],
     ) -> String {
-        crate::arch::substitute_asm_operands(self, template, regs, mems, names, goto_labels)
+        crate::arch::substitute_asm_operands(self, template, regs, sizes, mems, names, goto_labels)
     }
 
     /// Get a sized register name based on modifier
@@ -4158,9 +4161,15 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
         format!("%{}", self.sized_reg_name(reg, size_mod))
     }
 
-    fn format_reg_default(&self, reg: Reg) -> String {
-        // x86 inline asm defaults to 32-bit for GCC compatibility
-        format!("%{}", self.sized_reg_name(reg, 'k'))
+    fn format_reg_default(&self, reg: Reg, size_bits: u32) -> String {
+        // Select register width matching the operand's declared size
+        let size_mod = match size_bits {
+            8 => 'b',
+            16 => 'w',
+            64 => 'q',
+            _ => 'k', // 32-bit default
+        };
+        format!("%{}", self.sized_reg_name(reg, size_mod))
     }
 }
 

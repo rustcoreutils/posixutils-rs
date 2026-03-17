@@ -2463,3 +2463,201 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("unsigned_long_to_double", code, &[]), 0);
 }
+
+// ============================================================================
+// Regression: ternary result type must be common type of both branches
+// ============================================================================
+
+#[test]
+fn codegen_ternary_common_type() {
+    let code = r#"
+struct rec {
+    unsigned char flags;
+    unsigned char decimal;
+};
+
+static struct rec table[] = {
+    { 0x02, 5 },   /* digit */
+    { 0x00, 0xFF }, /* non-digit */
+};
+
+int get_decimal(struct rec *r) {
+    /* Result type must be int (common of unsigned char and int), not unsigned char */
+    return (r->flags & 0x02) ? r->decimal : -1;
+}
+
+int main(void) {
+    /* Digit case: should return 5 */
+    if (get_decimal(&table[0]) != 5) return 1;
+    /* Non-digit case: should return -1, not 255 */
+    if (get_decimal(&table[1]) != -1) return 2;
+
+    /* Also test with wider types */
+    int x = 1;
+    long result = x ? (short)42 : 1000000L;
+    if (result != 42) return 3;
+
+    long result2 = (!x) ? (short)42 : 1000000L;
+    if (result2 != 1000000L) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ternary_common_type", code, &[]), 0);
+}
+
+/// Regression test: FP compare clobber when src2 is allocated to Xmm0.
+/// The codegen for `d < -(double)MIN` would move src1 into Xmm0, clobbering
+/// src2 if it was already in Xmm0, then compare Xmm0 with itself.
+#[test]
+fn codegen_fp_compare_xmm0_clobber() {
+    let code = r#"
+#include <stdint.h>
+#include <limits.h>
+
+typedef int64_t _PyTime_t;
+#define _PyTime_MIN INT64_MIN
+
+/* Separate function to prevent constant folding */
+static double scale(double x, double y) { return x * y; }
+
+static int check(double value, long unit_to_ns) {
+    volatile double d;
+    d = value;
+    d = scale(d, (double)unit_to_ns);
+
+    /* This pattern triggers the bug: && with two FP comparisons
+       involving a negated cast of an int64_t min constant.
+       The second comparison's src2 (-(double)_PyTime_MIN) could be
+       allocated to Xmm0, which gets clobbered when src1 (d) is
+       moved into Xmm0 for the ucomisd instruction. */
+    if (!((double)_PyTime_MIN <= d && d < -(double)_PyTime_MIN)) {
+        return -1;  /* overflow */
+    }
+    return 0;  /* ok */
+}
+
+int main(void) {
+    /* Small values should NOT overflow */
+    if (check(0.001, 1000000000L) != 0) return 1;
+    if (check(1.0, 1000000000L) != 0) return 2;
+    if (check(120.0, 1000000000L) != 0) return 3;
+    if (check(0.0, 1000000000L) != 0) return 4;
+    if (check(-0.001, 1000000000L) != 0) return 5;
+
+    /* Huge values SHOULD overflow */
+    if (check(1e19, 1000000000L) != -1) return 6;
+    if (check(-1e19, 1000000000L) != -1) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("fp_compare_xmm0_clobber", code, &[]), 0);
+}
+
+/// Regression test: inline asm with "+r" constraint on 64-bit value used 32-bit register.
+/// The xchg instruction in CPython's atomic store macro would truncate pointers.
+#[test]
+fn codegen_inline_asm_64bit_constraint() {
+    let code = r#"
+#include <stdint.h>
+
+typedef struct { uintptr_t _value; } atomic_addr;
+
+static inline void atomic_store(atomic_addr *addr, uintptr_t val) {
+    uintptr_t new_val = val;
+    __asm__ volatile("xchg %0, %1"
+                     : "+r"(new_val)
+                     : "m"(addr->_value)
+                     : "memory");
+}
+
+int main(void) {
+    atomic_addr slot = {0};
+    /* Use a pointer value that exercises upper 32 bits */
+    uintptr_t ptr = 0x7F5500123456UL;
+
+    atomic_store(&slot, ptr);
+
+    uintptr_t loaded = *(volatile uintptr_t *)&slot._value;
+    if (loaded != ptr) return 1;  /* upper bits truncated */
+
+    /* Also test 32-bit values still work */
+    uintptr_t small = 42;
+    atomic_store(&slot, small);
+    loaded = *(volatile uintptr_t *)&slot._value;
+    if (loaded != 42) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inline_asm_64bit_constraint", code, &[]), 0);
+}
+
+/// Regression test: XMM-to-GPR move used movd (32-bit) instead of movq (64-bit)
+/// for doubles. This truncated the upper 32 bits, causing double values like
+/// 1.0 (0x3FF0000000000000) to become 0.0 (lower 32 bits are zero).
+#[test]
+fn codegen_double_xmm_to_gpr_movq() {
+    let code = r#"
+double negate_if(double val, int neg) {
+    if (neg) return -val;
+    return val;
+}
+
+int main(void) {
+    /* Without the fix, movd truncates to 32 bits.
+       1.0 = 0x3FF0000000000000 → lower 32 bits = 0 → result is 0.0 */
+    if (negate_if(1.0, 0) != 1.0) return 1;
+    if (negate_if(1.0, 1) != -1.0) return 2;
+    if (negate_if(3.14, 0) != 3.14) return 3;
+    if (negate_if(3.14, 1) != -3.14) return 4;
+
+    /* Also test ternary with doubles */
+    double x = 1.0;
+    double y = 2.0;
+    int cond = 1;
+    double r = cond ? x : y;
+    if (r != 1.0) return 5;
+    r = (!cond) ? x : y;
+    if (r != 2.0) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("double_xmm_to_gpr_movq", code, &[]), 0);
+}
+
+/// Regression test: ternary selecting function pointers lost return type.
+/// `(cond ? func_a : func_b)(arg)` used pointer_to() which returned void*
+/// when the pointer-to-function type wasn't in the lookup table. The call's
+/// return type defaulted to int (32-bit), truncating pointer return values.
+#[test]
+fn codegen_ternary_fptr_return_type() {
+    let code = r#"
+#include <stdlib.h>
+
+typedef struct { int x; } Obj;
+
+Obj *func_a(int *p) { Obj *o = malloc(sizeof(*o)); o->x = *p + 100; return o; }
+Obj *func_b(int *p) { Obj *o = malloc(sizeof(*o)); o->x = *p + 200; return o; }
+
+int main(void) {
+    int data = 42;
+    int cond = 1;
+
+    /* Ternary selecting function pointer, then calling result */
+    Obj *result = (cond ? func_a : func_b)(&data);
+    if (result->x != 142) return 1;
+
+    cond = 0;
+    Obj *result2 = (cond ? func_a : func_b)(&data);
+    if (result2->x != 242) return 2;
+
+    free(result);
+    free(result2);
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ternary_fptr_return_type", code, &[]), 0);
+}

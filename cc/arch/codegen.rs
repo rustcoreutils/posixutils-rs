@@ -443,8 +443,9 @@ pub trait AsmOperandFormatter {
     /// Returns the formatted register string (e.g., "%eax" for x86, "w0" for aarch64).
     fn format_reg_sized(&self, reg: Self::Reg, size_mod: char) -> String;
 
-    /// Format a register at default size (for bare %0, %1 references).
-    fn format_reg_default(&self, reg: Self::Reg) -> String;
+    /// Format a register at operand-appropriate size (for bare %0, %1 references).
+    /// The `size_bits` parameter is the operand's declared size from the constraint.
+    fn format_reg_default(&self, reg: Self::Reg, size_bits: u32) -> String;
 }
 
 /// Substitute %N, %[name], %lN, %l[name], and size modifiers in asm template.
@@ -460,6 +461,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     formatter: &F,
     template: &str,
     regs: &[Option<F::Reg>],
+    sizes: &[u32],
     mems: &[Option<String>],
     names: &[Option<String>],
     goto_labels: &[(String, String)],
@@ -495,7 +497,8 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                         if let Some(ref mem) = mems[idx] {
                             result.push_str(mem);
                         } else if let Some(reg) = regs[idx] {
-                            result.push_str(&formatter.format_reg_default(reg));
+                            let sz = sizes.get(idx).copied().unwrap_or(32);
+                            result.push_str(&formatter.format_reg_default(reg, sz));
                         }
                     } else {
                         // Unknown name, pass through
@@ -522,7 +525,8 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                         if let Some(ref mem) = mems[idx] {
                             result.push_str(mem);
                         } else if let Some(reg) = regs[idx] {
-                            result.push_str(&formatter.format_reg_default(reg));
+                            let sz = sizes.get(idx).copied().unwrap_or(32);
+                            result.push_str(&formatter.format_reg_default(reg, sz));
                         }
                     } else {
                         // Unknown operand, pass through

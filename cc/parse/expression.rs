@@ -575,8 +575,16 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // Neg has same type as operand
-            let typ = operand.typ.unwrap_or(self.types.int_id);
+            // C99 6.3.1.1: integer promotion — types smaller than int promote to int
+            let op_typ = operand.typ.unwrap_or(self.types.int_id);
+            let typ = {
+                let kind = self.types.kind(op_typ);
+                if matches!(kind, TypeKind::Bool | TypeKind::Char | TypeKind::Short) {
+                    self.types.int_id
+                } else {
+                    op_typ
+                }
+            };
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Neg,

@@ -705,6 +705,11 @@ impl X86_64CodeGen {
                 kind == TypeKind::Struct || kind == TypeKind::Union
             });
 
+            // Derive return size from type to avoid 32-bit truncation
+            let ret_size = ret_typ
+                .map(|t| types.size_bits(t).max(32))
+                .unwrap_or(insn.size.max(32));
+
             if insn.is_two_reg_return {
                 // Two-register struct return: check ABI for SSE vs INTEGER
                 if is_struct_or_union {
@@ -837,18 +842,18 @@ impl X86_64CodeGen {
                                             dst: XmmReg::Xmm0,
                                         });
                                     }
-                                    _ => self.emit_move(*src, Reg::Rax, insn.size),
+                                    _ => self.emit_move(*src, Reg::Rax, ret_size),
                                 }
                             }
                         } else {
                             // INTEGER class - return in RAX
-                            self.emit_move(*src, Reg::Rax, insn.size);
+                            self.emit_move(*src, Reg::Rax, ret_size);
                         }
                     } else {
-                        self.emit_move(*src, Reg::Rax, insn.size);
+                        self.emit_move(*src, Reg::Rax, ret_size);
                     }
                 } else {
-                    self.emit_move(*src, Reg::Rax, insn.size);
+                    self.emit_move(*src, Reg::Rax, ret_size);
                 }
             } else if is_complex {
                 // Complex return value handling:
@@ -942,7 +947,7 @@ impl X86_64CodeGen {
                     self.emit_fp_move(*src, XmmReg::Xmm0, fp_size);
                 }
             } else {
-                self.emit_move(*src, Reg::Rax, insn.size);
+                self.emit_move(*src, Reg::Rax, ret_size);
             }
         }
 
@@ -983,7 +988,11 @@ impl X86_64CodeGen {
         let loc = self.get_location(cond);
         // Use 64-bit test when insn.size is unset (0) to avoid truncating
         // 64-bit condition values. cbr instructions often lack size info.
-        let size = if insn.size == 0 { 64 } else { insn.size.max(32) };
+        let size = if insn.size == 0 {
+            64
+        } else {
+            insn.size.max(32)
+        };
         let op_size = OperandSize::from_bits(size);
 
         match &loc {
@@ -1095,19 +1104,42 @@ impl X86_64CodeGen {
             Opcode::Switch => {
                 // Switch uses target as the value to switch on
                 if let Some(val) = insn.target {
-                    // Load at actual size so emit_move uses zero-extending load
-                    // for sub-32-bit types (e.g., uint8_t). Then compare at 32-bit.
-                    self.emit_move(val, Reg::R10, insn.size);
-                    let op_size = OperandSize::B32;
+                    // Derive comparison size from type to handle long/pointer switches
+                    let switch_size = insn
+                        .typ
+                        .map(|t| types.size_bits(t).max(32))
+                        .unwrap_or(insn.size.max(32));
+                    self.emit_move(val, Reg::R10, switch_size);
+                    let op_size = if switch_size > 32 {
+                        OperandSize::B64
+                    } else {
+                        OperandSize::B32
+                    };
 
                     // Generate comparisons for each case
                     for (case_val, target_bb) in &insn.switch_cases {
-                        // LIR: compare with case value
-                        self.push_lir(X86Inst::Cmp {
-                            size: op_size,
-                            src: GpOperand::Imm(*case_val),
-                            dst: GpOperand::Reg(Reg::R10),
-                        });
+                        // For 64-bit comparisons with values that don't fit in a
+                        // sign-extended 32-bit immediate, load into R11 first
+                        let fits_in_simm32 =
+                            *case_val >= i32::MIN as i64 && *case_val <= i32::MAX as i64;
+                        if op_size == OperandSize::B64 && !fits_in_simm32 {
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Imm(*case_val),
+                                dst: GpOperand::Reg(Reg::R11),
+                            });
+                            self.push_lir(X86Inst::Cmp {
+                                size: op_size,
+                                src: GpOperand::Reg(Reg::R11),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                        } else {
+                            self.push_lir(X86Inst::Cmp {
+                                size: op_size,
+                                src: GpOperand::Imm(*case_val),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                        }
                         // LIR: conditional jump on equal
                         self.push_lir(X86Inst::Jcc {
                             cc: CondCode::Eq,
@@ -2237,8 +2269,8 @@ impl X86_64CodeGen {
                         let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
                         if sym_bits > 32 {
                             // Check if this is a struct/union (don't widen field stores)
-                            let is_struct = self.sym_type_sizes.contains_key(&addr)
-                                && sym_bits > 64;
+                            let is_struct =
+                                self.sym_type_sizes.contains_key(&addr) && sym_bits > 64;
                             if is_struct {
                                 op_size // struct field: exact size
                             } else {
@@ -2880,17 +2912,18 @@ impl X86_64CodeGen {
         let mut operand_names: Vec<Option<String>> = Vec::with_capacity(operand_count);
 
         // Track which outputs need to be moved from specific registers after asm
-        // (output_idx, specific_reg, actual_loc)
-        let mut output_moves: Vec<(usize, Reg, Loc)> = Vec::with_capacity(asm_data.outputs.len());
+        // (output_idx, specific_reg, actual_loc, size_bits)
+        let mut output_moves: Vec<(usize, Reg, Loc, u32)> =
+            Vec::with_capacity(asm_data.outputs.len());
 
         // Track which inputs need to be moved to specific registers before asm
-        // (specific_reg, actual_loc)
-        let mut input_moves: Vec<(Reg, Loc)> = Vec::with_capacity(asm_data.inputs.len());
+        // (specific_reg, actual_loc, size_bits)
+        let mut input_moves: Vec<(Reg, Loc, u32)> = Vec::with_capacity(asm_data.inputs.len());
 
         // Track register remaps: if an allocated reg conflicts with reserved, use temp
-        // (original_reg, temp_reg, actual_loc for restore)
-        let mut remap_setup: Vec<(Reg, Reg, Loc)> = Vec::with_capacity(operand_count);
-        let mut remap_restore: Vec<(Reg, Reg, Loc)> = Vec::with_capacity(operand_count);
+        // (original_reg, temp_reg, actual_loc for restore, size_bits)
+        let mut remap_setup: Vec<(Reg, Reg, Loc, u32)> = Vec::with_capacity(operand_count);
+        let mut remap_restore: Vec<(Reg, Reg, Loc, u32)> = Vec::with_capacity(operand_count);
 
         // Track which pseudos have been assigned temp registers (for +r where input/output share pseudo)
         let mut pseudo_to_temp: std::collections::HashMap<PseudoId, Reg> =
@@ -2914,6 +2947,7 @@ impl X86_64CodeGen {
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
+            let op_size = output.size;
             operand_names.push(output.name.clone());
 
             // Check for specific register constraint
@@ -2923,7 +2957,7 @@ impl X86_64CodeGen {
                 operand_mem.push(None);
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
-                    output_moves.push((idx, specific_reg, loc));
+                    output_moves.push((idx, specific_reg, loc, op_size));
                 }
             } else {
                 let requires_reg = Self::constraint_requires_register(&output.constraint);
@@ -2938,7 +2972,7 @@ impl X86_64CodeGen {
                             operand_regs.push(Some(temp));
                             operand_mem.push(None);
                             // For outputs, move from temp to actual loc after asm
-                            remap_restore.push((temp, r, loc.clone()));
+                            remap_restore.push((temp, r, loc.clone(), op_size));
                             // Track this pseudo -> temp mapping for +r inputs
                             pseudo_to_temp.insert(output.pseudo, temp);
                         } else {
@@ -2967,7 +3001,7 @@ impl X86_64CodeGen {
                         used_regs.insert(temp);
                         operand_regs.push(Some(temp));
                         operand_mem.push(None);
-                        output_moves.push((idx, temp, loc.clone()));
+                        output_moves.push((idx, temp, loc.clone(), op_size));
                         pseudo_to_temp.insert(output.pseudo, temp);
                     }
                     _ => {
@@ -2984,6 +3018,8 @@ impl X86_64CodeGen {
 
         // Process input operands
         for input in &asm_data.inputs {
+            let op_size = input.size;
+
             // Handle matching constraints - use the matched output's location/register
             let (loc, constraint_for_reg) = if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
@@ -3007,7 +3043,7 @@ impl X86_64CodeGen {
                 if match_idx < num_outputs {
                     if let Some(reg) = operand_regs[match_idx] {
                         // Load initial value into the register before asm
-                        input_moves.push((reg, loc));
+                        input_moves.push((reg, loc, op_size));
                     }
                     continue; // Skip — don't add a new operand slot
                 }
@@ -3022,7 +3058,7 @@ impl X86_64CodeGen {
                 operand_mem.push(None);
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
-                    input_moves.push((specific_reg, loc));
+                    input_moves.push((specific_reg, loc, op_size));
                 }
             } else {
                 // Check if this input shares a pseudo with an output that was remapped
@@ -3032,7 +3068,7 @@ impl X86_64CodeGen {
                     operand_regs.push(Some(temp));
                     operand_mem.push(None);
                     // Add setup move to load value into temp
-                    remap_setup.push((temp, temp, loc.clone()));
+                    remap_setup.push((temp, temp, loc.clone(), op_size));
                 } else {
                     let requires_reg = Self::constraint_requires_register(constraint_for_reg);
                     let requires_mem = Self::constraint_requires_memory(constraint_for_reg);
@@ -3044,7 +3080,7 @@ impl X86_64CodeGen {
                             // Load address into temp reg and emit as indirect memory ref.
                             let temp = find_temp_reg(&reserved_regs, &used_regs);
                             used_regs.insert(temp);
-                            input_moves.push((temp, loc.clone()));
+                            input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
                             operand_regs.push(None);
                             operand_mem.push(Some(mem_str));
@@ -3064,7 +3100,7 @@ impl X86_64CodeGen {
                                 operand_regs.push(Some(temp));
                                 operand_mem.push(None);
                                 // For inputs, move from actual loc to temp before asm
-                                remap_setup.push((r, temp, loc.clone()));
+                                remap_setup.push((r, temp, loc.clone(), op_size));
                             } else {
                                 operand_regs.push(Some(r));
                                 operand_mem.push(None);
@@ -3083,7 +3119,7 @@ impl X86_64CodeGen {
                             used_regs.insert(temp);
                             operand_regs.push(Some(temp));
                             operand_mem.push(None);
-                            input_moves.push((temp, loc.clone()));
+                            input_moves.push((temp, loc.clone(), op_size));
                         }
                         _ => {
                             // Memory or other location
@@ -3097,13 +3133,13 @@ impl X86_64CodeGen {
         }
 
         // Emit remap setup moves (for inputs that conflicted with reserved regs)
-        for (_orig, temp, actual_loc) in &remap_setup {
-            self.emit_raw_mov_from_loc(actual_loc, *temp);
+        for (_orig, temp, actual_loc, size) in &remap_setup {
+            self.emit_raw_mov_from_loc(actual_loc, *temp, *size);
         }
 
         // Emit moves from actual locations to specific registers (for inputs)
-        for (specific_reg, actual_loc) in &input_moves {
-            self.emit_raw_mov_from_loc(actual_loc, *specific_reg);
+        for (specific_reg, actual_loc, size) in &input_moves {
+            self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
         }
 
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
@@ -3136,13 +3172,13 @@ impl X86_64CodeGen {
         }
 
         // Emit moves from specific registers to actual locations (for outputs)
-        for (_idx, specific_reg, actual_loc) in &output_moves {
-            self.emit_raw_mov_to_loc(*specific_reg, actual_loc);
+        for (_idx, specific_reg, actual_loc, size) in &output_moves {
+            self.emit_raw_mov_to_loc(*specific_reg, actual_loc, *size);
         }
 
         // Emit remap restore moves (for outputs that conflicted with reserved regs)
-        for (temp, _orig, actual_loc) in &remap_restore {
-            self.emit_raw_mov_to_loc(*temp, actual_loc);
+        for (temp, _orig, actual_loc, size) in &remap_restore {
+            self.emit_raw_mov_to_loc(*temp, actual_loc, *size);
         }
 
         // Handle clobbers - for now just emit comments for documentation
@@ -3164,127 +3200,149 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Get the mov suffix and register size modifier for a given bit size
+    fn asm_mov_info(size_bits: u32) -> (&'static str, char) {
+        match size_bits {
+            0..=8 => ("movb", 'b'),
+            9..=16 => ("movw", 'w'),
+            17..=32 => ("movl", 'k'),
+            _ => ("movq", 'q'),
+        }
+    }
+
     /// Emit a raw mov instruction from a location to a register (for asm input setup)
-    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg) {
-        let dest_name = self.reg_name_64(dest_reg);
+    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg, size_bits: u32) {
+        let (mov, sz) = Self::asm_mov_info(size_bits);
+        let dest_name = if sz == 'q' {
+            self.reg_name_64(dest_reg)
+        } else {
+            self.sized_reg_name(dest_reg, sz)
+        };
         match loc {
             Loc::Reg(src_reg) => {
-                let src_name = self.reg_name_64(*src_reg);
+                let src_name = if sz == 'q' {
+                    self.reg_name_64(*src_reg)
+                } else {
+                    self.sized_reg_name(*src_reg, sz)
+                };
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movq %{}, %{}",
-                    src_name, dest_name
+                    "{} %{}, %{}",
+                    mov, src_name, dest_name
                 ))));
             }
             Loc::Stack(offset) => {
                 let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl -{}(%rbp), %{}",
-                    adjusted,
-                    self.sized_reg_name(dest_reg, 'k') // 32-bit for int
+                    "{} -{}(%rbp), %{}",
+                    mov, adjusted, dest_name
                 ))));
             }
             Loc::Imm(v) => {
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl ${}, %{}",
-                    v,
-                    self.sized_reg_name(dest_reg, 'k')
+                    "{} ${}, %{}",
+                    mov, v, dest_name
                 ))));
             }
             Loc::Global(name) => {
                 // Check TLS before GOT - TLS symbols need special access pattern
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
-                    // Thread-local storage: use %fs:symbol@TPOFF
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %fs:{}@TPOFF, %{}",
+                        "{} %fs:{}@TPOFF, %{}",
+                        mov,
                         self.format_symbol_name(name),
-                        self.sized_reg_name(dest_reg, 'k')
+                        dest_name
                     ))));
                 } else if self.needs_got_access(name) {
-                    // External symbols on macOS: load address from GOT, then load value
+                    // GOT indirection always uses 64-bit address load
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
                         self.format_symbol_name(name)
                     ))));
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl (%r11), %{}",
-                        self.sized_reg_name(dest_reg, 'k')
+                        "{} (%r11), %{}",
+                        mov, dest_name
                     ))));
                 } else {
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl {}(%rip), %{}",
+                        "{} {}(%rip), %{}",
+                        mov,
                         self.format_symbol_name(name),
-                        self.sized_reg_name(dest_reg, 'k')
+                        dest_name
                     ))));
                 }
             }
             _ => {
-                // Other locations - use generic string
                 let loc_str = self.loc_to_asm_string(loc);
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl {}, %{}",
-                    loc_str,
-                    self.sized_reg_name(dest_reg, 'k')
+                    "{} {}, %{}",
+                    mov, loc_str, dest_name
                 ))));
             }
         }
     }
 
     /// Emit a raw mov instruction from a register to a location (for asm output store)
-    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc) {
-        let src_name = self.sized_reg_name(src_reg, 'k'); // 32-bit for int
+    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc, size_bits: u32) {
+        let (mov, sz) = Self::asm_mov_info(size_bits);
+        let src_name = if sz == 'q' {
+            self.reg_name_64(src_reg)
+        } else {
+            self.sized_reg_name(src_reg, sz)
+        };
         match loc {
             Loc::Reg(dest_reg) => {
-                let dest_name = self.reg_name_64(*dest_reg);
+                let dest_name = if sz == 'q' {
+                    self.reg_name_64(*dest_reg)
+                } else {
+                    self.sized_reg_name(*dest_reg, sz)
+                };
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movq %{}, %{}",
-                    self.reg_name_64(src_reg),
-                    dest_name
+                    "{} %{}, %{}",
+                    mov, src_name, dest_name
                 ))));
             }
             Loc::Stack(offset) => {
                 let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl %{}, -{}(%rbp)",
-                    src_name, adjusted
+                    "{} %{}, -{}(%rbp)",
+                    mov, src_name, adjusted
                 ))));
             }
             Loc::Global(name) => {
-                // Check TLS before GOT - TLS symbols need special access pattern
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
-                    // Thread-local storage: use %fs:symbol@TPOFF
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %{}, %fs:{}@TPOFF",
+                        "{} %{}, %fs:{}@TPOFF",
+                        mov,
                         src_name,
                         self.format_symbol_name(name)
                     ))));
                 } else if self.needs_got_access(name) {
-                    // External symbols on macOS: load address from GOT, then store
+                    // GOT indirection always uses 64-bit address load
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
                         self.format_symbol_name(name)
                     ))));
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %{}, (%r11)",
-                        src_name
+                        "{} %{}, (%r11)",
+                        mov, src_name
                     ))));
                 } else {
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %{}, {}(%rip)",
+                        "{} %{}, {}(%rip)",
+                        mov,
                         src_name,
                         self.format_symbol_name(name)
                     ))));
                 }
             }
             Loc::Imm(_) => {
-                // Can't store to an immediate — this is dead code from
-                // unoptimized switch branches. Skip the store.
+                // Can't store to an immediate — dead code. Skip.
             }
             _ => {
-                // Other locations - use generic string
                 let loc_str = self.loc_to_asm_string(loc);
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl %{}, {}",
-                    src_name, loc_str
+                    "{} %{}, {}",
+                    mov, src_name, loc_str
                 ))));
             }
         }

@@ -1993,9 +1993,11 @@ impl<'a> Linearizer<'a> {
             if ret_kind == TypeKind::Void {
                 self.emit(Instruction::ret(None));
             } else {
-                // Return 0 as default
-                let zero = self.emit_const(0, self.types.int_id);
-                self.emit(Instruction::ret(Some(zero)));
+                // Return 0 as default, widened to actual return type
+                let ret_type = func.return_type;
+                let ret_size = self.types.size_bits(ret_type).max(32);
+                let zero = self.emit_const(0, ret_type);
+                self.emit(Instruction::ret_typed(Some(zero), ret_type, ret_size));
             }
         }
 
@@ -2512,7 +2514,9 @@ impl<'a> Linearizer<'a> {
                 );
             }
 
-            // Store the dimension size
+            // Widen dimension size to 64-bit before storing
+            let dim_expr_typ = vla_size_expr.typ.unwrap_or(self.types.int_id);
+            let dim_size = self.emit_convert(dim_size, dim_expr_typ, ulong_type);
             let store_dim_insn = Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64);
             self.emit(store_dim_insn);
             vla_dim_syms.push(dim_sym_id);
@@ -3810,12 +3814,12 @@ impl<'a> Linearizer<'a> {
             // Check if this output is a parameter (SSA value, not memory location)
             let param_info = self.get_param_if_ident(&op.expr);
 
+            let typ = self.expr_type(&op.expr);
+            let size = self.types.size_bits(typ);
+
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register
             if is_readwrite {
-                let typ = self.expr_type(&op.expr);
-                let size = self.types.size_bits(typ);
-
                 if let Some((_, param_pseudo)) = &param_info {
                     // Parameter: copy value directly (no memory address)
                     self.emit(
@@ -3839,6 +3843,7 @@ impl<'a> Linearizer<'a> {
                     name: name.clone(),
                     matching_output: Some(ir_outputs.len()), // matches the output about to be pushed
                     constraint: op.constraint.clone(),
+                    size,
                 });
             }
 
@@ -3847,6 +3852,7 @@ impl<'a> Linearizer<'a> {
                 name,
                 matching_output: None,
                 constraint: op.constraint.clone(),
+                size,
             });
 
             // Track if this is a parameter output
@@ -3860,6 +3866,9 @@ impl<'a> Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
+            let typ = self.expr_type(&op.expr);
+            let size = self.types.size_bits(typ);
+
             // For matching constraints (like "0"), we need to load the input value
             // into the matched output's pseudo so they use the same register
             let pseudo = if let Some(match_idx) = matching {
@@ -3868,8 +3877,6 @@ impl<'a> Linearizer<'a> {
                     let out_pseudo = ir_outputs[match_idx].pseudo;
                     // Load the input value into the output's pseudo
                     let val = self.linearize_expr(&op.expr);
-                    let typ = self.expr_type(&op.expr);
-                    let size = self.types.size_bits(typ);
                     // Copy val to out_pseudo so they share the same register
                     self.emit(
                         Instruction::new(Opcode::Copy)
@@ -3895,6 +3902,7 @@ impl<'a> Linearizer<'a> {
                 name,
                 matching_output: matching,
                 constraint: op.constraint.clone(),
+                size,
             });
         }
 
@@ -4685,10 +4693,11 @@ impl<'a> Linearizer<'a> {
             } else {
                 Opcode::FCvtS
             };
+            let dst_size = self.types.size_bits(cast_type);
             let mut insn = Instruction::new(opcode)
                 .with_target(result)
                 .with_src(src)
-                .with_type(cast_type);
+                .with_type_and_size(cast_type, dst_size);
             insn.src_size = self.types.size_bits(src_type);
             insn.src_typ = Some(src_type);
             self.emit(insn);
@@ -4728,7 +4737,7 @@ impl<'a> Linearizer<'a> {
                 let mut insn = Instruction::new(Opcode::FCvtF)
                     .with_target(result)
                     .with_src(src)
-                    .with_type(cast_type);
+                    .with_type_and_size(cast_type, dst_size);
                 insn.src_size = src_size;
                 insn.src_typ = Some(src_type);
                 self.emit(insn);
@@ -5670,8 +5679,12 @@ impl<'a> Linearizer<'a> {
             let scale = self.emit_const(elem_size as i64, self.types.long_id);
             let scaled_offset = self.alloc_pseudo();
             // Extend int_val to 64-bit for proper address arithmetic
-            let int_val_extended =
-                self.emit_convert(int_val, self.types.int_id, self.types.long_id);
+            let actual_int_type = if left_is_ptr_or_arr {
+                right_typ
+            } else {
+                left_typ
+            };
+            let int_val_extended = self.emit_convert(int_val, actual_int_type, self.types.long_id);
             self.emit(Instruction::binop(
                 Opcode::Mul,
                 scaled_offset,
@@ -7409,7 +7422,11 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         // Sign extend by shifting left then arithmetic shifting right
         let shift_amount = target_bits - bit_width;
-        let typ = self.types.int_id;
+        let typ = if target_bits <= 32 {
+            self.types.int_id
+        } else {
+            self.types.long_id
+        };
 
         let shift_val = self.emit_const(shift_amount as i64, typ);
         let shifted_left = self.alloc_pseudo();
@@ -7419,7 +7436,7 @@ impl<'a> Linearizer<'a> {
             value,
             shift_val,
             typ,
-            32,
+            target_bits,
         ));
 
         let result = self.alloc_pseudo();
@@ -7429,7 +7446,7 @@ impl<'a> Linearizer<'a> {
             shifted_left,
             shift_val,
             typ,
-            32,
+            target_bits,
         ));
         result
     }

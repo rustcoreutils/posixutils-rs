@@ -1658,3 +1658,317 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run_optimized("phisource_optimized", code), 0);
 }
+
+// ============================================================================
+// 32/64-bit type width audit tests
+// ============================================================================
+
+/// Test: enum is treated as integer for pointer arithmetic and is_integer checks
+#[test]
+fn codegen_enum_is_integer() {
+    let code = r#"
+enum Color { RED, GREEN, BLUE };
+
+int arr[] = {10, 20, 30};
+
+int get_via_enum_ptr(int *p, enum Color c) {
+    return *(p + c);
+}
+
+int main(void) {
+    // Section 1: enum used in pointer arithmetic
+    if (get_via_enum_ptr(arr, RED) != 10) return 1;
+    if (get_via_enum_ptr(arr, GREEN) != 20) return 2;
+    if (get_via_enum_ptr(arr, BLUE) != 30) return 3;
+
+    // Section 2: enum used as array index (also pointer arithmetic)
+    enum Color idx = BLUE;
+    if (arr[idx] != 30) return 4;
+
+    // Section 3: enum in arithmetic with unsigned
+    enum Color c = GREEN;
+    unsigned int u = 5;
+    unsigned int result = c + u;
+    if (result != 6) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("enum_is_integer", code, &[]), 0);
+}
+
+/// Test: unary minus applies integer promotion (char/short -> int)
+#[test]
+fn codegen_unary_neg_promotion() {
+    let code = r#"
+int main(void) {
+    // Section 1: negating a char should produce int-width result
+    char c = 100;
+    int neg_c = -c;
+    if (neg_c != -100) return 1;
+
+    // Section 2: negating a short should produce int-width result
+    short s = 30000;
+    int neg_s = -s;
+    if (neg_s != -30000) return 2;
+
+    // Section 3: negating a char and using in arithmetic
+    char ch = 1;
+    int x = -ch + 200;
+    if (x != 199) return 3;
+
+    // Section 4: negating unsigned char (should be int, not wrapping char)
+    unsigned char uc = 200;
+    int neg_uc = -uc;
+    // -200 as int (not as unsigned char which would be 56)
+    if (neg_uc != -200) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("unary_neg_promotion", code, &[]), 0);
+}
+
+/// Test: function returning pointer/long with no explicit return gets 64-bit zero
+#[test]
+fn codegen_default_return_64bit() {
+    let code = r#"
+// Function returning pointer without explicit return
+void *get_null(int flag) {
+    if (flag) {
+        return (void*)0;
+    }
+    // implicit return should be 64-bit zero, not 32-bit
+}
+
+// Function returning long without explicit return
+long get_long_default(int flag) {
+    if (flag) {
+        return 42L;
+    }
+    // implicit return should be 64-bit zero
+}
+
+int main(void) {
+    // Section 1: pointer default return
+    void *p = get_null(0);
+    if (p != (void*)0) return 1;
+
+    // Section 2: long default return
+    long l = get_long_default(0);
+    if (l != 0L) return 2;
+
+    // Section 3: explicit returns still work
+    void *p2 = get_null(1);
+    if (p2 != (void*)0) return 3;
+    long l2 = get_long_default(1);
+    if (l2 != 42L) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("default_return_64bit", code, &[]), 0);
+}
+
+/// Test: pointer arithmetic with char/short index uses correct sign extension
+#[test]
+fn codegen_ptr_arith_narrow_index() {
+    let code = r#"
+int arr[10] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90};
+
+int main(void) {
+    int *p = arr;
+
+    // Section 1: char index
+    char ci = 3;
+    if (*(p + ci) != 30) return 1;
+
+    // Section 2: short index
+    short si = 5;
+    if (*(p + si) != 50) return 2;
+
+    // Section 3: negative char index from middle of array
+    int *mid = &arr[5];
+    char neg = -2;
+    if (*(mid + neg) != 30) return 3;
+
+    // Section 4: negative short index
+    short sneg = -3;
+    if (*(mid + sneg) != 20) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ptr_arith_narrow_index", code, &[]), 0);
+}
+
+/// Test: float-to-int and float-to-float casts produce correct size
+#[test]
+fn codegen_float_cast_sizes() {
+    let code = r#"
+int main(void) {
+    // Section 1: double to int
+    double d = 42.7;
+    int i = (int)d;
+    if (i != 42) return 1;
+
+    // Section 2: double to long
+    double d2 = 1000000000000.0;
+    long l = (long)d2;
+    if (l != 1000000000000L) return 2;
+
+    // Section 3: float to long
+    float f = 123456.0f;
+    long l2 = (long)f;
+    if (l2 != 123456L) return 3;
+
+    // Section 4: double to unsigned long
+    double d3 = 4000000000.0;
+    unsigned long ul = (unsigned long)d3;
+    if (ul != 4000000000UL) return 4;
+
+    // Section 5: float to double (FCvtF)
+    float f2 = 3.14f;
+    double d4 = (double)f2;
+    // Check approximate equality (float precision)
+    if (d4 < 3.13 || d4 > 3.15) return 5;
+
+    // Section 6: double to float (FCvtF)
+    double d5 = 2.718;
+    float f3 = (float)d5;
+    if (f3 < 2.71f || f3 > 2.72f) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_cast_sizes", code, &[]), 0);
+}
+
+/// Test: switch on long value compares all 64 bits
+#[test]
+fn codegen_switch_64bit() {
+    let code = r#"
+int classify(long val) {
+    switch (val) {
+        case 0L: return 0;
+        case 1L: return 1;
+        case 0x100000000L: return 2;  // distinguishable only in upper 32 bits
+        case 0x200000000L: return 3;
+        default: return -1;
+    }
+}
+
+int main(void) {
+    if (classify(0L) != 0) return 1;
+    if (classify(1L) != 1) return 2;
+    if (classify(0x100000000L) != 2) return 3;
+    if (classify(0x200000000L) != 3) return 4;
+    if (classify(99L) != -1) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("switch_64bit", code, &[]), 0);
+}
+
+/// Test: function returning pointer via call — return value is full 64 bits
+#[test]
+fn codegen_call_return_pointer() {
+    let code = r#"
+#include <stdlib.h>
+
+void *identity(void *p) {
+    return p;
+}
+
+long return_long(long v) {
+    return v;
+}
+
+int main(void) {
+    // Section 1: pointer return value preserved through call
+    long stack_var = 12345;
+    void *p = &stack_var;
+    void *q = identity(p);
+    if (p != q) return 1;
+    if (*(long*)q != 12345) return 2;
+
+    // Section 2: long return value preserved through call
+    long big = 0x123456789ABCDEF0L;
+    long result = return_long(big);
+    if (result != big) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("call_return_pointer", code, &[]), 0);
+}
+
+/// Test: signed bitfield in 64-bit storage unit
+#[test]
+fn codegen_bitfield_64bit_storage() {
+    let code = r#"
+struct Wide {
+    long a : 40;
+    long b : 20;
+};
+
+int main(void) {
+    struct Wide w;
+
+    // Section 1: store and read 40-bit signed field
+    w.a = 0x7FFFFFFFFFL;  // max positive 40-bit
+    if (w.a != 0x7FFFFFFFFFL) return 1;
+
+    // Section 2: negative value in 40-bit field
+    w.a = -1;
+    if (w.a != -1) return 2;
+
+    // Section 3: 20-bit field
+    w.b = 500000;
+    if (w.b != 500000) return 3;
+
+    w.b = -1;
+    if (w.b != -1) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_64bit_storage", code, &[]), 0);
+}
+
+/// Test: emit_ret with 64-bit integer return value
+#[test]
+fn codegen_ret_64bit() {
+    let code = r#"
+long return_big(void) {
+    return 0x123456789ABCDEF0L;
+}
+
+void *return_ptr(void *p) {
+    return p;
+}
+
+unsigned long return_unsigned(void) {
+    return 0xFFFFFFFFFFFFFFFFUL;
+}
+
+int main(void) {
+    // Section 1: long return
+    long v = return_big();
+    if (v != 0x123456789ABCDEF0L) return 1;
+
+    // Section 2: pointer return
+    int x = 42;
+    void *p = return_ptr(&x);
+    if (*(int*)p != 42) return 2;
+
+    // Section 3: unsigned long return
+    unsigned long u = return_unsigned();
+    if (u != 0xFFFFFFFFFFFFFFFFUL) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ret_64bit", code, &[]), 0);
+}

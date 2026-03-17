@@ -473,7 +473,10 @@ impl X86_64CodeGen {
         };
 
         let dst_loc = self.get_location(target);
-        let ret_size = insn.size.max(32);
+        let ret_size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
 
         let abi_info = insn
             .abi_info

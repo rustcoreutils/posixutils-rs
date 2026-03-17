@@ -625,6 +625,8 @@ pub struct AsmConstraint {
     /// Note: Early clobber (&) is parsed but not explicitly handled since our
     /// simple register allocator doesn't share registers between inputs/outputs
     pub constraint: String,
+    /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
+    pub size: u32,
 }
 
 /// Data for an inline assembly instruction

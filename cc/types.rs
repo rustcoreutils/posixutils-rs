@@ -914,6 +914,7 @@ impl TypeTable {
                 | TypeKind::Int
                 | TypeKind::Long
                 | TypeKind::LongLong
+                | TypeKind::Enum
         )
     }
 

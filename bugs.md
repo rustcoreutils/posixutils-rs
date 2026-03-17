@@ -1,6 +1,6 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: Bugs N, P, Q fixed. -O flag handling fixed. Bug O + Bug R block CPython `make test`.
+## Status: 32/64-bit audit fixes applied. Bugs N, P, Q fixed. -O flag handling fixed. Bug O + Bug R block CPython `make test`.
 
 ### Bugs A-N, P, Q: ALL FIXED (see git history)
 
@@ -46,6 +46,20 @@
 - `chr(128)` returns `'Â\x80'` (2 chars, UTF-8 of U+0080) instead of `'\x80'` (1 char)
 - Root cause: one of the many pcc-compiled .o files corrupts the Unicode latin-1 cache during initialization. With ALL .o files gcc-compiled, chr() works correctly.
 - Finding the specific culprit requires binary search across ~100 .o files.
+
+### 32/64-bit Type Width Audit — 11 issues FIXED
+Comprehensive audit identified and fixed 11 systemic 32/64-bit type-width bugs:
+1. **`is_integer()` excluded Enum** — pointer arithmetic with enum index skipped element-size scaling
+2. **Unary `-` skipped integer promotion** — `-char_val` produced 8-bit result instead of int
+3. **Default function return used 32-bit zero** — functions returning long/pointer got 32-bit zero on fallthrough
+4. **Pointer arithmetic hardcoded `int_id`** — char/short indices in `ptr + idx` used wrong sign-extension
+5. **VLA dimension not widened** — int-typed VLA size stored as 64-bit without conversion
+6. **`emit_sign_extend_bitfield` hardcoded 32-bit** — signed bitfields in 64-bit storage units truncated
+7. **`FCvtS`/`FCvtU`/`FCvtF` emitted `insn.size = 0`** — float cast instructions had no size set
+8. **Call return value used `insn.size.max(32)`** — pointer/long returns truncated when size unset
+9. **`emit_ret` passed raw `insn.size` to `emit_move`** — 64-bit return values truncated
+10. **Inline asm I/O used 32-bit moves** — `movl` instead of `movq` for stack/global locations
+11. **Switch comparison hardcoded B32** — `switch(long_val)` only compared lower 32 bits
 
 ### CPython build status at -O0
 - **Build**: Compiles and links entirely by pcc (except linker wraps gcc).

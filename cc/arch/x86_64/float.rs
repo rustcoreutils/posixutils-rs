@@ -10,7 +10,7 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
+use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
@@ -585,19 +585,110 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm0,
         };
 
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == 64;
+
         // Move integer to R10 first (scratch register)
         self.emit_move(src, Reg::R10, src_size);
 
-        // Convert using cvtsi2ss/cvtsi2sd
-        // Use type-aware FP size for destination
-        let int_size = OperandSize::from_bits(src_size);
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
-        self.push_lir(X86Inst::CvtIntToFp {
-            int_size,
-            fp_size,
-            src: GpOperand::Reg(Reg::R10),
-            dst: dst_xmm,
-        });
+        if is_unsigned_64 {
+            // Unsigned 64-bit to float/double: cvtsi2sd treats input as signed,
+            // so values >= 2^63 produce wrong results. Use split conversion:
+            //   test r10, r10
+            //   js .unsigned_path
+            //   cvtsi2sd r10, xmm_dst    ; signed path (value < 2^63)
+            //   jmp .done
+            // .unsigned_path:
+            //   mov r10, r11
+            //   shr 1, r11               ; val/2
+            //   and 1, r10               ; save low bit
+            //   or r10, r11              ; (val/2) | (val&1) to avoid rounding loss
+            //   cvtsi2sd r11, xmm_dst    ; convert half-value (positive)
+            //   addsd xmm_dst, xmm_dst   ; multiply by 2
+            // .done:
+            let uid = self.unique_label_counter;
+            self.unique_label_counter += 1;
+            // Use high block_id values (10000+) to avoid colliding with basic block IDs
+            let unsigned_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+
+            // test r10, r10 — check sign bit
+            self.push_lir(X86Inst::Test {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            // js .unsigned_path (SF=1 after test means bit 63 set)
+            self.push_lir(X86Inst::Jcc {
+                cc: CondCode::Slt,
+                target: unsigned_label.clone(),
+            });
+            // Signed path: value < 2^63, cvtsi2sd works directly
+            self.push_lir(X86Inst::CvtIntToFp {
+                int_size: OperandSize::B64,
+                fp_size,
+                src: GpOperand::Reg(Reg::R10),
+                dst: dst_xmm,
+            });
+            self.push_lir(X86Inst::Jmp {
+                target: done_label.clone(),
+            });
+            // Unsigned path: value >= 2^63
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(unsigned_label)));
+            // mov r10, r11
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Reg(Reg::R11),
+            });
+            // shr $1, r11
+            self.push_lir(X86Inst::Shr {
+                size: OperandSize::B64,
+                count: ShiftCount::Imm(1),
+                dst: Reg::R11,
+            });
+            // and $1, r10
+            self.push_lir(X86Inst::And {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(1),
+                dst: Reg::R10,
+            });
+            // or r10, r11
+            self.push_lir(X86Inst::Or {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: Reg::R11,
+            });
+            // cvtsi2sd r11, xmm_dst
+            self.push_lir(X86Inst::CvtIntToFp {
+                int_size: OperandSize::B64,
+                fp_size,
+                src: GpOperand::Reg(Reg::R11),
+                dst: dst_xmm,
+            });
+            // addsd xmm_dst, xmm_dst (double the value)
+            // addsd/addss xmm_dst, xmm_dst (double the value)
+            self.push_lir(X86Inst::AddFp {
+                size: fp_size,
+                src: XmmOperand::Reg(dst_xmm),
+                dst: dst_xmm,
+            });
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        } else {
+            // Signed conversion, or unsigned 32-bit (zero-extended to 64-bit fits signed)
+            let int_size = if insn.op == Opcode::UCvtF && src_size == 32 {
+                // Zero-extend 32-bit unsigned to 64-bit signed for correct conversion
+                OperandSize::B64
+            } else {
+                OperandSize::from_bits(src_size)
+            };
+            self.push_lir(X86Inst::CvtIntToFp {
+                int_size,
+                fp_size,
+                src: GpOperand::Reg(Reg::R10),
+                dst: dst_xmm,
+            });
+        }
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
             self.emit_fp_move_from_xmm(

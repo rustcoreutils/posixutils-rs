@@ -20,12 +20,12 @@
   - Null terminator offsets in `cc/ir/linearize.rs` (2 places): use `chars().count()`
 - **Test:** `codegen_string_literal_high_bytes`
 
-### Bug U: math.floor() / int(float) returns 2^63 — NOT YET FIXED
-- `math.floor(37.5)` returns `9223372036854775808` (0x8000000000000000 = cvttsd2si indefinite)
-- `int(37.5)` also returns 2^63
-- Standalone C float-to-long conversion works correctly
-- Only manifests inside pcc-compiled CPython (PyLong_FromDouble path)
-- Blocks `make test`: `random.choices()` uses `floor(random() * n)`, gets garbage index
+### Bug U: unsigned long to double conversion — PARTIALLY FIXED
+- **Fixed:** `cvtsi2sdq` treated unsigned 64-bit values as signed. Values >= 2^63 produced negative doubles. Now uses the correct shift-convert-double sequence for unsigned values.
+- **Fixed:** XMM function parameters not spilled to stack at function entry. When any float computation reused the same XMM register, the parameter value was silently lost.
+- **Still open:** Short-circuit `&&` with float operands doesn't preserve intermediate float values across branch boundaries. In `if (-int_max < dval && dval < int_max)`, the second comparison uses a stale `-int_max` instead of `int_max` because the register allocator doesn't track float value liveness across `&&` branches.
+- **Impact:** `PyLong_FromDouble(37.5)` falls to the slow `frexp`-based path (returns correct but negative value due to this remaining issue). `int(37.5)` returns wrong value in CPython.
+- **Tests:** `codegen_unsigned_long_to_double`
 
 ### Bug V: Finalization segfault in _PyArg_Fini — NOT YET FIXED
 - CPython crashes during `Py_FinalizeEx` → `_PyArg_Fini()`

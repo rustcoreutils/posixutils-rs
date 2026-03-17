@@ -460,6 +460,18 @@ impl X86_64CodeGen {
                 }),
             });
         }
+        // Spill XMM function parameters to stack
+        for spilled in alloc.spilled_xmm_args() {
+            let adjusted = spilled.to_stack_offset + self.callee_saved_offset;
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Reg(spilled.from_xmm),
+                dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: -adjusted,
+                }),
+            });
+        }
     }
 
     /// Save argument registers to the register save area for variadic functions
@@ -511,8 +523,12 @@ impl X86_64CodeGen {
 
         // Track which pseudos were already spilled via spill_args_across_calls
         // to avoid double-storing them here
-        let spilled_pseudos: HashSet<PseudoId> =
-            alloc.spilled_args().iter().map(|s| s.pseudo).collect();
+        let spilled_pseudos: HashSet<PseudoId> = alloc
+            .spilled_args()
+            .iter()
+            .map(|s| s.pseudo)
+            .chain(alloc.spilled_xmm_args().iter().map(|s| s.pseudo))
+            .collect();
 
         // Detect if there's a hidden return pointer (for functions returning large structs)
         // The __sret pseudo has arg_idx=0 and shifts all other arg indices by 1

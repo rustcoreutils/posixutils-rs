@@ -2412,3 +2412,54 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("double_to_bool", code, &[]), 0);
 }
+
+// ============================================================================
+// Regression: unsigned long to double must not use signed cvtsi2sd
+// ============================================================================
+
+#[test]
+fn codegen_unsigned_long_to_double() {
+    let code = r#"
+#include <limits.h>
+#include <stdio.h>
+
+int main(void) {
+    /* Values >= 2^63 require unsigned conversion path */
+    unsigned long big = (unsigned long)LONG_MAX + 1;  /* 2^63 */
+    double d = (double)big;
+    /* Must be positive 9.22e18, not negative */
+    if (d < 0.0) return 1;
+    if (d < 9.2e18) return 2;
+
+    /* Smaller unsigned values should still work */
+    unsigned long small = 1000;
+    double ds = (double)small;
+    if (ds != 1000.0) return 3;
+
+    /* ULONG_MAX */
+    unsigned long umax = (unsigned long)-1;
+    double du = (double)umax;
+    if (du < 0.0) return 4;
+    if (du < 1.8e19) return 5;
+
+    /* Zero */
+    unsigned long zero = 0;
+    double dz = (double)zero;
+    if (dz != 0.0) return 6;
+
+    /* Value just below 2^63 (should use signed path) */
+    unsigned long below = (unsigned long)LONG_MAX;
+    double db = (double)below;
+    if (db < 9.2e18) return 7;
+    if (db < 0.0) return 8;
+
+    /* float conversion too */
+    unsigned long fbig = (unsigned long)LONG_MAX + 1;
+    float f = (float)fbig;
+    if (f < 0.0f) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("unsigned_long_to_double", code, &[]), 0);
+}

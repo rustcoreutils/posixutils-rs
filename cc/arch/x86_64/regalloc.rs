@@ -428,6 +428,18 @@ pub struct SpilledArg {
     pub to_stack_offset: i32,
 }
 
+/// XMM argument that was spilled from an XMM register to the stack.
+/// All XMM registers are caller-saved on x86-64 SysV ABI, so FP arguments
+/// must be spilled if their live interval extends past the function entry.
+pub struct SpilledXmmArg {
+    /// The pseudo that was spilled
+    pub pseudo: PseudoId,
+    /// The XMM register the argument originally arrived in
+    pub from_xmm: XmmReg,
+    /// The stack offset where it was spilled to
+    pub to_stack_offset: i32,
+}
+
 // ============================================================================
 // Register Allocator (Linear Scan)
 // ============================================================================
@@ -454,6 +466,8 @@ pub struct RegAlloc {
     ld_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
+    /// XMM arguments spilled from XMM registers to stack
+    spilled_xmm_args: Vec<SpilledXmmArg>,
 }
 
 impl RegAlloc {
@@ -469,6 +483,7 @@ impl RegAlloc {
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
+            spilled_xmm_args: Vec::new(),
         }
     }
 
@@ -504,6 +519,7 @@ impl RegAlloc {
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
         self.spilled_args.clear();
+        self.spilled_xmm_args.clear();
     }
 
     /// Identify pseudos that are long double (80-bit extended precision).
@@ -627,7 +643,7 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
-        // Check arguments in caller-saved registers
+        // Check integer arguments in caller-saved registers
         let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
@@ -650,11 +666,42 @@ impl RegAlloc {
                 }
             }
         }
+
+        // Always spill XMM function parameter arguments to stack.
+        // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
+        // computation within the function may reuse the same XMM register,
+        // clobbering the parameter value.
+        let xmm_arg_regs: Vec<XmmReg> = XmmReg::arg_regs().to_vec();
+        for interval in intervals {
+            if let Some(Loc::Xmm(xmm)) = self.locations.get(&interval.pseudo) {
+                if xmm_arg_regs.contains(xmm) && interval.start == 0 {
+                    // This is a function parameter in an XMM register — always spill
+                    let from_xmm = *xmm;
+                    self.stack_offset += 8;
+                    let to_stack_offset = self.stack_offset;
+
+                    self.spilled_xmm_args.push(SpilledXmmArg {
+                        pseudo: interval.pseudo,
+                        from_xmm,
+                        to_stack_offset,
+                    });
+
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                    self.free_xmm_regs.push(from_xmm);
+                }
+            }
+        }
     }
 
     /// Get arguments that were spilled from caller-saved registers
     pub fn spilled_args(&self) -> &[SpilledArg] {
         &self.spilled_args
+    }
+
+    /// Get XMM arguments that were spilled from XMM registers
+    pub fn spilled_xmm_args(&self) -> &[SpilledXmmArg] {
+        &self.spilled_xmm_args
     }
 
     /// Spill arguments in registers that would be clobbered by constraint points (e.g., shifts)

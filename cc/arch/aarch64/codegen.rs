@@ -432,8 +432,11 @@ impl Aarch64CodeGen {
     /// Zero-initialize the local variable area of the stack frame.
     /// This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
     /// leave zero in the unwritten upper bytes.
-    /// Uses `stp xzr, xzr, [x29, #offset]` pairs (16 bytes of zeros per instruction).
-    /// xzr is the zero register — no source register setup needed.
+    ///
+    /// For small frames (max offset ≤ 504): uses `stp xzr, xzr, [x29, #offset]`
+    /// (16 bytes per instruction, but signed 7-bit offset limited to [-512, 504]).
+    /// For large frames: uses `str xzr, [x29, #offset]` per qword
+    /// (unsigned 12-bit offset scaled by 8, range [0, 32760]).
     fn zero_stack_frame(&mut self) {
         let alloc_size = self.stack_alloc_size;
         if alloc_size <= 0 {
@@ -441,30 +444,48 @@ impl Aarch64CodeGen {
         }
         // Local variable area starts at FP + 16 + callee_saved_size
         let base_offset = 16 + self.callee_saved_size;
-        let mut offset = 0;
-        // Zero 16 bytes at a time using stp xzr, xzr
-        while offset + 16 <= alloc_size {
-            self.push_lir(Aarch64Inst::Stp {
-                size: OperandSize::B64,
-                src1: Reg::Xzr,
-                src2: Reg::Xzr,
-                addr: MemAddr::BaseOffset {
-                    base: Reg::X29,
-                    offset: base_offset + offset,
-                },
-            });
-            offset += 16;
-        }
-        // Zero remaining 8 bytes if any
-        if offset < alloc_size {
-            self.push_lir(Aarch64Inst::Str {
-                size: OperandSize::B64,
-                src: Reg::Xzr,
-                addr: MemAddr::BaseOffset {
-                    base: Reg::X29,
-                    offset: base_offset + offset,
-                },
-            });
+        // stp signed offset range is [-512, 504] for 64-bit registers
+        let max_stp_offset = base_offset + alloc_size - 16;
+        if max_stp_offset <= 504 {
+            // Small frame: use stp xzr, xzr (16 bytes per instruction)
+            let mut offset = 0;
+            while offset + 16 <= alloc_size {
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::Xzr,
+                    src2: Reg::Xzr,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: base_offset + offset,
+                    },
+                });
+                offset += 16;
+            }
+            if offset < alloc_size {
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: Reg::Xzr,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: base_offset + offset,
+                    },
+                });
+            }
+        } else {
+            // Large frame: use str xzr (8 bytes per instruction)
+            // str unsigned offset range is [0, 32760] for 64-bit — handles all practical frames
+            let mut offset = 0;
+            while offset < alloc_size {
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: Reg::Xzr,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: base_offset + offset,
+                    },
+                });
+                offset += 8;
+            }
         }
     }
 
@@ -1917,12 +1938,19 @@ impl Aarch64CodeGen {
             return;
         }
 
+        // Only widen stores to known local variable symbols (not stores through pointers).
+        // Widening a store through a pointer could clobber adjacent memory.
+        let is_sym = self
+            .pseudos
+            .iter()
+            .any(|p| p.id == addr && matches!(p.kind, PseudoKind::Sym(_)));
+
         // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
         // upper bits when a 32-bit result is stored into a 64-bit
         // local (e.g., int-to-long, int-to-pointer assignments).
         // Exception: struct/union fields at offset 0 must use exact
         // size to avoid clobbering the adjacent field at offset 4.
-        let store_size = if mem_size == 32 && insn.offset == 0 {
+        let store_size = if is_sym && mem_size == 32 && insn.offset == 0 {
             let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
             if sym_bits > 32 {
                 let is_struct = self.sym_type_sizes.contains_key(&addr) && sym_bits > 64;

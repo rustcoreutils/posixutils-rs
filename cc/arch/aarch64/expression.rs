@@ -299,8 +299,9 @@ impl Aarch64CodeGen {
 
         self.push_lir(Aarch64Inst::Cset { cond, dst: dst_reg });
 
+        // Compare result is always int (32-bit), regardless of operand size
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
         }
     }
 

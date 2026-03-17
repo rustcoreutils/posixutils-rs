@@ -1093,7 +1093,7 @@ impl X86_64CodeGen {
 
         // Store result from EAX to target
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
     }
 
     /// Emit longjmp(env, val) - restores execution context (noreturn)
@@ -1387,7 +1387,7 @@ impl X86_64CodeGen {
 
         // Result is in EAX (integer return), store to target
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
     }
 
     /// Emit __builtin_signbit - test sign bit of double
@@ -1413,6 +1413,6 @@ impl X86_64CodeGen {
 
         // Result is in EAX (integer return), store to target
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
     }
 }

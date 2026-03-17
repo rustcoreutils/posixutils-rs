@@ -404,7 +404,7 @@ impl X86_64CodeGen {
 
         // Move to final destination if not already there
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, 32);
+            self.emit_move_to_loc(work_reg, &dst_loc, u32::BITS);
         }
     }
 

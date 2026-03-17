@@ -726,7 +726,7 @@ impl Aarch64CodeGen {
 
         // Store result from W0 to target
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, 32);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
 
     /// Emit longjmp(env, val) - restores execution context (noreturn)
@@ -870,7 +870,7 @@ impl Aarch64CodeGen {
 
         // Result is in W0 (integer return), store to target
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, 32);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
 
     /// Emit __builtin_signbit - test sign bit of double
@@ -894,7 +894,7 @@ impl Aarch64CodeGen {
 
         // Result is in W0 (integer return), store to target
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, 32);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
 
     /// Emit __builtin_fabsf/__builtin_fabs - absolute value of float/double

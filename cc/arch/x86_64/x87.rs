@@ -311,7 +311,7 @@ impl X86_64CodeGen {
 
         // Move to final destination if needed
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 32);
+            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
         }
     }
 

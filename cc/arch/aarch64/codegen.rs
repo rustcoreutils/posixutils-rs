@@ -55,6 +55,10 @@ pub struct Aarch64CodeGen {
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
     unique_label_counter: u32,
+    /// Stack allocation size for locals (for zero_stack_frame)
+    stack_alloc_size: i32,
+    /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
+    sym_type_sizes: HashMap<PseudoId, u32>,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -81,6 +85,8 @@ impl Aarch64CodeGen {
             extern_symbols: HashSet::new(),
             pic_mode: false,
             unique_label_counter: 0,
+            stack_alloc_size: 0,
+            sym_type_sizes: HashMap::new(),
         }
     }
 
@@ -154,6 +160,17 @@ impl Aarch64CodeGen {
         self.locations = alloc.allocate(func, types);
         self.pseudos = func.pseudos.clone();
 
+        // Build sym type size map for emit_store to distinguish struct fields from scalars
+        self.sym_type_sizes.clear();
+        for pseudo in &func.pseudos {
+            if let PseudoKind::Sym(name) = &pseudo.kind {
+                if let Some(local_var) = func.locals.get(name) {
+                    self.sym_type_sizes
+                        .insert(pseudo.id, types.size_bits(local_var.typ));
+                }
+            }
+        }
+
         let stack_size = alloc.stack_size();
         let callee_saved = alloc.callee_saved_used().to_vec();
         let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
@@ -192,12 +209,19 @@ impl Aarch64CodeGen {
         self.frame_size = total_frame;
         self.callee_saved_size = callee_saved_size;
         self.reg_save_area_size = reg_save_area_size;
+        self.stack_alloc_size = stack_size;
 
         // Emit function header (directives, label, CFI start)
         self.emit_function_header(func.is_static, &func.name);
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
+
+        // Zero-initialize the local variable area BEFORE storing any arguments.
+        // This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
+        // leave zero in the unwritten upper bytes.
+        // Uses stp xzr, xzr which doesn't clobber any registers.
+        self.zero_stack_frame();
 
         // Detect sret and store X8 to stack if needed
         let has_sret = func
@@ -401,6 +425,45 @@ impl Aarch64CodeGen {
                 src1: Reg::SP,
                 src2: GpOperand::Reg(scratch),
                 dst: Reg::SP,
+            });
+        }
+    }
+
+    /// Zero-initialize the local variable area of the stack frame.
+    /// This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
+    /// leave zero in the unwritten upper bytes.
+    /// Uses `stp xzr, xzr, [x29, #offset]` pairs (16 bytes of zeros per instruction).
+    /// xzr is the zero register — no source register setup needed.
+    fn zero_stack_frame(&mut self) {
+        let alloc_size = self.stack_alloc_size;
+        if alloc_size <= 0 {
+            return;
+        }
+        // Local variable area starts at FP + 16 + callee_saved_size
+        let base_offset = 16 + self.callee_saved_size;
+        let mut offset = 0;
+        // Zero 16 bytes at a time using stp xzr, xzr
+        while offset + 16 <= alloc_size {
+            self.push_lir(Aarch64Inst::Stp {
+                size: OperandSize::B64,
+                src1: Reg::Xzr,
+                src2: Reg::Xzr,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X29,
+                    offset: base_offset + offset,
+                },
+            });
+            offset += 16;
+        }
+        // Zero remaining 8 bytes if any
+        if offset < alloc_size {
+            self.push_lir(Aarch64Inst::Str {
+                size: OperandSize::B64,
+                src: Reg::Xzr,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X29,
+                    offset: base_offset + offset,
+                },
             });
         }
     }
@@ -779,6 +842,12 @@ impl Aarch64CodeGen {
             let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
             let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
 
+            // Derive return size from type to avoid 32-bit truncation
+            let ret_typ = insn.typ;
+            let ret_size = ret_typ
+                .map(|t| types.size_bits(t).max(32))
+                .unwrap_or(insn.size.max(32));
+
             if insn.is_two_reg_return {
                 self.emit_move(src, Reg::X0, 64, total_frame);
                 if let Some(&src2) = insn.src.get(1) {
@@ -833,9 +902,9 @@ impl Aarch64CodeGen {
                     _ => {}
                 }
             } else if is_fp {
-                self.emit_fp_move(src, VReg::V0, insn.typ, insn.size, total_frame, types);
+                self.emit_fp_move(src, VReg::V0, insn.typ, ret_size, total_frame, types);
             } else {
-                self.emit_move(src, Reg::X0, insn.size, total_frame);
+                self.emit_move(src, Reg::X0, ret_size, total_frame);
             }
         }
 
@@ -1023,13 +1092,16 @@ impl Aarch64CodeGen {
     }
 
     /// Emit switch statement: compare value against cases and branch
-    fn emit_switch(&mut self, insn: &Instruction, total_frame: i32) {
+    fn emit_switch(&mut self, insn: &Instruction, total_frame: i32, types: &TypeTable) {
         let Some(val) = insn.target else { return };
 
         let loc = self.get_location(val);
         let (scratch0, scratch1, _) = Reg::scratch_regs();
-        let size = insn.size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let switch_size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
+        let op_size = OperandSize::from_bits(switch_size);
 
         // Move switch value to scratch0
         match &loc {
@@ -1130,7 +1202,7 @@ impl Aarch64CodeGen {
             Opcode::Cbr => if self.emit_cbr(insn, *total_frame) {},
 
             Opcode::Switch => {
-                self.emit_switch(insn, *total_frame);
+                self.emit_switch(insn, *total_frame, types);
             }
 
             Opcode::Add
@@ -1832,7 +1904,6 @@ impl Aarch64CodeGen {
     fn emit_store(&mut self, insn: &Instruction, frame_size: i32) {
         // Use actual size for memory stores (8, 16, 32, 64 bits)
         let mem_size = insn.size;
-        let reg_size = insn.size.max(32);
 
         let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&a), Some(&v)) => (a, v),
@@ -1846,10 +1917,35 @@ impl Aarch64CodeGen {
             return;
         }
 
-        self.emit_move(value, Reg::X9, reg_size, frame_size);
+        // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
+        // upper bits when a 32-bit result is stored into a 64-bit
+        // local (e.g., int-to-long, int-to-pointer assignments).
+        // Exception: struct/union fields at offset 0 must use exact
+        // size to avoid clobbering the adjacent field at offset 4.
+        let store_size = if mem_size == 32 && insn.offset == 0 {
+            let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
+            if sym_bits > 32 {
+                let is_struct = self.sym_type_sizes.contains_key(&addr) && sym_bits > 64;
+                if is_struct {
+                    OperandSize::from_bits(mem_size) // struct field: exact size
+                } else {
+                    OperandSize::B64 // scalar/pointer: safe to widen
+                }
+            } else {
+                OperandSize::from_bits(mem_size)
+            }
+        } else {
+            OperandSize::from_bits(mem_size)
+        };
 
-        // Get the store size based on mem_size
-        let store_size = OperandSize::from_bits(mem_size);
+        // Use widened size for register load when store is widened
+        let reg_size = if store_size == OperandSize::B64 {
+            64
+        } else {
+            insn.size.max(32)
+        };
+
+        self.emit_move(value, Reg::X9, reg_size, frame_size);
 
         // Helper to emit store instruction
         let emit_store_lir = |this: &mut Self, mem_addr: MemAddr| {
@@ -2258,7 +2354,7 @@ impl Aarch64CodeGen {
                 }
                 _ => {
                     // Memory or other location - emit as memory operand
-                    let mem_str = self.loc_to_asm_string(&loc);
+                    let mem_str = self.loc_to_asm_string(&loc, output.size);
                     operand_regs.push(None);
                     operand_mem.push(Some(mem_str));
                 }
@@ -2293,7 +2389,7 @@ impl Aarch64CodeGen {
                 }
                 _ => {
                     // Memory or other location
-                    let mem_str = self.loc_to_asm_string(&loc);
+                    let mem_str = self.loc_to_asm_string(&loc, input.size);
                     operand_regs.push(None);
                     operand_mem.push(Some(mem_str));
                 }
@@ -2349,9 +2445,15 @@ impl Aarch64CodeGen {
     }
 
     /// Convert a location to an asm operand string for AArch64
-    fn loc_to_asm_string(&self, loc: &Loc) -> String {
+    fn loc_to_asm_string(&self, loc: &Loc, size_bits: u32) -> String {
         match loc {
-            Loc::Reg(r) => asm_reg_name_64(*r).to_string(),
+            Loc::Reg(r) => {
+                if size_bits <= 32 {
+                    asm_reg_name_32(*r).to_string()
+                } else {
+                    asm_reg_name_64(*r).to_string()
+                }
+            }
             Loc::Stack(offset) => {
                 // AArch64 uses offsets from FP (x29)
                 format!("[x29, #-{}]", offset)

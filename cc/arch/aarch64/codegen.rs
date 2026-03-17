@@ -1938,29 +1938,26 @@ impl Aarch64CodeGen {
             return;
         }
 
-        // Only widen stores to known local variable symbols (not stores through pointers).
-        // Widening a store through a pointer could clobber adjacent memory.
-        let is_sym = self
-            .pseudos
-            .iter()
-            .any(|p| p.id == addr && matches!(p.kind, PseudoKind::Sym(_)));
-
         // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
         // upper bits when a 32-bit result is stored into a 64-bit
         // local (e.g., int-to-long, int-to-pointer assignments).
+        // Only widen for known local variables (in sym_type_sizes).
+        // Do NOT widen stores to globals/statics (not in sym_type_sizes)
+        // or stores through pointers — widening could clobber adjacent data.
         // Exception: struct/union fields at offset 0 must use exact
         // size to avoid clobbering the adjacent field at offset 4.
-        let store_size = if is_sym && mem_size == 32 && insn.offset == 0 {
-            let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
-            if sym_bits > 32 {
-                let is_struct = self.sym_type_sizes.contains_key(&addr) && sym_bits > 64;
-                if is_struct {
+        let store_size = if mem_size == 32 && insn.offset == 0 {
+            if let Some(&sym_bits) = self.sym_type_sizes.get(&addr) {
+                // Known local variable — safe to widen if scalar and > 32 bits
+                if sym_bits > 64 {
                     OperandSize::from_bits(mem_size) // struct field: exact size
+                } else if sym_bits > 32 {
+                    OperandSize::B64 // scalar/pointer local: safe to widen
                 } else {
-                    OperandSize::B64 // scalar/pointer: safe to widen
+                    OperandSize::from_bits(mem_size)
                 }
             } else {
-                OperandSize::from_bits(mem_size)
+                OperandSize::from_bits(mem_size) // global/static/pointer: exact size
             }
         } else {
             OperandSize::from_bits(mem_size)

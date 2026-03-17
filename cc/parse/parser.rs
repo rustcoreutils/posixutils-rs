@@ -3691,7 +3691,7 @@ impl Parser<'_> {
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as i64),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i64),
             // Float literals are constant, return truncated value
             ExprKind::FloatLit(val) => Some(*val as i64),
 

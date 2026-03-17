@@ -712,7 +712,7 @@ impl<'a> Linearizer<'a> {
         match &expr.kind {
             ExprKind::IntLit(v) => Initializer::Int(*v),
             ExprKind::FloatLit(v) => Initializer::Float(*v),
-            ExprKind::CharLit(c) => Initializer::Int(*c as i64),
+            ExprKind::CharLit(c) => Initializer::Int(*c as u8 as i8 as i64),
 
             // String literal - for arrays, store as String; for pointers, create label reference
             ExprKind::StringLit(s) => {
@@ -2271,7 +2271,7 @@ impl<'a> Linearizer<'a> {
             let typ = declarator.typ;
 
             // Check if this is a static local variable
-            if self.types.modifiers(typ).contains(TypeModifiers::STATIC) {
+            if declarator.storage_class.contains(TypeModifiers::STATIC) {
                 // Static local: create a global with unique name
                 self.linearize_static_local(declarator);
                 continue;
@@ -3398,7 +3398,7 @@ impl<'a> Linearizer<'a> {
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as i64),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i64),
 
             ExprKind::Ident(symbol_id) => {
                 // Check if it's an enum constant
@@ -6118,7 +6118,7 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::CharLit(c) => {
                 let typ = self.expr_type(expr);
-                self.emit_const(*c as i64, typ)
+                self.emit_const(*c as u8 as i8 as i64, typ)
             }
 
             ExprKind::StringLit(s) => {

@@ -2661,3 +2661,85 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("ternary_fptr_return_type", code, &[]), 0);
 }
+
+/// Regression test: character literals >= 0x80 must be sign-extended like GCC.
+/// '\x80' should produce -128 (signed char interpretation), not 128.
+/// This broke CPython's serialization module where enum { PROTO = '\x80' }
+/// didn't match switch cases on signed char values.
+#[test]
+fn codegen_char_literal_signedness() {
+    let code = r#"
+enum opcode { NONE = 'N', PROTO = '\x80', STOP = '.' };
+
+int dispatch(const char *s) {
+    switch ((enum opcode)s[0]) {
+    case NONE: return 1;
+    case PROTO: return 2;
+    case STOP: return 3;
+    default: return -1;
+    }
+}
+
+int main(void) {
+    char proto = '\x80';
+    char none = 'N';
+    char stop = '.';
+
+    if (dispatch(&proto) != 2) return 1;  /* PROTO must match */
+    if (dispatch(&none) != 1) return 2;
+    if (dispatch(&stop) != 3) return 3;
+
+    /* Verify char literal value */
+    int val = '\x80';
+    if (val != -128) return 4;  /* must be -128, not 128 */
+
+    int val2 = '\xff';
+    if (val2 != -1) return 5;  /* must be -1, not 255 */
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("char_literal_signedness", code, &[]), 0);
+}
+
+/// Regression test: static local struct variables must be in static storage,
+/// not on the stack. The linearizer checked type modifiers instead of
+/// declarator.storage_class for the STATIC flag, which missed struct types.
+#[test]
+fn codegen_static_local_struct() {
+    let code = r#"
+#include <stddef.h>
+
+struct Parser {
+    int initialized;
+    const char *fname;
+    struct Parser *next;
+};
+
+struct Parser *get_parser(void) {
+    static struct Parser p = { .fname = "test" };
+    return &p;
+}
+
+int main(void) {
+    struct Parser *p1 = get_parser();
+    struct Parser *p2 = get_parser();
+
+    /* Must return same address (static storage) */
+    if (p1 != p2) return 1;
+
+    /* Must NOT be near the stack */
+    int stack_var = 0;
+    ptrdiff_t diff = (char*)p1 - (char*)&stack_var;
+    if (diff < 0) diff = -diff;
+    if (diff < 1000000) return 2;  /* on stack = bug */
+
+    /* Value must persist across calls */
+    p1->initialized = 42;
+    if (get_parser()->initialized != 42) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_local_struct", code, &[]), 0);
+}

@@ -2881,10 +2881,8 @@ fn test_static_local_pre_increment() {
     let test_id = ctx.str("test");
 
     // Create static int type
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     // Create declaration: static int counter = 0;
@@ -2892,7 +2890,7 @@ fn test_static_local_pre_increment() {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -2959,17 +2957,15 @@ fn test_static_local_pre_decrement() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3029,17 +3025,15 @@ fn test_static_local_post_increment() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3097,17 +3091,15 @@ fn test_static_local_post_decrement() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3165,17 +3157,15 @@ fn test_static_local_compound_assignment() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let sum_sym = ctx.var("sum", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: sum_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3439,15 +3429,13 @@ fn test_static_local_address_in_initializer() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let x_sym = ctx.var("x", static_int_type);
 
     let static_int_ptr_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Pointer,
-        modifiers: TypeModifiers::STATIC,
+        modifiers: TypeModifiers::empty(),
         base: Some(ctx.types.int_id),
         array_size: None,
         params: None,
@@ -3462,7 +3450,7 @@ fn test_static_local_address_in_initializer() {
         declarators: vec![InitDeclarator {
             symbol: x_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3482,7 +3470,7 @@ fn test_static_local_address_in_initializer() {
         declarators: vec![InitDeclarator {
             symbol: p_sym,
             typ: static_int_ptr_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(addr_of_x),
             vla_sizes: vec![],
             explicit_align: None,
@@ -5056,10 +5044,10 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         },
     ];
 
-    // Create a static struct type (type must have STATIC modifier for static locals)
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::STATIC,
+        modifiers: TypeModifiers::empty(),
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5107,7 +5095,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         declarators: vec![InitDeclarator {
             symbol: s_sym,
             typ: struct_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(init_list),
             vla_sizes: vec![],
             explicit_align: None,

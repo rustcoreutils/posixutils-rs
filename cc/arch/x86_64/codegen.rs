@@ -4190,7 +4190,9 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         // Emit text start label for DWARF debug info (before first function)
+        // Must be in .text section — emit .text first since globals may leave us in .data
         if module.debug && !module.functions.is_empty() {
+            self.push_lir(X86Inst::Directive(Directive::Text));
             self.base.push_directive(Directive::local_label(".Ltext0"));
         }
 

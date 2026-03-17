@@ -1875,8 +1875,6 @@ int main(void) {
 #[test]
 fn codegen_call_return_pointer() {
     let code = r#"
-#include <stdlib.h>
-
 void *identity(void *p) {
     return p;
 }

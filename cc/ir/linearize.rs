@@ -1832,8 +1832,9 @@ impl<'a> Linearizer<'a> {
             }
 
             let typ_size = self.types.size_bits(typ);
-            if typ_size > 128 {
-                // Large struct (> 16 bytes): passed by value on the stack per SysV AMD64 ABI.
+            let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
+            if typ_size > 128 && !is_aarch64 {
+                // x86-64: Large struct (> 16 bytes) passed by value on the stack.
                 // arg_pseudo is an IncomingArg pointing to the struct data on the stack.
                 // Use SymAddr to get the base address, then copy each 8-byte chunk.
                 let ptr_type = self.types.pointer_to(typ);

@@ -1234,15 +1234,15 @@ impl Aarch64CodeGen {
             | Opcode::Shl
             | Opcode::Lsr
             | Opcode::Asr => {
-                self.emit_binop(insn, *total_frame);
+                self.emit_binop(insn, *total_frame, types);
             }
 
             Opcode::Mul => {
-                self.emit_mul(insn, *total_frame);
+                self.emit_mul(insn, *total_frame, types);
             }
 
             Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => {
-                self.emit_div(insn, *total_frame);
+                self.emit_div(insn, *total_frame, types);
             }
 
             Opcode::SetEq
@@ -1255,11 +1255,11 @@ impl Aarch64CodeGen {
             | Opcode::SetBe
             | Opcode::SetA
             | Opcode::SetAe => {
-                self.emit_compare(insn, *total_frame);
+                self.emit_compare(insn, *total_frame, types);
             }
 
-            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, *total_frame),
-            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, *total_frame),
+            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, *total_frame, types),
+            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, *total_frame, types),
 
             Opcode::Load => {
                 self.emit_load(insn, *total_frame, types);
@@ -1355,7 +1355,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Select => {
-                self.emit_select(insn, *total_frame);
+                self.emit_select(insn, *total_frame, types);
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
@@ -2204,7 +2204,7 @@ impl Aarch64CodeGen {
 
     /// Emit a select (ternary) instruction using CSEL
     /// This is used for pure ternary expressions: cond ? a : b
-    fn emit_select(&mut self, insn: &Instruction, frame_size: i32) {
+    fn emit_select(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
             (Some(&c), Some(&t), Some(&e)) => (c, t, e),
@@ -2214,7 +2214,10 @@ impl Aarch64CodeGen {
             Some(t) => t,
             None => return,
         };
-        let size = insn.size.max(32);
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         // Use X16 as default scratch to avoid clobbering live values

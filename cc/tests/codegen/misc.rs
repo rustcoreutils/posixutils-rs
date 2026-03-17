@@ -1970,3 +1970,279 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("ret_64bit", code, &[]), 0);
 }
+
+// ============================================================================
+// Type-based size derivation: verify 64-bit width through binop, unary, mul,
+// div, compare, and select when insn.typ carries the authoritative width.
+// Values above 2^32 prove no 32-bit truncation occurs.
+// ============================================================================
+
+#[test]
+fn codegen_type_based_sizing_64bit() {
+    let code = r#"
+long identity(long x) { return x; }
+
+int main(void) {
+    long base = 0x100000000L;  /* 4 GiB — above 32-bit range */
+
+    /* ===== binop: add, sub, and, or, xor, shift (returns 1-9) ===== */
+    long a = base + 1L;
+    if (a != 0x100000001L) return 1;
+
+    long b = a - 1L;
+    if (b != base) return 2;
+
+    long c = base | 0xFL;
+    if (c != 0x10000000FL) return 3;
+
+    long d = c & 0x1FFFFFFFFL;
+    if (d != 0x10000000FL) return 4;
+
+    long e = base ^ 0x100000000L;
+    if (e != 0L) return 5;
+
+    long f = 1L << 33;
+    if (f != 0x200000000L) return 6;
+
+    long g = 0x200000000L >> 1;
+    if (g != base) return 7;
+
+    /* ===== unary neg (returns 10-12) ===== */
+    long h = -base;
+    if (h != -0x100000000L) return 10;
+
+    long i = -h;
+    if (i != base) return 11;
+
+    /* ===== mul (returns 20-22) ===== */
+    long j = base * 2L;
+    if (j != 0x200000000L) return 20;
+
+    long k = 0x10000L * 0x10000L;
+    if (k != base) return 21;
+
+    /* ===== div (returns 30-34) ===== */
+    long m = 0x200000000L / 2L;
+    if (m != base) return 30;
+
+    long n = 0x200000001L % base;
+    if (n != 1L) return 31;
+
+    /* unsigned div */
+    unsigned long ud = 0x200000000UL / 2UL;
+    if (ud != 0x100000000UL) return 32;
+
+    unsigned long um = 0x200000003UL % 0x100000000UL;
+    if (um != 3UL) return 33;
+
+    /* ===== compare (returns 40-46) ===== */
+    if (!(base > 0xFFFFFFFFL)) return 40;
+    if (!(base == 0x100000000L)) return 41;
+    if (base < 0L) return 42;
+    if (!(0x200000000L > base)) return 43;
+
+    /* pointer comparison */
+    long arr[4];
+    long *p1 = &arr[0];
+    long *p2 = &arr[3];
+    if (!(p2 > p1)) return 44;
+    if (p1 == p2) return 45;
+
+    /* ===== select / ternary (returns 50-53) ===== */
+    int flag = 1;
+    long s1 = flag ? base : 0L;
+    if (s1 != base) return 50;
+
+    long s2 = (!flag) ? 0L : 0x200000000L;
+    if (s2 != 0x200000000L) return 51;
+
+    /* select with pointer */
+    long *ps = flag ? p2 : p1;
+    if (ps != p2) return 52;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("type_based_sizing_64bit", code, &[]), 0);
+}
+
+// ============================================================================
+// VLA sizeof with multi-dimensional arrays — exercises VLA Mul instructions
+// that now carry .with_type(ulong_id) for correct 64-bit multiplication.
+// ============================================================================
+
+#[test]
+fn codegen_vla_sizeof_mul_type() {
+    let code = r#"
+int main(void) {
+    /* ===== 1D VLA sizeof with different element types (returns 1-4) ===== */
+    int n = 10;
+
+    char c_arr[n];
+    if (sizeof(c_arr) != 10) return 1;   /* 10 * 1 */
+
+    int i_arr[n];
+    if (sizeof(i_arr) != 40) return 2;   /* 10 * 4 */
+
+    long l_arr[n];
+    if (sizeof(l_arr) != 80) return 3;   /* 10 * 8 */
+
+    long *p_arr[n];
+    if (sizeof(p_arr) != 80) return 4;   /* 10 * 8 (pointer) */
+
+    /* ===== 2D VLA sizeof — exercises dimension mul (returns 10-13) ===== */
+    int rows = 5, cols = 7;
+    int mat[rows][cols];
+    if (sizeof(mat) != 140) return 10;   /* 5 * 7 * 4 */
+
+    long lmat[rows][cols];
+    if (sizeof(lmat) != 280) return 11;  /* 5 * 7 * 8 */
+
+    /* ===== 3D VLA sizeof — two chained muls (returns 20-21) ===== */
+    int d1 = 3, d2 = 4, d3 = 5;
+    int cube[d1][d2][d3];
+    if (sizeof(cube) != 240) return 20;  /* 3 * 4 * 5 * 4 */
+
+    long lcube[d1][d2][d3];
+    if (sizeof(lcube) != 480) return 21; /* 3 * 4 * 5 * 8 */
+
+    /* ===== VLA sizeof via function (returns 30-31) ===== */
+    /* Ensure runtime sizeof flows correctly through return */
+    int m = 12;
+    int dyn[m];
+    int sz = sizeof(dyn);
+    if (sz != 48) return 30;             /* 12 * 4 */
+
+    /* sizeof in expression context */
+    int total = sizeof(dyn) + sizeof(mat);
+    if (total != 188) return 31;         /* 48 + 140 */
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vla_sizeof_mul_type", code, &[]), 0);
+}
+
+// ============================================================================
+// Variadic functions with 64-bit args — exercises VaArg .with_size() for
+// long and pointer types. Values above 2^32 prove no 32-bit truncation.
+// ============================================================================
+
+#[test]
+fn codegen_variadic_64bit_args() {
+    let code = r#"
+#include <stdarg.h>
+#include <string.h>
+
+/* va_arg with long — tests 64-bit integer extraction */
+long sum_longs(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    long sum = 0;
+    for (int i = 0; i < count; i++) {
+        sum += va_arg(ap, long);
+    }
+    va_end(ap);
+    return sum;
+}
+
+/* va_arg with pointer — tests 64-bit pointer extraction */
+int sum_through_ptrs(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    int sum = 0;
+    for (int i = 0; i < count; i++) {
+        int *p = va_arg(ap, int *);
+        sum += *p;
+    }
+    va_end(ap);
+    return sum;
+}
+
+/* mixed int and long args — tests correct slot advancement */
+long mixed_args(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    long result = 0;
+    for (int i = 0; i < count; i++) {
+        if (i % 2 == 0) {
+            result += va_arg(ap, int);
+        } else {
+            result += va_arg(ap, long);
+        }
+    }
+    va_end(ap);
+    return result;
+}
+
+/* va_copy with 64-bit args */
+long sum_longs_twice(int count, ...) {
+    va_list ap, ap2;
+    va_start(ap, count);
+    va_copy(ap2, ap);
+
+    long sum1 = 0;
+    for (int i = 0; i < count; i++) {
+        sum1 += va_arg(ap, long);
+    }
+
+    long sum2 = 0;
+    for (int i = 0; i < count; i++) {
+        sum2 += va_arg(ap2, long);
+    }
+
+    va_end(ap);
+    va_end(ap2);
+    return sum1 + sum2;
+}
+
+int main(void) {
+    /* ===== long va_arg (returns 1-4) ===== */
+    long big = 0x100000000L;
+
+    long r1 = sum_longs(1, big);
+    if (r1 != big) return 1;
+
+    long r2 = sum_longs(2, big, big);
+    if (r2 != 0x200000000L) return 2;
+
+    long r3 = sum_longs(3, 1L, 2L, 0x100000000L);
+    if (r3 != 0x100000003L) return 3;
+
+    /* negative 64-bit */
+    long r4 = sum_longs(2, -1L, big);
+    if (r4 != 0xFFFFFFFFL) return 4;
+
+    /* ===== pointer va_arg (returns 10-12) ===== */
+    int a = 10, b = 20, c = 30;
+    int s1 = sum_through_ptrs(1, &a);
+    if (s1 != 10) return 10;
+
+    int s2 = sum_through_ptrs(3, &a, &b, &c);
+    if (s2 != 60) return 11;
+
+    /* Array of values, pass pointers to several elements */
+    int arr[5] = {100, 200, 300, 400, 500};
+    int s3 = sum_through_ptrs(3, &arr[0], &arr[2], &arr[4]);
+    if (s3 != 900) return 12;  /* 100 + 300 + 500 */
+
+    /* ===== mixed int/long (returns 20-21) ===== */
+    /* mixed_args reads: int, long, int, long */
+    long m1 = mixed_args(4, 1, 0x100000000L, 2, 0x200000000L);
+    if (m1 != 0x300000003L) return 20;
+
+    long m2 = mixed_args(2, 42, 0x100000000L);
+    if (m2 != 0x10000002AL) return 21;
+
+    /* ===== va_copy with 64-bit (returns 30-31) ===== */
+    long vc1 = sum_longs_twice(1, big);
+    if (vc1 != 0x200000000L) return 30;  /* big + big */
+
+    long vc2 = sum_longs_twice(2, big, 1L);
+    if (vc2 != 0x200000002L) return 31;  /* (big+1) + (big+1) */
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("variadic_64bit_args", code, &[]), 0);
+}

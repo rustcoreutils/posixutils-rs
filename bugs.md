@@ -1,6 +1,6 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: 32/64-bit audit fixes applied. Bugs N, P, Q fixed. -O flag handling fixed. Bug O + Bug R block CPython `make test`.
+## Status: 32/64-bit audit + type-propagation fixes applied to both x86-64 and aarch64 backends. Bugs N, P, Q fixed. -O flag handling fixed. Bug O + Bug R block CPython `make test`.
 
 ### Bugs A-N, P, Q: ALL FIXED (see git history)
 
@@ -46,6 +46,12 @@
 - `chr(128)` returns `'Â\x80'` (2 chars, UTF-8 of U+0080) instead of `'\x80'` (1 char)
 - Root cause: one of the many pcc-compiled .o files corrupts the Unicode latin-1 cache during initialization. With ALL .o files gcc-compiled, chr() works correctly.
 - Finding the specific culprit requires binary search across ~100 .o files.
+
+### AArch64 Backend Bugs — 4 issues FIXED
+1. **Store-widening clobbered globals/statics** — `sym_type_sizes.get().unwrap_or(64)` treated unknown Syms as 64-bit scalars, widening 32→64 for globals. On macOS with 4-byte alignment, this overwrote adjacent static data.
+2. **Large struct param ABI on aarch64** — linearizer used x86-64 SymAddr path for >128-bit struct params. On AAPCS64, these are passed by reference (pointer in register), needing direct Load (like medium structs).
+3. **stp offset overflow** — `zero_stack_frame` used `stp xzr,xzr` which has signed offset range [-512,504]. Large frames overflowed. Fixed: fall back to `str xzr` (unsigned range [0,32760]) for large frames.
+4. **DWARF `.Ltext0` in wrong section** — label emitted after globals (in .data) instead of .text. macOS linker sensitive to this.
 
 ### 32/64-bit Type Width Audit — 11 issues FIXED
 Comprehensive audit identified and fixed 11 systemic 32/64-bit type-width bugs:

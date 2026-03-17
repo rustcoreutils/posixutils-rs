@@ -980,19 +980,18 @@ impl X86_64CodeGen {
 
     /// Emit conditional branch: test condition and branch accordingly
     /// Returns true if an early return was taken (for constant conditions)
-    fn emit_cbr(&mut self, insn: &Instruction) -> bool {
+    fn emit_cbr(&mut self, insn: &Instruction, types: &TypeTable) -> bool {
         let Some(&cond) = insn.src.first() else {
             return false;
         };
 
         let loc = self.get_location(cond);
-        // Use 64-bit test when insn.size is unset (0) to avoid truncating
-        // 64-bit condition values. cbr instructions often lack size info.
-        let size = if insn.size == 0 {
-            64
-        } else {
-            insn.size.max(32)
-        };
+        // Derive size from type when available, falling back to 64-bit
+        // when size is unset (0) to avoid truncating 64-bit condition values.
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(if insn.size == 0 { 64 } else { insn.size.max(32) });
         let op_size = OperandSize::from_bits(size);
 
         match &loc {
@@ -1099,7 +1098,7 @@ impl X86_64CodeGen {
                 }
             }
 
-            Opcode::Cbr => if self.emit_cbr(insn) {},
+            Opcode::Cbr => if self.emit_cbr(insn, types) {},
 
             Opcode::Switch => {
                 // Switch uses target as the value to switch on
@@ -1165,15 +1164,15 @@ impl X86_64CodeGen {
             | Opcode::Shl
             | Opcode::Lsr
             | Opcode::Asr => {
-                self.emit_binop(insn);
+                self.emit_binop(insn, types);
             }
 
             Opcode::Mul => {
-                self.emit_mul(insn);
+                self.emit_mul(insn, types);
             }
 
             Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => {
-                self.emit_div(insn);
+                self.emit_div(insn, types);
             }
 
             // Floating-point arithmetic operations
@@ -1259,11 +1258,11 @@ impl X86_64CodeGen {
             | Opcode::SetBe
             | Opcode::SetA
             | Opcode::SetAe => {
-                self.emit_compare(insn);
+                self.emit_compare(insn, types);
             }
 
-            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg),
-            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not),
+            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, types),
+            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, types),
 
             Opcode::Load => {
                 self.emit_load(insn, types);
@@ -1377,7 +1376,7 @@ impl X86_64CodeGen {
             }
 
             Opcode::Select => {
-                self.emit_select(insn);
+                self.emit_select(insn, types);
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
@@ -2665,7 +2664,7 @@ impl X86_64CodeGen {
 
     /// Emit a select (ternary) instruction using CMOVcc
     /// This is used for pure ternary expressions: cond ? a : b
-    fn emit_select(&mut self, insn: &Instruction) {
+    fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
             (Some(&c), Some(&t), Some(&e)) => (c, t, e),
@@ -2675,7 +2674,10 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-        let size = insn.size.max(32);
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
@@ -3533,7 +3535,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic store needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         // For SeqCst, use XCHG which provides full barrier
@@ -3609,7 +3611,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic swap needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3638,7 +3640,7 @@ impl X86_64CodeGen {
         let addr = insn.src[0];
         let expected_ptr = insn.src[1];
         let desired = insn.src[2];
-        let size = insn.size; // Element size in bits
+        let size = insn.size.max(32);
 
         let op_size = OperandSize::from_bits(size);
 
@@ -3819,7 +3821,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic fetch_add needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3847,7 +3849,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic fetch_sub needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3895,7 +3897,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic fetch needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);

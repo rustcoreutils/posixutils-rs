@@ -2532,7 +2532,8 @@ impl<'a> Linearizer<'a> {
                         .with_target(result)
                         .with_src(prev)
                         .with_src(dim_size)
-                        .with_size(64);
+                        .with_size(64)
+                        .with_type(self.types.ulong_id);
                     self.emit(mul_insn);
                     result
                 }
@@ -2571,7 +2572,8 @@ impl<'a> Linearizer<'a> {
             .with_target(total_size)
             .with_src(num_elements)
             .with_src(elem_size_const)
-            .with_size(64);
+            .with_size(64)
+            .with_type(self.types.ulong_id);
         self.emit(mul_insn);
 
         // Emit Alloca instruction to allocate stack space
@@ -6352,7 +6354,8 @@ impl<'a> Linearizer<'a> {
                                 .with_target(result)
                                 .with_src(num_elements)
                                 .with_src(elem_size_const)
-                                .with_size(64);
+                                .with_size(64)
+                                .with_type(result_typ);
                             self.emit(mul_insn);
                             return result;
                         }
@@ -6475,7 +6478,8 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(ap_addr)
                     .with_func(self.str(*last_param).to_string())
-                    .with_type(self.types.void_id);
+                    .with_type(self.types.void_id)
+                    .with_size(0);
                 self.emit(insn);
                 result
             }
@@ -6486,10 +6490,12 @@ impl<'a> Linearizer<'a> {
                 let ap_addr = self.linearize_lvalue(ap);
                 let result = self.alloc_pseudo();
 
+                let arg_size = self.types.size_bits(*arg_type);
                 let insn = Instruction::new(Opcode::VaArg)
                     .with_target(result)
                     .with_src(ap_addr)
-                    .with_type(*arg_type);
+                    .with_type(*arg_type)
+                    .with_size(arg_size);
                 self.emit(insn);
                 result
             }
@@ -6502,7 +6508,8 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::VaEnd)
                     .with_target(result)
                     .with_src(ap_addr)
-                    .with_type(self.types.void_id);
+                    .with_type(self.types.void_id)
+                    .with_size(0);
                 self.emit(insn);
                 result
             }
@@ -6517,7 +6524,8 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(dest_addr)
                     .with_src(src_addr)
-                    .with_type(self.types.void_id);
+                    .with_type(self.types.void_id)
+                    .with_size(0);
                 self.emit(insn);
                 result
             }

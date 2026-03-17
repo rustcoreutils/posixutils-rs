@@ -15,10 +15,14 @@ use super::regalloc::{Loc, Reg};
 use crate::arch::codegen::UnaryOp;
 use crate::arch::lir::{CondCode, OperandSize};
 use crate::ir::{Instruction, Opcode};
+use crate::types::TypeTable;
 
 impl Aarch64CodeGen {
-    pub(super) fn emit_binop(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_binop(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -106,8 +110,17 @@ impl Aarch64CodeGen {
         }
     }
 
-    pub(super) fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp, frame_size: i32) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_unary_op(
+        &mut self,
+        insn: &Instruction,
+        op: UnaryOp,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -142,8 +155,11 @@ impl Aarch64CodeGen {
         }
     }
 
-    pub(super) fn emit_mul(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_mul(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -174,8 +190,11 @@ impl Aarch64CodeGen {
         }
     }
 
-    pub(super) fn emit_div(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_div(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -230,8 +249,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    pub(super) fn emit_compare(&mut self, insn: &Instruction, frame_size: i32) {
-        let size = insn.size.max(32);
+    pub(super) fn emit_compare(
+        &mut self,
+        insn: &Instruction,
+        frame_size: i32,
+        types: &TypeTable,
+    ) {
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),

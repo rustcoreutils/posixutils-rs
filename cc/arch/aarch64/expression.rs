@@ -18,7 +18,7 @@ use crate::ir::{Instruction, Opcode};
 use crate::types::TypeTable;
 
 impl Aarch64CodeGen {
-    pub(super) fn emit_binop(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    pub(super) fn emit_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
@@ -39,7 +39,7 @@ impl Aarch64CodeGen {
         };
 
         // Load first operand
-        self.emit_move(src1, work_reg, size, frame_size);
+        self.emit_move(src1, work_reg, size);
 
         // Get second operand as GpOperand
         let src2_loc = self.get_location(src2);
@@ -47,7 +47,7 @@ impl Aarch64CodeGen {
             Loc::Reg(r) => GpOperand::Reg(*r),
             Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v),
             _ => {
-                self.emit_move(src2, Reg::X10, size, frame_size);
+                self.emit_move(src2, Reg::X10, size);
                 GpOperand::Reg(Reg::X10)
             }
         };
@@ -106,17 +106,11 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, size, frame_size);
+            self.emit_move_to_loc(work_reg, &dst_loc, size);
         }
     }
 
-    pub(super) fn emit_unary_op(
-        &mut self,
-        insn: &Instruction,
-        op: UnaryOp,
-        frame_size: i32,
-        types: &TypeTable,
-    ) {
+    pub(super) fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
@@ -136,7 +130,7 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        self.emit_move(src, work_reg, size, frame_size);
+        self.emit_move(src, work_reg, size);
         self.push_lir(match op {
             UnaryOp::Neg => Aarch64Inst::Neg {
                 size: op_size,
@@ -151,11 +145,11 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, size, frame_size);
+            self.emit_move_to_loc(work_reg, &dst_loc, size);
         }
     }
 
-    pub(super) fn emit_mul(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    pub(super) fn emit_mul(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
@@ -175,8 +169,8 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        self.emit_move(src1, Reg::X10, size, frame_size);
-        self.emit_move(src2, Reg::X11, size, frame_size);
+        self.emit_move(src1, Reg::X10, size);
+        self.emit_move(src2, Reg::X11, size);
 
         self.push_lir(Aarch64Inst::Mul {
             size: op_size,
@@ -186,11 +180,11 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size, frame_size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }
     }
 
-    pub(super) fn emit_div(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    pub(super) fn emit_div(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
@@ -205,8 +199,8 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        self.emit_move(src1, Reg::X10, size, frame_size);
-        self.emit_move(src2, Reg::X11, size, frame_size);
+        self.emit_move(src1, Reg::X10, size);
+        self.emit_move(src2, Reg::X11, size);
 
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
@@ -245,16 +239,11 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size, frame_size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }
     }
 
-    pub(super) fn emit_compare(
-        &mut self,
-        insn: &Instruction,
-        frame_size: i32,
-        types: &TypeTable,
-    ) {
+    pub(super) fn emit_compare(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
@@ -269,14 +258,14 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        self.emit_move(src1, Reg::X10, size, frame_size);
+        self.emit_move(src1, Reg::X10, size);
 
         // Try to use immediate for comparison if possible
         let src2_loc = self.get_location(src2);
         let src2_operand = match &src2_loc {
             Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v),
             _ => {
-                self.emit_move(src2, Reg::X11, size, frame_size);
+                self.emit_move(src2, Reg::X11, size);
                 GpOperand::Reg(Reg::X11)
             }
         };
@@ -311,11 +300,11 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Cset { cond, dst: dst_reg });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size, frame_size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }
     }
 
-    pub(super) fn emit_extend(&mut self, insn: &Instruction, frame_size: i32) {
+    pub(super) fn emit_extend(&mut self, insn: &Instruction) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -333,7 +322,7 @@ impl Aarch64CodeGen {
         match insn.op {
             Opcode::Zext => {
                 // Zero extend: use uxtb, uxth, or just mov for 32->64
-                self.emit_move(src, dst_reg, 64, frame_size);
+                self.emit_move(src, dst_reg, 64);
                 match insn.src_size {
                     8 => {
                         self.push_lir(Aarch64Inst::Uxtb {
@@ -355,7 +344,7 @@ impl Aarch64CodeGen {
             }
             Opcode::Sext => {
                 // Sign extend: use sxtb, sxth, sxtw based on source size
-                self.emit_move(src, dst_reg, 64, frame_size);
+                self.emit_move(src, dst_reg, 64);
                 match insn.src_size {
                     8 => {
                         self.push_lir(Aarch64Inst::Sxtb {
@@ -382,7 +371,7 @@ impl Aarch64CodeGen {
             }
             Opcode::Trunc => {
                 // Truncate: move value then mask to target size
-                self.emit_move(src, dst_reg, 64, frame_size);
+                self.emit_move(src, dst_reg, 64);
                 // Mask to target size using AND
                 match insn.size {
                     8 => {
@@ -411,7 +400,7 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size, frame_size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
         }
     }
 }

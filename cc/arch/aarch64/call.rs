@@ -19,10 +19,10 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
     /// Handle sret (hidden struct return pointer) argument
-    pub(super) fn setup_sret_arg(&mut self, insn: &Instruction, frame_size: i32) -> usize {
+    pub(super) fn setup_sret_arg(&mut self, insn: &Instruction) -> usize {
         if insn.is_sret_call && !insn.src.is_empty() {
             // First argument is sret pointer - move to X8
-            self.emit_move(insn.src[0], Reg::X8, 64, frame_size);
+            self.emit_move(insn.src[0], Reg::X8, 64);
             1 // Skip first arg in main loop
         } else {
             0
@@ -35,7 +35,6 @@ impl Aarch64CodeGen {
         insn: &Instruction,
         args_start: usize,
         types: &TypeTable,
-        frame_size: i32,
     ) -> i32 {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
@@ -73,18 +72,11 @@ impl Aarch64CodeGen {
                         64
                     };
                     if fp_arg_idx < fp_arg_regs.len() {
-                        self.emit_fp_move(
-                            arg,
-                            fp_arg_regs[fp_arg_idx],
-                            arg_type,
-                            fp_size,
-                            frame_size,
-                            types,
-                        );
+                        self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], arg_type, fp_size, types);
                         fp_arg_idx += 1;
                     }
                 } else if int_arg_idx < int_arg_regs.len() {
-                    self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size, frame_size);
+                    self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
                     int_arg_idx += 1;
                 }
             }
@@ -107,7 +99,7 @@ impl Aarch64CodeGen {
                 let offset = (idx * 8) as i32;
                 if is_fp {
                     // Variadic FP args don't have precise type info, use size-based detection
-                    self.emit_fp_move(arg, VReg::V16, None, arg_size, frame_size, types);
+                    self.emit_fp_move(arg, VReg::V16, None, arg_size, types);
                     self.push_lir(Aarch64Inst::StrFp {
                         size: FpSize::Double,
                         src: VReg::V16,
@@ -117,7 +109,7 @@ impl Aarch64CodeGen {
                         },
                     });
                 } else {
-                    self.emit_move(arg, Reg::X9, arg_size, frame_size);
+                    self.emit_move(arg, Reg::X9, arg_size);
                     self.push_lir(Aarch64Inst::Str {
                         size: OperandSize::B64,
                         src: Reg::X9,
@@ -145,7 +137,6 @@ impl Aarch64CodeGen {
         insn: &Instruction,
         args_start: usize,
         types: &TypeTable,
-        frame_size: i32,
     ) -> i32 {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
@@ -186,7 +177,6 @@ impl Aarch64CodeGen {
                         fp_arg_regs[fp_arg_idx],
                         fp_arg_regs[fp_arg_idx + 1],
                         types,
-                        frame_size,
                     );
                     fp_arg_idx += 2;
                 } else {
@@ -211,14 +201,7 @@ impl Aarch64CodeGen {
                     } else {
                         64
                     };
-                    self.emit_fp_move(
-                        arg,
-                        fp_arg_regs[fp_arg_idx],
-                        arg_type,
-                        fp_size,
-                        frame_size,
-                        types,
-                    );
+                    self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], arg_type, fp_size, types);
                     fp_arg_idx += 1;
                 } else {
                     stack_args_info.push(StackArg {
@@ -229,7 +212,7 @@ impl Aarch64CodeGen {
                     });
                 }
             } else if int_arg_idx < int_arg_regs.len() {
-                self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size, frame_size);
+                self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
                 int_arg_idx += 1;
             } else {
                 stack_args_info.push(StackArg {
@@ -268,7 +251,6 @@ impl Aarch64CodeGen {
                     VReg::V16,
                     stack_arg.typ,
                     stack_arg.size,
-                    frame_size,
                     types,
                 );
                 let fp_sz = stack_arg
@@ -296,7 +278,7 @@ impl Aarch64CodeGen {
                     },
                 });
             } else {
-                self.emit_move(stack_arg.pseudo, Reg::X9, stack_arg.size, frame_size);
+                self.emit_move(stack_arg.pseudo, Reg::X9, stack_arg.size);
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: Reg::X9,
@@ -320,7 +302,6 @@ impl Aarch64CodeGen {
         real_reg: VReg,
         imag_reg: VReg,
         types: &TypeTable,
-        frame_size: i32,
     ) {
         let arg_loc = self.get_location(arg);
         let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, arg_type.unwrap());
@@ -328,7 +309,7 @@ impl Aarch64CodeGen {
         match arg_loc {
             Loc::Stack(offset) => {
                 // Complex value is stored directly on stack, load both parts
-                let actual_offset = self.stack_offset(frame_size, offset);
+                let actual_offset = self.stack_offset(offset);
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
                     dst: real_reg,
@@ -391,12 +372,7 @@ impl Aarch64CodeGen {
     }
 
     /// Handle call return value using ABI classification.
-    pub(super) fn handle_call_return_value(
-        &mut self,
-        insn: &Instruction,
-        types: &TypeTable,
-        frame_size: i32,
-    ) {
+    pub(super) fn handle_call_return_value(&mut self, insn: &Instruction, types: &TypeTable) {
         let target = match insn.target {
             Some(t) => t,
             None => return,
@@ -418,34 +394,27 @@ impl Aarch64CodeGen {
                 // Two-register return (9-16 bytes)
                 if *size_bits > 64 && classes.len() == 2 {
                     if classes.iter().all(|c| *c == RegClass::Integer) {
-                        self.handle_two_reg_return(&dst_loc, frame_size);
+                        self.handle_two_reg_return(&dst_loc);
                         return;
                     }
                     // Two SSE registers (could be HFA with 2 doubles)
                     if classes.iter().all(|c| *c == RegClass::Sse) {
                         let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
                         if is_complex_result {
-                            self.handle_complex_return(insn, &dst_loc, types, frame_size);
+                            self.handle_complex_return(insn, &dst_loc, types);
                         } else {
-                            self.handle_two_fp_return(&dst_loc, frame_size);
+                            self.handle_two_fp_return(&dst_loc);
                         }
                         return;
                     }
                 }
                 // Single SSE return
                 if classes.first() == Some(&RegClass::Sse) {
-                    self.emit_fp_move_to_loc(
-                        VReg::V0,
-                        &dst_loc,
-                        insn.typ,
-                        ret_size,
-                        frame_size,
-                        types,
-                    );
+                    self.emit_fp_move_to_loc(VReg::V0, &dst_loc, insn.typ, ret_size, types);
                     return;
                 }
                 // Integer return
-                self.emit_move_to_loc(Reg::X0, &dst_loc, ret_size, frame_size);
+                self.emit_move_to_loc(Reg::X0, &dst_loc, ret_size);
             }
             ArgClass::Indirect { .. } => {
                 // sret: return value already written to memory via X8
@@ -454,14 +423,14 @@ impl Aarch64CodeGen {
                 // HFA: values in V0-V3
                 let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
                 if *count == 2 && is_complex_result {
-                    self.handle_complex_return(insn, &dst_loc, types, frame_size);
+                    self.handle_complex_return(insn, &dst_loc, types);
                     return;
                 }
                 // Handle HFA with 1-4 elements
-                self.handle_hfa_return(&dst_loc, *count, *base, frame_size);
+                self.handle_hfa_return(&dst_loc, *count, *base);
             }
             ArgClass::Extend { .. } => {
-                self.emit_move_to_loc(Reg::X0, &dst_loc, ret_size, frame_size);
+                self.emit_move_to_loc(Reg::X0, &dst_loc, ret_size);
             }
             ArgClass::X87 { .. } => {
                 unreachable!("x87 FPU returns not available on AArch64");
@@ -473,10 +442,10 @@ impl Aarch64CodeGen {
     }
 
     /// Handle two-register struct return (X0 + X1)
-    fn handle_two_reg_return(&mut self, dst_loc: &Loc, frame_size: i32) {
+    fn handle_two_reg_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(frame_size, *offset);
+                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: Reg::X0,
@@ -517,17 +486,11 @@ impl Aarch64CodeGen {
     }
 
     /// Handle complex return value (V0 + V1)
-    fn handle_complex_return(
-        &mut self,
-        insn: &Instruction,
-        dst_loc: &Loc,
-        types: &TypeTable,
-        frame_size: i32,
-    ) {
+    fn handle_complex_return(&mut self, insn: &Instruction, dst_loc: &Loc, types: &TypeTable) {
         let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, insn.typ.unwrap());
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(frame_size, *offset);
+                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
                     src: VReg::V0,
@@ -568,10 +531,10 @@ impl Aarch64CodeGen {
     }
 
     /// Handle two FP register return (V0 + V1) for non-complex structs
-    fn handle_two_fp_return(&mut self, dst_loc: &Loc, frame_size: i32) {
+    fn handle_two_fp_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(frame_size, *offset);
+                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::StrFp {
                     size: FpSize::Double,
                     src: VReg::V0,
@@ -612,7 +575,7 @@ impl Aarch64CodeGen {
     }
 
     /// Handle HFA (Homogeneous Floating-Point Aggregate) return (V0-V3)
-    fn handle_hfa_return(&mut self, dst_loc: &Loc, count: u8, base: HfaBase, frame_size: i32) {
+    fn handle_hfa_return(&mut self, dst_loc: &Loc, count: u8, base: HfaBase) {
         let (fp_size, elem_size) = match base {
             HfaBase::Float32 => (FpSize::Single, 4),
             HfaBase::Float64 => (FpSize::Double, 8),
@@ -622,7 +585,7 @@ impl Aarch64CodeGen {
 
         match dst_loc {
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(frame_size, *offset);
+                let actual_offset = self.stack_offset(*offset);
                 for i in 0..count.min(4) {
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,

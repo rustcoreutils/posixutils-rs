@@ -991,7 +991,11 @@ impl X86_64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(if insn.size == 0 { 64 } else { insn.size.max(32) });
+            .unwrap_or(if insn.size == 0 {
+                64
+            } else {
+                insn.size.max(32)
+            });
         let op_size = OperandSize::from_bits(size);
 
         match &loc {

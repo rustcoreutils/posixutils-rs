@@ -1,6 +1,6 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: CPython 3.12.9 builds and runs with pcc at -O0. Nine bugs fixed this session. 14/20 core tests pass. Remaining: some tests crash (complex, functools, copy, io), others fail needing _testcapi module.
+## Status: CPython 3.12.9 builds and runs with pcc at -O0. Stack coloring implemented — eval loop frame 118KB→83KB. test_copy/test_functools pass with default stack. 14/20 core tests pass with ulimit -s unlimited.
 
 ### Bugs A-N, P, Q, 1-6: ALL FIXED (see git history)
 
@@ -81,14 +81,16 @@
 - **Remaining:** When a 2-SSE struct is the FIRST param followed by integer params, the callee's function entry code assigns integer args to the wrong registers (off by one). `powu(Complex x, long n)` reads `n` from rsi instead of rdi.
 - **Workaround:** Complex tests work when struct is not first param, or with unlimited stack.
 
-### Bug AF: Stack overflow from excessive frame sizes — NOT YET FIXED
-- `_PyEval_EvalFrameDefault` allocates 118KB per frame (vs gcc's <1KB)
-- pcc allocates all local variables simultaneously instead of reusing stack slots
-- With default stack limit (12.5MB), recursive calls exhaust the stack
-- **Workaround:** `ulimit -s unlimited` fixes test_functools, test_copy, test_io
+### Bug AF: Stack overflow from excessive frame sizes — PARTIALLY FIXED
+- `_PyEval_EvalFrameDefault` frame reduced from 118KB to 83KB via stack slot reuse
+- Stack coloring reuses slots for non-loop-spanning pseudos with non-overlapping intervals
+- test_copy and test_functools now pass with default `ulimit -s` (8MB)
+- test_io still needs `ulimit -s unlimited` (deep `__repr__` recursion * 83KB frame)
+- **Remaining:** frame still ~83x larger than gcc's ~1KB; further reduction needs better register allocation or more aggressive stack coloring
 
-### Test status with `ulimit -s unlimited`:
-- **PASS:** test_bool, test_string, test_dict, test_list, test_tuple, test_set, test_bytes, test_operator, test_re, test_itertools, test_functools, test_copy, test_io
+### Test status (default stack unless noted):
+- **PASS (default stack):** test_bool, test_string, test_dict, test_list, test_tuple, test_set, test_bytes, test_operator, test_re, test_itertools, test_functools, test_copy, test_collections
+- **PASS (ulimit -s unlimited):** test_io (deep `__repr__` recursion)
 - **FAIL (complex power bug):** test_complex, test_float, test_builtin (complex power returns wrong values)
 - **FAIL (need _testcapi):** test_int, test_grammar, test_syntax, test_exceptions, test_bytes (skip)
 - **CRASH:** test_asyncio (SSL event loop crash — separate issue)

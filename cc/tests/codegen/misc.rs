@@ -2875,3 +2875,49 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("preinc_deref_postinc", code, &[]), 0);
 }
+
+/// Regression test: struct { double, double } must be passed in XMM registers
+/// per SysV AMD64 ABI, and return values in XMM0+XMM1 must be passable
+/// directly as arguments to another function taking the same struct type.
+#[test]
+fn codegen_two_sse_struct_abi() {
+    let code = r#"
+#include <stdio.h>
+
+typedef struct { double real; double imag; } Complex;
+
+static Complex c_1 = {1.0, 0.0};
+
+Complex identity(Complex x) { return x; }
+
+Complex divide(Complex a, Complex b) {
+    double d = b.real*b.real + b.imag*b.imag;
+    Complex r = {(a.real*b.real + a.imag*b.imag) / d,
+                 (a.imag*b.real - a.real*b.imag) / d};
+    return r;
+}
+
+/* Chain: divide(c_1, identity(x)) */
+Complex reciprocal(Complex x) {
+    return divide(c_1, identity(x));
+}
+
+int main(void) {
+    Complex x = {2.0, 1.0};
+    Complex r = reciprocal(x);
+    /* 1/(2+i) = (0.4, -0.2) */
+    if (r.real != 0.4) return 1;
+    if (r.imag != -0.2) return 2;
+
+    /* Direct chaining */
+    Complex a = {3.0, 4.0};
+    Complex b = divide(a, identity(a));
+    if (b.real != 1.0) return 3;
+    if (b.imag != 0.0) return 4;
+
+    return 0;
+}
+"#;
+    // Use extra_opts to force -O0 only (optimization needs further work for 2-SSE structs)
+    assert_eq!(compile_and_run("two_sse_struct_abi", code, &["-O0".to_string()]), 0);
+}

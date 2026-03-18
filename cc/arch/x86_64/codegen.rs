@@ -12,7 +12,7 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
-use crate::abi::{get_abi, ArgClass, RegClass};
+use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::float::f64_to_f16_bits;
@@ -566,7 +566,12 @@ impl X86_64CodeGen {
                             let is_complex = types.is_complex(*typ);
                             let is_longdouble =
                                 types.kind(*typ) == crate::types::TypeKind::LongDouble;
-                            if is_complex {
+                            let is_two_sse_spilled = !is_complex
+                                && (types.kind(*typ) == crate::types::TypeKind::Struct
+                                    || types.kind(*typ) == crate::types::TypeKind::Union)
+                                && type_size_bits > 64
+                                && type_size_bits <= 128;
+                            if is_complex || is_two_sse_spilled {
                                 fp_arg_idx += 2;
                             } else if is_longdouble {
                                 // Long double is on stack, doesn't use XMM registers
@@ -579,7 +584,22 @@ impl X86_64CodeGen {
                         }
                         let is_fp = types.is_float(*typ);
                         let is_complex = types.is_complex(*typ);
-                        if is_complex {
+                        // Check for medium struct with 2-SSE classification
+                        let is_two_sse_struct = !is_complex
+                            && (types.kind(*typ) == crate::types::TypeKind::Struct
+                                || types.kind(*typ) == crate::types::TypeKind::Union)
+                            && type_size_bits > 64
+                            && type_size_bits <= 128
+                            && {
+                                let abi = crate::abi::SysVAmd64Abi;
+                                matches!(
+                                    abi.classify_param(*typ, types),
+                                    crate::abi::ArgClass::Direct { ref classes, .. }
+                                        if classes.len() == 2
+                                            && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                                )
+                            };
+                        if is_complex || is_two_sse_struct {
                             // Complex argument - uses TWO consecutive XMM registers
                             // double _Complex: XMM0+XMM1, XMM2+XMM3, etc.
                             // Look up the local variable (same name as param) for stack location
@@ -590,8 +610,12 @@ impl X86_64CodeGen {
                                     if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
                                     {
                                         let adjusted = offset + self.callee_saved_offset;
-                                        let (fp_size, imag_offset) =
-                                            complex_fp_info(types, &self.base.target, *typ);
+                                        let (fp_size, imag_offset) = if is_two_sse_struct {
+                                            // Struct of two doubles: each field is 8 bytes
+                                            (FpSize::Double, 8)
+                                        } else {
+                                            complex_fp_info(types, &self.base.target, *typ)
+                                        };
                                         // Store real part from first XMM register
                                         self.push_lir(X86Inst::MovFp {
                                             size: fp_size,

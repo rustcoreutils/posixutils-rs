@@ -15,7 +15,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer,
     Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId,
 };
-use crate::abi::{get_abi_for_conv, ArgClass, CallingConv, RegClass};
+use crate::abi::{get_abi_for_conv, Abi, ArgClass, CallingConv, RegClass};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
@@ -1765,7 +1765,24 @@ impl<'a> Linearizer<'a> {
                 // We'll handle this after function setup.
                 valist_params.push((name, param.symbol, param.typ, pseudo_id));
             } else if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
-                struct_params.push((name, param.symbol, param.typ, pseudo_id));
+                // Medium structs (9-16 bytes) with all-SSE classification are
+                // passed like complex types (in two XMM registers). Route them
+                // through complex_params so the codegen handles the register split.
+                let size = self.types.size_bits(param.typ);
+                let is_two_sse = size > 64 && size <= 128 && {
+                    let abi = crate::abi::SysVAmd64Abi;
+                    matches!(
+                        abi.classify_param(param.typ, self.types),
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                    )
+                };
+                if is_two_sse {
+                    complex_params.push((name, param.symbol, param.typ, pseudo_id));
+                } else {
+                    struct_params.push((name, param.symbol, param.typ, pseudo_id));
+                }
             } else if self.types.is_complex(param.typ) {
                 // Complex parameters: copy to local storage so real/imag access works
                 // Unlike structs, complex types are passed in FP registers per ABI,
@@ -5266,9 +5283,21 @@ impl<'a> Linearizer<'a> {
                     // codegen will copy bytes to the stack.
                     arg_types_vec.push(arg_type);
                 } else {
-                    // Medium struct (9-16 bytes): pass as pointer
-                    // (2-register passing not yet implemented)
-                    arg_types_vec.push(self.types.pointer_to(arg_type));
+                    // Medium struct (9-16 bytes): check ABI classification
+                    let abi = crate::abi::SysVAmd64Abi;
+                    let is_two_sse = matches!(
+                        abi.classify_param(arg_type, self.types),
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                    );
+                    if is_two_sse {
+                        // All-SSE struct: keep struct type for 2-XMM passing
+                        arg_types_vec.push(arg_type);
+                    } else {
+                        // Integer or mixed struct: pass as pointer (existing behavior)
+                        arg_types_vec.push(self.types.pointer_to(arg_type));
+                    }
                 }
                 self.linearize_lvalue(a)
             } else if self.types.is_complex(arg_type) {

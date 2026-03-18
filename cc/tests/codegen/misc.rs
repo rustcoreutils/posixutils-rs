@@ -2921,3 +2921,47 @@ int main(void) {
     // Use extra_opts to force -O0 only (optimization needs further work for 2-SSE structs)
     assert_eq!(compile_and_run("two_sse_struct_abi", code, &["-O0".to_string()]), 0);
 }
+
+// ============================================================================
+// Large switch stack reduction test (stack slot reuse)
+// ============================================================================
+
+#[test]
+fn codegen_large_switch_stack() {
+    // 50 switch cases, each with 4 local variables.
+    // Without stack slot reuse, this would allocate 200+ unique stack slots.
+    // With reuse, case-local temporaries share slots.
+    let mut code = String::from(
+        r#"
+int large_switch(int x) {
+    switch (x) {
+"#,
+    );
+    for i in 0..50 {
+        let a = i * 4 + 1;
+        let b = i * 4 + 2;
+        let c = i * 4 + 3;
+        let d = i * 4 + 4;
+        code.push_str(&format!(
+            "    case {i}: {{ int a={a},b={b},c={c},d={d}; return a+b+c+d; }}\n"
+        ));
+    }
+    code.push_str(
+        r#"    default: return -1;
+    }
+}
+
+int main(void) {
+"#,
+    );
+    for i in 0..50 {
+        let expected = i * 4 + 1 + i * 4 + 2 + i * 4 + 3 + i * 4 + 4;
+        code.push_str(&format!(
+            "    if (large_switch({i}) != {expected}) return {ret};\n",
+            ret = i + 1
+        ));
+    }
+    code.push_str("    if (large_switch(999) != -1) return 51;\n");
+    code.push_str("    return 0;\n}\n");
+    assert_eq!(compile_and_run("codegen_large_switch_stack", &code, &[]), 0);
+}

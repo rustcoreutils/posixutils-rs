@@ -36,12 +36,13 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    compute_live_intervals, expire_intervals, find_call_positions, find_conflicting_registers,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval,
+    compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
+    find_conflicting_registers, identify_fp_pseudos, interval_crosses_call, ConstraintPoint,
+    FreeSlot, LiveInterval,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeKind, TypeTable};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Get constraint info for an instruction (used by shared compute_live_intervals).
 /// AArch64 has no implicit register constraints (unlike x86-64 which needs
@@ -680,6 +681,10 @@ pub struct RegAlloc {
     fp_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
+    /// Active stack slot intervals (interval, offset, size) for reuse tracking
+    active_stack: Vec<(LiveInterval, i32, i32)>,
+    /// Free stack slots keyed by size, available for reuse
+    free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
 }
 
 impl RegAlloc {
@@ -695,6 +700,8 @@ impl RegAlloc {
             used_callee_saved_fp: Vec::new(),
             fp_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
+            active_stack: Vec::new(),
+            free_stack_slots: BTreeMap::new(),
         }
     }
 
@@ -727,6 +734,8 @@ impl RegAlloc {
         self.used_callee_saved_fp.clear();
         self.fp_pseudos.clear();
         self.spilled_args.clear();
+        self.active_stack.clear();
+        self.free_stack_slots.clear();
     }
 
     /// Pre-allocate argument registers per AAPCS64
@@ -874,6 +883,37 @@ impl RegAlloc {
         &self.spilled_args
     }
 
+    /// Try to reuse a freed stack slot of the given size and alignment.
+    fn try_reuse_stack_slot(&mut self, size: i32, alignment: i32) -> Option<i32> {
+        if let Some(slots) = self.free_stack_slots.get_mut(&size) {
+            if let Some(idx) = slots.iter().position(|s| s.alignment >= alignment) {
+                let slot = slots.remove(idx);
+                if slots.is_empty() {
+                    self.free_stack_slots.remove(&size);
+                }
+                return Some(slot.offset);
+            }
+        }
+        None
+    }
+
+    /// Allocate a stack slot, reusing a freed slot if possible.
+    /// AArch64 uses negative offsets from the frame pointer.
+    fn alloc_stack_slot(&mut self, interval: &LiveInterval, size: i32, alignment: i32) {
+        let offset = if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
+            reused
+        } else {
+            if alignment > 8 {
+                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+            }
+            self.stack_offset += size;
+            -self.stack_offset
+        };
+        self.locations.insert(interval.pseudo, Loc::Stack(offset));
+        self.active_stack
+            .push((interval.clone(), offset, size));
+    }
+
     /// Run the linear scan allocation algorithm
     fn run_linear_scan(
         &mut self,
@@ -992,9 +1032,7 @@ impl RegAlloc {
                         self.active_fp.push((interval.clone(), reg));
                         self.active_fp.sort_by_key(|(i, _)| i.end);
                     } else {
-                        self.stack_offset += 8;
-                        self.locations
-                            .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                        self.alloc_stack_slot(&interval, 8, 8);
                     }
                 } else if let Some(reg) = self.free_fp_regs.pop() {
                     if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
@@ -1004,9 +1042,7 @@ impl RegAlloc {
                     self.active_fp.push((interval.clone(), reg));
                     self.active_fp.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 }
             } else if crosses_call {
                 // GP interval crosses a call - must use callee-saved register or spill
@@ -1025,9 +1061,7 @@ impl RegAlloc {
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
                     // No callee-saved registers available - spill to stack
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 }
             } else {
                 // Interval doesn't cross a call - prefer caller-saved registers
@@ -1063,9 +1097,7 @@ impl RegAlloc {
                     self.active.push((interval.clone(), reg));
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 }
             }
         }
@@ -1076,6 +1108,8 @@ impl RegAlloc {
         expire_intervals(&mut self.active, &mut self.free_regs, point);
         // Expire FP register intervals
         expire_intervals(&mut self.active_fp, &mut self.free_fp_regs, point);
+        // Expire stack slot intervals for reuse
+        expire_stack_intervals(&mut self.active_stack, &mut self.free_stack_slots, point);
     }
 
     fn compute_live_intervals(

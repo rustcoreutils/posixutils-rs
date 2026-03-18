@@ -39,12 +39,13 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    compute_live_intervals, expire_intervals, find_call_positions, find_conflicting_registers,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval,
+    compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
+    find_conflicting_registers, identify_fp_pseudos, interval_crosses_call, ConstraintPoint,
+    FreeSlot, LiveInterval,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ============================================================================
 // x86-64 Register Definitions
@@ -468,6 +469,10 @@ pub struct RegAlloc {
     spilled_args: Vec<SpilledArg>,
     /// XMM arguments spilled from XMM registers to stack
     spilled_xmm_args: Vec<SpilledXmmArg>,
+    /// Active stack slot intervals (interval, offset, size) for reuse tracking
+    active_stack: Vec<(LiveInterval, i32, i32)>,
+    /// Free stack slots keyed by size, available for reuse
+    free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
 }
 
 impl RegAlloc {
@@ -484,6 +489,8 @@ impl RegAlloc {
             ld_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
             spilled_xmm_args: Vec::new(),
+            active_stack: Vec::new(),
+            free_stack_slots: BTreeMap::new(),
         }
     }
 
@@ -520,6 +527,8 @@ impl RegAlloc {
         self.ld_pseudos.clear();
         self.spilled_args.clear();
         self.spilled_xmm_args.clear();
+        self.active_stack.clear();
+        self.free_stack_slots.clear();
     }
 
     /// Identify pseudos that are long double (80-bit extended precision).
@@ -803,6 +812,36 @@ impl RegAlloc {
         }
     }
 
+    /// Try to reuse a freed stack slot of the given size and alignment.
+    fn try_reuse_stack_slot(&mut self, size: i32, alignment: i32) -> Option<i32> {
+        if let Some(slots) = self.free_stack_slots.get_mut(&size) {
+            if let Some(idx) = slots.iter().position(|s| s.alignment >= alignment) {
+                let slot = slots.remove(idx);
+                if slots.is_empty() {
+                    self.free_stack_slots.remove(&size);
+                }
+                return Some(slot.offset);
+            }
+        }
+        None
+    }
+
+    /// Allocate a stack slot, reusing a freed slot if possible.
+    fn alloc_stack_slot(&mut self, interval: &LiveInterval, size: i32, alignment: i32) {
+        let offset = if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
+            reused
+        } else {
+            if alignment > 8 {
+                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+            }
+            self.stack_offset += size;
+            self.stack_offset
+        };
+        self.locations.insert(interval.pseudo, Loc::Stack(offset));
+        self.active_stack
+            .push((interval.clone(), offset, size));
+    }
+
     /// Run the linear scan allocation algorithm
     fn run_linear_scan(
         &mut self,
@@ -886,25 +925,17 @@ impl RegAlloc {
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
                 if is_longdouble {
                     // Long double needs 16 bytes (80-bit padded to 128-bit)
-                    // Align to 16-byte boundary for proper x87 access
-                    self.stack_offset = (self.stack_offset + 15) & !15;
-                    self.stack_offset += 16;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 16, 16);
                 } else if crosses_call {
                     // All XMM registers are caller-saved on x86-64 SysV ABI.
                     // Values live across function calls must be spilled to stack.
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
                     self.active_xmm.push((interval.clone(), xmm));
                     self.active_xmm.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 }
             } else if crosses_call || interval.in_loop {
                 // Interval crosses a call or is inside a loop - must use callee-saved register or spill
@@ -924,9 +955,7 @@ impl RegAlloc {
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
                     // No callee-saved registers available - spill to stack
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 }
             } else {
                 // Interval doesn't appear to cross a call. In functions WITH
@@ -958,9 +987,7 @@ impl RegAlloc {
                     self.active.push((interval.clone(), reg));
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8);
                 }
             }
         }
@@ -971,6 +998,8 @@ impl RegAlloc {
         expire_intervals(&mut self.active, &mut self.free_regs, point);
         // Expire XMM register intervals
         expire_intervals(&mut self.active_xmm, &mut self.free_xmm_regs, point);
+        // Expire stack slot intervals for reuse
+        expire_stack_intervals(&mut self.active_stack, &mut self.free_stack_slots, point);
     }
 
     /// Compute live intervals and collect constraint points.

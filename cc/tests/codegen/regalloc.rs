@@ -332,3 +332,71 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("codegen_shift_x86_64", code, &[]), 0);
 }
+
+// ============================================================================
+// Stack slot reuse tests
+// ============================================================================
+
+#[test]
+fn regalloc_stack_slot_reuse() {
+    let code = r#"
+int switch_reuse(int x) {
+    switch (x) {
+    case 0: { int a=10,b=20,c=30,d=40; return a+b+c+d; }
+    case 1: { int e=1,f=2,g=3,h=4; return e*f*g*h; }
+    case 2: { int p=100,q=200; return p-q; }
+    case 3: { int a=5,b=6,c=7,d=8; return a*b+c*d; }
+    case 4: { int x1=11,x2=22,x3=33,x4=44; return x1+x2+x3+x4; }
+    case 5: { int a=3,b=4; return a*b*a*b; }
+    case 6: { int m=1,n=2,o=3,p=4; return (m+n)*(o+p); }
+    case 7: { int a=50,b=25,c=10; return a-b+c; }
+    case 8: { int a=7,b=8,c=9,d=10; return a+b+c+d; }
+    case 9: { int a=2,b=3,c=4,d=5; return a*b+c*d; }
+    case 10: { int a=100,b=50,c=25,d=12; return a-b-c-d; }
+    case 11: { int a=6,b=7; return a*b; }
+    default: return -1;
+    }
+}
+
+int main(void) {
+    if (switch_reuse(0) != 100) return 1;
+    if (switch_reuse(1) != 24) return 2;
+    if (switch_reuse(2) != -100) return 3;
+    if (switch_reuse(3) != 86) return 4;
+    if (switch_reuse(4) != 110) return 5;
+    if (switch_reuse(5) != 144) return 6;
+    if (switch_reuse(6) != 21) return 7;
+    if (switch_reuse(7) != 35) return 8;
+    if (switch_reuse(8) != 34) return 9;
+    if (switch_reuse(9) != 26) return 10;
+    if (switch_reuse(10) != 13) return 11;
+    if (switch_reuse(11) != 42) return 12;
+    if (switch_reuse(99) != -1) return 13;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("regalloc_stack_slot_reuse", code, &[]), 0);
+}
+
+#[test]
+fn regalloc_no_reuse_overlapping() {
+    let code = r#"
+int overlapping(int x) {
+    int a = x + 1;
+    int b = x + 2;
+    int c = a + b;
+    return c;
+}
+
+int main(void) {
+    if (overlapping(10) != 23) return 1;
+    if (overlapping(0) != 3) return 2;
+    if (overlapping(-5) != -7) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("regalloc_no_reuse_overlapping", code, &[]),
+        0
+    );
+}

@@ -10,7 +10,7 @@
 //
 
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
@@ -30,6 +30,13 @@ pub struct LiveInterval {
     pub end: usize,
     /// True if this interval spans a loop back edge (used within a loop)
     pub in_loop: bool,
+}
+
+/// A stack slot freed by an expired live interval, available for reuse.
+#[derive(Debug, Clone)]
+pub struct FreeSlot {
+    pub offset: i32,
+    pub alignment: i32,
 }
 
 /// A point in the function where register constraints apply.
@@ -68,6 +75,30 @@ pub fn expire_intervals<R: Copy>(
     for i in to_remove.into_iter().rev() {
         active.remove(i);
     }
+}
+
+/// Expire stack intervals whose live range ended before `point`,
+/// returning their slots to the free list.
+pub fn expire_stack_intervals(
+    active_stack: &mut Vec<(LiveInterval, i32, i32)>,
+    free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
+    point: usize,
+) {
+    active_stack.retain(|(interval, offset, size)| {
+        if interval.end < point {
+            let alignment = if *size >= 16 { 16 } else { 8 };
+            free_slots
+                .entry(*size)
+                .or_default()
+                .push(FreeSlot {
+                    offset: *offset,
+                    alignment,
+                });
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Find all positions of call instructions in a function.

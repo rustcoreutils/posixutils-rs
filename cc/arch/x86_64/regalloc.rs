@@ -582,6 +582,22 @@ impl RegAlloc {
                     if arg_idx == (i as u32) + arg_idx_offset {
                         let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
                         let is_fp = types.is_float(*typ);
+                        let is_complex = types.is_complex(*typ);
+                        let type_size = types.size_bits(*typ);
+                        let is_two_sse_struct = !is_complex
+                            && (types.kind(*typ) == crate::types::TypeKind::Struct
+                                || types.kind(*typ) == crate::types::TypeKind::Union)
+                            && type_size > 64
+                            && type_size <= 128
+                            && {
+                                use crate::abi::{Abi, SysVAmd64Abi};
+                                matches!(
+                                    SysVAmd64Abi.classify_param(*typ, types),
+                                    crate::abi::ArgClass::Direct { ref classes, .. }
+                                        if classes.len() == 2
+                                            && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                                )
+                            };
 
                         // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
                         if is_longdouble {
@@ -590,6 +606,28 @@ impl RegAlloc {
                                 .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
                             self.fp_pseudos.insert(pseudo.id);
                             stack_arg_offset += 16;
+                        } else if is_two_sse_struct {
+                            // 2-SSE struct: uses two XMM regs. Don't assign to register —
+                            // the codegen stores both XMM values to the local's stack slot.
+                            // Just consume the FP arg indices without assigning a location;
+                            // the pseudo will get a stack slot from normal allocation.
+                            fp_arg_idx += 2;
+                        } else if is_complex {
+                            // Complex: uses two consecutive XMM registers
+                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                                self.locations
+                                    .insert(pseudo.id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                                self.free_xmm_regs.retain(|&r| {
+                                    r != fp_arg_regs[fp_arg_idx]
+                                        && r != fp_arg_regs[fp_arg_idx + 1]
+                                });
+                                self.fp_pseudos.insert(pseudo.id);
+                            } else {
+                                self.locations
+                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                                stack_arg_offset += 16;
+                            }
+                            fp_arg_idx += 2;
                         } else if is_fp {
                             if fp_arg_idx < fp_arg_regs.len() {
                                 self.locations

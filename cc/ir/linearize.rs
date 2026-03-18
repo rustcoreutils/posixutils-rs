@@ -5749,7 +5749,33 @@ impl<'a> Linearizer<'a> {
 
         // Handle PreInc/PreDec specially - they need store-back
         if op == UnaryOp::PreInc || op == UnaryOp::PreDec {
-            let val = self.linearize_expr(operand);
+            // For deref operands like *s++, compute the lvalue address once
+            // to avoid re-evaluating side effects (PostInc etc.) when storing back.
+            let deref_addr = if let ExprKind::Unary {
+                op: UnaryOp::Deref,
+                ..
+            } = &operand.kind
+            {
+                let addr = self.linearize_lvalue(operand);
+                Some(addr)
+            } else {
+                None
+            };
+            // If we pre-computed the deref address, load from it.
+            // Otherwise, evaluate normally.
+            let val = if let Some(addr) = deref_addr {
+                let deref_typ = self.expr_type(operand);
+                let deref_size = self.types.size_bits(deref_typ);
+                let loaded = self.alloc_pseudo();
+                let pseudo = Pseudo::reg(loaded, loaded.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+                self.emit(Instruction::load(loaded, addr, 0, deref_typ, deref_size));
+                loaded
+            } else {
+                self.linearize_expr(operand)
+            };
             let typ = self.expr_type(operand);
             let is_float = self.types.is_float(typ);
             let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
@@ -5856,10 +5882,12 @@ impl<'a> Linearizer<'a> {
                 }
                 ExprKind::Unary {
                     op: UnaryOp::Deref,
-                    operand: deref_operand,
+                    ..
                 } => {
-                    // Dereference: store to the pointer address
-                    let ptr = self.linearize_expr(deref_operand);
+                    // Dereference: store to the pointer address.
+                    // Use the pre-computed address to avoid re-evaluating
+                    // side effects (e.g., s++ in ++*s++).
+                    let ptr = deref_addr.expect("deref_addr should be set for Deref operand");
                     self.emit(Instruction::store(final_result, ptr, 0, typ, store_size));
                 }
                 ExprKind::Index { array, index } => {

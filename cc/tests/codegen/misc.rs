@@ -2832,3 +2832,46 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("nan_comparison_comprehensive", code, &[]), 0);
 }
+
+/// Regression test: ++*s++ re-evaluated s++ when storing back, causing the
+/// increment to write to the wrong address. The PreInc handler must compute
+/// the deref address once before evaluating the operand value.
+#[test]
+fn codegen_preinc_deref_postinc() {
+    let code = r#"
+#include <string.h>
+
+int main(void) {
+    /* ++*s++: increment char at *s, then advance s */
+    char buf[4] = "abc";
+    char *s = buf;
+    ++*s++;
+    *s = 0;
+    if (strcmp(buf, "b") != 0) return 1;
+
+    /* --*s++ */
+    char buf2[4] = "bcd";
+    s = buf2;
+    --*s++;
+    *s = 0;
+    if (strcmp(buf2, "a") != 0) return 2;
+
+    /* Multiple in sequence */
+    char buf3[6] = "abcde";
+    s = buf3;
+    ++*s++;
+    ++*s++;
+    *s = 0;
+    if (strcmp(buf3, "bc") != 0) return 3;
+
+    /* Pointer advancement check */
+    char buf4[4] = "xyz";
+    s = buf4;
+    ++*s++;
+    if (s - buf4 != 1) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preinc_deref_postinc", code, &[]), 0);
+}

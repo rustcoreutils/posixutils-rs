@@ -44,14 +44,6 @@ use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Get constraint info for an instruction (used by shared compute_live_intervals).
-/// AArch64 has no implicit register constraints (unlike x86-64 which needs
-/// Rax/Rdx for division and Rcx for shifts), so this always returns None.
-#[allow(clippy::unnecessary_wraps)]
-pub fn get_constraint_info(_insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
-    None
-}
-
 // ============================================================================
 // AArch64 Register Definitions
 // ============================================================================
@@ -833,7 +825,7 @@ impl RegAlloc {
         call_positions: &[usize],
     ) {
         // Check GP arguments in caller-saved registers (x0-x7)
-        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        let int_arg_regs_set = Reg::arg_regs();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
                 if int_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
@@ -858,7 +850,7 @@ impl RegAlloc {
         }
 
         // Check FP arguments in caller-saved registers (v0-v7)
-        let fp_arg_regs_set: Vec<VReg> = VReg::arg_regs().to_vec();
+        let fp_arg_regs_set = VReg::arg_regs();
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
                 if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
@@ -890,16 +882,7 @@ impl RegAlloc {
 
     /// Try to reuse a freed stack slot of the given size and alignment.
     fn try_reuse_stack_slot(&mut self, size: i32, alignment: i32) -> Option<i32> {
-        if let Some(slots) = self.free_stack_slots.get_mut(&size) {
-            if let Some(idx) = slots.iter().position(|s| s.alignment >= alignment) {
-                let slot = slots.remove(idx);
-                if slots.is_empty() {
-                    self.free_stack_slots.remove(&size);
-                }
-                return Some(slot.offset);
-            }
-        }
-        None
+        super::super::regalloc::try_reuse_stack_slot(&mut self.free_stack_slots, size, alignment)
     }
 
     /// Allocate a stack slot, optionally reusing a freed slot.
@@ -912,24 +895,18 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
-        let offset = if reusable {
+        if reusable {
             if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
                 self.active_stack.push((interval.clone(), reused, size));
                 return;
             }
-            if alignment > 8 {
-                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
-            }
-            self.stack_offset += size;
-            -self.stack_offset
-        } else {
-            if alignment > 8 {
-                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
-            }
-            self.stack_offset += size;
-            -self.stack_offset
-        };
+        }
+        if alignment > 8 {
+            self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+        }
+        self.stack_offset += size;
+        let offset = -self.stack_offset;
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
             self.active_stack.push((interval.clone(), offset, size));
@@ -956,7 +933,7 @@ impl RegAlloc {
             let conflicting = find_conflicting_registers(&interval, constraint_points);
 
             // Handle constants and symbols
-            if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == interval.pseudo) {
+            if let Some(pseudo) = func.get_pseudo(interval.pseudo) {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
@@ -1062,8 +1039,10 @@ impl RegAlloc {
                         self.used_callee_saved_fp.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::VReg(reg));
-                    self.active_fp.push((interval.clone(), reg));
-                    self.active_fp.sort_by_key(|(i, _)| i.end);
+                    let pos = self
+                        .active_fp
+                        .partition_point(|(i, _)| i.end <= interval.end);
+                    self.active_fp.insert(pos, (interval.clone(), reg));
                 } else {
                     self.alloc_stack_slot(&interval, 8, 8, true);
                 }
@@ -1080,8 +1059,8 @@ impl RegAlloc {
                         self.used_callee_saved.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
+                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
+                    self.active.insert(pos, (interval.clone(), reg));
                 } else {
                     // No callee-saved registers available - spill to stack
                     self.alloc_stack_slot(&interval, 8, 8, true);
@@ -1117,8 +1096,8 @@ impl RegAlloc {
                         self.used_callee_saved.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
+                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
+                    self.active.insert(pos, (interval.clone(), reg));
                 } else {
                     self.alloc_stack_slot(&interval, 8, 8, true);
                 }
@@ -1139,7 +1118,7 @@ impl RegAlloc {
         &self,
         func: &Function,
     ) -> (Vec<LiveInterval>, Vec<ConstraintPoint<Reg>>) {
-        compute_live_intervals(func, get_constraint_info)
+        compute_live_intervals(func, |_: &Instruction| None)
     }
 
     /// Get stack size needed (aligned to 16 bytes)

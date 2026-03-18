@@ -293,6 +293,7 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
 
     // Remove unreachable blocks
     func.blocks.retain(|bb| reachable.contains(&bb.id));
+    func.rebuild_block_idx();
 
     // Update parent/child references and phi nodes to remove dead blocks
     for bb in &mut func.blocks {

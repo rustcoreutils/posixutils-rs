@@ -69,12 +69,30 @@ pub struct InlineCandidate {
     pub call_count: usize,
 }
 
+/// Build a map of function name -> call count across the entire module in a single pass.
+fn build_call_count_map(module: &Module) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::with_capacity(module.functions.len());
+    for func in &module.functions {
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                if insn.op == Opcode::Call {
+                    if let Some(callee) = &insn.func_name {
+                        *counts.entry(callee.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
 /// Analyze all functions in a module for inlineability
 pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate> {
+    let call_counts = build_call_count_map(module);
     let mut candidates = HashMap::with_capacity(module.functions.len());
 
     for func in &module.functions {
-        let candidate = analyze_function(func, module);
+        let candidate = analyze_function(func, &call_counts);
         candidates.insert(func.name.clone(), candidate);
     }
 
@@ -82,7 +100,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 }
 
 /// Analyze a single function for inlineability
-fn analyze_function(func: &Function, module: &Module) -> InlineCandidate {
+fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
         has_inline_hint: func.is_inline,
         ..Default::default()
@@ -94,15 +112,12 @@ fn analyze_function(func: &Function, module: &Module) -> InlineCandidate {
 
         for insn in &bb.insns {
             match insn.op {
-                // Varargs: cannot inline
                 Opcode::VaStart | Opcode::VaArg | Opcode::VaEnd | Opcode::VaCopy => {
                     candidate.uses_varargs = true;
                 }
-                // Alloca: dynamic stack complicates inlining
                 Opcode::Alloca => {
                     candidate.uses_alloca = true;
                 }
-                // Check for recursion
                 Opcode::Call => {
                     if let Some(callee) = &insn.func_name {
                         if callee == &func.name {
@@ -115,29 +130,9 @@ fn analyze_function(func: &Function, module: &Module) -> InlineCandidate {
         }
     }
 
-    // Count call sites in module
-    candidate.call_count = count_calls_to_function(module, &func.name);
+    candidate.call_count = call_counts.get(&func.name).copied().unwrap_or(0);
 
     candidate
-}
-
-/// Count how many times a function is called in the module
-fn count_calls_to_function(module: &Module, func_name: &str) -> usize {
-    let mut count = 0;
-    for func in &module.functions {
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if insn.op == Opcode::Call {
-                    if let Some(callee) = &insn.func_name {
-                        if callee == func_name {
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    count
 }
 
 // ============================================================================
@@ -226,15 +221,10 @@ struct InlineContext {
 }
 
 /// Global counter for unique inline IDs
-static mut INLINE_COUNTER: u32 = 0;
+static INLINE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn next_inline_id() -> u32 {
-    // SAFETY: This is single-threaded compilation
-    unsafe {
-        let id = INLINE_COUNTER;
-        INLINE_COUNTER += 1;
-        id
-    }
+    INLINE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl InlineContext {
@@ -536,6 +526,12 @@ fn clone_instruction(
 
         // All other instructions: remap target and sources
         _ => {
+            debug_assert!(
+                insn.switch_cases.is_empty(),
+                "unexpected switch_cases in {:?} during inlining",
+                insn.op
+            );
+
             let mut new_insn = insn.clone();
 
             // Remap target
@@ -715,14 +711,16 @@ fn inline_call_site(
             continuation_bb.parents.push(block.id);
         }
 
-        caller.blocks.push(block);
+        caller.add_block(block);
     }
 
     // Add continuation block
-    caller.blocks.push(continuation_bb);
+    caller.add_block(continuation_bb);
 
     // Add cloned pseudos to caller
-    caller.pseudos.extend(inlined_pseudos);
+    for pseudo in inlined_pseudos {
+        caller.add_pseudo(pseudo);
+    }
 
     // Add callee's local variables to caller's locals with mangled names
     // This is necessary so that regalloc treats these as stack-allocated locals
@@ -841,6 +839,7 @@ fn reorder_blocks_topologically(func: &mut Function) {
         }
     }
     func.blocks = new_blocks;
+    func.rebuild_block_idx();
 }
 
 // ============================================================================
@@ -1042,11 +1041,11 @@ mod tests {
         ret.src = vec![PseudoId(0)];
         bb.insns.push(ret);
 
-        func.blocks.push(bb);
+        func.add_block(bb);
         func.entry = BasicBlockId(0);
 
         // Add constant pseudo
-        func.pseudos.push(Pseudo {
+        func.add_pseudo(Pseudo {
             id: PseudoId(0),
             kind: PseudoKind::Val(42),
             name: None,
@@ -1061,7 +1060,8 @@ mod tests {
         let mut module = Module::new();
         module.functions.push(func);
 
-        let candidate = analyze_function(&module.functions[0], &module);
+        let call_counts = build_call_count_map(&module);
+        let candidate = analyze_function(&module.functions[0], &call_counts);
 
         assert!(candidate.has_inline_hint);
         assert!(!candidate.uses_varargs);
@@ -1167,9 +1167,9 @@ mod tests {
         let mut ret = Instruction::new(Opcode::Ret);
         ret.src = vec![PseudoId(0)];
         handler_bb.insns.push(ret);
-        handler.blocks.push(handler_bb);
+        handler.add_block(handler_bb);
         handler.entry = BasicBlockId(0);
-        handler.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        handler.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(handler);
 
@@ -1182,21 +1182,21 @@ mod tests {
 
         // Create a symbol pseudo for "handler" function
         let handler_sym = Pseudo::sym(PseudoId(1), "handler".to_string());
-        main_func.pseudos.push(handler_sym);
+        main_func.add_pseudo(handler_sym);
 
         // Create SymAddr instruction to take address of handler
         let sym_addr = Instruction::sym_addr(PseudoId(2), PseudoId(1), types.void_ptr_id);
         main_bb.insns.push(sym_addr);
 
         // Add a register pseudo for the result
-        main_func.pseudos.push(Pseudo::reg(PseudoId(2), 2));
+        main_func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
 
         let mut ret_main = Instruction::new(Opcode::Ret);
         ret_main.src = vec![PseudoId(0)];
         main_bb.insns.push(ret_main);
-        main_func.blocks.push(main_bb);
+        main_func.add_block(main_bb);
         main_func.entry = BasicBlockId(0);
-        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        main_func.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(main_func);
 
@@ -1234,9 +1234,9 @@ mod tests {
         let mut ret = Instruction::new(Opcode::Ret);
         ret.src = vec![PseudoId(0)];
         callback_bb.insns.push(ret);
-        callback.blocks.push(callback_bb);
+        callback.add_block(callback_bb);
         callback.entry = BasicBlockId(0);
-        callback.pseudos.push(Pseudo::val(PseudoId(0), 42));
+        callback.add_pseudo(Pseudo::val(PseudoId(0), 42));
 
         module.functions.push(callback);
 
@@ -1249,9 +1249,9 @@ mod tests {
         let mut ret_main = Instruction::new(Opcode::Ret);
         ret_main.src = vec![PseudoId(0)];
         main_bb.insns.push(ret_main);
-        main_func.blocks.push(main_bb);
+        main_func.add_block(main_bb);
         main_func.entry = BasicBlockId(0);
-        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        main_func.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(main_func);
 
@@ -1292,9 +1292,9 @@ mod tests {
         let mut ret = Instruction::new(Opcode::Ret);
         ret.src = vec![PseudoId(0)];
         bb.insns.push(ret);
-        handler.blocks.push(bb);
+        handler.add_block(bb);
         handler.entry = BasicBlockId(0);
-        handler.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        handler.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(handler);
 
@@ -1305,9 +1305,9 @@ mod tests {
         let mut ret_main = Instruction::new(Opcode::Ret);
         ret_main.src = vec![PseudoId(0)];
         main_bb.insns.push(ret_main);
-        main_func.blocks.push(main_bb);
+        main_func.add_block(main_bb);
         main_func.entry = BasicBlockId(0);
-        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        main_func.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(main_func);
 
@@ -1345,9 +1345,9 @@ mod tests {
         let mut ret = Instruction::new(Opcode::Ret);
         ret.src = vec![PseudoId(0)];
         bb.insns.push(ret);
-        func.blocks.push(bb);
+        func.add_block(bb);
         func.entry = BasicBlockId(0);
-        func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        func.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(func);
 
@@ -1358,9 +1358,9 @@ mod tests {
         let mut ret_main = Instruction::new(Opcode::Ret);
         ret_main.src = vec![PseudoId(0)];
         main_bb.insns.push(ret_main);
-        main_func.blocks.push(main_bb);
+        main_func.add_block(main_bb);
         main_func.entry = BasicBlockId(0);
-        main_func.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        main_func.add_pseudo(Pseudo::val(PseudoId(0), 0));
 
         module.functions.push(main_func);
 
@@ -1392,23 +1392,23 @@ mod tests {
 
         // Build a minimal callee function with a PhiSource instruction
         let mut callee = Function::new("callee", types.int_id);
-        callee.pseudos.push(Pseudo::reg(PseudoId(0), 0)); // src
-        callee.pseudos.push(Pseudo::reg(PseudoId(1), 1)); // phisource target
-        callee.pseudos.push(Pseudo::phi(PseudoId(2), 0)); // phi target (back-pointer)
+        callee.add_pseudo(Pseudo::reg(PseudoId(0), 0)); // src
+        callee.add_pseudo(Pseudo::reg(PseudoId(1), 1)); // phisource target
+        callee.add_pseudo(Pseudo::phi(PseudoId(2), 0)); // phi target (back-pointer)
 
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.insns.push(Instruction::new(Opcode::Entry));
         bb.insns.push(Instruction::ret(None));
-        callee.blocks.push(bb);
+        callee.add_block(bb);
         callee.entry = BasicBlockId(0);
 
         // Build a minimal caller
         let mut caller = Function::new("caller", types.int_id);
-        caller.pseudos.push(Pseudo::val(PseudoId(0), 0));
+        caller.add_pseudo(Pseudo::val(PseudoId(0), 0));
         let mut caller_bb = BasicBlock::new(BasicBlockId(0));
         caller_bb.insns.push(Instruction::new(Opcode::Entry));
         caller_bb.insns.push(Instruction::ret(None));
-        caller.blocks.push(caller_bb);
+        caller.add_block(caller_bb);
         caller.entry = BasicBlockId(0);
         caller.next_pseudo = 100;
 

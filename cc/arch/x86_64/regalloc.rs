@@ -236,17 +236,11 @@ impl Reg {
 pub struct RegConstraints {
     /// Registers that are clobbered (written) by this instruction
     pub clobbers: &'static [Reg],
-    /// Registers that must hold specific input values
-    #[allow(dead_code)]
-    pub inputs: &'static [Reg],
 }
 
 impl RegConstraints {
     /// No constraints - most instructions have no implicit register requirements
-    pub const NONE: RegConstraints = RegConstraints {
-        clobbers: &[],
-        inputs: &[],
-    };
+    pub const NONE: RegConstraints = RegConstraints { clobbers: &[] };
 }
 
 /// Get register constraints for an opcode.
@@ -255,25 +249,14 @@ impl RegConstraints {
 /// VaArg clobbers Rax (used as scratch) and Rcx (used for sign-extended offset).
 pub fn opcode_constraints(op: Opcode) -> RegConstraints {
     match op {
-        // Division: uses Rax:Rdx as dividend, clobbers both with quotient/remainder
         Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
-            inputs: &[Reg::Rax],
         },
-        // Variable shifts: count must be in Cl (Rcx)
-        // The codegen moves the shift count INTO Rcx, clobbering it.
-        // For immediate shifts, this constraint is conservative but safe.
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => RegConstraints {
             clobbers: &[Reg::Rcx],
-            inputs: &[Reg::Rcx],
         },
-        // VaArg: emit_va_arg_int uses Rax for reg_save_area/overflow pointer,
-        // and Rcx for sign-extended offset calculation. Any pseudo that is live
-        // across a va_arg (but not the result or va_list operand) must not be
-        // in these registers.
         Opcode::VaArg => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rcx],
-            inputs: &[],
         },
         _ => RegConstraints::NONE,
     }
@@ -695,7 +678,7 @@ impl RegAlloc {
         call_positions: &[usize],
     ) {
         // Check integer arguments in caller-saved registers
-        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        let int_arg_regs_set = Reg::arg_regs();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
                 if int_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
@@ -722,7 +705,7 @@ impl RegAlloc {
         // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
         // computation within the function may reuse the same XMM register,
         // clobbering the parameter value.
-        let xmm_arg_regs: Vec<XmmReg> = XmmReg::arg_regs().to_vec();
+        let xmm_arg_regs = XmmReg::arg_regs();
         for interval in intervals {
             if let Some(Loc::Xmm(xmm)) = self.locations.get(&interval.pseudo) {
                 if xmm_arg_regs.contains(xmm) && interval.start == 0 {
@@ -768,7 +751,7 @@ impl RegAlloc {
     ) {
         // For each argument in a register, check if its interval is live across
         // any constraint point that clobbers that register
-        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        let int_arg_regs_set = Reg::arg_regs();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
                 if int_arg_regs_set.contains(reg) {
@@ -818,16 +801,7 @@ impl RegAlloc {
 
     /// Try to reuse a freed stack slot of the given size and alignment.
     fn try_reuse_stack_slot(&mut self, size: i32, alignment: i32) -> Option<i32> {
-        if let Some(slots) = self.free_stack_slots.get_mut(&size) {
-            if let Some(idx) = slots.iter().position(|s| s.alignment >= alignment) {
-                let slot = slots.remove(idx);
-                if slots.is_empty() {
-                    self.free_stack_slots.remove(&size);
-                }
-                return Some(slot.offset);
-            }
-        }
-        None
+        super::super::regalloc::try_reuse_stack_slot(&mut self.free_stack_slots, size, alignment)
     }
 
     /// Allocate a stack slot, optionally reusing a freed slot.
@@ -841,25 +815,18 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
-        let offset = if reusable {
+        if reusable {
             if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
                 self.active_stack.push((interval.clone(), reused, size));
                 return;
             }
-            // Fall through to allocate new slot
-            if alignment > 8 {
-                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
-            }
-            self.stack_offset += size;
-            self.stack_offset
-        } else {
-            if alignment > 8 {
-                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
-            }
-            self.stack_offset += size;
-            self.stack_offset
-        };
+        }
+        if alignment > 8 {
+            self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+        }
+        self.stack_offset += size;
+        let offset = self.stack_offset;
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
             self.active_stack.push((interval.clone(), offset, size));
@@ -883,7 +850,7 @@ impl RegAlloc {
             }
 
             // Handle constants and symbols
-            if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == interval.pseudo) {
+            if let Some(pseudo) = func.get_pseudo(interval.pseudo) {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
@@ -957,8 +924,10 @@ impl RegAlloc {
                     self.alloc_stack_slot(&interval, 8, 8, true);
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
-                    self.active_xmm.push((interval.clone(), xmm));
-                    self.active_xmm.sort_by_key(|(i, _)| i.end);
+                    let pos = self
+                        .active_xmm
+                        .partition_point(|(i, _)| i.end <= interval.end);
+                    self.active_xmm.insert(pos, (interval.clone(), xmm));
                 } else {
                     self.alloc_stack_slot(&interval, 8, 8, true);
                 }
@@ -976,8 +945,8 @@ impl RegAlloc {
                         self.used_callee_saved.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
+                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
+                    self.active.insert(pos, (interval.clone(), reg));
                 } else {
                     // No callee-saved registers available - spill to stack
                     self.alloc_stack_slot(&interval, 8, 8, true);
@@ -1009,8 +978,8 @@ impl RegAlloc {
                         self.used_callee_saved.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
+                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
+                    self.active.insert(pos, (interval.clone(), reg));
                 } else {
                     // Reusable: short-lived, no call/loop crossing
                     self.alloc_stack_slot(&interval, 8, 8, true);

@@ -555,6 +555,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, bb1, bb2, merge, exit];
+        func.rebuild_block_idx();
         func
     }
 
@@ -686,6 +687,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, bb1, exit, unreachable];
+        func.rebuild_block_idx();
 
         // This should not panic - the fix skips predecessors not reached during DFS
         domtree_build(&mut func);

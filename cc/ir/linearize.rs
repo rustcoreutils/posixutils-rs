@@ -105,6 +105,32 @@ struct AnonContinuation {
     levels: Vec<AnonLevel>,
 }
 
+/// Grouped array init elements, keyed by array index (sorted).
+/// Shared between static (ast_init_list_to_ir) and runtime (linearize_init_list_at_offset) paths.
+struct ArrayInitGroups {
+    element_lists: HashMap<i64, Vec<InitElement>>,
+    indices: Vec<i64>,
+}
+
+/// A field visit from walking struct/union initializer elements.
+/// Shared between static and runtime init paths.
+struct StructFieldVisit {
+    offset: usize,
+    typ: TypeId,
+    field_size: usize,
+    kind: StructFieldVisitKind,
+    bit_offset: Option<u32>,
+    bit_width: Option<u32>,
+    storage_unit_size: Option<u32>,
+}
+
+enum StructFieldVisitKind {
+    /// A single expression to initialize this field
+    Expr(Box<Expr>),
+    /// Sub-elements from brace elision
+    BraceElision(Vec<InitElement>),
+}
+
 /// Information about a static local variable
 #[derive(Clone)]
 struct StaticLocalInfo {
@@ -175,6 +201,9 @@ pub struct Linearizer<'a> {
     file_scope_statics: std::collections::HashSet<String>,
     /// Calling convention of the current function being linearized
     current_calling_conv: CallingConv,
+    /// Scope stack for locals: each entry records (sym, previous_value) pairs
+    /// for undoing inserts when a scope exits.
+    local_scope_stack: Vec<Vec<(SymbolId, Option<LocalVarInfo>)>>,
 }
 
 impl<'a> Linearizer<'a> {
@@ -214,6 +243,7 @@ impl<'a> Linearizer<'a> {
                 DEFAULT_FILE_SCOPE_CAPACITY,
             ),
             current_calling_conv: CallingConv::default(),
+            local_scope_stack: Vec::new(),
         }
     }
 
@@ -228,6 +258,36 @@ impl<'a> Linearizer<'a> {
         Self {
             run_ssa: false,
             ..Self::new(symbols, types, strings, target)
+        }
+    }
+
+    /// Push a new local scope. Subsequent `insert_local` calls will record
+    /// the previous value so `pop_scope` can restore it.
+    fn push_scope(&mut self) {
+        self.local_scope_stack.push(Vec::new());
+    }
+
+    /// Pop the current local scope, restoring all locals to their pre-scope values.
+    fn pop_scope(&mut self) {
+        if let Some(entries) = self.local_scope_stack.pop() {
+            for (sym, prev) in entries.into_iter().rev() {
+                match prev {
+                    Some(info) => {
+                        self.locals.insert(sym, info);
+                    }
+                    None => {
+                        self.locals.remove(&sym);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Insert a local variable, recording the previous value for scope restoration.
+    fn insert_local(&mut self, sym: SymbolId, info: LocalVarInfo) {
+        let prev = self.locals.insert(sym, info);
+        if let Some(scope) = self.local_scope_stack.last_mut() {
+            scope.push((sym, prev));
         }
     }
 
@@ -1050,6 +1110,187 @@ impl<'a> Linearizer<'a> {
         sub_elements
     }
 
+    /// Group array init elements by index, handling designators, brace elision,
+    /// and nested InitList flattening. Shared between static and runtime paths.
+    fn group_array_init_elements(
+        &self,
+        elements: &[InitElement],
+        elem_type: TypeId,
+    ) -> ArrayInitGroups {
+        let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
+        let mut element_indices: Vec<i64> = Vec::new();
+        let mut current_idx: i64 = 0;
+        let mut elem_idx = 0;
+
+        while elem_idx < elements.len() {
+            let element = &elements[elem_idx];
+            let mut index = None;
+            let mut index_pos = None;
+            for (pos, designator) in element.designators.iter().enumerate() {
+                if let Designator::Index(idx) = designator {
+                    index = Some(*idx);
+                    index_pos = Some(pos);
+                    break;
+                }
+            }
+
+            let element_index = if let Some(idx) = index {
+                current_idx = idx + 1;
+                idx
+            } else {
+                let idx = current_idx;
+                current_idx += 1;
+                idx
+            };
+
+            let remaining_designators = match index_pos {
+                Some(pos) => element.designators[pos + 1..].to_vec(),
+                None => element.designators.clone(),
+            };
+
+            // Brace elision (C99 6.7.8p20): positional scalar for aggregate element
+            if remaining_designators.is_empty()
+                && self.is_brace_elision_candidate(element, elem_type)
+            {
+                let sub_elements = self.consume_brace_elision(elements, &mut elem_idx, elem_type);
+                let entry = element_lists.entry(element_index).or_insert_with(|| {
+                    element_indices.push(element_index);
+                    Vec::new()
+                });
+                entry.extend(sub_elements);
+                continue;
+            }
+
+            let entry = element_lists.entry(element_index).or_insert_with(|| {
+                element_indices.push(element_index);
+                Vec::new()
+            });
+
+            if remaining_designators.is_empty() {
+                if let ExprKind::InitList {
+                    elements: nested_elements,
+                } = &element.value.kind
+                {
+                    entry.extend(nested_elements.clone());
+                    elem_idx += 1;
+                    continue;
+                }
+            }
+
+            entry.push(InitElement {
+                designators: remaining_designators,
+                value: element.value.clone(),
+            });
+            elem_idx += 1;
+        }
+
+        element_indices.sort();
+        ArrayInitGroups {
+            element_lists,
+            indices: element_indices,
+        }
+    }
+
+    /// Walk struct/union init elements and produce field visits.
+    /// Handles positional iteration, anonymous struct continuation, designators,
+    /// and brace elision. Shared between static and runtime init paths.
+    fn walk_struct_init_fields(
+        &self,
+        resolved_typ: TypeId,
+        members: &[crate::types::StructMember],
+        is_union: bool,
+        elements: &[InitElement],
+    ) -> Vec<StructFieldVisit> {
+        let mut visits = Vec::new();
+        let mut current_field_idx = 0;
+        let mut anon_cont: Option<AnonContinuation> = None;
+        let mut elem_idx = 0;
+
+        while elem_idx < elements.len() {
+            let element = &elements[elem_idx];
+            if element.designators.is_empty() {
+                // Positional: check anonymous struct continuation, then next member
+                let mut member = None;
+                if anon_cont.is_some() {
+                    member = self.get_anon_continuation_member(
+                        &mut anon_cont,
+                        members,
+                        &mut current_field_idx,
+                    );
+                }
+                if member.is_none() {
+                    member = self.next_positional_member(members, is_union, &mut current_field_idx);
+                }
+                let Some(member) = member else {
+                    elem_idx += 1;
+                    continue;
+                };
+                let field_size = (self.types.size_bits(member.typ) / 8) as usize;
+
+                // Brace elision: scalar for aggregate member
+                let kind = if self.is_brace_elision_candidate(element, member.typ) {
+                    let sub_elements =
+                        self.consume_brace_elision(elements, &mut elem_idx, member.typ);
+                    StructFieldVisitKind::BraceElision(sub_elements)
+                } else {
+                    elem_idx += 1;
+                    StructFieldVisitKind::Expr(element.value.clone())
+                };
+                visits.push(StructFieldVisit {
+                    offset: member.offset,
+                    typ: member.typ,
+                    field_size,
+                    kind,
+                    bit_offset: member.bit_offset,
+                    bit_width: member.bit_width,
+                    storage_unit_size: member.storage_unit_size,
+                });
+                continue;
+            }
+
+            // Designated path
+            let resolved = self.resolve_designator_chain(resolved_typ, 0, &element.designators);
+            let Some(ResolvedDesignator {
+                offset,
+                typ: field_type,
+                bit_offset,
+                bit_width,
+                storage_unit_size,
+            }) = resolved
+            else {
+                elem_idx += 1;
+                continue;
+            };
+            if let Some(Designator::Field(name)) = element.designators.first() {
+                if let Some(result) = self.member_index_for_designator(members, *name) {
+                    match result {
+                        MemberDesignatorResult::Direct(next_idx) => {
+                            current_field_idx = next_idx;
+                            anon_cont = None;
+                        }
+                        MemberDesignatorResult::Anonymous { outer_idx, levels } => {
+                            current_field_idx = outer_idx;
+                            anon_cont = Some(AnonContinuation { outer_idx, levels });
+                        }
+                    }
+                }
+            }
+            let field_size = (self.types.size_bits(field_type) / 8) as usize;
+            visits.push(StructFieldVisit {
+                offset,
+                typ: field_type,
+                field_size,
+                kind: StructFieldVisitKind::Expr(element.value.clone()),
+                bit_offset,
+                bit_width,
+                storage_unit_size,
+            });
+            elem_idx += 1;
+        }
+
+        visits
+    }
+
     /// Convert an AST initializer list to an IR Initializer
     fn ast_init_list_to_ir(&mut self, elements: &[InitElement], typ: TypeId) -> Initializer {
         let type_kind = self.types.kind(typ);
@@ -1064,78 +1305,10 @@ impl<'a> Linearizer<'a> {
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
                 );
 
+                let groups = self.group_array_init_elements(elements, elem_type);
                 let mut init_elements = Vec::new();
-                let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
-                let mut element_indices: Vec<i64> = Vec::new();
-                let mut current_idx: i64 = 0;
-                let mut elem_idx = 0;
-
-                while elem_idx < elements.len() {
-                    let element = &elements[elem_idx];
-                    let mut index = None;
-                    let mut index_pos = None;
-                    for (pos, designator) in element.designators.iter().enumerate() {
-                        if let Designator::Index(idx) = designator {
-                            index = Some(*idx);
-                            index_pos = Some(pos);
-                            break;
-                        }
-                    }
-
-                    let element_index = if let Some(idx) = index {
-                        current_idx = idx + 1;
-                        idx
-                    } else {
-                        let idx = current_idx;
-                        current_idx += 1;
-                        idx
-                    };
-
-                    let remaining_designators = match index_pos {
-                        Some(pos) => element.designators[pos + 1..].to_vec(),
-                        None => element.designators.clone(),
-                    };
-
-                    // Brace elision (C99 6.7.8p20): positional scalar for aggregate element
-                    if remaining_designators.is_empty()
-                        && self.is_brace_elision_candidate(element, elem_type)
-                    {
-                        let sub_elements =
-                            self.consume_brace_elision(elements, &mut elem_idx, elem_type);
-                        let entry = element_lists.entry(element_index).or_insert_with(|| {
-                            element_indices.push(element_index);
-                            Vec::new()
-                        });
-                        entry.extend(sub_elements);
-                        continue;
-                    }
-
-                    let entry = element_lists.entry(element_index).or_insert_with(|| {
-                        element_indices.push(element_index);
-                        Vec::new()
-                    });
-
-                    if remaining_designators.is_empty() {
-                        if let ExprKind::InitList {
-                            elements: nested_elements,
-                        } = &element.value.kind
-                        {
-                            entry.extend(nested_elements.clone());
-                            elem_idx += 1;
-                            continue;
-                        }
-                    }
-
-                    entry.push(InitElement {
-                        designators: remaining_designators,
-                        value: element.value.clone(),
-                    });
-                    elem_idx += 1;
-                }
-
-                element_indices.sort();
-                for element_index in element_indices {
-                    let Some(list) = element_lists.get(&element_index) else {
+                for element_index in groups.indices {
+                    let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;
                     };
                     let offset = (element_index as usize) * elem_size;
@@ -1159,104 +1332,34 @@ impl<'a> Linearizer<'a> {
             }
 
             TypeKind::Struct | TypeKind::Union => {
-                // Resolve incomplete struct types to their complete definitions
-                // This is needed when a typedef to an incomplete struct is used
-                // before the struct is fully defined (forward declaration pattern)
                 let resolved_typ = self.resolve_struct_type(typ);
                 let resolved_size = (self.types.size_bits(resolved_typ) / 8) as usize;
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
-                    let members = &composite.members;
+                    let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
-                    // Collect field initializations with bitfield info:
-                    // (offset, field_size, init, bit_offset, bit_width, storage_unit_size)
+
+                    let visits =
+                        self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+
+                    // Convert field visits to RawFieldInit by evaluating expressions
                     let mut raw_fields: Vec<RawFieldInit> = Vec::new();
-                    let mut current_field_idx = 0;
-                    let mut anon_cont: Option<AnonContinuation> = None;
-                    let mut elem_idx = 0;
-
-                    while elem_idx < elements.len() {
-                        let element = &elements[elem_idx];
-                        if element.designators.is_empty() {
-                            // Check if we're continuing inside an anonymous struct
-                            let mut member = None;
-                            if anon_cont.is_some() {
-                                member = self.get_anon_continuation_member(
-                                    &mut anon_cont,
-                                    members,
-                                    &mut current_field_idx,
-                                );
+                    for visit in visits {
+                        let field_init = match visit.kind {
+                            StructFieldVisitKind::BraceElision(sub_elements) => {
+                                self.ast_init_list_to_ir(&sub_elements, visit.typ)
                             }
-                            if member.is_none() {
-                                member = self.next_positional_member(
-                                    members,
-                                    is_union,
-                                    &mut current_field_idx,
-                                );
+                            StructFieldVisitKind::Expr(expr) => {
+                                self.ast_init_to_ir(&expr, visit.typ)
                             }
-                            let Some(member) = member else {
-                                elem_idx += 1;
-                                continue;
-                            };
-                            let field_size = (self.types.size_bits(member.typ) / 8) as usize;
-                            // Brace elision: scalar for aggregate member
-                            let field_init = if self.is_brace_elision_candidate(element, member.typ)
-                            {
-                                let sub_elements =
-                                    self.consume_brace_elision(elements, &mut elem_idx, member.typ);
-                                self.ast_init_list_to_ir(&sub_elements, member.typ)
-                            } else {
-                                elem_idx += 1;
-                                self.ast_init_to_ir(&element.value, member.typ)
-                            };
-                            raw_fields.push(RawFieldInit {
-                                offset: member.offset,
-                                field_size,
-                                init: field_init,
-                                bit_offset: member.bit_offset,
-                                bit_width: member.bit_width,
-                                storage_unit_size: member.storage_unit_size,
-                            });
-                            continue;
-                        }
-
-                        let resolved =
-                            self.resolve_designator_chain(resolved_typ, 0, &element.designators);
-                        let Some(ResolvedDesignator {
-                            offset,
-                            typ: field_type,
-                            bit_offset,
-                            bit_width,
-                            storage_unit_size,
-                        }) = resolved
-                        else {
-                            elem_idx += 1;
-                            continue;
                         };
-                        if let Some(Designator::Field(name)) = element.designators.first() {
-                            if let Some(result) = self.member_index_for_designator(members, *name) {
-                                match result {
-                                    MemberDesignatorResult::Direct(next_idx) => {
-                                        current_field_idx = next_idx;
-                                        anon_cont = None;
-                                    }
-                                    MemberDesignatorResult::Anonymous { outer_idx, levels } => {
-                                        current_field_idx = outer_idx;
-                                        anon_cont = Some(AnonContinuation { outer_idx, levels });
-                                    }
-                                }
-                            }
-                        }
-                        let field_size = (self.types.size_bits(field_type) / 8) as usize;
-                        let field_init = self.ast_init_to_ir(&element.value, field_type);
                         raw_fields.push(RawFieldInit {
-                            offset,
-                            field_size,
+                            offset: visit.offset,
+                            field_size: visit.field_size,
                             init: field_init,
-                            bit_offset,
-                            bit_width,
-                            storage_unit_size,
+                            bit_offset: visit.bit_offset,
+                            bit_width: visit.bit_width,
+                            storage_unit_size: visit.storage_unit_size,
                         });
-                        elem_idx += 1;
                     }
 
                     // Sort fields by offset to ensure proper emission order
@@ -1269,8 +1372,6 @@ impl<'a> Linearizer<'a> {
                     });
 
                     // Remove duplicate initializations (later one wins, per C semantics)
-                    // For regular fields: duplicate if same offset
-                    // For bitfields: duplicate if same offset AND same bit_offset
                     let mut idx = 0;
                     while idx + 1 < raw_fields.len() {
                         let same_offset = raw_fields[idx].offset == raw_fields[idx + 1].offset;
@@ -1279,9 +1380,6 @@ impl<'a> Linearizer<'a> {
                         let same_bitfield = both_bitfields
                             && raw_fields[idx].bit_offset == raw_fields[idx + 1].bit_offset;
 
-                        // Only remove if:
-                        // - Same offset for non-bitfields, OR
-                        // - Same offset AND same bit_offset for bitfields
                         if same_offset && (!both_bitfields || same_bitfield) {
                             raw_fields.remove(idx);
                         } else {
@@ -1289,7 +1387,7 @@ impl<'a> Linearizer<'a> {
                         }
                     }
 
-                    // Now pack bitfields that share the same storage unit
+                    // Pack bitfields that share the same storage unit
                     let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
                     let mut i = 0;
                     while i < raw_fields.len() {
@@ -1305,16 +1403,12 @@ impl<'a> Linearizer<'a> {
                         if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
                             (bit_offset, bit_width, storage_unit_size)
                         {
-                            // This is a bitfield - pack all bitfields at this offset together
                             let mut packed_value: u64 = 0;
-
-                            // Extract the integer value and pack it
                             if let Initializer::Int(v) = init {
                                 let mask = (1u64 << bit_w) - 1;
                                 packed_value |= ((*v as u64) & mask) << bit_off;
                             }
 
-                            // Look ahead for more bitfields at the same offset
                             let mut j = i + 1;
                             while j < raw_fields.len() {
                                 let RawFieldInit {
@@ -1336,15 +1430,13 @@ impl<'a> Linearizer<'a> {
                                 j += 1;
                             }
 
-                            // Emit packed value with storage unit size
                             init_fields.push((
                                 *offset,
                                 *storage_size as usize,
                                 Initializer::Int(packed_value as i64),
                             ));
-                            i = j; // Skip all bitfields we just packed
+                            i = j;
                         } else {
-                            // Regular field - emit as-is
                             init_fields.push((*offset, *field_size, init.clone()));
                             i += 1;
                         }
@@ -1360,7 +1452,6 @@ impl<'a> Linearizer<'a> {
             }
 
             _ => {
-                // For scalar types, just use the first element
                 if let Some(element) = elements.first() {
                     self.ast_init_to_ir(&element.value, typ)
                 } else {
@@ -1660,6 +1751,8 @@ impl<'a> Linearizer<'a> {
         self.next_bb = 0;
         self.var_map.clear();
         self.locals.clear();
+        self.local_scope_stack.clear();
+        self.push_scope(); // function-level scope
         self.label_map.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
@@ -1821,7 +1914,7 @@ impl<'a> Linearizer<'a> {
                 arg_pseudo, local_sym, 0, ptr_type, ptr_size,
             ));
             if let Some(symbol_id) = symbol_id_opt {
-                self.locals.insert(
+                self.insert_local(
                     symbol_id,
                     LocalVarInfo {
                         sym: local_sym,
@@ -1920,7 +2013,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.locals.insert(
+                self.insert_local(
                     symbol_id,
                     LocalVarInfo {
                         sym: local_sym,
@@ -1954,7 +2047,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.locals.insert(
+                self.insert_local(
                     symbol_id,
                     LocalVarInfo {
                         sym: local_sym,
@@ -1989,7 +2082,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.locals.insert(
+                self.insert_local(
                     symbol_id,
                     LocalVarInfo {
                         sym: local_sym,
@@ -2031,6 +2124,9 @@ impl<'a> Linearizer<'a> {
                 ir_func.next_pseudo = self.next_pseudo;
             }
         }
+
+        // Pop function-level scope
+        self.pop_scope();
 
         // Add function to module
         if let Some(ir_func) = self.current_func.take() {
@@ -2128,11 +2224,7 @@ impl<'a> Linearizer<'a> {
             }
 
             Stmt::Block(items) => {
-                // Save current locals state for scope restoration
-                // This handles variable shadowing: inner blocks can declare variables
-                // that shadow outer ones, but the outer variables must be restored
-                // when the block exits.
-                let saved_locals = self.locals.clone();
+                self.push_scope();
 
                 for item in items {
                     match item {
@@ -2141,8 +2233,7 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                // Restore locals to remove any shadowing declarations
-                self.locals = saved_locals;
+                self.pop_scope();
             }
 
             Stmt::If {
@@ -2331,7 +2422,7 @@ impl<'a> Linearizer<'a> {
             }
 
             // Track in linearizer's locals map using SymbolId as key
-            self.locals.insert(
+            self.insert_local(
                 declarator.symbol,
                 LocalVarInfo {
                     sym: sym_id,
@@ -2634,7 +2725,7 @@ impl<'a> Linearizer<'a> {
 
         // Track in linearizer's locals map with pointer type and VLA size info
         // This makes arr[i] behave like ptr[i] - load ptr, then offset
-        self.locals.insert(
+        self.insert_local(
             declarator.symbol,
             LocalVarInfo {
                 sym: sym_id,
@@ -2695,7 +2786,7 @@ impl<'a> Linearizer<'a> {
 
         // Also insert with the SymbolId for the current function scope
         // This is used during expression linearization
-        self.locals.insert(
+        self.insert_local(
             declarator.symbol,
             LocalVarInfo {
                 // Use a sentinel value - we'll handle static locals specially
@@ -2756,77 +2847,10 @@ impl<'a> Linearizer<'a> {
                     self.types.kind(elem_type),
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
                 );
-                let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
-                let mut element_indices: Vec<i64> = Vec::new();
-                let mut current_idx: i64 = 0;
-                let mut elem_idx = 0;
 
-                while elem_idx < elements.len() {
-                    let element = &elements[elem_idx];
-                    let mut index = None;
-                    let mut index_pos = None;
-                    for (pos, designator) in element.designators.iter().enumerate() {
-                        if let Designator::Index(idx) = designator {
-                            index = Some(*idx);
-                            index_pos = Some(pos);
-                            break;
-                        }
-                    }
-
-                    let element_index = if let Some(idx) = index {
-                        current_idx = idx + 1;
-                        idx
-                    } else {
-                        let idx = current_idx;
-                        current_idx += 1;
-                        idx
-                    };
-
-                    let remaining_designators = match index_pos {
-                        Some(pos) => element.designators[pos + 1..].to_vec(),
-                        None => element.designators.clone(),
-                    };
-
-                    // Brace elision: positional scalar for aggregate element type
-                    if remaining_designators.is_empty()
-                        && self.is_brace_elision_candidate(element, elem_type)
-                    {
-                        let sub_elements =
-                            self.consume_brace_elision(elements, &mut elem_idx, elem_type);
-                        let entry = element_lists.entry(element_index).or_insert_with(|| {
-                            element_indices.push(element_index);
-                            Vec::new()
-                        });
-                        entry.extend(sub_elements);
-                        continue;
-                    }
-
-                    let entry = element_lists.entry(element_index).or_insert_with(|| {
-                        element_indices.push(element_index);
-                        Vec::new()
-                    });
-
-                    if remaining_designators.is_empty() {
-                        if let ExprKind::InitList {
-                            elements: nested_elements,
-                        } = &element.value.kind
-                        {
-                            entry.extend(nested_elements.clone());
-                            elem_idx += 1;
-                            continue;
-                        }
-                    }
-
-                    entry.push(InitElement {
-                        designators: remaining_designators,
-                        value: element.value.clone(),
-                    });
-                    elem_idx += 1;
-                }
-
-                element_indices.sort();
-                for element_index in element_indices {
-                    let Some(list) = element_lists.get(&element_index) else {
+                let groups = self.group_array_init_elements(elements, elem_type);
+                for element_index in groups.indices {
+                    let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;
                     };
                     let offset = base_offset + element_index * elem_size as i64;
@@ -2847,160 +2871,60 @@ impl<'a> Linearizer<'a> {
                 }
             }
             TypeKind::Struct | TypeKind::Union => {
-                // Resolve incomplete struct types to their complete definitions
-                // This is needed when a typedef to an incomplete struct is used
-                // before the struct is fully defined (forward declaration pattern)
                 let resolved_typ = self.resolve_struct_type(typ);
-                // Get struct fields from the type's composite data
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
-                    // Clone members to avoid borrow issues
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
-                    let mut current_field_idx = 0;
-                    let mut anon_cont: Option<AnonContinuation> = None;
-                    let mut elem_idx = 0;
 
-                    while elem_idx < elements.len() {
-                        let element = &elements[elem_idx];
-                        if element.designators.is_empty() {
-                            // Check if we're continuing inside an anonymous struct
-                            let mut member = None;
-                            if anon_cont.is_some() {
-                                member = self.get_anon_continuation_member(
-                                    &mut anon_cont,
-                                    &members,
-                                    &mut current_field_idx,
-                                );
-                            }
-                            if member.is_none() {
-                                member = self.next_positional_member(
-                                    &members,
-                                    is_union,
-                                    &mut current_field_idx,
-                                );
-                            }
-                            let Some(member) = member else {
-                                elem_idx += 1;
-                                continue;
-                            };
-                            let offset = base_offset + member.offset as i64;
-                            let field_type = member.typ;
+                    let visits =
+                        self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
 
-                            // Brace elision: scalar for aggregate member
-                            if self.is_brace_elision_candidate(element, field_type) {
-                                let sub_elements =
-                                    self.consume_brace_elision(elements, &mut elem_idx, field_type);
+                    for visit in visits {
+                        let offset = base_offset + visit.offset as i64;
+                        let field_type = visit.typ;
+
+                        match visit.kind {
+                            StructFieldVisitKind::BraceElision(sub_elements) => {
                                 self.linearize_init_list_at_offset(
                                     base_sym,
                                     offset,
                                     field_type,
                                     &sub_elements,
                                 );
-                                continue;
                             }
-
-                            // Check if this is a bitfield
-                            if let (Some(bit_off), Some(bit_w), Some(storage_size)) = (
-                                member.bit_offset,
-                                member.bit_width,
-                                member.storage_unit_size,
-                            ) {
-                                let val = self.linearize_expr(&element.value);
-                                let val_type = self.expr_type(&element.value);
-                                let storage_type = match storage_size {
-                                    1 => self.types.uchar_id,
-                                    2 => self.types.ushort_id,
-                                    4 => self.types.uint_id,
-                                    8 => self.types.ulong_id,
-                                    _ => self.types.uint_id,
-                                };
-                                let converted = self.emit_convert(val, val_type, storage_type);
-                                self.emit_bitfield_store(
-                                    base_sym,
-                                    offset as usize,
-                                    bit_off,
-                                    bit_w,
-                                    storage_size,
-                                    converted,
-                                );
-                            } else {
-                                self.linearize_struct_field_init(
-                                    base_sym,
-                                    offset,
-                                    field_type,
-                                    &element.value,
-                                );
-                            }
-                            elem_idx += 1;
-                            continue;
-                        }
-
-                        let resolved =
-                            self.resolve_designator_chain(resolved_typ, 0, &element.designators);
-                        let Some(ResolvedDesignator {
-                            offset,
-                            typ: field_type,
-                            bit_offset,
-                            bit_width,
-                            storage_unit_size,
-                        }) = resolved
-                        else {
-                            elem_idx += 1;
-                            continue;
-                        };
-                        if let Some(Designator::Field(name)) = element.designators.first() {
-                            if let Some(result) = self.member_index_for_designator(&members, *name)
-                            {
-                                match result {
-                                    MemberDesignatorResult::Direct(next_idx) => {
-                                        current_field_idx = next_idx;
-                                        anon_cont = None;
-                                    }
-                                    MemberDesignatorResult::Anonymous { outer_idx, levels } => {
-                                        current_field_idx = outer_idx;
-                                        anon_cont = Some(AnonContinuation { outer_idx, levels });
-                                    }
+                            StructFieldVisitKind::Expr(expr) => {
+                                if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
+                                    (visit.bit_offset, visit.bit_width, visit.storage_unit_size)
+                                {
+                                    let val = self.linearize_expr(&expr);
+                                    let val_type = self.expr_type(&expr);
+                                    let storage_type = match storage_size {
+                                        1 => self.types.uchar_id,
+                                        2 => self.types.ushort_id,
+                                        4 => self.types.uint_id,
+                                        8 => self.types.ulong_id,
+                                        _ => self.types.uint_id,
+                                    };
+                                    let converted = self.emit_convert(val, val_type, storage_type);
+                                    self.emit_bitfield_store(
+                                        base_sym,
+                                        offset as usize,
+                                        bit_off,
+                                        bit_w,
+                                        storage_size,
+                                        converted,
+                                    );
+                                } else {
+                                    self.linearize_struct_field_init(
+                                        base_sym, offset, field_type, &expr,
+                                    );
                                 }
                             }
                         }
-                        let offset = base_offset + offset as i64;
-
-                        // Check if this is a bitfield
-                        if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
-                            (bit_offset, bit_width, storage_unit_size)
-                        {
-                            let val = self.linearize_expr(&element.value);
-                            let val_type = self.expr_type(&element.value);
-                            let storage_type = match storage_size {
-                                1 => self.types.uchar_id,
-                                2 => self.types.ushort_id,
-                                4 => self.types.uint_id,
-                                8 => self.types.ulong_id,
-                                _ => self.types.uint_id,
-                            };
-                            let converted = self.emit_convert(val, val_type, storage_type);
-                            self.emit_bitfield_store(
-                                base_sym,
-                                offset as usize,
-                                bit_off,
-                                bit_w,
-                                storage_size,
-                                converted,
-                            );
-                        } else {
-                            self.linearize_struct_field_init(
-                                base_sym,
-                                offset,
-                                field_type,
-                                &element.value,
-                            );
-                        }
-                        elem_idx += 1;
                     }
                 }
             }
             _ => {
-                // For other types, just use the first element if present
                 if let Some(element) = elements.first() {
                     let val = self.linearize_expr(&element.value);
                     let val_type = self.expr_type(&element.value);
@@ -3223,9 +3147,8 @@ impl<'a> Linearizer<'a> {
         post: Option<&Expr>,
         body: &Stmt,
     ) {
-        // Save locals state for scope restoration.
         // C99 for-loop declarations (e.g., for (int i = 0; ...)) are scoped to the loop.
-        let saved_locals = self.locals.clone();
+        self.push_scope();
 
         // Init
         if let Some(init) = init {
@@ -3298,7 +3221,7 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(exit_bb);
 
         // Restore locals to remove for-loop-scoped declarations
-        self.locals = saved_locals;
+        self.pop_scope();
     }
 
     fn linearize_switch(&mut self, expr: &Expr, body: &Stmt) {
@@ -4327,7 +4250,7 @@ impl<'a> Linearizer<'a> {
                     ));
 
                     // Update locals map so future accesses use the spilled location
-                    self.locals.insert(
+                    self.insert_local(
                         *symbol_id,
                         LocalVarInfo {
                             sym: local_sym,

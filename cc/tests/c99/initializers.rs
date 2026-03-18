@@ -1126,3 +1126,84 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("string_no_brace_elision", code, &[]), 0);
 }
+
+// ============================================================================
+// Parity test: global (static) vs local initializers must produce same results
+// ============================================================================
+
+#[test]
+fn c99_initializers_global_local_parity() {
+    let code = r#"
+struct Point { int x; int y; int z; };
+struct Nested { struct Point p; int val; };
+struct WithArray { int arr[4]; int extra; };
+
+// Global initializers (static path: ast_init_list_to_ir)
+struct Point g_desig = {.z = 30, .x = 10, .y = 20};
+struct Point g_pos = {1, 2, 3};
+struct Nested g_nested = {{100, 200, 300}, 400};
+struct Nested g_nested_desig = {.p = {.y = 50, .x = 40}, .val = 60};
+struct WithArray g_arr = {{10, 20, 30, 40}, 50};
+struct WithArray g_arr_desig = {.arr = {[2] = 300, [0] = 100}, .extra = 99};
+int g_2d[2][3] = {1, 2, 3, 4, 5, 6};
+int g_2d_desig[2][3] = {[1] = {[2] = 99}};
+
+int main(void) {
+    // Local initializers (runtime path: linearize_init_list_at_offset)
+    struct Point l_desig = {.z = 30, .x = 10, .y = 20};
+    struct Point l_pos = {1, 2, 3};
+    struct Nested l_nested = {{100, 200, 300}, 400};
+    struct Nested l_nested_desig = {.p = {.y = 50, .x = 40}, .val = 60};
+    struct WithArray l_arr = {{10, 20, 30, 40}, 50};
+    struct WithArray l_arr_desig = {.arr = {[2] = 300, [0] = 100}, .extra = 99};
+    int l_2d[2][3] = {1, 2, 3, 4, 5, 6};
+    int l_2d_desig[2][3] = {[1] = {[2] = 99}};
+
+    // Designated struct: global vs local
+    if (g_desig.x != l_desig.x) return 1;
+    if (g_desig.y != l_desig.y) return 2;
+    if (g_desig.z != l_desig.z) return 3;
+
+    // Positional struct: global vs local
+    if (g_pos.x != l_pos.x) return 10;
+    if (g_pos.y != l_pos.y) return 11;
+    if (g_pos.z != l_pos.z) return 12;
+
+    // Nested struct: global vs local
+    if (g_nested.p.x != l_nested.p.x) return 20;
+    if (g_nested.p.y != l_nested.p.y) return 21;
+    if (g_nested.p.z != l_nested.p.z) return 22;
+    if (g_nested.val != l_nested.val) return 23;
+
+    // Nested designated: global vs local
+    if (g_nested_desig.p.x != l_nested_desig.p.x) return 30;
+    if (g_nested_desig.p.y != l_nested_desig.p.y) return 31;
+    if (g_nested_desig.val != l_nested_desig.val) return 32;
+
+    // Array in struct: global vs local
+    if (g_arr.arr[0] != l_arr.arr[0]) return 40;
+    if (g_arr.arr[3] != l_arr.arr[3]) return 41;
+    if (g_arr.extra != l_arr.extra) return 42;
+
+    // Designated array in struct: global vs local
+    if (g_arr_desig.arr[0] != l_arr_desig.arr[0]) return 50;
+    if (g_arr_desig.arr[1] != l_arr_desig.arr[1]) return 51;
+    if (g_arr_desig.arr[2] != l_arr_desig.arr[2]) return 52;
+    if (g_arr_desig.extra != l_arr_desig.extra) return 53;
+
+    // 2D array brace elision: global vs local
+    if (g_2d[0][0] != l_2d[0][0]) return 60;
+    if (g_2d[1][2] != l_2d[1][2]) return 61;
+
+    // 2D designated array: global vs local
+    if (g_2d_desig[0][0] != l_2d_desig[0][0]) return 70;
+    if (g_2d_desig[1][2] != l_2d_desig[1][2]) return 71;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("initializers_global_local_parity", code, &[]),
+        0
+    );
+}

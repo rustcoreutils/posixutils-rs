@@ -345,6 +345,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, cond, body, exit];
+        func.rebuild_block_idx();
 
         // Add pseudos
         func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
@@ -682,6 +683,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, cond, body, exit];
+        func.rebuild_block_idx();
 
         // Add pseudos
         func.add_pseudo(Pseudo::reg(PseudoId(1), 1));

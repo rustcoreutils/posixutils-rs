@@ -777,6 +777,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, then_bb, else_bb, merge];
+        func.rebuild_block_idx();
         func
     }
 
@@ -867,6 +868,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry];
+        func.rebuild_block_idx();
 
         // This should NOT panic - the SSA converter should find max ID from instructions
         ssa_convert(&mut func, &types);
@@ -1018,6 +1020,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, dispatch, handler0, handler1, done];
+        func.rebuild_block_idx();
         func
     }
 

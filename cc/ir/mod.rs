@@ -1280,6 +1280,10 @@ pub struct Function {
     pub is_noreturn: bool,
     /// Is this function declared with the inline keyword?
     pub is_inline: bool,
+    /// Block ID -> index in `blocks` vec (O(1) lookup)
+    block_idx: HashMap<BasicBlockId, usize>,
+    /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
+    pseudo_idx: HashMap<PseudoId, usize>,
 }
 
 impl Default for Function {
@@ -1297,6 +1301,8 @@ impl Default for Function {
             is_static: false,
             is_noreturn: false,
             is_inline: false,
+            block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
+            pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }
     }
 }
@@ -1318,22 +1324,38 @@ impl Function {
 
     /// Add a basic block
     pub fn add_block(&mut self, block: BasicBlock) {
+        let idx = self.blocks.len();
+        self.block_idx.insert(block.id, idx);
         self.blocks.push(block);
     }
 
     /// Get a block by ID
     pub fn get_block(&self, id: BasicBlockId) -> Option<&BasicBlock> {
-        self.blocks.iter().find(|b| b.id == id)
+        self.block_idx
+            .get(&id)
+            .and_then(|&idx| self.blocks.get(idx))
     }
 
     /// Get a mutable block by ID
     pub fn get_block_mut(&mut self, id: BasicBlockId) -> Option<&mut BasicBlock> {
-        self.blocks.iter_mut().find(|b| b.id == id)
+        self.block_idx
+            .get(&id)
+            .and_then(|&idx| self.blocks.get_mut(idx))
     }
 
     /// Add a pseudo for tracking
     pub fn add_pseudo(&mut self, pseudo: Pseudo) {
+        let idx = self.pseudos.len();
+        self.pseudo_idx.insert(pseudo.id, idx);
         self.pseudos.push(pseudo);
+    }
+
+    /// Rebuild block index after bulk mutation of `self.blocks`
+    pub fn rebuild_block_idx(&mut self) {
+        self.block_idx.clear();
+        for (idx, block) in self.blocks.iter().enumerate() {
+            self.block_idx.insert(block.id, idx);
+        }
     }
 
     /// Add a local variable
@@ -1385,7 +1407,9 @@ impl Function {
 
     /// Get a pseudo by its ID
     pub fn get_pseudo(&self, id: PseudoId) -> Option<&Pseudo> {
-        self.pseudos.iter().find(|p| p.id == id)
+        self.pseudo_idx
+            .get(&id)
+            .and_then(|&idx| self.pseudos.get(idx))
     }
 
     /// Check if block a dominates block b
@@ -1547,18 +1571,6 @@ impl GlobalDef {
         }
     }
 
-    /// Create a thread-local global variable definition
-    pub fn thread_local(name: impl Into<String>, typ: TypeId, init: Initializer) -> Self {
-        Self {
-            name: name.into(),
-            typ,
-            init,
-            is_thread_local: true,
-            is_static: false,
-            explicit_align: None,
-        }
-    }
-
     /// Set explicit alignment from _Alignas specifier
     pub fn with_align(mut self, align: Option<u32>) -> Self {
         self.explicit_align = align;
@@ -1641,31 +1653,7 @@ impl Module {
         align: Option<u32>,
         is_static: bool,
     ) {
-        let name = name.into();
-        // Check for existing tentative definition
-        if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
-            // Replace tentative definition with actual definition
-            if matches!(existing.init, Initializer::None) {
-                // C99 6.9.2: Multiple declarations must have compatible types.
-                // The parser should enforce this; assert here as a safety check.
-                debug_assert_eq!(
-                    existing.typ, typ,
-                    "tentative definition type mismatch for '{}'",
-                    name
-                );
-                existing.init = init;
-                if align.is_some() {
-                    existing.explicit_align = align;
-                }
-                existing.is_static = is_static;
-                return;
-            }
-        }
-        self.globals.push(
-            GlobalDef::new(name, typ, init)
-                .with_align(align)
-                .with_static(is_static),
-        );
+        self.add_global_impl(name, typ, init, align, is_static, false);
     }
 
     /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
@@ -1679,32 +1667,46 @@ impl Module {
         align: Option<u32>,
         is_static: bool,
     ) {
+        self.add_global_impl(name, typ, init, align, is_static, true);
+    }
+
+    fn add_global_impl(
+        &mut self,
+        name: impl Into<String>,
+        typ: TypeId,
+        init: Initializer,
+        align: Option<u32>,
+        is_static: bool,
+        is_thread_local: bool,
+    ) {
         let name = name.into();
         // Check for existing tentative definition
         if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
-                // C99 6.9.2: Multiple declarations must have compatible types.
-                // The parser should enforce this; assert here as a safety check.
                 debug_assert_eq!(
                     existing.typ, typ,
                     "tentative definition type mismatch for '{}'",
                     name
                 );
                 existing.init = init;
-                existing.is_thread_local = true;
                 existing.is_static = is_static;
+                if is_thread_local {
+                    existing.is_thread_local = true;
+                }
                 if align.is_some() {
                     existing.explicit_align = align;
                 }
                 return;
             }
         }
-        self.globals.push(
-            GlobalDef::thread_local(name, typ, init)
-                .with_align(align)
-                .with_static(is_static),
-        );
+        let mut def = GlobalDef::new(name, typ, init)
+            .with_align(align)
+            .with_static(is_static);
+        if is_thread_local {
+            def.is_thread_local = true;
+        }
+        self.globals.push(def);
     }
 
     /// Add a string literal and return its label

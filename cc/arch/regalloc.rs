@@ -196,7 +196,11 @@ where
             }
             pos += 1;
         }
-        block_end_pos.push(if pos > block_start { pos - 1 } else { block_start });
+        block_end_pos.push(if pos > block_start {
+            pos - 1
+        } else {
+            block_start
+        });
     }
 
     // Collect argument pseudo IDs (implicitly defined at function entry)
@@ -465,4 +469,23 @@ where
     }
 
     fp_pseudos
+}
+
+/// Try to reuse a previously freed stack slot of the given size and alignment.
+/// Shared between x86_64 and aarch64 register allocators.
+pub fn try_reuse_stack_slot(
+    free_stack_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
+    size: i32,
+    alignment: i32,
+) -> Option<i32> {
+    if let Some(slots) = free_stack_slots.get_mut(&size) {
+        if let Some(idx) = slots.iter().position(|s| s.alignment >= alignment) {
+            let slot = slots.remove(idx);
+            if slots.is_empty() {
+                free_stack_slots.remove(&size);
+            }
+            return Some(slot.offset);
+        }
+    }
+    None
 }

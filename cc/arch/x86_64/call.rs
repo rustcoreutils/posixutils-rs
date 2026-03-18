@@ -377,7 +377,9 @@ impl X86_64CodeGen {
                 fp_arg_idx += 1;
             } else if arg_type.is_some_and(|t| {
                 let k = types.kind(t);
-                (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) > 64 && types.size_bits(t) <= 128
+                (k == TypeKind::Struct || k == TypeKind::Union)
+                    && types.size_bits(t) > 64
+                    && types.size_bits(t) <= 128
             }) {
                 // Medium struct (9-16 bytes, e.g., {double, double}):
                 // Load two 8-byte fields into register pairs per ABI classification.
@@ -385,7 +387,8 @@ impl X86_64CodeGen {
                 let abi = crate::abi::SysVAmd64Abi;
                 let arg_class = abi.classify_param(arg_type.unwrap(), types);
                 if let crate::abi::ArgClass::Direct { ref classes, .. } = arg_class {
-                    if classes.iter().all(|c| *c == crate::abi::RegClass::Sse) && classes.len() == 2 {
+                    if classes.iter().all(|c| *c == crate::abi::RegClass::Sse) && classes.len() == 2
+                    {
                         // Two SSE registers: load two 8-byte doubles from struct address
                         let arg_loc = self.get_location(arg);
                         let base = match arg_loc {
@@ -417,7 +420,9 @@ impl X86_64CodeGen {
                             dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
                         });
                         fp_arg_idx += 2;
-                    } else if classes.iter().all(|c| *c == crate::abi::RegClass::Integer) && classes.len() == 2 {
+                    } else if classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                        && classes.len() == 2
+                    {
                         // Two integer registers
                         let arg_loc = self.get_location(arg);
                         let addr = match arg_loc {
@@ -430,19 +435,30 @@ impl X86_64CodeGen {
                         // Load first 8 bytes
                         self.push_lir(X86Inst::Mov {
                             size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset { base: addr, offset: 0 }),
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: addr,
+                                offset: 0,
+                            }),
                             dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
                         });
                         // Load second 8 bytes
                         self.push_lir(X86Inst::Mov {
                             size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset { base: addr, offset: 8 }),
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: addr,
+                                offset: 8,
+                            }),
                             dst: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
                         });
                         int_arg_idx += 2;
                     } else {
                         // Mixed or single class — fall through to integer
-                        self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
+                        self.setup_int_arg(
+                            arg,
+                            arg_size,
+                            int_arg_regs[int_arg_idx],
+                            saved_arg_regs,
+                        );
                         int_arg_idx += 1;
                     }
                 } else {

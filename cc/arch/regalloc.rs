@@ -87,13 +87,10 @@ pub fn expire_stack_intervals(
     active_stack.retain(|(interval, offset, size)| {
         if interval.end < point {
             let alignment = if *size >= 16 { 16 } else { 8 };
-            free_slots
-                .entry(*size)
-                .or_default()
-                .push(FreeSlot {
-                    offset: *offset,
-                    alignment,
-                });
+            free_slots.entry(*size).or_default().push(FreeSlot {
+                offset: *offset,
+                alignment,
+            });
             false
         } else {
             true
@@ -176,102 +173,20 @@ where
     R: Clone,
     F: Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>,
 {
-    struct IntervalInfo {
-        pseudo: PseudoId,
-        first_def: usize,
-        last_def: usize,
-        last_use: usize,
-        in_loop: bool,
-    }
-
-    let mut intervals: HashMap<PseudoId, IntervalInfo> =
-        HashMap::with_capacity(DEFAULT_INTERVAL_CAPACITY);
+    let num_blocks = func.blocks.len();
     let mut constraint_points: Vec<ConstraintPoint<R>> =
         Vec::with_capacity(DEFAULT_CONSTRAINT_CAPACITY);
+
+    // Phase A: Assign linear positions and build block position maps
+    let mut block_start_pos: Vec<usize> = Vec::with_capacity(num_blocks);
+    let mut block_end_pos: Vec<usize> = Vec::with_capacity(num_blocks);
+    let mut bb_id_to_idx: HashMap<BasicBlockId, usize> = HashMap::with_capacity(num_blocks);
     let mut pos = 0usize;
-
-    // First pass: compute block start and end positions
-    let mut block_start_pos: HashMap<BasicBlockId, usize> =
-        HashMap::with_capacity(func.blocks.len());
-    let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::with_capacity(func.blocks.len());
-    let mut temp_pos = 0usize;
-    for block in &func.blocks {
-        block_start_pos.insert(block.id, temp_pos);
-        temp_pos += block.insns.len();
-        block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
-    }
-
-    // Pre-initialize intervals for argument pseudos with first_def = 0
-    // because arguments are live from function entry
-    for pseudo in &func.pseudos {
-        if let PseudoKind::Arg(_) = pseudo.kind {
-            intervals.insert(
-                pseudo.id,
-                IntervalInfo {
-                    pseudo: pseudo.id,
-                    first_def: 0,
-                    last_def: 0,
-                    last_use: 0,
-                    in_loop: false,
-                },
-            );
-        }
-    }
-
-    for block in &func.blocks {
+    for (idx, block) in func.blocks.iter().enumerate() {
+        bb_id_to_idx.insert(block.id, idx);
+        let block_start = pos;
+        block_start_pos.push(block_start);
         for insn in &block.insns {
-            if let Some(target) = insn.target {
-                intervals
-                    .entry(target)
-                    .and_modify(|info| {
-                        info.first_def = info.first_def.min(pos);
-                        info.last_def = info.last_def.max(pos);
-                    })
-                    .or_insert(IntervalInfo {
-                        pseudo: target,
-                        first_def: pos,
-                        last_def: pos,
-                        last_use: pos,
-                        in_loop: false,
-                    });
-            }
-
-            for &src in &insn.src {
-                if let Some(info) = intervals.get_mut(&src) {
-                    info.last_use = info.last_use.max(pos);
-                } else {
-                    intervals.insert(
-                        src,
-                        IntervalInfo {
-                            pseudo: src,
-                            first_def: pos,
-                            last_def: pos,
-                            last_use: pos,
-                            in_loop: false,
-                        },
-                    );
-                }
-            }
-
-            // For indirect calls, the indirect_target pseudo is also used
-            if let Some(indirect) = insn.indirect_target {
-                if let Some(info) = intervals.get_mut(&indirect) {
-                    info.last_use = info.last_use.max(pos);
-                } else {
-                    intervals.insert(
-                        indirect,
-                        IntervalInfo {
-                            pseudo: indirect,
-                            first_def: pos,
-                            last_def: pos,
-                            last_use: pos,
-                            in_loop: false,
-                        },
-                    );
-                }
-            }
-
-            // Collect constraint points via the architecture-specific callback
             if let Some((clobbers, involved_pseudos)) = get_constraint_info(insn) {
                 constraint_points.push(ConstraintPoint {
                     position: pos,
@@ -279,78 +194,203 @@ where
                     involved_pseudos,
                 });
             }
-
             pos += 1;
+        }
+        block_end_pos.push(if pos > block_start { pos - 1 } else { block_start });
+    }
+
+    // Collect argument pseudo IDs (implicitly defined at function entry)
+    let arg_pseudos: Vec<PseudoId> = func
+        .pseudos
+        .iter()
+        .filter(|p| matches!(p.kind, PseudoKind::Arg(_)))
+        .map(|p| p.id)
+        .collect();
+
+    // Phase B: Compute gen/kill sets and per-pseudo per-block positions
+    let mut gen: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    let mut kill: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
+    let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
+
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let mut ipos = block_start_pos[idx];
+        for insn in &block.insns {
+            // Uses: if not yet killed in this block, add to gen
+            for &src in &insn.src {
+                if !kill[idx].contains(&src) {
+                    gen[idx].insert(src);
+                }
+                first_pos_map[idx].entry(src).or_insert(ipos);
+                last_pos_map[idx].insert(src, ipos);
+            }
+            if let Some(indirect) = insn.indirect_target {
+                if !kill[idx].contains(&indirect) {
+                    gen[idx].insert(indirect);
+                }
+                first_pos_map[idx].entry(indirect).or_insert(ipos);
+                last_pos_map[idx].insert(indirect, ipos);
+            }
+            // Inline asm operands are stored in asm_data, not in src/target
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    for input in &asm.inputs {
+                        let p = input.pseudo;
+                        if !kill[idx].contains(&p) {
+                            gen[idx].insert(p);
+                        }
+                        first_pos_map[idx].entry(p).or_insert(ipos);
+                        last_pos_map[idx].insert(p, ipos);
+                    }
+                    for output in &asm.outputs {
+                        let p = output.pseudo;
+                        kill[idx].insert(p);
+                        first_pos_map[idx].entry(p).or_insert(ipos);
+                        last_pos_map[idx].insert(p, ipos);
+                    }
+                }
+            }
+            // Defs: add to kill
+            if let Some(target) = insn.target {
+                kill[idx].insert(target);
+                first_pos_map[idx].entry(target).or_insert(ipos);
+                last_pos_map[idx].insert(target, ipos);
+            }
+            ipos += 1;
         }
     }
 
-    // Handle loop back edges
-    let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> =
-        Vec::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
-    for block in &func.blocks {
-        if let Some(last_insn) = block.insns.last() {
-            let mut targets = Vec::with_capacity(2);
-            if let Some(target) = last_insn.bb_true {
-                targets.push(target);
-            }
-            if let Some(target) = last_insn.bb_false {
-                targets.push(target);
-            }
+    // Arguments are implicitly defined at entry block
+    if num_blocks > 0 {
+        for &arg_pseudo in &arg_pseudos {
+            kill[0].insert(arg_pseudo);
+            first_pos_map[0].entry(arg_pseudo).or_insert(0);
+            last_pos_map[0].entry(arg_pseudo).or_insert(0);
+        }
+    }
 
-            let from_start = block_start_pos.get(&block.id).copied().unwrap_or(0);
-            for target_bb in targets {
-                let target_start = block_start_pos.get(&target_bb).copied().unwrap_or(0);
-                if target_start < from_start {
-                    let from_end = block_end_pos.get(&block.id).copied().unwrap_or(0);
-                    loop_back_edges.push((block.id, target_bb, from_end));
+    // Phase C: Backward dataflow fixpoint for liveness
+    // LIVE_out[B] = ∪ LIVE_in[S] for all successors S of B
+    // LIVE_in[B]  = GEN[B] ∪ (LIVE_out[B] − KILL[B])
+    let mut live_in: Vec<HashSet<PseudoId>> = gen.clone();
+    let mut live_out: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for idx in (0..num_blocks).rev() {
+            for &child_id in &func.blocks[idx].children {
+                if let Some(&child_idx) = bb_id_to_idx.get(&child_id) {
+                    for &p in &live_in[child_idx] {
+                        if live_out[idx].insert(p) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for &p in &live_out[idx] {
+                if !kill[idx].contains(&p) && live_in[idx].insert(p) {
+                    changed = true;
                 }
             }
         }
     }
 
-    // Extend lifetimes for loop variables and mark them as in_loop
-    // Only mark variables that need to persist across loop iterations:
-    // - Defined before the loop but used within the loop
-    // - Used at or after the back edge (survive iteration boundary)
-    for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
-        let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
+    // Phase D: Construct intervals from liveness
+    let mut interval_start: HashMap<PseudoId, usize> =
+        HashMap::with_capacity(DEFAULT_INTERVAL_CAPACITY);
+    let mut interval_end: HashMap<PseudoId, usize> =
+        HashMap::with_capacity(DEFAULT_INTERVAL_CAPACITY);
 
-        for info in intervals.values_mut() {
-            // This is a loop-carried value that spans iterations
-            let spans_loop_iteration = info.first_def < loop_start
-                && info.last_use >= loop_start
-                && info.last_use <= *back_edge_pos;
+    for idx in 0..num_blocks {
+        let mut referenced: HashSet<PseudoId> =
+            HashSet::with_capacity(kill[idx].len() + live_in[idx].len());
+        for &p in &kill[idx] {
+            referenced.insert(p);
+        }
+        for &p in &live_in[idx] {
+            referenced.insert(p);
+        }
+        for &p in &live_out[idx] {
+            referenced.insert(p);
+        }
 
-            if spans_loop_iteration {
-                info.last_use = info.last_use.max(*back_edge_pos);
-                info.in_loop = true;
+        for &p in &referenced {
+            let start = if live_in[idx].contains(&p) {
+                block_start_pos[idx]
+            } else {
+                first_pos_map[idx]
+                    .get(&p)
+                    .copied()
+                    .unwrap_or(block_start_pos[idx])
+            };
+
+            let end = if live_out[idx].contains(&p) {
+                block_end_pos[idx]
+            } else {
+                last_pos_map[idx]
+                    .get(&p)
+                    .copied()
+                    .unwrap_or(block_end_pos[idx])
+            };
+
+            interval_start
+                .entry(p)
+                .and_modify(|s| *s = (*s).min(start))
+                .or_insert(start);
+            interval_end
+                .entry(p)
+                .and_modify(|e| *e = (*e).max(end))
+                .or_insert(end);
+        }
+    }
+
+    // Phase E: Detect loop back-edges and mark loop-carried pseudos
+    let mut loop_pseudos: HashSet<PseudoId> = HashSet::new();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        for &child_id in &block.children {
+            if let Some(&child_idx) = bb_id_to_idx.get(&child_id) {
+                if block_start_pos[child_idx] < block_start_pos[idx] {
+                    for &p in &live_out[idx] {
+                        if live_in[child_idx].contains(&p) {
+                            loop_pseudos.insert(p);
+                        }
+                    }
+                }
             }
         }
     }
 
-    let max_pos = pos.saturating_sub(1);
-
-    let mut result: Vec<_> = intervals
-        .into_values()
-        .map(|info| {
-            let end = if info.last_def > info.last_use {
-                max_pos
-            } else {
-                info.last_def.max(info.last_use)
-            };
-            LiveInterval {
-                pseudo: info.pseudo,
-                start: info.first_def,
+    // Phase F: Build sorted LiveInterval vec
+    let mut result: Vec<LiveInterval> = interval_start
+        .into_iter()
+        .filter_map(|(pseudo, start)| {
+            interval_end.get(&pseudo).map(|&end| LiveInterval {
+                pseudo,
+                start,
                 end,
-                in_loop: info.in_loop,
-            }
+                in_loop: loop_pseudos.contains(&pseudo),
+            })
         })
         .collect();
-    // Sort by (start, pseudo) to ensure deterministic ordering
-    // This is critical when multiple intervals have the same start position
-    // (e.g., all arguments start at 0), as HashMap iteration is non-deterministic
+
     result.sort_by_key(|i| (i.start, i.pseudo.0));
     (result, constraint_points)
+}
+
+/// Identify Sym pseudos whose address is taken (SymAddr opcode).
+/// These must have stable stack addresses and cannot participate in slot reuse.
+pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
+    let mut addr_taken = HashSet::new();
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if insn.op == Opcode::SymAddr {
+                for &src in &insn.src {
+                    addr_taken.insert(src);
+                }
+            }
+        }
+    }
+    addr_taken
 }
 
 /// Identify pseudo-registers that should use floating-point registers.

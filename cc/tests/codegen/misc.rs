@@ -2830,7 +2830,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("nan_comparison_comprehensive", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("nan_comparison_comprehensive", code, &[]),
+        0
+    );
 }
 
 /// Regression test: ++*s++ re-evaluated s++ when storing back, causing the
@@ -2919,7 +2922,10 @@ int main(void) {
 }
 "#;
     // Use extra_opts to force -O0 only (optimization needs further work for 2-SSE structs)
-    assert_eq!(compile_and_run("two_sse_struct_abi", code, &["-O0".to_string()]), 0);
+    assert_eq!(
+        compile_and_run("two_sse_struct_abi", code, &["-O0".to_string()]),
+        0
+    );
 }
 
 // ============================================================================

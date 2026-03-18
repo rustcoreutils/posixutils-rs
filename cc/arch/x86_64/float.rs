@@ -547,7 +547,11 @@ impl X86_64CodeGen {
         // exclude NaN by checking PF. seta/setae are already NaN-safe
         // (CF=1 for NaN makes them return 0). sete/setb/setbe/setne need
         // a parity check to handle NaN correctly.
-        let scratch = if dst_reg == Reg::R11 { Reg::R10 } else { Reg::R11 };
+        let scratch = if dst_reg == Reg::R11 {
+            Reg::R10
+        } else {
+            Reg::R11
+        };
         match insn.op {
             Opcode::FCmpOEq | Opcode::FCmpOLt | Opcode::FCmpOLe => {
                 // result = setcc(dst) AND setnp(scratch)

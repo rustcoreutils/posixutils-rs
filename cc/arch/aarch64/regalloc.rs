@@ -37,8 +37,8 @@
 
 use crate::arch::regalloc::{
     compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
-    find_conflicting_registers, identify_fp_pseudos, interval_crosses_call, ConstraintPoint,
-    FreeSlot, LiveInterval,
+    find_conflicting_registers, identify_addr_taken_syms, identify_fp_pseudos,
+    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeKind, TypeTable};
@@ -685,6 +685,8 @@ pub struct RegAlloc {
     active_stack: Vec<(LiveInterval, i32, i32)>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
+    /// Sym pseudos whose address is taken (cannot participate in slot reuse)
+    addr_taken_syms: HashSet<PseudoId>,
 }
 
 impl RegAlloc {
@@ -702,6 +704,7 @@ impl RegAlloc {
             spilled_args: Vec::new(),
             active_stack: Vec::new(),
             free_stack_slots: BTreeMap::new(),
+            addr_taken_syms: HashSet::new(),
         }
     }
 
@@ -710,6 +713,7 @@ impl RegAlloc {
         self.reset_state();
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
+        self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
         let (intervals, constraint_points) = self.compute_live_intervals(func);
@@ -736,6 +740,7 @@ impl RegAlloc {
         self.spilled_args.clear();
         self.active_stack.clear();
         self.free_stack_slots.clear();
+        self.addr_taken_syms.clear();
     }
 
     /// Pre-allocate argument registers per AAPCS64
@@ -910,8 +915,7 @@ impl RegAlloc {
         let offset = if reusable {
             if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
-                self.active_stack
-                    .push((interval.clone(), reused, size));
+                self.active_stack.push((interval.clone(), reused, size));
                 return;
             }
             if alignment > 8 {
@@ -928,8 +932,7 @@ impl RegAlloc {
         };
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
-            self.active_stack
-                .push((interval.clone(), offset, size));
+            self.active_stack.push((interval.clone(), offset, size));
         }
     }
 
@@ -980,12 +983,13 @@ impl RegAlloc {
                             // Determine alignment: explicit _Alignas takes precedence
                             let alignment = local.explicit_align.unwrap_or(8) as i32;
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-                            // Align stack offset before allocating
-                            self.stack_offset =
-                                (self.stack_offset + alignment - 1) & !(alignment - 1);
-                            self.stack_offset += aligned_size;
-                            self.locations
-                                .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+
+                            // Reusable when: not volatile, not address-taken
+                            let reusable = !local.is_volatile
+                                && !self.addr_taken_syms.contains(&interval.pseudo);
+
+                            self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
+
                             if types.is_float(local.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -1051,7 +1055,7 @@ impl RegAlloc {
                         self.active_fp.push((interval.clone(), reg));
                         self.active_fp.sort_by_key(|(i, _)| i.end);
                     } else {
-                        self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
+                        self.alloc_stack_slot(&interval, 8, 8, true);
                     }
                 } else if let Some(reg) = self.free_fp_regs.pop() {
                     if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
@@ -1080,8 +1084,7 @@ impl RegAlloc {
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
                     // No callee-saved registers available - spill to stack
-                    // Reusable only if not in a loop (see x86_64 comment)
-                    self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             } else {
                 // Interval doesn't cross a call - prefer caller-saved registers

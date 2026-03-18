@@ -40,8 +40,8 @@
 
 use crate::arch::regalloc::{
     compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
-    find_conflicting_registers, identify_fp_pseudos, interval_crosses_call, ConstraintPoint,
-    FreeSlot, LiveInterval,
+    find_conflicting_registers, identify_addr_taken_syms, identify_fp_pseudos,
+    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
@@ -473,6 +473,8 @@ pub struct RegAlloc {
     active_stack: Vec<(LiveInterval, i32, i32)>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
+    /// Sym pseudos whose address is taken (cannot participate in slot reuse)
+    addr_taken_syms: HashSet<PseudoId>,
 }
 
 impl RegAlloc {
@@ -491,6 +493,7 @@ impl RegAlloc {
             spilled_xmm_args: Vec::new(),
             active_stack: Vec::new(),
             free_stack_slots: BTreeMap::new(),
+            addr_taken_syms: HashSet::new(),
         }
     }
 
@@ -501,6 +504,7 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
+        self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
         let (intervals, constraint_points) = self.compute_live_intervals(func);
@@ -529,6 +533,7 @@ impl RegAlloc {
         self.spilled_xmm_args.clear();
         self.active_stack.clear();
         self.free_stack_slots.clear();
+        self.addr_taken_syms.clear();
     }
 
     /// Identify pseudos that are long double (80-bit extended precision).
@@ -627,8 +632,7 @@ impl RegAlloc {
                                 self.locations
                                     .insert(pseudo.id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
                                 self.free_xmm_regs.retain(|&r| {
-                                    r != fp_arg_regs[fp_arg_idx]
-                                        && r != fp_arg_regs[fp_arg_idx + 1]
+                                    r != fp_arg_regs[fp_arg_idx] && r != fp_arg_regs[fp_arg_idx + 1]
                                 });
                                 self.fp_pseudos.insert(pseudo.id);
                             } else {
@@ -840,8 +844,7 @@ impl RegAlloc {
         let offset = if reusable {
             if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
-                self.active_stack
-                    .push((interval.clone(), reused, size));
+                self.active_stack.push((interval.clone(), reused, size));
                 return;
             }
             // Fall through to allocate new slot
@@ -859,8 +862,7 @@ impl RegAlloc {
         };
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
-            self.active_stack
-                .push((interval.clone(), offset, size));
+            self.active_stack.push((interval.clone(), offset, size));
         }
     }
 
@@ -915,12 +917,13 @@ impl RegAlloc {
                                 8
                             };
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-                            // Align stack offset before allocating
-                            self.stack_offset =
-                                (self.stack_offset + alignment - 1) & !(alignment - 1);
-                            self.stack_offset += aligned_size;
-                            self.locations
-                                .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+
+                            // Reusable when: not volatile, not address-taken
+                            let reusable = !local_var.is_volatile
+                                && !self.addr_taken_syms.contains(&interval.pseudo);
+
+                            self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
+
                             if types.is_float(local_var.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -951,7 +954,7 @@ impl RegAlloc {
                 } else if crosses_call {
                     // All XMM registers are caller-saved on x86-64 SysV ABI.
                     // Values live across function calls must be spilled to stack.
-                    self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
                     self.active_xmm.push((interval.clone(), xmm));
@@ -977,11 +980,7 @@ impl RegAlloc {
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
                     // No callee-saved registers available - spill to stack
-                    // Reusable only if not in a loop — loop-spanning pseudos
-                    // have unreliable intervals due to back edges; non-loop
-                    // call-crossing pseudos (e.g., case-local temps in switch)
-                    // have accurate intervals and can safely share slots.
-                    self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             } else {
                 // Interval doesn't appear to cross a call. In functions WITH

@@ -5781,8 +5781,7 @@ impl<'a> Linearizer<'a> {
             // For deref operands like *s++, compute the lvalue address once
             // to avoid re-evaluating side effects (PostInc etc.) when storing back.
             let deref_addr = if let ExprKind::Unary {
-                op: UnaryOp::Deref,
-                ..
+                op: UnaryOp::Deref, ..
             } = &operand.kind
             {
                 let addr = self.linearize_lvalue(operand);
@@ -5910,8 +5909,7 @@ impl<'a> Linearizer<'a> {
                     }
                 }
                 ExprKind::Unary {
-                    op: UnaryOp::Deref,
-                    ..
+                    op: UnaryOp::Deref, ..
                 } => {
                     // Dereference: store to the pointer address.
                     // Use the pre-computed address to avoid re-evaluating

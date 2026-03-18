@@ -2743,3 +2743,92 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("static_local_struct", code, &[]), 0);
 }
+
+/// Regression test: NaN comparisons must follow IEEE 754.
+/// ucomisd sets PF=1 for NaN. Ordered comparisons (==, <, <=) must
+/// return false for NaN; != must return true. sete/setb/setbe/setne
+/// alone don't check PF, so we need setnp AND / setp OR.
+#[test]
+fn codegen_nan_comparison() {
+    let code = r#"
+int main(void) {
+    double nan = __builtin_nan("");
+    double x = 21.0;
+
+    /* IEEE 754: all ordered comparisons with NaN return false */
+    if (nan == nan) return 1;
+    if (nan == x) return 2;
+    if (nan < x) return 3;
+    if (nan <= x) return 4;
+    if (nan > x) return 5;
+    if (nan >= x) return 6;
+
+    /* != with NaN must return true */
+    if (!(nan != nan)) return 7;
+    if (!(nan != x)) return 8;
+
+    /* Normal comparisons must still work */
+    if (!(1.0 == 1.0)) return 9;
+    if (1.0 != 1.0) return 10;
+    if (!(1.0 < 2.0)) return 11;
+    if (!(1.0 <= 1.0)) return 12;
+    if (!(2.0 > 1.0)) return 13;
+    if (!(1.0 >= 1.0)) return 14;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nan_comparison", code, &[]), 0);
+}
+
+/// Comprehensive NaN test: value comparisons, float (single), stored results,
+/// and NaN propagation through variables.
+#[test]
+fn codegen_nan_comparison_comprehensive() {
+    let code = r#"
+int main(void) {
+    /* Test NaN comparison results as stored integers (not just if-branches) */
+    double nan = __builtin_nan("");
+    double x = 42.0;
+    int r;
+
+    r = (nan == x);  if (r != 0) return 1;
+    r = (nan != x);  if (r != 1) return 2;
+    r = (nan < x);   if (r != 0) return 3;
+    r = (nan <= x);  if (r != 0) return 4;
+    r = (nan > x);   if (r != 0) return 5;
+    r = (nan >= x);  if (r != 0) return 6;
+
+    /* NaN compared with itself */
+    r = (nan == nan); if (r != 0) return 7;
+    r = (nan != nan); if (r != 1) return 8;
+    r = (nan < nan);  if (r != 0) return 9;
+    r = (nan > nan);  if (r != 0) return 10;
+
+    /* Float (single-precision) NaN */
+    float fnan = __builtin_nanf("");
+    float fy = 42.0f;
+    r = (fnan == fy);  if (r != 0) return 11;
+    r = (fnan != fy);  if (r != 1) return 12;
+    r = (fnan < fy);   if (r != 0) return 13;
+    r = (fnan <= fy);  if (r != 0) return 14;
+
+    /* NaN through function call (prevents constant folding) */
+    volatile double vnan = nan;
+    volatile double vx = x;
+    r = (vnan == vx); if (r != 0) return 15;
+    r = (vnan != vx); if (r != 1) return 16;
+
+    /* Normal float comparisons must still work */
+    float a = 1.0f, b = 2.0f;
+    r = (a == a);  if (r != 1) return 17;
+    r = (a < b);   if (r != 1) return 18;
+    r = (a <= a);  if (r != 1) return 19;
+    r = (b > a);   if (r != 1) return 20;
+    r = (a >= a);  if (r != 1) return 21;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nan_comparison_comprehensive", code, &[]), 0);
+}

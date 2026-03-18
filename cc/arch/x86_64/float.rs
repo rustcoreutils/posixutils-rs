@@ -531,27 +531,74 @@ impl X86_64CodeGen {
             }
         }
 
-        // Set result based on comparison type
+        // Set result based on comparison type.
+        // IEEE 754: ucomisd sets PF=1 for unordered (NaN). Ordered comparisons
+        // must check PF to return false when either operand is NaN.
+        // - seta/setae already exclude NaN (CF=1 for NaN → seta/setae = 0)
+        // - sete/setb/setbe incorrectly return true for NaN (ZF=1 or CF=1)
+        // - setne incorrectly returns false for NaN (ZF=1)
         let dst_loc = self.get_location(target);
-        // Use R10 as scratch to avoid clobbering live values in Rax
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
             _ => Reg::R10,
         };
 
-        // Use appropriate setcc instruction
-        // Note: FP comparisons set flags differently - need to handle unordered (NaN) cases
-        let cc = match insn.op {
-            Opcode::FCmpOEq => CondCode::Eq,  // Equal (ZF=1, PF=0)
-            Opcode::FCmpONe => CondCode::Ne,  // Not equal
-            Opcode::FCmpOLt => CondCode::Ult, // Below (CF=1) - for ordered less than
-            Opcode::FCmpOLe => CondCode::Ule, // Below or equal
-            Opcode::FCmpOGt => CondCode::Ugt, // Above (CF=0, ZF=0)
-            Opcode::FCmpOGe => CondCode::Uge, // Above or equal
+        // IEEE 754: ucomisd sets PF=1 for NaN. Ordered comparisons must
+        // exclude NaN by checking PF. seta/setae are already NaN-safe
+        // (CF=1 for NaN makes them return 0). sete/setb/setbe/setne need
+        // a parity check to handle NaN correctly.
+        let scratch = if dst_reg == Reg::R11 { Reg::R10 } else { Reg::R11 };
+        match insn.op {
+            Opcode::FCmpOEq | Opcode::FCmpOLt | Opcode::FCmpOLe => {
+                // result = setcc(dst) AND setnp(scratch)
+                let cc = match insn.op {
+                    Opcode::FCmpOEq => CondCode::Eq,
+                    Opcode::FCmpOLt => CondCode::Ult,
+                    Opcode::FCmpOLe => CondCode::Ule,
+                    _ => unreachable!(),
+                };
+                self.push_lir(X86Inst::SetCC { cc, dst: dst_reg });
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Np,
+                    dst: scratch,
+                });
+                self.push_lir(X86Inst::And {
+                    size: OperandSize::B8,
+                    src: GpOperand::Reg(scratch),
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpONe => {
+                // result = setne(dst) OR setp(scratch)
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Ne,
+                    dst: dst_reg,
+                });
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::P,
+                    dst: scratch,
+                });
+                self.push_lir(X86Inst::Or {
+                    size: OperandSize::B8,
+                    src: GpOperand::Reg(scratch),
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpOGt => {
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Ugt,
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpOGe => {
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Uge,
+                    dst: dst_reg,
+                });
+            }
             _ => return,
-        };
+        }
 
-        self.push_lir(X86Inst::SetCC { cc, dst: dst_reg });
         self.push_lir(X86Inst::Movzx {
             src_size: OperandSize::B8,
             dst_size: OperandSize::B32,

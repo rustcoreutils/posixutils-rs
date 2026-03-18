@@ -186,6 +186,10 @@ pub enum CondCode {
     Ugt,
     /// Unsigned Greater or Equal (Above or Equal)
     Uge,
+    /// Not Parity (PF=0) — used for IEEE 754 ordered FP comparisons
+    Np,
+    /// Parity (PF=1) — used for IEEE 754 unordered FP comparisons
+    P,
 }
 
 impl CondCode {
@@ -202,6 +206,8 @@ impl CondCode {
             CondCode::Ule => "be",
             CondCode::Ugt => "a",
             CondCode::Uge => "ae",
+            CondCode::Np => "np",
+            CondCode::P => "p",
         }
     }
 
@@ -218,6 +224,8 @@ impl CondCode {
             CondCode::Ule => "ls",
             CondCode::Ugt => "hi",
             CondCode::Uge => "hs",
+            CondCode::Np => "vc", // V clear = no overflow/parity
+            CondCode::P => "vs",  // V set = overflow/parity
         }
     }
 }
@@ -235,6 +243,8 @@ impl fmt::Display for CondCode {
             CondCode::Ule => "ule",
             CondCode::Ugt => "ugt",
             CondCode::Uge => "uge",
+            CondCode::Np => "np",
+            CondCode::P => "p",
         };
         write!(f, "{}", name)
     }
@@ -1100,5 +1110,26 @@ mod tests {
         let mut out = String::new();
         Directive::comm("big_array", 64, 16).emit(&macos, &mut out);
         assert_eq!(out, ".comm _big_array,64,4\n");
+    }
+
+    #[test]
+    fn test_condcode_suffixes() {
+        // x86 suffixes
+        assert_eq!(CondCode::Eq.x86_suffix(), "e");
+        assert_eq!(CondCode::Ne.x86_suffix(), "ne");
+        assert_eq!(CondCode::Slt.x86_suffix(), "l");
+        assert_eq!(CondCode::Sle.x86_suffix(), "le");
+        assert_eq!(CondCode::Sgt.x86_suffix(), "g");
+        assert_eq!(CondCode::Sge.x86_suffix(), "ge");
+        assert_eq!(CondCode::Ult.x86_suffix(), "b");
+        assert_eq!(CondCode::Ule.x86_suffix(), "be");
+        assert_eq!(CondCode::Ugt.x86_suffix(), "a");
+        assert_eq!(CondCode::Uge.x86_suffix(), "ae");
+        assert_eq!(CondCode::Np.x86_suffix(), "np");
+        assert_eq!(CondCode::P.x86_suffix(), "p");
+
+        // Display
+        assert_eq!(format!("{}", CondCode::Np), "np");
+        assert_eq!(format!("{}", CondCode::P), "p");
     }
 }

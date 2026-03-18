@@ -897,11 +897,28 @@ impl RegAlloc {
         None
     }
 
-    /// Allocate a stack slot, reusing a freed slot if possible.
+    /// Allocate a stack slot, optionally reusing a freed slot.
     /// AArch64 uses negative offsets from the frame pointer.
-    fn alloc_stack_slot(&mut self, interval: &LiveInterval, size: i32, alignment: i32) {
-        let offset = if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
-            reused
+    /// Only short-lived spills (not crossing calls/loops) should set `reusable=true`.
+    fn alloc_stack_slot(
+        &mut self,
+        interval: &LiveInterval,
+        size: i32,
+        alignment: i32,
+        reusable: bool,
+    ) {
+        let offset = if reusable {
+            if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
+                self.locations.insert(interval.pseudo, Loc::Stack(reused));
+                self.active_stack
+                    .push((interval.clone(), reused, size));
+                return;
+            }
+            if alignment > 8 {
+                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+            }
+            self.stack_offset += size;
+            -self.stack_offset
         } else {
             if alignment > 8 {
                 self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
@@ -910,8 +927,10 @@ impl RegAlloc {
             -self.stack_offset
         };
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
-        self.active_stack
-            .push((interval.clone(), offset, size));
+        if reusable {
+            self.active_stack
+                .push((interval.clone(), offset, size));
+        }
     }
 
     /// Run the linear scan allocation algorithm
@@ -1032,7 +1051,7 @@ impl RegAlloc {
                         self.active_fp.push((interval.clone(), reg));
                         self.active_fp.sort_by_key(|(i, _)| i.end);
                     } else {
-                        self.alloc_stack_slot(&interval, 8, 8);
+                        self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
                     }
                 } else if let Some(reg) = self.free_fp_regs.pop() {
                     if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
@@ -1042,7 +1061,7 @@ impl RegAlloc {
                     self.active_fp.push((interval.clone(), reg));
                     self.active_fp.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             } else if crosses_call {
                 // GP interval crosses a call - must use callee-saved register or spill
@@ -1061,7 +1080,8 @@ impl RegAlloc {
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
                     // No callee-saved registers available - spill to stack
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    // Reusable only if not in a loop (see x86_64 comment)
+                    self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
                 }
             } else {
                 // Interval doesn't cross a call - prefer caller-saved registers
@@ -1097,7 +1117,7 @@ impl RegAlloc {
                     self.active.push((interval.clone(), reg));
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             }
         }

@@ -826,10 +826,30 @@ impl RegAlloc {
         None
     }
 
-    /// Allocate a stack slot, reusing a freed slot if possible.
-    fn alloc_stack_slot(&mut self, interval: &LiveInterval, size: i32, alignment: i32) {
-        let offset = if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
-            reused
+    /// Allocate a stack slot, optionally reusing a freed slot.
+    /// Only short-lived spills (no register available, not crossing calls/loops)
+    /// should set `reusable=true`. Call-crossing and in-loop spills have
+    /// unreliable interval estimates in complex control flow (e.g., computed gotos).
+    fn alloc_stack_slot(
+        &mut self,
+        interval: &LiveInterval,
+        size: i32,
+        alignment: i32,
+        reusable: bool,
+    ) {
+        let offset = if reusable {
+            if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
+                self.locations.insert(interval.pseudo, Loc::Stack(reused));
+                self.active_stack
+                    .push((interval.clone(), reused, size));
+                return;
+            }
+            // Fall through to allocate new slot
+            if alignment > 8 {
+                self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+            }
+            self.stack_offset += size;
+            self.stack_offset
         } else {
             if alignment > 8 {
                 self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
@@ -838,8 +858,10 @@ impl RegAlloc {
             self.stack_offset
         };
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
-        self.active_stack
-            .push((interval.clone(), offset, size));
+        if reusable {
+            self.active_stack
+                .push((interval.clone(), offset, size));
+        }
     }
 
     /// Run the linear scan allocation algorithm
@@ -925,17 +947,17 @@ impl RegAlloc {
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
                 if is_longdouble {
                     // Long double needs 16 bytes (80-bit padded to 128-bit)
-                    self.alloc_stack_slot(&interval, 16, 16);
+                    self.alloc_stack_slot(&interval, 16, 16, false);
                 } else if crosses_call {
                     // All XMM registers are caller-saved on x86-64 SysV ABI.
                     // Values live across function calls must be spilled to stack.
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
                     self.active_xmm.push((interval.clone(), xmm));
                     self.active_xmm.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             } else if crosses_call || interval.in_loop {
                 // Interval crosses a call or is inside a loop - must use callee-saved register or spill
@@ -955,7 +977,11 @@ impl RegAlloc {
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
                     // No callee-saved registers available - spill to stack
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    // Reusable only if not in a loop — loop-spanning pseudos
+                    // have unreliable intervals due to back edges; non-loop
+                    // call-crossing pseudos (e.g., case-local temps in switch)
+                    // have accurate intervals and can safely share slots.
+                    self.alloc_stack_slot(&interval, 8, 8, !interval.in_loop);
                 }
             } else {
                 // Interval doesn't appear to cross a call. In functions WITH
@@ -987,7 +1013,8 @@ impl RegAlloc {
                     self.active.push((interval.clone(), reg));
                     self.active.sort_by_key(|(i, _)| i.end);
                 } else {
-                    self.alloc_stack_slot(&interval, 8, 8);
+                    // Reusable: short-lived, no call/loop crossing
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             }
         }

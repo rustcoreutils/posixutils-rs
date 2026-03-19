@@ -5370,25 +5370,33 @@ impl<'a> Linearizer<'a> {
                 let mut val = self.linearize_expr(a);
 
                 // Implicit argument conversion when actual type differs from
-                // formal parameter type:
+                // formal parameter type. Covers:
                 // - Integer widening: int→long (sign/zero extend)
-                // - FP widening: float→double, _Float16→double
-                // - FP narrowing: long double→double (e.g., Py_MATH_TAU
-                //   passed to PyFloat_FromDouble)
+                // - FP widening/narrowing: float↔double↔long double
+                // - Int→FP: uint32_t→double (e.g., log10(uint32_t_val))
+                // - FP→Int: rare but legal
                 if let Some(ref params) = formal_param_types {
                     if arg_idx < params.len() {
                         let param_type = params[arg_idx];
                         let arg_size = self.types.size_bits(arg_type);
                         let param_size = self.types.size_bits(param_type);
-                        let is_int_widen = arg_size < param_size
-                            && arg_size <= 32
-                            && param_size <= 64
-                            && self.types.is_integer(arg_type)
-                            && self.types.is_integer(param_type);
-                        let is_fp_convert = self.types.is_float(arg_type)
-                            && self.types.is_float(param_type)
-                            && arg_size != param_size;
-                        if is_int_widen || is_fp_convert {
+                        let arg_is_int = self.types.is_integer(arg_type);
+                        let param_is_int = self.types.is_integer(param_type);
+                        let arg_is_fp = self.types.is_float(arg_type);
+                        let param_is_fp = self.types.is_float(param_type);
+
+                        let needs_convert =
+                            // Integer widening (e.g., int→long)
+                            (arg_is_int && param_is_int && arg_size < param_size
+                                && arg_size <= 32 && param_size <= 64)
+                            // FP size mismatch (float→double, long double→double, etc.)
+                            || (arg_is_fp && param_is_fp && arg_size != param_size)
+                            // Integer to FP (uint32_t→double, int→float, etc.)
+                            || (arg_is_int && param_is_fp)
+                            // FP to integer (rare but legal)
+                            || (arg_is_fp && param_is_int);
+
+                        if needs_convert {
                             val = self.emit_convert(val, arg_type, param_type);
                             arg_type = param_type;
                         }

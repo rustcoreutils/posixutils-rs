@@ -3458,10 +3458,36 @@ impl<'a> Linearizer<'a> {
                             _ => unreachable!(),
                         }
                     }
-                    BinaryOp::Lt => Some(if l < r { 1 } else { 0 }),
-                    BinaryOp::Le => Some(if l <= r { 1 } else { 0 }),
-                    BinaryOp::Gt => Some(if l > r { 1 } else { 0 }),
-                    BinaryOp::Ge => Some(if l >= r { 1 } else { 0 }),
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                        // Use unsigned comparison when either operand is unsigned.
+                        // C promotes both to the common unsigned type for comparison.
+                        let left_unsigned = left
+                            .typ
+                            .is_some_and(|t| self.types.modifiers(t).contains(TypeModifiers::UNSIGNED));
+                        let right_unsigned = right
+                            .typ
+                            .is_some_and(|t| self.types.modifiers(t).contains(TypeModifiers::UNSIGNED));
+                        let use_unsigned = left_unsigned || right_unsigned;
+                        if use_unsigned {
+                            let lu = l as u64;
+                            let ru = r as u64;
+                            Some(match op {
+                                BinaryOp::Lt => if lu < ru { 1 } else { 0 },
+                                BinaryOp::Le => if lu <= ru { 1 } else { 0 },
+                                BinaryOp::Gt => if lu > ru { 1 } else { 0 },
+                                BinaryOp::Ge => if lu >= ru { 1 } else { 0 },
+                                _ => unreachable!(),
+                            })
+                        } else {
+                            Some(match op {
+                                BinaryOp::Lt => if l < r { 1 } else { 0 },
+                                BinaryOp::Le => if l <= r { 1 } else { 0 },
+                                BinaryOp::Gt => if l > r { 1 } else { 0 },
+                                BinaryOp::Ge => if l >= r { 1 } else { 0 },
+                                _ => unreachable!(),
+                            })
+                        }
+                    }
                     BinaryOp::Eq => Some(if l == r { 1 } else { 0 }),
                     BinaryOp::Ne => Some(if l != r { 1 } else { 0 }),
                     BinaryOp::LogAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),

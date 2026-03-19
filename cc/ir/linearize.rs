@@ -2932,6 +2932,30 @@ impl<'a> Linearizer<'a> {
                 }
             }
             TypeKind::Struct | TypeKind::Union => {
+                // If the initializer is a single expression of the same struct
+                // type (e.g., `Py_complex in[1] = {a}` where `a` is Py_complex),
+                // do a block copy instead of field-by-field initialization.
+                if elements.len() == 1
+                    && elements[0].designators.is_empty()
+                    && elements[0].value.typ.is_some()
+                {
+                    let expr_type = self.expr_type(&elements[0].value);
+                    let expr_kind = self.types.kind(expr_type);
+                    if (expr_kind == TypeKind::Struct || expr_kind == TypeKind::Union)
+                        && self.types.size_bits(expr_type) == self.types.size_bits(typ)
+                    {
+                        let src_addr = self.linearize_lvalue(&elements[0].value);
+                        let target_size_bytes = self.types.size_bits(typ) / 8;
+                        self.emit_block_copy_at_offset(
+                            base_sym,
+                            base_offset,
+                            src_addr,
+                            target_size_bytes as i64,
+                        );
+                        return;
+                    }
+                }
+
                 let resolved_typ = self.resolve_struct_type(typ);
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
@@ -7500,6 +7524,65 @@ impl<'a> Linearizer<'a> {
             let tmp = self.alloc_pseudo();
             self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
             self.emit(Instruction::store(tmp, dst, offset, self.types.uchar_id, 8));
+        }
+    }
+
+    /// Like emit_block_copy but the destination stores start at dst_base_offset.
+    fn emit_block_copy_at_offset(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        src: PseudoId,
+        size_bytes: i64,
+    ) {
+        let mut offset: i64 = 0;
+        while offset + 8 <= size_bytes {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.ulong_id, 64));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                dst_base_offset + offset,
+                self.types.ulong_id,
+                64,
+            ));
+            offset += 8;
+        }
+        let remaining = size_bytes - offset;
+        if remaining >= 4 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.uint_id, 32));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                dst_base_offset + offset,
+                self.types.uint_id,
+                32,
+            ));
+            offset += 4;
+        }
+        if remaining % 4 >= 2 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.ushort_id, 16));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                dst_base_offset + offset,
+                self.types.ushort_id,
+                16,
+            ));
+            offset += 2;
+        }
+        if remaining % 2 == 1 {
+            let tmp = self.alloc_pseudo();
+            self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
+            self.emit(Instruction::store(
+                tmp,
+                dst,
+                dst_base_offset + offset,
+                self.types.uchar_id,
+                8,
+            ));
         }
     }
 

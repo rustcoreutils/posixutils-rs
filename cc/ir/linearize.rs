@@ -5172,6 +5172,31 @@ impl<'a> Linearizer<'a> {
                 );
             }
             (local_sym, Vec::new(), Vec::new())
+        } else if (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
+            && struct_size_bits > 0
+            && struct_size_bits <= 64
+        {
+            // Small struct/union returns (<=64 bits, single register):
+            // Allocate local storage so the result has a stable address.
+            // The codegen stores RAX (or XMM0) to this location.
+            // Without this, the result pseudo holds a raw value which
+            // emit_assign's block_copy would incorrectly dereference as a pointer.
+            let local_sym = self.alloc_pseudo();
+            let unique_name = format!("__sret1_{}", local_sym.0);
+            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(local_pseudo);
+                func.add_local(
+                    &unique_name,
+                    local_sym,
+                    typ,
+                    false,
+                    false,
+                    self.current_bb,
+                    None,
+                );
+            }
+            (local_sym, Vec::new(), Vec::new())
         } else {
             let result = self.alloc_pseudo();
             (result, Vec::new(), Vec::new())

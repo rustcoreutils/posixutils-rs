@@ -3350,3 +3350,65 @@ int main(void) {
         0
     );
 }
+
+/// Regression test: small struct (<=64 bits) returned by value from a function
+/// was stored as a raw register value. When assigned to a struct variable,
+/// emit_assign's block_copy dereferenced it as a pointer → SIGSEGV.
+/// Fixed by allocating local storage for small struct returns.
+#[test]
+fn codegen_small_struct_return() {
+    let code = r#"
+typedef struct { int a; int b; } Pair;
+
+__attribute__((noinline))
+Pair make_pair(int x, int y) {
+    Pair p;
+    p.a = x;
+    p.b = y;
+    return p;
+}
+
+__attribute__((noinline))
+int sum_pair(Pair p) {
+    return p.a + p.b;
+}
+
+int main(void) {
+    /* Basic: return small struct and access fields */
+    Pair p = make_pair(10, 20);
+    if (p.a != 10) return 1;
+    if (p.b != 20) return 2;
+
+    /* Pass returned struct to another function */
+    int s = sum_pair(make_pair(3, 7));
+    if (s != 10) return 3;
+
+    /* Assign return value to existing variable */
+    Pair q;
+    q = make_pair(100, 200);
+    if (q.a != 100 || q.b != 200) return 4;
+
+    /* Chain: use result in expression */
+    Pair r = make_pair(make_pair(1, 2).a + 3, make_pair(4, 5).b + 6);
+    if (r.a != 4 || r.b != 11) return 5;
+
+    /* Single-field struct (common in error handling) */
+    typedef struct { int err; } ErrCode;
+    ErrCode e;
+    e = (ErrCode){42};
+    if (e.err != 42) return 6;
+
+    /* Struct with two shorts (fits in single register) */
+    typedef struct { short x; short y; } Point;
+    Point pt;
+    pt = (Point){100, 200};
+    if (pt.x != 100 || pt.y != 200) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_small_struct_return", code, &[]),
+        0
+    );
+}

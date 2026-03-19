@@ -2971,3 +2971,103 @@ int main(void) {
     code.push_str("    return 0;\n}\n");
     assert_eq!(compile_and_run("codegen_large_switch_stack", &code, &[]), 0);
 }
+
+/// Regression: FP negation clobbered RAX (used for sign mask), corrupting
+/// integer pseudos allocated to RAX. FP ternary select with CMov also
+/// failed because CMov doesn't work on XMM registers.
+#[test]
+fn codegen_fp_ternary_select() {
+    let code = r#"
+/* FP ternary with negation — tests that fneg doesn't clobber condition */
+double select_val(int negate) {
+    return negate ? -1.0 : 1.0;
+}
+
+double negate_then_select(double v, int flag) {
+    double neg = -v;  /* fneg uses RAX for sign mask */
+    return flag ? neg : v;
+}
+
+int main(void) {
+    /* Basic FP ternary */
+    if (select_val(0) != 1.0) return 1;
+    if (select_val(1) != -1.0) return 2;
+
+    /* FP ternary after negation (fneg clobbers RAX) */
+    if (negate_then_select(5.0, 0) != 5.0) return 3;
+    if (negate_then_select(5.0, 1) != -5.0) return 4;
+    if (negate_then_select(-3.0, 0) != -3.0) return 5;
+    if (negate_then_select(-3.0, 1) != 3.0) return 6;
+
+    /* Multiple ternaries in sequence */
+    int a = 0, b = 1;
+    double x = a ? -2.0 : 2.0;
+    double y = b ? -3.0 : 3.0;
+    if (x != 2.0) return 7;
+    if (y != -3.0) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_fp_ternary_select", code, &[]), 0);
+}
+
+/// Regression: two-register integer struct return clobbered rax when
+/// second source was allocated there (parallel-move problem).
+#[test]
+fn codegen_two_reg_int_struct_return() {
+    let code = r#"
+#include <stdint.h>
+
+typedef struct { uint64_t low; uint64_t high; } u128_t;
+
+static u128_t make_u128(uint64_t lo, uint64_t hi) {
+    u128_t r;
+    r.low = lo;
+    r.high = hi;
+    return r;
+}
+
+static u128_t add_u128(u128_t a, u128_t b) {
+    u128_t r;
+    r.low = a.low + b.low;
+    uint64_t carry = (r.low < a.low) ? 1 : 0;
+    r.high = a.high + b.high + carry;
+    return r;
+}
+
+int main(void) {
+    u128_t a = make_u128(100, 0);
+    if (a.low != 100 || a.high != 0) return 1;
+
+    u128_t b = make_u128(200, 0);
+    if (b.low != 200 || b.high != 0) return 2;
+
+    u128_t c = add_u128(a, b);
+    if (c.low != 300 || c.high != 0) return 3;
+
+    /* Test with carry */
+    a = make_u128(0xFFFFFFFFFFFFFFFFULL, 0);
+    b = make_u128(1, 0);
+    c = add_u128(a, b);
+    if (c.low != 0 || c.high != 1) return 4;
+
+    /* Test chained calls — rvalue struct as call argument */
+    u128_t total = make_u128(0, 0);
+    for (int i = 0; i < 10; i++) {
+        total = add_u128(total, make_u128(i, 0));
+    }
+    if (total.low != 45 || total.high != 0) return 5;
+
+    /* Mixed values */
+    c = add_u128(make_u128(7, 3), make_u128(5, 2));
+    if (c.low != 12 || c.high != 5) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_two_reg_int_struct_return", code, &[]),
+        0
+    );
+}

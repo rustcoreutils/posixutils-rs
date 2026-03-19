@@ -566,13 +566,27 @@ impl X86_64CodeGen {
                             let is_complex = types.is_complex(*typ);
                             let is_longdouble =
                                 types.kind(*typ) == crate::types::TypeKind::LongDouble;
-                            let is_two_sse_spilled = !is_complex
+                            let is_medium_struct = !is_complex
                                 && (types.kind(*typ) == crate::types::TypeKind::Struct
                                     || types.kind(*typ) == crate::types::TypeKind::Union)
                                 && type_size_bits > 64
                                 && type_size_bits <= 128;
-                            if is_complex || is_two_sse_spilled {
+                            if is_complex {
                                 fp_arg_idx += 2;
+                            } else if is_medium_struct {
+                                // Check ABI classification for medium structs
+                                let abi = crate::abi::SysVAmd64Abi;
+                                let cls = abi.classify_param(*typ, types);
+                                if let crate::abi::ArgClass::Direct { ref classes, .. } = cls {
+                                    let sse_count =
+                                        classes.iter().filter(|c| **c == crate::abi::RegClass::Sse).count();
+                                    let gp_count =
+                                        classes.iter().filter(|c| **c == crate::abi::RegClass::Integer).count();
+                                    fp_arg_idx += sse_count;
+                                    int_arg_idx += gp_count;
+                                } else {
+                                    int_arg_idx += 1;
+                                }
                             } else if is_longdouble {
                                 // Long double is on stack, doesn't use XMM registers
                             } else if is_fp {
@@ -756,12 +770,16 @@ impl X86_64CodeGen {
                     if let Some(typ) = ret_typ {
                         let abi = get_abi(&self.base.target);
                         if let ArgClass::Direct { classes, .. } = abi.classify_return(typ, types) {
-                            // Handle mixed SSE+INTEGER returns per ABI classification
-                            // Each SSE class uses XMM0, XMM1; each INTEGER uses RAX, RDX
+                            // Handle two-register struct returns per ABI classification.
+                            // Must solve the parallel-move problem: if src[1] is in
+                            // Rax, moving src[0]→Rax first would clobber it.
+                            let srcs: Vec<Option<PseudoId>> =
+                                vec![Some(*src), insn.src.get(1).copied()];
+
+                            // Collect (src, dst_reg) pairs
+                            let mut gp_moves: Vec<(PseudoId, Reg)> = Vec::new();
                             let mut xmm_idx = 0;
                             let mut gp_idx = 0;
-                            let srcs = [Some(*src), insn.src.get(1).copied()];
-
                             for (i, &class) in classes.iter().enumerate() {
                                 if let Some(s) = srcs.get(i).copied().flatten() {
                                     match class {
@@ -774,18 +792,31 @@ impl X86_64CodeGen {
                                             self.emit_fp_move(s, xmm, 64);
                                             xmm_idx += 1;
                                         }
-                                        RegClass::Integer => {
-                                            let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
-                                            self.emit_move(s, gp, 64);
-                                            gp_idx += 1;
-                                        }
                                         _ => {
-                                            // NoClass, Memory - shouldn't happen for Direct
                                             let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
-                                            self.emit_move(s, gp, 64);
+                                            gp_moves.push((s, gp));
                                             gp_idx += 1;
                                         }
                                     }
+                                }
+                            }
+
+                            // Emit GP moves, handling clobber: if src[1] lives in Rax,
+                            // move it to Rdx FIRST, then src[0] to Rax.
+                            if gp_moves.len() == 2 {
+                                let src1_in_rax =
+                                    matches!(self.get_location(gp_moves[1].0), Loc::Reg(Reg::Rax));
+                                if src1_in_rax {
+                                    // Move second (Rdx) first to avoid clobbering
+                                    self.emit_move(gp_moves[1].0, gp_moves[1].1, 64);
+                                    self.emit_move(gp_moves[0].0, gp_moves[0].1, 64);
+                                } else {
+                                    self.emit_move(gp_moves[0].0, gp_moves[0].1, 64);
+                                    self.emit_move(gp_moves[1].0, gp_moves[1].1, 64);
+                                }
+                            } else {
+                                for (s, gp) in &gp_moves {
+                                    self.emit_move(*s, *gp, 64);
                                 }
                             }
                         } else {
@@ -2709,8 +2740,8 @@ impl X86_64CodeGen {
         self.handle_call_return_value(insn, types);
     }
 
-    /// Emit a select (ternary) instruction using CMOVcc
-    /// This is used for pure ternary expressions: cond ? a : b
+    /// Emit a select (ternary) instruction using CMOVcc (integers) or
+    /// conditional branch (floats, since CMov only works on GP registers).
     fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
@@ -2725,6 +2756,101 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
+
+        // Check if this is a floating-point select
+        let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+            || matches!(self.get_location(then_val), Loc::Xmm(_) | Loc::FImm(..))
+            || matches!(self.get_location(else_val), Loc::Xmm(_) | Loc::FImm(..));
+
+        if is_fp {
+            self.emit_select_fp(cond, then_val, else_val, target, size);
+        } else {
+            self.emit_select_int(cond, then_val, else_val, target, insn, types, size);
+        }
+    }
+
+    /// Emit FP select using conditional branch (CMov doesn't work on XMM regs)
+    fn emit_select_fp(
+        &mut self,
+        cond: PseudoId,
+        then_val: PseudoId,
+        else_val: PseudoId,
+        target: PseudoId,
+        size: u32,
+    ) {
+        let dst_loc = self.get_location(target);
+
+        // Load condition to R11. FP value computation (fneg, fadd, etc.)
+        // may clobber GP registers like RAX for immediate loading. We must
+        // reload the condition from its STACK slot, not trust the register.
+        let cond_loc = self.get_location(cond);
+        match &cond_loc {
+            Loc::Imm(v) => {
+                let val = if *v != 0 { then_val } else { else_val };
+                self.emit_fp_move(val, XmmReg::Xmm0, size);
+                self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size);
+                return;
+            }
+            Loc::Stack(offset) => {
+                // Reload directly from stack (safe from clobber)
+                let adjusted = offset + self.callee_saved_offset;
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -adjusted,
+                    }),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+            }
+            _ => {
+                // For other locations (Reg, Global), use emit_move
+                self.emit_move(cond, Reg::R11, 64);
+            }
+        }
+        self.push_lir(X86Inst::Test {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        // Branch: load else_val, skip over then_val load if condition is false
+        let then_suffix = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let done_suffix = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let then_label = Label::new("sel_then", then_suffix);
+        let done_label = Label::new("sel_done", done_suffix);
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ne,
+            target: then_label.clone(),
+        });
+        // Else branch: load else_val
+        self.emit_fp_move(else_val, XmmReg::Xmm0, size);
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+        // Then branch: load then_val
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(then_label)));
+        self.emit_fp_move(then_val, XmmReg::Xmm0, size);
+        // Done
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size);
+    }
+
+    /// Emit integer select using CMOVcc
+    #[allow(clippy::too_many_arguments)]
+    fn emit_select_int(
+        &mut self,
+        cond: PseudoId,
+        then_val: PseudoId,
+        else_val: PseudoId,
+        target: PseudoId,
+        insn: &Instruction,
+        _types: &TypeTable,
+        size: u32,
+    ) {
+        let _ = insn;
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
@@ -2739,7 +2865,6 @@ impl X86_64CodeGen {
         let cond_loc = self.get_location(cond);
         match &cond_loc {
             Loc::Reg(r) => {
-                // Test register with itself
                 self.push_lir(X86Inst::Test {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(*r),
@@ -2747,7 +2872,6 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                // Constant condition - just use appropriate value
                 if *v != 0 {
                     self.emit_move(then_val, dst_reg, size);
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
@@ -2755,14 +2879,12 @@ impl X86_64CodeGen {
                     }
                     return;
                 }
-                // else_val already in dst_reg
                 if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
                     self.emit_move_to_loc(dst_reg, &dst_loc, size);
                 }
                 return;
             }
             _ => {
-                // Load condition to scratch register and test
                 self.emit_move(cond, Reg::R11, 64);
                 self.push_lir(X86Inst::Test {
                     size: OperandSize::B64,
@@ -2772,8 +2894,6 @@ impl X86_64CodeGen {
             }
         }
 
-        // Conditional move: if condition is non-zero (NE), use then_val
-        // Use R11 for then_val when dst_reg is R10 to avoid clobbering else value
         let then_reg = if dst_reg == Reg::R10 {
             Reg::R11
         } else {
@@ -2787,7 +2907,6 @@ impl X86_64CodeGen {
             dst: dst_reg,
         });
 
-        // Move to final destination if needed
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }

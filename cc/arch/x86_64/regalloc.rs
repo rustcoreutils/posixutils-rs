@@ -885,9 +885,13 @@ impl RegAlloc {
                             };
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
 
-                            // Reusable when: not volatile, not address-taken
-                            let reusable = !local_var.is_volatile
-                                && !self.addr_taken_syms.contains(&interval.pseudo);
+                            // Disable stack slot reuse — liveness intervals are
+                            // unreliable for large functions with complex control flow
+                            // (e.g. computed gotos, deeply nested switches).  Wrong
+                            // intervals cause a freed slot to be reused while the
+                            // original variable is still live, leading to silent
+                            // corruption and SIGSEGV.
+                            let reusable = false;
 
                             self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
 

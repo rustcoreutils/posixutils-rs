@@ -961,9 +961,9 @@ impl RegAlloc {
                             let alignment = local.explicit_align.unwrap_or(8) as i32;
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
 
-                            // Reusable when: not volatile, not address-taken
-                            let reusable = !local.is_volatile
-                                && !self.addr_taken_syms.contains(&interval.pseudo);
+                            // Disable stack slot reuse — liveness intervals are
+                            // unreliable for large functions with complex control flow
+                            let reusable = false;
 
                             self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
 

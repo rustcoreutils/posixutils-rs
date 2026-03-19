@@ -5222,7 +5222,38 @@ impl<'a> Linearizer<'a> {
                         arg_types_vec.push(self.types.pointer_to(arg_type));
                     }
                 }
-                self.linearize_lvalue(a)
+                // For lvalue expressions (identifiers, member access), linearize_lvalue
+                // returns a symaddr (pointer). For rvalue expressions (call results),
+                // linearize_lvalue falls through to linearize_expr which returns the
+                // data pseudo, not its address. In that case we must emit a symaddr
+                // to get the address for pointer-based struct passing.
+                let is_lvalue = matches!(
+                    a.kind,
+                    ExprKind::Ident(_)
+                        | ExprKind::Member { .. }
+                        | ExprKind::Arrow { .. }
+                        | ExprKind::Index { .. }
+                        | ExprKind::Unary {
+                            op: crate::parse::ast::UnaryOp::Deref,
+                            ..
+                        }
+                        | ExprKind::CompoundLiteral { .. }
+                );
+                if is_lvalue {
+                    self.linearize_lvalue(a)
+                } else {
+                    // Rvalue (e.g., function call returning struct): evaluate,
+                    // then take address of the result local
+                    let val = self.linearize_expr(a);
+                    let result = self.alloc_pseudo();
+                    let pseudo = Pseudo::reg(result, result.0);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(pseudo);
+                    }
+                    let ptr_type = self.types.pointer_to(arg_type);
+                    self.emit(Instruction::sym_addr(result, val, ptr_type));
+                    result
+                }
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex

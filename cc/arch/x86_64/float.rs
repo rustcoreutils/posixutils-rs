@@ -419,16 +419,18 @@ impl X86_64CodeGen {
         } else {
             XmmReg::Xmm15
         };
+        // Use R10 (scratch) to avoid clobbering RAX which may hold
+        // a live pseudo (the register allocator allocates RAX to pseudos
+        // but doesn't know FP operations use it as scratch).
         if fp_size == FpSize::Single {
-            // Create sign mask in scratch register: all zeros except sign bit
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
                 src: GpOperand::Imm(0x80000000),
-                dst: GpOperand::Reg(Reg::Rax),
+                dst: GpOperand::Reg(Reg::R10),
             });
             self.push_lir(X86Inst::MovGpXmm {
                 size: OperandSize::B32,
-                src: Reg::Rax,
+                src: Reg::R10,
                 dst: scratch_xmm,
             });
             self.push_lir(X86Inst::XorFp {
@@ -439,11 +441,11 @@ impl X86_64CodeGen {
         } else {
             self.push_lir(X86Inst::MovAbs {
                 imm: 0x8000000000000000u64 as i64,
-                dst: Reg::Rax,
+                dst: Reg::R10,
             });
             self.push_lir(X86Inst::MovGpXmm {
                 size: OperandSize::B64,
-                src: Reg::Rax,
+                src: Reg::R10,
                 dst: scratch_xmm,
             });
             self.push_lir(X86Inst::XorFp {

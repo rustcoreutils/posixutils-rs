@@ -3512,3 +3512,40 @@ int main(void) {
         0
     );
 }
+
+/// Regression test: 2D char array initializers (e.g., char names[7][4] = {"Sun", ...})
+/// stored pointers to string constants instead of inline char data. The initializer
+/// treated each string as a `char*` (SymAddr) instead of `char[4]` (String).
+#[test]
+fn codegen_2d_char_array_init() {
+    let code = r#"
+#include <string.h>
+
+static const char wday[7][4] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+static const char mon[12][4] = {
+    "Jan","Feb","Mar","Apr","May","Jun",
+    "Jul","Aug","Sep","Oct","Nov","Dec"
+};
+
+int main(void) {
+    if (strcmp(wday[0], "Sun") != 0) return 1;
+    if (strcmp(wday[3], "Wed") != 0) return 2;
+    if (strcmp(wday[6], "Sat") != 0) return 3;
+    if (strcmp(mon[0], "Jan") != 0) return 4;
+    if (strcmp(mon[2], "Mar") != 0) return 5;
+    if (strcmp(mon[11], "Dec") != 0) return 6;
+
+    /* Test local (stack) 2D char array */
+    const char colors[3][6] = {"red", "green", "blue"};
+    if (strcmp(colors[0], "red") != 0) return 7;
+    if (strcmp(colors[1], "green") != 0) return 8;
+    if (strcmp(colors[2], "blue") != 0) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_2d_char_array_init", code, &[]),
+        0
+    );
+}

@@ -1312,7 +1312,21 @@ impl<'a> Linearizer<'a> {
                         continue;
                     };
                     let offset = (element_index as usize) * elem_size;
-                    let elem_init = if elem_is_aggregate {
+                    // When a string literal initializes a char/wchar_t array element
+                    // (e.g., char names[3][4] = {"Sun", "Mon", "Tue"}), handle it
+                    // directly with the ARRAY type. Otherwise ast_init_list_to_ir
+                    // recurses and passes elem_type=char, causing the string to be
+                    // stored as a pointer instead of inline char data.
+                    let is_string_for_char_array = elem_is_aggregate
+                        && list.len() == 1
+                        && matches!(
+                            list[0].value.kind,
+                            ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+                        )
+                        && self.types.kind(elem_type) == TypeKind::Array;
+                    let elem_init = if is_string_for_char_array {
+                        self.ast_init_to_ir(&list[0].value, elem_type)
+                    } else if elem_is_aggregate {
                         self.ast_init_list_to_ir(list, elem_type)
                     } else if let Some(last) = list.last() {
                         self.ast_init_to_ir(&last.value, elem_type)
@@ -2854,6 +2868,53 @@ impl<'a> Linearizer<'a> {
                         continue;
                     };
                     let offset = base_offset + element_index * elem_size as i64;
+                    // When a string literal initializes a char array element
+                    // (e.g., char arr[3][4] = {"Sun", "Mon", "Tue"}), handle
+                    // it as a string copy rather than recursing into individual
+                    // char stores. The recursion would treat the string as a
+                    // pointer instead of inline data.
+                    let is_string_for_char_array = elem_is_aggregate
+                        && list.len() == 1
+                        && matches!(
+                            list[0].value.kind,
+                            ExprKind::StringLit(_) | ExprKind::WideStringLit(_)
+                        )
+                        && self.types.kind(elem_type) == TypeKind::Array;
+                    if is_string_for_char_array {
+                        // Emit byte-by-byte stores for the string content
+                        if let ExprKind::StringLit(s) = &list[0].value.kind {
+                            let char_type = self
+                                .types
+                                .base_type(elem_type)
+                                .unwrap_or(self.types.char_id);
+                            let char_bits = self.types.size_bits(char_type);
+                            for (i, ch) in s.chars().enumerate() {
+                                let byte_val =
+                                    self.emit_const(ch as u8 as i64, self.types.int_id);
+                                self.emit(Instruction::store(
+                                    byte_val,
+                                    base_sym,
+                                    offset + i as i64,
+                                    char_type,
+                                    char_bits,
+                                ));
+                            }
+                            // Null terminator + zero fill
+                            let arr_bytes = (self.types.size_bits(elem_type) / 8) as usize;
+                            let str_len = s.chars().count();
+                            for i in str_len..arr_bytes {
+                                let zero = self.emit_const(0, self.types.int_id);
+                                self.emit(Instruction::store(
+                                    zero,
+                                    base_sym,
+                                    offset + i as i64,
+                                    char_type,
+                                    char_bits,
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                     if elem_is_aggregate {
                         self.linearize_init_list_at_offset(base_sym, offset, elem_type, list);
                         continue;

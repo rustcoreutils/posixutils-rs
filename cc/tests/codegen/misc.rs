@@ -3412,3 +3412,51 @@ int main(void) {
         0
     );
 }
+
+/// Regression test: FP binary operations (FMul, FDiv, etc.) clobbered src2
+/// when src2 was in the same XMM register as dst_xmm (Xmm0 for stack targets).
+/// emit_fp_move(src1, Xmm0) overwrote src2 before the operation.
+/// Manifested as `x *= scale` computing `x * x` instead of `x * scale`.
+#[test]
+fn codegen_fp_binop_src2_clobber() {
+    let code = r#"
+#include <math.h>
+
+/* Force enough register pressure that scale ends up in Xmm0 */
+__attribute__((noinline))
+double vector_norm_mini(int n, double *vec, double max) {
+    double x, scale, csum = 1.0, frac1 = 0.0;
+    int max_e;
+
+    frexp(max, &max_e);
+    scale = ldexp(1.0, -max_e);
+
+    for (int i = 0; i < n; i++) {
+        x = vec[i];
+        x *= scale;  /* Bug: became x *= x when scale was in Xmm0 */
+        double sq = x * x;
+        csum += sq;
+        frac1 += sq * 0.001;
+    }
+    double h = sqrt(csum - 1.0 + frac1);
+    return h / scale;
+}
+
+int main(void) {
+    double vec[] = {3.0, 4.0};
+    double r = vector_norm_mini(2, vec, 4.0);
+    /* Expected: sqrt((3/8)^2 + (4/8)^2 + frac) / (1/8) ≈ 5.0 */
+    if (r < 4.9 || r > 5.1) return 1;
+
+    double vec2[] = {5.0, 12.0};
+    r = vector_norm_mini(2, vec2, 12.0);
+    if (r < 12.9 || r > 13.1) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_fp_binop_src2_clobber", code, &["-lm".to_string()]),
+        0
+    );
+}

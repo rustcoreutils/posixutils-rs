@@ -319,6 +319,29 @@ impl X86_64CodeGen {
             _ => {}
         };
 
+        // Check if src2 is in dst_xmm — if so, moving src1 to dst_xmm would
+        // clobber src2. Save src2 to a scratch register first.
+        let src2_loc = self.get_location(src2);
+        let src2_saved = if let Loc::Xmm(x) = src2_loc {
+            if x == dst_xmm {
+                let scratch = if dst_xmm == XmmReg::Xmm15 {
+                    XmmReg::Xmm14
+                } else {
+                    XmmReg::Xmm15
+                };
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(x),
+                    dst: XmmOperand::Reg(scratch),
+                });
+                Some(scratch)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Move first operand to destination XMM register
         self.emit_fp_move(
             src1,
@@ -327,8 +350,10 @@ impl X86_64CodeGen {
         );
 
         // Apply operation with second operand
-        let src2_loc = self.get_location(src2);
         match src2_loc {
+            Loc::Xmm(_) if src2_saved.is_some() => {
+                emit_fp_binop_lir(self, XmmOperand::Reg(src2_saved.unwrap()), dst_xmm);
+            }
             Loc::Xmm(x) => {
                 emit_fp_binop_lir(self, XmmOperand::Reg(x), dst_xmm);
             }

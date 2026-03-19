@@ -3071,3 +3071,282 @@ int main(void) {
         0
     );
 }
+
+/// Regression test: emit_fp_move Loc::Imm used RAX as scratch, clobbering a live
+/// integer value. Fixed by using R10 (reserved scratch) instead.
+#[test]
+fn codegen_fp_move_no_rax_clobber() {
+    let code = r#"
+int printf(const char *, ...);
+
+/* Force RAX to hold a live integer value across an FP immediate load.
+   The function call returns in RAX, and the subsequent FP operation
+   must not clobber it. */
+int compute(int x) { return x * 7; }
+
+int main(void) {
+    int a = compute(6);   /* a = 42, likely in RAX after call */
+    double d = 3.14;      /* FP immediate load — must not clobber a */
+    int b = a + 1;        /* uses a — would get wrong value if clobbered */
+
+    if (b != 43) return 1;
+
+    /* Also test with float (32-bit path) */
+    int c = compute(10);  /* c = 70, in RAX */
+    float f = 2.5f;       /* float immediate — 32-bit Loc::Imm path */
+    int e = c + 2;
+    if (e != 72) return 2;
+
+    /* Multiple live ints across FP loads */
+    int x = compute(3);   /* x = 21 */
+    int y = compute(4);   /* y = 28 */
+    double d2 = 1.5;
+    float f2 = 0.5f;
+    if (x + y != 49) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_fp_move_no_rax_clobber", code, &[]), 0);
+}
+
+/// Regression test: emit_struct_store used RAX as a data shuttle in the qword
+/// copy loop (R10=src, R11=dst, RAX=shuttle). If a live pseudo was in RAX,
+/// it got clobbered. Fixed by using XMM15 (reserved scratch) as shuttle.
+#[test]
+fn codegen_struct_store_no_rax_clobber() {
+    let code = r#"
+typedef struct { long a; long b; long c; } Triple;
+
+Triple make_triple(long x, long y, long z) {
+    Triple t;
+    t.a = x; t.b = y; t.c = z;
+    return t;
+}
+
+int compute(int x) { return x * 11; }
+
+int main(void) {
+    /* Get a value in RAX from a call, then do a struct copy */
+    int val = compute(5);   /* val = 55, likely in RAX */
+    Triple t = make_triple(1, 2, 3);  /* struct store — must not clobber val */
+    int check = val + 1;
+    if (check != 56) return 1;
+    if (t.a != 1 || t.b != 2 || t.c != 3) return 2;
+
+    /* Chain: struct copy while multiple ints are live */
+    int a = compute(3);  /* 33 */
+    int b = compute(4);  /* 44 */
+    Triple t2 = make_triple(10, 20, 30);
+    if (a + b != 77) return 3;
+    if (t2.a != 10 || t2.b != 20 || t2.c != 30) return 4;
+
+    /* Struct assignment (copy, not return) */
+    Triple t3;
+    t3 = t2;
+    if (t3.a != 10 || t3.b != 20 || t3.c != 30) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_struct_store_no_rax_clobber", code, &[]),
+        0
+    );
+}
+
+/// Regression test: stack coloring with interference-graph approach.
+/// Tests that variables with non-contiguous live ranges in complex control flow
+/// (gotos creating non-linear block ordering) correctly share or don't share slots
+/// based on actual block-level liveness.
+#[test]
+fn codegen_stack_coloring_interference() {
+    let code = r#"
+int printf(const char *, ...);
+
+/* Volatile to prevent optimization */
+volatile int sink;
+
+int main(void) {
+    /* Test 1: Non-overlapping locals can share stack space */
+    {
+        int a = 10;
+        sink = a;
+    }
+    {
+        int b = 20;
+        sink = b;
+    }
+    if (sink != 20) return 1;
+
+    /* Test 2: Overlapping locals must NOT share stack space.
+       Use a loop with values that persist across iterations. */
+    int total = 0;
+    for (int i = 0; i < 10; i++) {
+        int x = i * 3;
+        int y = i * 7;
+        total += x + y;
+    }
+    /* sum(i*10, i=0..9) = 10*45 = 450 */
+    if (total != 450) return 2;
+
+    /* Test 3: Goto creating non-linear control flow */
+    int result = 0;
+    int phase = 0;
+    goto start;
+
+mid:
+    result += 100;
+    phase = 2;
+    goto done;
+
+start:
+    result = 42;
+    phase = 1;
+    goto mid;
+
+done:
+    if (result != 142) return 3;
+    if (phase != 2) return 4;
+
+    /* Test 4: Switch with fallthrough — complex CFG */
+    int sw_result = 0;
+    for (int i = 0; i < 4; i++) {
+        int temp = i * 5;
+        switch (i) {
+            case 0: sw_result += temp + 1; break;
+            case 1: sw_result += temp + 2; break;
+            case 2: sw_result += temp + 3; break;
+            default: sw_result += temp + 4; break;
+        }
+    }
+    /* (0+1) + (5+2) + (10+3) + (15+4) = 1+7+13+19 = 40 */
+    if (sw_result != 40) return 5;
+
+    /* Test 5: Large number of locals to exercise slot reuse */
+    int sum = 0;
+    for (int i = 0; i < 20; i++) {
+        int v0 = i;
+        int v1 = i + 1;
+        int v2 = i + 2;
+        int v3 = i + 3;
+        sum += v0 + v1 + v2 + v3;
+    }
+    /* sum = sum(4i+6, i=0..19) = 4*190+120 = 880 */
+    if (sum != 880) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_stack_coloring_interference", code, &[]),
+        0
+    );
+}
+
+/// Regression test: two-SSE struct (e.g., Py_complex {double, double}) passed as
+/// a call argument when the address pseudo is spilled to stack. The Loc::Stack
+/// case used LEA (address of stack slot) instead of MOV (load pointer from stack
+/// slot), producing garbage values.
+#[test]
+fn codegen_two_sse_struct_arg_spilled() {
+    let code = r#"
+typedef struct { double real; double imag; } Complex;
+
+/* Prevent inlining so the struct goes through the ABI */
+__attribute__((noinline))
+Complex make_complex(double r, double i) {
+    Complex c;
+    c.real = r;
+    c.imag = i;
+    return c;
+}
+
+__attribute__((noinline))
+Complex add_complex(Complex a, Complex b) {
+    Complex c;
+    c.real = a.real + b.real;
+    c.imag = a.imag + b.imag;
+    return c;
+}
+
+__attribute__((noinline))
+int check_complex(Complex c, double expect_real, double expect_imag) {
+    if (c.real != expect_real) return 1;
+    if (c.imag != expect_imag) return 1;
+    return 0;
+}
+
+int main(void) {
+    /* Basic: make and check */
+    Complex a = make_complex(1.0, 2.0);
+    if (check_complex(a, 1.0, 2.0)) return 1;
+
+    /* Chain: result of one call passed to another — triggers spill */
+    Complex b = make_complex(3.0, 4.0);
+    Complex c = add_complex(a, b);
+    if (check_complex(c, 4.0, 6.0)) return 2;
+
+    /* Multiple live complex values to force spills */
+    Complex d = make_complex(10.0, 20.0);
+    Complex e = make_complex(30.0, 40.0);
+    Complex f = add_complex(d, e);
+    if (check_complex(f, 40.0, 60.0)) return 3;
+
+    /* Verify earlier values weren't corrupted */
+    if (check_complex(a, 1.0, 2.0)) return 4;
+    if (check_complex(b, 3.0, 4.0)) return 5;
+
+    /* Triple chain */
+    Complex g = add_complex(add_complex(a, b), c);
+    if (check_complex(g, 8.0, 12.0)) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_two_sse_struct_arg_spilled", code, &[]),
+        0
+    );
+}
+
+/// Regression test: float arguments to variadic functions (e.g., printf) were
+/// not promoted to double per C99 6.5.2.2p7 "default argument promotions".
+/// The ABI requires xmm0 to hold a double, but pcc passed 32-bit float bits.
+#[test]
+fn codegen_variadic_float_promotion() {
+    let code = r#"
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char buf[64];
+    float f = 3.14f;
+
+    /* snprintf with %f — float must be promoted to double */
+    snprintf(buf, sizeof(buf), "%.2f", f);
+    if (strcmp(buf, "3.14") != 0) return 1;
+
+    /* FLT_MAX equivalent (avoid float.h dependency) */
+    float big = 3.40282346638528859811704183484516925440e+38f;
+    snprintf(buf, sizeof(buf), "%.0e", big);
+    /* Should be "3e+38" not "0e+00" */
+    if (buf[0] != '3') return 2;
+
+    /* Multiple float args in variadic call */
+    float a = 1.5f, b = 2.5f;
+    snprintf(buf, sizeof(buf), "%.1f,%.1f", a, b);
+    if (strcmp(buf, "1.5,2.5") != 0) return 3;
+
+    /* Mixed int and float in variadic */
+    snprintf(buf, sizeof(buf), "%d,%.1f,%d", 42, a, 99);
+    if (strcmp(buf, "42,1.5,99") != 0) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_variadic_float_promotion", code, &[]),
+        0
+    );
+}

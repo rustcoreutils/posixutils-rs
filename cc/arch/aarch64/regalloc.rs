@@ -38,7 +38,7 @@
 use crate::arch::regalloc::{
     compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
     find_conflicting_registers, identify_addr_taken_syms, identify_fp_pseudos,
-    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
+    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeKind, TypeTable};
@@ -679,6 +679,10 @@ pub struct RegAlloc {
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
     /// Sym pseudos whose address is taken (cannot participate in slot reuse)
     addr_taken_syms: HashSet<PseudoId>,
+    /// Per-block live-in sets for interference-based stack coloring
+    live_in: Vec<HashSet<PseudoId>>,
+    /// Per-block live-out sets for interference-based stack coloring
+    live_out: Vec<HashSet<PseudoId>>,
 }
 
 impl RegAlloc {
@@ -697,6 +701,8 @@ impl RegAlloc {
             active_stack: Vec::new(),
             free_stack_slots: BTreeMap::new(),
             addr_taken_syms: HashSet::new(),
+            live_in: Vec::new(),
+            live_out: Vec::new(),
         }
     }
 
@@ -708,7 +714,11 @@ impl RegAlloc {
         self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
-        let (intervals, constraint_points) = self.compute_live_intervals(func);
+        let result = self.compute_live_intervals(func);
+        self.live_in = result.live_in;
+        self.live_out = result.live_out;
+        let intervals = result.intervals;
+        let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func);
 
         self.spill_args_across_calls(func, &intervals, &call_positions);
@@ -733,6 +743,8 @@ impl RegAlloc {
         self.active_stack.clear();
         self.free_stack_slots.clear();
         self.addr_taken_syms.clear();
+        self.live_in.clear();
+        self.live_out.clear();
     }
 
     /// Pre-allocate argument registers per AAPCS64
@@ -881,8 +893,20 @@ impl RegAlloc {
     }
 
     /// Try to reuse a freed stack slot of the given size and alignment.
-    fn try_reuse_stack_slot(&mut self, size: i32, alignment: i32) -> Option<i32> {
-        super::super::regalloc::try_reuse_stack_slot(&mut self.free_stack_slots, size, alignment)
+    fn try_reuse_stack_slot(
+        &mut self,
+        size: i32,
+        alignment: i32,
+        candidate: PseudoId,
+    ) -> Option<i32> {
+        super::super::regalloc::try_reuse_stack_slot(
+            &mut self.free_stack_slots,
+            size,
+            alignment,
+            candidate,
+            &self.live_in,
+            &self.live_out,
+        )
     }
 
     /// Allocate a stack slot, optionally reusing a freed slot.
@@ -896,7 +920,7 @@ impl RegAlloc {
         reusable: bool,
     ) {
         if reusable {
-            if let Some(reused) = self.try_reuse_stack_slot(size, alignment) {
+            if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval.pseudo) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
                 self.active_stack.push((interval.clone(), reused, size));
                 return;
@@ -961,9 +985,10 @@ impl RegAlloc {
                             let alignment = local.explicit_align.unwrap_or(8) as i32;
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
 
-                            // Disable stack slot reuse — liveness intervals are
-                            // unreliable for large functions with complex control flow
-                            let reusable = false;
+                            // Stack slot reuse uses block-level interference checks
+                            // (live_in/live_out from dataflow fixpoint) which are correct
+                            // for all CFG shapes. Addr-taken syms need stable addresses.
+                            let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
 
                             self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
 
@@ -1114,10 +1139,7 @@ impl RegAlloc {
         expire_stack_intervals(&mut self.active_stack, &mut self.free_stack_slots, point);
     }
 
-    fn compute_live_intervals(
-        &self,
-        func: &Function,
-    ) -> (Vec<LiveInterval>, Vec<ConstraintPoint<Reg>>) {
+    fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {
         compute_live_intervals(func, |_: &Instruction| None)
     }
 

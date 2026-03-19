@@ -5279,27 +5279,39 @@ impl<'a> Linearizer<'a> {
             } else {
                 let mut val = self.linearize_expr(a);
 
-                // Implicit integer widening: if the actual argument is narrower
-                // than the formal parameter (e.g., int passed to Py_ssize_t/long),
-                // insert a sign/zero extension. This is needed for correct behavior
-                // when the function is later inlined — without it, the 32-bit pseudo
-                // would be used in 64-bit contexts with uninitialized upper bits.
+                // Implicit argument widening when actual type differs from formal
+                // parameter type. Handles both integer widening (int→long) and
+                // float widening (float→double, _Float16→double).
                 if let Some(ref params) = formal_param_types {
                     if arg_idx < params.len() {
                         let param_type = params[arg_idx];
                         let arg_size = self.types.size_bits(arg_type);
                         let param_size = self.types.size_bits(param_type);
-                        if arg_size < param_size
-                            && arg_size <= 32
+                        let is_int_widen = arg_size <= 32
                             && param_size <= 64
                             && self.types.is_integer(arg_type)
-                            && self.types.is_integer(param_type)
-                        {
+                            && self.types.is_integer(param_type);
+                        let is_fp_widen = self.types.is_float(arg_type)
+                            && self.types.is_float(param_type);
+                        if arg_size < param_size && (is_int_widen || is_fp_widen) {
                             val = self.emit_convert(val, arg_type, param_type);
-                            // Use the widened type so codegen emits a 64-bit
-                            // register move instead of a 32-bit one.
                             arg_type = param_type;
                         }
+                    }
+                }
+
+                // C99 6.5.2.2p7: Default argument promotions for variadic args.
+                // float/_Float16 are promoted to double; integer promotions
+                // also apply (already handled above for integers).
+                if let Some(va_start) = variadic_arg_start {
+                    if arg_idx >= va_start
+                        && matches!(
+                            self.types.kind(arg_type),
+                            TypeKind::Float | TypeKind::Float16
+                        )
+                    {
+                        val = self.emit_convert(val, arg_type, self.types.double_id);
+                        arg_type = self.types.double_id;
                     }
                 }
 

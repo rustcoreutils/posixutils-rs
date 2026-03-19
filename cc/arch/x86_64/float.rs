@@ -982,26 +982,27 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                // Integer immediate to float
+                // Integer immediate to float — use R10 (scratch) to avoid clobbering
+                // RAX which is allocatable and may hold a live pseudo
                 if size <= 32 {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(v),
-                        dst: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(Reg::R10),
                     });
                     self.push_lir(X86Inst::MovGpXmm {
                         size: OperandSize::B32,
-                        src: Reg::Rax,
+                        src: Reg::R10,
                         dst,
                     });
                 } else {
                     self.push_lir(X86Inst::MovAbs {
                         imm: v,
-                        dst: Reg::Rax,
+                        dst: Reg::R10,
                     });
                     self.push_lir(X86Inst::MovGpXmm {
                         size: OperandSize::B64,
-                        src: Reg::Rax,
+                        src: Reg::R10,
                         dst,
                     });
                 }

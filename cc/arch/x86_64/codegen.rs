@@ -2590,23 +2590,25 @@ impl X86_64CodeGen {
             _ => return,
         }
 
-        // Copy qword by qword
+        // Copy qword by qword using XMM15 as shuttle (R10=src, R11=dst).
+        // XMM15 is reserved scratch — avoids clobbering RAX which is
+        // allocatable and may hold a live pseudo.
         for i in 0..num_qwords {
             let byte_offset = (i * 8) as i32;
-            // LIR: load from source
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Mem(MemAddr::BaseOffset {
+            // LIR: load from source via XMM15
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::R10,
                     offset: byte_offset,
                 }),
-                dst: GpOperand::Reg(Reg::Rax),
+                dst: XmmOperand::Reg(XmmReg::Xmm15),
             });
-            // LIR: store to destination
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::Rax),
-                dst: GpOperand::Mem(MemAddr::BaseOffset {
+            // LIR: store to destination via XMM15
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Reg(XmmReg::Xmm15),
+                dst: XmmOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::R11,
                     offset: byte_offset,
                 }),

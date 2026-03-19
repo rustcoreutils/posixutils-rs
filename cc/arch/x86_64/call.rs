@@ -389,18 +389,22 @@ impl X86_64CodeGen {
                 if let crate::abi::ArgClass::Direct { ref classes, .. } = arg_class {
                     if classes.iter().all(|c| *c == crate::abi::RegClass::Sse) && classes.len() == 2
                     {
-                        // Two SSE registers: load two 8-byte doubles from struct address
+                        // Two SSE registers: load two 8-byte doubles from struct address.
+                        // The arg pseudo holds a pointer (from symaddr), not struct bytes.
+                        // For Loc::Stack, MOV loads the pointer; LEA would give the
+                        // address of the stack slot itself (pointer-to-pointer → garbage).
                         let arg_loc = self.get_location(arg);
                         let base = match arg_loc {
                             Loc::Reg(r) => r,
                             Loc::Stack(offset) => {
                                 let adjusted = offset + self.callee_saved_offset;
-                                self.push_lir(X86Inst::Lea {
-                                    addr: MemAddr::BaseOffset {
+                                self.push_lir(X86Inst::Mov {
+                                    size: OperandSize::B64,
+                                    src: GpOperand::Mem(MemAddr::BaseOffset {
                                         base: Reg::Rbp,
                                         offset: -adjusted,
-                                    },
-                                    dst: Reg::R11,
+                                    }),
+                                    dst: GpOperand::Reg(Reg::R11),
                                 });
                                 Reg::R11
                             }

@@ -5304,21 +5304,26 @@ impl<'a> Linearizer<'a> {
             } else {
                 let mut val = self.linearize_expr(a);
 
-                // Implicit argument widening when actual type differs from formal
-                // parameter type. Handles both integer widening (int→long) and
-                // float widening (float→double, _Float16→double).
+                // Implicit argument conversion when actual type differs from
+                // formal parameter type:
+                // - Integer widening: int→long (sign/zero extend)
+                // - FP widening: float→double, _Float16→double
+                // - FP narrowing: long double→double (e.g., Py_MATH_TAU
+                //   passed to PyFloat_FromDouble)
                 if let Some(ref params) = formal_param_types {
                     if arg_idx < params.len() {
                         let param_type = params[arg_idx];
                         let arg_size = self.types.size_bits(arg_type);
                         let param_size = self.types.size_bits(param_type);
-                        let is_int_widen = arg_size <= 32
+                        let is_int_widen = arg_size < param_size
+                            && arg_size <= 32
                             && param_size <= 64
                             && self.types.is_integer(arg_type)
                             && self.types.is_integer(param_type);
-                        let is_fp_widen = self.types.is_float(arg_type)
-                            && self.types.is_float(param_type);
-                        if arg_size < param_size && (is_int_widen || is_fp_widen) {
+                        let is_fp_convert = self.types.is_float(arg_type)
+                            && self.types.is_float(param_type)
+                            && arg_size != param_size;
+                        if is_int_widen || is_fp_convert {
                             val = self.emit_convert(val, arg_type, param_type);
                             arg_type = param_type;
                         }

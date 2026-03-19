@@ -3549,3 +3549,37 @@ int main(void) {
         0
     );
 }
+
+/// Regression test: ternary operator with division evaluated both branches
+/// unconditionally using cmov, causing SIGFPE when the divisor was zero.
+/// `b == 0 ? 0 : (a / b) + 1` crashed because `a / b` was computed even
+/// when `b == 0`.
+#[test]
+fn codegen_ternary_div_by_zero() {
+    let code = r#"
+long safe_div(long a, long b) {
+    return b == 0 ? 0 : (a / b) + 1;
+}
+
+int safe_mod(int a, int b) {
+    return b == 0 ? -1 : a % b;
+}
+
+int main(void) {
+    /* Division by zero should return 0, not crash */
+    if (safe_div(10, 0) != 0) return 1;
+    if (safe_div(10, 2) != 6) return 2;
+    if (safe_div(100, 3) != 34) return 3;
+
+    /* Modulo by zero should return -1, not crash */
+    if (safe_mod(10, 0) != -1) return 4;
+    if (safe_mod(10, 3) != 1) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_ternary_div_by_zero", code, &[]),
+        0
+    );
+}

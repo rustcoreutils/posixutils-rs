@@ -4057,9 +4057,13 @@ impl<'a> Linearizer<'a> {
             // __func__ is a pure string-like value
             ExprKind::FuncName => true,
 
-            // Binary ops are pure if both operands are pure
-            ExprKind::Binary { left, right, .. } => {
-                self.is_pure_expr(left) && self.is_pure_expr(right)
+            // Binary ops are pure if both operands are pure AND the
+            // operator can't trap. Division and modulo cause SIGFPE
+            // on division by zero, so they're never pure.
+            ExprKind::Binary { op, left, right, .. } => {
+                !matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                    && self.is_pure_expr(left)
+                    && self.is_pure_expr(right)
             }
 
             // Unary ops are pure if operand is pure, except for pre-inc/dec and dereference.

@@ -941,12 +941,21 @@ impl RegAlloc {
                 // Long double uses x87 FPU (stack-based), not XMM registers.
                 // Always allocate to stack with 16-byte slots for 80-bit extended precision.
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
+                // FP pseudos that live across basic block boundaries must be
+                // spilled to stack. Phase D's interval collapse is unreliable
+                // for multi-block lifetimes (same issue as stack coloring),
+                // so XMM registers would be prematurely freed and reused.
+                let crosses_block = self
+                    .live_out
+                    .iter()
+                    .any(|lo| lo.contains(&interval.pseudo));
                 if is_longdouble {
                     // Long double needs 16 bytes (80-bit padded to 128-bit)
                     self.alloc_stack_slot(&interval, 16, 16, false);
-                } else if crosses_call {
+                } else if crosses_call || crosses_block {
                     // All XMM registers are caller-saved on x86-64 SysV ABI.
-                    // Values live across function calls must be spilled to stack.
+                    // Values live across function calls or block boundaries
+                    // must be spilled to stack.
                     self.alloc_stack_slot(&interval, 8, 8, true);
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));

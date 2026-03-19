@@ -3420,10 +3420,14 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
-        // Handle character literal
+        // Handle character literal (including wide char L'x')
         if let Some(tok) = self.current() {
-            if let TokenValue::Char(c) = &tok.value {
-                let char_str = c.clone();
+            let char_str = match &tok.value {
+                TokenValue::Char(c) => Some(c.clone()),
+                TokenValue::WideChar(c) => Some(c.clone()),
+                _ => None,
+            };
+            if let Some(char_str) = char_str {
                 self.advance();
                 if char_str.is_empty() {
                     return 0;

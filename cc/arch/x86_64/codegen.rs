@@ -47,6 +47,8 @@ pub struct X86_64CodeGen {
     pub(super) num_fixed_gp_params: usize,
     /// Number of fixed FP parameters (for variadic functions)
     pub(super) num_fixed_fp_params: usize,
+    /// Number of fixed parameters passed on the stack (overflow beyond registers)
+    pub(super) num_fixed_stack_params: usize,
     /// Counter for generating unique internal labels
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
@@ -77,6 +79,7 @@ impl X86_64CodeGen {
             reg_save_area_offset: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
+            num_fixed_stack_params: 0,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
@@ -725,6 +728,11 @@ impl X86_64CodeGen {
                 types.is_float(*typ) && types.kind(*typ) != crate::types::TypeKind::LongDouble
             })
             .count();
+
+        // Count fixed params that overflow to the stack (beyond register capacity)
+        let gp_overflow = self.num_fixed_gp_params.saturating_sub(6);
+        let fp_overflow = self.num_fixed_fp_params.saturating_sub(8);
+        self.num_fixed_stack_params = gp_overflow + fp_overflow;
     }
 
     fn emit_block(&mut self, block: &crate::ir::BasicBlock, types: &TypeTable) {

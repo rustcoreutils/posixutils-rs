@@ -3460,3 +3460,55 @@ int main(void) {
         0
     );
 }
+
+/// Regression test: va_start overflow_arg_area didn't skip past fixed params
+/// that were passed on the stack (>6 int params). va_arg read the last fixed
+/// param as the first variadic arg, producing garbage values.
+#[test]
+fn codegen_va_start_stack_overflow_params() {
+    let code = r#"
+#include <stdarg.h>
+#include <stdio.h>
+
+/* 7 fixed int params — 6 in registers, 1 on stack. The variadic arg is the 8th. */
+__attribute__((noinline))
+int fmt7(int a, int b, int c, int d, int e, int f, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int val = va_arg(ap, int);
+    va_end(ap);
+    return val;
+}
+
+/* 8 fixed int params — 6 in regs, 2 on stack */
+__attribute__((noinline))
+int fmt8(int a, int b, int c, int d, int e, int f, int g, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int val = va_arg(ap, int);
+    va_end(ap);
+    return val;
+}
+
+int main(void) {
+    /* Test 7 fixed params + 1 variadic */
+    int r = fmt7(1, 2, 3, 4, 5, 6, "%c", 42);
+    if (r != 42) return 1;
+
+    /* Test 8 fixed params + 1 variadic */
+    r = fmt8(1, 2, 3, 4, 5, 6, 7, "%c", 99);
+    if (r != 99) return 2;
+
+    /* Test with snprintf-like pattern (7 params) */
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d", fmt7(10, 20, 30, 40, 50, 60, "test", 777));
+    if (buf[0] != '7') return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_va_start_stack_overflow_params", code, &[]),
+        0
+    );
+}

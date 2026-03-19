@@ -74,11 +74,14 @@ impl X86_64CodeGen {
                         offset: offset + 4,
                     }),
                 });
-                // overflow_arg_area = rbp + 16
+                // overflow_arg_area = rbp + 16 + (fixed_stack_params * 8)
+                // Skip past fixed parameters that were passed on the stack
+                // (when there are >6 int or >8 FP fixed params)
+                let overflow_offset = 16 + (self.num_fixed_stack_params * 8) as i32;
                 self.push_lir(X86Inst::Lea {
                     addr: MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: 16,
+                        offset: overflow_offset,
                     },
                     dst: Reg::Rax,
                 });
@@ -122,11 +125,12 @@ impl X86_64CodeGen {
                     src: GpOperand::Imm(fp_offset as i64),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 4 }),
                 });
-                // overflow_arg_area = rbp + 16
+                // overflow_arg_area = rbp + 16 + (fixed_stack_params * 8)
+                let overflow_offset = 16 + (self.num_fixed_stack_params * 8) as i32;
                 self.push_lir(X86Inst::Lea {
                     addr: MemAddr::BaseOffset {
                         base: Reg::Rbp,
-                        offset: 16,
+                        offset: overflow_offset,
                     },
                     dst: Reg::R10,
                 });

@@ -807,8 +807,17 @@ impl X86_64CodeGen {
             _ => Reg::R10, // Use scratch register R10
         };
 
-        // Convert using cvttss2si/cvttsd2si (truncate toward zero)
-        let int_size = OperandSize::from_bits(dst_size);
+        // Convert using cvttss2si/cvttsd2si (truncate toward zero).
+        // For unsigned 32-bit targets, use 64-bit conversion to avoid
+        // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
+        let is_unsigned = types
+            .modifiers(dst_typ)
+            .contains(crate::types::TypeModifiers::UNSIGNED);
+        let int_size = if is_unsigned && dst_size == 32 {
+            OperandSize::B64 // cvttsd2siq then truncate
+        } else {
+            OperandSize::from_bits(dst_size)
+        };
         self.push_lir(X86Inst::CvtFpToInt {
             fp_size,
             int_size,

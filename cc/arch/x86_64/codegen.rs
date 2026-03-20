@@ -581,10 +581,14 @@ impl X86_64CodeGen {
                                 let abi = crate::abi::SysVAmd64Abi;
                                 let cls = abi.classify_param(*typ, types);
                                 if let crate::abi::ArgClass::Direct { ref classes, .. } = cls {
-                                    let sse_count =
-                                        classes.iter().filter(|c| **c == crate::abi::RegClass::Sse).count();
-                                    let gp_count =
-                                        classes.iter().filter(|c| **c == crate::abi::RegClass::Integer).count();
+                                    let sse_count = classes
+                                        .iter()
+                                        .filter(|c| **c == crate::abi::RegClass::Sse)
+                                        .count();
+                                    let gp_count = classes
+                                        .iter()
+                                        .filter(|c| **c == crate::abi::RegClass::Integer)
+                                        .count();
                                     fp_arg_idx += sse_count;
                                     int_arg_idx += gp_count;
                                 } else {

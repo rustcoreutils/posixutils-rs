@@ -3107,7 +3107,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("codegen_fp_move_no_rax_clobber", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_fp_move_no_rax_clobber", code, &[]),
+        0
+    );
 }
 
 /// Regression test: emit_struct_store used RAX as a data shuttle in the qword
@@ -3407,10 +3410,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("codegen_small_struct_return", code, &[]),
-        0
-    );
+    assert_eq!(compile_and_run("codegen_small_struct_return", code, &[]), 0);
 }
 
 /// Regression test: FP binary operations (FMul, FDiv, etc.) clobbered src2
@@ -3544,10 +3544,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("codegen_2d_char_array_init", code, &[]),
-        0
-    );
+    assert_eq!(compile_and_run("codegen_2d_char_array_init", code, &[]), 0);
 }
 
 /// Regression test: ternary operator with division evaluated both branches
@@ -3578,8 +3575,60 @@ int main(void) {
     return 0;
 }
 "#;
+    assert_eq!(compile_and_run("codegen_ternary_div_by_zero", code, &[]), 0);
+}
+
+// ============================================================================
+// Test: switch-case block-scoped struct stack slot reuse
+// ============================================================================
+
+#[test]
+fn codegen_switch_case_slot_reuse() {
+    let code = r#"
+struct big { long a; long b; long c; long d; };
+
+int test_switch(int sel) {
+    int result = 0;
+    switch (sel) {
+    case 0: {
+        struct big x = {1, 2, 3, 4};
+        result = (int)(x.a + x.b + x.c + x.d);
+        break;
+    }
+    case 1: {
+        struct big y = {10, 20, 30, 40};
+        result = (int)(y.a + y.b + y.c + y.d);
+        break;
+    }
+    case 2: {
+        struct big z = {100, 200, 300, 400};
+        result = (int)(z.a + z.b + z.c + z.d);
+        break;
+    }
+    case 3: {
+        struct big w = {5, 6, 7, 8};
+        result = (int)(w.a + w.b + w.c + w.d);
+        break;
+    }
+    }
+    return result;
+}
+
+int main(void) {
+    if (test_switch(0) != 10) return 1;
+    if (test_switch(1) != 100) return 2;
+    if (test_switch(2) != 1000) return 3;
+    if (test_switch(3) != 26) return 4;
+    return 0;
+}
+"#;
     assert_eq!(
-        compile_and_run("codegen_ternary_div_by_zero", code, &[]),
+        compile_and_run("codegen_switch_case_slot_reuse", code, &[]),
+        0
+    );
+    // Also verify correctness at -O2
+    assert_eq!(
+        compile_and_run_optimized("codegen_switch_case_slot_reuse_opt", code),
         0
     );
 }

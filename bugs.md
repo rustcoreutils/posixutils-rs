@@ -1,6 +1,6 @@
 # pcc Bug Log — CPython Build Campaign
 
-## Status: CPython 3.12.9 builds and runs with pcc at -O0. Stack coloring implemented — eval loop frame 118KB→83KB. test_copy/test_functools pass with default stack. 14/20 core tests pass with ulimit -s unlimited.
+## Status: CPython 3.12.9 builds and runs with pcc at -O0. Sym pseudo liveness fix — eval loop frame 118KB→61KB. 456/458 tests pass (ulimit -s unlimited). test_threading passes with default 8MB stack.
 
 ### Bugs A-N, P, Q, 1-6: ALL FIXED (see git history)
 
@@ -81,19 +81,20 @@
 - **Remaining:** When a 2-SSE struct is the FIRST param followed by integer params, the callee's function entry code assigns integer args to the wrong registers (off by one). `powu(Complex x, long n)` reads `n` from rsi instead of rdi.
 - **Workaround:** Complex tests work when struct is not first param, or with unlimited stack.
 
-### Bug AF: Stack overflow from excessive frame sizes — PARTIALLY FIXED
-- `_PyEval_EvalFrameDefault` frame reduced from 118KB to 83KB via stack slot reuse
+### Bug AF: Stack overflow from excessive frame sizes — FIXED
+- `_PyEval_EvalFrameDefault` frame reduced from 118KB to 83KB to 61KB via stack slot reuse
 - Stack coloring reuses slots for non-loop-spanning pseudos with non-overlapping intervals
-- test_copy and test_functools now pass with default `ulimit -s` (8MB)
-- test_io still needs `ulimit -s unlimited` (deep `__repr__` recursion * 83KB frame)
-- **Remaining:** frame still ~83x larger than gcc's ~1KB; further reduction needs better register allocation or more aggressive stack coloring
+- Sym pseudo liveness fix: kill Sym pseudos at their declaration blocks before gen/kill scan, preventing block-scoped locals from appearing simultaneously live across switch/case/computed-goto dispatch
+- test_threading now passes without `ulimit -s unlimited` (previously SIGSEGV from thread stack overflow)
+- 17 additional CPython tests now passing
 
 ### Bug AG-AK: See git log for recent fixes (small struct return, FP binop clobber, va_start overflow, long double narrowing, XMM cross-block spill)
 
 ### Test status: CPython 3.12.9 make test at -O0 (ulimit -s unlimited)
 - 491 tests run (test_decimal skipped, hangs at -O0)
-- 439 PASS, 19 FAIL (baseline was 70 FAIL, 51 tests fixed)
-- Remaining 19: test_audioop test_buffer test_capi test_clinic test_cmd_line_script test_datetime test_descr test_fractions test_interpreters test_mailbox test_perf_profiler test_statistics test_threading test_time test_tools test_tracemalloc test_unicode test_userstring test.test_gdb.test_pretty_print
+- 456 PASS, 2 FAIL (baseline was 70 FAIL, 68 tests fixed)
+- Remaining 2: test.test_gdb.test_pretty_print (GCC-specific, expected), test_tools (parallel flake, passes individually)
+- test_threading and test_statistics pass without `ulimit -s unlimited`
 
 ### CPython build setup at -O0
 - configure CC=/tmp/pcc-bin/pcc, then fix pyconfig.h GETPGRP/SETPGRP

@@ -2889,8 +2889,7 @@ impl<'a> Linearizer<'a> {
                                 .unwrap_or(self.types.char_id);
                             let char_bits = self.types.size_bits(char_type);
                             for (i, ch) in s.chars().enumerate() {
-                                let byte_val =
-                                    self.emit_const(ch as u8 as i64, self.types.int_id);
+                                let byte_val = self.emit_const(ch as u8 as i64, self.types.int_id);
                                 self.emit(Instruction::store(
                                     byte_val,
                                     base_sym,
@@ -3485,29 +3484,77 @@ impl<'a> Linearizer<'a> {
                     BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                         // Use unsigned comparison when either operand is unsigned.
                         // C promotes both to the common unsigned type for comparison.
-                        let left_unsigned = left
-                            .typ
-                            .is_some_and(|t| self.types.modifiers(t).contains(TypeModifiers::UNSIGNED));
-                        let right_unsigned = right
-                            .typ
-                            .is_some_and(|t| self.types.modifiers(t).contains(TypeModifiers::UNSIGNED));
+                        let left_unsigned = left.typ.is_some_and(|t| {
+                            self.types.modifiers(t).contains(TypeModifiers::UNSIGNED)
+                        });
+                        let right_unsigned = right.typ.is_some_and(|t| {
+                            self.types.modifiers(t).contains(TypeModifiers::UNSIGNED)
+                        });
                         let use_unsigned = left_unsigned || right_unsigned;
                         if use_unsigned {
                             let lu = l as u64;
                             let ru = r as u64;
                             Some(match op {
-                                BinaryOp::Lt => if lu < ru { 1 } else { 0 },
-                                BinaryOp::Le => if lu <= ru { 1 } else { 0 },
-                                BinaryOp::Gt => if lu > ru { 1 } else { 0 },
-                                BinaryOp::Ge => if lu >= ru { 1 } else { 0 },
+                                BinaryOp::Lt => {
+                                    if lu < ru {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                BinaryOp::Le => {
+                                    if lu <= ru {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                BinaryOp::Gt => {
+                                    if lu > ru {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                BinaryOp::Ge => {
+                                    if lu >= ru {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
                                 _ => unreachable!(),
                             })
                         } else {
                             Some(match op {
-                                BinaryOp::Lt => if l < r { 1 } else { 0 },
-                                BinaryOp::Le => if l <= r { 1 } else { 0 },
-                                BinaryOp::Gt => if l > r { 1 } else { 0 },
-                                BinaryOp::Ge => if l >= r { 1 } else { 0 },
+                                BinaryOp::Lt => {
+                                    if l < r {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                BinaryOp::Le => {
+                                    if l <= r {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                BinaryOp::Gt => {
+                                    if l > r {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                BinaryOp::Ge => {
+                                    if l >= r {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
                                 _ => unreachable!(),
                             })
                         }
@@ -4110,7 +4157,9 @@ impl<'a> Linearizer<'a> {
             // Binary ops are pure if both operands are pure AND the
             // operator can't trap. Division and modulo cause SIGFPE
             // on division by zero, so they're never pure.
-            ExprKind::Binary { op, left, right, .. } => {
+            ExprKind::Binary {
+                op, left, right, ..
+            } => {
                 !matches!(op, BinaryOp::Div | BinaryOp::Mod)
                     && self.is_pure_expr(left)
                     && self.is_pure_expr(right)
@@ -7563,7 +7612,13 @@ impl<'a> Linearizer<'a> {
         }
         if remaining % 4 >= 2 {
             let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.ushort_id, 16));
+            self.emit(Instruction::load(
+                tmp,
+                src,
+                offset,
+                self.types.ushort_id,
+                16,
+            ));
             self.emit(Instruction::store(
                 tmp,
                 dst,

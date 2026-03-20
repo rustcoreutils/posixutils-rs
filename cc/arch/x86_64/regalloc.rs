@@ -945,10 +945,7 @@ impl RegAlloc {
                 // spilled to stack. Phase D's interval collapse is unreliable
                 // for multi-block lifetimes (same issue as stack coloring),
                 // so XMM registers would be prematurely freed and reused.
-                let crosses_block = self
-                    .live_out
-                    .iter()
-                    .any(|lo| lo.contains(&interval.pseudo));
+                let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
                 if is_longdouble {
                     // Long double needs 16 bytes (80-bit padded to 128-bit)
                     self.alloc_stack_slot(&interval, 16, 16, false);

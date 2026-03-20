@@ -197,10 +197,7 @@ pub fn pseudos_interfere(
 ///   - Returns `None` if no constraints apply
 ///
 /// The callback signature: `Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>`
-pub fn compute_live_intervals<R, F>(
-    func: &Function,
-    get_constraint_info: F,
-) -> LivenessResult<R>
+pub fn compute_live_intervals<R, F>(func: &Function, get_constraint_info: F) -> LivenessResult<R>
 where
     R: Clone,
     F: Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>,
@@ -248,6 +245,27 @@ where
     let mut kill: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
     let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
+
+    // Phase B.0: Pre-populate kill[] with Sym pseudo declaration points.
+    // Sym pseudos (local variable stack addresses) are never instruction targets —
+    // they only appear as sources in Load/Store/SymAddr. Without explicit kill points,
+    // backward dataflow propagates every Sym's liveness back to function entry, making
+    // ALL block-scoped locals appear simultaneously live. This prevents stack slot reuse
+    // for variables in different switch/case blocks or computed-goto dispatch targets.
+    // By killing each Sym at its declaration block BEFORE the gen/kill scan, uses of
+    // Sym pseudos in their declaration block won't be added to gen[], bounding liveness
+    // to [decl_block, last_use] and enabling slot reuse for non-overlapping scopes.
+    for local_var in func.locals.values() {
+        if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
+            kill[block_idx].insert(local_var.sym);
+            first_pos_map[block_idx]
+                .entry(local_var.sym)
+                .or_insert(block_start_pos[block_idx]);
+            last_pos_map[block_idx]
+                .entry(local_var.sym)
+                .or_insert(block_start_pos[block_idx]);
+        }
+    }
 
     for (idx, block) in func.blocks.iter().enumerate() {
         let mut ipos = block_start_pos[idx];

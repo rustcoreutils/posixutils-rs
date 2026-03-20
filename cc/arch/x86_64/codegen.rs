@@ -776,7 +776,7 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            if insn.is_two_reg_return {
+            if insn.returns_two_regs() {
                 // Two-register struct return: check ABI for SSE vs INTEGER
                 if is_struct_or_union {
                     if let Some(typ) = ret_typ {
@@ -1193,8 +1193,7 @@ impl X86_64CodeGen {
             Opcode::Cbr => if self.emit_cbr(insn, types) {},
 
             Opcode::Switch => {
-                // Switch uses target as the value to switch on
-                if let Some(val) = insn.target {
+                if let Some(&val) = insn.src.first() {
                     // Derive comparison size from type to handle long/pointer switches
                     let switch_size = insn
                         .typ

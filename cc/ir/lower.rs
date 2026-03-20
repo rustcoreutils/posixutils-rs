@@ -95,10 +95,7 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
     for (bb_id, insn_idx) in &phisource_positions {
         if let Some(bb) = func.get_block_mut(*bb_id) {
             if *insn_idx < bb.insns.len() {
-                bb.insns[*insn_idx].op = Opcode::Nop;
-                bb.insns[*insn_idx].src.clear();
-                bb.insns[*insn_idx].target = None;
-                bb.insns[*insn_idx].phi_list.clear();
+                bb.insns[*insn_idx].kill();
             }
         }
     }
@@ -122,10 +119,7 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
     for (bb_id, insn_idx) in phi_positions {
         if let Some(bb) = func.get_block_mut(bb_id) {
             if insn_idx < bb.insns.len() {
-                bb.insns[insn_idx].op = Opcode::Nop;
-                bb.insns[insn_idx].src.clear();
-                bb.insns[insn_idx].target = None;
-                bb.insns[insn_idx].phi_list.clear();
+                bb.insns[insn_idx].kill();
             }
         }
     }

@@ -15,7 +15,7 @@ use super::{
     AsmConstraint, AsmData, BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer,
     Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId,
 };
-use crate::abi::{get_abi_for_conv, Abi, ArgClass, CallingConv, RegClass};
+use crate::abi::{get_abi_for_conv, ArgClass, CallingConv, RegClass};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind,
@@ -325,6 +325,27 @@ impl<'a> Linearizer<'a> {
         id
     }
 
+    /// Allocate a new pseudo and register it in the current function.
+    fn alloc_reg_pseudo(&mut self) -> PseudoId {
+        let id = self.alloc_pseudo();
+        let pseudo = Pseudo::reg(id, id.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        id
+    }
+
+    /// Map a bitfield storage unit byte-size to the corresponding unsigned type.
+    fn bitfield_storage_type(&self, storage_size: u32) -> TypeId {
+        match storage_size {
+            1 => self.types.uchar_id,
+            2 => self.types.ushort_id,
+            4 => self.types.uint_id,
+            8 => self.types.ulong_id,
+            _ => self.types.uint_id,
+        }
+    }
+
     /// Allocate a new basic block ID
     fn alloc_bb(&mut self) -> BasicBlockId {
         let id = BasicBlockId(self.next_bb);
@@ -537,11 +558,7 @@ impl<'a> Linearizer<'a> {
         // - Result is 0 if the value compares equal to 0
         // - Result is 1 otherwise
         if to_kind == TypeKind::Bool && from_kind != TypeKind::Bool {
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
 
             // Create a zero constant for comparison
             let zero = self.emit_const(0, from_typ);
@@ -563,11 +580,7 @@ impl<'a> Linearizer<'a> {
 
         // Handle floating point conversions
         if from_float || to_float {
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
 
             let opcode = if from_float && to_float {
                 // Float to float (e.g., float to double or double to float)
@@ -601,11 +614,7 @@ impl<'a> Linearizer<'a> {
             return val;
         }
 
-        let result = self.alloc_pseudo();
-        let pseudo = Pseudo::reg(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
+        let result = self.alloc_reg_pseudo();
 
         if to_size > from_size {
             // Extending - use sign or zero extension based on source type
@@ -1877,7 +1886,7 @@ impl<'a> Linearizer<'a> {
                 // through complex_params so the codegen handles the register split.
                 let size = self.types.size_bits(param.typ);
                 let is_two_sse = size > 64 && size <= 128 && {
-                    let abi = crate::abi::SysVAmd64Abi;
+                    let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     matches!(
                         abi.classify_param(param.typ, self.types),
                         crate::abi::ArgClass::Direct { ref classes, .. }
@@ -1962,21 +1971,13 @@ impl<'a> Linearizer<'a> {
                 // arg_pseudo is an IncomingArg pointing to the struct data on the stack.
                 // Use SymAddr to get the base address, then copy each 8-byte chunk.
                 let ptr_type = self.types.pointer_to(typ);
-                let addr_pseudo = self.alloc_pseudo();
-                let addr_pseudo_obj = Pseudo::reg(addr_pseudo, addr_pseudo.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(addr_pseudo_obj);
-                }
+                let addr_pseudo = self.alloc_reg_pseudo();
                 self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
 
                 let struct_size = typ_size / 8;
                 let mut offset = 0i64;
                 while offset < struct_size as i64 {
-                    let temp = self.alloc_pseudo();
-                    let temp_pseudo = Pseudo::reg(temp, temp.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(temp_pseudo);
-                    }
+                    let temp = self.alloc_reg_pseudo();
                     self.emit(Instruction::load(
                         temp,
                         addr_pseudo,
@@ -1999,11 +2000,7 @@ impl<'a> Linearizer<'a> {
                 let struct_size = typ_size / 8;
                 let mut offset = 0i64;
                 while offset < struct_size as i64 {
-                    let temp = self.alloc_pseudo();
-                    let temp_pseudo = Pseudo::reg(temp, temp.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(temp_pseudo);
-                    }
+                    let temp = self.alloc_reg_pseudo();
                     self.emit(Instruction::load(
                         temp,
                         arg_pseudo,
@@ -2159,11 +2156,7 @@ impl<'a> Linearizer<'a> {
         let mut byte_offset = 0i64;
 
         while byte_offset < struct_bytes {
-            let temp = self.alloc_pseudo();
-            let temp_pseudo = Pseudo::reg(temp, temp.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(temp_pseudo);
-            }
+            let temp = self.alloc_reg_pseudo();
             self.emit(Instruction::load(
                 temp,
                 src_addr,
@@ -2194,11 +2187,7 @@ impl<'a> Linearizer<'a> {
         let struct_size = self.types.size_bits(ret_type);
 
         // Load first 8 bytes
-        let low_temp = self.alloc_pseudo();
-        let low_pseudo = Pseudo::reg(low_temp, low_temp.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(low_pseudo);
-        }
+        let low_temp = self.alloc_reg_pseudo();
         self.emit(Instruction::load(
             low_temp,
             src_addr,
@@ -2208,11 +2197,7 @@ impl<'a> Linearizer<'a> {
         ));
 
         // Load second portion (remaining bytes, up to 8)
-        let high_temp = self.alloc_pseudo();
-        let high_pseudo = Pseudo::reg(high_temp, high_temp.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(high_pseudo);
-        }
+        let high_temp = self.alloc_reg_pseudo();
         let high_size = std::cmp::min(64, struct_size - 64);
         self.emit(Instruction::load(
             high_temp,
@@ -2222,10 +2207,12 @@ impl<'a> Linearizer<'a> {
             high_size,
         ));
 
-        // Emit return with both values and two_reg_return flag
+        // Emit return with both values and ABI info for two-register return
         let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
         ret_insn.src.push(high_temp);
-        ret_insn.is_two_reg_return = true;
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let ret_class = abi.classify_return(ret_type, self.types);
+        ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
         self.emit(ret_insn);
     }
 
@@ -2982,13 +2969,7 @@ impl<'a> Linearizer<'a> {
                                 {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
-                                    let storage_type = match storage_size {
-                                        1 => self.types.uchar_id,
-                                        2 => self.types.ushort_id,
-                                        4 => self.types.uint_id,
-                                        8 => self.types.ulong_id,
-                                        _ => self.types.uint_id,
-                                    };
+                                    let storage_type = self.bitfield_storage_type(storage_size);
                                     let converted = self.emit_convert(val, val_type, storage_type);
                                     self.emit_bitfield_store(
                                         base_sym,
@@ -4617,11 +4598,7 @@ impl<'a> Linearizer<'a> {
                 self.linearize_init_list(sym_id, *typ, elements);
 
                 // Return address of the compound literal
-                let result = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
+                let result = self.alloc_reg_pseudo();
                 let ptr_type = self.types.pointer_to(*typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                 result
@@ -4789,11 +4766,7 @@ impl<'a> Linearizer<'a> {
 
         if src_is_float && !dst_is_float {
             // Float to integer conversion
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
             // FCvtS for signed int, FCvtU for unsigned
             let opcode = if self.types.is_unsigned(cast_type) {
                 Opcode::FCvtU
@@ -4811,11 +4784,7 @@ impl<'a> Linearizer<'a> {
             result
         } else if !src_is_float && dst_is_float {
             // Integer to float conversion
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
             // SCvtF for signed int, UCvtF for unsigned
             let opcode = if self.types.is_unsigned(src_type) {
                 Opcode::UCvtF
@@ -4836,11 +4805,7 @@ impl<'a> Linearizer<'a> {
             let src_size = self.types.size_bits(src_type);
             let dst_size = self.types.size_bits(cast_type);
             if src_size != dst_size {
-                let result = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
+                let result = self.alloc_reg_pseudo();
                 let mut insn = Instruction::new(Opcode::FCvtF)
                     .with_target(result)
                     .with_src(src)
@@ -4861,19 +4826,39 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a struct member access expression (e.g., s.member)
     fn linearize_member(&mut self, expr: &Expr, inner_expr: &Expr, member: StringId) -> PseudoId {
-        // Get address of the struct base
         let base = self.linearize_lvalue(inner_expr);
         let base_struct_type = self.expr_type(inner_expr);
-        // Resolve if the struct type is incomplete (forward-declared)
         let struct_type = self.resolve_struct_type(base_struct_type);
+        self.emit_member_access(base, struct_type, member, self.expr_type(expr))
+    }
 
-        // Look up member offset and type
+    /// Linearize a pointer member access expression (e.g., p->member)
+    fn linearize_arrow(&mut self, expr: &Expr, inner_expr: &Expr, member: StringId) -> PseudoId {
+        let ptr = self.linearize_expr(inner_expr);
+        let ptr_type = self.expr_type(inner_expr);
+        let base_struct_type = self
+            .types
+            .base_type(ptr_type)
+            .unwrap_or_else(|| self.expr_type(expr));
+        let struct_type = self.resolve_struct_type(base_struct_type);
+        self.emit_member_access(ptr, struct_type, member, self.expr_type(expr))
+    }
+
+    /// Shared logic for member access (both `.` and `->`).
+    /// `base` is the address of the struct (for `.`) or the pointer value (for `->`).
+    fn emit_member_access(
+        &mut self,
+        base: PseudoId,
+        struct_type: TypeId,
+        member: StringId,
+        fallback_type: TypeId,
+    ) -> PseudoId {
         let member_info = self
             .types
             .find_member(struct_type, member)
-            .unwrap_or_else(|| MemberInfo {
+            .unwrap_or(MemberInfo {
                 offset: 0,
-                typ: self.expr_type(expr),
+                typ: fallback_type,
                 bit_offset: None,
                 bit_width: None,
                 storage_unit_size: None,
@@ -4936,97 +4921,6 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::load(
                     result,
                     base,
-                    member_info.offset as i64,
-                    member_info.typ,
-                    size,
-                ));
-                result
-            }
-        }
-    }
-
-    /// Linearize a pointer member access expression (e.g., p->member)
-    fn linearize_arrow(&mut self, expr: &Expr, inner_expr: &Expr, member: StringId) -> PseudoId {
-        // Pointer already contains the struct address
-        let ptr = self.linearize_expr(inner_expr);
-        let ptr_type = self.expr_type(inner_expr);
-
-        // Dereference pointer to get struct type, then resolve if incomplete
-        let base_struct_type = self
-            .types
-            .base_type(ptr_type)
-            .unwrap_or_else(|| self.expr_type(expr));
-        let struct_type = self.resolve_struct_type(base_struct_type);
-
-        // Look up member offset and type
-        let member_info = self
-            .types
-            .find_member(struct_type, member)
-            .unwrap_or_else(|| MemberInfo {
-                offset: 0,
-                typ: self.expr_type(expr),
-                bit_offset: None,
-                bit_width: None,
-                storage_unit_size: None,
-            });
-
-        // If member type is an array, return the address (arrays decay to pointers)
-        if self.types.kind(member_info.typ) == TypeKind::Array {
-            if member_info.offset == 0 {
-                ptr
-            } else {
-                let result = self.alloc_pseudo();
-                let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
-                self.emit(Instruction::binop(
-                    Opcode::Add,
-                    result,
-                    ptr,
-                    offset_val,
-                    self.types.long_id,
-                    64,
-                ));
-                result
-            }
-        } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-            member_info.bit_offset,
-            member_info.bit_width,
-            member_info.storage_unit_size,
-        ) {
-            // Bitfield read
-            self.emit_bitfield_load(
-                ptr,
-                member_info.offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                member_info.typ,
-            )
-        } else {
-            let size = self.types.size_bits(member_info.typ);
-            let member_kind = self.types.kind(member_info.typ);
-
-            // Large structs (size > 64) can't be loaded into registers - return address
-            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
-                if member_info.offset == 0 {
-                    ptr
-                } else {
-                    let result = self.alloc_pseudo();
-                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
-                    self.emit(Instruction::binop(
-                        Opcode::Add,
-                        result,
-                        ptr,
-                        offset_val,
-                        self.types.long_id,
-                        64,
-                    ));
-                    result
-                }
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    result,
-                    ptr,
                     member_info.offset as i64,
                     member_info.typ,
                     size,
@@ -5285,11 +5179,7 @@ impl<'a> Linearizer<'a> {
             }
 
             // Get address of the allocated space
-            let sret_addr = self.alloc_pseudo();
-            let addr_pseudo = Pseudo::reg(sret_addr, sret_addr.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(addr_pseudo);
-            }
+            let sret_addr = self.alloc_reg_pseudo();
             self.emit(Instruction::sym_addr(
                 sret_addr,
                 sret_sym,
@@ -5396,7 +5286,7 @@ impl<'a> Linearizer<'a> {
                     arg_types_vec.push(arg_type);
                 } else {
                     // Medium struct (9-16 bytes): check ABI classification
-                    let abi = crate::abi::SysVAmd64Abi;
+                    let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     let is_two_sse = matches!(
                         abi.classify_param(arg_type, self.types),
                         crate::abi::ArgClass::Direct { ref classes, .. }
@@ -5434,11 +5324,7 @@ impl<'a> Linearizer<'a> {
                     // Rvalue (e.g., function call returning struct): evaluate,
                     // then take address of the result local
                     let val = self.linearize_expr(a);
-                    let result = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
+                    let result = self.alloc_reg_pseudo();
                     let ptr_type = self.types.pointer_to(arg_type);
                     self.emit(Instruction::sym_addr(result, val, ptr_type));
                     result
@@ -5537,11 +5423,7 @@ impl<'a> Linearizer<'a> {
         if returns_large_struct {
             // For large struct returns, the return value is the address
             // stored in result_sym (which is a local symbol containing the struct)
-            let result = self.alloc_pseudo();
-            let result_pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(result_pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
             let ptr_typ = self.types.pointer_to(typ);
             let mut call_insn = if let Some(func_addr) = indirect_target {
                 // Indirect call through function pointer
@@ -5565,7 +5447,6 @@ impl<'a> Linearizer<'a> {
                 )
             };
             call_insn.variadic_arg_start = variadic_arg_start;
-            call_insn.is_sret_call = true;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
@@ -5596,7 +5477,6 @@ impl<'a> Linearizer<'a> {
             };
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_noreturn_call = is_noreturn_call;
-            call_insn.is_two_reg_return = returns_two_reg_struct;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             result_sym
@@ -5620,11 +5500,7 @@ impl<'a> Linearizer<'a> {
 
         let old_val = if is_local {
             // Copy the old value to a temp
-            let temp = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(temp, temp.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let temp = self.alloc_reg_pseudo();
             self.emit(
                 Instruction::new(Opcode::Copy)
                     .with_target(temp)
@@ -5647,11 +5523,7 @@ impl<'a> Linearizer<'a> {
         } else {
             self.emit_const(1, typ)
         };
-        let result = self.alloc_pseudo();
-        let pseudo = Pseudo::reg(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
+        let result = self.alloc_reg_pseudo();
         let opcode = if is_float {
             if is_inc {
                 Opcode::FAdd
@@ -5772,11 +5644,7 @@ impl<'a> Linearizer<'a> {
                     ptr_typ,
                     64,
                 ));
-                let addr = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(addr, addr.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
+                let addr = self.alloc_reg_pseudo();
                 self.emit(Instruction::binop(
                     Opcode::Add,
                     addr,
@@ -5962,11 +5830,7 @@ impl<'a> Linearizer<'a> {
             let val = if let Some(addr) = deref_addr {
                 let deref_typ = self.expr_type(operand);
                 let deref_size = self.types.size_bits(deref_typ);
-                let loaded = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(loaded, loaded.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
+                let loaded = self.alloc_reg_pseudo();
                 self.emit(Instruction::load(loaded, addr, 0, deref_typ, deref_size));
                 loaded
             } else {
@@ -5986,11 +5850,7 @@ impl<'a> Linearizer<'a> {
             } else {
                 self.emit_const(1, typ)
             };
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
             let opcode = if is_float {
                 if op == UnaryOp::PreInc {
                     Opcode::FAdd
@@ -6111,11 +5971,7 @@ impl<'a> Linearizer<'a> {
                         ptr_typ,
                         64,
                     ));
-                    let addr = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(addr, addr.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
+                    let addr = self.alloc_reg_pseudo();
                     self.emit(Instruction::binop(
                         Opcode::Add,
                         addr,
@@ -6164,11 +6020,7 @@ impl<'a> Linearizer<'a> {
         }
 
         // Create result pseudo for the address
-        let result = self.alloc_pseudo();
-        let pseudo = Pseudo::reg(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
+        let result = self.alloc_reg_pseudo();
 
         // Type: const char* (pointer to char)
         let char_type = self.types.char_id;
@@ -6234,11 +6086,7 @@ impl<'a> Linearizer<'a> {
                     unreachable!("static local sentinel without static_locals entry");
                 }
             }
-            let result = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let result = self.alloc_reg_pseudo();
             let type_kind = self.types.kind(local.typ);
             let size = self.types.size_bits(local.typ);
             // Arrays decay to pointers - get address, not value
@@ -6324,6 +6172,113 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Emit a symbol address for a string/wide-string label.
+    fn emit_string_sym(&mut self, expr: &Expr, label: String) -> PseudoId {
+        let sym_id = self.alloc_pseudo();
+        let sym_pseudo = Pseudo::sym(sym_id, label);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(sym_pseudo);
+        }
+        let result = self.alloc_reg_pseudo();
+        let typ = self.expr_type(expr);
+        self.emit(Instruction::sym_addr(result, sym_id, typ));
+        result
+    }
+
+    fn linearize_ternary(
+        &mut self,
+        expr: &Expr,
+        cond: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> PseudoId {
+        let result_typ = self.expr_type(expr);
+        let size = if self.types.kind(result_typ) == TypeKind::Function {
+            64
+        } else {
+            self.types.size_bits(result_typ)
+        };
+
+        if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) {
+            // Pure: use Select instruction (enables cmov/csel)
+            let cond_val = self.linearize_expr(cond);
+            let cond_typ = self.expr_type(cond);
+            let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+            let mut then_val = self.linearize_expr(then_expr);
+            let mut else_val = self.linearize_expr(else_expr);
+
+            let then_typ = self.expr_type(then_expr);
+            let else_typ = self.expr_type(else_expr);
+            let then_size = self.types.size_bits(then_typ);
+            let else_size = self.types.size_bits(else_typ);
+            if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
+                then_val = self.emit_convert(then_val, then_typ, result_typ);
+            }
+            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+                else_val = self.emit_convert(else_val, else_typ, result_typ);
+            }
+
+            let result = self.alloc_pseudo();
+            self.emit(Instruction::select(
+                result, cond_bool, then_val, else_val, result_typ, size,
+            ));
+            result
+        } else {
+            // Impure: use control flow + phi for proper short-circuit evaluation
+            let then_bb = self.alloc_bb();
+            let else_bb = self.alloc_bb();
+            let merge_bb = self.alloc_bb();
+
+            let cond_val = self.linearize_expr(cond);
+            let cond_typ = self.expr_type(cond);
+            let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+            let cond_end_bb = self.current_bb.unwrap();
+
+            self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+            self.link_bb(cond_end_bb, then_bb);
+            self.link_bb(cond_end_bb, else_bb);
+
+            self.switch_bb(then_bb);
+            let mut then_val = self.linearize_expr(then_expr);
+            let then_typ = self.expr_type(then_expr);
+            let then_size = self.types.size_bits(then_typ);
+            if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
+                then_val = self.emit_convert(then_val, then_typ, result_typ);
+            }
+            let then_end_bb = self.current_bb.unwrap();
+            self.emit(Instruction::br(merge_bb));
+            self.link_bb(then_end_bb, merge_bb);
+
+            self.switch_bb(else_bb);
+            let mut else_val = self.linearize_expr(else_expr);
+            let else_typ = self.expr_type(else_expr);
+            let else_size = self.types.size_bits(else_typ);
+            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+                else_val = self.emit_convert(else_val, else_typ, result_typ);
+            }
+            let else_end_bb = self.current_bb.unwrap();
+            self.emit(Instruction::br(merge_bb));
+            self.link_bb(else_end_bb, merge_bb);
+
+            self.switch_bb(merge_bb);
+            let result = self.alloc_pseudo();
+            let phi_pseudo = Pseudo::phi(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(phi_pseudo);
+            }
+            let mut phi_insn = Instruction::phi(result, result_typ, size);
+            let phisrc1 =
+                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
+            phi_insn.phi_list.push((then_end_bb, phisrc1));
+            let phisrc2 =
+                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
+            phi_insn.phi_list.push((else_end_bb, phisrc2));
+            self.emit(phi_insn);
+
+            result
+        }
+    }
+
     fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
         // Set current position for debug info
         self.current_pos = Some(expr.pos);
@@ -6345,51 +6300,13 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::StringLit(s) => {
-                // Add string to module and get its label
                 let label = self.module.add_string(s.clone());
-
-                // Create a symbol pseudo for the string label
-                let sym_id = self.alloc_pseudo();
-                let sym_pseudo = Pseudo::sym(sym_id, label.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(sym_pseudo);
-                }
-
-                // Create result pseudo for the address
-                let result = self.alloc_pseudo();
-                let typ = self.expr_type(expr);
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-
-                // Emit SymAddr to load the address of the string
-                self.emit(Instruction::sym_addr(result, sym_id, typ));
-                result
+                self.emit_string_sym(expr, label)
             }
 
             ExprKind::WideStringLit(s) => {
-                // Add wide string to module and get its label
                 let label = self.module.add_wide_string(s.clone());
-
-                // Create a symbol pseudo for the wide string label
-                let sym_id = self.alloc_pseudo();
-                let sym_pseudo = Pseudo::sym(sym_id, label.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(sym_pseudo);
-                }
-
-                // Create result pseudo for the address
-                let result = self.alloc_pseudo();
-                let typ = self.expr_type(expr);
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-
-                // Emit SymAddr to load the address of the wide string
-                self.emit(Instruction::sym_addr(result, sym_id, typ));
-                result
+                self.emit_string_sym(expr, label)
             }
 
             ExprKind::Ident(symbol_id) => self.linearize_ident(expr, *symbol_id),
@@ -6410,122 +6327,7 @@ impl<'a> Linearizer<'a> {
                 cond,
                 then_expr,
                 else_expr,
-            } => {
-                let result_typ = self.expr_type(expr);
-                // Function types in ternary expressions decay to pointers (64-bit)
-                let size = if self.types.kind(result_typ) == TypeKind::Function {
-                    64
-                } else {
-                    self.types.size_bits(result_typ)
-                };
-
-                // Check if both branches are pure (side-effect-free).
-                // If so, we can use Select instruction which enables cmov/csel codegen.
-                // Otherwise, we must use control flow for proper short-circuit evaluation.
-                if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) {
-                    // Pure: use Select instruction (enables cmov/csel)
-                    let cond_val = self.linearize_expr(cond);
-                    let cond_typ = self.expr_type(cond);
-                    let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
-                    let mut then_val = self.linearize_expr(then_expr);
-                    let mut else_val = self.linearize_expr(else_expr);
-
-                    // Promote narrower operands to the result type (usual arithmetic conversions).
-                    // E.g., `long_var ? long_count : -1` where -1 is int (32-bit).
-                    let then_typ = self.expr_type(then_expr);
-                    let else_typ = self.expr_type(else_expr);
-                    let then_size = self.types.size_bits(then_typ);
-                    let else_size = self.types.size_bits(else_typ);
-                    if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
-                        then_val = self.emit_convert(then_val, then_typ, result_typ);
-                    }
-                    if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
-                        else_val = self.emit_convert(else_val, else_typ, result_typ);
-                    }
-
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::select(
-                        result, cond_bool, then_val, else_val, result_typ, size,
-                    ));
-                    result
-                } else {
-                    // Impure: use control flow + phi for proper short-circuit evaluation
-                    // Only evaluate the selected branch (important for side effects)
-
-                    // Create basic blocks for branches
-                    let then_bb = self.alloc_bb();
-                    let else_bb = self.alloc_bb();
-                    let merge_bb = self.alloc_bb();
-
-                    // Evaluate condition
-                    let cond_val = self.linearize_expr(cond);
-                    let cond_typ = self.expr_type(cond);
-                    let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
-
-                    let cond_end_bb = self.current_bb.unwrap();
-
-                    // Branch on condition: if true go to then_bb, else go to else_bb
-                    self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-                    self.link_bb(cond_end_bb, then_bb);
-                    self.link_bb(cond_end_bb, else_bb);
-
-                    // Then branch: evaluate then_expr
-                    self.switch_bb(then_bb);
-                    let mut then_val = self.linearize_expr(then_expr);
-                    // Promote narrower operand to result type
-                    let then_typ = self.expr_type(then_expr);
-                    let then_size = self.types.size_bits(then_typ);
-                    if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
-                        then_val = self.emit_convert(then_val, then_typ, result_typ);
-                    }
-                    let then_end_bb = self.current_bb.unwrap();
-                    self.emit(Instruction::br(merge_bb));
-                    self.link_bb(then_end_bb, merge_bb);
-
-                    // Else branch: evaluate else_expr
-                    self.switch_bb(else_bb);
-                    let mut else_val = self.linearize_expr(else_expr);
-                    let else_typ = self.expr_type(else_expr);
-                    let else_size = self.types.size_bits(else_typ);
-                    if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
-                        else_val = self.emit_convert(else_val, else_typ, result_typ);
-                    }
-                    let else_end_bb = self.current_bb.unwrap();
-                    self.emit(Instruction::br(merge_bb));
-                    self.link_bb(else_end_bb, merge_bb);
-
-                    // Merge: phi node to get result
-                    self.switch_bb(merge_bb);
-                    let result = self.alloc_pseudo();
-                    // Create a phi pseudo for the target - important for register allocation
-                    let phi_pseudo = Pseudo::phi(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(phi_pseudo);
-                    }
-                    let mut phi_insn = Instruction::phi(result, result_typ, size);
-                    let phisrc1 = self.emit_phi_source(
-                        then_end_bb,
-                        then_val,
-                        result,
-                        merge_bb,
-                        result_typ,
-                        size,
-                    );
-                    phi_insn.phi_list.push((then_end_bb, phisrc1));
-                    let phisrc2 = self.emit_phi_source(
-                        else_end_bb,
-                        else_val,
-                        result,
-                        merge_bb,
-                        result_typ,
-                        size,
-                    );
-                    phi_insn.phi_list.push((else_end_bb, phisrc2));
-                    self.emit(phi_insn);
-
-                    result
-                }
-            }
+            } => self.linearize_ternary(expr, cond, then_expr, else_expr),
 
             ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
 
@@ -6660,11 +6462,7 @@ impl<'a> Linearizer<'a> {
 
                 // For arrays: return pointer (array-to-pointer decay)
                 // For structs/scalars: load and return the value
-                let result = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
+                let result = self.alloc_reg_pseudo();
 
                 let type_kind = self.types.kind(*typ);
                 let size = self.types.size_bits(*typ);
@@ -7527,56 +7325,11 @@ impl<'a> Linearizer<'a> {
 
     /// Emit a block copy from src to dst using integer chunks.
     fn emit_block_copy(&mut self, dst: PseudoId, src: PseudoId, size_bytes: i64) {
-        let mut offset: i64 = 0;
-
-        // Copy in 8-byte chunks
-        while offset + 8 <= size_bytes {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.ulong_id, 64));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                offset,
-                self.types.ulong_id,
-                64,
-            ));
-            offset += 8;
-        }
-
-        // Handle remaining bytes
-        let remaining = size_bytes - offset;
-        if remaining >= 4 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.uint_id, 32));
-            self.emit(Instruction::store(tmp, dst, offset, self.types.uint_id, 32));
-            offset += 4;
-        }
-        if remaining % 4 >= 2 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                tmp,
-                src,
-                offset,
-                self.types.ushort_id,
-                16,
-            ));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                offset,
-                self.types.ushort_id,
-                16,
-            ));
-            offset += 2;
-        }
-        if remaining % 2 == 1 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
-            self.emit(Instruction::store(tmp, dst, offset, self.types.uchar_id, 8));
-        }
+        self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
     }
 
-    /// Like emit_block_copy but the destination stores start at dst_base_offset.
+    /// Emit a block copy from src to dst using integer chunks.
+    /// The destination stores start at dst_base_offset.
     fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
@@ -7653,13 +7406,7 @@ impl<'a> Linearizer<'a> {
         typ: TypeId,
     ) -> PseudoId {
         // Determine storage type based on storage unit size
-        let storage_type = match storage_size {
-            1 => self.types.uchar_id,
-            2 => self.types.ushort_id,
-            4 => self.types.uint_id,
-            8 => self.types.ulong_id,
-            _ => self.types.uint_id,
-        };
+        let storage_type = self.bitfield_storage_type(storage_size);
         let storage_bits = storage_size * 8;
 
         // 1. Load the entire storage unit
@@ -7759,13 +7506,7 @@ impl<'a> Linearizer<'a> {
         new_value: PseudoId,
     ) {
         // Determine storage type based on storage unit size
-        let storage_type = match storage_size {
-            1 => self.types.uchar_id,
-            2 => self.types.ushort_id,
-            4 => self.types.uint_id,
-            8 => self.types.ulong_id,
-            _ => self.types.uint_id,
-        };
+        let storage_type = self.bitfield_storage_type(storage_size);
         let storage_bits = storage_size * 8;
 
         // 1. Load current storage unit value
@@ -8430,6 +8171,41 @@ impl<'a> Linearizer<'a> {
         result_sym
     }
 
+    /// Emit a call to a runtime library function with ABI classification.
+    ///
+    /// Handles ABI param/return classification, instruction creation, and emission.
+    fn emit_rtlib_call(
+        &mut self,
+        func_name: &str,
+        arg_vals: Vec<PseudoId>,
+        arg_types: Vec<TypeId>,
+        ret_type: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let ret_size = self.types.size_bits(ret_type);
+
+        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, self.types))
+            .collect();
+        let ret_class = abi.classify_return(ret_type, self.types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut call_insn = Instruction::call(
+            Some(result),
+            func_name,
+            arg_vals,
+            arg_types,
+            ret_type,
+            ret_size,
+        );
+        call_insn.abi_info = Some(call_abi_info);
+        self.emit(call_insn);
+
+        result
+    }
+
     /// Emit a call to a long double rtlib function (__addxf3, __multf3, etc.).
     ///
     /// These functions take 2 long double args and return a long double.
@@ -8440,33 +8216,12 @@ impl<'a> Linearizer<'a> {
         right: PseudoId,
         longdouble_typ: TypeId,
     ) -> PseudoId {
-        let result = self.alloc_pseudo();
-        let size = self.types.size_bits(longdouble_typ);
-
-        let arg_vals = vec![left, right];
-        let arg_types = vec![longdouble_typ, longdouble_typ];
-
-        // Compute ABI classification for the call
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let param_classes: Vec<_> = arg_types
-            .iter()
-            .map(|&t| abi.classify_param(t, self.types))
-            .collect();
-        let ret_class = abi.classify_return(longdouble_typ, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
-
-        let mut call_insn = Instruction::call(
-            Some(result),
+        self.emit_rtlib_call(
             func_name,
-            arg_vals,
-            arg_types,
+            vec![left, right],
+            vec![longdouble_typ, longdouble_typ],
             longdouble_typ,
-            size,
-        );
-        call_insn.abi_info = Some(call_abi_info);
-        self.emit(call_insn);
-
-        result
+        )
     }
 
     /// Emit a call to a long double comparison rtlib function (__cmpxf2, __cmptf2).
@@ -8565,11 +8320,7 @@ impl<'a> Linearizer<'a> {
         let right_ext = self.emit_float16_extend_call(right, float16_typ, float_typ);
 
         // 3. Perform native float operation
-        let result_float = self.alloc_pseudo();
-        let pseudo = Pseudo::reg(result_float, result_float.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
+        let result_float = self.alloc_reg_pseudo();
         let opcode = match op {
             BinaryOp::Add => Opcode::FAdd,
             BinaryOp::Sub => Opcode::FSub,
@@ -8612,11 +8363,7 @@ impl<'a> Linearizer<'a> {
         let right_ext = self.emit_float16_extend_call(right, float16_typ, float_typ);
 
         // 3. Perform native float comparison
-        let result = self.alloc_pseudo();
-        let pseudo = Pseudo::reg(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
+        let result = self.alloc_reg_pseudo();
         let opcode = match op {
             BinaryOp::Lt => Opcode::FCmpOLt,
             BinaryOp::Le => Opcode::FCmpOLe,
@@ -8648,11 +8395,7 @@ impl<'a> Linearizer<'a> {
         let src_ext = self.emit_float16_extend_call(src, float16_typ, float_typ);
 
         // 2. Perform native float negation
-        let result_float = self.alloc_pseudo();
-        let pseudo = Pseudo::reg(result_float, result_float.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
+        let result_float = self.alloc_reg_pseudo();
         self.emit(Instruction::unop(
             Opcode::FNeg,
             result_float,
@@ -8801,33 +8544,7 @@ impl<'a> Linearizer<'a> {
         src_type: TypeId,
         dst_type: TypeId,
     ) -> PseudoId {
-        let result = self.alloc_pseudo();
-        let dst_size = self.types.size_bits(dst_type);
-
-        let arg_vals = vec![src];
-        let arg_types = vec![src_type];
-
-        // Compute ABI classification for the call
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let param_classes: Vec<_> = arg_types
-            .iter()
-            .map(|&t| abi.classify_param(t, self.types))
-            .collect();
-        let ret_class = abi.classify_return(dst_type, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
-
-        let mut call_insn = Instruction::call(
-            Some(result),
-            func_name,
-            arg_vals,
-            arg_types,
-            dst_type,
-            dst_size,
-        );
-        call_insn.abi_info = Some(call_abi_info);
-        self.emit(call_insn);
-
-        result
+        self.emit_rtlib_call(func_name, vec![src], vec![src_type], dst_type)
     }
 
     /// Emit a call to a Float16 conversion rtlib function with correct ABI for x86-64.
@@ -9164,11 +8881,7 @@ impl<'a> Linearizer<'a> {
             // Extend the integer to 64-bit for proper arithmetic
             let rhs_extended = self.emit_convert(rhs, value_typ, self.types.long_id);
 
-            let scaled = self.alloc_pseudo();
-            let pseudo = Pseudo::reg(scaled, scaled.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let scaled = self.alloc_reg_pseudo();
             self.emit(Instruction::binop(
                 Opcode::Mul,
                 scaled,
@@ -9187,11 +8900,7 @@ impl<'a> Linearizer<'a> {
             _ => {
                 // Compound assignment - get current value and apply operation
                 let lhs = self.linearize_expr(target);
-                let result = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
+                let result = self.alloc_reg_pseudo();
 
                 let is_float = self.types.is_float(target_typ);
                 let is_unsigned = self.types.is_unsigned(target_typ);

@@ -123,10 +123,10 @@ Call fields:
 - `src`: arguments
 - `arg_types`: parallel type info
 - `variadic_arg_start`: where varargs begin
-- `is_sret_call`: large struct return via hidden pointer
-- `is_two_reg_return`: 9-16 byte struct via RAX+RDX / X0+X1
 - `is_noreturn_call`: function never returns
 - `abi_info`: rich ABI classification (see below)
+- `returns_via_sret()`: derived from abi_info — large struct return via hidden pointer
+- `returns_two_regs()`: derived from abi_info — 9-16 byte struct via RAX+RDX / X0+X1
 
 ### ABI Classification (`abi_info`)
 
@@ -146,8 +146,8 @@ CallAbiInfo {
 - `Extend { signed, size_bits }` - extend small integer
 - `Ignore` - zero-sized type
 
-This provides more detailed ABI information than `is_sret_call`/`is_two_reg_return`,
-including per-eightbyte register class (INTEGER vs SSE) for struct fields.
+This provides per-eightbyte register class (INTEGER vs SSE) for struct fields.
+Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 
 ### Variadic Support
 

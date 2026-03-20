@@ -284,14 +284,14 @@ impl InlineContext {
     }
 
     /// Remap a pseudo from callee to caller space
-    fn remap_pseudo(&mut self, callee_id: PseudoId, callee_pseudos: &[Pseudo]) -> PseudoId {
+    fn remap_pseudo(&mut self, callee_id: PseudoId, callee_func: &Function) -> PseudoId {
         // Check if already mapped
         if let Some(&mapped) = self.pseudo_map.get(&callee_id) {
             return mapped;
         }
 
         // Find the pseudo in callee
-        let callee_pseudo = callee_pseudos.iter().find(|p| p.id == callee_id);
+        let callee_pseudo = callee_func.get_pseudo(callee_id);
 
         let new_id = match callee_pseudo.map(|p| &p.kind) {
             // Arguments: substitute with call site arguments
@@ -327,8 +327,8 @@ impl InlineContext {
     }
 
     /// Create a remapped copy of a pseudo
-    fn clone_pseudo(&mut self, callee_pseudo: &Pseudo, callee_pseudos: &[Pseudo]) -> Pseudo {
-        let new_id = self.remap_pseudo(callee_pseudo.id, callee_pseudos);
+    fn clone_pseudo(&mut self, callee_pseudo: &Pseudo, callee_func: &Function) -> Pseudo {
+        let new_id = self.remap_pseudo(callee_pseudo.id, callee_func);
 
         let new_kind = match &callee_pseudo.kind {
             PseudoKind::Arg(n) => {
@@ -382,7 +382,7 @@ impl InlineContext {
 fn clone_instruction(
     ctx: &mut InlineContext,
     insn: &Instruction,
-    callee_pseudos: &[Pseudo],
+    callee_func: &Function,
 ) -> Vec<Instruction> {
     match insn.op {
         // Entry instruction: skip (caller already has its own)
@@ -395,12 +395,12 @@ fn clone_instruction(
             // If returning a value, copy to return target
             if let Some(ret_val) = insn.src.first() {
                 if let Some(target) = ctx.return_target {
-                    if insn.is_two_reg_return && insn.src.len() >= 2 {
+                    if insn.returns_two_regs() && insn.src.len() >= 2 {
                         // Two-register struct return: store both halves to the
                         // result local. The target is a __2reg_N local symbol;
                         // low half goes at offset 0, high half at offset 8.
-                        let remapped_low = ctx.remap_pseudo(insn.src[0], callee_pseudos);
-                        let remapped_high = ctx.remap_pseudo(insn.src[1], callee_pseudos);
+                        let remapped_low = ctx.remap_pseudo(insn.src[0], callee_func);
+                        let remapped_high = ctx.remap_pseudo(insn.src[1], callee_func);
 
                         let mut store_low = Instruction::store(
                             remapped_low,
@@ -422,7 +422,7 @@ fn clone_instruction(
                         store_high.pos = insn.pos;
                         result.push(store_high);
                     } else {
-                        let remapped_val = ctx.remap_pseudo(*ret_val, callee_pseudos);
+                        let remapped_val = ctx.remap_pseudo(*ret_val, callee_func);
                         let mut copy_insn = Instruction::new(Opcode::Copy);
                         copy_insn.target = Some(target);
                         copy_insn.src = vec![remapped_val];
@@ -454,17 +454,21 @@ fn clone_instruction(
             new_insn.src = insn
                 .src
                 .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_pseudos))
+                .map(|s| ctx.remap_pseudo(*s, callee_func))
                 .collect();
             new_insn.bb_true = insn.bb_true.map(|bb| ctx.remap_bb(bb));
             new_insn.bb_false = insn.bb_false.map(|bb| ctx.remap_bb(bb));
             vec![new_insn]
         }
 
-        // Switch: remap all targets
+        // Switch: remap value (src[0]) and all branch targets
         Opcode::Switch => {
             let mut new_insn = Instruction::new(Opcode::Switch);
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_pseudos));
+            new_insn.src = insn
+                .src
+                .iter()
+                .map(|&s| ctx.remap_pseudo(s, callee_func))
+                .collect();
             new_insn.switch_cases = insn
                 .switch_cases
                 .iter()
@@ -477,13 +481,13 @@ fn clone_instruction(
         // Phi nodes: remap all sources and block references
         Opcode::Phi => {
             let mut new_insn = Instruction::new(Opcode::Phi);
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_pseudos));
+            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_func));
             new_insn.typ = insn.typ;
             new_insn.size = insn.size;
             new_insn.phi_list = insn
                 .phi_list
                 .iter()
-                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_pseudos)))
+                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_func)))
                 .collect();
             vec![new_insn]
         }
@@ -491,18 +495,18 @@ fn clone_instruction(
         // PhiSource: remap target, src, and back-pointer
         Opcode::PhiSource => {
             let mut new_insn = Instruction::new(Opcode::PhiSource);
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_pseudos));
+            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_func));
             new_insn.src = insn
                 .src
                 .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_pseudos))
+                .map(|s| ctx.remap_pseudo(*s, callee_func))
                 .collect();
             new_insn.typ = insn.typ;
             new_insn.size = insn.size;
             new_insn.phi_list = insn
                 .phi_list
                 .iter()
-                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_pseudos)))
+                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_func)))
                 .collect();
             vec![new_insn]
         }
@@ -510,16 +514,16 @@ fn clone_instruction(
         // Call instructions: remap arguments but keep function name
         Opcode::Call => {
             let mut new_insn = insn.clone();
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_pseudos));
+            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_func));
             new_insn.src = insn
                 .src
                 .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_pseudos))
+                .map(|s| ctx.remap_pseudo(*s, callee_func))
                 .collect();
             // For indirect calls, also remap the function pointer pseudo
             new_insn.indirect_target = insn
                 .indirect_target
-                .map(|t| ctx.remap_pseudo(t, callee_pseudos));
+                .map(|t| ctx.remap_pseudo(t, callee_func));
             // Keep func_name and other call metadata unchanged
             vec![new_insn]
         }
@@ -536,14 +540,14 @@ fn clone_instruction(
 
             // Remap target
             if let Some(target) = new_insn.target {
-                new_insn.target = Some(ctx.remap_pseudo(target, callee_pseudos));
+                new_insn.target = Some(ctx.remap_pseudo(target, callee_func));
             }
 
             // Remap sources
             new_insn.src = new_insn
                 .src
                 .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_pseudos))
+                .map(|s| ctx.remap_pseudo(*s, callee_func))
                 .collect();
 
             // Remap branch targets if present (shouldn't be for non-control-flow)
@@ -562,6 +566,75 @@ fn clone_instruction(
 // ============================================================================
 // Call Site Inlining
 // ============================================================================
+
+/// Clone all callee basic blocks into the inline context, remapping instructions.
+fn clone_callee_blocks(ctx: &mut InlineContext, callee: &Function) -> Vec<BasicBlock> {
+    let mut blocks = Vec::with_capacity(callee.blocks.len());
+    for callee_bb in &callee.blocks {
+        let new_bb_id = ctx.bb_map[&callee_bb.id];
+        let mut new_bb = BasicBlock::new(new_bb_id);
+        new_bb.parents = callee_bb.parents.clone();
+        new_bb.children = callee_bb.children.clone();
+        for insn in &callee_bb.insns {
+            let cloned = clone_instruction(ctx, insn, callee);
+            for new_insn in cloned {
+                new_bb.insns.push(new_insn);
+            }
+        }
+        new_bb.label = Some(format!(
+            "{}_inline{}_bb{}",
+            callee.name, ctx.inline_id, callee_bb.id.0
+        ));
+        blocks.push(new_bb);
+    }
+    blocks
+}
+
+/// Clone callee pseudos that were used during instruction cloning.
+fn clone_callee_pseudos(
+    ctx: &mut InlineContext,
+    callee: &Function,
+    caller: &Function,
+) -> Vec<Pseudo> {
+    let mut pseudos = Vec::with_capacity(callee.pseudos.len());
+    for callee_pseudo in &callee.pseudos {
+        if matches!(callee_pseudo.kind, PseudoKind::Arg(_)) {
+            continue;
+        }
+        if ctx.pseudo_map.contains_key(&callee_pseudo.id) {
+            let new_pseudo = ctx.clone_pseudo(callee_pseudo, callee);
+            if !caller.pseudos.iter().any(|p| p.id == new_pseudo.id) {
+                pseudos.push(new_pseudo);
+            }
+        }
+    }
+    pseudos
+}
+
+/// Split the caller's basic block at the call site.
+///
+/// Replaces the call instruction with a branch to the inlined entry,
+/// returns a continuation block containing the instructions after the call.
+fn split_caller_at_call(
+    caller: &mut Function,
+    call_bb_idx: usize,
+    call_insn_idx: usize,
+    inlined_entry: BasicBlockId,
+    continuation_bb_id: BasicBlockId,
+    inline_id: u32,
+) -> BasicBlock {
+    let call_bb = &mut caller.blocks[call_bb_idx];
+    let after_call_insns: Vec<Instruction> = call_bb.insns.drain((call_insn_idx + 1)..).collect();
+    call_bb.insns[call_insn_idx] = {
+        let mut br = Instruction::new(Opcode::Br);
+        br.bb_true = Some(inlined_entry);
+        br
+    };
+    let mut continuation_bb = BasicBlock::new(continuation_bb_id);
+    continuation_bb.insns = after_call_insns;
+    continuation_bb.label = Some(format!("inline{}_cont", inline_id));
+    continuation_bb
+}
 
 /// Inline a specific call site
 /// Returns true if inlining was performed
@@ -602,72 +675,18 @@ fn inline_call_site(
     let continuation_bb_id = ctx.alloc_bb_id();
     ctx.return_continuation_bb = continuation_bb_id;
 
-    // Clone all basic blocks from callee
-    let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
-    let mut inlined_pseudos: Vec<Pseudo> = Vec::with_capacity(callee.pseudos.len());
+    let inlined_blocks = clone_callee_blocks(&mut ctx, callee);
+    let inlined_pseudos = clone_callee_pseudos(&mut ctx, callee, caller);
 
-    for callee_bb in &callee.blocks {
-        let new_bb_id = ctx.bb_map[&callee_bb.id];
-        let mut new_bb = BasicBlock::new(new_bb_id);
-
-        // Copy parents and children (will be remapped later)
-        new_bb.parents = callee_bb.parents.clone();
-        new_bb.children = callee_bb.children.clone();
-
-        // Clone instructions
-        for insn in &callee_bb.insns {
-            let cloned = clone_instruction(&mut ctx, insn, &callee.pseudos);
-            for new_insn in cloned {
-                new_bb.insns.push(new_insn);
-            }
-        }
-
-        // Set label for debugging
-        new_bb.label = Some(format!(
-            "{}_inline{}_bb{}",
-            callee.name, ctx.inline_id, callee_bb.id.0
-        ));
-
-        inlined_blocks.push(new_bb);
-    }
-
-    // Clone pseudos that need to exist in caller
-    for callee_pseudo in &callee.pseudos {
-        // Skip arguments (they're substituted with call args)
-        if matches!(callee_pseudo.kind, PseudoKind::Arg(_)) {
-            continue;
-        }
-
-        // Check if this pseudo was used (has a mapping)
-        if ctx.pseudo_map.contains_key(&callee_pseudo.id) {
-            let new_pseudo = ctx.clone_pseudo(callee_pseudo, &callee.pseudos);
-            // Only add if not already substituted to an existing pseudo
-            if !caller.pseudos.iter().any(|p| p.id == new_pseudo.id) {
-                inlined_pseudos.push(new_pseudo);
-            }
-        }
-    }
-
-    // Get inlined entry block ID
     let inlined_entry = ctx.bb_map[&callee.entry];
-
-    // Split the caller's block at the call site
-    let call_bb = &mut caller.blocks[call_bb_idx];
-
-    // Move instructions after the call to continuation block
-    let after_call_insns: Vec<Instruction> = call_bb.insns.drain((call_insn_idx + 1)..).collect();
-
-    // Replace call with branch to inlined entry
-    call_bb.insns[call_insn_idx] = {
-        let mut br = Instruction::new(Opcode::Br);
-        br.bb_true = Some(inlined_entry);
-        br
-    };
-
-    // Create continuation block with instructions after the call
-    let mut continuation_bb = BasicBlock::new(continuation_bb_id);
-    continuation_bb.insns = after_call_insns;
-    continuation_bb.label = Some(format!("inline{}_cont", ctx.inline_id));
+    let mut continuation_bb = split_caller_at_call(
+        caller,
+        call_bb_idx,
+        call_insn_idx,
+        inlined_entry,
+        continuation_bb_id,
+        ctx.inline_id,
+    );
 
     // Update CFG: set children of call block to just the inlined entry
     let old_children = caller.blocks[call_bb_idx].children.clone();
@@ -1426,7 +1445,7 @@ mod tests {
         let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
         phisrc.phi_list = vec![(BasicBlockId(5), PseudoId(2))];
 
-        let cloned = clone_instruction(&mut ctx, &phisrc, &callee.pseudos);
+        let cloned = clone_instruction(&mut ctx, &phisrc, &callee);
 
         // Should produce exactly one instruction
         assert_eq!(cloned.len(), 1);

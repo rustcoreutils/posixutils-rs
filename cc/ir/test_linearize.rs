@@ -5695,3 +5695,24 @@ fn test_conditional_short_circuit_arrow() {
         ir
     );
 }
+
+// ========================================================================
+// Phase 1: Foundation Helper Tests
+// ========================================================================
+
+#[test]
+fn test_bitfield_storage_type() {
+    let strings = StringTable::new();
+    let types = TypeTable::new(&Target::host());
+    let symbols = SymbolTable::new();
+    let target = Target::host();
+    let linearizer = Linearizer::new(&symbols, &types, &strings, &target);
+
+    assert_eq!(linearizer.bitfield_storage_type(1), types.uchar_id);
+    assert_eq!(linearizer.bitfield_storage_type(2), types.ushort_id);
+    assert_eq!(linearizer.bitfield_storage_type(4), types.uint_id);
+    assert_eq!(linearizer.bitfield_storage_type(8), types.ulong_id);
+    // Fallback for unexpected sizes
+    assert_eq!(linearizer.bitfield_storage_type(3), types.uint_id);
+    assert_eq!(linearizer.bitfield_storage_type(16), types.uint_id);
+}

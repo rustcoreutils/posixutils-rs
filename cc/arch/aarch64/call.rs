@@ -20,7 +20,7 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 impl Aarch64CodeGen {
     /// Handle sret (hidden struct return pointer) argument
     pub(super) fn setup_sret_arg(&mut self, insn: &Instruction) -> usize {
-        if insn.is_sret_call && !insn.src.is_empty() {
+        if insn.returns_via_sret() && !insn.src.is_empty() {
             // First argument is sret pointer - move to X8
             self.emit_move(insn.src[0], Reg::X8, 64);
             1 // Skip first arg in main loop

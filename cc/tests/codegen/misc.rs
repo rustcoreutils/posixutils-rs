@@ -3632,3 +3632,79 @@ int main(void) {
         0
     );
 }
+
+// ============================================================================
+// Test: ABI dispatch for medium struct params (Phase 0 correctness fix)
+// ============================================================================
+
+#[test]
+fn codegen_abi_dispatch_medium_struct() {
+    // Verifies that medium structs (9-16 bytes) are correctly classified via
+    // the ABI dispatcher (get_abi_for_conv) rather than a hardcoded SysV AMD64 ABI.
+    // Tests both two-register integer structs and mixed int/SSE structs.
+    let code = r#"
+struct TwoLongs {
+    long a;
+    long b;
+};
+
+long sum_two_longs(struct TwoLongs s) {
+    return s.a + s.b;
+}
+
+struct TwoLongs make_two_longs(long a, long b) {
+    struct TwoLongs s;
+    s.a = a;
+    s.b = b;
+    return s;
+}
+
+struct IntDouble {
+    int i;
+    double d;
+};
+
+double get_sum(struct IntDouble s) {
+    return (double)s.i + s.d;
+}
+
+struct IntDouble make_id(int i, double d) {
+    struct IntDouble s;
+    s.i = i;
+    s.d = d;
+    return s;
+}
+
+int main(void) {
+    // Test passing a two-GP-register struct as parameter
+    struct TwoLongs s = { 15, 25 };
+    long r = sum_two_longs(s);
+    if (r != 40) return 1;
+
+    // Test returning a two-GP-register struct
+    struct TwoLongs s2 = make_two_longs(100, 200);
+    if (s2.a != 100) return 2;
+    if (s2.b != 200) return 3;
+
+    // Test struct from return passed directly to param
+    long r2 = sum_two_longs(make_two_longs(1000, 2000));
+    if (r2 != 3000) return 4;
+
+    // Test mixed int+double struct
+    struct IntDouble id = { 5, 7.5 };
+    double dr = get_sum(id);
+    if (dr != 12.5) return 5;
+
+    // Test returning mixed struct
+    struct IntDouble id2 = make_id(10, 20.5);
+    if (id2.i != 10) return 6;
+    if (id2.d != 20.5) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_abi_dispatch_medium_struct", code, &[]),
+        0
+    );
+}

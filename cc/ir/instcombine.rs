@@ -14,7 +14,7 @@
 // - Identity patterns: x - x -> 0, x ^ x -> 0, etc.
 //
 
-use super::{Function, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
+use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::TypeId;
 
 // ============================================================================
@@ -45,7 +45,7 @@ pub fn run(func: &mut Function) -> bool {
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            let result = try_simplify(insn, &func.pseudos);
+            let result = try_simplify(insn, func);
             if !matches!(result, Simplification::None) {
                 simplifications.push((bb_idx, insn_idx, result));
             }
@@ -81,22 +81,20 @@ pub fn run(func: &mut Function) -> bool {
 // ============================================================================
 
 /// Try to simplify an instruction. Returns the simplification to apply.
-fn try_simplify(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn try_simplify(insn: &Instruction, func: &Function) -> Simplification {
     match insn.op {
         // Integer arithmetic
-        Opcode::Add => simplify_add(insn, pseudos),
-        Opcode::Sub => simplify_sub(insn, pseudos),
-        Opcode::Mul => simplify_mul(insn, pseudos),
-        Opcode::DivS | Opcode::DivU => simplify_div(insn, pseudos),
-        Opcode::ModS | Opcode::ModU => simplify_mod(insn, pseudos),
+        Opcode::Add => simplify_add(insn, func),
+        Opcode::Sub => simplify_sub(insn, func),
+        Opcode::Mul => simplify_mul(insn, func),
+        Opcode::DivS | Opcode::DivU => simplify_div(insn, func),
+        Opcode::ModS | Opcode::ModU => simplify_mod(insn, func),
 
         // Shifts
-        Opcode::Shl => simplify_shl(insn, pseudos),
-        Opcode::Lsr => simplify_lsr(insn, pseudos),
-        Opcode::Asr => simplify_asr(insn, pseudos),
+        Opcode::Shl | Opcode::Lsr | Opcode::Asr => simplify_shift(insn, func),
 
         // Bitwise (all handled by unified simplify_bitwise)
-        Opcode::And | Opcode::Or | Opcode::Xor => simplify_bitwise(insn, pseudos),
+        Opcode::And | Opcode::Or | Opcode::Xor => simplify_bitwise(insn, func),
 
         // Comparisons (all handled by unified simplify_comparison)
         Opcode::SetEq
@@ -108,28 +106,14 @@ fn try_simplify(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
         | Opcode::SetB
         | Opcode::SetBe
         | Opcode::SetA
-        | Opcode::SetAe => simplify_comparison(insn, pseudos),
+        | Opcode::SetAe => simplify_comparison(insn, func),
 
         // Unary
-        Opcode::Neg => simplify_neg(insn, pseudos),
-        Opcode::Not => simplify_not(insn, pseudos),
+        Opcode::Neg => simplify_neg(insn, func),
+        Opcode::Not => simplify_not(insn, func),
 
         _ => Simplification::None,
     }
-}
-
-// ============================================================================
-// Helper: Get constant value from pseudos list
-// ============================================================================
-
-fn get_const(pseudos: &[Pseudo], id: PseudoId) -> Option<i64> {
-    pseudos
-        .iter()
-        .find(|p| p.id == id)
-        .and_then(|p| match &p.kind {
-            PseudoKind::Val(v) => Some(*v),
-            _ => None,
-        })
 }
 
 /// Create a Copy instruction from extracted parts.
@@ -153,15 +137,15 @@ fn make_copy_from_parts(
 // Add Simplification
 // ============================================================================
 
-fn simplify_add(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_add(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
         // Constant folding: a + b -> (a + b)
@@ -181,7 +165,7 @@ fn simplify_add(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // Sub Simplification
 // ============================================================================
 
-fn simplify_sub(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_sub(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
@@ -194,8 +178,8 @@ fn simplify_sub(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
         return Simplification::FoldToConst(0);
     }
 
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
         // Constant folding: a - b -> (a - b)
@@ -212,15 +196,15 @@ fn simplify_sub(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // Mul Simplification
 // ============================================================================
 
-fn simplify_mul(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_mul(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
         // Constant folding: a * b -> (a * b)
@@ -242,15 +226,15 @@ fn simplify_mul(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // Div Simplification
 // ============================================================================
 
-fn simplify_div(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_div(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
         // Constant folding: a / b -> (a / b) (avoid div by zero)
@@ -276,15 +260,15 @@ fn simplify_div(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // Mod Simplification
 // ============================================================================
 
-fn simplify_mod(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_mod(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
         // Constant folding: a % b -> (a % b) (avoid mod by zero)
@@ -310,78 +294,32 @@ fn simplify_mod(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 // Shift Simplifications
 // ============================================================================
 
-fn simplify_shl(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_shift(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
-        // Constant folding: a << b
+        // Constant folding
         (Some(a), Some(b)) if (0..64).contains(&b) => {
-            Simplification::FoldToConst(a.wrapping_shl(b as u32))
+            let folded = match insn.op {
+                Opcode::Shl => a.wrapping_shl(b as u32),
+                Opcode::Lsr => (a as u64).wrapping_shr(b as u32) as i64,
+                Opcode::Asr => a.wrapping_shr(b as u32),
+                _ => return Simplification::None,
+            };
+            Simplification::FoldToConst(folded)
         }
 
-        // Algebraic: x << 0 -> x
+        // Algebraic: x op 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
 
-        // Algebraic: 0 << n -> 0
-        (Some(0), None) => Simplification::FoldToConst(0),
-
-        _ => Simplification::None,
-    }
-}
-
-fn simplify_lsr(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    match (val1, val2) {
-        // Constant folding: a >> b (logical/unsigned)
-        (Some(a), Some(b)) if (0..64).contains(&b) => {
-            Simplification::FoldToConst((a as u64).wrapping_shr(b as u32) as i64)
-        }
-
-        // Algebraic: x >> 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
-
-        // Algebraic: 0 >> n -> 0
-        (Some(0), None) => Simplification::FoldToConst(0),
-
-        _ => Simplification::None,
-    }
-}
-
-fn simplify_asr(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
-    if insn.src.len() != 2 {
-        return Simplification::None;
-    }
-
-    let src1 = insn.src[0];
-    let src2 = insn.src[1];
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
-
-    match (val1, val2) {
-        // Constant folding: a >> b (arithmetic/signed)
-        (Some(a), Some(b)) if (0..64).contains(&b) => {
-            Simplification::FoldToConst(a.wrapping_shr(b as u32))
-        }
-
-        // Algebraic: x >> 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
-
-        // Algebraic: 0 >> n -> 0
+        // Algebraic: 0 op n -> 0
         (Some(0), None) => Simplification::FoldToConst(0),
 
         _ => Simplification::None,
@@ -439,7 +377,7 @@ fn get_bitwise_info(op: Opcode) -> Option<BitwiseInfo> {
 }
 
 /// Unified bitwise simplification for And/Or/Xor
-fn simplify_bitwise(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_bitwise(insn: &Instruction, func: &Function) -> Simplification {
     let info = match get_bitwise_info(insn.op) {
         Some(i) => i,
         None => return Simplification::None,
@@ -460,8 +398,8 @@ fn simplify_bitwise(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
         };
     }
 
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     match (val1, val2) {
         // Constant folding: a op b
@@ -539,7 +477,7 @@ fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
 }
 
 /// Unified comparison simplification for all SetXX opcodes
-fn simplify_comparison(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_comparison(insn: &Instruction, func: &Function) -> Simplification {
     let info = match get_cmp_info(insn.op) {
         Some(i) => i,
         None => return Simplification::None,
@@ -558,8 +496,8 @@ fn simplify_comparison(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification
     }
 
     // Constant folding
-    let val1 = get_const(pseudos, src1);
-    let val2 = get_const(pseudos, src2);
+    let val1 = func.const_val(src1);
+    let val2 = func.const_val(src2);
 
     if let (Some(a), Some(b)) = (val1, val2) {
         Simplification::FoldToConst(if (info.compare)(a, b) { 1 } else { 0 })
@@ -572,26 +510,26 @@ fn simplify_comparison(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification
 // Unary Simplifications
 // ============================================================================
 
-fn simplify_neg(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_neg(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 1 {
         return Simplification::None;
     }
 
     let src = insn.src[0];
-    if let Some(val) = get_const(pseudos, src) {
+    if let Some(val) = func.const_val(src) {
         Simplification::FoldToConst(val.wrapping_neg())
     } else {
         Simplification::None
     }
 }
 
-fn simplify_not(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
+fn simplify_not(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 1 {
         return Simplification::None;
     }
 
     let src = insn.src[0];
-    if let Some(val) = get_const(pseudos, src) {
+    if let Some(val) = func.const_val(src) {
         Simplification::FoldToConst(!val)
     } else {
         Simplification::None
@@ -605,7 +543,7 @@ fn simplify_not(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, BasicBlockId};
+    use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
     use crate::types::TypeTable;
 

@@ -862,7 +862,7 @@ impl Aarch64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            if insn.is_two_reg_return {
+            if insn.returns_two_regs() {
                 self.emit_move(src, Reg::X0, 64);
                 if let Some(&src2) = insn.src.get(1) {
                     self.emit_move(src2, Reg::X1, 64);
@@ -1117,7 +1117,7 @@ impl Aarch64CodeGen {
 
     /// Emit switch statement: compare value against cases and branch
     fn emit_switch(&mut self, insn: &Instruction, types: &TypeTable) {
-        let Some(val) = insn.target else { return };
+        let Some(&val) = insn.src.first() else { return };
 
         let loc = self.get_location(val);
         let (scratch0, scratch1, _) = Reg::scratch_regs();

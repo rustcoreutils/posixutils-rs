@@ -359,23 +359,15 @@ fn rename_insn(
                 let addr = insn.src[0];
 
                 // Look up what variable this address corresponds to
-                let var_name = converter
-                    .func
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .and_then(|p| match &p.kind {
-                        PseudoKind::Sym(name) => Some(name.clone()),
-                        _ => None,
-                    });
+                let var_name = converter.func.sym_name_of(addr);
 
                 if let Some(name) = var_name {
-                    if converter.to_rename.contains(&name) {
+                    if converter.to_rename.contains(name) {
                         // Get the value being stored
                         let val = insn.src[1];
 
                         // Push as new definition
-                        def_stack.push(&name, bb_id, val);
+                        def_stack.push(name, bb_id, val);
 
                         // Mark store for removal
                         converter.dead_stores.push(InsnRef::new(bb_id, insn_idx));
@@ -389,20 +381,12 @@ fn rename_insn(
             if !insn.src.is_empty() {
                 let addr = insn.src[0];
 
-                let var_name = converter
-                    .func
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .and_then(|p| match &p.kind {
-                        PseudoKind::Sym(name) => Some(name.clone()),
-                        _ => None,
-                    });
+                let var_name = converter.func.sym_name_of(addr);
 
                 if let Some(name) = var_name {
-                    if converter.to_rename.contains(&name) {
+                    if converter.to_rename.contains(name) {
                         // Get the reaching definition
-                        let val = lookup_var(converter.func, bb_id, &name, def_stack)
+                        let val = lookup_var(converter.func, bb_id, name, def_stack)
                             .unwrap_or_else(|| converter.undef_pseudo());
 
                         // Replace load with the value
@@ -603,21 +587,12 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
 
 /// Remove dead stores that were converted to SSA.
 fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
-    // Sort by block and index (descending) so we can remove from end first
-    let mut sorted: Vec<_> = dead_stores.to_vec();
-    sorted.sort_by(|a, b| {
-        if a.bb == b.bb {
-            b.idx.cmp(&a.idx) // Descending by index
-        } else {
-            a.bb.0.cmp(&b.bb.0)
-        }
-    });
-
-    for insn_ref in sorted {
+    // Converting to Nop is index-stable so iteration order doesn't matter.
+    for insn_ref in dead_stores {
         if let Some(bb) = func.get_block_mut(insn_ref.bb) {
             if insn_ref.idx < bb.insns.len() {
                 // Convert to Nop instead of removing to preserve indices
-                bb.insns[insn_ref.idx].op = Opcode::Nop;
+                bb.insns[insn_ref.idx].kill();
             }
         }
     }

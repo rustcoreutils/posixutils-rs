@@ -16,7 +16,7 @@
 //
 
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const DEFAULT_USE_CAPACITY: usize = 4;
 const DEFAULT_LIVE_CAPACITY: usize = 64;
@@ -69,13 +69,6 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
         }
     }
 
-    // Switch value (stored in target for switch)
-    if insn.op == Opcode::Switch {
-        if let Some(target) = insn.target {
-            uses.push(target);
-        }
-    }
-
     // Indirect call target (function pointer)
     if let Some(indirect) = insn.indirect_target {
         uses.push(indirect);
@@ -91,16 +84,13 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
     uses
 }
 
-/// Find all instructions that define a pseudo.
-/// Returns vec of (block_index, instruction_index) for each definition.
-/// After inlining, a pseudo may have multiple definitions from different branches
-/// (e.g., the return target is written to from multiple return paths).
-fn find_all_defs(func: &Function, id: PseudoId) -> Vec<(usize, usize)> {
-    let mut defs = Vec::new();
+/// Build a map from each pseudo to the instructions that define it.
+fn build_def_map(func: &Function) -> HashMap<PseudoId, Vec<(usize, usize)>> {
+    let mut defs: HashMap<PseudoId, Vec<(usize, usize)>> = HashMap::new();
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            if insn.target == Some(id) {
-                defs.push((bb_idx, insn_idx));
+            if let Some(target) = insn.target {
+                defs.entry(target).or_default().push((bb_idx, insn_idx));
             }
         }
     }
@@ -109,6 +99,7 @@ fn find_all_defs(func: &Function, id: PseudoId) -> Vec<(usize, usize)> {
 
 /// Eliminate dead code using mark-sweep algorithm.
 fn eliminate_dead_code(func: &mut Function) -> bool {
+    let def_map = build_def_map(func);
     let mut live: HashSet<PseudoId> = HashSet::with_capacity(DEFAULT_LIVE_CAPACITY);
     let mut worklist: VecDeque<PseudoId> = VecDeque::with_capacity(DEFAULT_LIVE_CAPACITY);
 
@@ -128,15 +119,16 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
 
     // Phase 2: Propagate liveness transitively
     while let Some(id) = worklist.pop_front() {
-        // Find all instructions that define this pseudo
-        // (there may be multiple after inlining, e.g., return target written from multiple paths)
-        for (bb_idx, insn_idx) in find_all_defs(func, id) {
-            let insn = &func.blocks[bb_idx].insns[insn_idx];
+        // Look up all instructions that define this pseudo (O(1) via def_map)
+        if let Some(def_sites) = def_map.get(&id) {
+            for &(bb_idx, insn_idx) in def_sites {
+                let insn = &func.blocks[bb_idx].insns[insn_idx];
 
-            // Mark all operands of the defining instruction as live
-            for use_id in get_uses(insn) {
-                if live.insert(use_id) {
-                    worklist.push_back(use_id);
+                // Mark all operands of the defining instruction as live
+                for use_id in get_uses(insn) {
+                    if live.insert(use_id) {
+                        worklist.push_back(use_id);
+                    }
                 }
             }
         }
@@ -159,11 +151,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
             // If this instruction has a target that's not live, it's dead
             if let Some(target) = insn.target {
                 if !live.contains(&target) {
-                    // Convert to Nop
-                    insn.op = Opcode::Nop;
-                    insn.src.clear();
-                    insn.target = None;
-                    insn.phi_list.clear();
+                    insn.kill();
                     changed = true;
                 }
             }

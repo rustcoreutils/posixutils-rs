@@ -996,7 +996,10 @@ impl TypeTable {
         let is_complex = typ.modifiers.contains(TypeModifiers::COMPLEX);
         let multiplier = if is_complex { 2 } else { 1 };
         match typ.kind {
-            TypeKind::Void => 0,
+            // GCC extension: sizeof(void) = 1 for pointer arithmetic on void*.
+            // Standard C leaves sizeof(void) undefined, but GCC and most code
+            // assumes void* arithmetic works like char* (1 byte per unit).
+            TypeKind::Void => 8,
             TypeKind::Bool => 8,
             TypeKind::Char => 8,
             TypeKind::Short => 16,

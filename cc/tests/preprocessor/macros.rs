@@ -449,3 +449,194 @@ android_api = __ANDROID_API__
         "#error directive should cause non-zero exit code"
     );
 }
+
+// ============================================================================
+// Mega-test: C99 preprocessor edge cases
+// ============================================================================
+
+#[test]
+fn preprocessor_c99_edge_cases_mega() {
+    let code = r#"
+// Section 5: #include via macro expansion (must be at file scope)
+#define HEADER "stdbool.h"
+#include HEADER
+
+// Section 6: Macro expansion producing defined() in #if (UB per C99, must not crash)
+#define HAS(x) defined(x)
+#define TESTMACRO 1
+#if HAS(TESTMACRO)
+int defined_ok = 1;
+#else
+int defined_ok = 1; // Either branch is fine, just no crash
+#endif
+
+int main(void) {
+    // Section 1: Stringification of empty variadic args
+    {
+#define S(...) #__VA_ARGS__
+        const char *e = S();
+        if (e[0] != '\0') return 1;
+    }
+
+    // Section 2: Token pasting with empty first arg
+    {
+#define P(a,b) a##b
+        int hello = 42;
+        if (P(,hello) != 42) return 2;
+    }
+
+    // Section 3: Multi-char character constants in #if (big-endian packing)
+    {
+        int multichar_ok = 0;
+#if 'ab' == (('a'<<8)+'b')
+        multichar_ok = 1;
+#endif
+        if (!multichar_ok) return 3;
+    }
+
+    // Section 4: Nested #elif chain with 3+ branches and complex expressions
+    {
+#define OPT 3
+        int elif_ok = 0;
+#if OPT == 1
+        elif_ok = 0;
+#elif OPT == 2
+        elif_ok = 0;
+#elif (OPT > 2) && (OPT < 5)
+        elif_ok = 1;
+#elif OPT == 5
+        elif_ok = 0;
+#else
+        elif_ok = 0;
+#endif
+        if (!elif_ok) return 4;
+    }
+
+    // Section 5: bool/true/false from stdbool.h included via macro
+    {
+        bool bval = true;
+        if (!bval) return 5;
+    }
+
+    // Section 6: defined() via macro expansion did not crash
+    {
+        if (!defined_ok) return 6;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preproc_c99_edge_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Test: C99 digraphs compile and run correctly
+// ============================================================================
+
+#[test]
+fn preprocessor_digraphs_mega() {
+    let code = r#"
+int main(void) {
+    // Section 1: <: and :> as [ and ]
+    {
+        int arr<:3:> = <% 10, 20, 30 %>;
+        if (arr<:0:> != 10) return 1;
+        if (arr<:1:> != 20) return 2;
+        if (arr<:2:> != 30) return 3;
+    }
+
+    // Section 2: <% and %> as { and }
+    {
+        struct Point <% int x; int y; %>;
+        struct Point p = <% .x = 5, .y = 7 %>;
+        if (p.x != 5) return 4;
+        if (p.y != 7) return 5;
+    }
+
+    // Section 3: mixed digraphs and regular tokens
+    {
+        int arr[2] = {100, 200};
+        if (arr<:0:> != 100) return 6;
+        int arr2<:2:> = {300, 400};
+        if (arr2[1] != 400) return 7;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preproc_digraphs_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Mega-test: #pragma STDC directives
+// ============================================================================
+
+#[test]
+fn preprocessor_pragma_stdc_mega() {
+    let code = r#"
+#pragma STDC FP_CONTRACT ON
+#pragma STDC FENV_ACCESS OFF
+#pragma STDC CX_LIMITED_RANGE DEFAULT
+
+int main(void) {
+    // All STDC pragmas should be silently recognized
+    int x = 42;
+    if (x != 42) return 1;
+
+    // _Pragma with STDC equivalent
+    _Pragma("STDC FP_CONTRACT OFF")
+    if (x != 42) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preproc_pragma_stdc_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Mega-test: Stringification escaping (C99 6.10.3.2p2)
+// ============================================================================
+
+#[test]
+fn preprocessor_stringify_escaping_mega() {
+    let code = r#"
+#include <string.h>
+
+#define S(x) #x
+
+int main(void) {
+    // Section 1: Stringifying a string literal adds escaped quotes
+    {
+        const char *s = S("hello");
+        // Result should be: \"hello\" (the delimiters become escaped in the string)
+        if (s[0] != '"') return 1;
+        if (s[1] != 'h') return 2;
+        if (s[5] != 'o') return 3;
+        if (s[6] != '"') return 4;
+        if (strlen(s) != 7) return 5;
+    }
+
+    // Section 2: Stringifying a char literal
+    {
+        const char *s = S('a');
+        // Result: 'a'
+        if (s[0] != '\'') return 10;
+        if (s[1] != 'a') return 11;
+        if (s[2] != '\'') return 12;
+        if (strlen(s) != 3) return 13;
+    }
+
+    // Section 3: Stringifying a regular identifier
+    {
+        const char *s = S(hello);
+        if (strcmp(s, "hello") != 0) return 20;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("preproc_stringify_escape_mega", code, &[]),
+        0
+    );
+}

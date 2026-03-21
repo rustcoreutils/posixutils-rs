@@ -815,6 +815,79 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
+        // C99 6.4.6 Digraphs: alternate token spellings
+        // Must be checked before two-char operator table
+        if first == b'<' {
+            let next = self.peekchar();
+            if next == b':' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'[' as u32),
+                ));
+            }
+            if next == b'%' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'{' as u32),
+                ));
+            }
+        }
+        if first == b':' {
+            let next = self.peekchar();
+            if next == b'>' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b']' as u32),
+                ));
+            }
+        }
+        if first == b'%' {
+            let next = self.peekchar();
+            if next == b'>' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'}' as u32),
+                ));
+            }
+            if next == b':' as i32 {
+                self.nextchar();
+                // Check for %:%: (digraph for ##)
+                let third = self.peekchar();
+                if third == b'%' as i32 {
+                    // Save position in case we need to back out
+                    let saved_offset = self.offset;
+                    let saved_col = self.col;
+                    self.nextchar(); // consume second %
+                    let fourth = self.peekchar();
+                    if fourth == b':' as i32 {
+                        self.nextchar(); // consume second :
+                        return Some(Token::with_value(
+                            TokenType::Special,
+                            pos,
+                            TokenValue::Special(SpecialToken::HashHash as u32),
+                        ));
+                    }
+                    // Not %:%: — back out the third char (%)
+                    self.offset = saved_offset;
+                    self.col = saved_col;
+                }
+                // Just %: → #
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'#' as u32),
+                ));
+            }
+        }
+
         // Two-character operator lookup table
         // Format: (first, second, code)
         static TWO_CHAR_OPS: &[(u8, u8, u32)] = &[
@@ -1986,5 +2059,50 @@ mod tests {
         let (tokens, strings) = tokenize_str("x");
         let text = tokens_to_text(&tokens, &strings);
         assert!(text.ends_with('\n'));
+    }
+
+    // ========================================================================
+    // C99 6.4.6 Digraph tests
+    // ========================================================================
+
+    #[test]
+    fn test_digraph_brackets() {
+        // <: and :> are digraphs for [ and ]
+        let (tokens, _) = tokenize_str("<:0:>");
+        // StreamBegin, [, 0, ], StreamEnd
+        assert_eq!(tokens.len(), 5);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'[' as u32));
+        assert!(matches!(&tokens[2].value, TokenValue::Number(n) if n == "0"));
+        assert!(matches!(&tokens[3].value, TokenValue::Special(c) if *c == b']' as u32));
+    }
+
+    #[test]
+    fn test_digraph_braces() {
+        // <% and %> are digraphs for { and }
+        let (tokens, _) = tokenize_str("<% %>");
+        // StreamBegin, {, }, StreamEnd
+        assert_eq!(tokens.len(), 4);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'{' as u32));
+        assert!(matches!(&tokens[2].value, TokenValue::Special(c) if *c == b'}' as u32));
+    }
+
+    #[test]
+    fn test_digraph_hash() {
+        // %: is digraph for #
+        let (tokens, _) = tokenize_str("%: define");
+        // StreamBegin, #, define, StreamEnd
+        assert_eq!(tokens.len(), 4);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'#' as u32));
+    }
+
+    #[test]
+    fn test_digraph_hashhash() {
+        // %:%: is digraph for ##
+        let (tokens, _) = tokenize_str("%:%:");
+        // StreamBegin, ##, StreamEnd
+        assert_eq!(tokens.len(), 3);
+        assert!(
+            matches!(&tokens[1].value, TokenValue::Special(c) if *c == SpecialToken::HashHash as u32)
+        );
     }
 }

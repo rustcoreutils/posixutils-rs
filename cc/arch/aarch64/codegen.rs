@@ -927,11 +927,38 @@ impl Aarch64CodeGen {
         callee_saved_fp: &[VReg],
         types: &TypeTable,
     ) {
-        // Move return value to x0 (integer), v0 (float), or v0+v1 (complex) if present
+        // Move return value to x0 (integer), v0 (float), v0+v1 (complex/HFA-2) if present
         if let Some(&src) = insn.src.first() {
             let src_loc = self.get_location(src);
             let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
             let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
+            // Check for HFA-2 struct return (e.g., {double, double}).
+            // Compute the HFA FP size once; None means not an HFA-2.
+            let hfa_two_fp_size: Option<FpSize> = if !is_complex {
+                insn.typ.and_then(|t| {
+                    let k = types.kind(t);
+                    if (k == TypeKind::Struct || k == TypeKind::Union)
+                        && types.size_bits(t) > 64
+                        && types.size_bits(t) <= 128
+                    {
+                        let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                        match abi.classify_return(t, types) {
+                            ArgClass::Hfa { base, .. } => {
+                                use crate::abi::HfaBase;
+                                Some(match base {
+                                    HfaBase::Float32 => FpSize::Single,
+                                    HfaBase::Float64 => FpSize::Double,
+                                })
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
 
             // Derive return size from type to avoid 32-bit truncation
             let ret_typ = insn.typ;
@@ -939,7 +966,74 @@ impl Aarch64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            if insn.returns_two_regs() {
+            if let Some(fp_size) = hfa_two_fp_size {
+                if insn.src.len() == 2 {
+                    // Two-source path: linearizer pre-loaded struct halves as integers.
+                    // Move from GP registers to V0/V1 via FmovFromGp.
+                    self.emit_move(src, Reg::X9, 64);
+                    self.push_lir(Aarch64Inst::FmovFromGp {
+                        size: fp_size,
+                        src: Reg::X9,
+                        dst: VReg::V0,
+                    });
+                    if let Some(&src2) = insn.src.get(1) {
+                        self.emit_move(src2, Reg::X9, 64);
+                        self.push_lir(Aarch64Inst::FmovFromGp {
+                            size: fp_size,
+                            src: Reg::X9,
+                            dst: VReg::V1,
+                        });
+                    }
+                } else {
+                    // Single-source path: src is an address to the struct.
+                    // Load both elements to V0/V1.
+                    let elem_offset = match fp_size {
+                        FpSize::Single => 4,
+                        _ => 8,
+                    };
+                    match src_loc {
+                        Loc::Stack(offset) => {
+                            self.push_lir(Aarch64Inst::Ldr {
+                                size: OperandSize::B64,
+                                dst: Reg::X9,
+                                addr: self.stack_mem(offset),
+                            });
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::X9,
+                                    offset: 0,
+                                },
+                            });
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V1,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::X9,
+                                    offset: elem_offset,
+                                },
+                            });
+                        }
+                        Loc::Reg(r) => {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V0,
+                                addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                            });
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: fp_size,
+                                dst: VReg::V1,
+                                addr: MemAddr::BaseOffset {
+                                    base: r,
+                                    offset: elem_offset,
+                                },
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            } else if insn.returns_two_regs() {
                 self.emit_move(src, Reg::X0, 64);
                 if let Some(&src2) = insn.src.get(1) {
                     self.emit_move(src2, Reg::X1, 64);

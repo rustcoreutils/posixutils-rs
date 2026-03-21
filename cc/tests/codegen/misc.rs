@@ -2669,6 +2669,53 @@ int main(void) {
     assert_eq!(compile_and_run("double_xmm_to_gpr_movq", code, &[]), 0);
 }
 
+/// Test: C11 nullability qualifiers (_Nonnull, _Nullable, _Null_unspecified)
+/// are parsed and ignored in pointer declarators and function parameters.
+/// macOS system headers use these extensively.
+#[test]
+fn codegen_nullability_qualifiers() {
+    let code = r#"
+/* Nullability qualifiers on pointer declarators */
+int * _Nonnull get_ptr(int * _Nullable p) {
+    static int fallback = 0;
+    return p ? p : &fallback;
+}
+
+/* Nullability on function pointer */
+typedef void (* _Nonnull callback_t)(int);
+
+void invoke(callback_t cb, int val) {
+    cb(val);
+}
+
+static int captured = 0;
+void capture(int v) { captured = v; }
+
+/* _Null_unspecified variant */
+int * _Null_unspecified identity_ptr(int * _Null_unspecified p) {
+    return p;
+}
+
+int main(void) {
+    int x = 42;
+    int *p = get_ptr(&x);
+    if (*p != 42) return 1;
+
+    int *q = get_ptr((int * _Nullable)0);
+    if (*q != 0) return 2;
+
+    invoke(capture, 99);
+    if (captured != 99) return 3;
+
+    int *r = identity_ptr(&x);
+    if (*r != 42) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nullability_qualifiers", code, &[]), 0);
+}
+
 /// Regression test: ternary selecting function pointers lost return type.
 /// `(cond ? func_a : func_b)(arg)` used pointer_to() which returned void*
 /// when the pointer-to-function type wasn't in the lookup table. The call's

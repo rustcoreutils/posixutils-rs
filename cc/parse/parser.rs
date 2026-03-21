@@ -2380,7 +2380,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers (const, volatile, restrict, _Atomic)
+            // Parse pointer qualifiers (const, volatile, restrict, _Atomic, nullability)
             while self.peek() == TokenType::Ident {
                 if let Some(name) = self.get_ident_name(self.current()) {
                     match name.as_str() {
@@ -2399,6 +2399,10 @@ impl Parser<'_> {
                         "_Atomic" => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::ATOMIC;
+                        }
+                        "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable"
+                        | "_Null_unspecified" | "__null_unspecified" => {
+                            self.advance();
                         }
                         _ => break,
                     }
@@ -2744,6 +2748,10 @@ impl Parser<'_> {
                         "restrict" => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
+                        }
+                        "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable"
+                        | "_Null_unspecified" | "__null_unspecified" => {
+                            self.advance();
                         }
                         _ => break,
                     }
@@ -3219,6 +3227,10 @@ impl Parser<'_> {
                         "restrict" => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
+                        }
+                        "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable"
+                        | "_Null_unspecified" | "__null_unspecified" => {
+                            self.advance();
                         }
                         _ => break,
                     }

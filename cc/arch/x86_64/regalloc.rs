@@ -462,6 +462,8 @@ pub struct RegAlloc {
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
     live_out: Vec<HashSet<PseudoId>>,
+    /// Maximum alignment requirement of any local variable (for dynamic stack alignment)
+    max_local_align: i32,
 }
 
 impl RegAlloc {
@@ -483,6 +485,7 @@ impl RegAlloc {
             addr_taken_syms: HashSet::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
+            max_local_align: 8,
         }
     }
 
@@ -529,6 +532,7 @@ impl RegAlloc {
         self.addr_taken_syms.clear();
         self.live_in.clear();
         self.live_out.clear();
+        self.max_local_align = 8;
     }
 
     /// Identify pseudos that are long double (80-bit extended precision).
@@ -840,6 +844,10 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
+        // Track maximum alignment for dynamic stack alignment
+        if alignment > self.max_local_align {
+            self.max_local_align = alignment;
+        }
         if reusable {
             if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval.pseudo) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
@@ -1034,9 +1042,15 @@ impl RegAlloc {
         compute_live_intervals(func, get_constraint_info)
     }
 
-    /// Get stack size needed (aligned to 16 bytes)
+    /// Get stack size needed (aligned to max local alignment, minimum 16)
     pub fn stack_size(&self) -> i32 {
-        (self.stack_offset + 15) & !15
+        let align = self.max_local_align.max(16);
+        (self.stack_offset + align - 1) & !(align - 1)
+    }
+
+    /// Get the maximum alignment requirement of any local variable
+    pub fn max_local_align(&self) -> i32 {
+        self.max_local_align
     }
 
     /// Get callee-saved registers that need to be preserved

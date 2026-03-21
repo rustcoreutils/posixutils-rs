@@ -13,5 +13,6 @@
 // - atomics: ALL atomic operations
 //
 
+mod alignment;
 mod atomics;
 mod core;

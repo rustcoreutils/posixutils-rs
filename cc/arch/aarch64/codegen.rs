@@ -59,6 +59,10 @@ pub struct Aarch64CodeGen {
     stack_alloc_size: i32,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     sym_type_sizes: HashMap<PseudoId, u32>,
+    /// When true, over-aligned locals use x19 as an aligned base register
+    use_aligned_base: bool,
+    /// Maximum local alignment (for computing aligned base)
+    max_local_align: i32,
 }
 
 /// Result of computing a memory address for load/store operations
@@ -87,6 +91,8 @@ impl Aarch64CodeGen {
             unique_label_counter: 0,
             stack_alloc_size: 0,
             sym_type_sizes: HashMap::new(),
+            use_aligned_base: false,
+            max_local_align: 16,
         }
     }
 
@@ -110,16 +116,59 @@ impl Aarch64CodeGen {
     #[inline]
     pub(super) fn stack_offset(&self, offset: i32) -> i32 {
         if offset < 0 {
-            // Local variable: use frame size minus reg_save_area
-            // Layout: [fp/lr][callee-saved][locals][reg_save_area]
-            // Locals are at offsets from (frame_size - reg_save_area_size)
-            (self.frame_size - self.reg_save_area_size) + offset
+            if self.use_aligned_base {
+                // Over-aligned locals: use x19-relative addressing.
+                // x19 = aligned base of locals area.
+                // Regalloc assigns negative offsets, so local at -8 is the first slot.
+                // x19 points to the start (lowest address) of the aligned locals area.
+                // offset is negative, e.g., -8 for first local.
+                // x19-relative: [x19 + (-offset - 8)] for first local at [x19 + 0]
+                // Actually: locals are at x19 + (stack_alloc_size + offset)
+                // because offset = -stack_alloc_size for the highest slot
+                self.stack_alloc_size + offset
+            } else {
+                // Local variable: use frame size minus reg_save_area
+                // Layout: [fp/lr][callee-saved][locals][reg_save_area]
+                // Locals are at offsets from (frame_size - reg_save_area_size)
+                (self.frame_size - self.reg_save_area_size) + offset
+            }
         } else {
             // Positive offset = stack args (passed by caller)
             // regalloc uses 16 as base (x86_64 convention: saved rbp + return addr)
             // but aarch64 places stack args at [x29 + frame_size + slot_offset]
             // where slot_offset = offset - 16
             self.frame_size + offset - 16
+        }
+    }
+
+    /// Get the base register for a stack location.
+    /// Normal locals use X29 (FP). Over-aligned locals use X19 (aligned base).
+    /// Incoming args always use X29.
+    #[inline]
+    pub(super) fn stack_base_reg(&self, raw_offset: i32) -> Reg {
+        if raw_offset < 0 && self.use_aligned_base {
+            Reg::X19
+        } else {
+            Reg::X29
+        }
+    }
+
+    /// Compute a MemAddr for a stack location (local variable or incoming arg).
+    /// Selects the correct base register (X29 for normal, X19 for over-aligned locals).
+    #[inline]
+    pub(super) fn stack_mem(&self, raw_offset: i32) -> MemAddr {
+        MemAddr::BaseOffset {
+            base: self.stack_base_reg(raw_offset),
+            offset: self.stack_offset(raw_offset),
+        }
+    }
+
+    /// Like stack_mem but adds an extra byte offset (for struct member access).
+    #[inline]
+    pub(super) fn stack_mem_plus(&self, raw_offset: i32, extra: i32) -> MemAddr {
+        MemAddr::BaseOffset {
+            base: self.stack_base_reg(raw_offset),
+            offset: self.stack_offset(raw_offset) + extra,
         }
     }
 
@@ -172,8 +221,15 @@ impl Aarch64CodeGen {
         }
 
         let stack_size = alloc.stack_size();
-        let callee_saved = alloc.callee_saved_used().to_vec();
+        self.max_local_align = alloc.max_local_align();
+        self.use_aligned_base = self.max_local_align > 16;
+        let mut callee_saved = alloc.callee_saved_used().to_vec();
         let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
+
+        // When using aligned base, x19 must be callee-saved
+        if self.use_aligned_base && !callee_saved.contains(&Reg::X19) {
+            callee_saved.push(Reg::X19);
+        }
 
         // For variadic functions on Linux/FreeBSD, we need extra space for the register save area
         // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
@@ -222,6 +278,26 @@ impl Aarch64CodeGen {
         // leave zero in the unwritten upper bytes.
         // Uses stp xzr, xzr which doesn't clobber any registers.
         self.zero_stack_frame();
+
+        // Compute aligned base register (x19) for over-aligned locals
+        if self.use_aligned_base {
+            let base_offset = 16 + self.callee_saved_size;
+            let max_align = self.max_local_align;
+            // x19 = (FP + base_offset + max_align - 1) & ~(max_align - 1)
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                dst: Reg::X19,
+                src1: Reg::X29,
+                src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
+            });
+            // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
+            self.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                dst: Reg::X19,
+                src1: Reg::X19,
+                src2: GpOperand::Imm(-(max_align as i64)),
+            });
+        }
 
         // Detect sret and store X8 to stack if needed
         let has_sret = func
@@ -639,14 +715,10 @@ impl Aarch64CodeGen {
         {
             if let Some(Loc::Stack(offset)) = self.locations.get(&sret.id) {
                 if *offset < 0 {
-                    let actual_offset = self.stack_offset(*offset);
                     self.push_lir(Aarch64Inst::Str {
                         size: OperandSize::B64,
                         src: Reg::X8,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // fp
-                            offset: actual_offset,
-                        },
+                        addr: self.stack_mem(*offset),
                     });
                 }
             }
@@ -675,25 +747,17 @@ impl Aarch64CodeGen {
     fn store_spilled_args(&mut self, alloc: &RegAlloc) {
         for spilled in alloc.spilled_args() {
             // spilled.to_stack_offset is negative (e.g., -8, -16, etc.)
-            // Convert to FP-relative offset
-            let actual_offset = self.stack_offset(spilled.to_stack_offset);
             if let Some(gp_reg) = spilled.from_gp_reg {
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
                     src: gp_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29, // fp
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(spilled.to_stack_offset),
                 });
             } else if let Some(fp_reg) = spilled.from_fp_reg {
                 self.push_lir(Aarch64Inst::StrFp {
                     size: FpSize::Double,
                     src: fp_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29, // fp
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(spilled.to_stack_offset),
                 });
             }
         }
@@ -746,28 +810,22 @@ impl Aarch64CodeGen {
                             if fp_arg_idx + 1 < fp_arg_regs.len() {
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
-                                    if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
+                                    if let Some(&Loc::Stack(offset)) =
+                                        self.locations.get(&local.sym)
                                     {
-                                        let actual_offset = self.stack_offset(*offset);
                                         let (fp_size, imag_offset) =
                                             complex_fp_info(types, &self.base.target, *typ);
                                         // Store real part from first FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx],
-                                            addr: MemAddr::BaseOffset {
-                                                base: Reg::X29,
-                                                offset: actual_offset,
-                                            },
+                                            addr: self.stack_mem(offset),
                                         });
                                         // Store imag part from second FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx + 1],
-                                            addr: MemAddr::BaseOffset {
-                                                base: Reg::X29,
-                                                offset: actual_offset + imag_offset,
-                                            },
+                                            addr: self.stack_mem_plus(offset, imag_offset),
                                         });
                                     }
                                 }
@@ -778,7 +836,6 @@ impl Aarch64CodeGen {
                             if fp_arg_idx < fp_arg_regs.len() {
                                 if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
                                     if *offset < 0 {
-                                        let actual_offset = self.stack_offset(*offset);
                                         let fp_size = if types.size_bits(*typ) == 32 {
                                             FpSize::Single
                                         } else {
@@ -787,10 +844,7 @@ impl Aarch64CodeGen {
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx],
-                                            addr: MemAddr::BaseOffset {
-                                                base: Reg::X29,
-                                                offset: actual_offset,
-                                            },
+                                            addr: self.stack_mem(*offset),
                                         });
                                     }
                                 }
@@ -802,14 +856,10 @@ impl Aarch64CodeGen {
                                 if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
                                     // Move from arg register to stack
                                     if *offset < 0 {
-                                        let actual_offset = self.stack_offset(*offset);
                                         self.push_lir(Aarch64Inst::Str {
                                             size: OperandSize::B64,
                                             src: arg_regs[int_arg_idx],
-                                            addr: MemAddr::BaseOffset {
-                                                base: Reg::X29, // fp
-                                                offset: actual_offset,
-                                            },
+                                            addr: self.stack_mem(*offset),
                                         });
                                     }
                                 }
@@ -872,14 +922,10 @@ impl Aarch64CodeGen {
                     complex_fp_info(types, &self.base.target, insn.typ.unwrap());
                 match src_loc {
                     Loc::Stack(offset) => {
-                        let actual_offset = self.stack_offset(offset);
                         self.push_lir(Aarch64Inst::Ldr {
                             size: OperandSize::B64,
                             dst: Reg::X9,
-                            addr: MemAddr::BaseOffset {
-                                base: Reg::X29,
-                                offset: actual_offset,
-                            },
+                            addr: self.stack_mem(offset),
                         });
                         self.push_lir(Aarch64Inst::LdrFp {
                             size: fp_size,
@@ -1042,13 +1088,9 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                     dst: scratch0,
                 });
                 self.push_lir(Aarch64Inst::Cmp {
@@ -1139,13 +1181,9 @@ impl Aarch64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                     dst: scratch0,
                 });
             }
@@ -1343,7 +1381,7 @@ impl Aarch64CodeGen {
                             let adjusted = self.stack_offset(offset);
                             self.push_lir(Aarch64Inst::Add {
                                 size: OperandSize::B64,
-                                src1: Reg::X29,
+                                src1: self.stack_base_reg(offset),
                                 src2: GpOperand::Imm(adjusted as i64),
                                 dst: dst_reg,
                             });
@@ -1690,17 +1728,13 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(offset);
                 // For sub-32-bit values, use sized load (ldrb/ldrh) which zero-extends.
                 // This avoids reading garbage from adjacent stack bytes.
                 let load_size = OperandSize::from_bits(actual_size.max(8));
                 // LIR: load from stack (FP-relative for alloca safety)
                 self.push_lir(Aarch64Inst::Ldr {
                     size: load_size,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(offset),
                     dst,
                 });
             }
@@ -1754,16 +1788,12 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(*offset);
                 // LIR: store to stack (FP-relative for alloca safety)
                 let op_size = OperandSize::from_bits(size);
                 self.push_lir(Aarch64Inst::Str {
                     size: op_size,
                     src,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: actual_offset,
-                    },
+                    addr: self.stack_mem(*offset),
                 });
             }
             _ => {}
@@ -1795,20 +1825,12 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     // Local variable - access directly from stack slot (FP-relative for alloca safety)
-                    let total_offset = self.stack_offset(offset) + insn_offset as i32;
-                    ComputedAddr::Direct(MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: total_offset,
-                    })
+                    ComputedAddr::Direct(self.stack_mem_plus(offset, insn_offset as i32))
                 } else {
                     // Spilled address - load address first (FP-relative for alloca safety)
-                    let adjusted = self.stack_offset(offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: adjusted,
-                        },
+                        addr: self.stack_mem(offset),
                         dst: temp_reg,
                     });
                     ComputedAddr::WithSetup(MemAddr::BaseOffset {
@@ -2018,7 +2040,7 @@ impl Aarch64CodeGen {
                 let total_offset = self.stack_offset(offset);
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
-                    src1: Reg::X29,
+                    src1: self.stack_base_reg(offset),
                     src2: GpOperand::Imm(total_offset as i64),
                     dst: Reg::X16,
                 });
@@ -2044,7 +2066,7 @@ impl Aarch64CodeGen {
                 let total_offset = self.stack_offset(offset) + insn.offset as i32;
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
-                    src1: Reg::X29,
+                    src1: self.stack_base_reg(offset),
                     src2: GpOperand::Imm(total_offset as i64),
                     dst: Reg::X17,
                 });
@@ -2103,7 +2125,7 @@ impl Aarch64CodeGen {
                 let total_offset = self.stack_offset(offset) + insn.offset as i32;
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
-                    src1: Reg::X29,
+                    src1: self.stack_base_reg(offset),
                     src2: GpOperand::Imm(total_offset as i64),
                     dst: Reg::X17,
                 });
@@ -2476,8 +2498,14 @@ impl Aarch64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                // AArch64 uses offsets from FP (x29)
-                format!("[x29, #-{}]", offset)
+                // AArch64 uses offsets from base register (x29 or x19 for aligned locals)
+                let base = if self.use_aligned_base && *offset < 0 {
+                    "x19"
+                } else {
+                    "x29"
+                };
+                let actual = self.stack_offset(*offset);
+                format!("[{}, #{}]", base, actual)
             }
             Loc::Imm(v) => format!("#{}", v),
             Loc::VReg(vreg) => vreg.name_d().to_string(),

@@ -3435,13 +3435,8 @@ fn test_static_local_address_in_initializer() {
 
     let static_int_ptr_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Pointer,
-        modifiers: TypeModifiers::empty(),
         base: Some(ctx.types.int_id),
-        array_size: None,
-        params: None,
-        variadic: false,
-        noreturn: false,
-        composite: None,
+        ..Default::default()
     });
     let p_sym = ctx.var("p", static_int_ptr_type);
 
@@ -5047,7 +5042,6 @@ fn test_bitfield_designated_init_multiple_same_offset() {
     // STATIC goes in storage_class, not type modifiers (matches parser behavior)
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::empty(),
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5056,11 +5050,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             align: 1,
             is_complete: true,
         })),
-        base: None,
-        array_size: None,
-        params: None,
-        noreturn: false,
-        variadic: false,
+        ..Default::default()
     });
 
     let s_sym = ctx.var("s", struct_type);
@@ -5329,7 +5319,6 @@ fn test_large_struct_copy_from_array() {
 
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::empty(),
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5338,11 +5327,7 @@ fn test_large_struct_copy_from_array() {
             align: 8,
             is_complete: true,
         })),
-        base: None,
-        array_size: None,
-        params: None,
-        noreturn: false,
-        variadic: false,
+        ..Default::default()
     });
 
     // Create array type: struct pair[2]
@@ -5469,7 +5454,6 @@ fn test_compound_literal_zero_init_lvalue() {
 
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::empty(),
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5478,11 +5462,7 @@ fn test_compound_literal_zero_init_lvalue() {
             align: 8,
             is_complete: true,
         })),
-        base: None,
-        array_size: None,
-        params: None,
-        noreturn: false,
-        variadic: false,
+        ..Default::default()
     });
 
     let struct_ptr_type = ctx.types.pointer_to(struct_type);

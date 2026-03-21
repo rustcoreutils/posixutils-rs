@@ -4868,3 +4868,114 @@ fn test_hex_float_with_exponent() {
     assert!(matches!(expr.kind, ExprKind::FloatLit(_)));
     assert_eq!(expr.typ, Some(types.double_id));
 }
+
+// ========================================================================
+// Alignment tests
+// ========================================================================
+
+#[test]
+fn test_alignas_on_variable() {
+    let (decl, _types, _strings, _symbols) = parse_decl("_Alignas(16) int x;").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    assert_eq!(decl.declarators[0].explicit_align, Some(16));
+}
+
+#[test]
+fn test_alignas_zero_no_effect() {
+    let (decl, _types, _strings, _symbols) = parse_decl("_Alignas(0) int x;").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    assert_eq!(decl.declarators[0].explicit_align, None);
+}
+
+#[test]
+fn test_multiple_alignas_strictest_wins() {
+    let (decl, _types, _strings, _symbols) = parse_decl("_Alignas(8) _Alignas(16) int x;").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    assert_eq!(decl.declarators[0].explicit_align, Some(16));
+}
+
+#[test]
+fn test_alignas_below_natural_alignment_error() {
+    let result = parse_decl("_Alignas(1) int x;");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_attr_aligned_on_variable() {
+    let (decl, _types, _strings, _symbols) =
+        parse_decl("int __attribute__((aligned(16))) x;").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    assert_eq!(decl.declarators[0].explicit_align, Some(16));
+}
+
+#[test]
+fn test_attr_aligned_no_args_defaults_to_16() {
+    let (decl, _types, _strings, _symbols) = parse_decl("int __attribute__((aligned)) x;").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    assert_eq!(decl.declarators[0].explicit_align, Some(16));
+}
+
+#[test]
+fn test_attr_aligned_on_struct_member() {
+    let (tu, types, _strings, _symbols) =
+        parse_tu("struct S { char a; int __attribute__((aligned(16))) b; char c; }; struct S x;")
+            .unwrap();
+    // The variable `x` of type `struct S` should have alignment 16
+    if let ExternalDecl::Declaration(ref decl) = tu.items[1] {
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.alignment(typ), 16);
+    }
+}
+
+#[test]
+fn test_attr_aligned_on_struct_tag() {
+    let (tu, types, _strings, _symbols) =
+        parse_tu("struct __attribute__((aligned(32))) S { int x; int y; }; struct S var;").unwrap();
+    // The variable type should have alignment 32
+    if let ExternalDecl::Declaration(ref decl) = tu.items[1] {
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.alignment(typ), 32);
+    }
+}
+
+#[test]
+fn test_attr_aligned_on_typedef() {
+    let (tu, types, _strings, _symbols) =
+        parse_tu("typedef int __attribute__((aligned(16))) aligned_int_t; aligned_int_t x;")
+            .unwrap();
+    // The variable's type should have alignment 16
+    if let ExternalDecl::Declaration(ref decl) = tu.items[1] {
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.alignment(typ), 16);
+    }
+}
+
+#[test]
+fn test_combined_alignas_and_attr_aligned() {
+    // _Alignas(16) + __attribute__((aligned(32))) — strictest (32) wins
+    let (decl, _types, _strings, _symbols) =
+        parse_decl("_Alignas(16) int __attribute__((aligned(32))) x;").unwrap();
+    assert_eq!(decl.declarators[0].explicit_align, Some(32));
+}
+
+#[test]
+fn test_aligned_typedef_as_struct_member() {
+    let (tu, types, _strings, _symbols) = parse_tu(
+        "typedef int __attribute__((aligned(16))) ai_t; \
+         struct S { char a; ai_t b; char c; }; struct S x;",
+    )
+    .unwrap();
+    // struct S should inherit alignment 16 from typedef member
+    if let ExternalDecl::Declaration(ref decl) = tu.items[2] {
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.alignment(typ), 16);
+    }
+}
+
+#[test]
+fn test_attr_aligned_nonpow2_ignored() {
+    // Non-power-of-2 is silently ignored — variable gets no explicit alignment
+    let (decl, _types, _strings, _symbols) =
+        parse_decl("int __attribute__((aligned(3))) x;").unwrap();
+    assert_eq!(decl.declarators[0].explicit_align, None);
+}

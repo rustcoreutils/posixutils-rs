@@ -683,6 +683,8 @@ pub struct RegAlloc {
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
     live_out: Vec<HashSet<PseudoId>>,
+    /// Maximum alignment requirement of any local variable (for dynamic stack alignment)
+    max_local_align: i32,
 }
 
 impl RegAlloc {
@@ -703,6 +705,7 @@ impl RegAlloc {
             addr_taken_syms: HashSet::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
+            max_local_align: 8,
         }
     }
 
@@ -745,6 +748,7 @@ impl RegAlloc {
         self.addr_taken_syms.clear();
         self.live_in.clear();
         self.live_out.clear();
+        self.max_local_align = 8;
     }
 
     /// Pre-allocate argument registers per AAPCS64
@@ -919,6 +923,9 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
+        if alignment > self.max_local_align {
+            self.max_local_align = alignment;
+        }
         if reusable {
             if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval.pseudo) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
@@ -1143,9 +1150,21 @@ impl RegAlloc {
         compute_live_intervals(func, |_: &Instruction| None)
     }
 
-    /// Get stack size needed (aligned to 16 bytes)
+    /// Get stack size needed (aligned to max local alignment, minimum 16).
+    /// When max_local_align > 16, adds extra padding for aligned base register.
     pub fn stack_size(&self) -> i32 {
-        (self.stack_offset + 15) & !15
+        let base = (self.stack_offset + 15) & !15;
+        if self.max_local_align > 16 {
+            // Over-allocate by (max_align - 1) to allow aligned base computation
+            base + self.max_local_align - 1
+        } else {
+            base
+        }
+    }
+
+    /// Get the maximum alignment requirement of any local variable
+    pub fn max_local_align(&self) -> i32 {
+        self.max_local_align
     }
 
     /// Get callee-saved registers that need to be preserved

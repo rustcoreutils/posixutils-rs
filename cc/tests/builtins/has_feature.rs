@@ -98,6 +98,10 @@ int main(void) {
         return 32;
 #endif
 
+#if !__has_feature(c_alignas)
+        return 33;
+#endif
+
 #if !__has_feature(c_thread_local)
         return 34;
 #endif

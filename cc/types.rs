@@ -265,6 +265,10 @@ pub struct Type {
 
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
+
+    /// Explicit alignment from __attribute__((aligned(N))) on typedef.
+    /// When set, overrides the natural alignment returned by alignment().
+    pub explicit_align: Option<u32>,
 }
 
 impl Default for Type {
@@ -278,6 +282,7 @@ impl Default for Type {
             variadic: false,
             noreturn: false,
             composite: None,
+            explicit_align: None,
         }
     }
 }
@@ -304,13 +309,8 @@ impl Type {
     pub fn pointer(base: TypeId) -> Self {
         Self {
             kind: TypeKind::Pointer,
-            modifiers: TypeModifiers::empty(),
             base: Some(base),
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
-            composite: None,
+            ..Default::default()
         }
     }
 
@@ -318,13 +318,9 @@ impl Type {
     pub fn array(base: TypeId, size: usize) -> Self {
         Self {
             kind: TypeKind::Array,
-            modifiers: TypeModifiers::empty(),
             base: Some(base),
             array_size: Some(size),
-            params: None,
-            variadic: false,
-            noreturn: false,
-            composite: None,
+            ..Default::default()
         }
     }
 
@@ -337,13 +333,11 @@ impl Type {
     ) -> Self {
         Self {
             kind: TypeKind::Function,
-            modifiers: TypeModifiers::empty(),
             base: Some(return_type),
-            array_size: None,
             params: Some(params),
             variadic,
             noreturn,
-            composite: None,
+            ..Default::default()
         }
     }
 
@@ -351,13 +345,8 @@ impl Type {
     pub fn struct_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Struct,
-            modifiers: TypeModifiers::empty(),
-            base: None,
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
             composite: Some(Box::new(composite)),
+            ..Default::default()
         }
     }
 
@@ -365,13 +354,8 @@ impl Type {
     pub fn union_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Union,
-            modifiers: TypeModifiers::empty(),
-            base: None,
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
             composite: Some(Box::new(composite)),
+            ..Default::default()
         }
     }
 
@@ -379,13 +363,8 @@ impl Type {
     pub fn enum_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Enum,
-            modifiers: TypeModifiers::empty(),
-            base: None,
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
             composite: Some(Box::new(composite)),
+            ..Default::default()
         }
     }
 
@@ -719,6 +698,10 @@ impl TypeTable {
         if typ.composite.is_some() {
             return None;
         }
+        // Don't deduplicate types with explicit alignment (typedef aligned types are unique)
+        if typ.explicit_align.is_some() {
+            return None;
+        }
 
         match typ.kind {
             TypeKind::Pointer => {
@@ -1044,9 +1027,15 @@ impl TypeTable {
         }
     }
 
-    /// Get natural alignment for a type in bytes
+    /// Get alignment for a type in bytes.
+    /// If the type has an explicit alignment (from typedef __attribute__((aligned(N)))),
+    /// that takes precedence over the natural alignment.
     pub fn alignment(&self, id: TypeId) -> usize {
         let typ = self.get(id);
+        // Explicit alignment from typedef __attribute__((aligned(N))) overrides natural
+        if let Some(explicit) = typ.explicit_align {
+            return explicit as usize;
+        }
         match typ.kind {
             TypeKind::Void => 1,
             TypeKind::Bool | TypeKind::Char => 1,

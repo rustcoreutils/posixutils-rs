@@ -3076,6 +3076,7 @@ impl<'a> Preprocessor<'a> {
                     // C11 features
                     "c_atomic" |
                     "c_static_assert" |
+                    "c_alignas" |
                     "c_alignof" |
                     "c_thread_local"
                 )
@@ -3539,6 +3540,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             // C11 features
             "c_atomic" |
             "c_static_assert" |
+            "c_alignas" |
             "c_alignof" |
             "c_thread_local"
         );

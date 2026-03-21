@@ -1151,14 +1151,15 @@ impl RegAlloc {
     }
 
     /// Get stack size needed (aligned to max local alignment, minimum 16).
-    /// When max_local_align > 16, adds extra padding for aligned base register.
+    /// When max_local_align > 16, rounds base to max_align then adds (max_align - 1)
+    /// padding so the aligned base register (x19) always finds an aligned start.
     pub fn stack_size(&self) -> i32 {
-        let base = (self.stack_offset + 15) & !15;
         if self.max_local_align > 16 {
-            // Over-allocate by (max_align - 1) to allow aligned base computation
-            base + self.max_local_align - 1
+            let align = self.max_local_align;
+            let base = (self.stack_offset + align - 1) & !(align - 1);
+            base + align - 1
         } else {
-            base
+            (self.stack_offset + 15) & !15
         }
     }
 

@@ -117,15 +117,14 @@ impl Aarch64CodeGen {
     pub(super) fn stack_offset(&self, offset: i32) -> i32 {
         if offset < 0 {
             if self.use_aligned_base {
-                // Over-aligned locals: use x19-relative addressing.
-                // x19 = aligned base of locals area.
-                // Regalloc assigns negative offsets, so local at -8 is the first slot.
-                // x19 points to the start (lowest address) of the aligned locals area.
-                // offset is negative, e.g., -8 for first local.
-                // x19-relative: [x19 + (-offset - 8)] for first local at [x19 + 0]
-                // Actually: locals are at x19 + (stack_alloc_size + offset)
-                // because offset = -stack_alloc_size for the highest slot
-                self.stack_alloc_size + offset
+                // Over-aligned locals: x19-relative addressing.
+                // stack_alloc_size = base_rounded + (max_align - 1), where base_rounded
+                // is round_up(stack_offset, max_align). x19 is the max_align-aligned
+                // start of the locals area. Offset from x19 = base_rounded + regalloc_offset.
+                // Since base_rounded is a multiple of max_align and regalloc aligns each
+                // local's position to its alignment, the result preserves alignment.
+                let base_rounded = self.stack_alloc_size - (self.max_local_align - 1);
+                base_rounded + offset
             } else {
                 // Local variable: use frame size minus reg_save_area
                 // Layout: [fp/lr][callee-saved][locals][reg_save_area]

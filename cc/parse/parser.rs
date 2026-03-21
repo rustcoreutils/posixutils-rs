@@ -330,8 +330,15 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(())
         } else {
+            let found = match &self.current().value {
+                TokenValue::Ident(id) => {
+                    format!("identifier '{}'", self.idents.get_opt(*id).unwrap_or("?"))
+                }
+                TokenValue::Special(v) => format!("'{}'", char::from_u32(*v).unwrap_or('?')),
+                other => format!("{:?}", other),
+            };
             Err(ParseError::new(
-                format!("expected '{}'", c as char),
+                format!("expected '{}', found {}", c as char, found),
                 self.current_pos(),
             ))
         }
@@ -3169,6 +3176,7 @@ impl Parser<'_> {
                     None
                 };
 
+                self.skip_extensions();
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
@@ -3367,6 +3375,7 @@ impl Parser<'_> {
                     None
                 };
 
+                self.skip_extensions();
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)

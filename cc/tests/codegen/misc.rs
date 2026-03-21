@@ -2717,7 +2717,7 @@ int main(void) {
 }
 
 /// Diagnostic: dump preprocessed stdlib.h lines around 540 to debug macOS parse error.
-/// This test always passes — it just prints diagnostic info.
+/// Intentionally panics to ensure output appears in CI test failure log.
 #[test]
 fn codegen_ternary_fptr_diag() {
     let code = r#"
@@ -2730,18 +2730,23 @@ int main(void) { return 0; }
     let output = run_test_base("pcc", &args, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    eprintln!("=== preprocessed output: {} total lines ===", lines.len());
+    let mut diag = format!("=== preprocessed output: {} total lines ===\n", lines.len());
+    // Show lines 530-550
     let start = if lines.len() > 545 { 530 } else { 0 };
-    let end = std::cmp::min(start + 20, lines.len());
+    let end = std::cmp::min(start + 25, lines.len());
     for (i, line) in lines[start..end].iter().enumerate() {
-        eprintln!("  {:>4}: {}", start + i + 1, line);
+        diag.push_str(&format!("  {:>4}: {}\n", start + i + 1, line));
     }
     // Also dump any line containing __v
+    diag.push_str("=== lines containing __v ===\n");
     for (i, line) in lines.iter().enumerate() {
         if line.contains("__v") {
-            eprintln!("  [__v] {:>4}: {}", i + 1, line);
+            diag.push_str(&format!("  {:>4}: {}\n", i + 1, line));
         }
     }
+    // Only panic on macOS (where the bug occurs) to show diagnostic output in CI
+    #[cfg(target_os = "macos")]
+    panic!("DIAGNOSTIC OUTPUT (intentional failure):\n{}", diag);
 }
 
 /// Regression test: ternary selecting function pointers lost return type.

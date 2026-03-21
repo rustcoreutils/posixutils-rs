@@ -2716,6 +2716,34 @@ int main(void) {
     assert_eq!(compile_and_run("nullability_qualifiers", code, &[]), 0);
 }
 
+/// Diagnostic: dump preprocessed stdlib.h lines around 540 to debug macOS parse error.
+/// This test always passes — it just prints diagnostic info.
+#[test]
+fn codegen_ternary_fptr_diag() {
+    let code = r#"
+#include <stdlib.h>
+int main(void) { return 0; }
+"#;
+    let c_file = create_c_file("ternary_fptr_diag", code);
+    let c_path = c_file.path().to_path_buf();
+    let args = vec!["-E".to_string(), c_path.to_string_lossy().to_string()];
+    let output = run_test_base("pcc", &args, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    eprintln!("=== preprocessed output: {} total lines ===", lines.len());
+    let start = if lines.len() > 545 { 530 } else { 0 };
+    let end = std::cmp::min(start + 20, lines.len());
+    for (i, line) in lines[start..end].iter().enumerate() {
+        eprintln!("  {:>4}: {}", start + i + 1, line);
+    }
+    // Also dump any line containing __v
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("__v") {
+            eprintln!("  [__v] {:>4}: {}", i + 1, line);
+        }
+    }
+}
+
 /// Regression test: ternary selecting function pointers lost return type.
 /// `(cond ? func_a : func_b)(arg)` used pointer_to() which returned void*
 /// when the pointer-to-function type wasn't in the lookup table. The call's

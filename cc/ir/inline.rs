@@ -558,6 +558,20 @@ fn clone_instruction(
                 new_insn.bb_false = Some(ctx.remap_bb(bb));
             }
 
+            // Remap pseudos inside inline asm operands
+            if let Some(ref mut asm_data) = new_insn.asm_data {
+                for output in &mut asm_data.outputs {
+                    output.pseudo = ctx.remap_pseudo(output.pseudo, callee_func);
+                }
+                for input in &mut asm_data.inputs {
+                    input.pseudo = ctx.remap_pseudo(input.pseudo, callee_func);
+                    if let Some(ref mut match_idx) = input.matching_output {
+                        // matching_output is an index, not a pseudo — no remap needed
+                        let _ = match_idx;
+                    }
+                }
+            }
+
             vec![new_insn]
         }
     }

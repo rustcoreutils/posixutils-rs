@@ -838,10 +838,8 @@ impl<'a> Parser<'a> {
                     self.advance();
                     mods |= TypeModifiers::ATOMIC;
                 }
-                "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable" | "_Null_unspecified"
-                | "__null_unspecified" => {
+                n if super::is_nullability_qualifier(n) => {
                     self.advance();
-                    // Nullability qualifiers — recognized but no semantic effect
                 }
                 _ => break,
             }

@@ -634,6 +634,14 @@ impl<'a> Parser<'a> {
         result
     }
 
+    /// Check if current token is a C11 nullability qualifier
+    fn is_nullability_qualifier(&self) -> bool {
+        self.peek() == TokenType::Ident
+            && self
+                .get_ident_name(self.current())
+                .is_some_and(|n| super::is_nullability_qualifier(n.as_str()))
+    }
+
     /// Check if current token is __asm or __asm__
     fn is_asm_keyword(&self) -> bool {
         if self.peek() != TokenType::Ident {
@@ -907,7 +915,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse __attribute__ and __asm extensions, wiring aligned() to pending_alignas
+    /// Parse __attribute__, __asm, and nullability extensions, wiring aligned() to pending_alignas
     fn skip_extensions(&mut self) {
         loop {
             if self.is_attribute_keyword() {
@@ -915,6 +923,8 @@ impl<'a> Parser<'a> {
                 self.apply_attribute_alignment(&attrs);
             } else if self.is_asm_keyword() {
                 self.skip_asm();
+            } else if self.is_nullability_qualifier() {
+                self.advance();
             } else {
                 break;
             }
@@ -2400,8 +2410,7 @@ impl Parser<'_> {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::ATOMIC;
                         }
-                        "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable"
-                        | "_Null_unspecified" | "__null_unspecified" => {
+                        n if super::is_nullability_qualifier(n) => {
                             self.advance();
                         }
                         _ => break,
@@ -2749,8 +2758,7 @@ impl Parser<'_> {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
-                        "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable"
-                        | "_Null_unspecified" | "__null_unspecified" => {
+                        n if super::is_nullability_qualifier(n) => {
                             self.advance();
                         }
                         _ => break,
@@ -3228,8 +3236,7 @@ impl Parser<'_> {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
-                        "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable"
-                        | "_Null_unspecified" | "__null_unspecified" => {
+                        n if super::is_nullability_qualifier(n) => {
                             self.advance();
                         }
                         _ => break,

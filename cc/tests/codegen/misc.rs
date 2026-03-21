@@ -3708,3 +3708,58 @@ int main(void) {
         0
     );
 }
+
+/// Regression: inlining a function with two-SSE struct parameters (e.g.
+/// `{double, double}`) failed because the inliner did not generate the
+/// struct copy that the backend prologue normally performs.  The local
+/// for the parameter was left uninitialised (zero-filled), so the
+/// inlined body read all-zeros.
+#[test]
+fn codegen_inline_two_sse_struct_param() {
+    let code = r#"
+typedef struct { double real; double imag; } Complex;
+
+Complex make_complex(double r, double i) {
+    Complex c;
+    c.real = r;
+    c.imag = i;
+    return c;
+}
+
+Complex add_complex(Complex a, Complex b) {
+    Complex c;
+    c.real = a.real + b.real;
+    c.imag = a.imag + b.imag;
+    return c;
+}
+
+Complex sub_complex(Complex a, Complex b) {
+    Complex c;
+    c.real = a.real - b.real;
+    c.imag = a.imag - b.imag;
+    return c;
+}
+
+int main(void) {
+    Complex z1 = make_complex(3.0, 4.0);
+    if (z1.real != 3.0 || z1.imag != 4.0) return 1;
+
+    Complex z2 = make_complex(1.0, 2.0);
+    Complex z3 = add_complex(z1, z2);
+    if (z3.real != 4.0 || z3.imag != 6.0) return 2;
+
+    Complex z4 = sub_complex(z1, z2);
+    if (z4.real != 2.0 || z4.imag != 2.0) return 3;
+
+    /* Chained: add(sub(z1, z2), z2) == z1 */
+    Complex z5 = add_complex(sub_complex(z1, z2), z2);
+    if (z5.real != 3.0 || z5.imag != 4.0) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("codegen_inline_two_sse_struct_param", code),
+        0
+    );
+}

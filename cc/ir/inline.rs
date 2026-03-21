@@ -675,8 +675,56 @@ fn inline_call_site(
     let continuation_bb_id = ctx.alloc_bb_id();
     ctx.return_continuation_bb = continuation_bb_id;
 
-    let inlined_blocks = clone_callee_blocks(&mut ctx, callee);
+    let mut inlined_blocks = clone_callee_blocks(&mut ctx, callee);
     let inlined_pseudos = clone_callee_pseudos(&mut ctx, callee, caller);
+
+    // Generate struct copies for implicit params (complex / two-SSE struct params).
+    // These params have their data filled by the backend prologue in non-inlined
+    // calls; when inlining we must copy explicitly from the caller's struct.
+    let mut implicit_copy_pseudos: Vec<Pseudo> = Vec::new();
+    if !callee.implicit_param_copies.is_empty() {
+        let entry_bb_id = ctx.bb_map[&callee.entry];
+        if let Some(entry_block) = inlined_blocks.iter_mut().find(|b| b.id == entry_bb_id) {
+            let mut copy_insns = Vec::new();
+            for copy in &callee.implicit_param_copies {
+                let arg_idx_usize = copy.arg_index as usize;
+                if arg_idx_usize >= ctx.call_args.len() {
+                    continue;
+                }
+                let call_arg = ctx.call_args[arg_idx_usize];
+                let remapped_local = ctx.remap_pseudo(copy.local_sym, callee);
+                let mut offset = 0i64;
+                while (offset as usize) < copy.size_bytes {
+                    let temp = ctx.alloc_pseudo_id();
+                    implicit_copy_pseudos.push(Pseudo::undef(temp));
+                    copy_insns.push(Instruction::load(
+                        temp,
+                        call_arg,
+                        offset,
+                        copy.qword_type,
+                        64,
+                    ));
+                    copy_insns.push(Instruction::store(
+                        temp,
+                        remapped_local,
+                        offset,
+                        copy.qword_type,
+                        64,
+                    ));
+                    offset += 8;
+                }
+            }
+            // Insert copies at the beginning of the entry block
+            let insert_pos = entry_block
+                .insns
+                .iter()
+                .position(|i| i.op != Opcode::Nop)
+                .unwrap_or(0);
+            for (i, insn) in copy_insns.into_iter().enumerate() {
+                entry_block.insns.insert(insert_pos + i, insn);
+            }
+        }
+    }
 
     let inlined_entry = ctx.bb_map[&callee.entry];
     let mut continuation_bb = split_caller_at_call(
@@ -738,6 +786,10 @@ fn inline_call_site(
 
     // Add cloned pseudos to caller
     for pseudo in inlined_pseudos {
+        caller.add_pseudo(pseudo);
+    }
+    // Add temp pseudos generated for implicit param copies
+    for pseudo in implicit_copy_pseudos {
         caller.add_pseudo(pseudo);
     }
 

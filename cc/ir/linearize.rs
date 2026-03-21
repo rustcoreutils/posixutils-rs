@@ -1851,7 +1851,8 @@ impl<'a> Linearizer<'a> {
         let mut struct_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
         // Complex parameters also need local storage for real/imag access
-        let mut complex_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
+        // Tuple: (name, symbol_id, type, arg_pseudo, arg_index_with_offset)
+        let mut complex_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId, u32)> =
             Vec::with_capacity(func.params.len());
         // Scalar parameters need local storage for SSA-correct reassignment handling
         let mut scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
@@ -1895,7 +1896,13 @@ impl<'a> Linearizer<'a> {
                     )
                 };
                 if is_two_sse {
-                    complex_params.push((name, param.symbol, param.typ, pseudo_id));
+                    complex_params.push((
+                        name,
+                        param.symbol,
+                        param.typ,
+                        pseudo_id,
+                        i as u32 + arg_offset,
+                    ));
                 } else {
                     struct_params.push((name, param.symbol, param.typ, pseudo_id));
                 }
@@ -1903,7 +1910,13 @@ impl<'a> Linearizer<'a> {
                 // Complex parameters: copy to local storage so real/imag access works
                 // Unlike structs, complex types are passed in FP registers per ABI,
                 // so we create local storage and the codegen handles the register split
-                complex_params.push((name, param.symbol, param.typ, pseudo_id));
+                complex_params.push((
+                    name,
+                    param.symbol,
+                    param.typ,
+                    pseudo_id,
+                    i as u32 + arg_offset,
+                ));
             } else {
                 // Store all scalar parameters to locals so SSA conversion can properly
                 // handle reassignment with phi nodes. If the parameter is never modified,
@@ -2041,16 +2054,25 @@ impl<'a> Linearizer<'a> {
         // Setup local storage for complex parameters
         // Complex types are passed in FP registers per ABI - the prologue codegen
         // handles storing from XMM registers to local storage
-        for (name, symbol_id_opt, typ, _arg_pseudo) in complex_params {
+        for (name, symbol_id_opt, typ, _arg_pseudo, arg_idx) in complex_params {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
+            let typ_size_bytes = (self.types.size_bits(typ) / 8) as usize;
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
                 let is_volatile = mods.contains(TypeModifiers::VOLATILE);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+                // Record for inliner: the backend prologue fills this local from
+                // registers; the inliner must generate an explicit copy instead.
+                func.implicit_param_copies.push(super::ImplicitParamCopy {
+                    arg_index: arg_idx,
+                    local_sym,
+                    size_bytes: typ_size_bytes,
+                    qword_type: self.types.long_id,
+                });
             }
 
             // Don't emit a store here - the prologue codegen handles storing

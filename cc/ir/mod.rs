@@ -1276,6 +1276,21 @@ pub struct LocalVar {
     pub explicit_align: Option<u32>,
 }
 
+/// A parameter whose local storage is filled implicitly by the backend prologue
+/// (e.g. complex / two-SSE struct params passed in XMM registers).
+/// The inliner uses this to generate explicit struct copies at inline sites.
+#[derive(Debug, Clone, Copy)]
+pub struct ImplicitParamCopy {
+    /// Index into the call instruction's source list
+    pub arg_index: u32,
+    /// Callee's local Sym pseudo that receives the data
+    pub local_sym: PseudoId,
+    /// Struct size in bytes
+    pub size_bytes: usize,
+    /// Type for the 8-byte load/store operations (typically `long`)
+    pub qword_type: TypeId,
+}
+
 /// A function in IR form
 #[derive(Debug, Clone)]
 pub struct Function {
@@ -1303,6 +1318,11 @@ pub struct Function {
     pub is_noreturn: bool,
     /// Is this function declared with the inline keyword?
     pub is_inline: bool,
+    /// Parameters whose data is supplied implicitly by the backend prologue
+    /// (e.g. complex / two-SSE struct params).  When inlining the function,
+    /// the inliner must generate an explicit struct copy from the caller's
+    /// address argument into the local.
+    pub implicit_param_copies: Vec<ImplicitParamCopy>,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -1324,6 +1344,7 @@ impl Default for Function {
             is_static: false,
             is_noreturn: false,
             is_inline: false,
+            implicit_param_copies: Vec::new(),
             block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
             pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }

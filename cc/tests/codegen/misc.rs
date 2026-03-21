@@ -2558,6 +2558,7 @@ int main(void) {
 /// Regression test: inline asm with "+r" constraint on 64-bit value used 32-bit register.
 /// The xchg instruction in CPython's atomic store macro would truncate pointers.
 #[test]
+#[cfg(target_arch = "x86_64")]
 fn codegen_inline_asm_64bit_constraint() {
     let code = r#"
 #include <stdint.h>
@@ -2569,6 +2570,46 @@ static inline void atomic_store(atomic_addr *addr, uintptr_t val) {
     __asm__ volatile("xchg %0, %1"
                      : "+r"(new_val)
                      : "m"(addr->_value)
+                     : "memory");
+}
+
+int main(void) {
+    atomic_addr slot = {0};
+    /* Use a pointer value that exercises upper 32 bits */
+    uintptr_t ptr = 0x7F5500123456UL;
+
+    atomic_store(&slot, ptr);
+
+    uintptr_t loaded = *(volatile uintptr_t *)&slot._value;
+    if (loaded != ptr) return 1;  /* upper bits truncated */
+
+    /* Also test 32-bit values still work */
+    uintptr_t small = 42;
+    atomic_store(&slot, small);
+    loaded = *(volatile uintptr_t *)&slot._value;
+    if (loaded != 42) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inline_asm_64bit_constraint", code, &[]), 0);
+}
+
+/// AArch64 version: inline asm with "r" constraint on 64-bit value.
+/// Verifies str instruction preserves full 64-bit register width.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_inline_asm_64bit_constraint() {
+    let code = r#"
+#include <stdint.h>
+
+typedef struct { uintptr_t _value; } atomic_addr;
+
+static inline void atomic_store(atomic_addr *addr, uintptr_t val) {
+    uintptr_t new_val = val;
+    __asm__ volatile("str %0, [%1]"
+                     :
+                     : "r"(new_val), "r"(&addr->_value)
                      : "memory");
 }
 

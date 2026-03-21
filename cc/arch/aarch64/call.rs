@@ -156,6 +156,22 @@ impl Aarch64CodeGen {
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
             let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+            // Check for HFA-2 struct (e.g., {double, double}) — passed in two FP regs
+            let is_hfa_two = !is_complex
+                && arg_type.is_some_and(|t| {
+                    let k = types.kind(t);
+                    (k == crate::types::TypeKind::Struct || k == crate::types::TypeKind::Union)
+                        && types.size_bits(t) > 64
+                        && types.size_bits(t) <= 128
+                        && {
+                            let abi = crate::abi::get_abi_for_conv(
+                                crate::abi::CallingConv::C,
+                                &self.base.target,
+                            );
+                            matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 2, .. })
+                        }
+                });
+            let uses_two_fp_regs = is_complex || is_hfa_two;
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -169,15 +185,25 @@ impl Aarch64CodeGen {
                 64
             };
 
-            if is_complex {
+            if uses_two_fp_regs {
                 if fp_arg_idx + 1 < fp_arg_regs.len() {
-                    self.setup_complex_arg(
-                        arg,
-                        arg_type,
-                        fp_arg_regs[fp_arg_idx],
-                        fp_arg_regs[fp_arg_idx + 1],
-                        types,
-                    );
+                    if is_hfa_two {
+                        self.setup_hfa2_arg(
+                            arg,
+                            arg_type,
+                            fp_arg_regs[fp_arg_idx],
+                            fp_arg_regs[fp_arg_idx + 1],
+                            types,
+                        );
+                    } else {
+                        self.setup_complex_arg(
+                            arg,
+                            arg_type,
+                            fp_arg_regs[fp_arg_idx],
+                            fp_arg_regs[fp_arg_idx + 1],
+                            types,
+                        );
+                    }
                     fp_arg_idx += 2;
                 } else {
                     // Complex on stack needs 2 slots
@@ -339,6 +365,65 @@ impl Aarch64CodeGen {
                     addr: MemAddr::BaseOffset {
                         base: r,
                         offset: imag_offset,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Set up an HFA-2 struct argument (two FP elements in consecutive V registers)
+    fn setup_hfa2_arg(
+        &mut self,
+        arg: PseudoId,
+        arg_type: Option<crate::types::TypeId>,
+        first_reg: VReg,
+        second_reg: VReg,
+        types: &TypeTable,
+    ) {
+        let arg_loc = self.get_location(arg);
+        let typ = arg_type.unwrap();
+        let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+        let (fp_size, elem_offset) = match abi.classify_param(typ, types) {
+            ArgClass::Hfa { base, .. } => match base {
+                HfaBase::Float32 => (FpSize::Single, 4),
+                HfaBase::Float64 => (FpSize::Double, 8),
+            },
+            _ => (FpSize::Double, 8),
+        };
+
+        match arg_loc {
+            Loc::Stack(offset) => {
+                let actual_offset = self.stack_offset(offset);
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    dst: first_reg,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: actual_offset,
+                    },
+                });
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    dst: second_reg,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: actual_offset + elem_offset,
+                    },
+                });
+            }
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    dst: first_reg,
+                    addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                });
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    dst: second_reg,
+                    addr: MemAddr::BaseOffset {
+                        base: r,
+                        offset: elem_offset,
                     },
                 });
             }

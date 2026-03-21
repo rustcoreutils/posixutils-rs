@@ -1886,16 +1886,17 @@ impl<'a> Linearizer<'a> {
                 // passed like complex types (in two XMM registers). Route them
                 // through complex_params so the codegen handles the register split.
                 let size = self.types.size_bits(param.typ);
-                let is_two_sse = size > 64 && size <= 128 && {
+                let is_two_fp_regs = size > 64 && size <= 128 && {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+                    let class = abi.classify_param(param.typ, self.types);
                     matches!(
-                        abi.classify_param(param.typ, self.types),
+                        class,
                         crate::abi::ArgClass::Direct { ref classes, .. }
                             if classes.len() == 2
                                 && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    )
+                    ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. })
                 };
-                if is_two_sse {
+                if is_two_fp_regs {
                     complex_params.push((
                         name,
                         param.symbol,
@@ -5309,13 +5310,15 @@ impl<'a> Linearizer<'a> {
                 } else {
                     // Medium struct (9-16 bytes): check ABI classification
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    let is_two_sse = matches!(
-                        abi.classify_param(arg_type, self.types),
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    );
-                    if is_two_sse {
+                    let class = abi.classify_param(arg_type, self.types);
+                    let is_two_fp_regs =
+                        matches!(
+                            class,
+                            crate::abi::ArgClass::Direct { ref classes, .. }
+                                if classes.len() == 2
+                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                        ) || matches!(class, crate::abi::ArgClass::Hfa { count: 2, .. });
+                    if is_two_fp_regs {
                         // All-SSE struct: keep struct type for 2-XMM passing
                         arg_types_vec.push(arg_type);
                     } else {

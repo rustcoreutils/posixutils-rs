@@ -115,6 +115,12 @@ impl StringTable {
         self.intern_internal(s)
     }
 
+    /// Look up a string without interning it.
+    /// Returns `Some(id)` if the string was previously interned, `None` otherwise.
+    pub fn lookup(&self, s: &str) -> Option<StringId> {
+        self.map.get(s).copied()
+    }
+
     /// Get the string for an ID
     ///
     /// # Panics

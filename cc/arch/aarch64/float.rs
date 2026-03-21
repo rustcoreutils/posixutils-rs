@@ -425,14 +425,22 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        // Set result based on condition
+        // Set result based on condition.
+        // AArch64 fcmp sets NZCV: Equal(0100), Less(1000), Greater(0010), NaN(0011).
+        // Ordered comparisons must return false for NaN:
+        //   OLt: use 'lo' (C=0) — NaN has C=1 → false ✓
+        //   OLe: use 'ls' (C=0 OR Z=1) — NaN has C=1,Z=0 → false ✓
+        //   OGt: use 'gt' (Z=0 AND N=V) — NaN has N≠V → false ✓
+        //   OGe: use 'ge' (N=V) — NaN has N≠V → false ✓
+        //   OEq: use 'eq' (Z=1) — NaN has Z=0 → false ✓
+        //   ONe: use 'ne' (Z=0) — NaN has Z=0 → true ✓ (correct for unordered not-equal)
         let cond = match insn.op {
             Opcode::FCmpOEq => CondCode::Eq,
             Opcode::FCmpONe => CondCode::Ne,
-            Opcode::FCmpOLt => CondCode::Slt,
-            Opcode::FCmpOLe => CondCode::Sle,
-            Opcode::FCmpOGt => CondCode::Sgt,
-            Opcode::FCmpOGe => CondCode::Sge,
+            Opcode::FCmpOLt => CondCode::Ult, // 'lo' = C clear, NaN-safe
+            Opcode::FCmpOLe => CondCode::Ule, // 'ls' = C=0 OR Z=1, NaN-safe
+            Opcode::FCmpOGt => CondCode::Sgt, // 'gt' = Z=0 AND N=V, NaN-safe
+            Opcode::FCmpOGe => CondCode::Sge, // 'ge' = N=V, NaN-safe
             _ => return,
         };
 

@@ -401,14 +401,22 @@ int main(void) {
     result++;
 #endif
 
+    // ========== OBJECT SIZE / FORTIFIED BUILTINS ==========
+#if __has_builtin(__builtin_object_size)
+    result++;
+#endif
+#if __has_builtin(__builtin___snprintf_chk)
+    result++;
+#endif
+
     // ========== UNKNOWN BUILTIN ==========
 #if __has_builtin(__builtin_nonexistent)
     result = -1;  // Should not happen
 #endif
 
-    // Expected: 30 builtins detected
-    // (4 va + 3 bswap + 3 bit + 4 mem + 4 compile + 3 fp-const + 3 fp-math + 6 atomic)
-    return (result == 30) ? 0 : result;
+    // Expected: 32 builtins detected
+    // (4 va + 3 bswap + 3 bit + 4 mem + 4 compile + 3 fp-const + 3 fp-math + 6 atomic + 2 fortified)
+    return (result == 32) ? 0 : result;
 }
 "#;
     assert_eq!(compile_and_run("preproc_has_builtin", code, &[]), 0);

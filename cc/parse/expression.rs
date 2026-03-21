@@ -838,6 +838,11 @@ impl<'a> Parser<'a> {
                     self.advance();
                     mods |= TypeModifiers::ATOMIC;
                 }
+                "_Nonnull" | "__nonnull" | "_Nullable" | "__nullable" | "_Null_unspecified"
+                | "__null_unspecified" => {
+                    self.advance();
+                    // Nullability qualifiers — recognized but no semantic effect
+                }
                 _ => break,
             }
         }
@@ -2635,6 +2640,68 @@ impl<'a> Parser<'a> {
                                     order: Box::new(order),
                                 },
                                 self.types.void_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_object_size" => {
+                            // __builtin_object_size(ptr, type) - returns (size_t)-1
+                            // at compile time without optimization (conservative "don't know")
+                            self.expect_special(b'(')?;
+                            let _ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let _otype = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(-1),
+                                self.types.ulong_id,
+                                token_pos,
+                            ));
+                        }
+                        name if name.starts_with("__builtin___") => {
+                            // Fortified builtins: __builtin___snprintf_chk etc.
+                            // Strip __builtin_ prefix → __snprintf_chk, which is a
+                            // real libc function (declared by macOS/glibc headers).
+                            let real_name = &name["__builtin_".len()..];
+                            // Parse arguments first (must consume tokens regardless)
+                            self.expect_special(b'(')?;
+                            let mut args = Vec::new();
+                            if !self.is_special(b')') {
+                                args.push(self.parse_assignment_expr()?);
+                                while self.is_special(b',') {
+                                    self.advance();
+                                    args.push(self.parse_assignment_expr()?);
+                                }
+                            }
+                            self.expect_special(b')')?;
+                            // Look up the real function by its de-prefixed name
+                            let real_name_id = self.idents.lookup(real_name);
+                            let symbol_id = real_name_id.and_then(|id| {
+                                self.symbols
+                                    .lookup_id(id, crate::symbol::Namespace::Ordinary)
+                            });
+                            if let Some(symbol_id) = symbol_id {
+                                let func_type = self.symbols.get(symbol_id).typ;
+                                let ret_type =
+                                    self.types.base_type(func_type).unwrap_or(self.types.int_id);
+                                let func_expr = Self::typed_expr(
+                                    ExprKind::Ident(symbol_id),
+                                    func_type,
+                                    token_pos,
+                                );
+                                return Ok(Self::typed_expr(
+                                    ExprKind::Call {
+                                        func: Box::new(func_expr),
+                                        args,
+                                    },
+                                    ret_type,
+                                    token_pos,
+                                ));
+                            }
+                            // Not declared — return 0 as fallback
+                            diag::error(token_pos, &format!("undeclared function '{}'", real_name));
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(0),
+                                self.types.int_id,
                                 token_pos,
                             ));
                         }

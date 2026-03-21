@@ -17,6 +17,7 @@
 // for prologue/epilogue, call stack argument passing, and alloca itself.
 //
 
+use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
@@ -786,6 +787,18 @@ impl Aarch64CodeGen {
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
+            // Check for HFA-2 struct (e.g., {double, double}) — passed in two FP regs
+            let is_hfa_two = !is_complex
+                && !is_fp
+                && (types.kind(*typ) == TypeKind::Struct || types.kind(*typ) == TypeKind::Union)
+                && {
+                    let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                    matches!(
+                        abi.classify_param(*typ, types),
+                        ArgClass::Hfa { count: 2, .. }
+                    )
+                };
+            let uses_two_fp_regs = is_complex || is_hfa_two;
 
             // Find the pseudo for this argument
             for pseudo in &func.pseudos {
@@ -795,7 +808,7 @@ impl Aarch64CodeGen {
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
                             // Still need to count this arg for register assignment tracking
-                            if is_complex {
+                            if uses_two_fp_regs {
                                 fp_arg_idx += 2;
                             } else if is_fp {
                                 fp_arg_idx += 1;
@@ -804,27 +817,42 @@ impl Aarch64CodeGen {
                             }
                             break;
                         }
-                        if is_complex {
-                            // Complex argument - uses TWO consecutive FP registers
+                        if uses_two_fp_regs {
+                            // Complex or HFA-2 argument — uses TWO consecutive FP registers
                             if fp_arg_idx + 1 < fp_arg_regs.len() {
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
                                     if let Some(&Loc::Stack(offset)) =
                                         self.locations.get(&local.sym)
                                     {
-                                        let (fp_size, imag_offset) =
-                                            complex_fp_info(types, &self.base.target, *typ);
-                                        // Store real part from first FP register
+                                        let (fp_size, second_offset) = if is_hfa_two {
+                                            // HFA-2: use ABI classification to get base type
+                                            let abi =
+                                                get_abi_for_conv(CallingConv::C, &self.base.target);
+                                            match abi.classify_param(*typ, types) {
+                                                ArgClass::Hfa { base, .. } => {
+                                                    use crate::abi::HfaBase;
+                                                    match base {
+                                                        HfaBase::Float32 => (FpSize::Single, 4),
+                                                        HfaBase::Float64 => (FpSize::Double, 8),
+                                                    }
+                                                }
+                                                _ => (FpSize::Double, 8),
+                                            }
+                                        } else {
+                                            complex_fp_info(types, &self.base.target, *typ)
+                                        };
+                                        // Store first element from first FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx],
                                             addr: self.stack_mem(offset),
                                         });
-                                        // Store imag part from second FP register
+                                        // Store second element from second FP register
                                         self.push_lir(Aarch64Inst::StrFp {
                                             size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx + 1],
-                                            addr: self.stack_mem_plus(offset, imag_offset),
+                                            addr: self.stack_mem_plus(offset, second_offset),
                                         });
                                     }
                                 }
@@ -2213,8 +2241,8 @@ impl Aarch64CodeGen {
         self.handle_call_return_value(insn, types);
     }
 
-    /// Emit a select (ternary) instruction using CSEL
-    /// This is used for pure ternary expressions: cond ? a : b
+    /// Emit a select (ternary) instruction using CSEL (integers) or
+    /// conditional branch (floats, since CSEL only works on GP registers).
     fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
@@ -2229,6 +2257,83 @@ impl Aarch64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
+
+        // Check if this is a floating-point select
+        let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+            || matches!(self.get_location(then_val), Loc::VReg(_) | Loc::FImm(..))
+            || matches!(self.get_location(else_val), Loc::VReg(_) | Loc::FImm(..));
+
+        if is_fp {
+            self.emit_select_fp(cond, then_val, else_val, target, insn.typ, size, types);
+        } else {
+            self.emit_select_int(cond, then_val, else_val, target, size);
+        }
+    }
+
+    /// Emit FP select using conditional branch (CSEL doesn't work on VRegs)
+    #[allow(clippy::too_many_arguments)]
+    fn emit_select_fp(
+        &mut self,
+        cond: PseudoId,
+        then_val: PseudoId,
+        else_val: PseudoId,
+        target: PseudoId,
+        typ: Option<TypeId>,
+        size: u32,
+        types: &TypeTable,
+    ) {
+        let dst_loc = self.get_location(target);
+
+        // Check if condition is a constant
+        let cond_loc = self.get_location(cond);
+        if let Loc::Imm(v) = cond_loc {
+            let val = if v != 0 { then_val } else { else_val };
+            self.emit_fp_move(val, VReg::V17, typ, size, types);
+            self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size, types);
+            return;
+        }
+
+        // Load condition to GP register and compare with zero
+        self.emit_move(cond, Reg::X16, 64);
+        self.push_lir(Aarch64Inst::Cmp {
+            size: OperandSize::B64,
+            src1: Reg::X16,
+            src2: GpOperand::Imm(0),
+        });
+
+        let then_label = self.next_unique_label("sel_then");
+        let done_label = self.next_unique_label("sel_done");
+
+        // Branch if cond != 0
+        self.push_lir(Aarch64Inst::BCond {
+            cond: CondCode::Ne,
+            target: then_label.clone(),
+        });
+
+        // Else: load else_val to V17
+        self.emit_fp_move(else_val, VReg::V17, typ, size, types);
+        self.push_lir(Aarch64Inst::B {
+            target: done_label.clone(),
+        });
+
+        // Then: load then_val to V17
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(then_label)));
+        self.emit_fp_move(then_val, VReg::V17, typ, size, types);
+
+        // Done: store V17 to destination
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
+        self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size, types);
+    }
+
+    /// Emit integer select using CSEL
+    fn emit_select_int(
+        &mut self,
+        cond: PseudoId,
+        then_val: PseudoId,
+        else_val: PseudoId,
+        target: PseudoId,
+        size: u32,
+    ) {
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         // Use X16 as default scratch to avoid clobbering live values

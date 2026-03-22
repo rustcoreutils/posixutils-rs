@@ -2731,11 +2731,33 @@ impl X86_64CodeGen {
         // Load destination address into R11
         match addr_loc {
             Loc::Stack(offset) => {
-                // LIR: lea for destination address
-                self.push_lir(X86Inst::Lea {
-                    addr: self.stack_mem(offset - insn.offset as i32),
-                    dst: Reg::R11,
-                });
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+
+                if is_symbol {
+                    // Local variable — LEA to get direct stack address
+                    self.push_lir(X86Inst::Lea {
+                        addr: self.stack_mem(offset - insn.offset as i32),
+                        dst: Reg::R11,
+                    });
+                } else {
+                    // Spilled pointer — load the pointer value from the slot
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.stack_mem(offset)),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    if insn.offset != 0 {
+                        self.push_lir(X86Inst::Add {
+                            size: OperandSize::B64,
+                            src: GpOperand::Imm(insn.offset),
+                            dst: Reg::R11,
+                        });
+                    }
+                }
             }
             Loc::Reg(r) => {
                 if insn.offset != 0 {

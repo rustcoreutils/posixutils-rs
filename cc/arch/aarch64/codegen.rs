@@ -2340,13 +2340,38 @@ impl Aarch64CodeGen {
         // Load destination address into X17 (FP-relative for alloca safety)
         match addr_loc {
             Loc::Stack(offset) => {
-                let total_offset = self.stack_offset(offset) + insn.offset as i32;
-                self.push_lir(Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: self.stack_base_reg(offset),
-                    src2: GpOperand::Imm(total_offset as i64),
-                    dst: Reg::X17,
-                });
+                // Distinguish symbol (local variable — use direct address) vs
+                // temp/spilled pointer (load the pointer value from the slot).
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+
+                if is_symbol {
+                    let total_offset = self.stack_offset(offset) + insn.offset as i32;
+                    self.push_lir(Aarch64Inst::Add {
+                        size: OperandSize::B64,
+                        src1: self.stack_base_reg(offset),
+                        src2: GpOperand::Imm(total_offset as i64),
+                        dst: Reg::X17,
+                    });
+                } else {
+                    // Spilled pointer — load the pointer value, then add offset
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::B64,
+                        addr: self.stack_mem(offset),
+                        dst: Reg::X17,
+                    });
+                    if insn.offset != 0 {
+                        self.push_lir(Aarch64Inst::Add {
+                            size: OperandSize::B64,
+                            src1: Reg::X17,
+                            src2: GpOperand::Imm(insn.offset),
+                            dst: Reg::X17,
+                        });
+                    }
+                }
             }
             Loc::Reg(r) => {
                 if insn.offset != 0 {

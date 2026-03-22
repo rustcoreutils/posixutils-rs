@@ -931,7 +931,7 @@ pub enum ForInit {
 #[derive(Debug, Clone)]
 pub enum BlockItem {
     Declaration(Declaration),
-    Statement(Stmt),
+    Statement(Box<Stmt>),
 }
 
 // ============================================================================

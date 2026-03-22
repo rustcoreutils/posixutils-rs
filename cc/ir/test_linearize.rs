@@ -538,12 +538,12 @@ fn test_switch_basic() {
 
     // Build switch body: { case 1: return 10; case 2: return 20; default: return 0; }
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Case(Expr::int(1, &ctx.types))),
-        BlockItem::Statement(Stmt::Return(Some(Expr::int(10, &ctx.types)))),
-        BlockItem::Statement(Stmt::Case(Expr::int(2, &ctx.types))),
-        BlockItem::Statement(Stmt::Return(Some(Expr::int(20, &ctx.types)))),
-        BlockItem::Statement(Stmt::Default),
-        BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
     ]);
 
     let switch_stmt = Stmt::Switch {
@@ -600,25 +600,25 @@ fn test_switch_with_break() {
     let x_sym = ctx.var("x", int_type);
 
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Case(Expr::int(1, &ctx.types))),
-        BlockItem::Statement(Stmt::Expr(Expr::typed_unpositioned(
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
                 target: Box::new(Expr::var_typed(x_sym, int_type)),
                 value: Box::new(Expr::int(10, &ctx.types)),
             },
             int_type,
-        ))),
-        BlockItem::Statement(Stmt::Break),
-        BlockItem::Statement(Stmt::Default),
-        BlockItem::Statement(Stmt::Expr(Expr::typed_unpositioned(
+        )))),
+        BlockItem::Statement(Box::new(Stmt::Break)),
+        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
                 target: Box::new(Expr::var_typed(x_sym, int_type)),
                 value: Box::new(Expr::int(0, &ctx.types)),
             },
             int_type,
-        ))),
+        )))),
     ]);
 
     let switch_stmt = Stmt::Switch {
@@ -771,8 +771,8 @@ fn test_do_while_with_break() {
         else_stmt: None,
     };
     let body = Stmt::Block(vec![
-        BlockItem::Statement(assign),
-        BlockItem::Statement(if_break),
+        BlockItem::Statement(Box::new(assign)),
+        BlockItem::Statement(Box::new(if_break)),
     ]);
 
     let do_while = Stmt::DoWhile {
@@ -837,16 +837,16 @@ fn test_goto_forward() {
 
     // Block: { goto end; x = 1; end: x = 2; return x; }
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Goto(end_id)),
-        BlockItem::Statement(Stmt::Expr(Expr::typed_unpositioned(
+        BlockItem::Statement(Box::new(Stmt::Goto(end_id))),
+        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
                 target: Box::new(Expr::var_typed(x_sym, int_type)),
                 value: Box::new(Expr::int(1, &ctx.types)),
             },
             int_type,
-        ))),
-        BlockItem::Statement(Stmt::Label {
+        )))),
+        BlockItem::Statement(Box::new(Stmt::Label {
             name: end_id,
             stmt: Box::new(Stmt::Expr(Expr::typed_unpositioned(
                 ExprKind::Assign {
@@ -856,8 +856,8 @@ fn test_goto_forward() {
                 },
                 int_type,
             ))),
-        }),
-        BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
     ]);
 
     let func = FunctionDef {
@@ -927,12 +927,12 @@ fn test_goto_backward() {
     };
 
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Label {
+        BlockItem::Statement(Box::new(Stmt::Label {
             name: loop_id,
             stmt: Box::new(increment),
-        }),
-        BlockItem::Statement(if_goto),
-        BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+        })),
+        BlockItem::Statement(Box::new(if_goto)),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
     ]);
 
     let func = FunctionDef {
@@ -1001,9 +1001,9 @@ fn test_nested_loop_break() {
 
     // Outer loop body: { inner_loop; x = 1; break; }
     let outer_body = Stmt::Block(vec![
-        BlockItem::Statement(inner_loop),
-        BlockItem::Statement(assign),
-        BlockItem::Statement(Stmt::Break),
+        BlockItem::Statement(Box::new(inner_loop)),
+        BlockItem::Statement(Box::new(assign)),
+        BlockItem::Statement(Box::new(Stmt::Break)),
     ]);
 
     let outer_loop = Stmt::While {
@@ -1078,8 +1078,8 @@ fn test_nested_loop_continue() {
 
     // Outer loop body: { inner_loop; x = 1; }
     let outer_body = Stmt::Block(vec![
-        BlockItem::Statement(inner_loop),
-        BlockItem::Statement(assign),
+        BlockItem::Statement(Box::new(inner_loop)),
+        BlockItem::Statement(Box::new(assign)),
     ]);
 
     let outer_loop = Stmt::While {
@@ -2022,7 +2022,7 @@ fn test_local_var_emits_load_store() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2081,7 +2081,7 @@ fn test_ssa_converts_local_to_phi() {
                 }],
             }),
             // if (cond) x = 2;
-            BlockItem::Statement(Stmt::If {
+            BlockItem::Statement(Box::new(Stmt::If {
                 cond: Expr::var_typed(cond_sym, int_type),
                 then_stmt: Box::new(Stmt::Expr(Expr::assign(
                     Expr::var_typed(x_sym, int_type),
@@ -2089,9 +2089,9 @@ fn test_ssa_converts_local_to_phi() {
                     &ctx.types,
                 ))),
                 else_stmt: None,
-            }),
+            })),
             // return x;
-            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2145,16 +2145,16 @@ fn test_ssa_loop_variable() {
                 }],
             }),
             // while (i < 10) { i = i + 1; }
-            BlockItem::Statement(Stmt::While {
+            BlockItem::Statement(Box::new(Stmt::While {
                 cond: Expr::binary(BinaryOp::Lt, i_var(), Expr::int(10, &ctx.types), &ctx.types),
                 body: Box::new(Stmt::Expr(Expr::assign(
                     i_var(),
                     Expr::binary(BinaryOp::Add, i_var(), Expr::int(1, &ctx.types), &ctx.types),
                     &ctx.types,
                 ))),
-            }),
+            })),
             // return i;
-            BlockItem::Statement(Stmt::Return(Some(i_var()))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(i_var())))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2622,7 +2622,7 @@ fn test_string_literal_char_array_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2673,7 +2673,7 @@ fn test_string_literal_char_pointer_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2913,7 +2913,7 @@ fn test_static_local_pre_increment() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(inc_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(inc_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2986,7 +2986,7 @@ fn test_static_local_pre_decrement() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(dec_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(dec_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3052,7 +3052,7 @@ fn test_static_local_post_increment() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(inc_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(inc_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3118,7 +3118,7 @@ fn test_static_local_post_decrement() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(dec_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(dec_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3188,11 +3188,11 @@ fn test_static_local_compound_assignment() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Expr(compound_assign)),
-            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(
+            BlockItem::Statement(Box::new(Stmt::Expr(compound_assign))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
                 sum_sym,
                 static_int_type,
-            )))),
+            ))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3480,7 +3480,7 @@ fn test_static_local_address_in_initializer() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(x_decl),
             BlockItem::Declaration(p_decl),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4220,7 +4220,7 @@ fn test_mixed_designated_positional_struct_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4316,7 +4316,7 @@ fn test_mixed_designated_positional_array_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4464,7 +4464,7 @@ fn test_designator_chain_nested_struct_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4538,7 +4538,7 @@ fn test_designator_chain_array_member_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4600,7 +4600,7 @@ fn test_repeated_designator_last_wins_array() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4699,7 +4699,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4782,7 +4782,7 @@ fn test_union_first_named_member_positional_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5098,7 +5098,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5232,7 +5232,7 @@ fn test_bitfield_designated_init_local_var() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5364,7 +5364,7 @@ fn test_large_struct_copy_from_array() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(None)),
+            BlockItem::Statement(Box::new(Stmt::Return(None))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5517,8 +5517,8 @@ fn test_compound_literal_zero_init_lvalue() {
             typ: struct_ptr_type,
         }],
         body: Stmt::Block(vec![
-            BlockItem::Statement(Stmt::Expr(assign)),
-            BlockItem::Statement(Stmt::Return(None)),
+            BlockItem::Statement(Box::new(Stmt::Expr(assign))),
+            BlockItem::Statement(Box::new(Stmt::Return(None))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5637,7 +5637,7 @@ fn test_conditional_short_circuit_arrow() {
             symbol: Some(entry_sym),
             typ: struct_ptr_type,
         }],
-        body: Stmt::Block(vec![BlockItem::Statement(Stmt::Return(Some(conditional)))]),
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Return(Some(conditional))))]),
         pos: test_pos(),
         is_static: false,
         is_inline: false,

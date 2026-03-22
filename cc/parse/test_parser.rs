@@ -1604,8 +1604,8 @@ fn test_block_stmt() {
     match stmt {
         Stmt::Block(items) => {
             assert_eq!(items.len(), 2);
-            assert!(matches!(items[0], BlockItem::Statement(Stmt::Expr(_))));
-            assert!(matches!(items[1], BlockItem::Statement(Stmt::Expr(_))));
+            assert!(matches!(&items[0], BlockItem::Statement(s) if matches!(s.as_ref(), Stmt::Expr(_))));
+            assert!(matches!(&items[1], BlockItem::Statement(s) if matches!(s.as_ref(), Stmt::Expr(_))));
         }
         _ => panic!("Expected Block"),
     }

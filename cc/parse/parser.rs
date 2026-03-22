@@ -1203,7 +1203,7 @@ impl Parser<'_> {
                 items.push(BlockItem::Declaration(decl));
             } else {
                 let stmt = self.parse_statement()?;
-                items.push(BlockItem::Statement(stmt));
+                items.push(BlockItem::Statement(Box::new(stmt)));
             }
         }
         Ok(items)
@@ -1265,7 +1265,10 @@ impl Parser<'_> {
             // Check if the last item is an expression statement
             let last = items.pop().unwrap();
             match last {
-                BlockItem::Statement(Stmt::Expr(expr)) => {
+                BlockItem::Statement(stmt) if matches!(stmt.as_ref(), Stmt::Expr(_)) => {
+                    let Stmt::Expr(expr) = *stmt else {
+                        unreachable!()
+                    };
                     let typ = expr.typ.unwrap_or(self.types.int_id);
                     (items, expr, typ)
                 }

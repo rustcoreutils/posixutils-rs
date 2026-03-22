@@ -857,7 +857,9 @@ fn test_goto_forward() {
                 int_type,
             ))),
         })),
-        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            x_sym, int_type,
+        ))))),
     ]);
 
     let func = FunctionDef {
@@ -932,7 +934,9 @@ fn test_goto_backward() {
             stmt: Box::new(increment),
         })),
         BlockItem::Statement(Box::new(if_goto)),
-        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            x_sym, int_type,
+        ))))),
     ]);
 
     let func = FunctionDef {
@@ -2022,7 +2026,9 @@ fn test_local_var_emits_load_store() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+                x_sym, int_type,
+            ))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2091,7 +2097,9 @@ fn test_ssa_converts_local_to_phi() {
                 else_stmt: None,
             })),
             // return x;
-            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type))))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+                x_sym, int_type,
+            ))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5637,7 +5645,9 @@ fn test_conditional_short_circuit_arrow() {
             symbol: Some(entry_sym),
             typ: struct_ptr_type,
         }],
-        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Return(Some(conditional))))]),
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Return(Some(
+            conditional,
+        ))))]),
         pos: test_pos(),
         is_static: false,
         is_inline: false,

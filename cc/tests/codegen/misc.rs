@@ -4685,3 +4685,79 @@ int main(void) {
         0
     );
 }
+
+#[test]
+fn codegen_float16_mega() {
+    let code = r#"
+int main(void) {
+    /* Arithmetic */
+    _Float16 a = 3.5f16;
+    _Float16 b = 2.0f16;
+
+    _Float16 sum = a + b;
+    if ((float)sum < 5.49f || (float)sum > 5.51f) return 1;
+
+    _Float16 diff = a - b;
+    if ((float)diff < 1.49f || (float)diff > 1.51f) return 2;
+
+    _Float16 prod = a * b;
+    if ((float)prod < 6.99f || (float)prod > 7.01f) return 3;
+
+    _Float16 quot = a / b;
+    if ((float)quot < 1.74f || (float)quot > 1.76f) return 4;
+
+    /* Negation */
+    _Float16 neg = -a;
+    if ((float)neg > -3.49f || (float)neg < -3.51f) return 5;
+
+    /* Comparisons */
+    if (!(a == a)) return 10;
+    if (a != a) return 11;
+    if (!(a > b)) return 12;
+    if (!(b < a)) return 13;
+    if (!(a >= b)) return 14;
+    if (!(b <= a)) return 15;
+    if (a == b) return 16;
+    if (!(a != b)) return 17;
+
+    /* Float16 <-> float conversions */
+    float f = (float)a;
+    if (f < 3.49f || f > 3.51f) return 20;
+
+    _Float16 from_float = (_Float16)f;
+    if ((float)from_float < 3.49f || (float)from_float > 3.51f) return 21;
+
+    /* Float16 <-> double conversions */
+    double d = (double)a;
+    if (d < 3.49 || d > 3.51) return 22;
+
+    _Float16 from_double = (_Float16)d;
+    if ((float)from_double < 3.49f || (float)from_double > 3.51f) return 23;
+
+    /* Float16 <-> int via float intermediary (avoids __fixhfsi) */
+    float fa = (float)a;
+    int i = (int)fa;
+    if (i != 3) return 30;
+
+    _Float16 from_int = (_Float16)(float)42;
+    if ((float)from_int < 41.9f || (float)from_int > 42.1f) return 31;
+
+    /* Compound assignment */
+    _Float16 ca = 10.0f16;
+    ca += 5.0f16;
+    if ((float)ca < 14.9f || (float)ca > 15.1f) return 40;
+
+    ca -= 3.0f16;
+    if ((float)ca < 11.9f || (float)ca > 12.1f) return 41;
+
+    ca *= 2.0f16;
+    if ((float)ca < 23.9f || (float)ca > 24.1f) return 42;
+
+    ca /= 4.0f16;
+    if ((float)ca < 5.9f || (float)ca > 6.1f) return 43;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_float16_mega", code, &[]), 0);
+}

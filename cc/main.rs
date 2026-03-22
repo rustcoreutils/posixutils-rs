@@ -91,9 +91,16 @@ struct Args {
     #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
     dump_ast: bool,
 
-    /// Dump IR (for debugging linearizer)
-    #[arg(long = "dump-ir", help = gettext("Linearize and dump IR to stdout"))]
-    dump_ir: bool,
+    /// Dump IR at a named stage (for debugging)
+    /// Stages: post-linearize, post-hwmap, post-opt, post-lower, all
+    /// Bare --dump-ir = post-opt (backward compat)
+    #[arg(long = "dump-ir", value_name = "stage", default_missing_value = "post-opt",
+          num_args = 0..=1, help = gettext("Dump IR at stage (post-linearize, post-hwmap, post-opt, post-lower, all)"))]
+    dump_ir: Option<String>,
+
+    /// Filter IR dumps to a specific function name
+    #[arg(long = "dump-ir-func", value_name = "name", help = gettext("Only dump IR for this function"))]
+    dump_ir_func: Option<String>,
 
     /// Verbose output (include position info)
     #[arg(
@@ -210,6 +217,33 @@ struct Args {
     /// Unsupported machine flags captured by preprocess_args
     #[arg(long = "pcc-unsupported-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     unsupported_mflags: Vec<String>,
+}
+
+/// Check if IR should be dumped at the given stage.
+fn should_dump_ir(args: &Args, stage: &str) -> bool {
+    match args.dump_ir.as_deref() {
+        Some("all") => true,
+        Some(s) => s == stage,
+        None => false,
+    }
+}
+
+/// Dump IR at a named pipeline stage.
+fn dump_ir(args: &Args, module: &ir::Module, stage: &str) {
+    if !should_dump_ir(args, stage) {
+        return;
+    }
+    eprintln!("=== {} ===", stage);
+    match &args.dump_ir_func {
+        Some(name) => {
+            for func in &module.functions {
+                if func.name == *name {
+                    print!("{}", func);
+                }
+            }
+        }
+        None => print!("{}", module),
+    }
 }
 
 /// Print compilation statistics for capacity tuning
@@ -433,21 +467,32 @@ fn process_file(
         .ok()
         .map(|p| p.to_string_lossy().to_string());
 
+    dump_ir(args, &module, "post-linearize");
+
     // Hardware mapping pass — centralized target-specific lowering decisions
     ir::hwmap::hwmap_module(&mut module, &types, target);
+
+    dump_ir(args, &module, "post-hwmap");
 
     // Optimize IR (if enabled)
     if args.opt_level > 0 {
         opt::optimize_module(&mut module, args.opt_level);
     }
 
-    if args.dump_ir {
-        print!("{}", module);
+    dump_ir(args, &module, "post-opt");
+
+    if args.dump_ir.is_some() && !should_dump_ir(args, "post-lower") {
         return Ok(());
     }
 
     // Lower IR (phi elimination, etc.)
     ir::lower::lower_module(&mut module);
+
+    dump_ir(args, &module, "post-lower");
+
+    if args.dump_ir.is_some() {
+        return Ok(());
+    }
 
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;

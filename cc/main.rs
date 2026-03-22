@@ -433,6 +433,9 @@ fn process_file(
         .ok()
         .map(|p| p.to_string_lossy().to_string());
 
+    // Hardware mapping pass — centralized target-specific lowering decisions
+    ir::hwmap::hwmap_module(&mut module, &types, target);
+
     // Optimize IR (if enabled)
     if args.opt_level > 0 {
         opt::optimize_module(&mut module, args.opt_level);

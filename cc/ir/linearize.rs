@@ -4655,10 +4655,6 @@ impl<'a> Linearizer<'a> {
         let src_kind = self.types.kind(src_type);
         let dst_kind = self.types.kind(cast_type);
 
-        // Check for long double conversions that need rtlib
-        let src_is_longdouble = src_kind == TypeKind::LongDouble;
-        let dst_is_longdouble = dst_kind == TypeKind::LongDouble;
-
         // Check for Float16 conversions that need rtlib
         let src_is_float16 = src_kind == TypeKind::Float16;
         let dst_is_float16 = dst_kind == TypeKind::Float16;
@@ -4671,7 +4667,6 @@ impl<'a> Linearizer<'a> {
         };
 
         // Skip Float16 handling for Int128 operands — no direct hf↔ti rtlib exists.
-        // These will fall through to the Int128 handler which converts via double.
         let src_is_int128 = src_kind == TypeKind::Int128;
         let dst_is_int128 = dst_kind == TypeKind::Int128;
         if (src_is_float16 || dst_is_float16) && !src_is_int128 && !dst_is_int128 {
@@ -4735,115 +4730,6 @@ impl<'a> Linearizer<'a> {
                 if let Some(func_name) = rtlib.float16_convert(from_suffix, to_suffix) {
                     // Use Float16-specific call that handles x86-64 soft-float ABI
                     return self.emit_float16_convert_call(func_name, src, src_type, cast_type);
-                }
-            }
-        }
-
-        if src_is_longdouble || dst_is_longdouble {
-            let rtlib = RtlibNames::new(self.target);
-
-            let (from_suffix, to_suffix) = if src_is_longdouble && dst_is_float {
-                // Long double -> float/double
-                let to = match dst_kind {
-                    TypeKind::Float => "sf",
-                    TypeKind::Double => "df",
-                    _ => "",
-                };
-                (ld_suffix, to)
-            } else if dst_is_longdouble && src_is_float {
-                // Float/double -> long double
-                let from = match src_kind {
-                    TypeKind::Float => "sf",
-                    TypeKind::Double => "df",
-                    _ => "",
-                };
-                (from, ld_suffix)
-            } else if src_is_longdouble && !dst_is_float {
-                // Long double -> integer
-                let dst_size = self.types.size_bits(cast_type);
-                let is_unsigned = self.types.is_unsigned(cast_type);
-                let to = if is_unsigned {
-                    if dst_size <= 32 {
-                        "usi"
-                    } else {
-                        "udi"
-                    }
-                } else if dst_size <= 32 {
-                    "si"
-                } else {
-                    "di"
-                };
-                (ld_suffix, to)
-            } else if dst_is_longdouble && !src_is_float {
-                // Integer -> long double
-                let src_size = self.types.size_bits(src_type);
-                let is_unsigned = self.types.is_unsigned(src_type);
-                let from = if is_unsigned {
-                    if src_size <= 32 {
-                        "usi"
-                    } else {
-                        "udi"
-                    }
-                } else if src_size <= 32 {
-                    "si"
-                } else {
-                    "di"
-                };
-                (from, ld_suffix)
-            } else {
-                ("", "")
-            };
-
-            if !from_suffix.is_empty() && !to_suffix.is_empty() {
-                if let Some(func_name) = rtlib.longdouble_convert(from_suffix, to_suffix) {
-                    return self.emit_longdouble_convert_call(func_name, src, src_type, cast_type);
-                }
-            }
-            // Fall through to native FP for macOS aarch64 (long double == double)
-        }
-
-        // Check for Int128 <-> float conversions that need rtlib
-        let src_is_int128 = src_kind == TypeKind::Int128;
-        let dst_is_int128 = dst_kind == TypeKind::Int128;
-
-        if (src_is_int128 && dst_is_float) || (dst_is_int128 && src_is_float) {
-            let rtlib = RtlibNames::new(self.target);
-
-            let (from_suffix, to_suffix) = if src_is_int128 && dst_is_float {
-                // Int128 -> float type
-                let from = if self.types.is_unsigned(src_type) {
-                    "uti"
-                } else {
-                    "ti"
-                };
-                let to = match dst_kind {
-                    TypeKind::Float => "sf",
-                    TypeKind::Double => "df",
-                    TypeKind::Float16 => "hf",
-                    TypeKind::LongDouble => ld_suffix,
-                    _ => "",
-                };
-                (from, to)
-            } else {
-                // float type -> Int128
-                let from = match src_kind {
-                    TypeKind::Float => "sf",
-                    TypeKind::Double => "df",
-                    TypeKind::Float16 => "hf",
-                    TypeKind::LongDouble => ld_suffix,
-                    _ => "",
-                };
-                let to = if self.types.is_unsigned(cast_type) {
-                    "uti"
-                } else {
-                    "ti"
-                };
-                (from, to)
-            };
-
-            if !from_suffix.is_empty() && !to_suffix.is_empty() {
-                if let Some(func_name) = rtlib.int128_convert(from_suffix, to_suffix) {
-                    return self.emit_rtlib_call(func_name, vec![src], vec![src_type], cast_type);
                 }
             }
         }
@@ -7682,15 +7568,6 @@ impl<'a> Linearizer<'a> {
         let is_float = self.types.is_float(typ);
         let size = self.types.size_bits(typ);
 
-        // Check for long double negation that needs rtlib
-        if op == UnaryOp::Neg && self.types.kind(typ) == TypeKind::LongDouble {
-            let rtlib = RtlibNames::new(self.target);
-            if let Some(func_name) = rtlib.longdouble_neg() {
-                return self.emit_longdouble_neg_call(func_name, src, typ);
-            }
-            // Fall through to native FP for macOS aarch64 (long double == double)
-        }
-
         // Check for Float16 negation that needs soft-float on x86-64
         if op == UnaryOp::Neg && self.types.kind(typ) == TypeKind::Float16 {
             let rtlib = RtlibNames::new(self.target);
@@ -7843,63 +7720,6 @@ impl<'a> Linearizer<'a> {
                 }
             }
             // Fall through to native FP16 for AArch64
-        }
-
-        // Check if this is a long double operation that needs rtlib
-        if self.types.kind(operand_typ) == TypeKind::LongDouble {
-            let rtlib = RtlibNames::new(self.target);
-
-            // Handle arithmetic operations
-            let arith_op = match op {
-                BinaryOp::Add => Some("add"),
-                BinaryOp::Sub => Some("sub"),
-                BinaryOp::Mul => Some("mul"),
-                BinaryOp::Div => Some("div"),
-                _ => None,
-            };
-
-            if let Some(op_str) = arith_op {
-                if let Some(func_name) = rtlib.longdouble_binop(op_str) {
-                    return self.emit_longdouble_binop_call(func_name, left, right, operand_typ);
-                }
-            }
-
-            // Handle comparison operations
-            let cmp_kind = match op {
-                BinaryOp::Lt => Some("lt"),
-                BinaryOp::Le => Some("le"),
-                BinaryOp::Gt => Some("gt"),
-                BinaryOp::Ge => Some("ge"),
-                BinaryOp::Eq => Some("eq"),
-                BinaryOp::Ne => Some("ne"),
-                _ => None,
-            };
-
-            if let Some(kind) = cmp_kind {
-                if let Some(func_name) = rtlib.longdouble_cmp(kind) {
-                    return self.emit_longdouble_cmp_call(func_name, left, right, op);
-                }
-            }
-            // Fall through to native FP for macOS aarch64 (long double == double)
-        }
-
-        // Check if this is an __int128 div/mod operation that needs rtlib
-        if self.types.kind(operand_typ) == TypeKind::Int128
-            && matches!(op, BinaryOp::Div | BinaryOp::Mod)
-        {
-            let rtlib = RtlibNames::new(self.target);
-            let op_str = if matches!(op, BinaryOp::Div) {
-                "div"
-            } else {
-                "mod"
-            };
-            let func_name = rtlib.int128_divmod(op_str, is_unsigned);
-            return self.emit_rtlib_call(
-                func_name,
-                vec![left, right],
-                vec![operand_typ, operand_typ],
-                result_typ,
-            );
         }
 
         let result = self.alloc_pseudo();
@@ -8283,128 +8103,6 @@ impl<'a> Linearizer<'a> {
         result_sym
     }
 
-    /// Emit a call to a runtime library function with ABI classification.
-    ///
-    /// Handles ABI param/return classification, instruction creation, and emission.
-    fn emit_rtlib_call(
-        &mut self,
-        func_name: &str,
-        arg_vals: Vec<PseudoId>,
-        arg_types: Vec<TypeId>,
-        ret_type: TypeId,
-    ) -> PseudoId {
-        let result = self.alloc_pseudo();
-        let ret_size = self.types.size_bits(ret_type);
-
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let param_classes: Vec<_> = arg_types
-            .iter()
-            .map(|&t| abi.classify_param(t, self.types))
-            .collect();
-        let ret_class = abi.classify_return(ret_type, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
-
-        let mut call_insn = Instruction::call(
-            Some(result),
-            func_name,
-            arg_vals,
-            arg_types,
-            ret_type,
-            ret_size,
-        );
-        call_insn.abi_info = Some(call_abi_info);
-        self.emit(call_insn);
-
-        result
-    }
-
-    /// Emit a call to a long double rtlib function (__addxf3, __multf3, etc.).
-    ///
-    /// These functions take 2 long double args and return a long double.
-    fn emit_longdouble_binop_call(
-        &mut self,
-        func_name: &str,
-        left: PseudoId,
-        right: PseudoId,
-        longdouble_typ: TypeId,
-    ) -> PseudoId {
-        self.emit_rtlib_call(
-            func_name,
-            vec![left, right],
-            vec![longdouble_typ, longdouble_typ],
-            longdouble_typ,
-        )
-    }
-
-    /// Emit a call to a long double comparison rtlib function (__cmpxf2, __cmptf2).
-    ///
-    /// The comparison function returns an int:
-    /// - < 0 if a < b
-    /// - 0 if a == b
-    /// - > 0 if a > b
-    ///
-    /// We then compare that result with 0 to produce the final boolean.
-    fn emit_longdouble_cmp_call(
-        &mut self,
-        func_name: &str,
-        left: PseudoId,
-        right: PseudoId,
-        op: BinaryOp,
-    ) -> PseudoId {
-        let longdouble_typ = self.types.longdouble_id;
-        let int_typ = self.types.int_id;
-        let int_size = self.types.size_bits(int_typ);
-
-        let arg_vals = vec![left, right];
-        let arg_types = vec![longdouble_typ, longdouble_typ];
-
-        // Compute ABI classification for the call
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let param_classes: Vec<_> = arg_types
-            .iter()
-            .map(|&t| abi.classify_param(t, self.types))
-            .collect();
-        let ret_class = abi.classify_return(int_typ, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
-
-        // Call the comparison function - it returns an int
-        let cmp_result = self.alloc_pseudo();
-        let mut call_insn = Instruction::call(
-            Some(cmp_result),
-            func_name,
-            arg_vals,
-            arg_types,
-            int_typ,
-            int_size,
-        );
-        call_insn.abi_info = Some(call_abi_info);
-        self.emit(call_insn);
-
-        // Now compare the result with 0 based on the original comparison op
-        let zero = self.emit_const(0, int_typ);
-        let result = self.alloc_pseudo();
-
-        // Map the original FP comparison to an int comparison
-        // cmp_result < 0 means a < b
-        // cmp_result == 0 means a == b
-        // cmp_result > 0 means a > b
-        let opcode = match op {
-            BinaryOp::Lt => Opcode::SetLt, // cmp_result < 0
-            BinaryOp::Gt => Opcode::SetGt, // cmp_result > 0
-            BinaryOp::Le => Opcode::SetLe, // cmp_result <= 0
-            BinaryOp::Ge => Opcode::SetGe, // cmp_result >= 0
-            BinaryOp::Eq => Opcode::SetEq, // cmp_result == 0
-            BinaryOp::Ne => Opcode::SetNe, // cmp_result != 0
-            _ => unreachable!("emit_longdouble_cmp_call called with non-comparison op"),
-        };
-
-        self.emit(Instruction::binop(
-            opcode, result, cmp_result, zero, int_typ, int_size,
-        ));
-
-        result
-    }
-
     // ========================================================================
     // Float16 soft-float helpers (for x86-64)
     // ========================================================================
@@ -8638,27 +8336,6 @@ impl<'a> Linearizer<'a> {
         result
     }
 
-    /// Emit a call to a long double conversion rtlib function.
-    ///
-    /// These functions convert between long double and other types:
-    /// - __extendsfxf2/__extendsftf2: float -> long double
-    /// - __extenddfxf2/__extenddftf2: double -> long double
-    /// - __truncxfsf2/__trunctfsf2: long double -> float
-    /// - __truncxfdf2/__trunctfdf2: long double -> double
-    /// - __floatsixf/__floatsitf: int32 -> long double
-    /// - __floatdixf/__floatditf: int64 -> long double
-    /// - __fixxfsi/__fixtfsi: long double -> int32
-    /// - __fixxfdi/__fixtfdi: long double -> int64
-    fn emit_longdouble_convert_call(
-        &mut self,
-        func_name: &str,
-        src: PseudoId,
-        src_type: TypeId,
-        dst_type: TypeId,
-    ) -> PseudoId {
-        self.emit_rtlib_call(func_name, vec![src], vec![src_type], dst_type)
-    }
-
     /// Emit a call to a Float16 conversion rtlib function with correct ABI for x86-64.
     ///
     /// On x86-64 without native FP16, Float16 values are passed/returned as integers:
@@ -8729,42 +8406,6 @@ impl<'a> Linearizer<'a> {
             arg_types,
             dst_type,
             dst_size,
-        );
-        call_insn.abi_info = Some(call_abi_info);
-        self.emit(call_insn);
-
-        result
-    }
-
-    /// Emit a call to a long double negation rtlib function (__negxf2, __negtf2).
-    fn emit_longdouble_neg_call(
-        &mut self,
-        func_name: &str,
-        src: PseudoId,
-        longdouble_typ: TypeId,
-    ) -> PseudoId {
-        let result = self.alloc_pseudo();
-        let size = self.types.size_bits(longdouble_typ);
-
-        let arg_vals = vec![src];
-        let arg_types = vec![longdouble_typ];
-
-        // Compute ABI classification for the call
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-        let param_classes: Vec<_> = arg_types
-            .iter()
-            .map(|&t| abi.classify_param(t, self.types))
-            .collect();
-        let ret_class = abi.classify_return(longdouble_typ, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
-
-        let mut call_insn = Instruction::call(
-            Some(result),
-            func_name,
-            arg_vals,
-            arg_types,
-            longdouble_typ,
-            size,
         );
         call_insn.abi_info = Some(call_abi_info);
         self.emit(call_insn);

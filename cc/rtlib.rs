@@ -71,13 +71,6 @@ impl<'a> RtlibNames<'a> {
         self.target.arch == Arch::Aarch64 && self.target.os == Os::MacOS
     }
 
-    /// Returns true if Float16 operations need soft-float emulation.
-    /// On x86-64, there are no native FP16 arithmetic instructions.
-    /// On AArch64, native FP16 instructions exist (FADD, FSUB, etc.).
-    pub fn float16_needs_softfloat(&self) -> bool {
-        self.target.arch == Arch::X86_64
-    }
-
     /// Returns the ABI used by this rtlib for Float16 parameters/returns.
     ///
     /// This is an rtlib attribute - different runtime libraries have different

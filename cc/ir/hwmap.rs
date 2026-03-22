@@ -15,8 +15,9 @@
 //   - Expand: instruction must be expanded into multiple simpler instructions
 //
 
-use crate::abi::{get_abi_for_conv, CallingConv};
+use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::ir::{CallAbiInfo, Function, Instruction, Module, Opcode, Pseudo, PseudoId};
+use crate::rtlib::{Float16Abi, RtlibNames};
 use crate::target::{Arch, Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -30,6 +31,8 @@ pub enum HwMapAction {
     /// Long double comparison: call rtlib, then compare result against 0.
     /// Contains (rtlib_func_name, int_compare_opcode).
     CmpLibCall(&'static str, Opcode),
+    /// Expand into multiple instructions (promote-operate-truncate, etc.).
+    Expand,
 }
 
 /// Classify an int128 div/mod instruction into a LibCall action.
@@ -339,6 +342,77 @@ pub trait TargetHwMap {
     fn map_op(&self, insn: &Instruction, types: &TypeTable) -> HwMapAction;
 }
 
+/// Classify a Float16 instruction that needs soft-float expansion on x86-64.
+/// Returns Expand for arithmetic/neg (promote-operate-truncate) and
+/// comparisons (promote-compare). Returns LibCall for conversions.
+fn map_float16_softfloat(insn: &Instruction, types: &TypeTable) -> Option<HwMapAction> {
+    match insn.op {
+        // Arithmetic: promote-operate-truncate
+        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+            let typ = insn.typ?;
+            if types.kind(typ) == TypeKind::Float16 {
+                return Some(HwMapAction::Expand);
+            }
+            None
+        }
+        // Negation: promote-negate-truncate
+        Opcode::FNeg => {
+            let typ = insn.typ?;
+            if types.kind(typ) == TypeKind::Float16 {
+                return Some(HwMapAction::Expand);
+            }
+            None
+        }
+        // Comparisons: promote both, compare (no truncate)
+        Opcode::FCmpOEq
+        | Opcode::FCmpONe
+        | Opcode::FCmpOLt
+        | Opcode::FCmpOLe
+        | Opcode::FCmpOGt
+        | Opcode::FCmpOGe => {
+            // Comparisons store the operand type in src_typ or check size
+            if let Some(src_typ) = insn.src_typ {
+                if types.kind(src_typ) == TypeKind::Float16 {
+                    return Some(HwMapAction::Expand);
+                }
+            }
+            // Also check by size: Float16 operations have size==16
+            if insn.size == 16 {
+                if let Some(typ) = insn.typ {
+                    // Result type is int, but check if this is a float comparison
+                    if matches!(
+                        insn.op,
+                        Opcode::FCmpOEq
+                            | Opcode::FCmpONe
+                            | Opcode::FCmpOLt
+                            | Opcode::FCmpOLe
+                            | Opcode::FCmpOGt
+                            | Opcode::FCmpOGe
+                    ) {
+                        let _ = typ;
+                        return Some(HwMapAction::Expand);
+                    }
+                }
+            }
+            None
+        }
+        // Float16 conversions via rtlib
+        Opcode::FCvtF => {
+            let dst_typ = insn.typ?;
+            let src_typ = insn.src_typ?;
+            let dst_kind = types.kind(dst_typ);
+            let src_kind = types.kind(src_typ);
+            if src_kind == TypeKind::Float16 || dst_kind == TypeKind::Float16 {
+                // These are handled by the linearizer's Float16 conversion code
+                // which already emits the correct calls. No hwmap action needed
+                // because the linearizer emits Call instructions directly.
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// x86-64 hardware mapping.
 pub struct X86_64HwMap {
     target: Target,
@@ -347,6 +421,9 @@ pub struct X86_64HwMap {
 impl TargetHwMap for X86_64HwMap {
     fn map_op(&self, insn: &Instruction, types: &TypeTable) -> HwMapAction {
         if let Some(action) = map_common(insn, types, &self.target) {
+            return action;
+        }
+        if let Some(action) = map_float16_softfloat(insn, types) {
             return action;
         }
         HwMapAction::Legal
@@ -484,6 +561,210 @@ fn build_convert_rtlib_call(
     build_rtlib_call(insn, func_name, arg_types, ret_type, types, target)
 }
 
+/// Build a call to __extendhfsf2 (Float16 → float) with proper ABI.
+fn build_f16_extend_call(
+    target_pseudo: PseudoId,
+    src: PseudoId,
+    pos: Option<crate::diag::Position>,
+    types: &TypeTable,
+    target: &Target,
+) -> Instruction {
+    let rtlib = RtlibNames::new(target);
+    let f16_abi = rtlib.float16_abi();
+    let float_type = types.float_id;
+    let float_size = types.size_bits(float_type);
+
+    // Arg type: ushort for compiler-rt, Float16 for libgcc
+    let arg_type = if f16_abi == Float16Abi::Integer {
+        types.ushort_id
+    } else {
+        types.float16_id
+    };
+
+    // Arg classification
+    let param_class = if f16_abi == Float16Abi::Integer {
+        ArgClass::Extend {
+            signed: false,
+            size_bits: 16,
+        }
+    } else {
+        let abi = get_abi_for_conv(CallingConv::C, target);
+        abi.classify_param(types.float16_id, types)
+    };
+
+    // Return is always SSE float
+    let abi = get_abi_for_conv(CallingConv::C, target);
+    let ret_class = abi.classify_return(float_type, types);
+
+    let call_abi_info = Box::new(CallAbiInfo::new(vec![param_class], ret_class));
+
+    let mut call_insn = Instruction::call(
+        Some(target_pseudo),
+        "__extendhfsf2",
+        vec![src],
+        vec![arg_type],
+        float_type,
+        float_size,
+    );
+    call_insn.abi_info = Some(call_abi_info);
+    call_insn.pos = pos;
+    call_insn
+}
+
+/// Build a call to __truncsfhf2 (float → Float16) with proper ABI.
+fn build_f16_truncate_call(
+    target_pseudo: PseudoId,
+    src: PseudoId,
+    pos: Option<crate::diag::Position>,
+    types: &TypeTable,
+    target: &Target,
+) -> Instruction {
+    let rtlib = RtlibNames::new(target);
+    let f16_abi = rtlib.float16_abi();
+    let float_type = types.float_id;
+    let float16_type = types.float16_id;
+    let f16_size = types.size_bits(float16_type);
+
+    // Arg is always SSE float
+    let abi = get_abi_for_conv(CallingConv::C, target);
+    let param_class = abi.classify_param(float_type, types);
+
+    // Return: ushort for compiler-rt, Float16/SSE for libgcc
+    let ret_class = if f16_abi == Float16Abi::Integer {
+        ArgClass::Extend {
+            signed: false,
+            size_bits: 16,
+        }
+    } else {
+        abi.classify_return(float16_type, types)
+    };
+
+    let call_abi_info = Box::new(CallAbiInfo::new(vec![param_class], ret_class));
+
+    let mut call_insn = Instruction::call(
+        Some(target_pseudo),
+        "__truncsfhf2",
+        vec![src],
+        vec![float_type],
+        float16_type,
+        f16_size,
+    );
+    call_insn.abi_info = Some(call_abi_info);
+    call_insn.pos = pos;
+    call_insn
+}
+
+/// Expand a Float16 arithmetic/neg/cmp instruction using promote-operate-truncate.
+fn expand_float16(
+    insn: &Instruction,
+    func: &mut Function,
+    new_insns: &mut Vec<Instruction>,
+    types: &TypeTable,
+    target: &Target,
+) {
+    let float_type = types.float_id;
+    let float_size = types.size_bits(float_type);
+    let pos = insn.pos;
+
+    match insn.op {
+        // Binary arithmetic: extend both → float op → truncate
+        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+            let result = insn.target.expect("binop must have target");
+            let left = insn.src[0];
+            let right = insn.src[1];
+
+            // Extend left to float
+            let left_ext = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(left_ext, left_ext.0));
+            new_insns.push(build_f16_extend_call(left_ext, left, pos, types, target));
+
+            // Extend right to float
+            let right_ext = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(right_ext, right_ext.0));
+            new_insns.push(build_f16_extend_call(right_ext, right, pos, types, target));
+
+            // Native float operation
+            let float_result = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(float_result, float_result.0));
+            new_insns.push(Instruction::binop(
+                insn.op,
+                float_result,
+                left_ext,
+                right_ext,
+                float_type,
+                float_size,
+            ));
+
+            // Truncate result back to Float16
+            new_insns.push(build_f16_truncate_call(
+                result,
+                float_result,
+                pos,
+                types,
+                target,
+            ));
+        }
+
+        // Negation: extend → negate → truncate
+        Opcode::FNeg => {
+            let result = insn.target.expect("unary must have target");
+            let src = insn.src[0];
+
+            let src_ext = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(src_ext, src_ext.0));
+            new_insns.push(build_f16_extend_call(src_ext, src, pos, types, target));
+
+            let neg_result = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(neg_result, neg_result.0));
+            new_insns.push(Instruction::unop(
+                Opcode::FNeg,
+                neg_result,
+                src_ext,
+                float_type,
+                float_size,
+            ));
+
+            new_insns.push(build_f16_truncate_call(
+                result, neg_result, pos, types, target,
+            ));
+        }
+
+        // Comparison: extend both → float compare (no truncate)
+        Opcode::FCmpOEq
+        | Opcode::FCmpONe
+        | Opcode::FCmpOLt
+        | Opcode::FCmpOLe
+        | Opcode::FCmpOGt
+        | Opcode::FCmpOGe => {
+            let result = insn.target.expect("cmp must have target");
+            let left = insn.src[0];
+            let right = insn.src[1];
+
+            let left_ext = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(left_ext, left_ext.0));
+            new_insns.push(build_f16_extend_call(left_ext, left, pos, types, target));
+
+            let right_ext = func.alloc_pseudo();
+            func.add_pseudo(Pseudo::reg(right_ext, right_ext.0));
+            new_insns.push(build_f16_extend_call(right_ext, right, pos, types, target));
+
+            // Float comparison — result type is int, keep original type/size
+            let mut cmp = Instruction::binop(
+                insn.op,
+                result,
+                left_ext,
+                right_ext,
+                insn.typ.unwrap_or(types.int_id),
+                float_size,
+            );
+            cmp.src_typ = Some(float_type);
+            new_insns.push(cmp);
+        }
+
+        _ => panic!("expand_float16: unexpected opcode {}", insn.op),
+    }
+}
+
 /// Run the hardware mapping pass on a single function.
 ///
 /// Walks all instructions and transforms non-Legal ops:
@@ -561,6 +842,10 @@ pub fn hwmap_function(func: &mut Function, types: &TypeTable, target: &Target) {
                         int_type,
                         int_size,
                     ));
+                    block_changed = true;
+                }
+                HwMapAction::Expand => {
+                    expand_float16(insn, func, &mut new_insns, types, target);
                     block_changed = true;
                 }
             }

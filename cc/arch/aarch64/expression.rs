@@ -329,9 +329,11 @@ impl Aarch64CodeGen {
 
         self.push_lir(Aarch64Inst::Cset { cond, dst: dst_reg });
 
-        // Compare result is always int (32-bit), regardless of operand size
+        // Store as 64-bit so that CBR's 64-bit load doesn't read stack garbage
+        // in the upper 32 bits. cset produces 0 or 1 in a 64-bit register
+        // (upper 32 bits are already zero), so str x__ is correct.
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
+            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
         }
     }
 
@@ -1165,9 +1167,9 @@ impl Aarch64CodeGen {
             }
         }
 
-        // Compare result is always 32-bit
+        // Store as 64-bit so CBR's 64-bit load doesn't read stack garbage
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
+            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
         }
     }
 

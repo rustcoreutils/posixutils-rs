@@ -1337,6 +1337,9 @@ impl Parser<'_> {
                     | "_Bool"
                     | "__attribute__"
                     | "__attribute"
+                    | "__int128"
+                    | "__int128_t"
+                    | "__uint128_t"
                     | "__builtin_va_list"
                     | "typeof"
                     | "__typeof__"
@@ -1903,6 +1906,19 @@ impl Parser<'_> {
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                 }
+                "__int128" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                }
+                "__int128_t" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                }
+                "__uint128_t" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::UNSIGNED;
+                    base_kind = Some(TypeKind::Int128);
+                }
                 "__builtin_va_list" => {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
@@ -2016,7 +2032,7 @@ impl Parser<'_> {
                     // Evaluate constant expression
                     self.eval_const_expr(&expr).ok_or_else(|| {
                         ParseError::new("enum value must be constant", self.current_pos())
-                    })?
+                    })? as i64
                 } else {
                     next_value
                 };
@@ -3751,17 +3767,18 @@ impl Parser<'_> {
     /// - Casts to integer types
     /// - Unary/binary operators with constant operands
     /// - Conditional expressions with constant operands
-    pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+    pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
-            ExprKind::IntLit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i64),
+            ExprKind::IntLit(val) => Some(*val as i128),
+            ExprKind::Int128Lit(val) => Some(*val),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
             // Float literals are constant, return truncated value
-            ExprKind::FloatLit(val) => Some(*val as i64),
+            ExprKind::FloatLit(val) => Some(*val as i128),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => Some(-val),
+                    UnaryOp::Neg => Some(val.wrapping_neg()),
                     UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
                     UnaryOp::BitNot => Some(!val),
                     _ => None,
@@ -3792,8 +3809,8 @@ impl Parser<'_> {
                     BinaryOp::BitAnd => Some(lval & rval),
                     BinaryOp::BitOr => Some(lval | rval),
                     BinaryOp::BitXor => Some(lval ^ rval),
-                    BinaryOp::Shl => Some(lval << (rval as u32)),
-                    BinaryOp::Shr => Some(lval >> (rval as u32)),
+                    BinaryOp::Shl => Some(lval.wrapping_shl(rval as u32)),
+                    BinaryOp::Shr => Some(lval.wrapping_shr(rval as u32)),
                     BinaryOp::Lt => Some(if lval < rval { 1 } else { 0 }),
                     BinaryOp::Le => Some(if lval <= rval { 1 } else { 0 }),
                     BinaryOp::Gt => Some(if lval > rval { 1 } else { 0 }),
@@ -3809,7 +3826,7 @@ impl Parser<'_> {
                 // Check for enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value
+                    sym.enum_value.map(|v| v as i128)
                 } else {
                     None
                 }
@@ -3833,14 +3850,14 @@ impl Parser<'_> {
             // sizeof(type) - constant for complete types
             ExprKind::SizeofType(type_id) => {
                 let size_bits = self.types.size_bits(*type_id);
-                Some((size_bits / 8) as i64)
+                Some((size_bits / 8) as i128)
             }
 
             // sizeof(expr) - constant if expr type is complete
             ExprKind::SizeofExpr(inner_expr) => {
                 if let Some(typ) = inner_expr.typ {
                     let size_bits = self.types.size_bits(typ);
-                    Some((size_bits / 8) as i64)
+                    Some((size_bits / 8) as i128)
                 } else {
                     None
                 }
@@ -3854,31 +3871,28 @@ impl Parser<'_> {
 
             // __builtin_offsetof(type, member-designator) - compile-time constant
             ExprKind::OffsetOf { type_id, path } => {
-                let mut offset: i64 = 0;
+                let mut offset: i128 = 0;
                 let mut current_type = *type_id;
 
                 for element in path {
                     match element {
                         OffsetOfPath::Field(field_id) => {
-                            // Look up the field in the current struct type
-                            // find_member handles recursive lookup through anonymous members
                             if let Some(member_info) =
                                 self.types.find_member(current_type, *field_id)
                             {
-                                offset += member_info.offset as i64;
+                                offset += member_info.offset as i128;
                                 current_type = member_info.typ;
                             } else {
-                                return None; // Field not found
+                                return None;
                             }
                         }
                         OffsetOfPath::Index(index) => {
-                            // Array indexing: offset += index * sizeof(element)
                             if let Some(elem_type) = self.types.base_type(current_type) {
                                 let elem_size = self.types.size_bytes(elem_type);
-                                offset += *index * (elem_size as i64);
+                                offset += *index as i128 * (elem_size as i128);
                                 current_type = elem_type;
                             } else {
-                                return None; // Not an array type
+                                return None;
                             }
                         }
                     }
@@ -3923,6 +3937,7 @@ impl Parser<'_> {
                 | TypeKind::Short
                 | TypeKind::Long
                 | TypeKind::LongLong
+                | TypeKind::Int128
         );
 
         if !valid_type {

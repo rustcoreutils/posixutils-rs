@@ -2716,37 +2716,38 @@ int main(void) {
     assert_eq!(compile_and_run("nullability_qualifiers", code, &[]), 0);
 }
 
-/// Diagnostic: dump preprocessed stdlib.h lines around 540 to debug macOS parse error.
-/// Intentionally panics to ensure output appears in CI test failure log.
+/// Test __int128 / __uint128_t / __int128_t type support.
+/// Validates sizeof, alignof, struct members, arrays, and pointer declarations.
 #[test]
-fn codegen_ternary_fptr_diag() {
+fn codegen_int128_basic() {
     let code = r#"
-#include <stdlib.h>
-int main(void) { return 0; }
+int main(void) {
+    /* sizeof checks for all spelling variants */
+    if (sizeof(__uint128_t) != 16) return 1;
+    if (sizeof(__int128_t) != 16) return 2;
+    if (sizeof(__int128) != 16) return 3;
+
+    /* Struct member usage (mirrors macOS mach/arm/_structs.h) */
+    struct { __uint128_t v[4]; } regs;
+    if (sizeof(regs) != 64) return 4;
+
+    /* Array of __int128 */
+    __int128 arr[3];
+    if (sizeof(arr) != 48) return 5;
+
+    /* Alignment check */
+    if (__alignof__(__int128) != 16) return 6;
+    if (__alignof__(__uint128_t) != 16) return 7;
+
+    /* Pointer to __int128 */
+    __int128 val;
+    __int128 *p = &val;
+    if (sizeof(*p) != 16) return 8;
+
+    return 0;
+}
 "#;
-    let c_file = create_c_file("ternary_fptr_diag", code);
-    let c_path = c_file.path().to_path_buf();
-    let args = vec!["-E".to_string(), c_path.to_string_lossy().to_string()];
-    let output = run_test_base("pcc", &args, &[]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-    let mut diag = format!("=== preprocessed output: {} total lines ===\n", lines.len());
-    // Show lines 530-550
-    let start = if lines.len() > 545 { 530 } else { 0 };
-    let end = std::cmp::min(start + 25, lines.len());
-    for (i, line) in lines[start..end].iter().enumerate() {
-        diag.push_str(&format!("  {:>4}: {}\n", start + i + 1, line));
-    }
-    // Also dump any line containing __v
-    diag.push_str("=== lines containing __v ===\n");
-    for (i, line) in lines.iter().enumerate() {
-        if line.contains("__v") {
-            diag.push_str(&format!("  {:>4}: {}\n", i + 1, line));
-        }
-    }
-    // Only panic on macOS (where the bug occurs) to show diagnostic output in CI
-    #[cfg(target_os = "macos")]
-    panic!("DIAGNOSTIC OUTPUT (intentional failure):\n{}", diag);
+    assert_eq!(compile_and_run("int128_basic", code, &[]), 0);
 }
 
 /// Regression test: ternary selecting function pointers lost return type.
@@ -3883,4 +3884,136 @@ int main(void) {
         compile_and_run_optimized("codegen_inline_two_sse_struct_param", code),
         0
     );
+}
+
+// ============================================================================
+// __int128 codegen tests
+// ============================================================================
+
+#[test]
+fn codegen_int128_mega() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+
+int main(void) {
+    // ========== ADD/SUB (returns 1-9) ==========
+    {
+        int128 a = 100;
+        int128 b = 200;
+        int128 c = a + b;
+        if (c != 300) return 1;
+        int128 d = b - a;
+        if (d != 100) return 2;
+        uint128 big = (uint128)1 << 63;
+        uint128 sum = big + big;
+        if ((unsigned long long)(sum >> 64) != 1) return 3;
+        if ((unsigned long long)sum != 0) return 4;
+        uint128 one_hi = (uint128)1 << 64;
+        uint128 diff = one_hi - 1;
+        if ((unsigned long long)diff != (unsigned long long)-1) return 5;
+        if ((unsigned long long)(diff >> 64) != 0) return 6;
+    }
+    // ========== BITWISE (returns 10-19) ==========
+    {
+        int128 a = 0xFF00FF00;
+        int128 b = 0x0F0F0F0F;
+        if ((a & b) != 0x0F000F00) return 10;
+        if ((a | b) != 0xFF0FFF0F) return 11;
+        if ((a ^ b) != 0xF00FF00F) return 12;
+    }
+    // ========== MULTIPLY (returns 20-29) ==========
+    {
+        int128 a = 1000000000LL;
+        int128 b = 1000000000LL;
+        int128 c = a * b;
+        if (c != 1000000000000000000LL) return 20;
+        uint128 x = (uint128)1 << 63;
+        uint128 y = 4;
+        uint128 z = x * y;
+        if ((unsigned long long)(z >> 64) != 2) return 21;
+        if ((unsigned long long)z != 0) return 22;
+    }
+    // ========== SHIFTS (returns 30-49) ==========
+    {
+        int128 a = 1;
+        int128 b = a << 10;
+        if (b != 1024) return 30;
+        uint128 c = (uint128)1 << 64;
+        if ((unsigned long long)c != 0) return 31;
+        if ((unsigned long long)(c >> 64) != 1) return 32;
+        uint128 d = (uint128)1 << 100;
+        if ((unsigned long long)d != 0) return 33;
+        if ((unsigned long long)(d >> 64) != ((unsigned long long)1 << 36)) return 34;
+        uint128 e = (uint128)1 << 100;
+        uint128 f = e >> 36;
+        if ((unsigned long long)f != 0) return 35;
+        if ((unsigned long long)(f >> 64) != 1) return 36;
+        uint128 g = (uint128)1 << 100;
+        uint128 h = g >> 100;
+        if (h != 1) return 37;
+        int128 i = -1;
+        int128 j = i >> 1;
+        if (j != -1) return 38;
+        int k = 10;
+        int128 m = (int128)1 << k;
+        if (m != 1024) return 39;
+    }
+    // ========== COMPARISONS (returns 50-69) ==========
+    {
+        int128 a = 100;
+        int128 b = 200;
+        int128 c = 100;
+        if (a != c) return 50;
+        if (a == b) return 51;
+        if (a < b) { } else return 54;
+        if (b < a) return 55;
+        if (a <= c) { } else return 56;
+        if (a <= b) { } else return 57;
+        if (b <= a) return 58;
+        if (b > a) { } else return 59;
+        if (a > b) return 60;
+        if (a >= c) { } else return 61;
+        if (a >= b) return 62;
+        uint128 big1 = (uint128)1 << 100;
+        uint128 big2 = (uint128)2 << 100;
+        if (big1 < big2) { } else return 63;
+        if (big2 < big1) return 64;
+        int128 neg = -1;
+        int128 pos = 1;
+        if (neg < pos) { } else return 65;
+        if (pos < neg) return 66;
+    }
+    // ========== UNARY (returns 70-79) ==========
+    {
+        int128 a = 42;
+        int128 b = -a;
+        if (b != -42) return 70;
+        int128 c2 = 0;
+        int128 d2 = -c2;
+        if (d2 != 0) return 71;
+        uint128 e = 0;
+        uint128 f = ~e;
+        if ((unsigned long long)f != (unsigned long long)-1) return 72;
+        if ((unsigned long long)(f >> 64) != (unsigned long long)-1) return 73;
+    }
+    // ========== EXTEND/TRUNC (returns 80-89) ==========
+    {
+        unsigned int small_u = 0xDEADBEEF;
+        uint128 big_u = small_u;
+        if ((unsigned long long)big_u != 0xDEADBEEF) return 80;
+        if ((unsigned long long)(big_u >> 64) != 0) return 81;
+        int small_s = -1;
+        int128 big_s = small_s;
+        if (big_s != -1) return 82;
+        int128 large = 0x1234567890ABCDEFLL;
+        int trunc = (int)large;
+        if (trunc != (int)0x90ABCDEF) return 83;
+        unsigned long long trunc_ll = (unsigned long long)large;
+        if (trunc_ll != 0x1234567890ABCDEFULL) return 84;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_mega", code, &[]), 0);
 }

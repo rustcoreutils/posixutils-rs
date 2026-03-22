@@ -780,6 +780,7 @@ impl<'a> Linearizer<'a> {
     fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         match &expr.kind {
             ExprKind::IntLit(v) => Initializer::Int(*v),
+            ExprKind::Int128Lit(v) => Initializer::Int128(*v),
             ExprKind::FloatLit(v) => Initializer::Float(*v),
             ExprKind::CharLit(c) => Initializer::Int(*c as u8 as i8 as i64),
 
@@ -818,11 +819,12 @@ impl<'a> Linearizer<'a> {
                 operand,
             } => match &operand.kind {
                 ExprKind::IntLit(v) => Initializer::Int(-*v),
+                ExprKind::Int128Lit(v) => Initializer::Int128(v.wrapping_neg()),
                 ExprKind::FloatLit(v) => Initializer::Float(-*v),
                 // For more complex expressions like -(1+2), try constant evaluation
                 _ => {
                     if let Some(val) = self.eval_const_expr(expr) {
-                        Initializer::Int(val)
+                        Self::int_initializer(val)
                     } else {
                         Initializer::None
                     }
@@ -898,7 +900,7 @@ impl<'a> Linearizer<'a> {
                     // Check if it's an enum constant
                     let sym = self.symbols.get(*symbol_id);
                     if let Some(val) = sym.enum_value {
-                        Initializer::Int(val)
+                        Initializer::Int(val) // enum values are always i64
                     } else {
                         Initializer::None
                     }
@@ -921,7 +923,7 @@ impl<'a> Linearizer<'a> {
                 } else {
                     // Neither operand is pointer — try as integer constant
                     if let Some(val) = self.eval_const_expr(expr) {
-                        return Initializer::Int(val);
+                        return Self::int_initializer(val);
                     }
                     error(
                         self.current_pos.unwrap_or_default(),
@@ -944,9 +946,9 @@ impl<'a> Linearizer<'a> {
                             .map(|t| self.types.size_bytes(t) as i64)
                             .unwrap_or(1);
                         let byte_offset = if is_sub {
-                            base_off - int_val * pointee_size
+                            base_off - int_val as i64 * pointee_size
                         } else {
-                            base_off + int_val * pointee_size
+                            base_off + int_val as i64 * pointee_size
                         };
                         if byte_offset == 0 {
                             Initializer::SymAddr(name)
@@ -954,7 +956,7 @@ impl<'a> Linearizer<'a> {
                             Initializer::SymAddrOffset(name, byte_offset)
                         }
                     } else if let Some(val) = self.eval_const_expr(expr) {
-                        Initializer::Int(val)
+                        Self::int_initializer(val)
                     } else {
                         error(
                             self.current_pos.unwrap_or_default(),
@@ -963,7 +965,7 @@ impl<'a> Linearizer<'a> {
                         Initializer::None
                     }
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    Initializer::Int(val)
+                    Self::int_initializer(val)
                 } else {
                     error(
                         self.current_pos.unwrap_or_default(),
@@ -1002,7 +1004,7 @@ impl<'a> Linearizer<'a> {
             // Try to evaluate as integer or float constant expression
             _ => {
                 if let Some(val) = self.eval_const_expr(expr) {
-                    Initializer::Int(val)
+                    Self::int_initializer(val)
                 } else if let Some(val) = self.eval_const_float_expr(expr) {
                     Initializer::Float(val)
                 } else if let Some((name, offset)) = self.eval_static_address(expr) {
@@ -3405,7 +3407,7 @@ impl<'a> Linearizer<'a> {
             Stmt::Case(expr) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
-                    case_values.push(val);
+                    case_values.push(val as i64); // switch cases truncated to i64
                 }
             }
             Stmt::Default => {
@@ -3423,16 +3425,17 @@ impl<'a> Linearizer<'a> {
     ///
     /// C99 6.6 defines integer constant expressions. This function evaluates
     /// expressions that can be computed at compile time.
-    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+    fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
-            ExprKind::IntLit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i64),
+            ExprKind::IntLit(val) => Some(*val as i128),
+            ExprKind::Int128Lit(val) => Some(*val),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
 
             ExprKind::Ident(symbol_id) => {
                 // Check if it's an enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value
+                    sym.enum_value.map(|v| v as i128)
                 } else {
                     None
                 }
@@ -3441,7 +3444,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => Some(-val),
+                    UnaryOp::Neg => Some(val.wrapping_neg()),
                     UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
                     UnaryOp::BitNot => Some(!val),
                     _ => None,
@@ -3474,10 +3477,15 @@ impl<'a> Linearizer<'a> {
                     BinaryOp::BitXor => Some(l ^ r),
                     BinaryOp::Shl | BinaryOp::Shr => {
                         // Mask shift amount to match C semantics and target hardware behavior.
-                        // After C integer promotion: 8/16/32-bit types use 32-bit shifts (mask 31),
-                        // 64-bit types use 64-bit shifts (mask 63).
+                        // 8/16/32-bit: mask 31, 64-bit: mask 63, 128-bit: mask 127.
                         let size_bits = left.typ.map(|t| self.types.size_bits(t)).unwrap_or(32);
-                        let mask = if size_bits > 32 { 63 } else { 31 };
+                        let mask: i128 = if size_bits > 64 {
+                            127
+                        } else if size_bits > 32 {
+                            63
+                        } else {
+                            31
+                        };
                         let shift_amt = (r & mask) as u32;
                         match op {
                             BinaryOp::Shl => Some(l << shift_amt),
@@ -3496,8 +3504,8 @@ impl<'a> Linearizer<'a> {
                         });
                         let use_unsigned = left_unsigned || right_unsigned;
                         if use_unsigned {
-                            let lu = l as u64;
-                            let ru = r as u64;
+                            let lu = l as u128;
+                            let ru = r as u128;
                             Some(match op {
                                 BinaryOp::Lt => {
                                     if lu < ru {
@@ -3586,14 +3594,14 @@ impl<'a> Linearizer<'a> {
             // sizeof(type) - constant for complete types
             ExprKind::SizeofType(type_id) => {
                 let size_bits = self.types.size_bits(*type_id);
-                Some((size_bits / 8) as i64)
+                Some((size_bits / 8) as i128)
             }
 
             // sizeof(expr) - constant if expr type is complete
             ExprKind::SizeofExpr(inner_expr) => {
                 if let Some(typ) = inner_expr.typ {
                     let size_bits = self.types.size_bits(typ);
-                    Some((size_bits / 8) as i64)
+                    Some((size_bits / 8) as i128)
                 } else {
                     None
                 }
@@ -3602,14 +3610,14 @@ impl<'a> Linearizer<'a> {
             // _Alignof(type) - constant for complete types
             ExprKind::AlignofType(type_id) => {
                 let align = self.types.alignment(*type_id);
-                Some(align as i64)
+                Some(align as i128)
             }
 
             // _Alignof(expr) - constant if expr type is complete
             ExprKind::AlignofExpr(inner_expr) => {
                 if let Some(typ) = inner_expr.typ {
                     let align = self.types.alignment(typ);
-                    Some(align as i64)
+                    Some(align as i128)
                 } else {
                     None
                 }
@@ -3648,7 +3656,7 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                Some(offset as i64)
+                Some(offset as i128)
             }
 
             _ => None,
@@ -3745,7 +3753,7 @@ impl<'a> Linearizer<'a> {
                 let elem_type = self.types.base_type(array_type)?;
                 let elem_size = self.types.size_bytes(elem_type) as i64;
 
-                Some((name, base_offset + idx * elem_size))
+                Some((name, base_offset + idx as i64 * elem_size))
             }
 
             // Address-of: &expr → same as evaluating expr as static address
@@ -3787,9 +3795,9 @@ impl<'a> Linearizer<'a> {
                     .map(|t| self.types.size_bytes(t) as i64)
                     .unwrap_or(1);
                 let byte_offset = if is_sub {
-                    base_offset - int_val * pointee_size
+                    base_offset - int_val as i64 * pointee_size
                 } else {
-                    base_offset + int_val * pointee_size
+                    base_offset + int_val as i64 * pointee_size
                 };
 
                 Some((name, byte_offset))
@@ -3839,7 +3847,7 @@ impl<'a> Linearizer<'a> {
             Stmt::Case(expr) => {
                 // Find the matching case block
                 if let Some(val) = self.eval_const_expr(expr) {
-                    if let Some(idx) = case_values.iter().position(|v| *v == val) {
+                    if let Some(idx) = case_values.iter().position(|v| *v as i128 == val) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -4141,6 +4149,7 @@ impl<'a> Linearizer<'a> {
         match &expr.kind {
             // Literals are always pure
             ExprKind::IntLit(_)
+            | ExprKind::Int128Lit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::CharLit(_)
             | ExprKind::StringLit(_)
@@ -4659,7 +4668,11 @@ impl<'a> Linearizer<'a> {
             "tf"
         };
 
-        if src_is_float16 || dst_is_float16 {
+        // Skip Float16 handling for Int128 operands — no direct hf↔ti rtlib exists.
+        // These will fall through to the Int128 handler which converts via double.
+        let src_is_int128 = src_kind == TypeKind::Int128;
+        let dst_is_int128 = dst_kind == TypeKind::Int128;
+        if (src_is_float16 || dst_is_float16) && !src_is_int128 && !dst_is_int128 {
             let rtlib = RtlibNames::new(self.target);
 
             let (from_suffix, to_suffix) = if src_is_float16 && dst_is_float {
@@ -4785,6 +4798,52 @@ impl<'a> Linearizer<'a> {
                 }
             }
             // Fall through to native FP for macOS aarch64 (long double == double)
+        }
+
+        // Check for Int128 <-> float conversions that need rtlib
+        let src_is_int128 = src_kind == TypeKind::Int128;
+        let dst_is_int128 = dst_kind == TypeKind::Int128;
+
+        if (src_is_int128 && dst_is_float) || (dst_is_int128 && src_is_float) {
+            let rtlib = RtlibNames::new(self.target);
+
+            let (from_suffix, to_suffix) = if src_is_int128 && dst_is_float {
+                // Int128 -> float type
+                let from = if self.types.is_unsigned(src_type) {
+                    "uti"
+                } else {
+                    "ti"
+                };
+                let to = match dst_kind {
+                    TypeKind::Float => "sf",
+                    TypeKind::Double => "df",
+                    TypeKind::Float16 => "hf",
+                    TypeKind::LongDouble => ld_suffix,
+                    _ => "",
+                };
+                (from, to)
+            } else {
+                // float type -> Int128
+                let from = match src_kind {
+                    TypeKind::Float => "sf",
+                    TypeKind::Double => "df",
+                    TypeKind::Float16 => "hf",
+                    TypeKind::LongDouble => ld_suffix,
+                    _ => "",
+                };
+                let to = if self.types.is_unsigned(cast_type) {
+                    "uti"
+                } else {
+                    "ti"
+                };
+                (from, to)
+            };
+
+            if !from_suffix.is_empty() && !to_suffix.is_empty() {
+                if let Some(func_name) = rtlib.int128_convert(from_suffix, to_suffix) {
+                    return self.emit_rtlib_call(func_name, vec![src], vec![src_type], cast_type);
+                }
+            }
         }
 
         if src_is_float && !dst_is_float {
@@ -6314,6 +6373,11 @@ impl<'a> Linearizer<'a> {
                 self.emit_const(*val, typ)
             }
 
+            ExprKind::Int128Lit(val) => {
+                let typ = self.expr_type(expr);
+                self.emit_const128(*val, typ)
+            }
+
             ExprKind::FloatLit(val) => {
                 let typ = self.expr_type(expr);
                 self.emit_fconst(*val, typ)
@@ -7253,6 +7317,31 @@ impl<'a> Linearizer<'a> {
         id
     }
 
+    /// Create an integer Initializer, using Int128 only when the value exceeds i64 range.
+    fn int_initializer(val: i128) -> Initializer {
+        if val >= i64::MIN as i128 && val <= i64::MAX as i128 {
+            Initializer::Int(val as i64)
+        } else {
+            Initializer::Int128(val)
+        }
+    }
+
+    fn emit_const128(&mut self, val: i128, typ: TypeId) -> PseudoId {
+        let id = self.alloc_pseudo();
+        let pseudo = Pseudo::val128(id, val);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+
+        // Emit setval instruction with 128-bit size
+        let insn = Instruction::new(Opcode::SetVal)
+            .with_target(id)
+            .with_type_and_size(typ, 128);
+        self.emit(insn);
+
+        id
+    }
+
     fn emit_fconst(&mut self, val: f64, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::fval(id, val);
@@ -7813,6 +7902,25 @@ impl<'a> Linearizer<'a> {
                 }
             }
             // Fall through to native FP for macOS aarch64 (long double == double)
+        }
+
+        // Check if this is an __int128 div/mod operation that needs rtlib
+        if self.types.kind(operand_typ) == TypeKind::Int128
+            && matches!(op, BinaryOp::Div | BinaryOp::Mod)
+        {
+            let rtlib = RtlibNames::new(self.target);
+            let op_str = if matches!(op, BinaryOp::Div) {
+                "div"
+            } else {
+                "mod"
+            };
+            let func_name = rtlib.int128_divmod(op_str, is_unsigned);
+            return self.emit_rtlib_call(
+                func_name,
+                vec![left, right],
+                vec![operand_typ, operand_typ],
+                result_typ,
+            );
         }
 
         let result = self.alloc_pseudo();

@@ -317,6 +317,60 @@ impl<'a> RtlibNames<'a> {
             _ => None,
         }
     }
+
+    // ========================================================================
+    // Int128 operations
+    // ========================================================================
+
+    /// Get function name for __int128 division/modulo.
+    ///
+    /// Suffix convention: ti = 128-bit integer
+    pub fn int128_divmod(&self, op: &str, unsigned: bool) -> &'static str {
+        match (op, unsigned) {
+            ("div", false) => "__divti3",
+            ("mod", false) => "__modti3",
+            ("div", true) => "__udivti3",
+            ("mod", true) => "__umodti3",
+            _ => panic!("invalid int128 divmod op: {}", op),
+        }
+    }
+
+    /// Get function name for __int128 ↔ float/double conversions.
+    ///
+    /// Suffix convention:
+    /// - ti = signed int128, uti = unsigned int128
+    /// - sf = float, df = double, xf = x87 extended, tf = quad, hf = half
+    pub fn int128_convert(&self, from: &str, to: &str) -> Option<&'static str> {
+        match (from, to) {
+            // int128 -> float types
+            ("ti", "sf") => Some("__floattisf"),
+            ("ti", "df") => Some("__floattidf"),
+            ("ti", "xf") => Some("__floattixf"),
+            ("ti", "tf") => Some("__floattitf"),
+            // Note: no hf (Float16) entries — __floattihf etc. don't exist in
+            // libgcc/compiler-rt. Float16↔Int128 goes through intermediate double.
+
+            // uint128 -> float types
+            ("uti", "sf") => Some("__floatuntisf"),
+            ("uti", "df") => Some("__floatuntidf"),
+            ("uti", "xf") => Some("__floatuntixf"),
+            ("uti", "tf") => Some("__floatuntitf"),
+
+            // float types -> int128
+            ("sf", "ti") => Some("__fixsfti"),
+            ("df", "ti") => Some("__fixdfti"),
+            ("xf", "ti") => Some("__fixxfti"),
+            ("tf", "ti") => Some("__fixtfti"),
+
+            // float types -> uint128
+            ("sf", "uti") => Some("__fixunssfti"),
+            ("df", "uti") => Some("__fixunsdfti"),
+            ("xf", "uti") => Some("__fixunsxfti"),
+            ("tf", "uti") => Some("__fixunstfti"),
+
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -558,5 +612,58 @@ mod tests {
 
         // Invalid conversion
         assert_eq!(rtlib.float16_convert("hf", "invalid"), None);
+    }
+
+    // ========================================================================
+    // Int128 (__int128 / __uint128_t) rtlib tests
+    // ========================================================================
+
+    #[test]
+    fn test_int128_divmod() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let rtlib = RtlibNames::new(&target);
+
+        assert_eq!(rtlib.int128_divmod("div", false), "__divti3");
+        assert_eq!(rtlib.int128_divmod("mod", false), "__modti3");
+        assert_eq!(rtlib.int128_divmod("div", true), "__udivti3");
+        assert_eq!(rtlib.int128_divmod("mod", true), "__umodti3");
+    }
+
+    #[test]
+    fn test_int128_convert() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let rtlib = RtlibNames::new(&target);
+
+        // int128 -> float types
+        assert_eq!(rtlib.int128_convert("ti", "sf"), Some("__floattisf"));
+        assert_eq!(rtlib.int128_convert("ti", "df"), Some("__floattidf"));
+        assert_eq!(rtlib.int128_convert("ti", "xf"), Some("__floattixf"));
+        assert_eq!(rtlib.int128_convert("ti", "tf"), Some("__floattitf"));
+        // Float16 (hf) ↔ Int128: no direct rtlib function exists
+        assert_eq!(rtlib.int128_convert("ti", "hf"), None);
+
+        // uint128 -> float types
+        assert_eq!(rtlib.int128_convert("uti", "sf"), Some("__floatuntisf"));
+        assert_eq!(rtlib.int128_convert("uti", "df"), Some("__floatuntidf"));
+        assert_eq!(rtlib.int128_convert("uti", "xf"), Some("__floatuntixf"));
+        assert_eq!(rtlib.int128_convert("uti", "tf"), Some("__floatuntitf"));
+        assert_eq!(rtlib.int128_convert("uti", "hf"), None);
+
+        // float types -> int128
+        assert_eq!(rtlib.int128_convert("sf", "ti"), Some("__fixsfti"));
+        assert_eq!(rtlib.int128_convert("df", "ti"), Some("__fixdfti"));
+        assert_eq!(rtlib.int128_convert("xf", "ti"), Some("__fixxfti"));
+        assert_eq!(rtlib.int128_convert("tf", "ti"), Some("__fixtfti"));
+        assert_eq!(rtlib.int128_convert("hf", "ti"), None);
+
+        // float types -> uint128
+        assert_eq!(rtlib.int128_convert("sf", "uti"), Some("__fixunssfti"));
+        assert_eq!(rtlib.int128_convert("df", "uti"), Some("__fixunsdfti"));
+        assert_eq!(rtlib.int128_convert("xf", "uti"), Some("__fixunsxfti"));
+        assert_eq!(rtlib.int128_convert("tf", "uti"), Some("__fixunstfti"));
+        assert_eq!(rtlib.int128_convert("hf", "uti"), None);
+
+        // Invalid conversion
+        assert_eq!(rtlib.int128_convert("ti", "invalid"), None);
     }
 }

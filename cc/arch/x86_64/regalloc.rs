@@ -252,6 +252,11 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
         Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
         },
+        // Int128 mul uses `mulq` which clobbers RAX:RDX. Regular mul uses IMul2
+        // which doesn't depend on these, so marking them as clobbers is safe for both.
+        Opcode::Mul => RegConstraints {
+            clobbers: &[Reg::Rax, Reg::Rdx],
+        },
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => RegConstraints {
             clobbers: &[Reg::Rcx],
         },
@@ -395,6 +400,8 @@ pub enum Loc {
     IncomingArg(i32),
     /// Immediate integer constant
     Imm(i64),
+    /// Immediate 128-bit integer constant
+    Imm128(i128),
     /// Immediate float constant (value, size in bits)
     FImm(f64, u32),
     /// Global symbol
@@ -448,6 +455,8 @@ pub struct RegAlloc {
     fp_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are long double (use x87, need 16-byte stack slots)
     ld_pseudos: HashSet<PseudoId>,
+    /// Track which pseudos are 128-bit integers (need 16-byte stack slots, never registers)
+    int128_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// XMM arguments spilled from XMM registers to stack
@@ -478,6 +487,7 @@ impl RegAlloc {
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
+            int128_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
             spilled_xmm_args: Vec::new(),
             active_stack: Vec::new(),
@@ -496,6 +506,8 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
+        // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
+        self.identify_int128_pseudos(func, types);
         self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
@@ -525,6 +537,7 @@ impl RegAlloc {
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
+        self.int128_pseudos.clear();
         self.spilled_args.clear();
         self.spilled_xmm_args.clear();
         self.active_stack.clear();
@@ -553,6 +566,89 @@ impl RegAlloc {
                     // Mark sources as long double for Load/Store/Copy
                     for &src in &insn.src {
                         self.ld_pseudos.insert(src);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Identify pseudos that are 128-bit integers (__int128).
+    /// These need 16-byte stack slots and must never be allocated to GP registers.
+    fn identify_int128_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        // First pass: identify targets of 128-bit instructions and all sources
+        // of 128-bit binary/unary ops.
+        for block in &func.blocks {
+            for insn in &block.insns {
+                // Only match Int128 type, not 16-byte structs or long doubles
+                let is_int128 = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128);
+
+                if is_int128 {
+                    // Comparison results are always small integers, not 128-bit.
+                    let is_comparison = matches!(
+                        insn.op,
+                        Opcode::SetEq
+                            | Opcode::SetNe
+                            | Opcode::SetLt
+                            | Opcode::SetLe
+                            | Opcode::SetGt
+                            | Opcode::SetGe
+                            | Opcode::SetB
+                            | Opcode::SetBe
+                            | Opcode::SetA
+                            | Opcode::SetAe
+                    );
+
+                    // For Load: target is int128, but src[0] is the address (64-bit pointer).
+                    // For Store: src[0] is address (64-bit), src[1] is the int128 value.
+                    // For comparisons: target is a small integer result.
+                    if !is_comparison && !matches!(insn.op, Opcode::Load) {
+                        if let Some(target) = insn.target {
+                            self.int128_pseudos.insert(target);
+                        }
+                    }
+                    if matches!(insn.op, Opcode::Load) {
+                        // Load: only target is int128, not the address src[0]
+                        if let Some(target) = insn.target {
+                            self.int128_pseudos.insert(target);
+                        }
+                    } else if matches!(insn.op, Opcode::Store) {
+                        // Store: src[0] is address (skip), src[1] is the int128 value
+                        if let Some(&val) = insn.src.get(1) {
+                            self.int128_pseudos.insert(val);
+                        }
+                    } else {
+                        // Other ops: all sources are int128
+                        for &src in &insn.src {
+                            self.int128_pseudos.insert(src);
+                        }
+                    }
+                }
+            }
+        }
+        // Second pass: propagate through Copy instructions only.
+        // Load src is an address (not int128), so don't propagate through Load.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &func.blocks {
+                for insn in &block.insns {
+                    if insn.op == Opcode::Copy {
+                        if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                            if self.int128_pseudos.contains(&src)
+                                && !self.int128_pseudos.contains(&target)
+                            {
+                                self.int128_pseudos.insert(target);
+                                changed = true;
+                            }
+                            if self.int128_pseudos.contains(&target)
+                                && !self.int128_pseudos.contains(&src)
+                            {
+                                self.int128_pseudos.insert(src);
+                                changed = true;
+                            }
+                        }
                     }
                 }
             }
@@ -754,6 +850,11 @@ impl RegAlloc {
         &self.spilled_xmm_args
     }
 
+    /// Get the set of pseudos identified as 128-bit integers
+    pub fn int128_pseudos(&self) -> &HashSet<PseudoId> {
+        &self.int128_pseudos
+    }
+
     /// Spill arguments in registers that would be clobbered by constraint points (e.g., shifts)
     ///
     /// For example, if the 4th parameter is in Rcx and the function contains variable shifts,
@@ -889,6 +990,10 @@ impl RegAlloc {
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
                         continue;
                     }
+                    PseudoKind::Val128(v) => {
+                        self.locations.insert(interval.pseudo, Loc::Imm128(*v));
+                        continue;
+                    }
                     PseudoKind::FVal(v) => {
                         let size = func
                             .blocks
@@ -936,6 +1041,12 @@ impl RegAlloc {
                     }
                     _ => {}
                 }
+            }
+
+            // 128-bit integers always go on the stack (16 bytes, 16-byte aligned)
+            if self.int128_pseudos.contains(&interval.pseudo) {
+                self.alloc_stack_slot(&interval, 16, 16, true);
+                continue;
             }
 
             // Allocate register based on type

@@ -29,6 +29,8 @@ enum Simplification {
     CopyFrom(PseudoId),
     /// Create a new constant with this value and copy from it
     FoldToConst(i64),
+    /// Create a new 128-bit constant with this value and copy from it
+    FoldToConst128(i128),
 }
 
 // ============================================================================
@@ -66,6 +68,10 @@ pub fn run(func: &mut Function) -> bool {
             Simplification::FoldToConst(value) => {
                 // Create a new constant pseudo
                 let const_id = func.create_const_pseudo(value);
+                make_copy_from_parts(target, typ, size, const_id)
+            }
+            Simplification::FoldToConst128(value) => {
+                let const_id = func.create_const128_pseudo(value);
                 make_copy_from_parts(target, typ, size, const_id)
             }
         };
@@ -116,6 +122,24 @@ fn try_simplify(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
+/// Return FoldToConst(0) or FoldToConst128(0) based on instruction size.
+fn fold_to_zero(insn: &Instruction) -> Simplification {
+    if insn.size == 128 {
+        Simplification::FoldToConst128(0)
+    } else {
+        Simplification::FoldToConst(0)
+    }
+}
+
+/// Return FoldToConst or FoldToConst128 for an absorbing/identity constant based on instruction size.
+fn fold_to_const(insn: &Instruction, value: i64) -> Simplification {
+    if insn.size == 128 {
+        Simplification::FoldToConst128(value as i128)
+    } else {
+        Simplification::FoldToConst(value)
+    }
+}
+
 /// Create a Copy instruction from extracted parts.
 fn make_copy_from_parts(
     target: Option<PseudoId>,
@@ -157,7 +181,17 @@ fn simplify_add(insn: &Instruction, func: &Function) -> Simplification {
         // Algebraic: 0 + x -> x
         (Some(0), None) => Simplification::CopyFrom(src2),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            let v2_128 = func.const_val128(src2);
+            match (v1_128, v2_128) {
+                (Some(a), Some(b)) => Simplification::FoldToConst128(a.wrapping_add(b)),
+                (None, Some(0)) => Simplification::CopyFrom(src1),
+                (Some(0), None) => Simplification::CopyFrom(src2),
+                _ => Simplification::None,
+            }
+        }
     }
 }
 
@@ -175,7 +209,7 @@ fn simplify_sub(insn: &Instruction, func: &Function) -> Simplification {
 
     // Identity: x - x -> 0
     if src1 == src2 {
-        return Simplification::FoldToConst(0);
+        return fold_to_zero(insn);
     }
 
     let val1 = func.const_val(src1);
@@ -188,7 +222,16 @@ fn simplify_sub(insn: &Instruction, func: &Function) -> Simplification {
         // Algebraic: x - 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            let v2_128 = func.const_val128(src2);
+            match (v1_128, v2_128) {
+                (Some(a), Some(b)) => Simplification::FoldToConst128(a.wrapping_sub(b)),
+                (None, Some(0)) => Simplification::CopyFrom(src1),
+                _ => Simplification::None,
+            }
+        }
     }
 }
 
@@ -211,14 +254,26 @@ fn simplify_mul(insn: &Instruction, func: &Function) -> Simplification {
         (Some(a), Some(b)) => Simplification::FoldToConst(a.wrapping_mul(b)),
 
         // Algebraic: x * 0 -> 0
-        (None, Some(0)) => Simplification::FoldToConst(0),
-        (Some(0), None) => Simplification::FoldToConst(0),
+        (None, Some(0)) => fold_to_zero(insn),
+        (Some(0), None) => fold_to_zero(insn),
 
         // Algebraic: x * 1 -> x
         (None, Some(1)) => Simplification::CopyFrom(src1),
         (Some(1), None) => Simplification::CopyFrom(src2),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            let v2_128 = func.const_val128(src2);
+            match (v1_128, v2_128) {
+                (Some(a), Some(b)) => Simplification::FoldToConst128(a.wrapping_mul(b)),
+                (None, Some(0)) => fold_to_zero(insn),
+                (Some(0), None) => fold_to_zero(insn),
+                (None, Some(1)) => Simplification::CopyFrom(src1),
+                (Some(1), None) => Simplification::CopyFrom(src2),
+                _ => Simplification::None,
+            }
+        }
     }
 }
 
@@ -250,9 +305,25 @@ fn simplify_div(insn: &Instruction, func: &Function) -> Simplification {
         (None, Some(1)) => Simplification::CopyFrom(src1),
 
         // Algebraic: 0 / x -> 0
-        (Some(0), None) => Simplification::FoldToConst(0),
+        (Some(0), None) => fold_to_zero(insn),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            let v2_128 = func.const_val128(src2);
+            match (v1_128, v2_128) {
+                (Some(a), Some(b)) if b != 0 => {
+                    if insn.op == Opcode::DivS {
+                        Simplification::FoldToConst128(a.wrapping_div(b))
+                    } else {
+                        Simplification::FoldToConst128((a as u128).wrapping_div(b as u128) as i128)
+                    }
+                }
+                (None, Some(1)) => Simplification::CopyFrom(src1),
+                (Some(0), None) => fold_to_zero(insn),
+                _ => Simplification::None,
+            }
+        }
     }
 }
 
@@ -281,12 +352,28 @@ fn simplify_mod(insn: &Instruction, func: &Function) -> Simplification {
         }
 
         // Algebraic: 0 % x -> 0
-        (Some(0), None) => Simplification::FoldToConst(0),
+        (Some(0), None) => fold_to_zero(insn),
 
         // Algebraic: x % 1 -> 0
-        (None, Some(1)) => Simplification::FoldToConst(0),
+        (None, Some(1)) => fold_to_zero(insn),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            let v2_128 = func.const_val128(src2);
+            match (v1_128, v2_128) {
+                (Some(a), Some(b)) if b != 0 => {
+                    if insn.op == Opcode::ModS {
+                        Simplification::FoldToConst128(a.wrapping_rem(b))
+                    } else {
+                        Simplification::FoldToConst128((a as u128).wrapping_rem(b as u128) as i128)
+                    }
+                }
+                (Some(0), None) => fold_to_zero(insn),
+                (None, Some(1)) => fold_to_zero(insn),
+                _ => Simplification::None,
+            }
+        }
     }
 }
 
@@ -320,9 +407,33 @@ fn simplify_shift(insn: &Instruction, func: &Function) -> Simplification {
         (None, Some(0)) => Simplification::CopyFrom(src1),
 
         // Algebraic: 0 op n -> 0
-        (Some(0), None) => Simplification::FoldToConst(0),
+        (Some(0), None) => fold_to_zero(insn),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            // Shift amount is always an i64 (val2), but the value being shifted may be 128-bit
+            match (v1_128, val2) {
+                (Some(a), Some(b)) if (0..128).contains(&b) => {
+                    let folded = match insn.op {
+                        Opcode::Shl => a.wrapping_shl(b as u32),
+                        Opcode::Lsr => (a as u128).wrapping_shr(b as u32) as i128,
+                        Opcode::Asr => a.wrapping_shr(b as u32),
+                        _ => return Simplification::None,
+                    };
+                    Simplification::FoldToConst128(folded)
+                }
+                (Some(0), None) => fold_to_zero(insn),
+                _ => {
+                    // Check if shift amount is a Val128(0)
+                    if let Some(0) = func.const_val128(src2) {
+                        Simplification::CopyFrom(src1)
+                    } else {
+                        Simplification::None
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -394,7 +505,7 @@ fn simplify_bitwise(insn: &Instruction, func: &Function) -> Simplification {
     if src1 == src2 {
         return match info.self_result {
             SelfOpResult::CopySrc => Simplification::CopyFrom(src1),
-            SelfOpResult::Const(c) => Simplification::FoldToConst(c),
+            SelfOpResult::Const(c) => fold_to_const(insn, c),
         };
     }
 
@@ -410,10 +521,34 @@ fn simplify_bitwise(insn: &Instruction, func: &Function) -> Simplification {
         (Some(v), None) if v == info.identity => Simplification::CopyFrom(src2),
 
         // Algebraic: x op absorbing -> absorbing (if exists)
-        (None, Some(v)) if info.absorbing == Some(v) => Simplification::FoldToConst(v),
-        (Some(v), None) if info.absorbing == Some(v) => Simplification::FoldToConst(v),
+        (None, Some(v)) if info.absorbing == Some(v) => fold_to_const(insn, v),
+        (Some(v), None) if info.absorbing == Some(v) => fold_to_const(insn, v),
 
-        _ => Simplification::None,
+        _ => {
+            // Try 128-bit constant folding
+            let v1_128 = func.const_val128(src1);
+            let v2_128 = func.const_val128(src2);
+            let identity_128 = info.identity as i128;
+            let absorbing_128 = info.absorbing.map(|v| v as i128);
+
+            match (v1_128, v2_128) {
+                (Some(a), Some(b)) => {
+                    // Apply the fold using i128 arithmetic
+                    let folded = match insn.op {
+                        Opcode::And => a & b,
+                        Opcode::Or => a | b,
+                        Opcode::Xor => a ^ b,
+                        _ => return Simplification::None,
+                    };
+                    Simplification::FoldToConst128(folded)
+                }
+                (None, Some(v)) if v == identity_128 => Simplification::CopyFrom(src1),
+                (Some(v), None) if v == identity_128 => Simplification::CopyFrom(src2),
+                (None, Some(v)) if absorbing_128 == Some(v) => Simplification::FoldToConst128(v),
+                (Some(v), None) if absorbing_128 == Some(v) => Simplification::FoldToConst128(v),
+                _ => Simplification::None,
+            }
+        }
     }
 }
 
@@ -476,6 +611,47 @@ fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
     }
 }
 
+/// 128-bit comparison function type
+struct CmpInfo128 {
+    compare: fn(i128, i128) -> bool,
+}
+
+fn get_cmp_info128(op: Opcode) -> Option<CmpInfo128> {
+    match op {
+        Opcode::SetEq => Some(CmpInfo128 {
+            compare: |a, b| a == b,
+        }),
+        Opcode::SetNe => Some(CmpInfo128 {
+            compare: |a, b| a != b,
+        }),
+        Opcode::SetLt => Some(CmpInfo128 {
+            compare: |a, b| a < b,
+        }),
+        Opcode::SetLe => Some(CmpInfo128 {
+            compare: |a, b| a <= b,
+        }),
+        Opcode::SetGt => Some(CmpInfo128 {
+            compare: |a, b| a > b,
+        }),
+        Opcode::SetGe => Some(CmpInfo128 {
+            compare: |a, b| a >= b,
+        }),
+        Opcode::SetB => Some(CmpInfo128 {
+            compare: |a, b| (a as u128) < (b as u128),
+        }),
+        Opcode::SetBe => Some(CmpInfo128 {
+            compare: |a, b| (a as u128) <= (b as u128),
+        }),
+        Opcode::SetA => Some(CmpInfo128 {
+            compare: |a, b| (a as u128) > (b as u128),
+        }),
+        Opcode::SetAe => Some(CmpInfo128 {
+            compare: |a, b| (a as u128) >= (b as u128),
+        }),
+        _ => None,
+    }
+}
+
 /// Unified comparison simplification for all SetXX opcodes
 fn simplify_comparison(insn: &Instruction, func: &Function) -> Simplification {
     let info = match get_cmp_info(insn.op) {
@@ -490,7 +666,7 @@ fn simplify_comparison(insn: &Instruction, func: &Function) -> Simplification {
     let src1 = insn.src[0];
     let src2 = insn.src[1];
 
-    // Identity: x op x -> identity_result
+    // Identity: x op x -> identity_result (comparison result is always i32/i64, never i128)
     if src1 == src2 {
         return Simplification::FoldToConst(info.identity_result);
     }
@@ -500,10 +676,20 @@ fn simplify_comparison(insn: &Instruction, func: &Function) -> Simplification {
     let val2 = func.const_val(src2);
 
     if let (Some(a), Some(b)) = (val1, val2) {
-        Simplification::FoldToConst(if (info.compare)(a, b) { 1 } else { 0 })
-    } else {
-        Simplification::None
+        return Simplification::FoldToConst(if (info.compare)(a, b) { 1 } else { 0 });
     }
+
+    // Try 128-bit constant folding
+    let v1_128 = func.const_val128(src1);
+    let v2_128 = func.const_val128(src2);
+    if let (Some(a), Some(b)) = (v1_128, v2_128) {
+        if let Some(info128) = get_cmp_info128(insn.op) {
+            // Comparison result is always an i64 (boolean 0 or 1), not i128
+            return Simplification::FoldToConst(if (info128.compare)(a, b) { 1 } else { 0 });
+        }
+    }
+
+    Simplification::None
 }
 
 // ============================================================================
@@ -518,6 +704,8 @@ fn simplify_neg(insn: &Instruction, func: &Function) -> Simplification {
     let src = insn.src[0];
     if let Some(val) = func.const_val(src) {
         Simplification::FoldToConst(val.wrapping_neg())
+    } else if let Some(val) = func.const_val128(src) {
+        Simplification::FoldToConst128(val.wrapping_neg())
     } else {
         Simplification::None
     }
@@ -531,6 +719,8 @@ fn simplify_not(insn: &Instruction, func: &Function) -> Simplification {
     let src = insn.src[0];
     if let Some(val) = func.const_val(src) {
         Simplification::FoldToConst(!val)
+    } else if let Some(val) = func.const_val128(src) {
+        Simplification::FoldToConst128(!val)
     } else {
         Simplification::None
     }

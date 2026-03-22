@@ -1065,6 +1065,7 @@ impl X86_64CodeGen {
                     });
                 }
             }
+            Loc::Imm128(_) => panic!("__int128 value cannot be loaded into XMM register"),
         }
     }
 

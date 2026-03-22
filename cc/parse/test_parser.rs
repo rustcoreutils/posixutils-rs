@@ -1242,6 +1242,44 @@ fn test_cast_volatile_pointer() {
 }
 
 #[test]
+fn test_cast_int128_constant_folding() {
+    // (__int128)42 should fold to Int128Lit(42)
+    let (expr, types, _strings, _symbols) = parse_expr("(__int128)42").unwrap();
+    match expr.kind {
+        ExprKind::Int128Lit(val) => {
+            assert_eq!(val, 42);
+            assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int128);
+        }
+        _ => panic!("Expected Int128Lit, got {:?}", expr.kind),
+    }
+}
+
+#[test]
+fn test_cast_int128_constant_folding_negative() {
+    // (__int128)(-1) should fold to Int128Lit(-1)
+    let (expr, types, _strings, _symbols) = parse_expr("(__int128)(-1)").unwrap();
+    match expr.kind {
+        ExprKind::Int128Lit(val) => {
+            assert_eq!(val, -1);
+            assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int128);
+        }
+        _ => panic!("Expected Int128Lit, got {:?}", expr.kind),
+    }
+}
+
+#[test]
+fn test_cast_int128_non_constant_no_fold() {
+    // (__int128)x should remain as Cast (non-constant expression)
+    let (expr, types, _strings, _symbols) = parse_expr_with_vars("(__int128)x", &["x"]).unwrap();
+    match expr.kind {
+        ExprKind::Cast { cast_type, .. } => {
+            assert_eq!(types.kind(cast_type), TypeKind::Int128);
+        }
+        _ => panic!("Expected Cast, got {:?}", expr.kind),
+    }
+}
+
+#[test]
 fn test_sizeof_compound_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(unsigned long long)").unwrap();
     match expr.kind {
@@ -4978,4 +5016,58 @@ fn test_attr_aligned_nonpow2_ignored() {
     let (decl, _types, _strings, _symbols) =
         parse_decl("int __attribute__((aligned(3))) x;").unwrap();
     assert_eq!(decl.declarators[0].explicit_align, None);
+}
+
+#[test]
+fn test_int128_decl() {
+    let (decl, types, _strings, _symbols) = parse_decl("__int128 x;").unwrap();
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int128);
+    assert!(!types.is_unsigned(decl.declarators[0].typ));
+}
+
+#[test]
+fn test_int128_t_decl() {
+    let (decl, types, _strings, _symbols) = parse_decl("__int128_t x;").unwrap();
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int128);
+    assert!(!types.is_unsigned(decl.declarators[0].typ));
+}
+
+#[test]
+fn test_uint128_t_decl() {
+    let (decl, types, _strings, _symbols) = parse_decl("__uint128_t x;").unwrap();
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int128);
+    assert!(types.is_unsigned(decl.declarators[0].typ));
+}
+
+#[test]
+fn test_unsigned_int128_decl() {
+    let (decl, types, _strings, _symbols) = parse_decl("unsigned __int128 x;").unwrap();
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int128);
+    assert!(types.is_unsigned(decl.declarators[0].typ));
+}
+
+#[test]
+fn test_signed_int128_decl() {
+    let (decl, types, _strings, _symbols) = parse_decl("signed __int128 x;").unwrap();
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int128);
+    assert!(!types.is_unsigned(decl.declarators[0].typ));
+}
+
+#[test]
+fn test_int128_sizeof() {
+    let (_, types, _, _) = parse_decl("__int128 x;").unwrap();
+    assert_eq!(types.size_bits(types.int128_id), 128);
+    assert_eq!(types.size_bits(types.uint128_id), 128);
+    assert_eq!(types.alignment(types.int128_id), 16);
+    assert_eq!(types.alignment(types.uint128_id), 16);
+}
+
+#[test]
+fn test_int128_struct_member() {
+    let code = "struct s { __uint128_t v[32]; } x;";
+    let (decl, types, _strings, _symbols) = parse_decl(code).unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.kind(typ), TypeKind::Struct);
+    // 32 * 16 = 512 bytes
+    assert_eq!(types.size_bytes(typ), 512);
 }

@@ -219,6 +219,7 @@ fn is_integer(kind: TypeKind) -> bool {
             | TypeKind::Int
             | TypeKind::Long
             | TypeKind::LongLong
+            | TypeKind::Int128
             | TypeKind::Bool
             | TypeKind::Enum
     )

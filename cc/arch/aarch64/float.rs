@@ -253,6 +253,9 @@ impl Aarch64CodeGen {
                     dst,
                 });
             }
+            Loc::Imm128(_) => {
+                panic!("Int128 codegen not yet implemented on AArch64");
+            }
         }
     }
 

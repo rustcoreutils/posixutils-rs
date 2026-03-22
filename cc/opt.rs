@@ -56,7 +56,12 @@ fn get_const_fval(func: &Function, id: PseudoId) -> Option<f64> {
 #[cfg(test)]
 fn is_const(func: &Function, id: PseudoId) -> bool {
     get_pseudo(func, id)
-        .map(|p| matches!(&p.kind, PseudoKind::Val(_) | PseudoKind::FVal(_)))
+        .map(|p| {
+            matches!(
+                &p.kind,
+                PseudoKind::Val(_) | PseudoKind::Val128(_) | PseudoKind::FVal(_)
+            )
+        })
         .unwrap_or(false)
 }
 

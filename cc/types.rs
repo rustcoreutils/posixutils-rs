@@ -177,6 +177,8 @@ pub enum TypeKind {
     Int,
     Long,
     LongLong,
+    /// __int128 / __uint128_t - 128-bit integer (GCC/Clang extension)
+    Int128,
     Float,
     Double,
     LongDouble,
@@ -212,6 +214,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Int => write!(f, "int"),
             TypeKind::Long => write!(f, "long"),
             TypeKind::LongLong => write!(f, "long long"),
+            TypeKind::Int128 => write!(f, "__int128"),
             TypeKind::Float => write!(f, "float"),
             TypeKind::Double => write!(f, "double"),
             TypeKind::LongDouble => write!(f, "long double"),
@@ -570,6 +573,8 @@ pub struct TypeTable {
     pub ulong_id: TypeId,
     pub longlong_id: TypeId,
     pub ulonglong_id: TypeId,
+    pub int128_id: TypeId,
+    pub uint128_id: TypeId,
     pub float_id: TypeId,
     pub double_id: TypeId,
     pub longdouble_id: TypeId,
@@ -604,6 +609,8 @@ impl TypeTable {
             ulong_id: TypeId::INVALID,
             longlong_id: TypeId::INVALID,
             ulonglong_id: TypeId::INVALID,
+            int128_id: TypeId::INVALID,
+            uint128_id: TypeId::INVALID,
             float_id: TypeId::INVALID,
             double_id: TypeId::INVALID,
             longdouble_id: TypeId::INVALID,
@@ -640,6 +647,11 @@ impl TypeTable {
         table.longlong_id = table.intern(Type::basic(TypeKind::LongLong));
         table.ulonglong_id = table.intern(Type::with_modifiers(
             TypeKind::LongLong,
+            TypeModifiers::UNSIGNED,
+        ));
+        table.int128_id = table.intern(Type::basic(TypeKind::Int128));
+        table.uint128_id = table.intern(Type::with_modifiers(
+            TypeKind::Int128,
             TypeModifiers::UNSIGNED,
         ));
         table.float_id = table.intern(Type::basic(TypeKind::Float));
@@ -897,6 +909,7 @@ impl TypeTable {
                 | TypeKind::Int
                 | TypeKind::Long
                 | TypeKind::LongLong
+                | TypeKind::Int128
                 | TypeKind::Enum
         )
     }
@@ -969,6 +982,7 @@ impl TypeTable {
             TypeKind::Int => self.uint_id,
             TypeKind::Long => self.ulong_id,
             TypeKind::LongLong => self.ulonglong_id,
+            TypeKind::Int128 => self.uint128_id,
             _ => id, // For non-integer types, just return the original
         }
     }
@@ -989,6 +1003,7 @@ impl TypeTable {
             TypeKind::Int => 32,
             TypeKind::Long => 64,
             TypeKind::LongLong => 64,
+            TypeKind::Int128 => 128,
             TypeKind::Float => 32 * multiplier,
             TypeKind::Double => 64 * multiplier,
             TypeKind::LongDouble => self.longdouble_size_bits() * multiplier,
@@ -1042,6 +1057,7 @@ impl TypeTable {
             TypeKind::Short => 2,
             TypeKind::Int | TypeKind::Float => 4,
             TypeKind::Long | TypeKind::LongLong | TypeKind::Double | TypeKind::Pointer => 8,
+            TypeKind::Int128 => 16,
             TypeKind::LongDouble => self.longdouble_alignment(),
             TypeKind::Float16 => 2,
             TypeKind::Struct | TypeKind::Union => {

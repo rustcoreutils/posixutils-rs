@@ -69,6 +69,8 @@ pub struct X86_64CodeGen {
     use_rsp_locals: bool,
     /// Maximum local alignment (for andq in prologue)
     max_local_align: i32,
+    /// Pseudos that are 128-bit integers (need full 16-byte copies)
+    pub(super) int128_pseudos: HashSet<PseudoId>,
 }
 
 impl X86_64CodeGen {
@@ -94,6 +96,7 @@ impl X86_64CodeGen {
             sym_type_sizes: HashMap::new(),
             use_rsp_locals: false,
             max_local_align: 16,
+            int128_pseudos: HashSet::new(),
         }
     }
 
@@ -136,6 +139,10 @@ impl X86_64CodeGen {
             Loc::Imm(v) => GpOperand::Imm(*v),
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
+            Loc::Imm128(v) => {
+                // When used as a GP operand, use the lo 64 bits (truncation).
+                GpOperand::Imm(*v as i64)
+            }
             Loc::Global(name) => {
                 let symbol = if name.starts_with('.') {
                     Symbol::local(name.clone())
@@ -257,6 +264,7 @@ impl X86_64CodeGen {
         // Register allocation
         let mut alloc = RegAlloc::new();
         self.locations = alloc.allocate(func, types);
+        self.int128_pseudos = alloc.int128_pseudos().clone();
         self.pseudos = func.pseudos.clone();
 
         // Build sym type size map for emit_store to distinguish struct fields from scalars
@@ -1079,6 +1087,38 @@ impl X86_64CodeGen {
             } else {
                 insn.size.max(32)
             });
+
+        // Handle 128-bit integer stack values: OR both halves together and test
+        if self.int128_pseudos.contains(&insn.src[0]) {
+            if let Loc::Stack(_) | Loc::IncomingArg(_) = &loc {
+                let lo_mem = self.int128_lo_mem_loc(&loc);
+                let hi_mem = self.int128_hi_mem_loc(&loc);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(lo_mem),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Or {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(hi_mem),
+                    dst: Reg::R10,
+                });
+                // Test result: NE if nonzero
+                if let Some(target) = insn.bb_true {
+                    self.push_lir(X86Inst::Jcc {
+                        cc: CondCode::Ne,
+                        target: Label::new(&self.base.current_fn, target.0),
+                    });
+                }
+                if let Some(target) = insn.bb_false {
+                    self.push_lir(X86Inst::Jmp {
+                        target: Label::new(&self.base.current_fn, target.0),
+                    });
+                }
+                return false;
+            }
+        }
+
         let op_size = OperandSize::from_bits(size);
 
         match &loc {
@@ -1142,6 +1182,16 @@ impl X86_64CodeGen {
                 } else {
                     insn.bb_false
                 };
+                if let Some(target) = target {
+                    self.push_lir(X86Inst::Jmp {
+                        target: Label::new(&self.base.current_fn, target.0),
+                    });
+                }
+                return true;
+            }
+            Loc::Imm128(v) => {
+                // Constant 128-bit: branch based on whether value is nonzero
+                let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
                         target: Label::new(&self.base.current_fn, target.0),
@@ -1803,6 +1853,21 @@ impl X86_64CodeGen {
                     });
                 }
             }
+            Loc::Imm128(v) => {
+                // When loading an Imm128 into a GP register, use the lo 64 bits.
+                // This handles truncation (trunc 128→64) and cases where
+                // emit_move is called for a 128-bit pseudo with a scalar destination.
+                let lo = v as i64;
+                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
+                    self.push_lir(X86Inst::MovAbs { imm: lo, dst });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: op_size,
+                        src: GpOperand::Imm(lo),
+                        dst: GpOperand::Reg(dst),
+                    });
+                }
+            }
         }
     }
 
@@ -1888,6 +1953,62 @@ impl X86_64CodeGen {
             None => return,
         };
         let dst_loc = self.get_location(target);
+
+        // Check if this is a 128-bit integer load (target is an int128 pseudo).
+        // For int128 local variables, the IR Load uses a Sym pseudo (addr) which
+        // resolves to the variable's stack slot. This is effectively a stack-to-stack
+        // copy via the emit_int128_copy path. For pointer dereferences (*ptr where
+        // ptr is to an int128), addr is a runtime pointer that must be dereferenced.
+        if self.int128_pseudos.contains(&target) {
+            let addr_loc = self.get_location(addr);
+            match &addr_loc {
+                Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Imm128(_) | Loc::Imm(_) => {
+                    // addr is a local/sym — do stack-to-stack copy
+                    self.emit_int128_copy(addr, target);
+                }
+                _ => {
+                    // addr is a runtime pointer — dereference it
+                    let dst_lo = self.int128_lo_mem_loc(&dst_loc);
+                    let dst_hi = self.int128_hi_mem_loc(&dst_loc);
+                    self.emit_move(addr, Reg::R10, 64);
+                    if insn.offset != 0 {
+                        self.push_lir(X86Inst::Add {
+                            size: OperandSize::B64,
+                            src: GpOperand::Imm(insn.offset),
+                            dst: Reg::R10,
+                        });
+                    }
+                    // Copy 16 bytes from [R10] to dst
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R10,
+                            offset: 0,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: GpOperand::Mem(dst_lo),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R10,
+                            offset: 8,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: GpOperand::Mem(dst_hi),
+                    });
+                }
+            }
+            return;
+        }
 
         // Check if this is an FP load
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t)) || matches!(dst_loc, Loc::Xmm(_));
@@ -2579,6 +2700,147 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Emit a 128-bit integer copy (stack-to-stack, imm128-to-stack, etc).
+    fn emit_int128_copy(&mut self, src: PseudoId, dst: PseudoId) {
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+
+        match &src_loc {
+            Loc::Imm128(v) => {
+                let lo = *v as i64;
+                let hi = (*v >> 64) as i64;
+                // Store lo half
+                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: lo,
+                        dst: Reg::R10,
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R10),
+                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(lo),
+                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                }
+                // Store hi half
+                if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: hi,
+                        dst: Reg::R10,
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R10),
+                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(hi),
+                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                    });
+                }
+            }
+            Loc::Imm(v) => {
+                // Small constant sign-extended to 128 bits
+                let lo = *v;
+                let hi = *v >> 63;
+                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: lo,
+                        dst: Reg::R10,
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R10),
+                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(lo),
+                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                }
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(hi),
+                    dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                });
+            }
+            Loc::Stack(_) | Loc::IncomingArg(_) => {
+                // Stack-to-stack copy: two qword moves via R10
+                let src_lo = self.int128_lo_mem_loc(&src_loc);
+                let dst_lo = self.int128_lo_mem_loc(&dst_loc);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(src_lo),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(dst_lo),
+                });
+                let src_hi = self.int128_hi_mem_loc(&src_loc);
+                let dst_hi = self.int128_hi_mem_loc(&dst_loc);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(src_hi),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(dst_hi),
+                });
+            }
+            _ => {
+                // Fallback: load lo half into R10 and store it
+                self.emit_move(src, Reg::R10, 64);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                });
+            }
+        }
+    }
+
+    /// Helper: get lo-half MemAddr for a 128-bit Loc.
+    fn int128_lo_mem_loc(&self, loc: &Loc) -> MemAddr {
+        match loc {
+            Loc::Stack(offset) => self.stack_mem(*offset),
+            Loc::IncomingArg(offset) => MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: *offset,
+            },
+            _ => panic!("int128_lo_mem_loc: expected stack loc, got {:?}", loc),
+        }
+    }
+
+    /// Helper: get hi-half MemAddr for a 128-bit Loc.
+    fn int128_hi_mem_loc(&self, loc: &Loc) -> MemAddr {
+        match loc {
+            Loc::Stack(offset) => self.stack_mem(*offset - 8),
+            Loc::IncomingArg(offset) => MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: *offset + 8,
+            },
+            _ => panic!("int128_hi_mem_loc: expected stack loc, got {:?}", loc),
+        }
+    }
+
     /// Emit code to zero a struct (for struct = {0} initialization)
     fn emit_struct_zero(&mut self, insn: &Instruction, addr: PseudoId, num_qwords: u32) {
         let addr_loc = self.get_location(addr);
@@ -2877,6 +3139,18 @@ impl X86_64CodeGen {
         typ: Option<TypeId>,
         types: &TypeTable,
     ) {
+        // Handle 128-bit integer copies (stack-to-stack).
+        // Only intercept when src/dst are known int128 pseudos or Imm128 constants.
+        // Do NOT check size==128 here — 16-byte structs also have size 128 but
+        // use the struct copy path instead.
+        if matches!(self.get_location(src), Loc::Imm128(_))
+            || self.int128_pseudos.contains(&src)
+            || self.int128_pseudos.contains(&dst)
+        {
+            self.emit_int128_copy(src, dst);
+            return;
+        }
+
         // Keep actual size for handling narrow types
         let actual_size = size;
         let reg_size = size.max(32);
@@ -3497,6 +3771,10 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => {
                 format!("{}(%rip)", self.format_symbol_name(name))
+            }
+            Loc::Imm128(v) => {
+                // For inline asm, use the lo 64 bits
+                format!("${}", *v as i64)
             }
         }
     }

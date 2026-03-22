@@ -1209,16 +1209,38 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B64,
-                    addr: self.stack_mem(*offset),
-                    dst: scratch0,
-                });
-                self.push_lir(Aarch64Inst::Cmp {
-                    size: OperandSize::B64,
-                    src1: scratch0,
-                    src2: GpOperand::Imm(0),
-                });
+                if insn.size >= 128 {
+                    // 128-bit: load both halves and ORR them to check for non-zero
+                    let (_, scratch1, _) = Reg::scratch_regs();
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: self.stack_mem(*offset),
+                        dst1: scratch0,
+                        dst2: scratch1,
+                    });
+                    self.push_lir(Aarch64Inst::Orr {
+                        size: OperandSize::B64,
+                        src1: scratch0,
+                        src2: GpOperand::Reg(scratch1),
+                        dst: scratch0,
+                    });
+                    self.push_lir(Aarch64Inst::Cmp {
+                        size: OperandSize::B64,
+                        src1: scratch0,
+                        src2: GpOperand::Imm(0),
+                    });
+                } else {
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::B64,
+                        addr: self.stack_mem(*offset),
+                        dst: scratch0,
+                    });
+                    self.push_lir(Aarch64Inst::Cmp {
+                        size: OperandSize::B64,
+                        src1: scratch0,
+                        src2: GpOperand::Imm(0),
+                    });
+                }
             }
             Loc::Imm(v) => {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
@@ -1255,6 +1277,15 @@ impl Aarch64CodeGen {
                 } else {
                     insn.bb_false
                 };
+                if let Some(target) = target {
+                    self.push_lir(Aarch64Inst::B {
+                        target: Label::new(&self.base.current_fn, target.0),
+                    });
+                }
+                return true;
+            }
+            Loc::Imm128(v) => {
+                let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(Aarch64Inst::B {
                         target: Label::new(&self.base.current_fn, target.0),
@@ -1319,6 +1350,11 @@ impl Aarch64CodeGen {
                 self.emit_load_global(name, scratch0, op_size);
             }
             Loc::VReg(_) | Loc::FImm(..) => {}
+            Loc::Imm128(v) => {
+                // Load lo half into scratch0 for switch comparison
+                let lo = *v as u64 as i64;
+                self.emit_mov_imm(scratch0, lo, 64);
+            }
         }
 
         // Generate comparisons for each case
@@ -1891,6 +1927,75 @@ impl Aarch64CodeGen {
                 };
                 self.emit_mov_imm(dst, bits, imm_size);
             }
+            Loc::Imm128(v) => {
+                // 128-bit immediate: load lo 64 bits into dst register
+                // (caller must handle hi half separately for full 128-bit moves)
+                let lo = v as u64 as i64;
+                self.emit_mov_imm(dst, lo, 64);
+            }
+        }
+    }
+
+    /// Move a 128-bit value from a source pseudo to a stack destination.
+    /// Both halves (lo/hi) are loaded into scratch registers and stored via STP.
+    pub(super) fn emit_int128_move_to_stack(&mut self, src: PseudoId, dst_offset: i32) {
+        let loc = self.get_location(src);
+        match loc {
+            Loc::Stack(src_offset) => {
+                // Stack-to-stack copy: load lo/hi via LDP, store via STP
+                let src_mem = self.stack_mem(src_offset);
+                let dst_mem = self.stack_mem(dst_offset);
+                self.push_lir(Aarch64Inst::Ldp {
+                    size: OperandSize::B64,
+                    addr: src_mem,
+                    dst1: Reg::X9,
+                    dst2: Reg::X10,
+                });
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: dst_mem,
+                });
+            }
+            Loc::Imm128(v) => {
+                let lo = v as u64 as i64;
+                let hi = (v >> 64) as u64 as i64;
+                self.emit_mov_imm(Reg::X9, lo, 64);
+                self.emit_mov_imm(Reg::X10, hi, 64);
+                let dst_mem = self.stack_mem(dst_offset);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: dst_mem,
+                });
+            }
+            Loc::Imm(v) => {
+                // Sign-extend 64-bit immediate to 128-bit
+                let lo = v;
+                let hi = if v < 0 { -1i64 } else { 0i64 };
+                self.emit_mov_imm(Reg::X9, lo, 64);
+                self.emit_mov_imm(Reg::X10, hi, 64);
+                let dst_mem = self.stack_mem(dst_offset);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: dst_mem,
+                });
+            }
+            _ => {
+                // For other locations, load as 64-bit and zero-extend
+                self.emit_move(src, Reg::X9, 64);
+                let dst_mem = self.stack_mem(dst_offset);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::Xzr,
+                    addr: dst_mem,
+                });
+            }
         }
     }
 
@@ -1993,6 +2098,44 @@ impl Aarch64CodeGen {
             return;
         }
 
+        // 128-bit integer load: load both halves to destination stack slot
+        if mem_size == 128 {
+            if let Loc::Stack(dst_offset) = dst_loc {
+                match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
+                    ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
+                        self.push_lir(Aarch64Inst::Ldp {
+                            size: OperandSize::B64,
+                            addr: mem_addr,
+                            dst1: Reg::X9,
+                            dst2: Reg::X10,
+                        });
+                        self.push_lir(Aarch64Inst::Stp {
+                            size: OperandSize::B64,
+                            src1: Reg::X9,
+                            src2: Reg::X10,
+                            addr: self.stack_mem(dst_offset),
+                        });
+                    }
+                    ComputedAddr::Global(name) => {
+                        self.emit_load_addr(&name, Reg::X16);
+                        self.push_lir(Aarch64Inst::Ldp {
+                            size: OperandSize::B64,
+                            addr: MemAddr::Base(Reg::X16),
+                            dst1: Reg::X9,
+                            dst2: Reg::X10,
+                        });
+                        self.push_lir(Aarch64Inst::Stp {
+                            size: OperandSize::B64,
+                            src1: Reg::X9,
+                            src2: Reg::X10,
+                            addr: self.stack_mem(dst_offset),
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
             _ => Reg::X9,
@@ -2079,6 +2222,14 @@ impl Aarch64CodeGen {
         // For struct stores (size > 64), we need to copy multiple words
         // The value is a symbol containing the struct data
         if mem_size > 64 {
+            // Check for Int128 immediate stores
+            if mem_size == 128 {
+                let value_loc = self.get_location(value);
+                if let Loc::Imm128(v) = value_loc {
+                    self.emit_int128_imm_store(insn, addr, v);
+                    return;
+                }
+            }
             self.emit_struct_store(insn, addr, value);
             return;
         }
@@ -2295,6 +2446,34 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Store a 128-bit immediate value to a memory destination
+    fn emit_int128_imm_store(&mut self, insn: &Instruction, addr: PseudoId, v: i128) {
+        let lo = v as u64 as i64;
+        let hi = (v >> 64) as u64 as i64;
+        self.emit_mov_imm(Reg::X9, lo, 64);
+        self.emit_mov_imm(Reg::X10, hi, 64);
+
+        match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
+            ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: mem_addr,
+                });
+            }
+            ComputedAddr::Global(name) => {
+                self.emit_load_addr(&name, Reg::X16);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: MemAddr::Base(Reg::X16),
+                });
+            }
+        }
+    }
+
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
         // Get function name (or placeholder for indirect calls)
         let func_name = if insn.indirect_target.is_some() {
@@ -2505,6 +2684,14 @@ impl Aarch64CodeGen {
             }
         });
 
+        // Handle 128-bit integer copy
+        if actual_size == 128 {
+            if let Loc::Stack(dst_offset) = dst_loc {
+                self.emit_int128_move_to_stack(src, dst_offset);
+            }
+            return;
+        }
+
         if is_fp_copy {
             // Handle FP copy
             let dst_vreg = match &dst_loc {
@@ -2712,6 +2899,9 @@ impl Aarch64CodeGen {
                 panic!("Float immediate not supported in inline asm operand")
             }
             Loc::Global(name) => name.clone(),
+            Loc::Imm128(_) => {
+                panic!("Int128 codegen not yet implemented on AArch64");
+            }
         }
     }
 
@@ -3199,7 +3389,7 @@ impl Aarch64CodeGen {
     }
 
     /// Generate a unique label with the given prefix
-    fn next_unique_label(&mut self, prefix: &str) -> Label {
+    pub(super) fn next_unique_label(&mut self, prefix: &str) -> Label {
         let id = self.unique_label_counter;
         self.unique_label_counter += 1;
         Label::new(prefix, id)

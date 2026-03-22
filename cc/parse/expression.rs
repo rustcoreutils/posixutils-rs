@@ -208,7 +208,7 @@ impl<'a> Parser<'a> {
                         self.current_pos(),
                     )
                 })?;
-                designators.push(Designator::Index(index));
+                designators.push(Designator::Index(index as i64));
             } else {
                 break;
             }
@@ -803,6 +803,9 @@ impl<'a> Parser<'a> {
                 | "struct"
                 | "union"
                 | "enum"
+                | "__int128"
+                | "__int128_t"
+                | "__uint128_t"
                 | "__builtin_va_list"
                 | "typeof"
                 | "__typeof__"
@@ -1049,6 +1052,22 @@ impl<'a> Parser<'a> {
                 "_Bool" => {
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
+                    parsed_something = true;
+                }
+                "__int128" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                    parsed_something = true;
+                }
+                "__int128_t" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                    parsed_something = true;
+                }
+                "__uint128_t" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::UNSIGNED;
+                    base_kind = Some(TypeKind::Int128);
                     parsed_something = true;
                 }
                 "__builtin_va_list" => {
@@ -1716,6 +1735,12 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.float16_id
             }
+        } else if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
+            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                self.types.uint128_id
+            } else {
+                self.types.int128_id
+            }
         } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
             // If either is unsigned long long, result is unsigned long long
             if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
@@ -2353,7 +2378,7 @@ impl<'a> Parser<'a> {
                                             index_pos,
                                         )
                                         })?;
-                                    path.push(OffsetOfPath::Index(index_val));
+                                    path.push(OffsetOfPath::Index(index_val as i64));
                                 } else {
                                     break;
                                 }
@@ -2900,6 +2925,18 @@ impl<'a> Parser<'a> {
 
                         // Regular cast expression
                         let expr = self.parse_unary_expr()?;
+
+                        // Fold cast-to-Int128 of constant expressions into Int128Lit
+                        if self.types.kind(typ) == TypeKind::Int128 {
+                            if let Some(val) = self.eval_const_expr(&expr) {
+                                return Ok(Self::typed_expr(
+                                    ExprKind::Int128Lit(val),
+                                    typ,
+                                    paren_pos,
+                                ));
+                            }
+                        }
+
                         return Ok(Self::typed_expr(
                             ExprKind::Cast {
                                 cast_type: typ,

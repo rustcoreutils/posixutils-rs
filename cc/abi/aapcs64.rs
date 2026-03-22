@@ -184,6 +184,14 @@ impl Abi for Aapcs64Abi {
             return ArgClass::Extend { signed, size_bits };
         }
 
+        // 128-bit integer types: two consecutive GP registers, 16-byte aligned
+        if kind == TypeKind::Int128 {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits,
+            };
+        }
+
         // Integer and pointer types - pass in X registers
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
@@ -271,6 +279,14 @@ impl Abi for Aapcs64Abi {
         // Void return
         if kind == TypeKind::Void {
             return ArgClass::Ignore;
+        }
+
+        // 128-bit integer types: return in X0+X1
+        if kind == TypeKind::Int128 {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits,
+            };
         }
 
         // Integer and pointer types - return in X0

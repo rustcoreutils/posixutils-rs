@@ -286,6 +286,13 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 4 => self.push_directive(Directive::Long(*val)),
                 _ => self.push_directive(Directive::Quad(*val)),
             },
+            Initializer::Int128(val) => {
+                // Emit as two .quad directives (little-endian: lo then hi)
+                let lo = *val as i64;
+                let hi = (*val >> 64) as i64;
+                self.push_directive(Directive::Quad(lo));
+                self.push_directive(Directive::Quad(hi));
+            }
             Initializer::Float(val) => {
                 if size == 4 {
                     // float - emit as 32-bit IEEE 754

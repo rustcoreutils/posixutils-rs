@@ -196,6 +196,14 @@ impl Abi for SysVAmd64Abi {
             return ArgClass::Extend { signed, size_bits };
         }
 
+        // 128-bit integer types: two GP registers
+        if kind == TypeKind::Int128 {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits,
+            };
+        }
+
         // Integer and pointer types
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
@@ -272,6 +280,14 @@ impl Abi for SysVAmd64Abi {
         // Void return
         if kind == TypeKind::Void {
             return ArgClass::Ignore;
+        }
+
+        // 128-bit integer types: return in RAX+RDX
+        if kind == TypeKind::Int128 {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits,
+            };
         }
 
         // Integer and pointer types - return in RAX

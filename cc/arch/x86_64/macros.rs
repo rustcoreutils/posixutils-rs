@@ -50,5 +50,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__GCC_ATOMIC_LONG_LOCK_FREE", Some("2")),
         ("__GCC_ATOMIC_LLONG_LOCK_FREE", Some("2")),
         ("__GCC_ATOMIC_POINTER_LOCK_FREE", Some("2")),
+        // 128-bit integer support
+        ("__SIZEOF_INT128__", Some("16")),
     ]
 }

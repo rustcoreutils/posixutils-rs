@@ -232,6 +232,16 @@ pub enum Opcode {
     AtomicFetchOr,  // Atomic fetch-and-or
     AtomicFetchXor, // Atomic fetch-and-xor
     Fence,          // Memory fence
+
+    // Int128 decomposition ops (used by hwmap expansion)
+    Lo64,   // Extract low 64 bits from 128-bit pseudo
+    Hi64,   // Extract high 64 bits from 128-bit pseudo
+    Pair64, // Combine two 64-bit pseudos into 128-bit: target = (src[0]=lo, src[1]=hi)
+    AddC,   // 64-bit add with carry output: target = src[0] + src[1], sets carry
+    AdcC, // 64-bit add with carry in+out: target = src[0] + src[1] + carry; src[2] = carry producer
+    SubC, // 64-bit sub with borrow output: target = src[0] - src[1], sets borrow
+    SbcC, // 64-bit sub with borrow in+out: target = src[0] - src[1] - borrow; src[2] = borrow producer
+    UMulHi, // Upper 64 bits of unsigned 64×64 multiply: target = (src[0] * src[1]) >> 64
 }
 
 impl Opcode {
@@ -384,6 +394,14 @@ impl Opcode {
             Opcode::AtomicFetchOr => "atomic_fetch_or",
             Opcode::AtomicFetchXor => "atomic_fetch_xor",
             Opcode::Fence => "fence",
+            Opcode::Lo64 => "lo64",
+            Opcode::Hi64 => "hi64",
+            Opcode::Pair64 => "pair64",
+            Opcode::AddC => "addc",
+            Opcode::AdcC => "adcc",
+            Opcode::SubC => "subc",
+            Opcode::SbcC => "sbcc",
+            Opcode::UMulHi => "umulhi",
         }
     }
 }

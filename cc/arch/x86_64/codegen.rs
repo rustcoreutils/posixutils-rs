@@ -1717,6 +1717,16 @@ impl X86_64CodeGen {
                 self.emit_fence(insn);
             }
 
+            // Int128 decomposition ops (from hwmap expansion)
+            Opcode::Lo64 => self.emit_lo64(insn),
+            Opcode::Hi64 => self.emit_hi64(insn),
+            Opcode::Pair64 => self.emit_pair64(insn),
+            Opcode::AddC => self.emit_addc(insn, false),
+            Opcode::AdcC => self.emit_addc(insn, true),
+            Opcode::SubC => self.emit_subc(insn, false),
+            Opcode::SbcC => self.emit_subc(insn, true),
+            Opcode::UMulHi => self.emit_umulhi(insn),
+
             // Skip no-ops and unimplemented
             _ => {}
         }

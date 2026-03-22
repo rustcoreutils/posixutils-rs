@@ -598,28 +598,44 @@ impl RegAlloc {
                             | Opcode::SetAe
                     );
 
-                    // For Load: target is int128, but src[0] is the address (64-bit pointer).
-                    // For Store: src[0] is address (64-bit), src[1] is the int128 value.
-                    // For comparisons: target is a small integer result.
-                    if !is_comparison && !matches!(insn.op, Opcode::Load) {
-                        if let Some(target) = insn.target {
-                            self.int128_pseudos.insert(target);
+                    // Lo64/Hi64: target is 64-bit (not int128), source is int128
+                    // Pair64: target is int128, sources are 64-bit (not int128)
+                    // AddC/AdcC/SubC/SbcC/UMulHi: 64-bit ops, not int128
+                    match insn.op {
+                        Opcode::Lo64 | Opcode::Hi64 => {
+                            // Source is int128, target is 64-bit
+                            for &src in &insn.src {
+                                self.int128_pseudos.insert(src);
+                            }
                         }
-                    }
-                    if matches!(insn.op, Opcode::Load) {
-                        // Load: only target is int128, not the address src[0]
-                        if let Some(target) = insn.target {
-                            self.int128_pseudos.insert(target);
+                        Opcode::Pair64 => {
+                            // Target is int128, sources are 64-bit
+                            if let Some(target) = insn.target {
+                                self.int128_pseudos.insert(target);
+                            }
                         }
-                    } else if matches!(insn.op, Opcode::Store) {
-                        // Store: src[0] is address (skip), src[1] is the int128 value
-                        if let Some(&val) = insn.src.get(1) {
-                            self.int128_pseudos.insert(val);
-                        }
-                    } else {
-                        // Other ops: all sources are int128
-                        for &src in &insn.src {
-                            self.int128_pseudos.insert(src);
+                        _ => {
+                            // For Load: target is int128, but src[0] is the address (64-bit pointer).
+                            // For Store: src[0] is address (64-bit), src[1] is the int128 value.
+                            // For comparisons: target is a small integer result.
+                            if !is_comparison && !matches!(insn.op, Opcode::Load) {
+                                if let Some(target) = insn.target {
+                                    self.int128_pseudos.insert(target);
+                                }
+                            }
+                            if matches!(insn.op, Opcode::Load) {
+                                if let Some(target) = insn.target {
+                                    self.int128_pseudos.insert(target);
+                                }
+                            } else if matches!(insn.op, Opcode::Store) {
+                                if let Some(&val) = insn.src.get(1) {
+                                    self.int128_pseudos.insert(val);
+                                }
+                            } else {
+                                for &src in &insn.src {
+                                    self.int128_pseudos.insert(src);
+                                }
+                            }
                         }
                     }
                 }

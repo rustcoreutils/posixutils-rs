@@ -1356,4 +1356,160 @@ impl Aarch64CodeGen {
             _ => {}
         }
     }
+
+    // ========================================================================
+    // Int128 decomposition ops (Lo64, Hi64, Pair64)
+    // ========================================================================
+
+    /// Lo64: extract low 64 bits from 128-bit pseudo.
+    pub(super) fn emit_lo64(&mut self, insn: &Instruction) {
+        let src = insn.src[0];
+        let target = insn.target.expect("Lo64 must have target");
+        // Load both halves, use lo
+        self.load_int128(src, Reg::X9, Reg::X10);
+        let dst_loc = self.get_location(target);
+        match dst_loc {
+            Loc::Reg(r) => {
+                if r != Reg::X9 {
+                    self.push_lir(Aarch64Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::X9),
+                        dst: r,
+                    });
+                }
+            }
+            _ => self.emit_move_to_loc(Reg::X9, &dst_loc, 64),
+        }
+    }
+
+    /// Hi64: extract high 64 bits from 128-bit pseudo.
+    pub(super) fn emit_hi64(&mut self, insn: &Instruction) {
+        let src = insn.src[0];
+        let target = insn.target.expect("Hi64 must have target");
+        // Load both halves, use hi
+        self.load_int128(src, Reg::X9, Reg::X10);
+        let dst_loc = self.get_location(target);
+        match dst_loc {
+            Loc::Reg(r) => {
+                if r != Reg::X10 {
+                    self.push_lir(Aarch64Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::X10),
+                        dst: r,
+                    });
+                }
+            }
+            _ => self.emit_move_to_loc(Reg::X10, &dst_loc, 64),
+        }
+    }
+
+    /// Pair64: combine two 64-bit pseudos into 128-bit.
+    pub(super) fn emit_pair64(&mut self, insn: &Instruction) {
+        let src_lo = insn.src[0];
+        let src_hi = insn.src[1];
+        let target = insn.target.expect("Pair64 must have target");
+
+        self.emit_move(src_lo, Reg::X9, 64);
+        self.emit_move(src_hi, Reg::X10, 64);
+        self.store_int128(Reg::X9, Reg::X10, target);
+    }
+
+    /// AddC/AdcC: 64-bit add with carry.
+    /// AddC (with_carry=false): adds (sets flags)
+    /// AdcC (with_carry=true): adc (add with carry in)
+    pub(super) fn emit_addc(&mut self, insn: &Instruction, with_carry: bool) {
+        let target = insn.target.expect("AddC/AdcC must have target");
+        let src1 = insn.src[0];
+        let src2 = insn.src[1];
+        let dst_loc = self.get_location(target);
+        let dst_reg = match &dst_loc {
+            Loc::Reg(r) => *r,
+            _ => Reg::X16,
+        };
+
+        self.emit_move(src1, dst_reg, 64);
+        self.emit_move(src2, Reg::X10, 64);
+
+        if with_carry {
+            self.push_lir(Aarch64Inst::Adc {
+                size: OperandSize::B64,
+                src1: dst_reg,
+                src2: Reg::X10,
+                dst: dst_reg,
+            });
+        } else {
+            self.push_lir(Aarch64Inst::Adds {
+                size: OperandSize::B64,
+                src1: dst_reg,
+                src2: GpOperand::Reg(Reg::X10),
+                dst: dst_reg,
+            });
+        }
+
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
+            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+        }
+    }
+
+    /// SubC/SbcC: 64-bit sub with borrow.
+    /// SubC (with_borrow=false): subs (sets flags)
+    /// SbcC (with_borrow=true): sbc (sub with borrow in)
+    pub(super) fn emit_subc(&mut self, insn: &Instruction, with_borrow: bool) {
+        let target = insn.target.expect("SubC/SbcC must have target");
+        let src1 = insn.src[0];
+        let src2 = insn.src[1];
+        let dst_loc = self.get_location(target);
+        let dst_reg = match &dst_loc {
+            Loc::Reg(r) => *r,
+            _ => Reg::X16,
+        };
+
+        self.emit_move(src1, dst_reg, 64);
+        self.emit_move(src2, Reg::X10, 64);
+
+        if with_borrow {
+            self.push_lir(Aarch64Inst::Sbc {
+                size: OperandSize::B64,
+                src1: dst_reg,
+                src2: Reg::X10,
+                dst: dst_reg,
+            });
+        } else {
+            self.push_lir(Aarch64Inst::Subs {
+                size: OperandSize::B64,
+                src1: dst_reg,
+                src2: GpOperand::Reg(Reg::X10),
+                dst: dst_reg,
+            });
+        }
+
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
+            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+        }
+    }
+
+    /// UMulHi: upper 64 bits of 64×64 unsigned multiply.
+    pub(super) fn emit_umulhi(&mut self, insn: &Instruction) {
+        let target = insn.target.expect("UMulHi must have target");
+        let src1 = insn.src[0];
+        let src2 = insn.src[1];
+        let dst_loc = self.get_location(target);
+        let dst_reg = match &dst_loc {
+            Loc::Reg(r) => *r,
+            _ => Reg::X16,
+        };
+
+        self.emit_move(src1, Reg::X9, 64);
+        self.emit_move(src2, Reg::X10, 64);
+
+        self.push_lir(Aarch64Inst::Umulh {
+            src1: Reg::X9,
+            src2: Reg::X10,
+            dst: dst_reg,
+        });
+
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
+            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+        }
+    }
 }

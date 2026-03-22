@@ -1016,6 +1016,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Imm(v) => {
+                let v = v as i64;
                 // Integer immediate to float — use R10 (scratch) to avoid clobbering
                 // RAX which is allocatable and may hold a live pseudo
                 if size <= 32 {
@@ -1065,7 +1066,6 @@ impl X86_64CodeGen {
                     });
                 }
             }
-            Loc::Imm128(_) => panic!("__int128 value cannot be loaded into XMM register"),
         }
     }
 

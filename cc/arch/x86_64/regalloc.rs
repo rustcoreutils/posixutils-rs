@@ -399,9 +399,7 @@ pub enum Loc {
     /// Used for function parameters 7+ that are passed on the stack by the caller
     IncomingArg(i32),
     /// Immediate integer constant
-    Imm(i64),
-    /// Immediate 128-bit integer constant
-    Imm128(i128),
+    Imm(i128),
     /// Immediate float constant (value, size in bits)
     FImm(f64, u32),
     /// Global symbol
@@ -750,10 +748,11 @@ impl RegAlloc {
                             }
                             fp_arg_idx += 1;
                         } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
-                            // __int128: uses two GP registers. Allocate a 16-byte
-                            // stack slot for the arg pseudo so store_args_to_stack
-                            // can store both halves, and the IR store can copy from it.
-                            self.stack_offset = (self.stack_offset + 15) & !15; // 16-byte align
+                            // __int128: uses two GP registers when available.
+                            // Always allocate a local stack slot — for register params,
+                            // store_args_to_stack stores register values; for stack params,
+                            // store_args_to_stack copies from the incoming arg area.
+                            self.stack_offset = (self.stack_offset + 15) & !15;
                             self.stack_offset += 16;
                             self.locations
                                 .insert(pseudo.id, Loc::Stack(self.stack_offset));
@@ -763,6 +762,8 @@ impl RegAlloc {
                                     r != int_arg_regs[int_arg_idx]
                                         && r != int_arg_regs[int_arg_idx + 1]
                                 });
+                            } else {
+                                stack_arg_offset += 16;
                             }
                             int_arg_idx += 2;
                         } else {
@@ -1004,10 +1005,6 @@ impl RegAlloc {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
-                        continue;
-                    }
-                    PseudoKind::Val128(v) => {
-                        self.locations.insert(interval.pseudo, Loc::Imm128(*v));
                         continue;
                     }
                     PseudoKind::FVal(v) => {

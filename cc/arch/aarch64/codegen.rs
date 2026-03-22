@@ -1323,15 +1323,6 @@ impl Aarch64CodeGen {
                 }
                 return true;
             }
-            Loc::Imm128(v) => {
-                let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
-                if let Some(target) = target {
-                    self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
-                    });
-                }
-                return true;
-            }
         }
 
         if let Some(target) = insn.bb_true {
@@ -1381,7 +1372,7 @@ impl Aarch64CodeGen {
             Loc::Imm(v) => {
                 self.push_lir(Aarch64Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(*v),
+                    src: GpOperand::Imm(*v as i64),
                     dst: scratch0,
                 });
             }
@@ -1389,11 +1380,6 @@ impl Aarch64CodeGen {
                 self.emit_load_global(name, scratch0, op_size);
             }
             Loc::VReg(_) | Loc::FImm(..) => {}
-            Loc::Imm128(v) => {
-                // Load lo half into scratch0 for switch comparison
-                let lo = *v as u64 as i64;
-                self.emit_mov_imm(scratch0, lo, 64);
-            }
         }
 
         // Generate comparisons for each case
@@ -1516,7 +1502,7 @@ impl Aarch64CodeGen {
                         match self.locations.get(&target).cloned() {
                             Some(Loc::Reg(r)) => {
                                 if let PseudoKind::Val(v) = &pseudo.kind {
-                                    self.emit_mov_imm(r, *v, insn.size);
+                                    self.emit_mov_imm(r, *v as i64, insn.size);
                                 }
                             }
                             Some(Loc::VReg(v)) => {
@@ -1935,7 +1921,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                self.emit_mov_imm(dst, v, size);
+                self.emit_mov_imm(dst, v as i64, size);
             }
             Loc::Global(name) => {
                 let load_size = OperandSize::from_bits(size.max(32));
@@ -1966,12 +1952,6 @@ impl Aarch64CodeGen {
                 };
                 self.emit_mov_imm(dst, bits, imm_size);
             }
-            Loc::Imm128(v) => {
-                // 128-bit immediate: load lo 64 bits into dst register
-                // (caller must handle hi half separately for full 128-bit moves)
-                let lo = v as u64 as i64;
-                self.emit_mov_imm(dst, lo, 64);
-            }
         }
     }
 
@@ -1997,23 +1977,9 @@ impl Aarch64CodeGen {
                     addr: dst_mem,
                 });
             }
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let lo = v as u64 as i64;
                 let hi = (v >> 64) as u64 as i64;
-                self.emit_mov_imm(Reg::X9, lo, 64);
-                self.emit_mov_imm(Reg::X10, hi, 64);
-                let dst_mem = self.stack_mem(dst_offset);
-                self.push_lir(Aarch64Inst::Stp {
-                    size: OperandSize::B64,
-                    src1: Reg::X9,
-                    src2: Reg::X10,
-                    addr: dst_mem,
-                });
-            }
-            Loc::Imm(v) => {
-                // Sign-extend 64-bit immediate to 128-bit
-                let lo = v;
-                let hi = if v < 0 { -1i64 } else { 0i64 };
                 self.emit_mov_imm(Reg::X9, lo, 64);
                 self.emit_mov_imm(Reg::X10, hi, 64);
                 let dst_mem = self.stack_mem(dst_offset);
@@ -2264,7 +2230,7 @@ impl Aarch64CodeGen {
             // Check for Int128 immediate stores
             if mem_size == 128 {
                 let value_loc = self.get_location(value);
-                if let Loc::Imm128(v) = value_loc {
+                if let Loc::Imm(v) = value_loc {
                     self.emit_int128_imm_store(insn, addr, v);
                     return;
                 }
@@ -2851,7 +2817,7 @@ impl Aarch64CodeGen {
                 Loc::Imm(v) => {
                     // Immediate value
                     operand_regs.push(None);
-                    operand_mem.push(Some(format!("#{}", v)));
+                    operand_mem.push(Some(format!("#{}", v as i64)));
                 }
                 _ => {
                     // Memory or other location
@@ -2931,16 +2897,13 @@ impl Aarch64CodeGen {
                 let actual = self.stack_offset(*offset);
                 format!("[{}, #{}]", base, actual)
             }
-            Loc::Imm(v) => format!("#{}", v),
+            Loc::Imm(v) => format!("#{}", *v as i64),
             Loc::VReg(vreg) => vreg.name_d().to_string(),
             Loc::FImm(_, _) => {
                 // Float immediates not directly usable in inline asm
                 panic!("Float immediate not supported in inline asm operand")
             }
             Loc::Global(name) => name.clone(),
-            Loc::Imm128(_) => {
-                panic!("Int128 codegen not yet implemented on AArch64");
-            }
         }
     }
 
@@ -3450,7 +3413,7 @@ impl Aarch64CodeGen {
             Loc::Imm(v) => {
                 self.push_lir(Aarch64Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(v),
+                    src: GpOperand::Imm(v as i64),
                     dst: reg,
                 });
             }

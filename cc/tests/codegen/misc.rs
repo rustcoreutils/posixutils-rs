@@ -4121,3 +4121,567 @@ int main(void) {
         0
     );
 }
+
+#[test]
+fn codegen_int128_ternary() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+uint128 pick(uint128 a, uint128 b, int cond) {
+    return cond ? a : b;
+}
+
+int main(void) {
+    uint128 a = ((uint128)0xDEADULL << 64) | 0xBEEFULL;
+    uint128 b = ((uint128)0xCAFEULL << 64) | 0xBABEULL;
+
+    /* Function call path */
+    uint128 r = pick(a, b, 1);
+    if (r != a) return 1;
+    r = pick(a, b, 0);
+    if (r != b) return 2;
+
+    /* Pure ternary (inline) */
+    r = (a > b) ? a : b;
+    if (r != a) return 3;
+    r = (a < b) ? a : b;
+    if (r != b) return 4;
+
+    /* Ternary with same-value check */
+    r = (1) ? a : b;
+    if (r != a) return 5;
+    r = (0) ? a : b;
+    if (r != b) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_ternary", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_many_args() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+/* 4 int128 params: on x86_64, 3 fit in GP regs (6 regs / 2 = 3), 4th spills */
+uint128 sum4(uint128 a, uint128 b, uint128 c, uint128 d) {
+    return a + b + c + d;
+}
+
+/* 5 int128 params to stress stack args further */
+uint128 sum5(uint128 a, uint128 b, uint128 c, uint128 d, uint128 e) {
+    return a + b + c + d + e;
+}
+
+int main(void) {
+    /* Use int128 variables to ensure correct arg types at call site */
+    uint128 v1 = 1, v2 = 2, v3 = 3, v4 = 4, v5 = 5;
+
+    /* Basic small values */
+    uint128 r = sum4(v1, v2, v3, v4);
+    if (r != 10) return 1;
+
+    /* With hi-word values */
+    uint128 big = (uint128)1 << 100;
+    r = sum4(big, big, big, big);
+    if (r != ((uint128)4 << 100)) return 2;
+
+    /* Mixed hi/lo */
+    uint128 a = ((uint128)1 << 64) | 1;
+    r = sum4(a, a, a, a);
+    unsigned long lo = (unsigned long)r;
+    unsigned long hi = (unsigned long)(r >> 64);
+    if (lo != 4) return 3;
+    if (hi != 4) return 4;
+
+    /* 5 args */
+    r = sum5(v1, v2, v3, v4, v5);
+    if (r != 15) return 5;
+
+    r = sum5(big, big, big, big, big);
+    if (r != ((uint128)5 << 100)) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_many_args", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_divmod() {
+    let code = r#"
+typedef __int128 int128;
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    /* Signed division: positive / positive */
+    int128 a = 100;
+    int128 b = 7;
+    if (a / b != 14) return 1;
+
+    /* Signed division: negative / positive */
+    a = -100;
+    if (a / b != -14) return 2;
+
+    /* Division of zero */
+    a = 0;
+    if (a / b != 0) return 3;
+
+    /* Unsigned division: large value crossing 64-bit boundary */
+    uint128 ua = ((uint128)1 << 64) | 0;
+    uint128 ub = 2;
+    uint128 uc = ua / ub;
+    if (uc != ((uint128)1 << 63)) return 4;
+
+    /* Signed modulo: positive */
+    a = 100;
+    if (a % b != 2) return 5;
+
+    /* Signed modulo: negative dividend */
+    a = -100;
+    if (a % b != -2) return 6;
+
+    /* Unsigned modulo */
+    ua = ((uint128)1 << 64) | 3;
+    if (ua % 4 != 3) return 7;
+
+    /* Division by 1 */
+    a = ((int128)0x1234 << 64) | 0x5678;
+    if (a / 1 != a) return 8;
+
+    /* Division by power of 2 */
+    ua = (uint128)1 << 100;
+    if (ua / ((uint128)1 << 50) != ((uint128)1 << 50)) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_divmod", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_globals() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+
+uint128 g1 = 0;
+uint128 g2 = 42;
+int128 g4 = -1;
+
+int main(void) {
+    /* Zero-initialized */
+    if (g1 != 0) return 1;
+    if ((unsigned long)g1 != 0) return 2;
+    if ((unsigned long)(g1 >> 64) != 0) return 3;
+
+    /* Lo-only initializer */
+    if (g2 != 42) return 4;
+    if ((unsigned long)(g2 >> 64) != 0) return 5;
+
+    /* Both halves: set at runtime */
+    uint128 g3 = ((uint128)0xDEAD << 64) | 0xBEEF;
+    if ((unsigned long)g3 != 0xBEEF) return 6;
+    if ((unsigned long)(g3 >> 64) != 0xDEAD) return 7;
+
+    /* All bits set (-1 signed) */
+    if ((unsigned long)g4 != 0xFFFFFFFFFFFFFFFFULL) return 8;
+    if ((unsigned long)((uint128)g4 >> 64) != 0xFFFFFFFFFFFFFFFFULL) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_globals", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_ptr_deref() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    uint128 val = ((uint128)0xAAAA << 64) | 0xBBBB;
+    uint128 storage;
+
+    /* Write through pointer */
+    uint128 *p = &storage;
+    *p = val;
+    if (storage != val) return 1;
+
+    /* Read through pointer */
+    uint128 readback = *p;
+    if (readback != val) return 2;
+
+    /* Verify both halves */
+    if ((unsigned long)readback != 0xBBBB) return 3;
+    if ((unsigned long)(readback >> 64) != 0xAAAA) return 4;
+
+    /* Array indexing */
+    uint128 arr[4];
+    arr[0] = 10;
+    arr[1] = ((uint128)1 << 64) | 20;
+    arr[2] = ((uint128)2 << 64) | 30;
+    arr[3] = ((uint128)3 << 64) | 40;
+
+    if (arr[0] != 10) return 5;
+    if ((unsigned long)arr[1] != 20) return 6;
+    if ((unsigned long)(arr[1] >> 64) != 1) return 7;
+    if ((unsigned long)arr[3] != 40) return 8;
+    if ((unsigned long)(arr[3] >> 64) != 3) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_ptr_deref", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_compound_assign() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    uint128 x;
+
+    /* += */
+    x = ((uint128)1 << 64) | 10;
+    x += 5;
+    if ((unsigned long)x != 15) return 1;
+    if ((unsigned long)(x >> 64) != 1) return 2;
+
+    /* -= */
+    x = ((uint128)2 << 64) | 20;
+    x -= 10;
+    if ((unsigned long)x != 10) return 3;
+    if ((unsigned long)(x >> 64) != 2) return 4;
+
+    /* *= */
+    x = ((uint128)1 << 64) | 3;
+    x *= 2;
+    if ((unsigned long)x != 6) return 5;
+    if ((unsigned long)(x >> 64) != 2) return 6;
+
+    /* /= */
+    x = ((uint128)4 << 64) | 100;
+    x /= 2;
+    if ((unsigned long)x != 50) return 7;
+    if ((unsigned long)(x >> 64) != 2) return 8;
+
+    /* %= */
+    x = 100;
+    x %= 7;
+    if (x != 2) return 9;
+
+    /* <<= */
+    x = 1;
+    x <<= 64;
+    if ((unsigned long)x != 0) return 10;
+    if ((unsigned long)(x >> 64) != 1) return 11;
+
+    /* >>= */
+    x = (uint128)1 << 64;
+    x >>= 64;
+    if (x != 1) return 12;
+
+    /* &= */
+    x = ((uint128)0xFF << 64) | 0xFF;
+    x &= ((uint128)0x0F << 64) | 0x0F;
+    if ((unsigned long)x != 0x0F) return 13;
+    if ((unsigned long)(x >> 64) != 0x0F) return 14;
+
+    /* |= */
+    x = ((uint128)0xF0 << 64) | 0xF0;
+    x |= ((uint128)0x0F << 64) | 0x0F;
+    if ((unsigned long)x != 0xFF) return 15;
+    if ((unsigned long)(x >> 64) != 0xFF) return 16;
+
+    /* ^= */
+    x = ((uint128)0xFF << 64) | 0xFF;
+    x ^= ((uint128)0x0F << 64) | 0x0F;
+    if ((unsigned long)x != 0xF0) return 17;
+    if ((unsigned long)(x >> 64) != 0xF0) return 18;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_compound_assign", code, &[]),
+        0
+    );
+}
+
+#[test]
+fn codegen_int128_shift_boundaries() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+
+int main(void) {
+    uint128 one = 1;
+
+    /* shl by 0 */
+    if ((one << 0) != 1) return 1;
+    /* shl by 1 */
+    if ((one << 1) != 2) return 2;
+    /* shl by 63 — last bit of lo */
+    if ((one << 63) != ((uint128)1 << 63)) return 3;
+    /* shl by 64 — first bit of hi */
+    uint128 r = one << 64;
+    if ((unsigned long)r != 0) return 4;
+    if ((unsigned long)(r >> 64) != 1) return 5;
+    /* shl by 65 */
+    r = one << 65;
+    if ((unsigned long)(r >> 64) != 2) return 6;
+    /* shl by 127 — top bit */
+    r = one << 127;
+    if ((unsigned long)(r >> 64) != (1ULL << 63)) return 7;
+
+    /* lsr by 0 */
+    uint128 big = (uint128)1 << 127;
+    if ((big >> 0) != big) return 8;
+    /* lsr by 1 */
+    if ((big >> 1) != ((uint128)1 << 126)) return 9;
+    /* lsr by 63: 1<<127 >> 63 = 1<<64, so lo=0, hi=1 */
+    r = big >> 63;
+    if ((unsigned long)(r >> 64) != 1) return 10;
+    if ((unsigned long)r != 0) return 11;
+    /* lsr by 64 */
+    r = big >> 64;
+    if (r != ((uint128)1 << 63)) return 12;
+    /* lsr by 127 */
+    r = big >> 127;
+    if (r != 1) return 13;
+
+    /* asr: negative value */
+    int128 neg = (int128)-1 << 100;
+    int128 sr = neg >> 50;
+    /* Should still be negative (sign-extended) */
+    if (sr >= 0) return 14;
+
+    /* Variable shift amounts */
+    volatile int amt = 64;
+    r = one << amt;
+    if ((unsigned long)r != 0) return 15;
+    if ((unsigned long)(r >> 64) != 1) return 16;
+
+    amt = 0;
+    r = one << amt;
+    if (r != 1) return 17;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_shift_boundaries", code, &[]),
+        0
+    );
+}
+
+#[test]
+fn codegen_int128_float_convert() {
+    let code = r#"
+typedef __int128 int128;
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    /* double -> int128 (positive) */
+    double d = 42.0;
+    int128 iv = (int128)d;
+    if (iv != 42) return 1;
+
+    /* double -> int128 (negative) */
+    d = -100.0;
+    iv = (int128)d;
+    if (iv != -100) return 2;
+
+    /* double -> int128 (large) */
+    d = 1e18;
+    iv = (int128)d;
+    if (iv != (int128)1000000000000000000LL) return 3;
+
+    /* int128 -> double (small) */
+    iv = 42;
+    d = (double)iv;
+    if (d != 42.0) return 4;
+
+    /* int128 -> double (negative) */
+    iv = -100;
+    d = (double)iv;
+    if (d != -100.0) return 5;
+
+    /* float -> int128 */
+    float f = 123.0f;
+    iv = (int128)f;
+    if (iv != 123) return 6;
+
+    /* int128 -> float */
+    iv = 456;
+    f = (float)iv;
+    if (f != 456.0f) return 7;
+
+    /* Round-trip */
+    iv = 42;
+    d = (double)iv;
+    if (d != 42.0) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_int128_float_convert", code, &[]),
+        0
+    );
+}
+
+#[test]
+fn codegen_int128_struct_array() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+struct S128 {
+    uint128 val;
+    int tag;
+};
+
+uint128 get_val(struct S128 s) {
+    return s.val;
+}
+
+int main(void) {
+    /* Struct with int128 member */
+    struct S128 s;
+    s.val = ((uint128)0xAAAA << 64) | 0xBBBB;
+    s.tag = 42;
+    if ((unsigned long)s.val != 0xBBBB) return 1;
+    if ((unsigned long)(s.val >> 64) != 0xAAAA) return 2;
+    if (s.tag != 42) return 3;
+
+    /* Array of int128 */
+    uint128 arr[3];
+    arr[0] = 10;
+    arr[1] = ((uint128)0x1111 << 64) | 0x2222;
+    arr[2] = ((uint128)0x3333 << 64) | 0x4444;
+
+    if (arr[0] != 10) return 4;
+    if ((unsigned long)arr[1] != 0x2222) return 5;
+    if ((unsigned long)(arr[1] >> 64) != 0x1111) return 6;
+    if ((unsigned long)arr[2] != 0x4444) return 7;
+    if ((unsigned long)(arr[2] >> 64) != 0x3333) return 8;
+
+    /* Struct passed by value */
+    uint128 r = get_val(s);
+    if (r != s.val) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_struct_array", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_inc_dec() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    /* Pre-increment */
+    uint128 x = ((uint128)1 << 64) - 1;
+    uint128 y = ++x;
+    if ((unsigned long)x != 0) return 1;
+    if ((unsigned long)(x >> 64) != 1) return 2;
+    if (y != x) return 3;
+
+    /* Post-increment */
+    x = 10;
+    y = x++;
+    if (y != 10) return 4;
+    if (x != 11) return 5;
+
+    /* Pre-decrement */
+    x = (uint128)1 << 64;
+    y = --x;
+    if ((unsigned long)x != 0xFFFFFFFFFFFFFFFFULL) return 6;
+    if ((unsigned long)(x >> 64) != 0) return 7;
+    if (y != x) return 8;
+
+    /* Post-decrement */
+    x = 10;
+    y = x--;
+    if (y != 10) return 9;
+    if (x != 9) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_inc_dec", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_optimized_mega() {
+    // Run key int128 operations through the optimizer to catch optimizer+codegen bugs
+    let code = r#"
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+
+uint128 add128(uint128 a, uint128 b) { return a + b; }
+uint128 sub128(uint128 a, uint128 b) { return a - b; }
+uint128 mul128(uint128 a, uint128 b) { return a * b; }
+uint128 shl128(uint128 a, int n) { return a << n; }
+uint128 shr128(uint128 a, int n) { return a >> n; }
+uint128 and128(uint128 a, uint128 b) { return a & b; }
+uint128 or128(uint128 a, uint128 b) { return a | b; }
+uint128 xor128(uint128 a, uint128 b) { return a ^ b; }
+int cmp128(uint128 a, uint128 b) { return a == b; }
+
+int main(void) {
+    uint128 a = ((uint128)0xDEAD << 64) | 0xBEEF;
+    uint128 b = ((uint128)0xCAFE << 64) | 0xBABE;
+
+    /* Arithmetic */
+    uint128 one = 1;
+    uint128 r = add128(a, one);
+    if ((unsigned long)r != 0xBEF0) return 1;
+    if ((unsigned long)(r >> 64) != 0xDEAD) return 2;
+
+    uint128 beef = 0xBEEF;
+    r = sub128(a, beef);
+    if ((unsigned long)r != 0) return 3;
+    if ((unsigned long)(r >> 64) != 0xDEAD) return 4;
+
+    uint128 two = 2, three = 3;
+    r = mul128(two, three);
+    if (r != 6) return 5;
+
+    /* Shifts */
+    r = shl128(one, 64);
+    if ((unsigned long)r != 0) return 6;
+    if ((unsigned long)(r >> 64) != 1) return 7;
+
+    uint128 hi1 = (uint128)1 << 64;
+    r = shr128(hi1, 64);
+    if (r != 1) return 8;
+
+    /* Bitwise */
+    uint128 xff = 0xFF, x0f = 0x0F, xf0 = 0xF0;
+    r = and128(xff, x0f);
+    if (r != 0x0F) return 9;
+
+    r = or128(xf0, x0f);
+    if (r != 0xFF) return 10;
+
+    r = xor128(xff, x0f);
+    if (r != 0xF0) return 11;
+
+    /* Comparison */
+    if (!cmp128(a, a)) return 12;
+    if (cmp128(a, b)) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("codegen_int128_optimized_mega", code),
+        0
+    );
+}

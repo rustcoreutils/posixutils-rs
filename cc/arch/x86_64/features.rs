@@ -766,7 +766,7 @@ impl X86_64CodeGen {
                     } else {
                         op_size
                     },
-                    src: GpOperand::Imm(*v),
+                    src: GpOperand::Imm(*v as i64),
                     dst: GpOperand::Reg(Reg::R10),
                 });
             }
@@ -873,7 +873,7 @@ impl X86_64CodeGen {
                 // Load immediate first, then BSF
                 self.push_lir(X86Inst::Mov {
                     size: src_size,
-                    src: GpOperand::Imm(v),
+                    src: GpOperand::Imm(v as i64),
                     dst: GpOperand::Reg(Reg::R10),
                 });
                 self.push_lir(X86Inst::Bsf {
@@ -949,7 +949,7 @@ impl X86_64CodeGen {
                 // Load immediate first, then BSR
                 self.push_lir(X86Inst::Mov {
                     size: src_size,
-                    src: GpOperand::Imm(v),
+                    src: GpOperand::Imm(v as i64),
                     dst: GpOperand::Reg(Reg::R10),
                 });
                 self.push_lir(X86Inst::Bsr {
@@ -1034,7 +1034,7 @@ impl X86_64CodeGen {
                 // Load immediate first, then POPCNT
                 self.push_lir(X86Inst::Mov {
                     size: src_size,
-                    src: GpOperand::Imm(v),
+                    src: GpOperand::Imm(v as i64),
                     dst: GpOperand::Reg(Reg::R10),
                 });
                 self.push_lir(X86Inst::Popcnt {

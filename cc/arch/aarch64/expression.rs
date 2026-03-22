@@ -51,7 +51,7 @@ impl Aarch64CodeGen {
         let src2_loc = self.get_location(src2);
         let src2_operand = match &src2_loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
-            Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v),
+            Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v as i64),
             _ => {
                 self.emit_move(src2, Reg::X10, size);
                 GpOperand::Reg(Reg::X10)
@@ -293,7 +293,7 @@ impl Aarch64CodeGen {
         // Try to use immediate for comparison if possible
         let src2_loc = self.get_location(src2);
         let src2_operand = match &src2_loc {
-            Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v),
+            Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v as i64),
             _ => {
                 self.emit_move(src2, Reg::X11, size);
                 GpOperand::Reg(Reg::X11)
@@ -472,16 +472,10 @@ impl Aarch64CodeGen {
                     dst2: hi_reg,
                 });
             }
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let lo = v as u64 as i64;
                 let hi = (v >> 64) as u64 as i64;
                 self.emit_mov_imm(lo_reg, lo, 64);
-                self.emit_mov_imm(hi_reg, hi, 64);
-            }
-            Loc::Imm(v) => {
-                // Sign-extend 64-bit to 128-bit
-                self.emit_mov_imm(lo_reg, v, 64);
-                let hi = if v < 0 { -1i64 } else { 0i64 };
                 self.emit_mov_imm(hi_reg, hi, 64);
             }
             _ => {

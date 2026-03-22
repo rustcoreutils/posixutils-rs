@@ -595,7 +595,7 @@ impl X86_64CodeGen {
                 };
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(*val),
+                    src: GpOperand::Imm(*val as i64),
                     dst: GpOperand::Mem(temp_addr.clone()),
                 });
                 temp_addr

@@ -230,7 +230,7 @@ impl Aarch64CodeGen {
             Loc::Imm(v) => {
                 // Load integer immediate and move to FP
                 let (scratch0, _, _) = Reg::scratch_regs();
-                self.emit_mov_imm(scratch0, v, 64);
+                self.emit_mov_imm(scratch0, v as i64, 64);
                 self.push_lir(Aarch64Inst::FmovFromGp {
                     size: fp_size,
                     src: scratch0,
@@ -252,9 +252,6 @@ impl Aarch64CodeGen {
                     src: scratch0,
                     dst,
                 });
-            }
-            Loc::Imm128(_) => {
-                panic!("Int128 codegen not yet implemented on AArch64");
             }
         }
     }

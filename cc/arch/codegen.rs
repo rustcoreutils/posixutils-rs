@@ -280,18 +280,21 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // Zero-fill
                 self.push_directive(Directive::Zero(size));
             }
-            Initializer::Int(val) => match size {
-                1 => self.push_directive(Directive::Byte(*val)),
-                2 => self.push_directive(Directive::Short(*val)),
-                4 => self.push_directive(Directive::Long(*val)),
-                _ => self.push_directive(Directive::Quad(*val)),
-            },
-            Initializer::Int128(val) => {
-                // Emit as two .quad directives (little-endian: lo then hi)
-                let lo = *val as i64;
-                let hi = (*val >> 64) as i64;
-                self.push_directive(Directive::Quad(lo));
-                self.push_directive(Directive::Quad(hi));
+            Initializer::Int(val) => {
+                if size > 8 {
+                    // 128-bit: emit as two quads (little-endian: lo then hi)
+                    let lo = *val as i64;
+                    let hi = (*val >> 64) as i64;
+                    self.push_directive(Directive::Quad(lo));
+                    self.push_directive(Directive::Quad(hi));
+                } else {
+                    match size {
+                        1 => self.push_directive(Directive::Byte(*val as i64)),
+                        2 => self.push_directive(Directive::Short(*val as i64)),
+                        4 => self.push_directive(Directive::Long(*val as i64)),
+                        _ => self.push_directive(Directive::Quad(*val as i64)),
+                    }
+                }
             }
             Initializer::Float(val) => {
                 if size == 4 {

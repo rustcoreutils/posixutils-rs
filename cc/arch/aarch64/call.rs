@@ -252,7 +252,7 @@ impl Aarch64CodeGen {
                                 dst2: int_arg_regs[int_arg_idx + 1],
                             });
                         }
-                        Loc::Imm128(v) => {
+                        Loc::Imm(v) => {
                             let lo = v as u64 as i64;
                             let hi = (v >> 64) as u64 as i64;
                             self.emit_mov_imm(int_arg_regs[int_arg_idx], lo, 64);
@@ -295,9 +295,11 @@ impl Aarch64CodeGen {
             return 0;
         }
 
-        // Pre-allocate stack space for all stack args (8 bytes each, 16-byte aligned)
-        let num_stack_args = stack_args_info.len();
-        let stack_bytes = (num_stack_args * 8) as i32;
+        // Pre-allocate stack space for all stack args (8 bytes each, 16 for int128, 16-byte aligned)
+        let stack_bytes: i32 = stack_args_info
+            .iter()
+            .map(|a| if a.size == 128 { 16 } else { 8 })
+            .sum();
         let aligned_bytes = (stack_bytes + 15) & !15;
 
         self.push_lir(Aarch64Inst::Sub {
@@ -308,8 +310,58 @@ impl Aarch64CodeGen {
         });
 
         // Store each stack arg at its proper offset from SP (in parameter order)
-        for (idx, stack_arg) in stack_args_info.into_iter().enumerate() {
-            let offset = (idx * 8) as i32;
+        let mut offset: i32 = 0;
+        for stack_arg in stack_args_info.into_iter() {
+            if stack_arg
+                .typ
+                .is_some_and(|t| types.kind(t) == TypeKind::Int128)
+            {
+                // Int128: store both 64-bit halves
+                let loc = self.get_location(stack_arg.pseudo);
+                match loc {
+                    Loc::Stack(src_off) => {
+                        let mem = self.stack_mem(src_off);
+                        self.push_lir(Aarch64Inst::Ldp {
+                            size: OperandSize::B64,
+                            addr: mem,
+                            dst1: Reg::X9,
+                            dst2: Reg::X10,
+                        });
+                    }
+                    Loc::Imm(v) => {
+                        let lo = v as u64 as i64;
+                        let hi = (v >> 64) as u64 as i64;
+                        self.emit_mov_imm(Reg::X9, lo, 64);
+                        self.emit_mov_imm(Reg::X10, hi, 64);
+                    }
+                    _ => {
+                        self.emit_move(stack_arg.pseudo, Reg::X9, 64);
+                        self.push_lir(Aarch64Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::Xzr),
+                            dst: Reg::X10,
+                        });
+                    }
+                }
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: Reg::X9,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::SP,
+                        offset,
+                    },
+                });
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: Reg::X10,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::SP,
+                        offset: offset + 8,
+                    },
+                });
+                offset += 16;
+                continue;
+            }
             if stack_arg.is_fp {
                 // Use type info for proper FP size determination
                 self.emit_fp_move(
@@ -354,6 +406,7 @@ impl Aarch64CodeGen {
                     },
                 });
             }
+            offset += 8;
         }
 
         // Return number of 16-byte units allocated (for cleanup)

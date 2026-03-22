@@ -71,7 +71,7 @@ impl X86_64CodeGen {
 
                     if !has_gp || !has_fp {
                         stack_arg_indices.push(i);
-                        total_stack_qwords += 1;
+                        total_stack_qwords += gp_needed.max(fp_needed).max(1);
                     }
                     temp_int_idx += gp_needed;
                     temp_fp_idx += fp_needed;
@@ -192,6 +192,30 @@ impl X86_64CodeGen {
                     }),
                 });
             } else {
+                // Check if this is an __int128 arg (needs 16 bytes = 2 stack slots)
+                let is_int128 = arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128);
+                if is_int128 {
+                    let arg_loc = self.get_location(arg).clone();
+                    // Push hi first (stack grows down), then lo
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_hi_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Push {
+                        src: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_lo_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Push {
+                        src: GpOperand::Reg(Reg::Rax),
+                    });
+                    stack_args += 2;
+                    continue;
+                }
                 // Check if this is a large struct arg (> 16 bytes, MEMORY class)
                 let is_large_struct = arg_type.is_some_and(|t| {
                     let k = types.kind(t);

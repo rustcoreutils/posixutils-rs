@@ -459,9 +459,7 @@ pub enum PseudoKind {
     /// Symbol reference (variable, function)
     Sym(String),
     /// Constant integer value
-    Val(i64),
-    /// Constant 128-bit integer value (__int128 / __uint128_t)
-    Val128(i128),
+    Val(i128),
     /// Constant float value
     FVal(f64),
 }
@@ -538,19 +536,10 @@ impl Pseudo {
     }
 
     /// Create a constant value pseudo
-    pub fn val(id: PseudoId, value: i64) -> Self {
+    pub fn val(id: PseudoId, value: i128) -> Self {
         Self {
             id,
             kind: PseudoKind::Val(value),
-            name: None,
-        }
-    }
-
-    /// Create a constant 128-bit value pseudo
-    pub fn val128(id: PseudoId, value: i128) -> Self {
-        Self {
-            id,
-            kind: PseudoKind::Val128(value),
             name: None,
         }
     }
@@ -597,13 +586,6 @@ impl fmt::Display for Pseudo {
                     write!(f, "${:#x}", v)
                 } else {
                     write!(f, "${}", v)
-                }
-            }
-            PseudoKind::Val128(v) => {
-                if *v > 1000 || *v < -1000 {
-                    write!(f, "${:#x}_i128", v)
-                } else {
-                    write!(f, "${}_i128", v)
                 }
             }
             PseudoKind::FVal(v) => write!(f, "${}", v),
@@ -1460,18 +1442,9 @@ impl Function {
 
     /// Create a new constant integer pseudo and return its ID
     /// The pseudo is added to self.pseudos
-    pub fn create_const_pseudo(&mut self, value: i64) -> PseudoId {
+    pub fn create_const_pseudo(&mut self, value: i128) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, value);
-        self.add_pseudo(pseudo);
-        id
-    }
-
-    /// Create a new 128-bit constant integer pseudo and return its ID
-    /// The pseudo is added to self.pseudos
-    pub fn create_const128_pseudo(&mut self, value: i128) -> PseudoId {
-        let id = self.alloc_pseudo();
-        let pseudo = Pseudo::val128(id, value);
         self.add_pseudo(pseudo);
         id
     }
@@ -1484,17 +1457,9 @@ impl Function {
     }
 
     /// Get the constant integer value of a pseudo, if it is a Val.
-    pub fn const_val(&self, id: PseudoId) -> Option<i64> {
+    pub fn const_val(&self, id: PseudoId) -> Option<i128> {
         self.get_pseudo(id).and_then(|p| match &p.kind {
             PseudoKind::Val(v) => Some(*v),
-            _ => None,
-        })
-    }
-
-    /// Get the constant 128-bit integer value of a pseudo, if it is a Val128.
-    pub fn const_val128(&self, id: PseudoId) -> Option<i128> {
-        self.get_pseudo(id).and_then(|p| match &p.kind {
-            PseudoKind::Val128(v) => Some(*v),
             _ => None,
         })
     }
@@ -1561,9 +1526,7 @@ pub enum Initializer {
     #[default]
     None,
     /// Integer initializer
-    Int(i64),
-    /// 128-bit integer initializer (__int128 / __uint128_t)
-    Int128(i128),
+    Int(i128),
     /// Float/double initializer
     Float(f64),
     /// String literal initializer (for char arrays)
@@ -1595,7 +1558,6 @@ impl fmt::Display for Initializer {
         match self {
             Initializer::None => write!(f, "0"),
             Initializer::Int(v) => write!(f, "{}", v),
-            Initializer::Int128(v) => write!(f, "{}i128", v),
             Initializer::Float(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
             Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),

@@ -779,10 +779,10 @@ impl<'a> Linearizer<'a> {
     /// - Compound literals (C99 6.5.2.5)
     fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         match &expr.kind {
-            ExprKind::IntLit(v) => Initializer::Int(*v),
-            ExprKind::Int128Lit(v) => Initializer::Int128(*v),
+            ExprKind::IntLit(v) => Initializer::Int(*v as i128),
+            ExprKind::Int128Lit(v) => Initializer::Int(*v),
             ExprKind::FloatLit(v) => Initializer::Float(*v),
-            ExprKind::CharLit(c) => Initializer::Int(*c as u8 as i8 as i64),
+            ExprKind::CharLit(c) => Initializer::Int(*c as u8 as i8 as i128),
 
             // String literal - for arrays, store as String; for pointers, create label reference
             ExprKind::StringLit(s) => {
@@ -818,13 +818,13 @@ impl<'a> Linearizer<'a> {
                 op: UnaryOp::Neg,
                 operand,
             } => match &operand.kind {
-                ExprKind::IntLit(v) => Initializer::Int(-*v),
-                ExprKind::Int128Lit(v) => Initializer::Int128(v.wrapping_neg()),
+                ExprKind::IntLit(v) => Initializer::Int(-(*v as i128)),
+                ExprKind::Int128Lit(v) => Initializer::Int(v.wrapping_neg()),
                 ExprKind::FloatLit(v) => Initializer::Float(-*v),
                 // For more complex expressions like -(1+2), try constant evaluation
                 _ => {
                     if let Some(val) = self.eval_const_expr(expr) {
-                        Self::int_initializer(val)
+                        Initializer::Int(val)
                     } else {
                         Initializer::None
                     }
@@ -900,7 +900,7 @@ impl<'a> Linearizer<'a> {
                     // Check if it's an enum constant
                     let sym = self.symbols.get(*symbol_id);
                     if let Some(val) = sym.enum_value {
-                        Initializer::Int(val) // enum values are always i64
+                        Initializer::Int(val as i128)
                     } else {
                         Initializer::None
                     }
@@ -923,7 +923,7 @@ impl<'a> Linearizer<'a> {
                 } else {
                     // Neither operand is pointer — try as integer constant
                     if let Some(val) = self.eval_const_expr(expr) {
-                        return Self::int_initializer(val);
+                        return Initializer::Int(val);
                     }
                     error(
                         self.current_pos.unwrap_or_default(),
@@ -956,7 +956,7 @@ impl<'a> Linearizer<'a> {
                             Initializer::SymAddrOffset(name, byte_offset)
                         }
                     } else if let Some(val) = self.eval_const_expr(expr) {
-                        Self::int_initializer(val)
+                        Initializer::Int(val)
                     } else {
                         error(
                             self.current_pos.unwrap_or_default(),
@@ -965,7 +965,7 @@ impl<'a> Linearizer<'a> {
                         Initializer::None
                     }
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    Self::int_initializer(val)
+                    Initializer::Int(val)
                 } else {
                     error(
                         self.current_pos.unwrap_or_default(),
@@ -1004,7 +1004,7 @@ impl<'a> Linearizer<'a> {
             // Try to evaluate as integer or float constant expression
             _ => {
                 if let Some(val) = self.eval_const_expr(expr) {
-                    Self::int_initializer(val)
+                    Initializer::Int(val)
                 } else if let Some(val) = self.eval_const_float_expr(expr) {
                     Initializer::Float(val)
                 } else if let Some((name, offset)) = self.eval_static_address(expr) {
@@ -1458,7 +1458,7 @@ impl<'a> Linearizer<'a> {
                             init_fields.push((
                                 *offset,
                                 *storage_size as usize,
-                                Initializer::Int(packed_value as i64),
+                                Initializer::Int(packed_value as i128),
                             ));
                             i = j;
                         } else {
@@ -2483,7 +2483,7 @@ impl<'a> Linearizer<'a> {
 
                         // Copy each byte from string literal to local array
                         for (i, byte) in s.bytes().enumerate() {
-                            let byte_val = self.emit_const(byte as i64, elem_type);
+                            let byte_val = self.emit_const(byte as i128, elem_type);
                             self.emit(Instruction::store(
                                 byte_val, sym_id, i as i64, elem_type, elem_size,
                             ));
@@ -2515,7 +2515,7 @@ impl<'a> Linearizer<'a> {
 
                         // Copy each wchar_t from wide string literal to local array
                         for (i, ch) in s.chars().enumerate() {
-                            let ch_val = self.emit_const(ch as i64, elem_type);
+                            let ch_val = self.emit_const(ch as i128, elem_type);
                             self.emit(Instruction::store(
                                 ch_val,
                                 sym_id,
@@ -2700,7 +2700,7 @@ impl<'a> Linearizer<'a> {
         self.emit(store_size_insn);
 
         // Compute total size in bytes: num_elements * sizeof(element)
-        let elem_size_const = self.emit_const(elem_size, self.types.long_id);
+        let elem_size_const = self.emit_const(elem_size as i128, self.types.long_id);
         let total_size = self.alloc_pseudo();
         let mul_insn = Instruction::new(Opcode::Mul)
             .with_target(total_size)
@@ -2901,7 +2901,7 @@ impl<'a> Linearizer<'a> {
                                 .unwrap_or(self.types.char_id);
                             let char_bits = self.types.size_bits(char_type);
                             for (i, ch) in s.chars().enumerate() {
-                                let byte_val = self.emit_const(ch as u8 as i64, self.types.int_id);
+                                let byte_val = self.emit_const(ch as u8 as i128, self.types.int_id);
                                 self.emit(Instruction::store(
                                     byte_val,
                                     base_sym,
@@ -3053,7 +3053,7 @@ impl<'a> Linearizer<'a> {
                 let elem_size = self.types.size_bits(elem_type);
 
                 for (i, byte) in s.bytes().enumerate() {
-                    let byte_val = self.emit_const(byte as i64, elem_type);
+                    let byte_val = self.emit_const(byte as i128, elem_type);
                     self.emit(Instruction::store(
                         byte_val,
                         base_sym,
@@ -4499,7 +4499,8 @@ impl<'a> Linearizer<'a> {
                 if member_info.offset == 0 {
                     base
                 } else {
-                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    let offset_val =
+                        self.emit_const(member_info.offset as i128, self.types.long_id);
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::binop(
                         Opcode::Add,
@@ -4539,7 +4540,8 @@ impl<'a> Linearizer<'a> {
                 if member_info.offset == 0 {
                     ptr
                 } else {
-                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    let offset_val =
+                        self.emit_const(member_info.offset as i128, self.types.long_id);
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::binop(
                         Opcode::Add,
@@ -4571,7 +4573,7 @@ impl<'a> Linearizer<'a> {
                 let idx = self.linearize_expr(idx_expr);
                 let elem_type = self.expr_type(expr);
                 let elem_size = self.types.size_bits(elem_type) / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
                 let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
@@ -4952,7 +4954,7 @@ impl<'a> Linearizer<'a> {
                 base
             } else {
                 let result = self.alloc_pseudo();
-                let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                let offset_val = self.emit_const(member_info.offset as i128, self.types.long_id);
                 self.emit(Instruction::binop(
                     Opcode::Add,
                     result,
@@ -4987,7 +4989,8 @@ impl<'a> Linearizer<'a> {
                     base
                 } else {
                     let result = self.alloc_pseudo();
-                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                    let offset_val =
+                        self.emit_const(member_info.offset as i128, self.types.long_id);
                     self.emit(Instruction::binop(
                         Opcode::Add,
                         result,
@@ -5083,7 +5086,8 @@ impl<'a> Linearizer<'a> {
                     }
 
                     // Multiply by sizeof(innermost element)
-                    let innermost_size_val = self.emit_const(innermost_size, self.types.long_id);
+                    let innermost_size_val =
+                        self.emit_const(innermost_size as i128, self.types.long_id);
                     match stride {
                         Some(s) => {
                             let result = self.alloc_pseudo();
@@ -5103,18 +5107,18 @@ impl<'a> Linearizer<'a> {
                     // Not a multi-dimensional VLA or accessing innermost dimension
                     // Use compile-time size
                     let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i64, self.types.long_id)
+                    self.emit_const(elem_size as i128, self.types.long_id)
                 }
             } else {
                 // Variable not found in locals (global or something else)
                 let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i64, self.types.long_id)
+                self.emit_const(elem_size as i128, self.types.long_id)
             }
         } else {
             // Not indexing an identifier directly (e.g., arr[i][j] where arr[i] is an Index)
             // Use compile-time size
             let elem_size = self.types.size_bits(elem_type) / 8;
-            self.emit_const(elem_size as i64, self.types.long_id)
+            self.emit_const(elem_size as i128, self.types.long_id)
         };
 
         // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
@@ -5601,7 +5605,7 @@ impl<'a> Linearizer<'a> {
         let delta = if is_ptr {
             let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
             let elem_size = self.types.size_bits(elem_type) / 8;
-            self.emit_const(elem_size as i64, self.types.long_id)
+            self.emit_const(elem_size as i128, self.types.long_id)
         } else if is_float {
             self.emit_fconst(1.0, typ)
         } else {
@@ -5716,7 +5720,7 @@ impl<'a> Linearizer<'a> {
                 let arr = self.linearize_expr(ptr_expr);
                 let idx = self.linearize_expr(idx_expr);
                 let elem_size = store_size / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
                 let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
                 let offset = self.alloc_pseudo();
                 let ptr_typ = self.types.long_id;
@@ -5799,7 +5803,7 @@ impl<'a> Linearizer<'a> {
             let elem_size = self.types.size_bits(elem_type) / 8;
 
             // Divide by element size
-            let scale = self.emit_const(elem_size as i64, self.types.long_id);
+            let scale = self.emit_const(elem_size as i128, self.types.long_id);
             let result = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::DivS,
@@ -5828,7 +5832,7 @@ impl<'a> Linearizer<'a> {
             let elem_size = self.types.size_bits(elem_type) / 8;
 
             // Scale the integer by element size
-            let scale = self.emit_const(elem_size as i64, self.types.long_id);
+            let scale = self.emit_const(elem_size as i128, self.types.long_id);
             let scaled_offset = self.alloc_pseudo();
             // Extend int_val to 64-bit for proper address arithmetic
             let actual_int_type = if left_is_ptr_or_arr {
@@ -5928,7 +5932,7 @@ impl<'a> Linearizer<'a> {
             let increment = if is_ptr {
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
                 let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i64, self.types.long_id)
+                self.emit_const(elem_size as i128, self.types.long_id)
             } else if is_float {
                 self.emit_fconst(1.0, typ)
             } else {
@@ -6043,7 +6047,7 @@ impl<'a> Linearizer<'a> {
                     let arr = self.linearize_expr(ptr_expr);
                     let idx = self.linearize_expr(idx_expr);
                     let elem_size = store_size / 8;
-                    let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                    let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
                     let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
                     let offset = self.alloc_pseudo();
                     let ptr_typ = self.types.long_id;
@@ -6120,7 +6124,7 @@ impl<'a> Linearizer<'a> {
         // First check if it's an enum constant
         if sym.is_enum_constant() {
             if let Some(value) = sym.enum_value {
-                return self.emit_const(value, self.types.int_id);
+                return self.emit_const(value as i128, self.types.int_id);
             }
         }
 
@@ -6283,7 +6287,7 @@ impl<'a> Linearizer<'a> {
             self.types.size_bits(result_typ)
         };
 
-        if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) {
+        if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) && size <= 64 {
             // Pure: use Select instruction (enables cmov/csel)
             let cond_val = self.linearize_expr(cond);
             let cond_typ = self.expr_type(cond);
@@ -6370,12 +6374,12 @@ impl<'a> Linearizer<'a> {
         match &expr.kind {
             ExprKind::IntLit(val) => {
                 let typ = self.expr_type(expr);
-                self.emit_const(*val, typ)
+                self.emit_const(*val as i128, typ)
             }
 
             ExprKind::Int128Lit(val) => {
                 let typ = self.expr_type(expr);
-                self.emit_const128(*val, typ)
+                self.emit_const(*val, typ)
             }
 
             ExprKind::FloatLit(val) => {
@@ -6385,7 +6389,7 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::CharLit(c) => {
                 let typ = self.expr_type(expr);
-                self.emit_const(*c as u8 as i8 as i64, typ)
+                self.emit_const(*c as u8 as i8 as i128, typ)
             }
 
             ExprKind::StringLit(s) => {
@@ -6441,7 +6445,7 @@ impl<'a> Linearizer<'a> {
                 let size = self.types.size_bits(*typ) / 8;
                 // sizeof returns size_t, which is unsigned long in our implementation
                 let result_typ = self.types.ulong_id;
-                self.emit_const(size as i64, result_typ)
+                self.emit_const(size as i128, result_typ)
             }
 
             ExprKind::SizeofExpr(inner_expr) => {
@@ -6462,7 +6466,7 @@ impl<'a> Linearizer<'a> {
                             self.emit(load_insn);
 
                             // Multiply by element size
-                            let elem_size_const = self.emit_const(elem_size, result_typ);
+                            let elem_size_const = self.emit_const(elem_size as i128, result_typ);
                             let result = self.alloc_pseudo();
                             let mul_insn = Instruction::new(Opcode::Mul)
                                 .with_target(result)
@@ -6481,14 +6485,14 @@ impl<'a> Linearizer<'a> {
                 let size = self.types.size_bits(inner_typ) / 8;
                 // sizeof returns size_t, which is unsigned long in our implementation
                 let result_typ = self.types.ulong_id;
-                self.emit_const(size as i64, result_typ)
+                self.emit_const(size as i128, result_typ)
             }
 
             ExprKind::AlignofType(typ) => {
                 let align = self.types.alignment(*typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
-                self.emit_const(align as i64, result_typ)
+                self.emit_const(align as i128, result_typ)
             }
 
             ExprKind::AlignofExpr(inner_expr) => {
@@ -6496,7 +6500,7 @@ impl<'a> Linearizer<'a> {
                 let align = self.types.alignment(inner_typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
-                self.emit_const(align as i64, result_typ)
+                self.emit_const(align as i128, result_typ)
             }
 
             ExprKind::Comma(exprs) => {
@@ -7006,7 +7010,7 @@ impl<'a> Linearizer<'a> {
                 }
 
                 // Return the offset as a constant
-                self.emit_const(offset as i64, self.types.ulong_id)
+                self.emit_const(offset as i128, self.types.ulong_id)
             }
 
             // ================================================================
@@ -7301,7 +7305,7 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    fn emit_const(&mut self, val: i64, typ: TypeId) -> PseudoId {
+    fn emit_const(&mut self, val: i128, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, val);
         if let Some(func) = &mut self.current_func {
@@ -7312,31 +7316,6 @@ impl<'a> Linearizer<'a> {
         let insn = Instruction::new(Opcode::SetVal)
             .with_target(id)
             .with_type_and_size(typ, self.types.size_bits(typ));
-        self.emit(insn);
-
-        id
-    }
-
-    /// Create an integer Initializer, using Int128 only when the value exceeds i64 range.
-    fn int_initializer(val: i128) -> Initializer {
-        if val >= i64::MIN as i128 && val <= i64::MAX as i128 {
-            Initializer::Int(val as i64)
-        } else {
-            Initializer::Int128(val)
-        }
-    }
-
-    fn emit_const128(&mut self, val: i128, typ: TypeId) -> PseudoId {
-        let id = self.alloc_pseudo();
-        let pseudo = Pseudo::val128(id, val);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(pseudo);
-        }
-
-        // Emit setval instruction with 128-bit size
-        let insn = Instruction::new(Opcode::SetVal)
-            .with_target(id)
-            .with_type_and_size(typ, 128);
         self.emit(insn);
 
         id
@@ -7535,7 +7514,7 @@ impl<'a> Linearizer<'a> {
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
         let shifted = if bit_offset > 0 {
-            let shift_amount = self.emit_const(bit_offset as i64, self.types.int_id);
+            let shift_amount = self.emit_const(bit_offset as i128, self.types.int_id);
             let shifted = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::Lsr,
@@ -7552,7 +7531,7 @@ impl<'a> Linearizer<'a> {
 
         // 3. Mask to bit_width bits
         let mask = (1u64 << bit_width) - 1;
-        let mask_val = self.emit_const(mask as i64, storage_type);
+        let mask_val = self.emit_const(mask as i128, storage_type);
         let masked = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::And,
@@ -7586,7 +7565,7 @@ impl<'a> Linearizer<'a> {
             self.types.long_id
         };
 
-        let shift_val = self.emit_const(shift_amount as i64, typ);
+        let shift_val = self.emit_const(shift_amount as i128, typ);
         let shifted_left = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::Shl,
@@ -7636,7 +7615,7 @@ impl<'a> Linearizer<'a> {
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
         let field_mask = ((1u64 << bit_width) - 1) << bit_offset;
         let clear_mask = !field_mask;
-        let clear_mask_val = self.emit_const(clear_mask as i64, storage_type);
+        let clear_mask_val = self.emit_const(clear_mask as i128, storage_type);
 
         // 3. Clear the bitfield bits in old value
         let cleared = self.alloc_pseudo();
@@ -7651,7 +7630,7 @@ impl<'a> Linearizer<'a> {
 
         // 4. Mask new value to bit_width and shift to position
         let value_mask = (1u64 << bit_width) - 1;
-        let value_mask_val = self.emit_const(value_mask as i64, storage_type);
+        let value_mask_val = self.emit_const(value_mask as i128, storage_type);
         let masked_new = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::And,
@@ -7663,7 +7642,7 @@ impl<'a> Linearizer<'a> {
         ));
 
         let positioned = if bit_offset > 0 {
-            let shift_val = self.emit_const(bit_offset as i64, self.types.int_id);
+            let shift_val = self.emit_const(bit_offset as i128, self.types.int_id);
             let positioned = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::Shl,
@@ -7793,7 +7772,7 @@ impl<'a> Linearizer<'a> {
                 let increment = if is_ptr {
                     let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
                     let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i64, self.types.long_id)
+                    self.emit_const(elem_size as i128, self.types.long_id)
                 } else if is_float {
                     self.emit_fconst(1.0, typ)
                 } else {
@@ -7810,7 +7789,7 @@ impl<'a> Linearizer<'a> {
                 let decrement = if is_ptr {
                     let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
                     let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i64, self.types.long_id)
+                    self.emit_const(elem_size as i128, self.types.long_id)
                 } else if is_float {
                     self.emit_fconst(1.0, typ)
                 } else {
@@ -8232,7 +8211,7 @@ impl<'a> Linearizer<'a> {
     /// Allocate a local temporary variable for a complex result
     fn alloc_local_temp(&mut self, typ: TypeId) -> PseudoId {
         let size = self.types.size_bytes(typ);
-        let size_const = self.emit_const(size as i64, self.types.ulong_id);
+        let size_const = self.emit_const(size as i128, self.types.ulong_id);
         let addr = self.alloc_pseudo();
         let alloca_insn = Instruction::new(Opcode::Alloca)
             .with_target(addr)
@@ -9009,7 +8988,7 @@ impl<'a> Linearizer<'a> {
                 .base_type(target_typ)
                 .unwrap_or(self.types.char_id);
             let elem_size = self.types.size_bits(elem_type) / 8;
-            let scale = self.emit_const(elem_size as i64, self.types.long_id);
+            let scale = self.emit_const(elem_size as i128, self.types.long_id);
 
             // Extend the integer to 64-bit for proper arithmetic
             let rhs_extended = self.emit_convert(rhs, value_typ, self.types.long_id);
@@ -9289,7 +9268,7 @@ impl<'a> Linearizer<'a> {
                 let arr = self.linearize_expr(ptr_expr);
                 let idx = self.linearize_expr(idx_expr);
                 let elem_size = target_size / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
                 let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);

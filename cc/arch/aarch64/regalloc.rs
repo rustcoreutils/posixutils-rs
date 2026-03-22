@@ -627,9 +627,7 @@ pub enum Loc {
     /// On the stack at [sp + offset] (positive offset from sp after allocation)
     Stack(i32),
     /// Immediate constant
-    Imm(i64),
-    /// Immediate 128-bit integer constant
-    Imm128(i128),
+    Imm(i128),
     /// Floating-point immediate constant (value, size in bits)
     FImm(f64, u32),
     /// Global symbol
@@ -990,10 +988,6 @@ impl RegAlloc {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
-                        continue;
-                    }
-                    PseudoKind::Val128(v) => {
-                        self.locations.insert(interval.pseudo, Loc::Imm128(*v));
                         continue;
                     }
                     PseudoKind::FVal(v) => {

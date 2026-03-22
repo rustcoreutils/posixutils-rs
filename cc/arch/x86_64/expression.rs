@@ -119,10 +119,13 @@ impl X86_64CodeGen {
             // x86-64 binary ops (add, sub, and, or, xor) only support 32-bit sign-extended immediates.
             // If the immediate doesn't fit, load it into R11 first.
             let src2_gp = match &src2_loc {
-                Loc::Imm(v) if size == 64 && (*v > i32::MAX as i64 || *v < i32::MIN as i64) => {
+                Loc::Imm(v)
+                    if size == 64
+                        && (*v as i64 > i32::MAX as i64 || (*v as i64) < i32::MIN as i64) =>
+                {
                     // Large 64-bit immediate - load into R11 first
                     self.push_lir(X86Inst::MovAbs {
-                        imm: *v,
+                        imm: *v as i64,
                         dst: Reg::R11,
                     });
                     GpOperand::Reg(Reg::R11)
@@ -232,7 +235,7 @@ impl X86_64CodeGen {
         // Check if src2 is a large immediate that doesn't fit in 32-bit signed
         // x86-64 imul with immediate only accepts 32-bit immediates
         let src2_gp = match &src2_loc {
-            Loc::Imm(v) if *v > i32::MAX as i64 || *v < i32::MIN as i64 => {
+            Loc::Imm(v) if (*v as i64 > i32::MAX as i64 || (*v as i64) < i32::MIN as i64) => {
                 // Large immediate - must load into register first
                 self.emit_move(src2, Reg::R11, size);
                 GpOperand::Reg(Reg::R11)
@@ -374,7 +377,7 @@ impl X86_64CodeGen {
         // x86-64 cmp instruction only supports 32-bit signed immediates
         // For larger values, we need to load into a register first
         let src2_gp = match &src2_loc {
-            Loc::Imm(v) if *v > i32::MAX as i64 || *v < i32::MIN as i64 => {
+            Loc::Imm(v) if (*v as i64 > i32::MAX as i64 || (*v as i64) < i32::MIN as i64) => {
                 // Large immediate - load into a different scratch register
                 let scratch = if work_reg == Reg::R10 {
                     Reg::R11
@@ -382,7 +385,7 @@ impl X86_64CodeGen {
                     Reg::R10
                 };
                 self.push_lir(X86Inst::MovAbs {
-                    imm: *v,
+                    imm: *v as i64,
                     dst: scratch,
                 });
                 GpOperand::Reg(scratch)
@@ -583,7 +586,7 @@ impl X86_64CodeGen {
     fn int128_load_lo(&mut self, pseudo: PseudoId, dst: Reg) {
         let loc = self.get_location(pseudo);
         match &loc {
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let lo = *v as i64;
                 if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs { imm: lo, dst });
@@ -591,18 +594,6 @@ impl X86_64CodeGen {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Imm(lo),
-                        dst: GpOperand::Reg(dst),
-                    });
-                }
-            }
-            Loc::Imm(v) => {
-                // Small integer promoted to 128-bit: lo = v
-                if *v > i32::MAX as i64 || *v < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs { imm: *v, dst });
-                } else {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(*v),
                         dst: GpOperand::Reg(dst),
                     });
                 }
@@ -623,7 +614,7 @@ impl X86_64CodeGen {
     fn int128_load_hi(&mut self, pseudo: PseudoId, dst: Reg) {
         let loc = self.get_location(pseudo);
         match &loc {
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let hi = (*v >> 64) as i64;
                 if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs { imm: hi, dst });
@@ -634,15 +625,6 @@ impl X86_64CodeGen {
                         dst: GpOperand::Reg(dst),
                     });
                 }
-            }
-            Loc::Imm(v) => {
-                // Small integer promoted to 128-bit: hi = sign extension
-                let hi = *v >> 63; // 0 or -1
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(hi),
-                    dst: GpOperand::Reg(dst),
-                });
             }
             Loc::Stack(_) | Loc::IncomingArg(_) => {
                 let mem = self.int128_hi_mem(&loc);
@@ -726,7 +708,7 @@ impl X86_64CodeGen {
     fn int128_src2_lo_operand(&mut self, src2: PseudoId) -> GpOperand {
         let loc = self.get_location(src2);
         match &loc {
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let lo = *v as i64;
                 if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs {
@@ -738,17 +720,6 @@ impl X86_64CodeGen {
                     GpOperand::Imm(lo)
                 }
             }
-            Loc::Imm(v) => {
-                if *v > i32::MAX as i64 || *v < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: *v,
-                        dst: Reg::R11,
-                    });
-                    GpOperand::Reg(Reg::R11)
-                } else {
-                    GpOperand::Imm(*v)
-                }
-            }
             Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_lo_mem(&loc)),
             _ => panic!("int128_src2_lo_operand: unexpected loc {:?}", loc),
         }
@@ -758,7 +729,7 @@ impl X86_64CodeGen {
     fn int128_src2_hi_operand(&mut self, src2: PseudoId) -> GpOperand {
         let loc = self.get_location(src2);
         match &loc {
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let hi = (*v >> 64) as i64;
                 if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs {
@@ -769,10 +740,6 @@ impl X86_64CodeGen {
                 } else {
                     GpOperand::Imm(hi)
                 }
-            }
-            Loc::Imm(v) => {
-                let hi = *v >> 63; // sign extension: 0 or -1
-                GpOperand::Imm(hi)
             }
             Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_hi_mem(&loc)),
             _ => panic!("int128_src2_hi_operand: unexpected loc {:?}", loc),
@@ -896,58 +863,51 @@ impl X86_64CodeGen {
     fn emit_int128_shl(&mut self, src1: PseudoId, src2: PseudoId, dst_loc: &Loc) {
         // Load shift amount into Rcx
         let src2_loc = self.get_location(src2);
-        match &src2_loc {
-            Loc::Imm(_) | Loc::Imm128(_) => {
-                let n = match &src2_loc {
-                    Loc::Imm(v) => *v as u32,
-                    Loc::Imm128(v) => *v as u32,
-                    _ => unreachable!(),
-                };
-                // Constant shift amount - generate specialized code
-                if n == 0 {
-                    // No-op: just copy
-                    self.int128_load_lo(src1, Reg::R10);
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_load_hi(src1, Reg::R10);
-                    self.int128_store_hi(Reg::R10, dst_loc);
-                } else if n < 64 {
-                    // Load both halves
-                    self.int128_load_lo(src1, Reg::R10); // lo
-                    self.int128_load_hi(src1, Reg::R11); // hi
-                                                         // shldq shifts hi left, filling from lo
-                    self.push_lir(X86Inst::Shld {
-                        size: OperandSize::B64,
-                        count: ShiftCount::Imm(n as u8),
-                        src: Reg::R10,
-                        dst: Reg::R11,
-                    });
+        if let Loc::Imm(v) = &src2_loc {
+            let n = *v as u32;
+            // Constant shift amount - generate specialized code
+            if n == 0 {
+                // No-op: just copy
+                self.int128_load_lo(src1, Reg::R10);
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_load_hi(src1, Reg::R10);
+                self.int128_store_hi(Reg::R10, dst_loc);
+            } else if n < 64 {
+                // Load both halves
+                self.int128_load_lo(src1, Reg::R10); // lo
+                self.int128_load_hi(src1, Reg::R11); // hi
+                                                     // shldq shifts hi left, filling from lo
+                self.push_lir(X86Inst::Shld {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(n as u8),
+                    src: Reg::R10,
+                    dst: Reg::R11,
+                });
+                self.push_lir(X86Inst::Shl {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(n as u8),
+                    dst: Reg::R10,
+                });
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_store_hi(Reg::R11, dst_loc);
+            } else if n < 128 {
+                // hi = lo << (n-64), lo = 0
+                self.int128_load_lo(src1, Reg::R10);
+                if n > 64 {
                     self.push_lir(X86Inst::Shl {
                         size: OperandSize::B64,
-                        count: ShiftCount::Imm(n as u8),
+                        count: ShiftCount::Imm((n - 64) as u8),
                         dst: Reg::R10,
                     });
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_store_hi(Reg::R11, dst_loc);
-                } else if n < 128 {
-                    // hi = lo << (n-64), lo = 0
-                    self.int128_load_lo(src1, Reg::R10);
-                    if n > 64 {
-                        self.push_lir(X86Inst::Shl {
-                            size: OperandSize::B64,
-                            count: ShiftCount::Imm((n - 64) as u8),
-                            dst: Reg::R10,
-                        });
-                    }
-                    self.int128_store_hi(Reg::R10, dst_loc);
-                    self.int128_store_lo_imm(0, dst_loc);
-                } else {
-                    // Shift >= 128: result is 0
-                    self.int128_store_lo_imm(0, dst_loc);
-                    self.int128_store_hi_imm(0, dst_loc);
                 }
-                return;
+                self.int128_store_hi(Reg::R10, dst_loc);
+                self.int128_store_lo_imm(0, dst_loc);
+            } else {
+                // Shift >= 128: result is 0
+                self.int128_store_lo_imm(0, dst_loc);
+                self.int128_store_hi_imm(0, dst_loc);
             }
-            _ => {}
+            return;
         }
 
         // Variable shift amount
@@ -1008,53 +968,46 @@ impl X86_64CodeGen {
     /// Emit 128-bit logical shift right.
     fn emit_int128_lsr(&mut self, src1: PseudoId, src2: PseudoId, dst_loc: &Loc) {
         let src2_loc = self.get_location(src2);
-        match &src2_loc {
-            Loc::Imm(_) | Loc::Imm128(_) => {
-                let n = match &src2_loc {
-                    Loc::Imm(v) => *v as u32,
-                    Loc::Imm128(v) => *v as u32,
-                    _ => unreachable!(),
-                };
-                if n == 0 {
-                    self.int128_load_lo(src1, Reg::R10);
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_load_hi(src1, Reg::R10);
-                    self.int128_store_hi(Reg::R10, dst_loc);
-                } else if n < 64 {
-                    self.int128_load_lo(src1, Reg::R10);
-                    self.int128_load_hi(src1, Reg::R11);
-                    self.push_lir(X86Inst::Shrd {
-                        size: OperandSize::B64,
-                        count: ShiftCount::Imm(n as u8),
-                        src: Reg::R11,
-                        dst: Reg::R10,
-                    });
+        if let Loc::Imm(v) = &src2_loc {
+            let n = *v as u32;
+            if n == 0 {
+                self.int128_load_lo(src1, Reg::R10);
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_load_hi(src1, Reg::R10);
+                self.int128_store_hi(Reg::R10, dst_loc);
+            } else if n < 64 {
+                self.int128_load_lo(src1, Reg::R10);
+                self.int128_load_hi(src1, Reg::R11);
+                self.push_lir(X86Inst::Shrd {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(n as u8),
+                    src: Reg::R11,
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Shr {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(n as u8),
+                    dst: Reg::R11,
+                });
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_store_hi(Reg::R11, dst_loc);
+            } else if n < 128 {
+                // lo = hi >> (n-64), hi = 0
+                self.int128_load_hi(src1, Reg::R10);
+                if n > 64 {
                     self.push_lir(X86Inst::Shr {
                         size: OperandSize::B64,
-                        count: ShiftCount::Imm(n as u8),
-                        dst: Reg::R11,
+                        count: ShiftCount::Imm((n - 64) as u8),
+                        dst: Reg::R10,
                     });
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_store_hi(Reg::R11, dst_loc);
-                } else if n < 128 {
-                    // lo = hi >> (n-64), hi = 0
-                    self.int128_load_hi(src1, Reg::R10);
-                    if n > 64 {
-                        self.push_lir(X86Inst::Shr {
-                            size: OperandSize::B64,
-                            count: ShiftCount::Imm((n - 64) as u8),
-                            dst: Reg::R10,
-                        });
-                    }
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_store_hi_imm(0, dst_loc);
-                } else {
-                    self.int128_store_lo_imm(0, dst_loc);
-                    self.int128_store_hi_imm(0, dst_loc);
                 }
-                return;
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_store_hi_imm(0, dst_loc);
+            } else {
+                self.int128_store_lo_imm(0, dst_loc);
+                self.int128_store_hi_imm(0, dst_loc);
             }
-            _ => {}
+            return;
         }
 
         // Variable shift
@@ -1120,66 +1073,59 @@ impl X86_64CodeGen {
     /// Emit 128-bit arithmetic shift right.
     fn emit_int128_asr(&mut self, src1: PseudoId, src2: PseudoId, dst_loc: &Loc) {
         let src2_loc = self.get_location(src2);
-        match &src2_loc {
-            Loc::Imm(_) | Loc::Imm128(_) => {
-                let n = match &src2_loc {
-                    Loc::Imm(v) => *v as u32,
-                    Loc::Imm128(v) => *v as u32,
-                    _ => unreachable!(),
-                };
-                if n == 0 {
-                    self.int128_load_lo(src1, Reg::R10);
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_load_hi(src1, Reg::R10);
-                    self.int128_store_hi(Reg::R10, dst_loc);
-                } else if n < 64 {
-                    self.int128_load_lo(src1, Reg::R10);
-                    self.int128_load_hi(src1, Reg::R11);
-                    self.push_lir(X86Inst::Shrd {
+        if let Loc::Imm(v) = &src2_loc {
+            let n = *v as u32;
+            if n == 0 {
+                self.int128_load_lo(src1, Reg::R10);
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_load_hi(src1, Reg::R10);
+                self.int128_store_hi(Reg::R10, dst_loc);
+            } else if n < 64 {
+                self.int128_load_lo(src1, Reg::R10);
+                self.int128_load_hi(src1, Reg::R11);
+                self.push_lir(X86Inst::Shrd {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(n as u8),
+                    src: Reg::R11,
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Sar {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(n as u8),
+                    dst: Reg::R11,
+                });
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_store_hi(Reg::R11, dst_loc);
+            } else if n < 128 {
+                // lo = hi >> (n-64) arithmetic, hi = hi >> 63 (all sign bits)
+                self.int128_load_hi(src1, Reg::R10);
+                self.int128_load_hi(src1, Reg::R11);
+                if n > 64 {
+                    self.push_lir(X86Inst::Sar {
                         size: OperandSize::B64,
-                        count: ShiftCount::Imm(n as u8),
-                        src: Reg::R11,
+                        count: ShiftCount::Imm((n - 64) as u8),
                         dst: Reg::R10,
                     });
-                    self.push_lir(X86Inst::Sar {
-                        size: OperandSize::B64,
-                        count: ShiftCount::Imm(n as u8),
-                        dst: Reg::R11,
-                    });
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_store_hi(Reg::R11, dst_loc);
-                } else if n < 128 {
-                    // lo = hi >> (n-64) arithmetic, hi = hi >> 63 (all sign bits)
-                    self.int128_load_hi(src1, Reg::R10);
-                    self.int128_load_hi(src1, Reg::R11);
-                    if n > 64 {
-                        self.push_lir(X86Inst::Sar {
-                            size: OperandSize::B64,
-                            count: ShiftCount::Imm((n - 64) as u8),
-                            dst: Reg::R10,
-                        });
-                    }
-                    self.push_lir(X86Inst::Sar {
-                        size: OperandSize::B64,
-                        count: ShiftCount::Imm(63),
-                        dst: Reg::R11,
-                    });
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_store_hi(Reg::R11, dst_loc);
-                } else {
-                    // All sign bits
-                    self.int128_load_hi(src1, Reg::R10);
-                    self.push_lir(X86Inst::Sar {
-                        size: OperandSize::B64,
-                        count: ShiftCount::Imm(63),
-                        dst: Reg::R10,
-                    });
-                    self.int128_store_lo(Reg::R10, dst_loc);
-                    self.int128_store_hi(Reg::R10, dst_loc);
                 }
-                return;
+                self.push_lir(X86Inst::Sar {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(63),
+                    dst: Reg::R11,
+                });
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_store_hi(Reg::R11, dst_loc);
+            } else {
+                // All sign bits
+                self.int128_load_hi(src1, Reg::R10);
+                self.push_lir(X86Inst::Sar {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(63),
+                    dst: Reg::R10,
+                });
+                self.int128_store_lo(Reg::R10, dst_loc);
+                self.int128_store_hi(Reg::R10, dst_loc);
             }
-            _ => {}
+            return;
         }
 
         // Variable shift
@@ -1269,24 +1215,17 @@ impl X86_64CodeGen {
         let src2_lo_loc = self.get_location(src2);
         let src2_lo_op = match &src2_lo_loc {
             Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_lo_mem(&src2_lo_loc)),
-            Loc::Imm128(v) => {
-                let lo = *v as i64;
-                self.push_lir(X86Inst::MovAbs {
-                    imm: lo,
-                    dst: Reg::R10,
-                });
-                GpOperand::Reg(Reg::R10)
-            }
             Loc::Imm(v) => {
-                if *v > i32::MAX as i64 || *v < i32::MIN as i64 {
+                let lo = *v as i64;
+                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs {
-                        imm: *v,
+                        imm: lo,
                         dst: Reg::R10,
                     });
                 } else {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Imm(*v),
+                        src: GpOperand::Imm(lo),
                         dst: GpOperand::Reg(Reg::R10),
                     });
                 }
@@ -1315,7 +1254,7 @@ impl X86_64CodeGen {
             Loc::Stack(_) | Loc::IncomingArg(_) => {
                 GpOperand::Mem(self.int128_lo_mem(&src2_lo_loc2))
             }
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let lo = *v as i64;
                 if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs {
@@ -1325,17 +1264,6 @@ impl X86_64CodeGen {
                     GpOperand::Reg(Reg::Rax)
                 } else {
                     GpOperand::Imm(lo)
-                }
-            }
-            Loc::Imm(v) => {
-                if *v > i32::MAX as i64 || *v < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: *v,
-                        dst: Reg::Rax,
-                    });
-                    GpOperand::Reg(Reg::Rax)
-                } else {
-                    GpOperand::Imm(*v)
                 }
             }
             _ => panic!("int128_mul: unexpected src2 loc {:?}", src2_lo_loc2),
@@ -1357,7 +1285,7 @@ impl X86_64CodeGen {
         let src2_hi_loc = self.get_location(src2);
         let src2_hi_gp = match &src2_hi_loc {
             Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_hi_mem(&src2_hi_loc)),
-            Loc::Imm128(v) => {
+            Loc::Imm(v) => {
                 let hi = (*v >> 64) as i64;
                 if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs {
@@ -1368,10 +1296,6 @@ impl X86_64CodeGen {
                 } else {
                     GpOperand::Imm(hi)
                 }
-            }
-            Loc::Imm(v) => {
-                let hi = *v >> 63;
-                GpOperand::Imm(hi)
             }
             _ => panic!("int128_mul: unexpected src2 loc {:?}", src2_hi_loc),
         };

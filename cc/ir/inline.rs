@@ -356,7 +356,6 @@ impl InlineContext {
             PseudoKind::Reg(nr) => PseudoKind::Reg(*nr),
             PseudoKind::Phi(nr) => PseudoKind::Phi(*nr),
             PseudoKind::Val(v) => PseudoKind::Val(*v),
-            PseudoKind::Val128(v) => PseudoKind::Val128(*v),
             PseudoKind::FVal(v) => PseudoKind::FVal(*v),
             PseudoKind::Void => PseudoKind::Void,
             PseudoKind::Undef => PseudoKind::Undef,
@@ -1045,7 +1044,6 @@ fn collect_func_refs_from_initializer(
         // Other initializer types don't contain function references
         Initializer::None
         | Initializer::Int(_)
-        | Initializer::Int128(_)
         | Initializer::Float(_)
         | Initializer::String(_)
         | Initializer::WideString(_) => {}

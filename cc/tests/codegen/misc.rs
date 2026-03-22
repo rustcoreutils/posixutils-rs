@@ -4017,3 +4017,107 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("codegen_int128_mega", code, &[]), 0);
 }
+
+#[test]
+fn codegen_int128_param_return() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+
+/* Function that takes __int128 params and returns __int128 */
+uint128 add128(uint128 a, uint128 b) {
+    return a + b;
+}
+
+/* Function that takes multiple __int128 params */
+int128 select128(int128 a, int128 b, int c) {
+    if (c) return a;
+    return b;
+}
+
+/* Function with mixed param types including __int128 */
+long mixed_params(int x, uint128 big, long y) {
+    /* Extract lo 64 bits of big */
+    long lo = (long)big;
+    return x + lo + y;
+}
+
+/* Return __int128 with specific hi and lo halves */
+uint128 make128(unsigned long lo, unsigned long hi) {
+    return ((uint128)hi << 64) | lo;
+}
+
+int main(void) {
+    /* Test 1: __int128 param passed correctly (both halves) */
+    uint128 a = ((uint128)0xDEADBEEFULL << 64) | 0x12345678ULL;
+    uint128 b = 1;
+    uint128 c = add128(a, b);
+    unsigned long lo = (unsigned long)c;
+    unsigned long hi = (unsigned long)(c >> 64);
+    if (lo != 0x12345679ULL) return 1;
+    if (hi != 0xDEADBEEFULL) return 2;
+
+    /* Test 2: __int128 return value has correct hi half */
+    uint128 d = make128(0xAAAAULL, 0xBBBBULL);
+    lo = (unsigned long)d;
+    hi = (unsigned long)(d >> 64);
+    if (lo != 0xAAAAULL) return 3;
+    if (hi != 0xBBBBULL) return 4;
+
+    /* Test 3: multiple __int128 params */
+    int128 x = ((int128)0x1111ULL << 64) | 0x2222ULL;
+    int128 y = ((int128)0x3333ULL << 64) | 0x4444ULL;
+    int128 r = select128(x, y, 1);
+    if ((unsigned long)r != 0x2222ULL) return 5;
+    if ((unsigned long)((uint128)r >> 64) != 0x1111ULL) return 6;
+    r = select128(x, y, 0);
+    if ((unsigned long)r != 0x4444ULL) return 7;
+    if ((unsigned long)((uint128)r >> 64) != 0x3333ULL) return 8;
+
+    /* Test 4: mixed params — __int128 between regular args */
+    uint128 big = 100;
+    long result = mixed_params(10, big, 20);
+    if (result != 130) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_param_return", code, &[]), 0);
+}
+
+#[test]
+fn codegen_int128_param_return_optimized() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+uint128 add128(uint128 a, uint128 b) {
+    return a + b;
+}
+
+uint128 make128(unsigned long lo, unsigned long hi) {
+    return ((uint128)hi << 64) | lo;
+}
+
+int main(void) {
+    uint128 a = ((uint128)0xDEADBEEFULL << 64) | 0x12345678ULL;
+    uint128 b = 1;
+    uint128 c = add128(a, b);
+    unsigned long lo = (unsigned long)c;
+    unsigned long hi = (unsigned long)(c >> 64);
+    if (lo != 0x12345679ULL) return 1;
+    if (hi != 0xDEADBEEFULL) return 2;
+
+    uint128 d = make128(0xAAAAULL, 0xBBBBULL);
+    lo = (unsigned long)d;
+    hi = (unsigned long)(d >> 64);
+    if (lo != 0xAAAAULL) return 3;
+    if (hi != 0xBBBBULL) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("codegen_int128_param_return_opt", code),
+        0
+    );
+}

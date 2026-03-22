@@ -749,6 +749,22 @@ impl RegAlloc {
                                 stack_arg_offset += 8;
                             }
                             fp_arg_idx += 1;
+                        } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
+                            // __int128: uses two GP registers. Allocate a 16-byte
+                            // stack slot for the arg pseudo so store_args_to_stack
+                            // can store both halves, and the IR store can copy from it.
+                            self.stack_offset = (self.stack_offset + 15) & !15; // 16-byte align
+                            self.stack_offset += 16;
+                            self.locations
+                                .insert(pseudo.id, Loc::Stack(self.stack_offset));
+                            self.int128_pseudos.insert(pseudo.id);
+                            if int_arg_idx + 1 < int_arg_regs.len() {
+                                self.free_regs.retain(|&r| {
+                                    r != int_arg_regs[int_arg_idx]
+                                        && r != int_arg_regs[int_arg_idx + 1]
+                                });
+                            }
+                            int_arg_idx += 2;
                         } else {
                             let type_size = types.size_bits(*typ);
                             let is_large_struct = (types.kind(*typ)
@@ -1013,13 +1029,11 @@ impl RegAlloc {
                             let size = (types.size_bits(local_var.typ) / 8) as i32;
                             let size = size.max(8);
                             // Determine alignment: explicit _Alignas takes precedence
+                            let natural_align = types.alignment(local_var.typ) as i32;
                             let alignment = if let Some(explicit) = local_var.explicit_align {
                                 explicit as i32
-                            } else if size >= 16 {
-                                // Long double (size 16) needs 16-byte alignment for x87 access
-                                16
                             } else {
-                                8
+                                natural_align.max(8)
                             };
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
 

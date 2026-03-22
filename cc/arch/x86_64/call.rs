@@ -470,6 +470,22 @@ impl X86_64CodeGen {
                     self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
                     int_arg_idx += 1;
                 }
+            } else if arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+                // __int128 argument: load lo and hi halves into two consecutive GP registers
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let arg_loc = self.get_location(arg).clone();
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_lo_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_hi_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                    });
+                }
+                int_arg_idx += 2;
             } else {
                 self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
                 int_arg_idx += 1;

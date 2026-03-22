@@ -604,6 +604,7 @@ impl X86_64CodeGen {
                             let is_complex = types.is_complex(*typ);
                             let is_longdouble =
                                 types.kind(*typ) == crate::types::TypeKind::LongDouble;
+                            let is_int128 = types.kind(*typ) == TypeKind::Int128;
                             let is_medium_struct = !is_complex
                                 && (types.kind(*typ) == crate::types::TypeKind::Struct
                                     || types.kind(*typ) == crate::types::TypeKind::Union)
@@ -611,6 +612,8 @@ impl X86_64CodeGen {
                                 && type_size_bits <= 128;
                             if is_complex {
                                 fp_arg_idx += 2;
+                            } else if is_int128 {
+                                int_arg_idx += 2;
                             } else if is_medium_struct {
                                 // Check ABI classification for medium structs
                                 let abi = crate::abi::SysVAmd64Abi;
@@ -712,6 +715,26 @@ impl X86_64CodeGen {
                                 }
                             }
                             fp_arg_idx += 1;
+                        } else if types.kind(*typ) == TypeKind::Int128 {
+                            // __int128 argument — uses TWO consecutive GP registers
+                            // Store to the arg pseudo's stack slot (allocated by regalloc)
+                            if int_arg_idx + 1 < int_arg_regs.len() {
+                                if let Some(loc) = self.locations.get(&pseudo.id).cloned() {
+                                    // Store lo half from first GP register
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                                    });
+                                    // Store hi half from second GP register
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                                    });
+                                }
+                            }
+                            int_arg_idx += 2;
                         } else {
                             // Integer argument
                             if int_arg_idx < int_arg_regs.len() {
@@ -1037,6 +1060,19 @@ impl X86_64CodeGen {
                     let fp_size = types.size_bits(fp_typ).max(32);
                     self.emit_fp_move(*src, XmmReg::Xmm0, fp_size);
                 }
+            } else if ret_typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+                // __int128 return: lo half → RAX, hi half → RDX
+                let loc = self.get_location(*src).clone();
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                    dst: GpOperand::Reg(Reg::Rdx),
+                });
             } else {
                 self.emit_move(*src, Reg::Rax, ret_size);
             }
@@ -2818,7 +2854,7 @@ impl X86_64CodeGen {
     }
 
     /// Helper: get lo-half MemAddr for a 128-bit Loc.
-    fn int128_lo_mem_loc(&self, loc: &Loc) -> MemAddr {
+    pub(super) fn int128_lo_mem_loc(&self, loc: &Loc) -> MemAddr {
         match loc {
             Loc::Stack(offset) => self.stack_mem(*offset),
             Loc::IncomingArg(offset) => MemAddr::BaseOffset {
@@ -2830,7 +2866,7 @@ impl X86_64CodeGen {
     }
 
     /// Helper: get hi-half MemAddr for a 128-bit Loc.
-    fn int128_hi_mem_loc(&self, loc: &Loc) -> MemAddr {
+    pub(super) fn int128_hi_mem_loc(&self, loc: &Loc) -> MemAddr {
         match loc {
             Loc::Stack(offset) => self.stack_mem(*offset - 8),
             Loc::IncomingArg(offset) => MemAddr::BaseOffset {

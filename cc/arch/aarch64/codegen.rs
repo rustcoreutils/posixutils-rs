@@ -812,6 +812,8 @@ impl Aarch64CodeGen {
                                 fp_arg_idx += 2;
                             } else if is_fp {
                                 fp_arg_idx += 1;
+                            } else if types.kind(*typ) == TypeKind::Int128 {
+                                int_arg_idx += 2;
                             } else {
                                 int_arg_idx += 1;
                             }
@@ -877,6 +879,28 @@ impl Aarch64CodeGen {
                                 }
                             }
                             fp_arg_idx += 1;
+                        } else if types.kind(*typ) == TypeKind::Int128 {
+                            // __int128 argument — uses TWO consecutive GP registers
+                            // Look up the local variable (same name as param) for stack location
+                            if int_arg_idx + 1 < arg_regs.len() {
+                                let param_name = &func.params[i].0;
+                                if let Some(local) = func.locals.get(param_name) {
+                                    if let Some(&Loc::Stack(offset)) =
+                                        self.locations.get(&local.sym)
+                                    {
+                                        if offset < 0 {
+                                            // STP stores two 64-bit registers to consecutive memory
+                                            self.push_lir(Aarch64Inst::Stp {
+                                                size: OperandSize::B64,
+                                                src1: arg_regs[int_arg_idx],
+                                                src2: arg_regs[int_arg_idx + 1],
+                                                addr: self.stack_mem(offset),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            int_arg_idx += 2;
                         } else {
                             // GP argument
                             if int_arg_idx < arg_regs.len() {

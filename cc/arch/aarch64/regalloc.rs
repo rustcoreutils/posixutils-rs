@@ -41,7 +41,7 @@ use crate::arch::regalloc::{
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::{TypeKind, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ============================================================================
@@ -1039,37 +1039,32 @@ impl RegAlloc {
 
             // Force stack allocation for complex and struct return values from calls
             // These types span multiple FP/GP registers and cannot fit in a single register
-            let needs_stack_for_multi_reg_return = func.blocks.iter().any(|b| {
-                b.insns.iter().any(|insn| {
+            let multi_reg_return_typ: Option<TypeId> = func.blocks.iter().find_map(|b| {
+                b.insns.iter().find_map(|insn| {
                     if insn.op == Opcode::Call && insn.target == Some(interval.pseudo) {
                         if let Some(typ) = insn.typ {
                             // Complex types use V0+V1 (2 FP regs)
                             // Struct/union types may use multiple regs depending on size
                             let kind = types.kind(typ);
-                            types.is_complex(typ)
+                            if types.is_complex(typ)
                                 || matches!(kind, TypeKind::Struct | TypeKind::Union)
-                        } else {
-                            false
+                            {
+                                return Some(typ);
+                            }
                         }
+                        None
                     } else {
-                        false
+                        None
                     }
                 })
             });
 
-            if needs_stack_for_multi_reg_return {
-                let size = func
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.insns)
-                    .find(|insn| insn.target == Some(interval.pseudo))
-                    .map(|insn| (insn.size / 8) as i32)
-                    .unwrap_or(8)
-                    .max(8);
-                let aligned_size = (size + 7) & !7;
-                self.stack_offset += aligned_size;
-                self.locations
-                    .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+            if let Some(typ) = multi_reg_return_typ {
+                let size = (types.size_bits(typ) / 8) as i32;
+                let size = size.max(8);
+                let alignment = types.alignment(typ) as i32;
+                let aligned_size = (size + (alignment - 1)) & !(alignment - 1);
+                self.alloc_stack_slot(&interval, aligned_size, alignment, false);
                 continue;
             }
 

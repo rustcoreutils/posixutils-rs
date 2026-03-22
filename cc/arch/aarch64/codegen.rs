@@ -1106,6 +1106,26 @@ impl Aarch64CodeGen {
                     }
                     _ => {}
                 }
+            } else if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+                // __int128 return: lo half → X0, hi half → X1
+                let loc = self.get_location(src);
+                if let Loc::Stack(offset) = loc {
+                    let mem = self.stack_mem(offset);
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: Reg::X0,
+                        dst2: Reg::X1,
+                    });
+                } else {
+                    // Fallback: load lo half to X0, zero X1
+                    self.emit_move(src, Reg::X0, 64);
+                    self.push_lir(Aarch64Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::Xzr),
+                        dst: Reg::X1,
+                    });
+                }
             } else if is_fp {
                 self.emit_fp_move(src, VReg::V0, insn.typ, ret_size, types);
             } else {

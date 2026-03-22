@@ -519,9 +519,17 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // Load operands: src1 -> (X9=lo1, X10=hi1), src2 -> (X11=lo2, X16=hi2)
+        // Load src1 as 128-bit: X9=lo1, X10=hi1
         self.load_int128(src1, Reg::X9, Reg::X10);
-        self.load_int128(src2, Reg::X11, Reg::X16);
+
+        // For shift ops, src2 is the shift amount (a regular small integer, not int128).
+        // Load it as a 64-bit value into X11 only. For all other ops, load as 128-bit.
+        let is_shift = matches!(insn.op, Opcode::Shl | Opcode::Lsr | Opcode::Asr);
+        if is_shift {
+            self.emit_move(src2, Reg::X11, 64);
+        } else {
+            self.load_int128(src2, Reg::X11, Reg::X16);
+        }
 
         match insn.op {
             Opcode::Add => {

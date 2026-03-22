@@ -800,6 +800,26 @@ impl RegAlloc {
                                 stack_arg_offset += 8;
                             }
                             fp_arg_idx += 1;
+                        } else if types.kind(*typ) == TypeKind::Int128 {
+                            // __int128 uses two consecutive GP registers
+                            if int_arg_idx + 1 < int_arg_regs.len() {
+                                // Allocate a 16-byte aligned stack slot for the int128
+                                // (int128 always lives on stack, never in a single reg)
+                                self.stack_offset += 16;
+                                let slot = -self.stack_offset;
+                                self.locations.insert(pseudo.id, Loc::Stack(slot));
+                                // Reserve both GP registers (they'll be stored in prologue)
+                                self.free_regs.retain(|&r| {
+                                    r != int_arg_regs[int_arg_idx]
+                                        && r != int_arg_regs[int_arg_idx + 1]
+                                });
+                            } else {
+                                // Stack args: int128 takes 16 bytes
+                                self.locations
+                                    .insert(pseudo.id, Loc::Stack(stack_arg_offset));
+                                stack_arg_offset += 16;
+                            }
+                            int_arg_idx += 2;
                         } else {
                             if int_arg_idx < int_arg_regs.len() {
                                 self.locations

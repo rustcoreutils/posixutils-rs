@@ -994,8 +994,13 @@ impl RegAlloc {
                         if let Some(local) = func.locals.get(name) {
                             let size = (types.size_bits(local.typ) / 8) as i32;
                             let size = size.max(8);
-                            // Determine alignment: explicit _Alignas takes precedence
-                            let alignment = local.explicit_align.unwrap_or(8) as i32;
+                            // Determine alignment: explicit _Alignas takes precedence,
+                            // otherwise use natural type alignment (16 for __int128, etc.)
+                            let natural_align = types.alignment(local.typ) as i32;
+                            let alignment = local
+                                .explicit_align
+                                .map(|a| a as i32)
+                                .unwrap_or(natural_align.max(8));
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
 
                             // Stack slot reuse uses block-level interference checks
@@ -1016,6 +1021,20 @@ impl RegAlloc {
                     }
                     _ => {}
                 }
+            }
+
+            // Force 128-bit integers to 16-byte aligned stack slots (never in GP regs)
+            let is_int128 = func.blocks.iter().any(|b| {
+                b.insns.iter().any(|insn| {
+                    insn.typ
+                        .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128)
+                        && (insn.target == Some(interval.pseudo)
+                            || insn.src.contains(&interval.pseudo))
+                })
+            });
+            if is_int128 {
+                self.alloc_stack_slot(&interval, 16, 16, true);
+                continue;
             }
 
             // Force stack allocation for complex and struct return values from calls

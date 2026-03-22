@@ -27,7 +27,6 @@
 //
 
 use crate::target::{Arch, Os, Target};
-use crate::types::TypeKind;
 
 /// ABI used for Float16 parameters/returns in rtlib functions.
 ///
@@ -63,12 +62,6 @@ impl<'a> RtlibNames<'a> {
     /// Create a new RtlibNames for the given target
     pub fn new(target: &'a Target) -> Self {
         Self { target }
-    }
-
-    /// Returns true if long double is the same as double on this platform.
-    /// On macOS aarch64 (Apple Silicon), long double is 64-bit (same as double).
-    pub fn longdouble_is_double(&self) -> bool {
-        self.target.arch == Arch::Aarch64 && self.target.os == Os::MacOS
     }
 
     /// Returns the ABI used by this rtlib for Float16 parameters/returns.
@@ -138,105 +131,11 @@ impl<'a> RtlibNames<'a> {
             _ => None,
         }
     }
-
-    // ========================================================================
-    // Complex operations
-    // ========================================================================
-
-    /// Get function name for complex multiplication
-    ///
-    /// Complex multiply: result = __mulXc3(a_real, a_imag, b_real, b_imag)
-    pub fn complex_mul(&self, base_kind: TypeKind) -> &'static str {
-        match base_kind {
-            TypeKind::Float => "__mulsc3",
-            TypeKind::Double => "__muldc3",
-            TypeKind::LongDouble => {
-                if self.longdouble_is_double() {
-                    "__muldc3" // macOS aarch64: long double == double
-                } else {
-                    match self.target.arch {
-                        Arch::X86_64 => "__mulxc3",  // x87 80-bit
-                        Arch::Aarch64 => "__multc3", // IEEE quad 128-bit
-                    }
-                }
-            }
-            _ => "__muldc3", // fallback
-        }
-    }
-
-    /// Get function name for complex division
-    ///
-    /// Complex divide: result = __divXc3(a_real, a_imag, b_real, b_imag)
-    /// Uses Smith's method for robust overflow handling.
-    pub fn complex_div(&self, base_kind: TypeKind) -> &'static str {
-        match base_kind {
-            TypeKind::Float => "__divsc3",
-            TypeKind::Double => "__divdc3",
-            TypeKind::LongDouble => {
-                if self.longdouble_is_double() {
-                    "__divdc3"
-                } else {
-                    match self.target.arch {
-                        Arch::X86_64 => "__divxc3",
-                        Arch::Aarch64 => "__divtc3",
-                    }
-                }
-            }
-            _ => "__divdc3", // fallback
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_complex_mul_float() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        let rtlib = RtlibNames::new(&target);
-        assert_eq!(rtlib.complex_mul(TypeKind::Float), "__mulsc3");
-    }
-
-    #[test]
-    fn test_complex_mul_double() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        let rtlib = RtlibNames::new(&target);
-        assert_eq!(rtlib.complex_mul(TypeKind::Double), "__muldc3");
-    }
-
-    #[test]
-    fn test_complex_mul_longdouble_x86_64() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        let rtlib = RtlibNames::new(&target);
-        assert_eq!(rtlib.complex_mul(TypeKind::LongDouble), "__mulxc3");
-    }
-
-    #[test]
-    fn test_complex_mul_longdouble_aarch64_linux() {
-        let target = Target::new(Arch::Aarch64, Os::Linux);
-        let rtlib = RtlibNames::new(&target);
-        assert_eq!(rtlib.complex_mul(TypeKind::LongDouble), "__multc3");
-    }
-
-    #[test]
-    fn test_complex_mul_longdouble_aarch64_macos() {
-        // On macOS aarch64, long double == double
-        let target = Target::new(Arch::Aarch64, Os::MacOS);
-        let rtlib = RtlibNames::new(&target);
-        assert_eq!(rtlib.complex_mul(TypeKind::LongDouble), "__muldc3");
-    }
-
-    #[test]
-    fn test_longdouble_is_double() {
-        let macos_arm = Target::new(Arch::Aarch64, Os::MacOS);
-        let linux_arm = Target::new(Arch::Aarch64, Os::Linux);
-        let linux_x86 = Target::new(Arch::X86_64, Os::Linux);
-
-        assert!(RtlibNames::new(&macos_arm).longdouble_is_double());
-        assert!(!RtlibNames::new(&linux_arm).longdouble_is_double());
-        assert!(!RtlibNames::new(&linux_x86).longdouble_is_double());
-    }
 
     // ========================================================================
     // Float16 (_Float16) rtlib tests

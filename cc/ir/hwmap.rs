@@ -336,6 +336,50 @@ fn map_common(insn: &Instruction, types: &TypeTable, target: &Target) -> Option<
     map_longdouble_convert(insn, types, target)
 }
 
+// ============================================================================
+// Complex number rtlib name selection
+// ============================================================================
+
+/// Get the rtlib function name for complex multiplication.
+/// Target-dependent for long double (x87 vs IEEE quad).
+pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
+    match base_kind {
+        TypeKind::Float => "__mulsc3",
+        TypeKind::Double => "__muldc3",
+        TypeKind::LongDouble => {
+            if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
+                "__muldc3" // macOS aarch64: long double == double
+            } else {
+                match target.arch {
+                    Arch::X86_64 => "__mulxc3",
+                    Arch::Aarch64 => "__multc3",
+                }
+            }
+        }
+        _ => "__muldc3",
+    }
+}
+
+/// Get the rtlib function name for complex division.
+/// Target-dependent for long double (x87 vs IEEE quad).
+pub fn complex_div_name(base_kind: TypeKind, target: &Target) -> &'static str {
+    match base_kind {
+        TypeKind::Float => "__divsc3",
+        TypeKind::Double => "__divdc3",
+        TypeKind::LongDouble => {
+            if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
+                "__divdc3"
+            } else {
+                match target.arch {
+                    Arch::X86_64 => "__divxc3",
+                    Arch::Aarch64 => "__divtc3",
+                }
+            }
+        }
+        _ => "__divdc3",
+    }
+}
+
 /// Trait for target-specific hardware mapping decisions.
 pub trait TargetHwMap {
     /// Determine how the target handles a given instruction.
@@ -1743,5 +1787,63 @@ mod tests {
         // x86_64 long double conversions are native
         let insn = make_convert_insn(Opcode::FCvtF, types.longdouble_id, 80, types.float_id, 32);
         assert_eq!(hwmap.map_op(&insn, &types), HwMapAction::Legal);
+    }
+
+    // ========================================================================
+    // Phase 2e: Complex mul/div rtlib name tests
+    // ========================================================================
+
+    #[test]
+    fn test_complex_mul_name_float() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        assert_eq!(complex_mul_name(TypeKind::Float, &target), "__mulsc3");
+    }
+
+    #[test]
+    fn test_complex_mul_name_double() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        assert_eq!(complex_mul_name(TypeKind::Double, &target), "__muldc3");
+    }
+
+    #[test]
+    fn test_complex_mul_name_longdouble() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        assert_eq!(complex_mul_name(TypeKind::LongDouble, &x86), "__mulxc3");
+
+        let arm_linux = Target::new(Arch::Aarch64, Os::Linux);
+        assert_eq!(
+            complex_mul_name(TypeKind::LongDouble, &arm_linux),
+            "__multc3"
+        );
+
+        let arm_macos = Target::new(Arch::Aarch64, Os::MacOS);
+        assert_eq!(
+            complex_mul_name(TypeKind::LongDouble, &arm_macos),
+            "__muldc3"
+        );
+    }
+
+    #[test]
+    fn test_complex_div_name_float() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        assert_eq!(complex_div_name(TypeKind::Float, &target), "__divsc3");
+    }
+
+    #[test]
+    fn test_complex_div_name_longdouble() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        assert_eq!(complex_div_name(TypeKind::LongDouble, &x86), "__divxc3");
+
+        let arm_linux = Target::new(Arch::Aarch64, Os::Linux);
+        assert_eq!(
+            complex_div_name(TypeKind::LongDouble, &arm_linux),
+            "__divtc3"
+        );
+
+        let arm_macos = Target::new(Arch::Aarch64, Os::MacOS);
+        assert_eq!(
+            complex_div_name(TypeKind::LongDouble, &arm_macos),
+            "__divdc3"
+        );
     }
 }

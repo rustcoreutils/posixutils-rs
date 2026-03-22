@@ -7913,10 +7913,8 @@ impl<'a> Linearizer<'a> {
             }
             BinaryOp::Mul => {
                 // Complex multiply via rtlib call (__mulsc3, __muldc3, etc.)
-                // Uses robust implementation that handles overflow correctly
-                let rtlib = RtlibNames::new(self.target);
                 let base_kind = self.types.kind(base_typ);
-                let func_name = rtlib.complex_mul(base_kind);
+                let func_name = crate::ir::hwmap::complex_mul_name(base_kind, self.target);
                 let call_result = self.emit_complex_rtlib_call(
                     func_name,
                     (left_real, left_imag),
@@ -7939,10 +7937,8 @@ impl<'a> Linearizer<'a> {
             }
             BinaryOp::Div => {
                 // Complex divide via rtlib call (__divsc3, __divdc3, etc.)
-                // Uses Smith's method for robust overflow handling
-                let rtlib = RtlibNames::new(self.target);
                 let base_kind = self.types.kind(base_typ);
-                let func_name = rtlib.complex_div(base_kind);
+                let func_name = crate::ir::hwmap::complex_div_name(base_kind, self.target);
                 let call_result = self.emit_complex_rtlib_call(
                     func_name,
                     (left_real, left_imag),

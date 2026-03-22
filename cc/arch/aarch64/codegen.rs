@@ -881,22 +881,17 @@ impl Aarch64CodeGen {
                             fp_arg_idx += 1;
                         } else if types.kind(*typ) == TypeKind::Int128 {
                             // __int128 argument — uses TWO consecutive GP registers
-                            // Look up the local variable (same name as param) for stack location
+                            // Store to the arg pseudo's stack slot (allocated in allocate_arguments).
+                            // The IR will Copy from arg pseudo → local variable.
                             if int_arg_idx + 1 < arg_regs.len() {
-                                let param_name = &func.params[i].0;
-                                if let Some(local) = func.locals.get(param_name) {
-                                    if let Some(&Loc::Stack(offset)) =
-                                        self.locations.get(&local.sym)
-                                    {
-                                        if offset < 0 {
-                                            // STP stores two 64-bit registers to consecutive memory
-                                            self.push_lir(Aarch64Inst::Stp {
-                                                size: OperandSize::B64,
-                                                src1: arg_regs[int_arg_idx],
-                                                src2: arg_regs[int_arg_idx + 1],
-                                                addr: self.stack_mem(offset),
-                                            });
-                                        }
+                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                    if *offset < 0 {
+                                        self.push_lir(Aarch64Inst::Stp {
+                                            size: OperandSize::B64,
+                                            src1: arg_regs[int_arg_idx],
+                                            src2: arg_regs[int_arg_idx + 1],
+                                            addr: self.stack_mem(*offset),
+                                        });
                                     }
                                 }
                             }

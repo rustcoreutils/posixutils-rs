@@ -642,29 +642,6 @@ pub enum Aarch64Inst {
     /// UMULH - Unsigned multiply high (upper 64 bits of 64x64->128 multiply)
     Umulh { src1: Reg, src2: Reg, dst: Reg },
 
-    /// MADD - Multiply-add: dst = acc + (src1 * src2)
-    MAdd {
-        size: OperandSize,
-        src1: Reg,
-        src2: Reg,
-        acc: Reg,
-        dst: Reg,
-    },
-
-    /// NEGS - Negate and set flags (used for 128-bit negate: lo half)
-    Negs {
-        size: OperandSize,
-        src: Reg,
-        dst: Reg,
-    },
-
-    /// NGC - Negate with carry (used for 128-bit negate: hi half)
-    Ngc {
-        size: OperandSize,
-        src: Reg,
-        dst: Reg,
-    },
-
     // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
@@ -1786,44 +1763,6 @@ impl EmitAsm for Aarch64Inst {
                     dst.name_for_size(64),
                     src1.name_for_size(64),
                     src2.name_for_size(64)
-                );
-            }
-
-            Aarch64Inst::MAdd {
-                size,
-                src1,
-                src2,
-                acc,
-                dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    madd {}, {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.name_for_size(sz),
-                    acc.name_for_size(sz)
-                );
-            }
-
-            Aarch64Inst::Negs { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    negs {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
-            Aarch64Inst::Ngc { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    ngc {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
                 );
             }
 

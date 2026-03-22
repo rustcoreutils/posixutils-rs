@@ -172,10 +172,6 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
-        if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
-            self.emit_int128_unary(insn, op);
-            return;
-        }
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -211,10 +207,6 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
-        if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
-            self.emit_int128_mul(insn);
-            return;
-        }
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -259,10 +251,6 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
-        if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
-            self.emit_int128_div(insn);
-            return;
-        }
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -339,10 +327,6 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
-        if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
-            self.emit_int128_compare(insn);
-            return;
-        }
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -721,50 +705,9 @@ impl X86_64CodeGen {
         Label::new(prefix, suffix)
     }
 
-    /// Get the GpOperand for the lo half of src2 (for use in add/sub/etc).
-    /// If the operand is an immediate, returns GpOperand::Imm or loads into R11.
-    fn int128_src2_lo_operand(&mut self, src2: PseudoId) -> GpOperand {
-        let loc = self.get_location(src2);
-        match &loc {
-            Loc::Imm(v) => {
-                let lo = *v as i64;
-                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: lo,
-                        dst: Reg::R11,
-                    });
-                    GpOperand::Reg(Reg::R11)
-                } else {
-                    GpOperand::Imm(lo)
-                }
-            }
-            Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_lo_mem(&loc)),
-            _ => panic!("int128_src2_lo_operand: unexpected loc {:?}", loc),
-        }
-    }
-
-    /// Get the GpOperand for the hi half of src2.
-    fn int128_src2_hi_operand(&mut self, src2: PseudoId) -> GpOperand {
-        let loc = self.get_location(src2);
-        match &loc {
-            Loc::Imm(v) => {
-                let hi = (*v >> 64) as i64;
-                if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: hi,
-                        dst: Reg::R11,
-                    });
-                    GpOperand::Reg(Reg::R11)
-                } else {
-                    GpOperand::Imm(hi)
-                }
-            }
-            Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_hi_mem(&loc)),
-            _ => panic!("int128_src2_hi_operand: unexpected loc {:?}", loc),
-        }
-    }
-
-    /// Emit 128-bit binary operation (Add, Sub, And, Or, Xor, Shl, Lsr, Asr).
+    /// Emit 128-bit shift operations (Shl, Lsr, Asr).
+    /// Other int128 ops (Add, Sub, And, Or, Xor, Mul, Neg, Not, comparisons)
+    /// are expanded by the hwmap pass into 64-bit sequences.
     fn emit_int128_binop(&mut self, insn: &Instruction) {
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -777,91 +720,6 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
 
         match insn.op {
-            Opcode::Add => {
-                // lo: addq src2_lo, src1_lo → dst_lo (sets CF)
-                // hi: adcq src2_hi, src1_hi → dst_hi (uses CF)
-                self.int128_load_lo(src1, Reg::R10);
-                let src2_lo = self.int128_src2_lo_operand(src2);
-                self.push_lir(X86Inst::Add {
-                    size: OperandSize::B64,
-                    src: src2_lo,
-                    dst: Reg::R10,
-                });
-                self.int128_store_lo(Reg::R10, &dst_loc);
-                self.int128_load_hi(src1, Reg::R10);
-                let src2_hi = self.int128_src2_hi_operand(src2);
-                self.push_lir(X86Inst::Adc {
-                    size: OperandSize::B64,
-                    src: src2_hi,
-                    dst: Reg::R10,
-                });
-                self.int128_store_hi(Reg::R10, &dst_loc);
-            }
-            Opcode::Sub => {
-                // lo: subq src2_lo, src1_lo → dst_lo (sets CF)
-                // hi: sbbq src2_hi, src1_hi → dst_hi (uses CF)
-                self.int128_load_lo(src1, Reg::R10);
-                let src2_lo = self.int128_src2_lo_operand(src2);
-                self.push_lir(X86Inst::Sub {
-                    size: OperandSize::B64,
-                    src: src2_lo,
-                    dst: Reg::R10,
-                });
-                self.int128_store_lo(Reg::R10, &dst_loc);
-                self.int128_load_hi(src1, Reg::R10);
-                let src2_hi = self.int128_src2_hi_operand(src2);
-                self.push_lir(X86Inst::Sbb {
-                    size: OperandSize::B64,
-                    src: src2_hi,
-                    dst: Reg::R10,
-                });
-                self.int128_store_hi(Reg::R10, &dst_loc);
-            }
-            Opcode::And | Opcode::Or | Opcode::Xor => {
-                // Independent 64-bit ops on lo and hi halves (no carry)
-                self.int128_load_lo(src1, Reg::R10);
-                let src2_lo = self.int128_src2_lo_operand(src2);
-                match insn.op {
-                    Opcode::And => self.push_lir(X86Inst::And {
-                        size: OperandSize::B64,
-                        src: src2_lo,
-                        dst: Reg::R10,
-                    }),
-                    Opcode::Or => self.push_lir(X86Inst::Or {
-                        size: OperandSize::B64,
-                        src: src2_lo,
-                        dst: Reg::R10,
-                    }),
-                    Opcode::Xor => self.push_lir(X86Inst::Xor {
-                        size: OperandSize::B64,
-                        src: src2_lo,
-                        dst: Reg::R10,
-                    }),
-                    _ => unreachable!(),
-                }
-                self.int128_store_lo(Reg::R10, &dst_loc);
-                self.int128_load_hi(src1, Reg::R10);
-                let src2_hi = self.int128_src2_hi_operand(src2);
-                match insn.op {
-                    Opcode::And => self.push_lir(X86Inst::And {
-                        size: OperandSize::B64,
-                        src: src2_hi,
-                        dst: Reg::R10,
-                    }),
-                    Opcode::Or => self.push_lir(X86Inst::Or {
-                        size: OperandSize::B64,
-                        src: src2_hi,
-                        dst: Reg::R10,
-                    }),
-                    Opcode::Xor => self.push_lir(X86Inst::Xor {
-                        size: OperandSize::B64,
-                        src: src2_hi,
-                        dst: Reg::R10,
-                    }),
-                    _ => unreachable!(),
-                }
-                self.int128_store_hi(Reg::R10, &dst_loc);
-            }
             Opcode::Shl => {
                 self.emit_int128_shl(src1, src2, &dst_loc);
             }
@@ -1211,385 +1069,6 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
     }
 
-    /// Emit 128-bit multiply.
-    /// result_lo = lo(src1_lo * src2_lo)
-    /// result_hi = hi(src1_lo * src2_lo) + src1_lo * src2_hi + src1_hi * src2_lo
-    ///
-    /// Uses RAX, RDX (for mul), R10, R11 as scratch. RAX/RDX are allocatable
-    /// but the regalloc ensures they are not live across this instruction.
-    fn emit_int128_mul(&mut self, insn: &Instruction) {
-        let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
-            (Some(&s1), Some(&s2)) => (s1, s2),
-            _ => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-
-        // Step 1: RAX = src1_lo, mulq src2_lo → RDX:RAX = src1_lo * src2_lo
-        self.int128_load_lo(src1, Reg::Rax);
-        let src2_lo_loc = self.get_location(src2);
-        let src2_lo_op = match &src2_lo_loc {
-            Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_lo_mem(&src2_lo_loc)),
-            Loc::Imm(v) => {
-                let lo = *v as i64;
-                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: lo,
-                        dst: Reg::R10,
-                    });
-                } else {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(lo),
-                        dst: GpOperand::Reg(Reg::R10),
-                    });
-                }
-                GpOperand::Reg(Reg::R10)
-            }
-            _ => panic!("int128_mul: unexpected src2 loc {:?}", src2_lo_loc),
-        };
-        self.push_lir(X86Inst::Mul1 {
-            size: OperandSize::B64,
-            src: src2_lo_op,
-        });
-        // RAX = result_lo, RDX = partial_hi
-        self.int128_store_lo(Reg::Rax, &dst_loc);
-        // Save partial_hi in R11
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rdx),
-            dst: GpOperand::Reg(Reg::R11),
-        });
-
-        // Step 2: R10 = src1_hi * src2_lo (only lo 64 bits matter)
-        self.int128_load_hi(src1, Reg::R10);
-        // We need src2_lo in a register for imulq
-        let src2_lo_loc2 = self.get_location(src2);
-        let src2_lo_gp = match &src2_lo_loc2 {
-            Loc::Stack(_) | Loc::IncomingArg(_) => {
-                GpOperand::Mem(self.int128_lo_mem(&src2_lo_loc2))
-            }
-            Loc::Imm(v) => {
-                let lo = *v as i64;
-                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: lo,
-                        dst: Reg::Rax,
-                    });
-                    GpOperand::Reg(Reg::Rax)
-                } else {
-                    GpOperand::Imm(lo)
-                }
-            }
-            _ => panic!("int128_mul: unexpected src2 loc {:?}", src2_lo_loc2),
-        };
-        self.push_lir(X86Inst::IMul2 {
-            size: OperandSize::B64,
-            src: src2_lo_gp,
-            dst: Reg::R10,
-        });
-        // R11 += R10
-        self.push_lir(X86Inst::Add {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: Reg::R11,
-        });
-
-        // Step 3: R10 = src1_lo * src2_hi (only lo 64 bits matter)
-        self.int128_load_lo(src1, Reg::R10);
-        let src2_hi_loc = self.get_location(src2);
-        let src2_hi_gp = match &src2_hi_loc {
-            Loc::Stack(_) | Loc::IncomingArg(_) => GpOperand::Mem(self.int128_hi_mem(&src2_hi_loc)),
-            Loc::Imm(v) => {
-                let hi = (*v >> 64) as i64;
-                if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: hi,
-                        dst: Reg::Rax,
-                    });
-                    GpOperand::Reg(Reg::Rax)
-                } else {
-                    GpOperand::Imm(hi)
-                }
-            }
-            _ => panic!("int128_mul: unexpected src2 loc {:?}", src2_hi_loc),
-        };
-        self.push_lir(X86Inst::IMul2 {
-            size: OperandSize::B64,
-            src: src2_hi_gp,
-            dst: Reg::R10,
-        });
-        // R11 += R10
-        self.push_lir(X86Inst::Add {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: Reg::R11,
-        });
-
-        // Store result_hi
-        self.int128_store_hi(Reg::R11, &dst_loc);
-    }
-
-    /// Emit 128-bit division.
-    /// For __int128 division, we call the compiler runtime functions
-    /// __divti3 (signed) or __udivti3 (unsigned).
-    /// Args: (lo1, hi1, lo2, hi2) in RDI, RSI, RDX, RCX
-    /// Returns: (lo, hi) in RAX, RDX
-    fn emit_int128_div(&mut self, insn: &Instruction) {
-        let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
-            (Some(&s1), Some(&s2)) => (s1, s2),
-            _ => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-
-        let func_name = match insn.op {
-            Opcode::DivS => "__divti3",
-            Opcode::DivU => "__udivti3",
-            Opcode::ModS => "__modti3",
-            Opcode::ModU => "__umodti3",
-            _ => return,
-        };
-
-        // SysV ABI: __int128 args passed as (lo, hi) pairs in GP registers
-        // arg1 = (RDI=lo1, RSI=hi1), arg2 = (RDX=lo2, RCX=hi2)
-        // BUT: we must be careful about order because loading src2_lo into RDX
-        // could clobber a register we need. Load src2 first into RCX/R10,
-        // then src1, then move src2_lo to RDX.
-
-        // Load src2_hi into RCX first
-        self.int128_load_hi(src2, Reg::Rcx);
-        // Load src2_lo into R10 (temporary, will move to RDX later)
-        self.int128_load_lo(src2, Reg::R10);
-        // Load src1
-        self.int128_load_lo(src1, Reg::Rdi);
-        self.int128_load_hi(src1, Reg::Rsi);
-        // Now move src2_lo to RDX
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: GpOperand::Reg(Reg::Rdx),
-        });
-
-        // Call the runtime function
-        let sym = crate::arch::lir::Symbol::global(func_name.to_string());
-        self.push_lir(X86Inst::Call {
-            target: crate::arch::lir::CallTarget::Direct(sym),
-        });
-
-        // Result in RAX (lo), RDX (hi)
-        self.int128_store_lo(Reg::Rax, &dst_loc);
-        self.int128_store_hi(Reg::Rdx, &dst_loc);
-    }
-
-    /// Emit 128-bit comparison.
-    fn emit_int128_compare(&mut self, insn: &Instruction) {
-        let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
-            (Some(&s1), Some(&s2)) => (s1, s2),
-            _ => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-        let work_reg = match &dst_loc {
-            Loc::Reg(r) => *r,
-            _ => Reg::R10,
-        };
-
-        match insn.op {
-            Opcode::SetEq | Opcode::SetNe => {
-                // XOR both halves and OR them. Result is zero iff equal.
-                self.int128_load_lo(src1, Reg::R10);
-                let src2_lo = self.int128_src2_lo_operand(src2);
-                self.push_lir(X86Inst::Xor {
-                    size: OperandSize::B64,
-                    src: src2_lo,
-                    dst: Reg::R10,
-                });
-                self.int128_load_hi(src1, Reg::R11);
-                let src2_hi = self.int128_src2_hi_operand(src2);
-                self.push_lir(X86Inst::Xor {
-                    size: OperandSize::B64,
-                    src: src2_hi,
-                    dst: Reg::R11,
-                });
-                self.push_lir(X86Inst::Or {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::R11),
-                    dst: Reg::R10,
-                });
-                let cc = if insn.op == Opcode::SetEq {
-                    CondCode::Eq
-                } else {
-                    CondCode::Ne
-                };
-                self.push_lir(X86Inst::SetCC { cc, dst: work_reg });
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B8,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(work_reg),
-                    dst: work_reg,
-                });
-            }
-            _ => {
-                // Ordered comparisons: compare hi first, then lo if hi equal.
-                // For signed: hi compared signed, lo compared unsigned.
-                // For unsigned: both compared unsigned.
-                let is_signed = matches!(
-                    insn.op,
-                    Opcode::SetLt | Opcode::SetLe | Opcode::SetGt | Opcode::SetGe
-                );
-
-                let hi_decides_label = self.int128_label("i128cmp_hi");
-                let done_label = self.int128_label("i128cmp_done");
-
-                // Compare hi halves
-                self.int128_load_hi(src1, Reg::R10);
-                let src2_hi = self.int128_src2_hi_operand(src2);
-                self.push_lir(X86Inst::Cmp {
-                    size: OperandSize::B64,
-                    src: src2_hi,
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                // If hi halves are not equal, the hi comparison decides
-                self.push_lir(X86Inst::Jcc {
-                    cc: CondCode::Ne,
-                    target: hi_decides_label.clone(),
-                });
-
-                // Hi halves are equal: compare lo halves (always unsigned)
-                self.int128_load_lo(src1, Reg::R10);
-                let src2_lo = self.int128_src2_lo_operand(src2);
-                self.push_lir(X86Inst::Cmp {
-                    size: OperandSize::B64,
-                    src: src2_lo,
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                // Use unsigned comparison for lo half
-                let lo_cc = match insn.op {
-                    Opcode::SetLt | Opcode::SetB => CondCode::Ult,
-                    Opcode::SetLe | Opcode::SetBe => CondCode::Ule,
-                    Opcode::SetGt | Opcode::SetA => CondCode::Ugt,
-                    Opcode::SetGe | Opcode::SetAe => CondCode::Uge,
-                    _ => CondCode::Ult,
-                };
-                self.push_lir(X86Inst::SetCC {
-                    cc: lo_cc,
-                    dst: work_reg,
-                });
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B8,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(work_reg),
-                    dst: work_reg,
-                });
-                self.push_lir(X86Inst::Jmp {
-                    target: done_label.clone(),
-                });
-
-                // Hi decides the comparison
-                self.push_lir(X86Inst::Directive(Directive::BlockLabel(hi_decides_label)));
-                let hi_cc = if is_signed {
-                    match insn.op {
-                        Opcode::SetLt => CondCode::Slt,
-                        Opcode::SetLe => CondCode::Sle,
-                        Opcode::SetGt => CondCode::Sgt,
-                        Opcode::SetGe => CondCode::Sge,
-                        _ => CondCode::Slt,
-                    }
-                } else {
-                    match insn.op {
-                        Opcode::SetB => CondCode::Ult,
-                        Opcode::SetBe => CondCode::Ule,
-                        Opcode::SetA => CondCode::Ugt,
-                        Opcode::SetAe => CondCode::Uge,
-                        _ => CondCode::Ult,
-                    }
-                };
-                self.push_lir(X86Inst::SetCC {
-                    cc: hi_cc,
-                    dst: work_reg,
-                });
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B8,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(work_reg),
-                    dst: work_reg,
-                });
-
-                self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
-            }
-        }
-
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, u32::BITS);
-        }
-    }
-
-    /// Emit 128-bit unary operation (Neg, Not).
-    fn emit_int128_unary(&mut self, insn: &Instruction, op: UnaryOp) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let dst_loc = self.get_location(target);
-
-        match op {
-            UnaryOp::Not => {
-                // Bitwise NOT: not lo; not hi
-                self.int128_load_lo(src, Reg::R10);
-                self.push_lir(X86Inst::Not {
-                    size: OperandSize::B64,
-                    dst: Reg::R10,
-                });
-                self.int128_store_lo(Reg::R10, &dst_loc);
-                self.int128_load_hi(src, Reg::R10);
-                self.push_lir(X86Inst::Not {
-                    size: OperandSize::B64,
-                    dst: Reg::R10,
-                });
-                self.int128_store_hi(Reg::R10, &dst_loc);
-            }
-            UnaryOp::Neg => {
-                // Two's complement negate: not lo; not hi; add $1, lo; adc $0, hi
-                self.int128_load_lo(src, Reg::R10);
-                self.push_lir(X86Inst::Not {
-                    size: OperandSize::B64,
-                    dst: Reg::R10,
-                });
-                self.push_lir(X86Inst::Add {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(1),
-                    dst: Reg::R10,
-                });
-                self.int128_store_lo(Reg::R10, &dst_loc);
-                self.int128_load_hi(src, Reg::R10);
-                self.push_lir(X86Inst::Not {
-                    size: OperandSize::B64,
-                    dst: Reg::R10,
-                });
-                self.push_lir(X86Inst::Adc {
-                    size: OperandSize::B64,
-                    src: GpOperand::Imm(0),
-                    dst: Reg::R10,
-                });
-                self.int128_store_hi(Reg::R10, &dst_loc);
-            }
-        }
-    }
-
     /// Emit 128-bit extend/truncate operations.
     fn emit_int128_extend(&mut self, insn: &Instruction) {
         let src = match insn.src.first() {
@@ -1601,111 +1080,43 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        if insn.size == 128 {
-            // Extending TO 128-bit
-            let dst_loc = self.get_location(target);
-            match insn.op {
-                Opcode::Zext => {
-                    // Zero-extend: lo = src, hi = 0
-                    self.emit_move(src, Reg::R10, insn.src_size.max(32));
-                    // If src_size < 64, ensure upper bits are zeroed
-                    if insn.src_size < 32 {
-                        let mask = (1i64 << insn.src_size) - 1;
-                        self.push_lir(X86Inst::And {
-                            size: OperandSize::B32,
-                            src: GpOperand::Imm(mask),
-                            dst: Reg::R10,
-                        });
-                    }
-                    self.int128_store_lo(Reg::R10, &dst_loc);
-                    self.int128_store_hi_imm(0, &dst_loc);
-                }
-                Opcode::Sext => {
-                    // Sign-extend: lo = src, hi = src >> 63 (sign extension)
-                    self.emit_move(src, Reg::R10, insn.src_size.max(32));
-                    // Sign-extend src to 64 bits first if needed
-                    match insn.src_size {
-                        8 => {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size: OperandSize::B8,
-                                dst_size: OperandSize::B64,
-                                src: GpOperand::Reg(Reg::R10),
-                                dst: Reg::R10,
-                            });
-                        }
-                        16 => {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size: OperandSize::B16,
-                                dst_size: OperandSize::B64,
-                                src: GpOperand::Reg(Reg::R10),
-                                dst: Reg::R10,
-                            });
-                        }
-                        32 => {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size: OperandSize::B32,
-                                dst_size: OperandSize::B64,
-                                src: GpOperand::Reg(Reg::R10),
-                                dst: Reg::R10,
-                            });
-                        }
-                        _ => {} // 64-bit: already correct
-                    }
-                    self.int128_store_lo(Reg::R10, &dst_loc);
-                    // hi = sign extension of lo
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    self.push_lir(X86Inst::Sar {
-                        size: OperandSize::B64,
-                        count: ShiftCount::Imm(63),
-                        dst: Reg::R11,
-                    });
-                    self.int128_store_hi(Reg::R11, &dst_loc);
-                }
-                _ => {}
+        // Truncating FROM 128-bit (insn.src_size == 128)
+        // Just load the lo half and truncate
+        let dst_loc = self.get_location(target);
+        let dst_reg = match &dst_loc {
+            Loc::Reg(r) => *r,
+            _ => Reg::R10,
+        };
+        self.int128_load_lo(src, dst_reg);
+        // Truncate to target size
+        match insn.size {
+            8 => {
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::B8,
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Reg(dst_reg),
+                    dst: dst_reg,
+                });
             }
-        } else {
-            // Truncating FROM 128-bit (insn.src_size == 128)
-            // Just load the lo half and truncate
-            let dst_loc = self.get_location(target);
-            let dst_reg = match &dst_loc {
-                Loc::Reg(r) => *r,
-                _ => Reg::R10,
-            };
-            self.int128_load_lo(src, dst_reg);
-            // Truncate to target size
-            match insn.size {
-                8 => {
-                    self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::B8,
-                        dst_size: OperandSize::B32,
-                        src: GpOperand::Reg(dst_reg),
-                        dst: dst_reg,
-                    });
-                }
-                16 => {
-                    self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::B16,
-                        dst_size: OperandSize::B32,
-                        src: GpOperand::Reg(dst_reg),
-                        dst: dst_reg,
-                    });
-                }
-                32 => {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(dst_reg),
-                        dst: GpOperand::Reg(dst_reg),
-                    });
-                }
-                _ => {} // 64-bit: lo half is the result
+            16 => {
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::B16,
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Reg(dst_reg),
+                    dst: dst_reg,
+                });
             }
-            if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
+            32 => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(dst_reg),
+                    dst: GpOperand::Reg(dst_reg),
+                });
             }
+            _ => {} // 64-bit: lo half is the result
+        }
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
         }
     }
 

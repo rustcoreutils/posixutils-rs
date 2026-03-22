@@ -237,6 +237,46 @@ impl Aarch64CodeGen {
                         typ: arg_type,
                     });
                 }
+            } else if arg_type.is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128) {
+                // __int128 uses two consecutive GP registers
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let loc = self.get_location(arg);
+                    match loc {
+                        Loc::Stack(offset) => {
+                            // Load lo/hi from int128 stack slot into two consecutive regs
+                            let mem = self.stack_mem(offset);
+                            self.push_lir(Aarch64Inst::Ldp {
+                                size: OperandSize::B64,
+                                addr: mem,
+                                dst1: int_arg_regs[int_arg_idx],
+                                dst2: int_arg_regs[int_arg_idx + 1],
+                            });
+                        }
+                        Loc::Imm128(v) => {
+                            let lo = v as u64 as i64;
+                            let hi = (v >> 64) as u64 as i64;
+                            self.emit_mov_imm(int_arg_regs[int_arg_idx], lo, 64);
+                            self.emit_mov_imm(int_arg_regs[int_arg_idx + 1], hi, 64);
+                        }
+                        _ => {
+                            self.emit_move(arg, int_arg_regs[int_arg_idx], 64);
+                            self.push_lir(Aarch64Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(Reg::Xzr),
+                                dst: int_arg_regs[int_arg_idx + 1],
+                            });
+                        }
+                    }
+                    int_arg_idx += 2;
+                } else {
+                    // Int128 on stack needs 16 bytes
+                    stack_args_info.push(StackArg {
+                        pseudo: arg,
+                        is_fp: false,
+                        size: 128,
+                        typ: arg_type,
+                    });
+                }
             } else if int_arg_idx < int_arg_regs.len() {
                 self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
                 int_arg_idx += 1;

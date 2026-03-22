@@ -39,12 +39,13 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    compute_live_intervals, expire_intervals, find_call_positions, find_conflicting_registers,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval,
+    compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
+    find_conflicting_registers, identify_addr_taken_syms, identify_fp_pseudos,
+    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ============================================================================
 // x86-64 Register Definitions
@@ -235,17 +236,11 @@ impl Reg {
 pub struct RegConstraints {
     /// Registers that are clobbered (written) by this instruction
     pub clobbers: &'static [Reg],
-    /// Registers that must hold specific input values
-    #[allow(dead_code)]
-    pub inputs: &'static [Reg],
 }
 
 impl RegConstraints {
     /// No constraints - most instructions have no implicit register requirements
-    pub const NONE: RegConstraints = RegConstraints {
-        clobbers: &[],
-        inputs: &[],
-    };
+    pub const NONE: RegConstraints = RegConstraints { clobbers: &[] };
 }
 
 /// Get register constraints for an opcode.
@@ -254,25 +249,19 @@ impl RegConstraints {
 /// VaArg clobbers Rax (used as scratch) and Rcx (used for sign-extended offset).
 pub fn opcode_constraints(op: Opcode) -> RegConstraints {
     match op {
-        // Division: uses Rax:Rdx as dividend, clobbers both with quotient/remainder
         Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
-            inputs: &[Reg::Rax],
         },
-        // Variable shifts: count must be in Cl (Rcx)
-        // The codegen moves the shift count INTO Rcx, clobbering it.
-        // For immediate shifts, this constraint is conservative but safe.
+        // Int128 mul uses `mulq` which clobbers RAX:RDX. Regular mul uses IMul2
+        // which doesn't depend on these, so marking them as clobbers is safe for both.
+        Opcode::Mul => RegConstraints {
+            clobbers: &[Reg::Rax, Reg::Rdx],
+        },
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => RegConstraints {
             clobbers: &[Reg::Rcx],
-            inputs: &[Reg::Rcx],
         },
-        // VaArg: emit_va_arg_int uses Rax for reg_save_area/overflow pointer,
-        // and Rcx for sign-extended offset calculation. Any pseudo that is live
-        // across a va_arg (but not the result or va_list operand) must not be
-        // in these registers.
         Opcode::VaArg => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rcx],
-            inputs: &[],
         },
         _ => RegConstraints::NONE,
     }
@@ -369,7 +358,8 @@ impl XmmReg {
     }
 
     /// All allocatable XMM registers
-    /// XMM0-XMM7 are caller-saved (scratch), XMM8-XMM15 are callee-saved on Windows but not on System V
+    /// All XMM registers (XMM0-XMM15) are caller-saved on x86-64 SysV ABI.
+    /// Values in XMM registers are NOT preserved across function calls.
     /// XMM14 and XMM15 are reserved as scratch registers for codegen operations
     pub fn allocatable() -> &'static [XmmReg] {
         &[
@@ -409,7 +399,7 @@ pub enum Loc {
     /// Used for function parameters 7+ that are passed on the stack by the caller
     IncomingArg(i32),
     /// Immediate integer constant
-    Imm(i64),
+    Imm(i128),
     /// Immediate float constant (value, size in bits)
     FImm(f64, u32),
     /// Global symbol
@@ -423,6 +413,18 @@ pub struct SpilledArg {
     pub pseudo: PseudoId,
     /// The register the argument originally arrived in
     pub from_reg: Reg,
+    /// The stack offset where it was spilled to
+    pub to_stack_offset: i32,
+}
+
+/// XMM argument that was spilled from an XMM register to the stack.
+/// All XMM registers are caller-saved on x86-64 SysV ABI, so FP arguments
+/// must be spilled if their live interval extends past the function entry.
+pub struct SpilledXmmArg {
+    /// The pseudo that was spilled
+    pub pseudo: PseudoId,
+    /// The XMM register the argument originally arrived in
+    pub from_xmm: XmmReg,
     /// The stack offset where it was spilled to
     pub to_stack_offset: i32,
 }
@@ -451,8 +453,24 @@ pub struct RegAlloc {
     fp_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are long double (use x87, need 16-byte stack slots)
     ld_pseudos: HashSet<PseudoId>,
+    /// Track which pseudos are 128-bit integers (need 16-byte stack slots, never registers)
+    int128_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
+    /// XMM arguments spilled from XMM registers to stack
+    spilled_xmm_args: Vec<SpilledXmmArg>,
+    /// Active stack slot intervals (interval, offset, size) for reuse tracking
+    active_stack: Vec<(LiveInterval, i32, i32)>,
+    /// Free stack slots keyed by size, available for reuse
+    free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
+    /// Sym pseudos whose address is taken (cannot participate in slot reuse)
+    addr_taken_syms: HashSet<PseudoId>,
+    /// Per-block live-in sets for interference-based stack coloring
+    live_in: Vec<HashSet<PseudoId>>,
+    /// Per-block live-out sets for interference-based stack coloring
+    live_out: Vec<HashSet<PseudoId>>,
+    /// Maximum alignment requirement of any local variable (for dynamic stack alignment)
+    max_local_align: i32,
 }
 
 impl RegAlloc {
@@ -467,7 +485,15 @@ impl RegAlloc {
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
+            int128_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
+            spilled_xmm_args: Vec::new(),
+            active_stack: Vec::new(),
+            free_stack_slots: BTreeMap::new(),
+            addr_taken_syms: HashSet::new(),
+            live_in: Vec::new(),
+            live_out: Vec::new(),
+            max_local_align: 8,
         }
     }
 
@@ -478,9 +504,16 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
+        // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
+        self.identify_int128_pseudos(func, types);
+        self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
-        let (intervals, constraint_points) = self.compute_live_intervals(func);
+        let result = self.compute_live_intervals(func);
+        self.live_in = result.live_in;
+        self.live_out = result.live_out;
+        let intervals = result.intervals;
+        let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func);
 
         self.spill_args_across_calls(func, &intervals, &call_positions);
@@ -502,7 +535,15 @@ impl RegAlloc {
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
+        self.int128_pseudos.clear();
         self.spilled_args.clear();
+        self.spilled_xmm_args.clear();
+        self.active_stack.clear();
+        self.free_stack_slots.clear();
+        self.addr_taken_syms.clear();
+        self.live_in.clear();
+        self.live_out.clear();
+        self.max_local_align = 8;
     }
 
     /// Identify pseudos that are long double (80-bit extended precision).
@@ -523,6 +564,89 @@ impl RegAlloc {
                     // Mark sources as long double for Load/Store/Copy
                     for &src in &insn.src {
                         self.ld_pseudos.insert(src);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Identify pseudos that are 128-bit integers (__int128).
+    /// These need 16-byte stack slots and must never be allocated to GP registers.
+    fn identify_int128_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        // First pass: identify targets of 128-bit instructions and all sources
+        // of 128-bit binary/unary ops.
+        for block in &func.blocks {
+            for insn in &block.insns {
+                // Only match Int128 type, not 16-byte structs or long doubles
+                let is_int128 = insn
+                    .typ
+                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128);
+
+                if is_int128 {
+                    // Comparison results are always small integers, not 128-bit.
+                    let is_comparison = matches!(
+                        insn.op,
+                        Opcode::SetEq
+                            | Opcode::SetNe
+                            | Opcode::SetLt
+                            | Opcode::SetLe
+                            | Opcode::SetGt
+                            | Opcode::SetGe
+                            | Opcode::SetB
+                            | Opcode::SetBe
+                            | Opcode::SetA
+                            | Opcode::SetAe
+                    );
+
+                    // For Load: target is int128, but src[0] is the address (64-bit pointer).
+                    // For Store: src[0] is address (64-bit), src[1] is the int128 value.
+                    // For comparisons: target is a small integer result.
+                    if !is_comparison && !matches!(insn.op, Opcode::Load) {
+                        if let Some(target) = insn.target {
+                            self.int128_pseudos.insert(target);
+                        }
+                    }
+                    if matches!(insn.op, Opcode::Load) {
+                        // Load: only target is int128, not the address src[0]
+                        if let Some(target) = insn.target {
+                            self.int128_pseudos.insert(target);
+                        }
+                    } else if matches!(insn.op, Opcode::Store) {
+                        // Store: src[0] is address (skip), src[1] is the int128 value
+                        if let Some(&val) = insn.src.get(1) {
+                            self.int128_pseudos.insert(val);
+                        }
+                    } else {
+                        // Other ops: all sources are int128
+                        for &src in &insn.src {
+                            self.int128_pseudos.insert(src);
+                        }
+                    }
+                }
+            }
+        }
+        // Second pass: propagate through Copy instructions only.
+        // Load src is an address (not int128), so don't propagate through Load.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &func.blocks {
+                for insn in &block.insns {
+                    if insn.op == Opcode::Copy {
+                        if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                            if self.int128_pseudos.contains(&src)
+                                && !self.int128_pseudos.contains(&target)
+                            {
+                                self.int128_pseudos.insert(target);
+                                changed = true;
+                            }
+                            if self.int128_pseudos.contains(&target)
+                                && !self.int128_pseudos.contains(&src)
+                            {
+                                self.int128_pseudos.insert(src);
+                                changed = true;
+                            }
+                        }
                     }
                 }
             }
@@ -565,6 +689,22 @@ impl RegAlloc {
                     if arg_idx == (i as u32) + arg_idx_offset {
                         let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
                         let is_fp = types.is_float(*typ);
+                        let is_complex = types.is_complex(*typ);
+                        let type_size = types.size_bits(*typ);
+                        let is_two_sse_struct = !is_complex
+                            && (types.kind(*typ) == crate::types::TypeKind::Struct
+                                || types.kind(*typ) == crate::types::TypeKind::Union)
+                            && type_size > 64
+                            && type_size <= 128
+                            && {
+                                use crate::abi::{Abi, SysVAmd64Abi};
+                                matches!(
+                                    SysVAmd64Abi.classify_param(*typ, types),
+                                    crate::abi::ArgClass::Direct { ref classes, .. }
+                                        if classes.len() == 2
+                                            && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                                )
+                            };
 
                         // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
                         if is_longdouble {
@@ -573,6 +713,27 @@ impl RegAlloc {
                                 .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
                             self.fp_pseudos.insert(pseudo.id);
                             stack_arg_offset += 16;
+                        } else if is_two_sse_struct {
+                            // 2-SSE struct: uses two XMM regs. Don't assign to register —
+                            // the codegen stores both XMM values to the local's stack slot.
+                            // Just consume the FP arg indices without assigning a location;
+                            // the pseudo will get a stack slot from normal allocation.
+                            fp_arg_idx += 2;
+                        } else if is_complex {
+                            // Complex: uses two consecutive XMM registers
+                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                                self.locations
+                                    .insert(pseudo.id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                                self.free_xmm_regs.retain(|&r| {
+                                    r != fp_arg_regs[fp_arg_idx] && r != fp_arg_regs[fp_arg_idx + 1]
+                                });
+                                self.fp_pseudos.insert(pseudo.id);
+                            } else {
+                                self.locations
+                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                                stack_arg_offset += 16;
+                            }
+                            fp_arg_idx += 2;
                         } else if is_fp {
                             if fp_arg_idx < fp_arg_regs.len() {
                                 self.locations
@@ -586,18 +747,50 @@ impl RegAlloc {
                                 stack_arg_offset += 8;
                             }
                             fp_arg_idx += 1;
+                        } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
+                            // __int128: uses two GP registers when available.
+                            // Always allocate a local stack slot — for register params,
+                            // store_args_to_stack stores register values; for stack params,
+                            // store_args_to_stack copies from the incoming arg area.
+                            self.stack_offset = (self.stack_offset + 15) & !15;
+                            self.stack_offset += 16;
+                            self.locations
+                                .insert(pseudo.id, Loc::Stack(self.stack_offset));
+                            self.int128_pseudos.insert(pseudo.id);
+                            if int_arg_idx + 1 < int_arg_regs.len() {
+                                self.free_regs.retain(|&r| {
+                                    r != int_arg_regs[int_arg_idx]
+                                        && r != int_arg_regs[int_arg_idx + 1]
+                                });
+                            } else {
+                                stack_arg_offset += 16;
+                            }
+                            int_arg_idx += 2;
                         } else {
-                            if int_arg_idx < int_arg_regs.len() {
+                            let type_size = types.size_bits(*typ);
+                            let is_large_struct = (types.kind(*typ)
+                                == crate::types::TypeKind::Struct
+                                || types.kind(*typ) == crate::types::TypeKind::Union)
+                                && type_size > 128;
+                            if is_large_struct {
+                                // Large struct (> 16 bytes): always passed on stack per
+                                // SysV AMD64 ABI. Advance by full struct size.
+                                self.locations
+                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
+                                stack_arg_offset += (type_size / 8) as i32;
+                                // Don't increment int_arg_idx — no GP register consumed
+                            } else if int_arg_idx < int_arg_regs.len() {
                                 self.locations
                                     .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
                                 self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
+                                int_arg_idx += 1;
                             } else {
                                 // Stack args are placed in parameter order per System V AMD64 ABI
                                 self.locations
                                     .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
                                 stack_arg_offset += 8;
+                                int_arg_idx += 1;
                             }
-                            int_arg_idx += 1;
                         }
                         break;
                     }
@@ -613,8 +806,8 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
-        // Check arguments in caller-saved registers
-        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        // Check integer arguments in caller-saved registers
+        let int_arg_regs_set = Reg::arg_regs();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
                 if int_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
@@ -636,11 +829,47 @@ impl RegAlloc {
                 }
             }
         }
+
+        // Always spill XMM function parameter arguments to stack.
+        // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
+        // computation within the function may reuse the same XMM register,
+        // clobbering the parameter value.
+        let xmm_arg_regs = XmmReg::arg_regs();
+        for interval in intervals {
+            if let Some(Loc::Xmm(xmm)) = self.locations.get(&interval.pseudo) {
+                if xmm_arg_regs.contains(xmm) && interval.start == 0 {
+                    // This is a function parameter in an XMM register — always spill
+                    let from_xmm = *xmm;
+                    self.stack_offset += 8;
+                    let to_stack_offset = self.stack_offset;
+
+                    self.spilled_xmm_args.push(SpilledXmmArg {
+                        pseudo: interval.pseudo,
+                        from_xmm,
+                        to_stack_offset,
+                    });
+
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                    self.free_xmm_regs.push(from_xmm);
+                }
+            }
+        }
     }
 
     /// Get arguments that were spilled from caller-saved registers
     pub fn spilled_args(&self) -> &[SpilledArg] {
         &self.spilled_args
+    }
+
+    /// Get XMM arguments that were spilled from XMM registers
+    pub fn spilled_xmm_args(&self) -> &[SpilledXmmArg] {
+        &self.spilled_xmm_args
+    }
+
+    /// Get the set of pseudos identified as 128-bit integers
+    pub fn int128_pseudos(&self) -> &HashSet<PseudoId> {
+        &self.int128_pseudos
     }
 
     /// Spill arguments in registers that would be clobbered by constraint points (e.g., shifts)
@@ -656,7 +885,7 @@ impl RegAlloc {
     ) {
         // For each argument in a register, check if its interval is live across
         // any constraint point that clobbers that register
-        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        let int_arg_regs_set = Reg::arg_regs();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
                 if int_arg_regs_set.contains(reg) {
@@ -704,6 +933,57 @@ impl RegAlloc {
         }
     }
 
+    /// Try to reuse a freed stack slot of the given size and alignment.
+    /// Uses interference check to ensure the candidate doesn't overlap with the slot's owner.
+    fn try_reuse_stack_slot(
+        &mut self,
+        size: i32,
+        alignment: i32,
+        candidate: PseudoId,
+    ) -> Option<i32> {
+        super::super::regalloc::try_reuse_stack_slot(
+            &mut self.free_stack_slots,
+            size,
+            alignment,
+            candidate,
+            &self.live_in,
+            &self.live_out,
+        )
+    }
+
+    /// Allocate a stack slot, optionally reusing a freed slot.
+    /// Only short-lived spills (no register available, not crossing calls/loops)
+    /// should set `reusable=true`. Call-crossing and in-loop spills have
+    /// unreliable interval estimates in complex control flow (e.g., computed gotos).
+    fn alloc_stack_slot(
+        &mut self,
+        interval: &LiveInterval,
+        size: i32,
+        alignment: i32,
+        reusable: bool,
+    ) {
+        // Track maximum alignment for dynamic stack alignment
+        if alignment > self.max_local_align {
+            self.max_local_align = alignment;
+        }
+        if reusable {
+            if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval.pseudo) {
+                self.locations.insert(interval.pseudo, Loc::Stack(reused));
+                self.active_stack.push((interval.clone(), reused, size));
+                return;
+            }
+        }
+        if alignment > 8 {
+            self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
+        }
+        self.stack_offset += size;
+        let offset = self.stack_offset;
+        self.locations.insert(interval.pseudo, Loc::Stack(offset));
+        if reusable {
+            self.active_stack.push((interval.clone(), offset, size));
+        }
+    }
+
     /// Run the linear scan allocation algorithm
     fn run_linear_scan(
         &mut self,
@@ -721,7 +1001,7 @@ impl RegAlloc {
             }
 
             // Handle constants and symbols
-            if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == interval.pseudo) {
+            if let Some(pseudo) = func.get_pseudo(interval.pseudo) {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
@@ -746,21 +1026,21 @@ impl RegAlloc {
                             let size = (types.size_bits(local_var.typ) / 8) as i32;
                             let size = size.max(8);
                             // Determine alignment: explicit _Alignas takes precedence
+                            let natural_align = types.alignment(local_var.typ) as i32;
                             let alignment = if let Some(explicit) = local_var.explicit_align {
                                 explicit as i32
-                            } else if size >= 16 {
-                                // Long double (size 16) needs 16-byte alignment for x87 access
-                                16
                             } else {
-                                8
+                                natural_align.max(8)
                             };
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-                            // Align stack offset before allocating
-                            self.stack_offset =
-                                (self.stack_offset + alignment - 1) & !(alignment - 1);
-                            self.stack_offset += aligned_size;
-                            self.locations
-                                .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+
+                            // Stack slot reuse uses block-level interference checks
+                            // (live_in/live_out from dataflow fixpoint) which are correct
+                            // for all CFG shapes. Addr-taken syms need stable addresses.
+                            let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
+
+                            self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
+
                             if types.is_float(local_var.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -774,6 +1054,12 @@ impl RegAlloc {
                 }
             }
 
+            // 128-bit integers always go on the stack (16 bytes, 16-byte aligned)
+            if self.int128_pseudos.contains(&interval.pseudo) {
+                self.alloc_stack_slot(&interval, 16, 16, true);
+                continue;
+            }
+
             // Allocate register based on type
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
             let crosses_call = interval_crosses_call(&interval, call_positions);
@@ -785,21 +1071,27 @@ impl RegAlloc {
                 // Long double uses x87 FPU (stack-based), not XMM registers.
                 // Always allocate to stack with 16-byte slots for 80-bit extended precision.
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
+                // FP pseudos that live across basic block boundaries must be
+                // spilled to stack. Phase D's interval collapse is unreliable
+                // for multi-block lifetimes (same issue as stack coloring),
+                // so XMM registers would be prematurely freed and reused.
+                let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
                 if is_longdouble {
                     // Long double needs 16 bytes (80-bit padded to 128-bit)
-                    // Align to 16-byte boundary for proper x87 access
-                    self.stack_offset = (self.stack_offset + 15) & !15;
-                    self.stack_offset += 16;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 16, 16, false);
+                } else if crosses_call || crosses_block {
+                    // All XMM registers are caller-saved on x86-64 SysV ABI.
+                    // Values live across function calls or block boundaries
+                    // must be spilled to stack.
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 } else if let Some(xmm) = self.free_xmm_regs.pop() {
                     self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
-                    self.active_xmm.push((interval.clone(), xmm));
-                    self.active_xmm.sort_by_key(|(i, _)| i.end);
+                    let pos = self
+                        .active_xmm
+                        .partition_point(|(i, _)| i.end <= interval.end);
+                    self.active_xmm.insert(pos, (interval.clone(), xmm));
                 } else {
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             } else if crosses_call || interval.in_loop {
                 // Interval crosses a call or is inside a loop - must use callee-saved register or spill
@@ -815,18 +1107,18 @@ impl RegAlloc {
                         self.used_callee_saved.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
+                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
+                    self.active.insert(pos, (interval.clone(), reg));
                 } else {
                     // No callee-saved registers available - spill to stack
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             } else {
-                // Interval doesn't cross a call - prefer caller-saved registers
-                // to minimize callee-saved register usage and stack conflicts
-                // Also exclude registers that conflict with constraints
+                // Interval doesn't appear to cross a call. In functions WITH
+                // calls, prefer callee-saved registers to guard against
+                // under-estimated live intervals from complex control flow
+                // (e.g., switch/goto dispatch). In functions WITHOUT calls,
+                // prefer caller-saved to minimize callee-saved usage.
                 let reg_opt = if let Some(idx) = self
                     .free_regs
                     .iter()
@@ -848,12 +1140,11 @@ impl RegAlloc {
                         self.used_callee_saved.push(reg);
                     }
                     self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
+                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
+                    self.active.insert(pos, (interval.clone(), reg));
                 } else {
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    // Reusable: short-lived, no call/loop crossing
+                    self.alloc_stack_slot(&interval, 8, 8, true);
                 }
             }
         }
@@ -864,22 +1155,24 @@ impl RegAlloc {
         expire_intervals(&mut self.active, &mut self.free_regs, point);
         // Expire XMM register intervals
         expire_intervals(&mut self.active_xmm, &mut self.free_xmm_regs, point);
+        // Expire stack slot intervals for reuse
+        expire_stack_intervals(&mut self.active_stack, &mut self.free_stack_slots, point);
     }
 
-    /// Compute live intervals and collect constraint points.
-    /// Returns (intervals, constraint_points) where:
-    /// - intervals: Live ranges for each pseudo
-    /// - constraint_points: Positions where register constraints apply (e.g., division clobbers)
-    fn compute_live_intervals(
-        &self,
-        func: &Function,
-    ) -> (Vec<LiveInterval>, Vec<ConstraintPoint<Reg>>) {
+    /// Compute live intervals, constraint points, and per-block liveness sets.
+    fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {
         compute_live_intervals(func, get_constraint_info)
     }
 
-    /// Get stack size needed (aligned to 16 bytes)
+    /// Get stack size needed (aligned to max local alignment, minimum 16)
     pub fn stack_size(&self) -> i32 {
-        (self.stack_offset + 15) & !15
+        let align = self.max_local_align.max(16);
+        (self.stack_offset + align - 1) & !(align - 1)
+    }
+
+    /// Get the maximum alignment requirement of any local variable
+    pub fn max_local_align(&self) -> i32 {
+        self.max_local_align
     }
 
     /// Get callee-saved registers that need to be preserved

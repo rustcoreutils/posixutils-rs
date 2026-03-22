@@ -177,6 +177,8 @@ pub enum TypeKind {
     Int,
     Long,
     LongLong,
+    /// __int128 / __uint128_t - 128-bit integer (GCC/Clang extension)
+    Int128,
     Float,
     Double,
     LongDouble,
@@ -212,6 +214,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Int => write!(f, "int"),
             TypeKind::Long => write!(f, "long"),
             TypeKind::LongLong => write!(f, "long long"),
+            TypeKind::Int128 => write!(f, "__int128"),
             TypeKind::Float => write!(f, "float"),
             TypeKind::Double => write!(f, "double"),
             TypeKind::LongDouble => write!(f, "long double"),
@@ -265,6 +268,10 @@ pub struct Type {
 
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
+
+    /// Explicit alignment from __attribute__((aligned(N))) on typedef.
+    /// When set, overrides the natural alignment returned by alignment().
+    pub explicit_align: Option<u32>,
 }
 
 impl Default for Type {
@@ -278,6 +285,7 @@ impl Default for Type {
             variadic: false,
             noreturn: false,
             composite: None,
+            explicit_align: None,
         }
     }
 }
@@ -304,13 +312,8 @@ impl Type {
     pub fn pointer(base: TypeId) -> Self {
         Self {
             kind: TypeKind::Pointer,
-            modifiers: TypeModifiers::empty(),
             base: Some(base),
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
-            composite: None,
+            ..Default::default()
         }
     }
 
@@ -318,13 +321,9 @@ impl Type {
     pub fn array(base: TypeId, size: usize) -> Self {
         Self {
             kind: TypeKind::Array,
-            modifiers: TypeModifiers::empty(),
             base: Some(base),
             array_size: Some(size),
-            params: None,
-            variadic: false,
-            noreturn: false,
-            composite: None,
+            ..Default::default()
         }
     }
 
@@ -337,13 +336,11 @@ impl Type {
     ) -> Self {
         Self {
             kind: TypeKind::Function,
-            modifiers: TypeModifiers::empty(),
             base: Some(return_type),
-            array_size: None,
             params: Some(params),
             variadic,
             noreturn,
-            composite: None,
+            ..Default::default()
         }
     }
 
@@ -351,13 +348,8 @@ impl Type {
     pub fn struct_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Struct,
-            modifiers: TypeModifiers::empty(),
-            base: None,
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
             composite: Some(Box::new(composite)),
+            ..Default::default()
         }
     }
 
@@ -365,13 +357,8 @@ impl Type {
     pub fn union_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Union,
-            modifiers: TypeModifiers::empty(),
-            base: None,
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
             composite: Some(Box::new(composite)),
+            ..Default::default()
         }
     }
 
@@ -379,13 +366,8 @@ impl Type {
     pub fn enum_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Enum,
-            modifiers: TypeModifiers::empty(),
-            base: None,
-            array_size: None,
-            params: None,
-            variadic: false,
-            noreturn: false,
             composite: Some(Box::new(composite)),
+            ..Default::default()
         }
     }
 
@@ -591,6 +573,8 @@ pub struct TypeTable {
     pub ulong_id: TypeId,
     pub longlong_id: TypeId,
     pub ulonglong_id: TypeId,
+    pub int128_id: TypeId,
+    pub uint128_id: TypeId,
     pub float_id: TypeId,
     pub double_id: TypeId,
     pub longdouble_id: TypeId,
@@ -625,6 +609,8 @@ impl TypeTable {
             ulong_id: TypeId::INVALID,
             longlong_id: TypeId::INVALID,
             ulonglong_id: TypeId::INVALID,
+            int128_id: TypeId::INVALID,
+            uint128_id: TypeId::INVALID,
             float_id: TypeId::INVALID,
             double_id: TypeId::INVALID,
             longdouble_id: TypeId::INVALID,
@@ -661,6 +647,11 @@ impl TypeTable {
         table.longlong_id = table.intern(Type::basic(TypeKind::LongLong));
         table.ulonglong_id = table.intern(Type::with_modifiers(
             TypeKind::LongLong,
+            TypeModifiers::UNSIGNED,
+        ));
+        table.int128_id = table.intern(Type::basic(TypeKind::Int128));
+        table.uint128_id = table.intern(Type::with_modifiers(
+            TypeKind::Int128,
             TypeModifiers::UNSIGNED,
         ));
         table.float_id = table.intern(Type::basic(TypeKind::Float));
@@ -717,6 +708,10 @@ impl TypeTable {
     fn make_key(&self, typ: &Type) -> Option<TypeKey> {
         // Don't deduplicate types with composite data (structs/unions/enums have identity)
         if typ.composite.is_some() {
+            return None;
+        }
+        // Don't deduplicate types with explicit alignment (typedef aligned types are unique)
+        if typ.explicit_align.is_some() {
             return None;
         }
 
@@ -914,6 +909,8 @@ impl TypeTable {
                 | TypeKind::Int
                 | TypeKind::Long
                 | TypeKind::LongLong
+                | TypeKind::Int128
+                | TypeKind::Enum
         )
     }
 
@@ -985,6 +982,7 @@ impl TypeTable {
             TypeKind::Int => self.uint_id,
             TypeKind::Long => self.ulong_id,
             TypeKind::LongLong => self.ulonglong_id,
+            TypeKind::Int128 => self.uint128_id,
             _ => id, // For non-integer types, just return the original
         }
     }
@@ -995,22 +993,33 @@ impl TypeTable {
         let is_complex = typ.modifiers.contains(TypeModifiers::COMPLEX);
         let multiplier = if is_complex { 2 } else { 1 };
         match typ.kind {
-            TypeKind::Void => 0,
+            // GCC extension: sizeof(void) = 1 for pointer arithmetic on void*.
+            // Standard C leaves sizeof(void) undefined, but GCC and most code
+            // assumes void* arithmetic works like char* (1 byte per unit).
+            TypeKind::Void => 8,
             TypeKind::Bool => 8,
             TypeKind::Char => 8,
             TypeKind::Short => 16,
             TypeKind::Int => 32,
             TypeKind::Long => 64,
             TypeKind::LongLong => 64,
+            TypeKind::Int128 => 128,
             TypeKind::Float => 32 * multiplier,
             TypeKind::Double => 64 * multiplier,
             TypeKind::LongDouble => self.longdouble_size_bits() * multiplier,
             TypeKind::Float16 => 16 * multiplier,
             TypeKind::Pointer => self.pointer_width,
             TypeKind::Array => {
-                let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0);
-                let count = typ.array_size.unwrap_or(0) as u32;
-                elem_size * count
+                let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
+                let count = typ.array_size.unwrap_or(0) as u64;
+                let total = elem_size.saturating_mul(count);
+                if total > u32::MAX as u64 {
+                    // Array too large for u32 size_bits; cap at u32::MAX
+                    // (size_bytes via size_bits/8 still works for reasonable sizes)
+                    u32::MAX
+                } else {
+                    total as u32
+                }
             }
             TypeKind::Struct | TypeKind::Union => {
                 (typ.composite.as_ref().map(|c| c.size).unwrap_or(0) * 8) as u32
@@ -1033,15 +1042,22 @@ impl TypeTable {
         }
     }
 
-    /// Get natural alignment for a type in bytes
+    /// Get alignment for a type in bytes.
+    /// If the type has an explicit alignment (from typedef __attribute__((aligned(N)))),
+    /// that takes precedence over the natural alignment.
     pub fn alignment(&self, id: TypeId) -> usize {
         let typ = self.get(id);
+        // Explicit alignment from typedef __attribute__((aligned(N))) overrides natural
+        if let Some(explicit) = typ.explicit_align {
+            return explicit as usize;
+        }
         match typ.kind {
             TypeKind::Void => 1,
             TypeKind::Bool | TypeKind::Char => 1,
             TypeKind::Short => 2,
             TypeKind::Int | TypeKind::Float => 4,
             TypeKind::Long | TypeKind::LongLong | TypeKind::Double | TypeKind::Pointer => 8,
+            TypeKind::Int128 => 16,
             TypeKind::LongDouble => self.longdouble_alignment(),
             TypeKind::Float16 => 2,
             TypeKind::Struct | TypeKind::Union => {
@@ -1162,7 +1178,11 @@ impl TypeTable {
 
     /// Compute struct layout with natural alignment
     /// Updates member offsets in place and returns (total_size, alignment)
-    pub fn compute_struct_layout(&self, members: &mut [StructMember]) -> (usize, usize) {
+    pub fn compute_struct_layout(
+        &self,
+        members: &mut [StructMember],
+        packed: bool,
+    ) -> (usize, usize) {
         let mut offset = 0usize;
         let mut max_align = 1usize;
         let mut current_bit_offset = 0u32;
@@ -1211,13 +1231,18 @@ impl TypeTable {
                     current_storage_unit_size = 0;
                 }
 
-                // Use explicit alignment from _Alignas if specified, otherwise natural alignment
-                let natural_align = self.alignment(member.typ);
+                // Use explicit alignment from _Alignas if specified, otherwise natural alignment.
+                // For packed structs, force alignment to 1 (no padding between members).
+                let natural_align = if packed {
+                    1
+                } else {
+                    self.alignment(member.typ)
+                };
                 let align = member
                     .explicit_align
                     .map(|a| a as usize)
                     .unwrap_or(natural_align);
-                max_align = max_align.max(align);
+                max_align = max_align.max(if packed { 1 } else { align });
 
                 offset = (offset + align - 1) & !(align - 1);
                 member.offset = offset;
@@ -1232,12 +1257,13 @@ impl TypeTable {
             offset += current_storage_unit_size as usize;
         }
 
-        let size = if max_align > 1 {
-            (offset + max_align - 1) & !(max_align - 1)
+        let final_align = if packed { 1 } else { max_align };
+        let size = if final_align > 1 {
+            (offset + final_align - 1) & !(final_align - 1)
         } else {
             offset
         };
-        (size, max_align)
+        (size, final_align)
     }
 
     /// Get the number of interned types

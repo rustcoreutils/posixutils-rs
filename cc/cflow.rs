@@ -392,6 +392,13 @@ fn format_type(typ: posixutils_cc::types::TypeId, types: &TypeTable) -> String {
                 "long long".to_string()
             }
         }
+        TypeKind::Int128 => {
+            if is_unsigned {
+                "__uint128_t".to_string()
+            } else {
+                "__int128".to_string()
+            }
+        }
         TypeKind::Float => "float".to_string(),
         TypeKind::Double => "double".to_string(),
         TypeKind::LongDouble => "long double".to_string(),

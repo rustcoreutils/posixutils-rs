@@ -358,3 +358,56 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_features_mega", code, &[]), 0);
 }
+
+#[test]
+fn c99_scope_shadowing_deep() {
+    let code = r#"
+int main(void) {
+    int x = 1;
+    {
+        int x = 2;
+        {
+            int x = 3;
+            {
+                int x = 4;
+                {
+                    int x = 5;
+                    if (x != 5) return 1;
+                }
+                if (x != 4) return 2;
+            }
+            if (x != 3) return 3;
+        }
+        if (x != 2) return 4;
+    }
+    if (x != 1) return 5;
+
+    // For-loop scoping with nested for-loop and x shadowing
+    int sum = 0;
+    for (int i = 0; i < 3; i++) {
+        int x = i * 10;
+        sum += x;
+        for (int i = 0; i < 2; i++) {
+            int x = i + 100;
+            sum += x;
+        }
+    }
+    // outer x: 0+10+20 = 30
+    // inner x: 3*(100+101) = 603
+    // total: 633
+    if (sum != 633) return 10;
+
+    // Shadowing in for-init
+    {
+        int val = 99;
+        for (int val = 0; val < 1; val++) {
+            if (val != 0) return 20;
+        }
+        if (val != 99) return 21;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("scope_shadowing_deep", code, &[]), 0);
+}

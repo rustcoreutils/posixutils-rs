@@ -87,9 +87,14 @@ pub fn escape_string(s: &str) -> String {
             '"' => result.push_str("\\\""),
             c if c.is_ascii_graphic() || c == ' ' => result.push(c),
             c => {
-                // Escape non-printable as octal bytes (handles UTF-8 correctly)
-                for byte in c.to_string().as_bytes() {
-                    result.push_str(&format!("\\{:03o}", byte));
+                // String literals represent raw byte values (0-255).
+                // Emit as single octal byte, not UTF-8 encoded.
+                if (c as u32) <= 255 {
+                    result.push_str(&format!("\\{:03o}", c as u8));
+                } else {
+                    for byte in c.to_string().as_bytes() {
+                        result.push_str(&format!("\\{:03o}", byte));
+                    }
                 }
             }
         }
@@ -273,14 +278,24 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         match init {
             Initializer::None => {
                 // Zero-fill
-                self.push_directive(Directive::Zero(size as u32));
+                self.push_directive(Directive::Zero(size));
             }
-            Initializer::Int(val) => match size {
-                1 => self.push_directive(Directive::Byte(*val)),
-                2 => self.push_directive(Directive::Short(*val)),
-                4 => self.push_directive(Directive::Long(*val)),
-                _ => self.push_directive(Directive::Quad(*val)),
-            },
+            Initializer::Int(val) => {
+                if size > 8 {
+                    // 128-bit: emit as two quads (little-endian: lo then hi)
+                    let lo = *val as i64;
+                    let hi = (*val >> 64) as i64;
+                    self.push_directive(Directive::Quad(lo));
+                    self.push_directive(Directive::Quad(hi));
+                } else {
+                    match size {
+                        1 => self.push_directive(Directive::Byte(*val as i64)),
+                        2 => self.push_directive(Directive::Short(*val as i64)),
+                        4 => self.push_directive(Directive::Long(*val as i64)),
+                        _ => self.push_directive(Directive::Quad(*val as i64)),
+                    }
+                }
+            }
             Initializer::Float(val) => {
                 if size == 4 {
                     // float - emit as 32-bit IEEE 754
@@ -296,10 +311,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // Emit string as .ascii (without null terminator)
                 // Then zero-fill the remaining bytes (which includes the null terminator)
                 self.push_directive(Directive::Ascii(escape_string(s)));
-                // .ascii emits s.len() bytes; fill remaining with zeros
-                let bytes_emitted = s.len();
+                // Each char in the parsed string represents one C byte (0-255).
+                // Use chars().count() not len() since len() counts UTF-8 bytes.
+                let bytes_emitted = s.chars().count();
                 if size > bytes_emitted {
-                    self.push_directive(Directive::Zero((size - bytes_emitted) as u32));
+                    self.push_directive(Directive::Zero(size - bytes_emitted));
                 }
             }
             Initializer::WideString(s) => {
@@ -313,7 +329,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // Zero-fill remaining bytes if array is larger than string
                 let wide_string_bytes = (char_count + 1) * 4; // +1 for null terminator, 4 bytes each
                 if size > wide_string_bytes {
-                    self.push_directive(Directive::Zero((size - wide_string_bytes) as u32));
+                    self.push_directive(Directive::Zero(size - wide_string_bytes));
                 }
             }
             Initializer::Array {
@@ -327,7 +343,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 for (offset, elem_init) in elements {
                     // Zero-fill gap before this element
                     if *offset > current_offset {
-                        self.push_directive(Directive::Zero((*offset - current_offset) as u32));
+                        self.push_directive(Directive::Zero(*offset - current_offset));
                     }
 
                     // Emit element
@@ -337,7 +353,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
                 // Zero-fill remaining space
                 if *total_size > current_offset {
-                    self.push_directive(Directive::Zero((*total_size - current_offset) as u32));
+                    self.push_directive(Directive::Zero(*total_size - current_offset));
                 }
             }
             Initializer::Struct { total_size, fields } => {
@@ -347,7 +363,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 for (offset, field_size, field_init) in fields {
                     // Zero-fill gap before this field
                     if *offset > current_offset {
-                        self.push_directive(Directive::Zero((*offset - current_offset) as u32));
+                        self.push_directive(Directive::Zero(*offset - current_offset));
                     }
 
                     // Emit field
@@ -357,7 +373,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
                 // Zero-fill remaining space
                 if *total_size > current_offset {
-                    self.push_directive(Directive::Zero((*total_size - current_offset) as u32));
+                    self.push_directive(Directive::Zero(*total_size - current_offset));
                 }
             }
             Initializer::SymAddr(name) => {
@@ -437,8 +453,9 @@ pub trait AsmOperandFormatter {
     /// Returns the formatted register string (e.g., "%eax" for x86, "w0" for aarch64).
     fn format_reg_sized(&self, reg: Self::Reg, size_mod: char) -> String;
 
-    /// Format a register at default size (for bare %0, %1 references).
-    fn format_reg_default(&self, reg: Self::Reg) -> String;
+    /// Format a register at operand-appropriate size (for bare %0, %1 references).
+    /// The `size_bits` parameter is the operand's declared size from the constraint.
+    fn format_reg_default(&self, reg: Self::Reg, size_bits: u32) -> String;
 }
 
 /// Substitute %N, %[name], %lN, %l[name], and size modifiers in asm template.
@@ -454,6 +471,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     formatter: &F,
     template: &str,
     regs: &[Option<F::Reg>],
+    sizes: &[u32],
     mems: &[Option<String>],
     names: &[Option<String>],
     goto_labels: &[(String, String)],
@@ -489,7 +507,8 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                         if let Some(ref mem) = mems[idx] {
                             result.push_str(mem);
                         } else if let Some(reg) = regs[idx] {
-                            result.push_str(&formatter.format_reg_default(reg));
+                            let sz = sizes.get(idx).copied().unwrap_or(32);
+                            result.push_str(&formatter.format_reg_default(reg, sz));
                         }
                     } else {
                         // Unknown name, pass through
@@ -516,7 +535,8 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                         if let Some(ref mem) = mems[idx] {
                             result.push_str(mem);
                         } else if let Some(reg) = regs[idx] {
-                            result.push_str(&formatter.format_reg_default(reg));
+                            let sz = sizes.get(idx).copied().unwrap_or(32);
+                            result.push_str(&formatter.format_reg_default(reg, sz));
                         }
                     } else {
                         // Unknown operand, pass through

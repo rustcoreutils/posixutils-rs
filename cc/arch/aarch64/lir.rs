@@ -605,6 +605,67 @@ pub enum Aarch64Inst {
     },
 
     // ========================================================================
+    // 128-bit Integer (Int128) Operations
+    // ========================================================================
+    /// ADDS - Add and set flags (used for 128-bit add: lo half)
+    Adds {
+        size: OperandSize,
+        src1: Reg,
+        src2: GpOperand,
+        dst: Reg,
+    },
+
+    /// ADC - Add with carry (used for 128-bit add: hi half)
+    Adc {
+        size: OperandSize,
+        src1: Reg,
+        src2: Reg,
+        dst: Reg,
+    },
+
+    /// SUBS - Subtract and set flags (used for 128-bit sub: lo half)
+    Subs {
+        size: OperandSize,
+        src1: Reg,
+        src2: GpOperand,
+        dst: Reg,
+    },
+
+    /// SBC - Subtract with carry (used for 128-bit sub: hi half)
+    Sbc {
+        size: OperandSize,
+        src1: Reg,
+        src2: Reg,
+        dst: Reg,
+    },
+
+    /// UMULH - Unsigned multiply high (upper 64 bits of 64x64->128 multiply)
+    Umulh { src1: Reg, src2: Reg, dst: Reg },
+
+    /// MADD - Multiply-add: dst = acc + (src1 * src2)
+    MAdd {
+        size: OperandSize,
+        src1: Reg,
+        src2: Reg,
+        acc: Reg,
+        dst: Reg,
+    },
+
+    /// NEGS - Negate and set flags (used for 128-bit negate: lo half)
+    Negs {
+        size: OperandSize,
+        src: Reg,
+        dst: Reg,
+    },
+
+    /// NGC - Negate with carry (used for 128-bit negate: hi half)
+    Ngc {
+        size: OperandSize,
+        src: Reg,
+        dst: Reg,
+    },
+
+    // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
@@ -1651,6 +1712,119 @@ impl EmitAsm for Aarch64Inst {
                     DmbOption::Ishld => "ishld",
                 };
                 let _ = writeln!(out, "    dmb {}", opt);
+            }
+
+            // 128-bit Integer (Int128) Operations
+            Aarch64Inst::Adds {
+                size,
+                src1,
+                src2,
+                dst,
+            } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    adds {}, {}, {}",
+                    dst.name_for_size(sz),
+                    src1.name_for_size(sz),
+                    src2.format(OperandSize::from_bits(sz))
+                );
+            }
+
+            Aarch64Inst::Adc {
+                size,
+                src1,
+                src2,
+                dst,
+            } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    adc {}, {}, {}",
+                    dst.name_for_size(sz),
+                    src1.name_for_size(sz),
+                    src2.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Subs {
+                size,
+                src1,
+                src2,
+                dst,
+            } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    subs {}, {}, {}",
+                    dst.name_for_size(sz),
+                    src1.name_for_size(sz),
+                    src2.format(OperandSize::from_bits(sz))
+                );
+            }
+
+            Aarch64Inst::Sbc {
+                size,
+                src1,
+                src2,
+                dst,
+            } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    sbc {}, {}, {}",
+                    dst.name_for_size(sz),
+                    src1.name_for_size(sz),
+                    src2.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Umulh { src1, src2, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    umulh {}, {}, {}",
+                    dst.name_for_size(64),
+                    src1.name_for_size(64),
+                    src2.name_for_size(64)
+                );
+            }
+
+            Aarch64Inst::MAdd {
+                size,
+                src1,
+                src2,
+                acc,
+                dst,
+            } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    madd {}, {}, {}, {}",
+                    dst.name_for_size(sz),
+                    src1.name_for_size(sz),
+                    src2.name_for_size(sz),
+                    acc.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Negs { size, src, dst } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    negs {}, {}",
+                    dst.name_for_size(sz),
+                    src.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Ngc { size, src, dst } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    ngc {}, {}",
+                    dst.name_for_size(sz),
+                    src.name_for_size(sz)
+                );
             }
 
             // Directives - delegate to shared implementation

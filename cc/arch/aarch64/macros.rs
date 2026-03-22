@@ -58,5 +58,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__ARM_SIZEOF_MINIMAL_ENUM", Some("4")),
         ("__ARM_FEATURE_UNALIGNED", Some("1")),
         ("__ARM_FEATURE_CLZ", Some("1")),
+        // 128-bit integer support
+        ("__SIZEOF_INT128__", Some("16")),
     ]
 }

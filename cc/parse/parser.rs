@@ -190,6 +190,23 @@ impl AttributeList {
             None
         }
     }
+
+    /// Get alignment from __attribute__((aligned(N))) or __attribute__((aligned))
+    /// Returns Some(alignment) if found, None otherwise.
+    /// Per GCC: aligned with no args defaults to 16 ("max useful alignment").
+    pub fn get_alignment(&self) -> Option<u32> {
+        for attr in &self.attrs {
+            if attr.name == "aligned" || attr.name == "__aligned__" {
+                if attr.args.is_empty() {
+                    return Some(16); // GCC default: max useful alignment
+                }
+                if let Some(AttributeArg::Int(n)) = attr.args.first() {
+                    return Some(*n as u32);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl fmt::Display for AttributeList {
@@ -313,8 +330,15 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(())
         } else {
+            let found = match &self.current().value {
+                TokenValue::Ident(id) => {
+                    format!("identifier '{}'", self.idents.get_opt(*id).unwrap_or("?"))
+                }
+                TokenValue::Special(v) => format!("'{}'", char::from_u32(*v).unwrap_or('?')),
+                other => format!("{:?}", other),
+            };
             Err(ParseError::new(
-                format!("expected '{}'", c as char),
+                format!("expected '{}', found {}", c as char, found),
                 self.current_pos(),
             ))
         }
@@ -617,10 +641,12 @@ impl<'a> Parser<'a> {
         result
     }
 
-    /// Skip __attribute__((...)) declarations (GCC extension, no-op)
-    /// Wrapper around parse_attributes that discards the result.
-    fn skip_attributes(&mut self) {
-        let _ = self.parse_attributes();
+    /// Check if current token is a C11 nullability qualifier
+    fn is_nullability_qualifier(&self) -> bool {
+        self.peek() == TokenType::Ident
+            && self
+                .get_ident_name(self.current())
+                .is_some_and(|n| super::is_nullability_qualifier(n.as_str()))
     }
 
     /// Check if current token is __asm or __asm__
@@ -882,13 +908,30 @@ impl<'a> Parser<'a> {
         Ok(labels)
     }
 
-    /// Skip both __attribute__ and __asm extensions
+    /// Apply alignment from __attribute__((aligned(N))) to pending_alignas.
+    /// Merges max: multiple aligned attrs → strictest wins.
+    fn apply_attribute_alignment(&mut self, attrs: &AttributeList) {
+        if let Some(align) = attrs.get_alignment() {
+            if align > 0 && align.is_power_of_two() {
+                if let Some(existing) = self.pending_alignas {
+                    self.pending_alignas = Some(existing.max(align));
+                } else {
+                    self.pending_alignas = Some(align);
+                }
+            }
+        }
+    }
+
+    /// Parse __attribute__, __asm, and nullability extensions, wiring aligned() to pending_alignas
     fn skip_extensions(&mut self) {
         loop {
             if self.is_attribute_keyword() {
-                self.skip_attributes();
+                let attrs = self.parse_attributes();
+                self.apply_attribute_alignment(&attrs);
             } else if self.is_asm_keyword() {
                 self.skip_asm();
+            } else if self.is_nullability_qualifier() {
+                self.advance();
             } else {
                 break;
             }
@@ -1160,7 +1203,7 @@ impl Parser<'_> {
                 items.push(BlockItem::Declaration(decl));
             } else {
                 let stmt = self.parse_statement()?;
-                items.push(BlockItem::Statement(stmt));
+                items.push(BlockItem::Statement(Box::new(stmt)));
             }
         }
         Ok(items)
@@ -1222,7 +1265,10 @@ impl Parser<'_> {
             // Check if the last item is an expression statement
             let last = items.pop().unwrap();
             match last {
-                BlockItem::Statement(Stmt::Expr(expr)) => {
+                BlockItem::Statement(stmt) if matches!(stmt.as_ref(), Stmt::Expr(_)) => {
+                    let Stmt::Expr(expr) = *stmt else {
+                        unreachable!()
+                    };
                     let typ = expr.typ.unwrap_or(self.types.int_id);
                     (items, expr, typ)
                 }
@@ -1294,6 +1340,9 @@ impl Parser<'_> {
                     | "_Bool"
                     | "__attribute__"
                     | "__attribute"
+                    | "__int128"
+                    | "__int128_t"
+                    | "__uint128_t"
                     | "__builtin_va_list"
                     | "typeof"
                     | "__typeof__"
@@ -1598,6 +1647,13 @@ impl Parser<'_> {
                 // Bind typedef to symbol table (after parsing initializer, which
                 // is forbidden for typedefs anyway)
                 if has_name && is_typedef {
+                    // Apply __attribute__((aligned(N))) to typedef type
+                    if let Some(align) = self.pending_alignas {
+                        let mut aligned_type = self.types.get(typ).clone();
+                        aligned_type.explicit_align =
+                            Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
+                        typ = self.types.intern(aligned_type);
+                    }
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
@@ -1853,6 +1909,19 @@ impl Parser<'_> {
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                 }
+                "__int128" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                }
+                "__int128_t" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                }
+                "__uint128_t" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::UNSIGNED;
+                    base_kind = Some(TypeKind::Int128);
+                }
                 "__builtin_va_list" => {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
@@ -1966,7 +2035,7 @@ impl Parser<'_> {
                     // Evaluate constant expression
                     self.eval_const_expr(&expr).ok_or_else(|| {
                         ParseError::new("enum value must be constant", self.current_pos())
-                    })?
+                    })? as i64
                 } else {
                     next_value
                 };
@@ -2044,16 +2113,30 @@ impl Parser<'_> {
     pub(crate) fn parse_struct_or_union_specifier(&mut self, is_union: bool) -> ParseResult<Type> {
         self.advance(); // consume 'struct' or 'union'
 
-        // Skip any __attribute__ between 'struct' and tag name
-        self.skip_extensions();
+        // Parse __attribute__ between 'struct' keyword and tag name
+        // (e.g., struct __attribute__((packed)) tagname { ... })
+        let early_attrs = self.parse_attributes();
+        let mut is_packed = early_attrs
+            .attrs
+            .iter()
+            .any(|a| a.name == "packed" || a.name == "__packed__");
+        // Track struct-level aligned attribute (max across all positions)
+        let mut struct_align: Option<u32> = early_attrs.get_alignment();
 
         // Optional tag name
         let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-            // Make sure it's not __attribute__
             if !self.is_attribute_keyword() {
                 Some(self.expect_identifier()?)
             } else {
-                self.skip_extensions();
+                let mid_attrs = self.parse_attributes();
+                is_packed = is_packed
+                    || mid_attrs
+                        .attrs
+                        .iter()
+                        .any(|a| a.name == "packed" || a.name == "__packed__");
+                if let Some(a) = mid_attrs.get_alignment() {
+                    struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
+                }
                 if self.peek() == TokenType::Ident && !self.is_special(b'{') {
                     Some(self.expect_identifier()?)
                 } else {
@@ -2064,8 +2147,16 @@ impl Parser<'_> {
             None
         };
 
-        // Skip any __attribute__ after tag name but before '{'
-        self.skip_extensions();
+        // Parse __attribute__ after tag name but before '{'
+        let pre_attrs = self.parse_attributes();
+        is_packed = is_packed
+            || pre_attrs
+                .attrs
+                .iter()
+                .any(|a| a.name == "packed" || a.name == "__packed__");
+        if let Some(a) = pre_attrs.get_alignment() {
+            struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
+        }
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -2205,14 +2296,36 @@ impl Parser<'_> {
 
             self.expect_special(b'}')?;
 
-            // Skip any trailing __attribute__ (e.g., __attribute__((packed)))
-            self.skip_extensions();
+            // Parse trailing __attribute__ (e.g., __attribute__((packed)))
+            let attrs = self.parse_attributes();
+            is_packed = is_packed
+                || attrs
+                    .attrs
+                    .iter()
+                    .any(|a| a.name == "packed" || a.name == "__packed__");
+            if let Some(a) = attrs.get_alignment() {
+                struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
+            }
 
             // Compute layout
-            let (size, align) = if is_union {
+            let (size, mut align) = if is_union {
                 self.types.compute_union_layout(&mut members)
             } else {
-                self.types.compute_struct_layout(&mut members)
+                self.types.compute_struct_layout(&mut members, is_packed)
+            };
+
+            // Apply struct-level aligned attribute (raises alignment, never lowers)
+            if let Some(sa) = struct_align {
+                if sa as usize > align {
+                    align = sa as usize;
+                }
+            }
+
+            // Re-pad size to new alignment
+            let size = if align > 1 {
+                (size + align - 1) & !(align - 1)
+            } else {
+                size
             };
 
             let composite = CompositeType {
@@ -2303,7 +2416,7 @@ impl Parser<'_> {
             self.advance();
             let mut ptr_modifiers = TypeModifiers::empty();
 
-            // Parse pointer qualifiers (const, volatile, restrict, _Atomic)
+            // Parse pointer qualifiers (const, volatile, restrict, _Atomic, nullability)
             while self.peek() == TokenType::Ident {
                 if let Some(name) = self.get_ident_name(self.current()) {
                     match name.as_str() {
@@ -2322,6 +2435,9 @@ impl Parser<'_> {
                         "_Atomic" => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::ATOMIC;
+                        }
+                        n if super::is_nullability_qualifier(n) => {
+                            self.advance();
                         }
                         _ => break,
                     }
@@ -2479,11 +2595,7 @@ impl Parser<'_> {
                     kind: TypeKind::Pointer,
                     modifiers,
                     base: Some(result_type_id),
-                    array_size: None,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 result_type_id = self.types.intern(ptr_type);
             }
@@ -2501,13 +2613,9 @@ impl Parser<'_> {
             for size in dimensions.into_iter().rev() {
                 let arr_type = Type {
                     kind: TypeKind::Array,
-                    modifiers: TypeModifiers::empty(),
                     base: Some(result_type_id),
                     array_size: size,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 result_type_id = self.types.intern(arr_type);
             }
@@ -2530,11 +2638,7 @@ impl Parser<'_> {
                     kind: TypeKind::Pointer,
                     modifiers,
                     base: Some(result_type_id),
-                    array_size: None,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 result_type_id = self.types.intern(ptr_type);
             }
@@ -2544,13 +2648,9 @@ impl Parser<'_> {
             for size in dimensions.into_iter().rev() {
                 let arr_type = Type {
                     kind: TypeKind::Array,
-                    modifiers: TypeModifiers::empty(),
                     base: Some(result_type_id),
                     array_size: size,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 result_type_id = self.types.intern(arr_type);
             }
@@ -2610,11 +2710,7 @@ impl Parser<'_> {
                     kind: TypeKind::Pointer,
                     modifiers: decl_modifiers,
                     base: Some(new_base_id),
-                    array_size: None,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 self.types.intern(ptr_type)
             }
@@ -2628,10 +2724,7 @@ impl Parser<'_> {
                     modifiers: decl_modifiers,
                     base: Some(new_base_id),
                     array_size: decl_array_size,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 self.types.intern(arr_type)
             }
@@ -2646,13 +2739,11 @@ impl Parser<'_> {
                 let new_ret_id = self.substitute_base_type(inner_base_id, actual_base_id);
                 let func_type = Type {
                     kind: TypeKind::Function,
-                    modifiers: TypeModifiers::empty(),
                     base: Some(new_ret_id),
-                    array_size: None,
                     params: decl_params,
                     variadic: decl_variadic,
                     noreturn: decl_noreturn,
-                    composite: None,
+                    ..Default::default()
                 };
                 self.types.intern(func_type)
             }
@@ -2693,6 +2784,9 @@ impl Parser<'_> {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
+                        n if super::is_nullability_qualifier(n) => {
+                            self.advance();
+                        }
                         _ => break,
                     }
                 } else {
@@ -2704,11 +2798,7 @@ impl Parser<'_> {
                 kind: TypeKind::Pointer,
                 modifiers: ptr_modifiers,
                 base: Some(ret_type_id),
-                array_size: None,
-                params: None,
-                variadic: false,
-                composite: None,
-                noreturn: false,
+                ..Default::default()
             };
             ret_type_id = self.types.intern(ptr_type);
         }
@@ -2840,13 +2930,8 @@ impl Parser<'_> {
                 let element_type = typ.base.unwrap_or(self.types.void_id);
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
-                    modifiers: TypeModifiers::empty(),
                     base: Some(element_type),
-                    array_size: None,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 typ_id = self.types.intern(ptr_type);
             } else if typ.kind == TypeKind::Function {
@@ -2854,13 +2939,8 @@ impl Parser<'_> {
                 // e.g., `int fn(int)` becomes `int (*)(int)`
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
-                    modifiers: TypeModifiers::empty(),
                     base: Some(typ_id),
-                    array_size: None,
-                    params: None,
-                    variadic: false,
-                    noreturn: false,
-                    composite: None,
+                    ..Default::default()
                 };
                 typ_id = self.types.intern(ptr_type);
             }
@@ -2984,6 +3064,9 @@ impl Parser<'_> {
 
     /// Parse an external declaration (function definition or declaration)
     fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        // Clear pending alignment from previous declaration
+        self.pending_alignas = None;
+
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
             self.parse_static_assert()?;
@@ -3028,7 +3111,7 @@ impl Parser<'_> {
             if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, typ, vla_sizes, decl_func_params) =
+                let (name, mut typ, vla_sizes, decl_func_params) =
                     self.parse_declarator(base_type_id)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
@@ -3112,6 +3195,7 @@ impl Parser<'_> {
                     None
                 };
 
+                self.skip_extensions();
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
@@ -3120,6 +3204,13 @@ impl Parser<'_> {
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
+                    // Apply __attribute__((aligned(N))) to typedef type
+                    if let Some(align) = self.pending_alignas {
+                        let mut aligned_type = self.types.get(typ).clone();
+                        aligned_type.explicit_align =
+                            Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
+                        typ = self.types.intern(aligned_type);
+                    }
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     self.symbols
                         .declare(sym)
@@ -3172,6 +3263,9 @@ impl Parser<'_> {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
+                        n if super::is_nullability_qualifier(n) => {
+                            self.advance();
+                        }
                         _ => break,
                     }
                 } else {
@@ -3183,11 +3277,7 @@ impl Parser<'_> {
                 kind: TypeKind::Pointer,
                 modifiers: ptr_modifiers,
                 base: Some(typ_id),
-                array_size: None,
-                params: None,
-                variadic: false,
-                noreturn: false,
-                composite: None,
+                ..Default::default()
             };
             typ_id = self.types.intern(ptr_type);
         }
@@ -3304,6 +3394,7 @@ impl Parser<'_> {
                     None
                 };
 
+                self.skip_extensions();
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
@@ -3554,6 +3645,13 @@ impl Parser<'_> {
 
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
         if is_typedef {
+            // Apply __attribute__((aligned(N))) to typedef type
+            if let Some(align) = self.pending_alignas {
+                let mut aligned_type = self.types.get(var_type_id).clone();
+                aligned_type.explicit_align =
+                    Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
+                var_type_id = self.types.intern(aligned_type);
+            }
             let sym = Symbol::typedef(name, var_type_id, self.symbols.depth());
             symbol = Some(match self.symbols.declare(sym) {
                 Ok(id) => id,
@@ -3657,6 +3755,9 @@ impl Parser<'_> {
 
         self.expect_special(b';')?;
 
+        // Clear pending alignment after declaration
+        self.pending_alignas = None;
+
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }
 
@@ -3669,17 +3770,18 @@ impl Parser<'_> {
     /// - Casts to integer types
     /// - Unary/binary operators with constant operands
     /// - Conditional expressions with constant operands
-    pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+    pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
-            ExprKind::IntLit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as i64),
+            ExprKind::IntLit(val) => Some(*val as i128),
+            ExprKind::Int128Lit(val) => Some(*val),
+            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
             // Float literals are constant, return truncated value
-            ExprKind::FloatLit(val) => Some(*val as i64),
+            ExprKind::FloatLit(val) => Some(*val as i128),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
-                    UnaryOp::Neg => Some(-val),
+                    UnaryOp::Neg => Some(val.wrapping_neg()),
                     UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
                     UnaryOp::BitNot => Some(!val),
                     _ => None,
@@ -3710,8 +3812,8 @@ impl Parser<'_> {
                     BinaryOp::BitAnd => Some(lval & rval),
                     BinaryOp::BitOr => Some(lval | rval),
                     BinaryOp::BitXor => Some(lval ^ rval),
-                    BinaryOp::Shl => Some(lval << (rval as u32)),
-                    BinaryOp::Shr => Some(lval >> (rval as u32)),
+                    BinaryOp::Shl => Some(lval.wrapping_shl(rval as u32)),
+                    BinaryOp::Shr => Some(lval.wrapping_shr(rval as u32)),
                     BinaryOp::Lt => Some(if lval < rval { 1 } else { 0 }),
                     BinaryOp::Le => Some(if lval <= rval { 1 } else { 0 }),
                     BinaryOp::Gt => Some(if lval > rval { 1 } else { 0 }),
@@ -3727,7 +3829,7 @@ impl Parser<'_> {
                 // Check for enum constant
                 let sym = self.symbols.get(*symbol_id);
                 if sym.is_enum_constant() {
-                    sym.enum_value
+                    sym.enum_value.map(|v| v as i128)
                 } else {
                     None
                 }
@@ -3751,14 +3853,14 @@ impl Parser<'_> {
             // sizeof(type) - constant for complete types
             ExprKind::SizeofType(type_id) => {
                 let size_bits = self.types.size_bits(*type_id);
-                Some((size_bits / 8) as i64)
+                Some((size_bits / 8) as i128)
             }
 
             // sizeof(expr) - constant if expr type is complete
             ExprKind::SizeofExpr(inner_expr) => {
                 if let Some(typ) = inner_expr.typ {
                     let size_bits = self.types.size_bits(typ);
-                    Some((size_bits / 8) as i64)
+                    Some((size_bits / 8) as i128)
                 } else {
                     None
                 }
@@ -3772,31 +3874,28 @@ impl Parser<'_> {
 
             // __builtin_offsetof(type, member-designator) - compile-time constant
             ExprKind::OffsetOf { type_id, path } => {
-                let mut offset: i64 = 0;
+                let mut offset: i128 = 0;
                 let mut current_type = *type_id;
 
                 for element in path {
                     match element {
                         OffsetOfPath::Field(field_id) => {
-                            // Look up the field in the current struct type
-                            // find_member handles recursive lookup through anonymous members
                             if let Some(member_info) =
                                 self.types.find_member(current_type, *field_id)
                             {
-                                offset += member_info.offset as i64;
+                                offset += member_info.offset as i128;
                                 current_type = member_info.typ;
                             } else {
-                                return None; // Field not found
+                                return None;
                             }
                         }
                         OffsetOfPath::Index(index) => {
-                            // Array indexing: offset += index * sizeof(element)
                             if let Some(elem_type) = self.types.base_type(current_type) {
                                 let elem_size = self.types.size_bytes(elem_type);
-                                offset += *index * (elem_size as i64);
+                                offset += *index as i128 * (elem_size as i128);
                                 current_type = elem_type;
                             } else {
-                                return None; // Not an array type
+                                return None;
                             }
                         }
                     }
@@ -3841,6 +3940,7 @@ impl Parser<'_> {
                 | TypeKind::Short
                 | TypeKind::Long
                 | TypeKind::LongLong
+                | TypeKind::Int128
         );
 
         if !valid_type {
@@ -3884,22 +3984,36 @@ impl Parser<'_> {
     ///
     /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
     /// Returns None if no explicit alignment was specified.
+    /// Also propagates alignment from typedef's explicit_align.
     fn validated_explicit_align(&self, typ: TypeId) -> ParseResult<Option<u32>> {
-        match self.pending_alignas {
+        // Combine pending_alignas (from _Alignas / __attribute__) with type's explicit_align
+        let type_align = self.types.get(typ).explicit_align;
+        let effective = match (self.pending_alignas, type_align) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        match effective {
             None => Ok(None),
             Some(explicit) => {
-                let natural = self.types.alignment(typ) as u32;
-                if explicit < natural {
-                    Err(ParseError::new(
-                        format!(
-                            "_Alignas({}) cannot reduce alignment below natural alignment {}",
-                            explicit, natural
-                        ),
-                        self.current_pos(),
-                    ))
-                } else {
-                    Ok(Some(explicit))
+                // For C11 _Alignas validation, don't reject typedef alignment that
+                // exceeds the natural alignment of the underlying type (that's the point).
+                // Only reject explicit _Alignas that reduces below natural.
+                if self.pending_alignas.is_some() {
+                    let natural = self.types.alignment(typ) as u32;
+                    if explicit < natural {
+                        return Err(ParseError::new(
+                            format!(
+                                "_Alignas({}) cannot reduce alignment below natural alignment {}",
+                                explicit, natural
+                            ),
+                            self.current_pos(),
+                        ));
+                    }
                 }
+                Ok(Some(explicit))
             }
         }
     }

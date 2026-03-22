@@ -12,7 +12,7 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
-use crate::abi::{get_abi, ArgClass, RegClass};
+use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{complex_fp_info, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::float::f64_to_f16_bits;
@@ -39,12 +39,16 @@ pub struct X86_64CodeGen {
     callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
     pub(super) callee_saved_offset: i32,
+    /// Stack allocation size (for zero_stack_frame)
+    stack_alloc_size: i32,
     /// Offset from rbp to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
     /// Number of fixed FP parameters (for variadic functions)
     pub(super) num_fixed_fp_params: usize,
+    /// Number of fixed parameters passed on the stack (overflow beyond registers)
+    pub(super) num_fixed_stack_params: usize,
     /// Counter for generating unique internal labels
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
@@ -59,6 +63,14 @@ pub struct X86_64CodeGen {
     pub(super) ld_constants: HashMap<u64, [u8; 16]>,
     /// Double constants to emit (label_bits -> f64 value)
     pub(super) double_constants: HashMap<u64, f64>,
+    /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
+    sym_type_sizes: HashMap<PseudoId, u32>,
+    /// When true, locals are addressed via RSP instead of RBP (for dynamic stack alignment)
+    use_rsp_locals: bool,
+    /// Maximum local alignment (for andq in prologue)
+    max_local_align: i32,
+    /// Pseudos that are 128-bit integers (need full 16-byte copies)
+    pub(super) int128_pseudos: HashSet<PseudoId>,
 }
 
 impl X86_64CodeGen {
@@ -69,9 +81,11 @@ impl X86_64CodeGen {
             pseudos: Vec::new(),
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
+            stack_alloc_size: 0,
             reg_save_area_offset: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
+            num_fixed_stack_params: 0,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
@@ -79,6 +93,10 @@ impl X86_64CodeGen {
             shared_mode: false,
             ld_constants: HashMap::new(),
             double_constants: HashMap::new(),
+            sym_type_sizes: HashMap::new(),
+            use_rsp_locals: false,
+            max_local_align: 16,
+            int128_pseudos: HashSet::new(),
         }
     }
 
@@ -88,17 +106,28 @@ impl X86_64CodeGen {
         self.base.push_lir(inst);
     }
 
+    /// Compute the memory address for a stack offset.
+    /// In normal mode: [rbp - (offset + callee_saved_offset)]
+    /// In dynamic alignment mode: [rsp + (stack_alloc_size - offset)]
+    pub(super) fn stack_mem(&self, offset: i32) -> MemAddr {
+        if self.use_rsp_locals {
+            MemAddr::BaseOffset {
+                base: Reg::Rsp,
+                offset: self.stack_alloc_size - offset,
+            }
+        } else {
+            MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: -(offset + self.callee_saved_offset),
+            }
+        }
+    }
+
     /// Convert a Loc to a GpOperand for LIR
     pub(super) fn loc_to_gp_operand(&self, loc: &Loc) -> GpOperand {
         match loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
-            Loc::Stack(offset) => {
-                let adjusted = *offset + self.callee_saved_offset;
-                GpOperand::Mem(MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -adjusted,
-                })
-            }
+            Loc::Stack(offset) => GpOperand::Mem(self.stack_mem(*offset)),
             Loc::IncomingArg(offset) => {
                 // Incoming stack argument: at [rbp + offset] (positive offset)
                 // No callee_saved_offset adjustment needed - these are above the return address
@@ -107,7 +136,7 @@ impl X86_64CodeGen {
                     offset: *offset,
                 })
             }
-            Loc::Imm(v) => GpOperand::Imm(*v),
+            Loc::Imm(v) => GpOperand::Imm(*v as i64),
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
             Loc::Global(name) => {
@@ -231,11 +260,28 @@ impl X86_64CodeGen {
         // Register allocation
         let mut alloc = RegAlloc::new();
         self.locations = alloc.allocate(func, types);
+        self.int128_pseudos = alloc.int128_pseudos().clone();
         self.pseudos = func.pseudos.clone();
+
+        // Build sym type size map for emit_store to distinguish struct fields from scalars
+        self.sym_type_sizes.clear();
+        for pseudo in &func.pseudos {
+            if let PseudoKind::Sym(name) = &pseudo.kind {
+                if let Some(local_var) = func.locals.get(name) {
+                    self.sym_type_sizes
+                        .insert(pseudo.id, types.size_bits(local_var.typ));
+                }
+            }
+        }
 
         let stack_size = alloc.stack_size();
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
-        self.callee_saved_offset = self.callee_saved_regs.len() as i32 * 8;
+        self.max_local_align = alloc.max_local_align();
+        self.use_rsp_locals = self.max_local_align > 16;
+        // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned
+        // stack_offset values produce 16-byte-aligned final addresses.
+        // rbp is 16-aligned (ABI), so -(padded_offset + aligned_stack_offset) is also aligned.
+        self.callee_saved_offset = ((self.callee_saved_regs.len() as i32 * 8) + 15) & !15;
 
         // For variadic functions, we need extra space for the register save area
         // 6 GP regs * 8 bytes = 48 bytes for GP registers
@@ -254,6 +300,12 @@ impl X86_64CodeGen {
 
         // Emit prologue (push rbp, callee-saved regs, allocate stack)
         self.emit_prologue(stack_size, reg_save_area_size);
+
+        // Zero-initialize the stack frame BEFORE storing any arguments.
+        // This ensures all 8-byte stack slots start as zero, so narrow
+        // writes (8/16/32-bit) leave zero in the unwritten upper bytes.
+        // Uses R10/R11 to save/restore RDI/RCX (which may hold arguments).
+        self.zero_stack_frame();
 
         // Store spilled arguments before any calls can clobber them
         self.store_spilled_args(&alloc);
@@ -345,33 +397,113 @@ impl X86_64CodeGen {
             cfi_offset -= 8;
         }
 
-        // Allocate stack space for locals + register save area (if variadic)
-        let total_stack =
-            stack_size + (self.callee_saved_regs.len() as i32 * 8) + reg_save_area_size;
+        // Allocate stack space for locals + callee-saved padding + register save area
+        // callee_saved_offset is already padded to 16; use it instead of raw pushed bytes
+        let total_stack = stack_size + self.callee_saved_offset + reg_save_area_size;
         // Ensure 16-byte alignment
         let aligned_stack = (total_stack + 15) & !15;
-        if aligned_stack > self.callee_saved_regs.len() as i32 * 8 {
+        // Subtract only the actual pushed bytes (not the padded offset)
+        let alloc_size = aligned_stack - (self.callee_saved_regs.len() as i32 * 8);
+        if alloc_size > 0 {
             self.push_lir(X86Inst::Sub {
                 size: OperandSize::B64,
-                src: GpOperand::Imm(
-                    (aligned_stack - (self.callee_saved_regs.len() as i32 * 8)) as i64,
-                ),
+                src: GpOperand::Imm(alloc_size as i64),
                 dst: Reg::Rsp,
             });
         }
+
+        // Dynamic stack alignment for locals with alignment > 16
+        // After sub, emit andq to force RSP to the required alignment.
+        // Locals will be addressed via RSP; epilogue uses `leave` to restore RSP from RBP.
+        if self.use_rsp_locals {
+            self.push_lir(X86Inst::And {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(-(self.max_local_align as i64)),
+                dst: Reg::Rsp,
+            });
+        }
+
+        // Store alloc_size for use in zero_stack_frame()
+        self.stack_alloc_size = alloc_size;
+    }
+
+    /// Zero-initialize the stack frame AFTER argument registers have been
+    /// spilled to their stack slots. This prevents stale bytes from being
+    /// read when narrow values (8/16/32-bit) are stored to 8-byte stack
+    /// slots and later loaded at wider widths.
+    ///
+    /// Must be called after store_spilled_args() and emit_variadic_save_area()
+    /// because rep stosq clobbers RAX, RCX, RDI.
+    fn zero_stack_frame(&mut self) {
+        let alloc_size = self.stack_alloc_size;
+        if alloc_size <= 0 {
+            return;
+        }
+        let qwords = alloc_size / 8;
+        if qwords <= 0 {
+            return;
+        }
+        // Save RDI and RCX to scratch registers R10/R11 — they may hold
+        // function arguments (SysV ABI: RDI=arg0, RCX=arg3).
+        // R10 and R11 are caller-saved scratch, NOT used for arg passing.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rdi),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rcx),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        // RDI = RSP (start of stack frame to zero)
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rsp),
+            dst: GpOperand::Reg(Reg::Rdi),
+        });
+        // RCX = number of qwords
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(qwords as i64),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
+        // RAX = 0 (value to fill)
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: Reg::Rax,
+        });
+        // rep stosq: zero [RDI] for RCX qwords
+        self.push_lir(X86Inst::RepStosq);
+        // Restore RDI and RCX
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Reg(Reg::Rdi),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
     }
 
     /// Emit stores for arguments spilled from caller-saved registers to stack
     fn store_spilled_args(&mut self, alloc: &RegAlloc) {
         for spilled in alloc.spilled_args() {
-            let adjusted = spilled.to_stack_offset + self.callee_saved_offset;
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(spilled.from_reg),
-                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -adjusted,
-                }),
+                dst: GpOperand::Mem(self.stack_mem(spilled.to_stack_offset)),
+            });
+        }
+        // Spill XMM function parameters to stack
+        for spilled in alloc.spilled_xmm_args() {
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Reg(spilled.from_xmm),
+                dst: XmmOperand::Mem(self.stack_mem(spilled.to_stack_offset)),
             });
         }
     }
@@ -422,11 +554,17 @@ impl X86_64CodeGen {
         let fp_arg_regs = XmmReg::arg_regs();
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
+        // Track incoming stack arg position (after saved RBP + return addr = 16)
+        let mut incoming_stack_offset: i32 = 16;
 
         // Track which pseudos were already spilled via spill_args_across_calls
         // to avoid double-storing them here
-        let spilled_pseudos: HashSet<PseudoId> =
-            alloc.spilled_args().iter().map(|s| s.pseudo).collect();
+        let spilled_pseudos: HashSet<PseudoId> = alloc
+            .spilled_args()
+            .iter()
+            .map(|s| s.pseudo)
+            .chain(alloc.spilled_xmm_args().iter().map(|s| s.pseudo))
+            .collect();
 
         // Detect if there's a hidden return pointer (for functions returning large structs)
         // The __sret pseudo has arg_idx=0 and shifts all other arg indices by 1
@@ -446,6 +584,17 @@ impl X86_64CodeGen {
             for pseudo in &func.pseudos {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     if arg_idx == (i as u32) + arg_idx_offset {
+                        // Large struct params (> 16 bytes) are passed on the stack
+                        // and don't use GP registers — skip them entirely.
+                        let type_size_bits = types.size_bits(*typ);
+                        let is_large_struct_param = (types.kind(*typ)
+                            == crate::types::TypeKind::Struct
+                            || types.kind(*typ) == crate::types::TypeKind::Union)
+                            && type_size_bits > 128;
+                        if is_large_struct_param {
+                            break;
+                        }
+
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
                             // Still need to count this arg for register assignment tracking
@@ -453,8 +602,34 @@ impl X86_64CodeGen {
                             let is_complex = types.is_complex(*typ);
                             let is_longdouble =
                                 types.kind(*typ) == crate::types::TypeKind::LongDouble;
+                            let is_int128 = types.kind(*typ) == TypeKind::Int128;
+                            let is_medium_struct = !is_complex
+                                && (types.kind(*typ) == crate::types::TypeKind::Struct
+                                    || types.kind(*typ) == crate::types::TypeKind::Union)
+                                && type_size_bits > 64
+                                && type_size_bits <= 128;
                             if is_complex {
                                 fp_arg_idx += 2;
+                            } else if is_int128 {
+                                int_arg_idx += 2;
+                            } else if is_medium_struct {
+                                // Check ABI classification for medium structs
+                                let abi = crate::abi::SysVAmd64Abi;
+                                let cls = abi.classify_param(*typ, types);
+                                if let crate::abi::ArgClass::Direct { ref classes, .. } = cls {
+                                    let sse_count = classes
+                                        .iter()
+                                        .filter(|c| **c == crate::abi::RegClass::Sse)
+                                        .count();
+                                    let gp_count = classes
+                                        .iter()
+                                        .filter(|c| **c == crate::abi::RegClass::Integer)
+                                        .count();
+                                    fp_arg_idx += sse_count;
+                                    int_arg_idx += gp_count;
+                                } else {
+                                    int_arg_idx += 1;
+                                }
                             } else if is_longdouble {
                                 // Long double is on stack, doesn't use XMM registers
                             } else if is_fp {
@@ -466,7 +641,22 @@ impl X86_64CodeGen {
                         }
                         let is_fp = types.is_float(*typ);
                         let is_complex = types.is_complex(*typ);
-                        if is_complex {
+                        // Check for medium struct with 2-SSE classification
+                        let is_two_sse_struct = !is_complex
+                            && (types.kind(*typ) == crate::types::TypeKind::Struct
+                                || types.kind(*typ) == crate::types::TypeKind::Union)
+                            && type_size_bits > 64
+                            && type_size_bits <= 128
+                            && {
+                                let abi = crate::abi::SysVAmd64Abi;
+                                matches!(
+                                    abi.classify_param(*typ, types),
+                                    crate::abi::ArgClass::Direct { ref classes, .. }
+                                        if classes.len() == 2
+                                            && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                                )
+                            };
+                        if is_complex || is_two_sse_struct {
                             // Complex argument - uses TWO consecutive XMM registers
                             // double _Complex: XMM0+XMM1, XMM2+XMM3, etc.
                             // Look up the local variable (same name as param) for stack location
@@ -476,26 +666,26 @@ impl X86_64CodeGen {
                                 if let Some(local) = func.locals.get(param_name) {
                                     if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
                                     {
-                                        let adjusted = offset + self.callee_saved_offset;
-                                        let (fp_size, imag_offset) =
-                                            complex_fp_info(types, &self.base.target, *typ);
+                                        let offset = *offset;
+                                        let (fp_size, imag_offset) = if is_two_sse_struct {
+                                            // Struct of two doubles: each field is 8 bytes
+                                            (FpSize::Double, 8)
+                                        } else {
+                                            complex_fp_info(types, &self.base.target, *typ)
+                                        };
                                         // Store real part from first XMM register
                                         self.push_lir(X86Inst::MovFp {
                                             size: fp_size,
                                             src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                                base: Reg::Rbp,
-                                                offset: -adjusted,
-                                            }),
+                                            dst: XmmOperand::Mem(self.stack_mem(offset)),
                                         });
                                         // Store imag part from second XMM register
                                         self.push_lir(X86Inst::MovFp {
                                             size: fp_size,
                                             src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                                base: Reg::Rbp,
-                                                offset: -adjusted + imag_offset,
-                                            }),
+                                            dst: XmmOperand::Mem(
+                                                self.stack_mem(offset - imag_offset),
+                                            ),
                                         });
                                     }
                                 }
@@ -510,7 +700,6 @@ impl X86_64CodeGen {
                             if fp_arg_idx < fp_arg_regs.len() {
                                 if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
                                     // Move from FP arg register to stack
-                                    let adjusted = offset + self.callee_saved_offset;
                                     let fp_size = if types.size_bits(*typ) == 32 {
                                         FpSize::Single
                                     } else {
@@ -519,27 +708,74 @@ impl X86_64CodeGen {
                                     self.push_lir(X86Inst::MovFp {
                                         size: fp_size,
                                         src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                            base: Reg::Rbp,
-                                            offset: -adjusted,
-                                        }),
+                                        dst: XmmOperand::Mem(self.stack_mem(*offset)),
                                     });
                                 }
                             }
                             fp_arg_idx += 1;
+                        } else if types.kind(*typ) == TypeKind::Int128 {
+                            // __int128 argument — uses TWO consecutive GP registers
+                            // Store to the arg pseudo's stack slot (allocated by regalloc)
+                            if int_arg_idx + 1 < int_arg_regs.len() {
+                                if let Some(loc) = self.locations.get(&pseudo.id).cloned() {
+                                    // Store lo half from first GP register
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                                    });
+                                    // Store hi half from second GP register
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                                    });
+                                }
+                            } else {
+                                // Stack-passed int128: copy from incoming arg area
+                                // to the local stack slot.
+                                if let Some(loc) = self.locations.get(&pseudo.id).cloned() {
+                                    // Load lo from incoming, store to local
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                                            base: Reg::Rbp,
+                                            offset: incoming_stack_offset,
+                                        }),
+                                        dst: GpOperand::Reg(Reg::R10),
+                                    });
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Reg(Reg::R10),
+                                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                                    });
+                                    // Load hi from incoming, store to local
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                                            base: Reg::Rbp,
+                                            offset: incoming_stack_offset + 8,
+                                        }),
+                                        dst: GpOperand::Reg(Reg::R10),
+                                    });
+                                    self.push_lir(X86Inst::Mov {
+                                        size: OperandSize::B64,
+                                        src: GpOperand::Reg(Reg::R10),
+                                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                                    });
+                                }
+                                incoming_stack_offset += 16;
+                            }
+                            int_arg_idx += 2;
                         } else {
                             // Integer argument
                             if int_arg_idx < int_arg_regs.len() {
                                 if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
                                     // Move from arg register to stack
-                                    let adjusted = offset + self.callee_saved_offset;
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
                                         src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
-                                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                            base: Reg::Rbp,
-                                            offset: -adjusted,
-                                        }),
+                                        dst: GpOperand::Mem(self.stack_mem(*offset)),
                                     });
                                 }
                             }
@@ -574,6 +810,11 @@ impl X86_64CodeGen {
                 types.is_float(*typ) && types.kind(*typ) != crate::types::TypeKind::LongDouble
             })
             .count();
+
+        // Count fixed params that overflow to the stack (beyond register capacity)
+        let gp_overflow = self.num_fixed_gp_params.saturating_sub(6);
+        let fp_overflow = self.num_fixed_fp_params.saturating_sub(8);
+        self.num_fixed_stack_params = gp_overflow + fp_overflow;
     }
 
     fn emit_block(&mut self, block: &crate::ir::BasicBlock, types: &TypeTable) {
@@ -608,18 +849,27 @@ impl X86_64CodeGen {
                 kind == TypeKind::Struct || kind == TypeKind::Union
             });
 
-            if insn.is_two_reg_return {
+            // Derive return size from type to avoid 32-bit truncation
+            let ret_size = ret_typ
+                .map(|t| types.size_bits(t).max(32))
+                .unwrap_or(insn.size.max(32));
+
+            if insn.returns_two_regs() {
                 // Two-register struct return: check ABI for SSE vs INTEGER
                 if is_struct_or_union {
                     if let Some(typ) = ret_typ {
                         let abi = get_abi(&self.base.target);
                         if let ArgClass::Direct { classes, .. } = abi.classify_return(typ, types) {
-                            // Handle mixed SSE+INTEGER returns per ABI classification
-                            // Each SSE class uses XMM0, XMM1; each INTEGER uses RAX, RDX
+                            // Handle two-register struct returns per ABI classification.
+                            // Must solve the parallel-move problem: if src[1] is in
+                            // Rax, moving src[0]→Rax first would clobber it.
+                            let srcs: Vec<Option<PseudoId>> =
+                                vec![Some(*src), insn.src.get(1).copied()];
+
+                            // Collect (src, dst_reg) pairs
+                            let mut gp_moves: Vec<(PseudoId, Reg)> = Vec::new();
                             let mut xmm_idx = 0;
                             let mut gp_idx = 0;
-                            let srcs = [Some(*src), insn.src.get(1).copied()];
-
                             for (i, &class) in classes.iter().enumerate() {
                                 if let Some(s) = srcs.get(i).copied().flatten() {
                                     match class {
@@ -632,18 +882,31 @@ impl X86_64CodeGen {
                                             self.emit_fp_move(s, xmm, 64);
                                             xmm_idx += 1;
                                         }
-                                        RegClass::Integer => {
-                                            let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
-                                            self.emit_move(s, gp, 64);
-                                            gp_idx += 1;
-                                        }
                                         _ => {
-                                            // NoClass, Memory - shouldn't happen for Direct
                                             let gp = if gp_idx == 0 { Reg::Rax } else { Reg::Rdx };
-                                            self.emit_move(s, gp, 64);
+                                            gp_moves.push((s, gp));
                                             gp_idx += 1;
                                         }
                                     }
+                                }
+                            }
+
+                            // Emit GP moves, handling clobber: if src[1] lives in Rax,
+                            // move it to Rdx FIRST, then src[0] to Rax.
+                            if gp_moves.len() == 2 {
+                                let src1_in_rax =
+                                    matches!(self.get_location(gp_moves[1].0), Loc::Reg(Reg::Rax));
+                                if src1_in_rax {
+                                    // Move second (Rdx) first to avoid clobbering
+                                    self.emit_move(gp_moves[1].0, gp_moves[1].1, 64);
+                                    self.emit_move(gp_moves[0].0, gp_moves[0].1, 64);
+                                } else {
+                                    self.emit_move(gp_moves[0].0, gp_moves[0].1, 64);
+                                    self.emit_move(gp_moves[1].0, gp_moves[1].1, 64);
+                                }
+                            } else {
+                                for (s, gp) in &gp_moves {
+                                    self.emit_move(*s, *gp, 64);
                                 }
                             }
                         } else {
@@ -675,21 +938,14 @@ impl X86_64CodeGen {
                                 // Two SSE regs for 9-16 byte float struct
                                 match src_loc {
                                     Loc::Stack(offset) => {
-                                        let adjusted = offset + self.callee_saved_offset;
                                         self.push_lir(X86Inst::MovFp {
                                             size: FpSize::Double,
-                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                                base: Reg::Rbp,
-                                                offset: -adjusted,
-                                            }),
+                                            src: XmmOperand::Mem(self.stack_mem(offset)),
                                             dst: XmmOperand::Reg(XmmReg::Xmm0),
                                         });
                                         self.push_lir(X86Inst::MovFp {
                                             size: FpSize::Double,
-                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                                base: Reg::Rbp,
-                                                offset: -adjusted + 8,
-                                            }),
+                                            src: XmmOperand::Mem(self.stack_mem(offset - 8)),
                                             dst: XmmOperand::Reg(XmmReg::Xmm1),
                                         });
                                     }
@@ -722,13 +978,9 @@ impl X86_64CodeGen {
                                 };
                                 match src_loc {
                                     Loc::Stack(offset) => {
-                                        let adjusted = offset + self.callee_saved_offset;
                                         self.push_lir(X86Inst::MovFp {
                                             size: fp_size,
-                                            src: XmmOperand::Mem(MemAddr::BaseOffset {
-                                                base: Reg::Rbp,
-                                                offset: -adjusted,
-                                            }),
+                                            src: XmmOperand::Mem(self.stack_mem(offset)),
                                             dst: XmmOperand::Reg(XmmReg::Xmm0),
                                         });
                                     }
@@ -740,18 +992,18 @@ impl X86_64CodeGen {
                                             dst: XmmReg::Xmm0,
                                         });
                                     }
-                                    _ => self.emit_move(*src, Reg::Rax, insn.size),
+                                    _ => self.emit_move(*src, Reg::Rax, ret_size),
                                 }
                             }
                         } else {
                             // INTEGER class - return in RAX
-                            self.emit_move(*src, Reg::Rax, insn.size);
+                            self.emit_move(*src, Reg::Rax, ret_size);
                         }
                     } else {
-                        self.emit_move(*src, Reg::Rax, insn.size);
+                        self.emit_move(*src, Reg::Rax, ret_size);
                     }
                 } else {
-                    self.emit_move(*src, Reg::Rax, insn.size);
+                    self.emit_move(*src, Reg::Rax, ret_size);
                 }
             } else if is_complex {
                 // Complex return value handling:
@@ -763,13 +1015,9 @@ impl X86_64CodeGen {
 
                 match src_loc {
                     Loc::Stack(offset) => {
-                        let adjusted = offset + self.callee_saved_offset;
                         self.push_lir(X86Inst::Mov {
                             size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -adjusted,
-                            }),
+                            src: GpOperand::Mem(self.stack_mem(offset)),
                             dst: GpOperand::Reg(Reg::Rax),
                         });
                         if is_float_complex {
@@ -844,8 +1092,21 @@ impl X86_64CodeGen {
                     let fp_size = types.size_bits(fp_typ).max(32);
                     self.emit_fp_move(*src, XmmReg::Xmm0, fp_size);
                 }
+            } else if ret_typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+                // __int128 return: lo half → RAX, hi half → RDX
+                let loc = self.get_location(*src).clone();
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                    dst: GpOperand::Reg(Reg::Rdx),
+                });
             } else {
-                self.emit_move(*src, Reg::Rax, insn.size);
+                self.emit_move(*src, Reg::Rax, ret_size);
             }
         }
 
@@ -878,13 +1139,54 @@ impl X86_64CodeGen {
 
     /// Emit conditional branch: test condition and branch accordingly
     /// Returns true if an early return was taken (for constant conditions)
-    fn emit_cbr(&mut self, insn: &Instruction) -> bool {
+    fn emit_cbr(&mut self, insn: &Instruction, types: &TypeTable) -> bool {
         let Some(&cond) = insn.src.first() else {
             return false;
         };
 
         let loc = self.get_location(cond);
-        let size = insn.size.max(32);
+        // Derive size from type when available, falling back to 64-bit
+        // when size is unset (0) to avoid truncating 64-bit condition values.
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(if insn.size == 0 {
+                64
+            } else {
+                insn.size.max(32)
+            });
+
+        // Handle 128-bit integer stack values: OR both halves together and test
+        if self.int128_pseudos.contains(&insn.src[0]) {
+            if let Loc::Stack(_) | Loc::IncomingArg(_) = &loc {
+                let lo_mem = self.int128_lo_mem_loc(&loc);
+                let hi_mem = self.int128_hi_mem_loc(&loc);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(lo_mem),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Or {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(hi_mem),
+                    dst: Reg::R10,
+                });
+                // Test result: NE if nonzero
+                if let Some(target) = insn.bb_true {
+                    self.push_lir(X86Inst::Jcc {
+                        cc: CondCode::Ne,
+                        target: Label::new(&self.base.current_fn, target.0),
+                    });
+                }
+                if let Some(target) = insn.bb_false {
+                    self.push_lir(X86Inst::Jmp {
+                        target: Label::new(&self.base.current_fn, target.0),
+                    });
+                }
+                return false;
+            }
+        }
+
         let op_size = OperandSize::from_bits(size);
 
         match &loc {
@@ -896,14 +1198,10 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::Cmp {
                     size: op_size,
                     src: GpOperand::Imm(0),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
+                    dst: GpOperand::Mem(self.stack_mem(*offset)),
                 });
             }
             Loc::IncomingArg(offset) => {
@@ -934,9 +1232,14 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Xmm(x) => {
+                let fp_size = if size <= 32 {
+                    FpSize::Single
+                } else {
+                    FpSize::Double
+                };
                 self.push_lir(X86Inst::XorpsSelf { reg: XmmReg::Xmm15 });
                 self.push_lir(X86Inst::UComiFp {
-                    size: FpSize::Single,
+                    size: fp_size,
                     src: XmmOperand::Reg(*x),
                     dst: XmmReg::Xmm15,
                 });
@@ -991,24 +1294,46 @@ impl X86_64CodeGen {
                 }
             }
 
-            Opcode::Cbr => if self.emit_cbr(insn) {},
+            Opcode::Cbr => if self.emit_cbr(insn, types) {},
 
             Opcode::Switch => {
-                // Switch uses target as the value to switch on
-                if let Some(val) = insn.target {
-                    let size = insn.size.max(32);
-                    let op_size = OperandSize::from_bits(size);
-                    // Move switch value to R10 (scratch register)
-                    self.emit_move(val, Reg::R10, size);
+                if let Some(&val) = insn.src.first() {
+                    // Derive comparison size from type to handle long/pointer switches
+                    let switch_size = insn
+                        .typ
+                        .map(|t| types.size_bits(t).max(32))
+                        .unwrap_or(insn.size.max(32));
+                    self.emit_move(val, Reg::R10, switch_size);
+                    let op_size = if switch_size > 32 {
+                        OperandSize::B64
+                    } else {
+                        OperandSize::B32
+                    };
 
                     // Generate comparisons for each case
                     for (case_val, target_bb) in &insn.switch_cases {
-                        // LIR: compare with case value
-                        self.push_lir(X86Inst::Cmp {
-                            size: op_size,
-                            src: GpOperand::Imm(*case_val),
-                            dst: GpOperand::Reg(Reg::R10),
-                        });
+                        // For 64-bit comparisons with values that don't fit in a
+                        // sign-extended 32-bit immediate, load into R11 first
+                        let fits_in_simm32 =
+                            *case_val >= i32::MIN as i64 && *case_val <= i32::MAX as i64;
+                        if op_size == OperandSize::B64 && !fits_in_simm32 {
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Imm(*case_val),
+                                dst: GpOperand::Reg(Reg::R11),
+                            });
+                            self.push_lir(X86Inst::Cmp {
+                                size: op_size,
+                                src: GpOperand::Reg(Reg::R11),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                        } else {
+                            self.push_lir(X86Inst::Cmp {
+                                size: op_size,
+                                src: GpOperand::Imm(*case_val),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                        }
                         // LIR: conditional jump on equal
                         self.push_lir(X86Inst::Jcc {
                             cc: CondCode::Eq,
@@ -1034,15 +1359,15 @@ impl X86_64CodeGen {
             | Opcode::Shl
             | Opcode::Lsr
             | Opcode::Asr => {
-                self.emit_binop(insn);
+                self.emit_binop(insn, types);
             }
 
             Opcode::Mul => {
-                self.emit_mul(insn);
+                self.emit_mul(insn, types);
             }
 
             Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => {
-                self.emit_div(insn);
+                self.emit_div(insn, types);
             }
 
             // Floating-point arithmetic operations
@@ -1128,11 +1453,11 @@ impl X86_64CodeGen {
             | Opcode::SetBe
             | Opcode::SetA
             | Opcode::SetAe => {
-                self.emit_compare(insn);
+                self.emit_compare(insn, types);
             }
 
-            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg),
-            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not),
+            Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, types),
+            Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, types),
 
             Opcode::Load => {
                 self.emit_load(insn, types);
@@ -1155,7 +1480,7 @@ impl X86_64CodeGen {
                                 if let Some(Loc::Reg(r)) = target_loc {
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::from_bits(insn.size),
-                                        src: GpOperand::Imm(*v),
+                                        src: GpOperand::Imm(*v as i64),
                                         dst: GpOperand::Reg(r),
                                     });
                                 }
@@ -1217,11 +1542,17 @@ impl X86_64CodeGen {
                         }
                         Loc::Stack(offset) => {
                             // Get address of stack location
-                            let adjusted = offset + self.callee_saved_offset;
+                            self.push_lir(X86Inst::Lea {
+                                addr: self.stack_mem(offset),
+                                dst: dst_reg,
+                            });
+                        }
+                        Loc::IncomingArg(offset) => {
+                            // Get address of incoming stack argument (e.g., large struct param)
                             self.push_lir(X86Inst::Lea {
                                 addr: MemAddr::BaseOffset {
                                     base: Reg::Rbp,
-                                    offset: -adjusted,
+                                    offset,
                                 },
                                 dst: dst_reg,
                             });
@@ -1236,7 +1567,7 @@ impl X86_64CodeGen {
             }
 
             Opcode::Select => {
-                self.emit_select(insn);
+                self.emit_select(insn, types);
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
@@ -1413,27 +1744,20 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 // For sub-32-bit values, use zero-extending load to avoid garbage in upper bits
                 if actual_size < 32 {
                     // LIR: zero-extending memory-to-register move
                     self.push_lir(X86Inst::Movzx {
                         src_size: OperandSize::from_bits(actual_size),
                         dst_size: OperandSize::B32,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst,
                     });
                 } else {
                     // LIR: memory-to-register move
                     self.push_lir(X86Inst::Mov {
                         size: op_size,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(dst),
                     });
                 }
@@ -1464,6 +1788,7 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Imm(v) => {
+                let v = v as i64;
                 // x86-64: movl sign-extends to 64-bit, movq only works with 32-bit signed immediates
                 // For values outside 32-bit signed range, use movabsq
                 if size == 64 && (v > i32::MAX as i64 || v < i32::MIN as i64) {
@@ -1542,12 +1867,10 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Xmm(x) => {
-                // Move from XMM to general-purpose register
-                // For Float16 (16-bit), XMM may have garbage in bits 16-31 from movss loads.
-                // We need to: 1) use movd (32-bit), 2) zero-extend from 16 to 32 if needed.
-                // LIR: XMM to GP move
+                // Move from XMM to general-purpose register.
+                // Use movd for ≤32-bit (float/float16) or movq for 64-bit (double).
                 self.push_lir(X86Inst::MovXmmGp {
-                    size: OperandSize::B32, // Use movd instead of movq
+                    size: op_size,
                     src: x,
                     dst,
                 });
@@ -1592,6 +1915,21 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Store a GP register to a regalloc stack slot. All regalloc slots are
+    /// 8 bytes on x86-64. For integer values >= 32 bits, we always write the
+    /// full 64-bit slot to prevent stale upper bytes from being read by
+    /// subsequent wider loads. On x86-64, any 32-bit register operation
+    /// zero-extends to 64 bits, so `movq %reg, mem` is correct.
+    /// For 8/16-bit values, store the actual size to avoid clobbering adjacent
+    /// struct fields when the "slot" is really a struct member.
+    pub(super) fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i32) {
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(src),
+            dst: GpOperand::Mem(self.stack_mem(stack_offset)),
+        });
+    }
+
     pub(super) fn emit_move_to_loc(&mut self, src: Reg, dst: &Loc, size: u32) {
         // For stack stores, use actual size to properly handle char/short
         // For register-to-register, use minimum 32-bit
@@ -1610,46 +1948,24 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
-                // For sub-32-bit values, first zero-extend to 32 bits then store 32 bits.
-                // This ensures that subsequent 32-bit loads get correct values.
                 if size < 32 {
-                    // Use scratch register to avoid modifying source
+                    // Sub-32-bit values: zero-extend to 32 bits, then store
+                    // full slot via store_to_stack_slot (which writes 64-bit)
                     let scratch = if src == Reg::R10 { Reg::R11 } else { Reg::R10 };
-                    // Copy to scratch
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Reg(src),
                         dst: GpOperand::Reg(scratch),
                     });
-                    // Zero-extend by masking to the appropriate size
                     let mask = (1i64 << size) - 1;
                     self.push_lir(X86Inst::And {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(mask),
                         dst: scratch,
                     });
-                    // Store 32 bits
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(scratch),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
-                    });
+                    self.store_to_stack_slot(scratch, *offset);
                 } else {
-                    // Store with actual size
-                    let op_size = OperandSize::from_bits(size);
-                    // LIR: register-to-memory move
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(src),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
-                    });
+                    self.store_to_stack_slot(src, *offset);
                 }
             }
             Loc::Xmm(xmm) => {
@@ -1681,6 +1997,124 @@ impl X86_64CodeGen {
             None => return,
         };
         let dst_loc = self.get_location(target);
+
+        // Check if this is a 128-bit integer load (target is an int128 pseudo).
+        // For int128 local variables, the IR Load uses a Sym pseudo (addr) which
+        // resolves to the variable's stack slot. This is effectively a stack-to-stack
+        // copy via the emit_int128_copy path. For pointer dereferences (*ptr where
+        // ptr is to an int128), addr is a runtime pointer that must be dereferenced.
+        if self.int128_pseudos.contains(&target) {
+            let addr_loc = self.get_location(addr);
+            match &addr_loc {
+                Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Imm(_) => {
+                    // addr is a local/sym — do stack-to-stack copy
+                    self.emit_int128_copy(addr, target);
+                }
+                Loc::Global(name) => {
+                    // Global int128: load address into R10, then load both halves.
+                    // emit_move would load the VALUE (double deref), so load
+                    // the address directly instead.
+                    let dst_lo = self.int128_lo_mem_loc(&dst_loc);
+                    let dst_hi = self.int128_hi_mem_loc(&dst_loc);
+                    let symbol = if name.starts_with('.') {
+                        Symbol::local(name.clone())
+                    } else {
+                        Symbol::global(name.clone())
+                    };
+                    if self.needs_got_access(name) {
+                        // GOT: movq loads the address
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(
+                                name.clone(),
+                            ))),
+                            dst: GpOperand::Reg(Reg::R10),
+                        });
+                    } else {
+                        // RIP-relative: LEA to get address
+                        self.push_lir(X86Inst::Lea {
+                            addr: MemAddr::RipRelative(symbol),
+                            dst: Reg::R10,
+                        });
+                    }
+                    if insn.offset != 0 {
+                        self.push_lir(X86Inst::Add {
+                            size: OperandSize::B64,
+                            src: GpOperand::Imm(insn.offset),
+                            dst: Reg::R10,
+                        });
+                    }
+                    // Load both halves from [R10]
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R10,
+                            offset: 0,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: GpOperand::Mem(dst_lo),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R10,
+                            offset: 8,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: GpOperand::Mem(dst_hi),
+                    });
+                }
+                _ => {
+                    // addr is a runtime pointer — dereference it
+                    let dst_lo = self.int128_lo_mem_loc(&dst_loc);
+                    let dst_hi = self.int128_hi_mem_loc(&dst_loc);
+                    self.emit_move(addr, Reg::R10, 64);
+                    if insn.offset != 0 {
+                        self.push_lir(X86Inst::Add {
+                            size: OperandSize::B64,
+                            src: GpOperand::Imm(insn.offset),
+                            dst: Reg::R10,
+                        });
+                    }
+                    // Copy 16 bytes from [R10] to dst
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R10,
+                            offset: 0,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: GpOperand::Mem(dst_lo),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::R10,
+                            offset: 8,
+                        }),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: GpOperand::Mem(dst_hi),
+                    });
+                }
+            }
+            return;
+        }
 
         // Check if this is an FP load
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t)) || matches!(dst_loc, Loc::Xmm(_));
@@ -1766,7 +2200,7 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
-                    let total_offset = offset - insn.offset as i32 + self.callee_saved_offset;
+                    let stack_addr = self.stack_mem(offset - insn.offset as i32);
                     if mem_size <= 16 {
                         // LIR: sign/zero extending load from stack
                         let src_size = OperandSize::from_bits(mem_size);
@@ -1774,20 +2208,14 @@ impl X86_64CodeGen {
                             self.push_lir(X86Inst::Movzx {
                                 src_size,
                                 dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -total_offset,
-                                }),
+                                src: GpOperand::Mem(stack_addr),
                                 dst: dst_reg,
                             });
                         } else {
                             self.push_lir(X86Inst::Movsx {
                                 src_size,
                                 dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -total_offset,
-                                }),
+                                src: GpOperand::Mem(stack_addr),
                                 dst: dst_reg,
                             });
                         }
@@ -1796,23 +2224,16 @@ impl X86_64CodeGen {
                         let op_size = OperandSize::from_bits(reg_size);
                         self.push_lir(X86Inst::Mov {
                             size: op_size,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::Rbp,
-                                offset: -total_offset,
-                            }),
+                            src: GpOperand::Mem(stack_addr),
                             dst: GpOperand::Reg(dst_reg),
                         });
                     }
                 } else {
                     // Spilled address - load address first, then load from that address
-                    let adjusted = offset + self.callee_saved_offset;
                     // LIR: load spilled address
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                     if mem_size <= 16 {
@@ -2120,27 +2541,41 @@ impl X86_64CodeGen {
 
                 let op_size = OperandSize::from_bits(mem_size);
                 if is_symbol {
-                    // Local variable - store directly to stack slot
-                    let total_offset = offset - insn.offset as i32 + self.callee_saved_offset;
+                    // Local variable - store directly to stack slot.
+                    // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
+                    // upper bits when a 32-bit result is stored into a 64-bit
+                    // local (e.g., int-to-long, int-to-pointer assignments).
+                    // Exception: struct/union fields at offset 0 must use exact
+                    // size to avoid clobbering the adjacent field at offset 4.
+                    let store_size = if mem_size == 32 && insn.offset == 0 {
+                        let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
+                        if sym_bits > 32 {
+                            // Check if this is a struct/union (don't widen field stores)
+                            let is_struct =
+                                self.sym_type_sizes.contains_key(&addr) && sym_bits > 64;
+                            if is_struct {
+                                op_size // struct field: exact size
+                            } else {
+                                OperandSize::B64 // scalar/pointer: safe to widen
+                            }
+                        } else {
+                            OperandSize::B64 // small scalar: safe to widen
+                        }
+                    } else {
+                        op_size
+                    };
                     // LIR: store to stack slot
                     self.push_lir(X86Inst::Mov {
-                        size: op_size,
+                        size: store_size,
                         src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -total_offset,
-                        }),
+                        dst: GpOperand::Mem(self.stack_mem(offset - insn.offset as i32)),
                     });
                 } else {
                     // Spilled address - load address first, then store through it
-                    let adjusted = offset + self.callee_saved_offset;
                     // LIR: load spilled address
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                     // LIR: store through loaded address
@@ -2253,13 +2688,9 @@ impl X86_64CodeGen {
         // Load source address into R10
         match value_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 // LIR: lea for source address
                 self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    },
+                    addr: self.stack_mem(offset),
                     dst: Reg::R10,
                 });
             }
@@ -2300,15 +2731,33 @@ impl X86_64CodeGen {
         // Load destination address into R11
         match addr_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset - insn.offset as i32 + self.callee_saved_offset;
-                // LIR: lea for destination address
-                self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    },
-                    dst: Reg::R11,
-                });
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+
+                if is_symbol {
+                    // Local variable — LEA to get direct stack address
+                    self.push_lir(X86Inst::Lea {
+                        addr: self.stack_mem(offset - insn.offset as i32),
+                        dst: Reg::R11,
+                    });
+                } else {
+                    // Spilled pointer — load the pointer value from the slot
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.stack_mem(offset)),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                    if insn.offset != 0 {
+                        self.push_lir(X86Inst::Add {
+                            size: OperandSize::B64,
+                            src: GpOperand::Imm(insn.offset),
+                            dst: Reg::R11,
+                        });
+                    }
+                }
             }
             Loc::Reg(r) => {
                 if insn.offset != 0 {
@@ -2353,27 +2802,143 @@ impl X86_64CodeGen {
             _ => return,
         }
 
-        // Copy qword by qword
+        // Copy qword by qword using XMM15 as shuttle (R10=src, R11=dst).
+        // XMM15 is reserved scratch — avoids clobbering RAX which is
+        // allocatable and may hold a live pseudo.
         for i in 0..num_qwords {
             let byte_offset = (i * 8) as i32;
-            // LIR: load from source
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Mem(MemAddr::BaseOffset {
+            // LIR: load from source via XMM15
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::R10,
                     offset: byte_offset,
                 }),
-                dst: GpOperand::Reg(Reg::Rax),
+                dst: XmmOperand::Reg(XmmReg::Xmm15),
             });
-            // LIR: store to destination
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::Rax),
-                dst: GpOperand::Mem(MemAddr::BaseOffset {
+            // LIR: store to destination via XMM15
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Reg(XmmReg::Xmm15),
+                dst: XmmOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::R11,
                     offset: byte_offset,
                 }),
             });
+        }
+    }
+
+    /// Emit a 128-bit integer copy (stack-to-stack, imm128-to-stack, etc).
+    fn emit_int128_copy(&mut self, src: PseudoId, dst: PseudoId) {
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+
+        match &src_loc {
+            Loc::Imm(v) => {
+                let lo = *v as i64;
+                let hi = (*v >> 64) as i64;
+                // Store lo half
+                if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: lo,
+                        dst: Reg::R10,
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R10),
+                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(lo),
+                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                }
+                // Store hi half
+                if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
+                    self.push_lir(X86Inst::MovAbs {
+                        imm: hi,
+                        dst: Reg::R10,
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R10),
+                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(hi),
+                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                    });
+                }
+            }
+            Loc::Stack(_) | Loc::IncomingArg(_) => {
+                // Stack-to-stack copy: two qword moves via R10
+                let src_lo = self.int128_lo_mem_loc(&src_loc);
+                let dst_lo = self.int128_lo_mem_loc(&dst_loc);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(src_lo),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(dst_lo),
+                });
+                let src_hi = self.int128_hi_mem_loc(&src_loc);
+                let dst_hi = self.int128_hi_mem_loc(&dst_loc);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(src_hi),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(dst_hi),
+                });
+            }
+            _ => {
+                // Fallback: load lo half into R10 and store it
+                self.emit_move(src, Reg::R10, 64);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(0),
+                    dst: GpOperand::Mem(self.int128_hi_mem_loc(&dst_loc)),
+                });
+            }
+        }
+    }
+
+    /// Helper: get lo-half MemAddr for a 128-bit Loc.
+    pub(super) fn int128_lo_mem_loc(&self, loc: &Loc) -> MemAddr {
+        match loc {
+            Loc::Stack(offset) => self.stack_mem(*offset),
+            Loc::IncomingArg(offset) => MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: *offset,
+            },
+            _ => panic!("int128_lo_mem_loc: expected stack loc, got {:?}", loc),
+        }
+    }
+
+    /// Helper: get hi-half MemAddr for a 128-bit Loc.
+    pub(super) fn int128_hi_mem_loc(&self, loc: &Loc) -> MemAddr {
+        match loc {
+            Loc::Stack(offset) => self.stack_mem(*offset - 8),
+            Loc::IncomingArg(offset) => MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: *offset + 8,
+            },
+            _ => panic!("int128_hi_mem_loc: expected stack loc, got {:?}", loc),
         }
     }
 
@@ -2384,12 +2949,8 @@ impl X86_64CodeGen {
         // Load destination address into R11
         match addr_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset - insn.offset as i32 + self.callee_saved_offset;
                 self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    },
+                    addr: self.stack_mem(offset - insn.offset as i32),
                     dst: Reg::R11,
                 });
             }
@@ -2503,9 +3064,9 @@ impl X86_64CodeGen {
         self.handle_call_return_value(insn, types);
     }
 
-    /// Emit a select (ternary) instruction using CMOVcc
-    /// This is used for pure ternary expressions: cond ? a : b
-    fn emit_select(&mut self, insn: &Instruction) {
+    /// Emit a select (ternary) instruction using CMOVcc (integers) or
+    /// conditional branch (floats, since CMov only works on GP registers).
+    fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
         let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
         {
             (Some(&c), Some(&t), Some(&e)) => (c, t, e),
@@ -2515,7 +3076,101 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-        let size = insn.size.max(32);
+        let size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
+
+        // Check if this is a floating-point select
+        let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
+            || matches!(self.get_location(then_val), Loc::Xmm(_) | Loc::FImm(..))
+            || matches!(self.get_location(else_val), Loc::Xmm(_) | Loc::FImm(..));
+
+        if is_fp {
+            self.emit_select_fp(cond, then_val, else_val, target, size);
+        } else {
+            self.emit_select_int(cond, then_val, else_val, target, insn, types, size);
+        }
+    }
+
+    /// Emit FP select using conditional branch (CMov doesn't work on XMM regs)
+    fn emit_select_fp(
+        &mut self,
+        cond: PseudoId,
+        then_val: PseudoId,
+        else_val: PseudoId,
+        target: PseudoId,
+        size: u32,
+    ) {
+        let dst_loc = self.get_location(target);
+
+        // Load condition to R11. FP value computation (fneg, fadd, etc.)
+        // may clobber GP registers like RAX for immediate loading. We must
+        // reload the condition from its STACK slot, not trust the register.
+        let cond_loc = self.get_location(cond);
+        match &cond_loc {
+            Loc::Imm(v) => {
+                let val = if *v != 0 { then_val } else { else_val };
+                self.emit_fp_move(val, XmmReg::Xmm0, size);
+                self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size);
+                return;
+            }
+            Loc::Stack(offset) => {
+                // Reload directly from stack (safe from clobber)
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(self.stack_mem(*offset)),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+            }
+            _ => {
+                // For other locations (Reg, Global), use emit_move
+                self.emit_move(cond, Reg::R11, 64);
+            }
+        }
+        self.push_lir(X86Inst::Test {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        // Branch: load else_val, skip over then_val load if condition is false
+        let then_suffix = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let done_suffix = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let then_label = Label::new("sel_then", then_suffix);
+        let done_label = Label::new("sel_done", done_suffix);
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ne,
+            target: then_label.clone(),
+        });
+        // Else branch: load else_val
+        self.emit_fp_move(else_val, XmmReg::Xmm0, size);
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+        // Then branch: load then_val
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(then_label)));
+        self.emit_fp_move(then_val, XmmReg::Xmm0, size);
+        // Done
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size);
+    }
+
+    /// Emit integer select using CMOVcc
+    #[allow(clippy::too_many_arguments)]
+    fn emit_select_int(
+        &mut self,
+        cond: PseudoId,
+        then_val: PseudoId,
+        else_val: PseudoId,
+        target: PseudoId,
+        insn: &Instruction,
+        _types: &TypeTable,
+        size: u32,
+    ) {
+        let _ = insn;
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
@@ -2530,7 +3185,6 @@ impl X86_64CodeGen {
         let cond_loc = self.get_location(cond);
         match &cond_loc {
             Loc::Reg(r) => {
-                // Test register with itself
                 self.push_lir(X86Inst::Test {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(*r),
@@ -2538,7 +3192,6 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                // Constant condition - just use appropriate value
                 if *v != 0 {
                     self.emit_move(then_val, dst_reg, size);
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
@@ -2546,14 +3199,12 @@ impl X86_64CodeGen {
                     }
                     return;
                 }
-                // else_val already in dst_reg
                 if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
                     self.emit_move_to_loc(dst_reg, &dst_loc, size);
                 }
                 return;
             }
             _ => {
-                // Load condition to scratch register and test
                 self.emit_move(cond, Reg::R11, 64);
                 self.push_lir(X86Inst::Test {
                     size: OperandSize::B64,
@@ -2563,8 +3214,6 @@ impl X86_64CodeGen {
             }
         }
 
-        // Conditional move: if condition is non-zero (NE), use then_val
-        // Use R11 for then_val when dst_reg is R10 to avoid clobbering else value
         let then_reg = if dst_reg == Reg::R10 {
             Reg::R11
         } else {
@@ -2578,7 +3227,6 @@ impl X86_64CodeGen {
             dst: dst_reg,
         });
 
-        // Move to final destination if needed
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }
@@ -2592,6 +3240,15 @@ impl X86_64CodeGen {
         typ: Option<TypeId>,
         types: &TypeTable,
     ) {
+        // Handle 128-bit integer copies (stack-to-stack).
+        // Only intercept when src/dst are known int128 pseudos.
+        // Do NOT check size==128 here — 16-byte structs also have size 128 but
+        // use the struct copy path instead.
+        if self.int128_pseudos.contains(&src) || self.int128_pseudos.contains(&dst) {
+            self.emit_int128_copy(src, dst);
+            return;
+        }
+
         // Keep actual size for handling narrow types
         let actual_size = size;
         let reg_size = size.max(32);
@@ -2698,12 +3355,19 @@ impl X86_64CodeGen {
                     }
                 }
                 Loc::Stack(_) => {
+                    // All regalloc stack slots are 8 bytes on x86-64.
+                    // Always store full 64-bit to prevent stale upper bytes
+                    // from being read by subsequent 64-bit loads of the same slot.
+                    // movl to a 32-bit register zero-extends to 64-bit on x86-64,
+                    // so loading with reg_size then storing with 64 is correct.
                     self.emit_move(src, Reg::R10, reg_size);
-                    // For narrow types stored to stack, use the actual size
                     if actual_size <= 16 {
+                        // 8/16-bit values: store actual size (these are char/short
+                        // fields stored to struct offsets, not full stack slots)
                         self.emit_move_to_loc(Reg::R10, &dst_loc, actual_size);
                     } else {
-                        self.emit_move_to_loc(Reg::R10, &dst_loc, reg_size);
+                        // 32-bit values: store as 64-bit to zero-fill upper 4 bytes
+                        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
                     }
                 }
                 _ => {}
@@ -2741,21 +3405,23 @@ impl X86_64CodeGen {
         // and emit mov instructions to/from the actual locations.
         let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
         let mut operand_regs: Vec<Option<Reg>> = Vec::with_capacity(operand_count);
+        let mut operand_sizes: Vec<u32> = Vec::with_capacity(operand_count);
         let mut operand_mem: Vec<Option<String>> = Vec::with_capacity(operand_count);
         let mut operand_names: Vec<Option<String>> = Vec::with_capacity(operand_count);
 
         // Track which outputs need to be moved from specific registers after asm
-        // (output_idx, specific_reg, actual_loc)
-        let mut output_moves: Vec<(usize, Reg, Loc)> = Vec::with_capacity(asm_data.outputs.len());
+        // (output_idx, specific_reg, actual_loc, size_bits)
+        let mut output_moves: Vec<(usize, Reg, Loc, u32)> =
+            Vec::with_capacity(asm_data.outputs.len());
 
         // Track which inputs need to be moved to specific registers before asm
-        // (specific_reg, actual_loc)
-        let mut input_moves: Vec<(Reg, Loc)> = Vec::with_capacity(asm_data.inputs.len());
+        // (specific_reg, actual_loc, size_bits)
+        let mut input_moves: Vec<(Reg, Loc, u32)> = Vec::with_capacity(asm_data.inputs.len());
 
         // Track register remaps: if an allocated reg conflicts with reserved, use temp
-        // (original_reg, temp_reg, actual_loc for restore)
-        let mut remap_setup: Vec<(Reg, Reg, Loc)> = Vec::with_capacity(operand_count);
-        let mut remap_restore: Vec<(Reg, Reg, Loc)> = Vec::with_capacity(operand_count);
+        // (original_reg, temp_reg, actual_loc for restore, size_bits)
+        let mut remap_setup: Vec<(Reg, Reg, Loc, u32)> = Vec::with_capacity(operand_count);
+        let mut remap_restore: Vec<(Reg, Reg, Loc, u32)> = Vec::with_capacity(operand_count);
 
         // Track which pseudos have been assigned temp registers (for +r where input/output share pseudo)
         let mut pseudo_to_temp: std::collections::HashMap<PseudoId, Reg> =
@@ -2779,7 +3445,9 @@ impl X86_64CodeGen {
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
+            let op_size = output.size;
             operand_names.push(output.name.clone());
+            operand_sizes.push(op_size);
 
             // Check for specific register constraint
             if let Some(specific_reg) = Self::constraint_to_specific_reg(&output.constraint) {
@@ -2788,9 +3456,10 @@ impl X86_64CodeGen {
                 operand_mem.push(None);
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
-                    output_moves.push((idx, specific_reg, loc));
+                    output_moves.push((idx, specific_reg, loc, op_size));
                 }
             } else {
+                let requires_reg = Self::constraint_requires_register(&output.constraint);
                 // No specific register - use allocated location
                 match loc {
                     Loc::Reg(r) => {
@@ -2802,7 +3471,7 @@ impl X86_64CodeGen {
                             operand_regs.push(Some(temp));
                             operand_mem.push(None);
                             // For outputs, move from temp to actual loc after asm
-                            remap_restore.push((temp, r, loc.clone()));
+                            remap_restore.push((temp, r, loc.clone(), op_size));
                             // Track this pseudo -> temp mapping for +r inputs
                             pseudo_to_temp.insert(output.pseudo, temp);
                         } else {
@@ -2810,6 +3479,29 @@ impl X86_64CodeGen {
                             operand_mem.push(None);
                             used_regs.insert(r);
                         }
+                    }
+                    Loc::Imm(_) if requires_reg => {
+                        // Constant-propagated value used as asm output.
+                        // Allocate temp register; after asm, the register holds the
+                        // modified value — update the location map directly.
+                        let temp = find_temp_reg(&reserved_regs, &used_regs);
+                        used_regs.insert(temp);
+                        operand_regs.push(Some(temp));
+                        operand_mem.push(None);
+                        // Don't add to output_moves (can't store to Imm).
+                        // Instead, update the pseudo's location to the temp reg after asm.
+                        self.locations.insert(output.pseudo, Loc::Reg(temp));
+                        pseudo_to_temp.insert(output.pseudo, temp);
+                    }
+                    _ if requires_reg => {
+                        // Constraint requires register but value is on stack/memory.
+                        // Allocate a temp register; move from temp to actual loc after asm.
+                        let temp = find_temp_reg(&reserved_regs, &used_regs);
+                        used_regs.insert(temp);
+                        operand_regs.push(Some(temp));
+                        operand_mem.push(None);
+                        output_moves.push((idx, temp, loc.clone(), op_size));
+                        pseudo_to_temp.insert(output.pseudo, temp);
                     }
                     _ => {
                         // Memory or other location - emit as memory operand
@@ -2825,6 +3517,8 @@ impl X86_64CodeGen {
 
         // Process input operands
         for input in &asm_data.inputs {
+            let op_size = input.size;
+
             // Handle matching constraints - use the matched output's location/register
             let (loc, constraint_for_reg) = if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
@@ -2840,7 +3534,22 @@ impl X86_64CodeGen {
                 (self.get_location(input.pseudo), &input.constraint)
             };
 
+            // Matching inputs from '+' constraints share the output's operand number
+            // (GCC: "+r" counts as two operands but uses one %N number).
+            // We DON'T push a new operand slot — the output's slot is reused.
+            // But we DO need to load the initial value into the output's register.
+            if let Some(match_idx) = input.matching_output {
+                if match_idx < num_outputs {
+                    if let Some(reg) = operand_regs[match_idx] {
+                        // Load initial value into the register before asm
+                        input_moves.push((reg, loc, op_size));
+                    }
+                    continue; // Skip — don't add a new operand slot
+                }
+            }
+
             operand_names.push(input.name.clone());
+            operand_sizes.push(op_size);
 
             // Check for specific register constraint
             if let Some(specific_reg) = Self::constraint_to_specific_reg(constraint_for_reg) {
@@ -2849,7 +3558,7 @@ impl X86_64CodeGen {
                 operand_mem.push(None);
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
-                    input_moves.push((specific_reg, loc));
+                    input_moves.push((specific_reg, loc, op_size));
                 }
             } else {
                 // Check if this input shares a pseudo with an output that was remapped
@@ -2859,10 +3568,29 @@ impl X86_64CodeGen {
                     operand_regs.push(Some(temp));
                     operand_mem.push(None);
                     // Add setup move to load value into temp
-                    remap_setup.push((temp, temp, loc.clone()));
+                    remap_setup.push((temp, temp, loc.clone(), op_size));
                 } else {
+                    let requires_reg = Self::constraint_requires_register(constraint_for_reg);
+                    let requires_mem = Self::constraint_requires_memory(constraint_for_reg);
                     // No specific register - use allocated location
                     match loc {
+                        Loc::Imm(_) if requires_mem => {
+                            // Memory constraint with constant address (may be dead code
+                            // from unoptimized switch on constant ORDER in atomic macros).
+                            // Load address into temp reg and emit as indirect memory ref.
+                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            used_regs.insert(temp);
+                            input_moves.push((temp, loc.clone(), op_size));
+                            let mem_str = format!("(%{})", self.reg_name_64(temp));
+                            operand_regs.push(None);
+                            operand_mem.push(Some(mem_str));
+                        }
+                        Loc::Reg(r) if requires_mem => {
+                            // Memory constraint with value in register — emit as indirect
+                            let mem_str = format!("(%{})", self.reg_name_64(r));
+                            operand_regs.push(None);
+                            operand_mem.push(Some(mem_str));
+                        }
                         Loc::Reg(r) => {
                             // Check if allocated reg conflicts with reserved
                             if reserved_regs.contains(&r) {
@@ -2872,7 +3600,7 @@ impl X86_64CodeGen {
                                 operand_regs.push(Some(temp));
                                 operand_mem.push(None);
                                 // For inputs, move from actual loc to temp before asm
-                                remap_setup.push((r, temp, loc.clone()));
+                                remap_setup.push((r, temp, loc.clone(), op_size));
                             } else {
                                 operand_regs.push(Some(r));
                                 operand_mem.push(None);
@@ -2882,7 +3610,16 @@ impl X86_64CodeGen {
                         Loc::Imm(v) => {
                             // Immediate value
                             operand_regs.push(None);
-                            operand_mem.push(Some(format!("${}", v)));
+                            operand_mem.push(Some(format!("${}", v as i64)));
+                        }
+                        _ if requires_reg => {
+                            // Constraint requires register but value is on stack/memory.
+                            // Allocate a temp register and load value before asm.
+                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            used_regs.insert(temp);
+                            operand_regs.push(Some(temp));
+                            operand_mem.push(None);
+                            input_moves.push((temp, loc.clone(), op_size));
                         }
                         _ => {
                             // Memory or other location
@@ -2896,13 +3633,13 @@ impl X86_64CodeGen {
         }
 
         // Emit remap setup moves (for inputs that conflicted with reserved regs)
-        for (_orig, temp, actual_loc) in &remap_setup {
-            self.emit_raw_mov_from_loc(actual_loc, *temp);
+        for (_orig, temp, actual_loc, size) in &remap_setup {
+            self.emit_raw_mov_from_loc(actual_loc, *temp, *size);
         }
 
         // Emit moves from actual locations to specific registers (for inputs)
-        for (specific_reg, actual_loc) in &input_moves {
-            self.emit_raw_mov_from_loc(actual_loc, *specific_reg);
+        for (specific_reg, actual_loc, size) in &input_moves {
+            self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
         }
 
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
@@ -2920,6 +3657,7 @@ impl X86_64CodeGen {
         let asm_output = self.substitute_asm_operands(
             &asm_data.template,
             &operand_regs,
+            &operand_sizes,
             &operand_mem,
             &operand_names,
             &goto_labels_formatted,
@@ -2935,13 +3673,13 @@ impl X86_64CodeGen {
         }
 
         // Emit moves from specific registers to actual locations (for outputs)
-        for (_idx, specific_reg, actual_loc) in &output_moves {
-            self.emit_raw_mov_to_loc(*specific_reg, actual_loc);
+        for (_idx, specific_reg, actual_loc, size) in &output_moves {
+            self.emit_raw_mov_to_loc(*specific_reg, actual_loc, *size);
         }
 
         // Emit remap restore moves (for outputs that conflicted with reserved regs)
-        for (temp, _orig, actual_loc) in &remap_restore {
-            self.emit_raw_mov_to_loc(*temp, actual_loc);
+        for (temp, _orig, actual_loc, size) in &remap_restore {
+            self.emit_raw_mov_to_loc(*temp, actual_loc, *size);
         }
 
         // Handle clobbers - for now just emit comments for documentation
@@ -2963,123 +3701,153 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Get the mov suffix and register size modifier for a given bit size
+    fn asm_mov_info(size_bits: u32) -> (&'static str, char) {
+        match size_bits {
+            0..=8 => ("movb", 'b'),
+            9..=16 => ("movw", 'w'),
+            17..=32 => ("movl", 'k'),
+            _ => ("movq", 'q'),
+        }
+    }
+
     /// Emit a raw mov instruction from a location to a register (for asm input setup)
-    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg) {
-        let dest_name = self.reg_name_64(dest_reg);
+    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg, size_bits: u32) {
+        let (mov, sz) = Self::asm_mov_info(size_bits);
+        let dest_name = if sz == 'q' {
+            self.reg_name_64(dest_reg)
+        } else {
+            self.sized_reg_name(dest_reg, sz)
+        };
         match loc {
             Loc::Reg(src_reg) => {
-                let src_name = self.reg_name_64(*src_reg);
+                let src_name = if sz == 'q' {
+                    self.reg_name_64(*src_reg)
+                } else {
+                    self.sized_reg_name(*src_reg, sz)
+                };
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movq %{}, %{}",
-                    src_name, dest_name
+                    "{} %{}, %{}",
+                    mov, src_name, dest_name
                 ))));
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
+                let mem = self.stack_mem(*offset);
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl -{}(%rbp), %{}",
-                    adjusted,
-                    self.sized_reg_name(dest_reg, 'k') // 32-bit for int
+                    "{} {}, %{}",
+                    mov,
+                    mem.format(&self.base.target),
+                    dest_name
                 ))));
             }
             Loc::Imm(v) => {
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl ${}, %{}",
-                    v,
-                    self.sized_reg_name(dest_reg, 'k')
+                    "{} ${}, %{}",
+                    mov, *v as i64, dest_name
                 ))));
             }
             Loc::Global(name) => {
                 // Check TLS before GOT - TLS symbols need special access pattern
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
-                    // Thread-local storage: use %fs:symbol@TPOFF
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %fs:{}@TPOFF, %{}",
+                        "{} %fs:{}@TPOFF, %{}",
+                        mov,
                         self.format_symbol_name(name),
-                        self.sized_reg_name(dest_reg, 'k')
+                        dest_name
                     ))));
                 } else if self.needs_got_access(name) {
-                    // External symbols on macOS: load address from GOT, then load value
+                    // GOT indirection always uses 64-bit address load
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
                         self.format_symbol_name(name)
                     ))));
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl (%r11), %{}",
-                        self.sized_reg_name(dest_reg, 'k')
+                        "{} (%r11), %{}",
+                        mov, dest_name
                     ))));
                 } else {
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl {}(%rip), %{}",
+                        "{} {}(%rip), %{}",
+                        mov,
                         self.format_symbol_name(name),
-                        self.sized_reg_name(dest_reg, 'k')
+                        dest_name
                     ))));
                 }
             }
             _ => {
-                // Other locations - use generic string
                 let loc_str = self.loc_to_asm_string(loc);
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl {}, %{}",
-                    loc_str,
-                    self.sized_reg_name(dest_reg, 'k')
+                    "{} {}, %{}",
+                    mov, loc_str, dest_name
                 ))));
             }
         }
     }
 
     /// Emit a raw mov instruction from a register to a location (for asm output store)
-    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc) {
-        let src_name = self.sized_reg_name(src_reg, 'k'); // 32-bit for int
+    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc, size_bits: u32) {
+        let (mov, sz) = Self::asm_mov_info(size_bits);
+        let src_name = if sz == 'q' {
+            self.reg_name_64(src_reg)
+        } else {
+            self.sized_reg_name(src_reg, sz)
+        };
         match loc {
             Loc::Reg(dest_reg) => {
-                let dest_name = self.reg_name_64(*dest_reg);
+                let dest_name = if sz == 'q' {
+                    self.reg_name_64(*dest_reg)
+                } else {
+                    self.sized_reg_name(*dest_reg, sz)
+                };
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movq %{}, %{}",
-                    self.reg_name_64(src_reg),
-                    dest_name
+                    "{} %{}, %{}",
+                    mov, src_name, dest_name
                 ))));
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
+                let mem = self.stack_mem(*offset);
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl %{}, -{}(%rbp)",
-                    src_name, adjusted
+                    "{} %{}, {}",
+                    mov,
+                    src_name,
+                    mem.format(&self.base.target)
                 ))));
             }
             Loc::Global(name) => {
-                // Check TLS before GOT - TLS symbols need special access pattern
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
-                    // Thread-local storage: use %fs:symbol@TPOFF
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %{}, %fs:{}@TPOFF",
+                        "{} %{}, %fs:{}@TPOFF",
+                        mov,
                         src_name,
                         self.format_symbol_name(name)
                     ))));
                 } else if self.needs_got_access(name) {
-                    // External symbols on macOS: load address from GOT, then store
+                    // GOT indirection always uses 64-bit address load
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
                         self.format_symbol_name(name)
                     ))));
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %{}, (%r11)",
-                        src_name
+                        "{} %{}, (%r11)",
+                        mov, src_name
                     ))));
                 } else {
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "movl %{}, {}(%rip)",
+                        "{} %{}, {}(%rip)",
+                        mov,
                         src_name,
                         self.format_symbol_name(name)
                     ))));
                 }
             }
+            Loc::Imm(_) => {
+                // Can't store to an immediate — dead code. Skip.
+            }
             _ => {
-                // Other locations - use generic string
                 let loc_str = self.loc_to_asm_string(loc);
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "movl %{}, {}",
-                    src_name, loc_str
+                    "{} %{}, {}",
+                    mov, src_name, loc_str
                 ))));
             }
         }
@@ -3089,14 +3857,11 @@ impl X86_64CodeGen {
     fn loc_to_asm_string(&self, loc: &Loc) -> String {
         match loc {
             Loc::Reg(r) => format!("%{}", self.reg_name_64(*r)),
-            Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
-                format!("-{}(%rbp)", adjusted)
-            }
+            Loc::Stack(offset) => self.stack_mem(*offset).format(&self.base.target),
             Loc::IncomingArg(offset) => {
                 format!("{}(%rbp)", offset)
             }
-            Loc::Imm(v) => format!("${}", v),
+            Loc::Imm(v) => format!("${}", *v as i64),
             Loc::Xmm(xmm) => xmm.name().to_string(),
             Loc::FImm(_, _) => {
                 // Float immediates not directly usable in inline asm
@@ -3159,17 +3924,43 @@ impl X86_64CodeGen {
         None
     }
 
+    /// Check if an inline asm constraint requires a register (not memory).
+    /// 'r' = general register, specific letter = specific register.
+    fn constraint_requires_register(constraint: &str) -> bool {
+        for c in constraint.chars() {
+            match c {
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => return true,
+                '=' | '+' | '&' | '%' => continue, // skip modifiers
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Check if an inline asm constraint requires a memory operand.
+    fn constraint_requires_memory(constraint: &str) -> bool {
+        for c in constraint.chars() {
+            match c {
+                'm' | 'o' | 'V' => return true,
+                '=' | '+' | '&' | '%' => continue,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Substitute %0, %1, %[name], %l0, %l[name], etc. with actual operand strings
     /// goto_labels: (label_string, label_name) - label_string is the fully formatted label
     fn substitute_asm_operands(
         &self,
         template: &str,
         regs: &[Option<Reg>],
+        sizes: &[u32],
         mems: &[Option<String>],
         names: &[Option<String>],
         goto_labels: &[(String, String)],
     ) -> String {
-        crate::arch::substitute_asm_operands(self, template, regs, mems, names, goto_labels)
+        crate::arch::substitute_asm_operands(self, template, regs, sizes, mems, names, goto_labels)
     }
 
     /// Get a sized register name based on modifier
@@ -3245,7 +4036,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic store needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         // For SeqCst, use XCHG which provides full barrier
@@ -3262,13 +4053,9 @@ impl X86_64CodeGen {
             let mem_addr = match addr_loc {
                 Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
                 Loc::Stack(offset) => {
-                    let adjusted = offset + self.callee_saved_offset;
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                     MemAddr::BaseOffset {
@@ -3321,7 +4108,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic swap needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3350,7 +4137,7 @@ impl X86_64CodeGen {
         let addr = insn.src[0];
         let expected_ptr = insn.src[1];
         let desired = insn.src[2];
-        let size = insn.size; // Element size in bits
+        let size = insn.size.max(32);
 
         let op_size = OperandSize::from_bits(size);
 
@@ -3531,7 +4318,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic fetch_add needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3559,7 +4346,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic fetch_sub needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3607,7 +4394,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("atomic fetch needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size;
+        let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
@@ -3726,18 +4513,14 @@ impl X86_64CodeGen {
             Loc::Imm(v) => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(v),
+                    src: GpOperand::Imm(v as i64),
                     dst: GpOperand::Reg(reg),
                 });
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
+                    src: GpOperand::Mem(self.stack_mem(offset)),
                     dst: GpOperand::Reg(reg),
                 });
             }
@@ -3779,13 +4562,9 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 // Load address into R11
                 self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    },
+                    addr: self.stack_mem(offset),
                     dst: Reg::R11,
                 });
                 MemAddr::BaseOffset {
@@ -3843,9 +4622,15 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
         format!("%{}", self.sized_reg_name(reg, size_mod))
     }
 
-    fn format_reg_default(&self, reg: Reg) -> String {
-        // x86 inline asm defaults to 32-bit for GCC compatibility
-        format!("%{}", self.sized_reg_name(reg, 'k'))
+    fn format_reg_default(&self, reg: Reg, size_bits: u32) -> String {
+        // Select register width matching the operand's declared size
+        let size_mod = match size_bits {
+            8 => 'b',
+            16 => 'w',
+            64 => 'q',
+            _ => 'k', // 32-bit default
+        };
+        format!("%{}", self.sized_reg_name(reg, size_mod))
     }
 }
 
@@ -3902,7 +4687,9 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         // Emit text start label for DWARF debug info (before first function)
+        // Must be in .text section — emit .text first since globals may leave us in .data
         if module.debug && !module.functions.is_empty() {
+            self.push_lir(X86Inst::Directive(Directive::Text));
             self.base.push_directive(Directive::local_label(".Ltext0"));
         }
 

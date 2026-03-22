@@ -82,13 +82,8 @@ Supported:
 
 Not yet implemented (features we want to add):
 - -fverbose-asm
-- top builtins to implement:
-  __builtin_expect
-  __sync_synchronize
-  __sync_fetch_and_add (and maybe a couple of its siblings)
 - assembly peephole optimizations
-- C11 atomics (_Atomic operations)
-- Other C11 features: _Generic, anonymous structs
+- C11 `_Generic` type-generic selection
 
 ## Code Quality
 

@@ -11,4 +11,5 @@
 // Tests for macro expansion, stringification, token pasting, and directives.
 //
 
+mod directives;
 mod macros;

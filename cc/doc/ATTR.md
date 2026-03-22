@@ -1,33 +1,72 @@
-# Function Attributes
+# Attributes
 
-This document describes the function attribute support in pcc.
+This document describes attribute support in pcc.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Supported Attributes](#supported-attributes)
-  - [`noreturn`](#noreturn)
 - [Compile-Time Attribute Queries](#compile-time-attribute-queries)
-  - [`__has_attribute(name)`](#__has_attributename)
 - [setjmp/longjmp Integration](#setjmplongjmp-integration)
-- [Future Attribute Support](#future-attribute-support)
 - [References](#references)
 
 ## Overview
 
-pcc supports function attributes that modify function behavior and enable compiler optimizations. Attributes can be specified using:
+pcc supports GNU-style attributes that modify function, variable, and type behavior. Attributes can be specified using:
 
-1. **GNU-style attributes**: `__attribute__((name))`
+1. **GNU-style attributes**: `__attribute__((name))` or `__attribute__((__name__))`
 2. **C11 keyword**: `_Noreturn`
+
+All attribute names accept the double-underscore variant (`__name__`) as an alternative spelling.
 
 ## Supported Attributes
 
-### `noreturn`
+Attributes fall into three categories based on implementation depth:
+
+### Fully implemented (affects codegen)
+
+| Attribute | Applies to | Effect |
+|-----------|-----------|--------|
+| `noreturn` | Functions | Emits trap after call; enables DCE |
+| `packed` | Structs/unions | Removes padding from layout |
+| `sysv_abi` | Functions | Forces System V AMD64 calling convention |
+| `ms_abi` | Functions | Forces Win64 calling convention |
+
+### Parsed and accepted (no semantic effect)
+
+These are parsed by `__attribute__((...))`, reported by `__has_attribute()`, but silently ignored by codegen. This is sufficient for compatibility with headers that use them.
+
+| Attribute | Description |
+|-----------|-------------|
+| `unused` | Suppress unused warnings |
+| `aligned` | Alignment specification |
+| `deprecated` | Mark as deprecated |
+| `weak` | Weak symbol linkage |
+| `section` | Place in named section |
+| `visibility` | Symbol visibility (default, hidden, protected) |
+| `constructor` | Run before main |
+| `destructor` | Run after main |
+| `used` | Prevent dead-stripping |
+| `noinline` | Prevent inlining |
+| `always_inline` | Force inlining |
+| `hot` | Optimize for speed |
+| `cold` | Optimize for size |
+| `warn_unused_result` | Warn if return value ignored |
+| `format` | Printf/scanf format checking |
+| `fallthrough` | Suppress switch fallthrough warning |
+| `nonstring` | Mark char array as non-NUL-terminated |
+| `malloc` | Mark as malloc-like allocator |
+| `pure` | No side effects (reads memory) |
+| `sentinel` | Require NULL sentinel argument |
+| `no_sanitize_memory` | Disable memory sanitizer |
+| `no_sanitize_address` | Disable address sanitizer |
+| `no_sanitize_thread` | Disable thread sanitizer |
+
+### `noreturn` details
 
 Indicates that a function never returns to its caller. This enables the compiler to:
 - Eliminate unreachable code after calls to the function
 - Skip generating return sequences in the function (if defined)
-- Warn about code paths that unexpectedly return
 
 #### Syntax
 
@@ -38,48 +77,6 @@ void abort(void) __attribute__((__noreturn__));
 
 // C11 keyword
 _Noreturn void my_exit(int code);
-
-// Combined (for maximum portability)
-_Noreturn void fatal_error(const char *msg) __attribute__((noreturn));
-```
-
-#### Examples
-
-**Declaring noreturn functions:**
-```c
-// External declarations (libc functions)
-extern void exit(int status) __attribute__((noreturn));
-extern void abort(void) __attribute__((noreturn));
-extern void _Exit(int status) __attribute__((noreturn));
-
-// C11 style
-extern _Noreturn void longjmp(jmp_buf env, int val);
-```
-
-**Using noreturn for error handling:**
-```c
-_Noreturn void fatal(const char *msg) {
-    fprintf(stderr, "Fatal: %s\n", msg);
-    exit(1);
-}
-
-int process(int x) {
-    if (x < 0) {
-        fatal("negative value");
-        // No return statement needed here - compiler knows fatal() doesn't return
-    }
-    return x * 2;
-}
-```
-
-**Dead code elimination:**
-```c
-void example(int x) {
-    if (x == 0) {
-        exit(1);
-        printf("unreachable\n");  // This code is dead - never executed
-    }
-}
 ```
 
 #### Implementation Notes
@@ -95,35 +92,27 @@ Standard library functions that are typically declared noreturn:
 - `abort()` - abnormal termination
 - `longjmp()`, `_longjmp()`, `siglongjmp()` - non-local jumps
 - `pthread_exit()` - thread termination
-- `execve()` and `exec*()` family (on success)
+
+### `packed` details
+
+Removes inter-field padding from struct/union layout. Parsed from `__attribute__((packed))` on struct/union definitions. Applied during `compute_struct_layout()`.
+
+```c
+struct __attribute__((packed)) Example {
+    char a;    // offset 0
+    int b;     // offset 1 (not 4)
+    short c;   // offset 5 (not 8)
+};  // sizeof = 7 (not 12)
+```
 
 ## Compile-Time Attribute Queries
 
 ### `__has_attribute(name)`
 
-A preprocessor operator that returns 1 if the specified attribute is supported, 0 otherwise.
+A preprocessor operator that returns 1 if the specified attribute is recognized, 0 otherwise. This covers all attributes in both tables above (fully implemented and parsed-only).
 
 #### Syntax
 
-```c
-#if __has_attribute(noreturn)
-    // noreturn attribute is available
-#endif
-```
-
-#### Supported Attribute Names
-
-| Name | Supported | Description |
-|------|-----------|-------------|
-| `noreturn` | Yes | Function never returns |
-| `__noreturn__` | Yes | Alternative spelling for noreturn |
-| `unused` | No | Suppress unused warnings |
-| `packed` | No | Struct packing |
-| `aligned` | No | Alignment specification |
-
-#### Usage Patterns
-
-**Conditional attribute usage:**
 ```c
 #if __has_attribute(noreturn)
 #define NORETURN __attribute__((noreturn))
@@ -132,19 +121,6 @@ A preprocessor operator that returns 1 if the specified attribute is supported, 
 #endif
 
 NORETURN void my_exit(int code);
-```
-
-**Portable header definitions:**
-```c
-// Works with pcc, GCC, and Clang
-#if defined(__has_attribute)
-#  if __has_attribute(noreturn)
-#    define ATTR_NORETURN __attribute__((noreturn))
-#  endif
-#endif
-#ifndef ATTR_NORETURN
-#  define ATTR_NORETURN
-#endif
 ```
 
 ## setjmp/longjmp Integration
@@ -193,19 +169,6 @@ int main(void) {
     return 0;
 }
 ```
-
-## Future Attribute Support
-
-The following attributes are planned but not yet implemented:
-
-| Attribute | Description |
-|-----------|-------------|
-| `unused` | Suppress unused variable/parameter warnings |
-| `packed` | Remove padding from struct/union |
-| `aligned(n)` | Specify alignment requirement |
-| `deprecated` | Mark as deprecated with optional message |
-| `format` | Printf/scanf format string checking |
-| `visibility` | Symbol visibility (default, hidden, protected) |
 
 ## References
 

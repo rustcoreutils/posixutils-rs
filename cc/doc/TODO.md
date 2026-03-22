@@ -128,16 +128,16 @@ ARM64:
 
 #### Implementation Order
 
-| Order | Phase | Complexity | Dependencies |
-|-------|-------|------------|--------------|
-| 1 | Type system (`ATOMIC` modifier) | Low | None |
-| 2 | Parser (`_Atomic` keyword) | Medium | Phase 1 |
-| 3 | IR opcodes | Medium | None |
-| 4 | Linearizer (atomic load/store) | Medium | Phases 1-3 |
-| 5 | x86-64 codegen | High | Phases 1-4 |
-| 6 | ARM64 codegen | High | Phases 1-4 |
-| 7 | stdatomic.h builtins | Medium | Phases 1-5 |
-| 8 | Semantic validation | Low | Phases 1-2 |
+| Order | Phase | Complexity | Dependencies | Status |
+|-------|-------|------------|--------------|--------|
+| 1 | Type system (`ATOMIC` modifier) | Low | None | **Done** |
+| 2 | Parser (`_Atomic` keyword) | Medium | Phase 1 | **Done** |
+| 3 | IR opcodes | Medium | None | **Done** |
+| 4 | Linearizer (atomic load/store) | Medium | Phases 1-3 | **Done** |
+| 5 | x86-64 codegen | High | Phases 1-4 | **Done** |
+| 6 | ARM64 codegen | High | Phases 1-4 | **Done** |
+| 7 | stdatomic.h builtins | Medium | Phases 1-5 | **Done** |
+| 8 | Semantic validation | Low | Phases 1-2 | Not started |
 
 #### Test Cases Needed
 
@@ -224,12 +224,12 @@ For locals:
 
 #### Implementation Order
 
-| Order | Component | Complexity |
-|-------|-----------|------------|
-| 1 | `_Alignof` operator | Easy - compile-time type query |
-| 2 | `_Alignas` for globals | Easy - `.balign` directives |
-| 3 | `_Alignas` for struct members | Moderate - layout changes |
-| 4 | `_Alignas` for locals | Moderate - stack frame adjustments |
+| Order | Component | Complexity | Status |
+|-------|-----------|------------|--------|
+| 1 | `_Alignof` operator | Easy - compile-time type query | **Done** |
+| 2 | `_Alignas` for globals | Easy - `.balign` directives | **Done** |
+| 3 | `_Alignas` for struct members | Moderate - layout changes | **Done** |
+| 4 | `_Alignas` for locals | Moderate - stack frame adjustments | **Done** |
 
 #### References
 
@@ -325,14 +325,14 @@ Relocations needed:
 
 #### Implementation Order
 
-| Order | Component | Complexity |
-|-------|-----------|------------|
-| 1 | Parser + symbol tracking | Low |
-| 2 | IR representation | Low |
-| 3 | x86-64 Local-Exec codegen | Medium |
-| 4 | ARM64 Local-Exec codegen | Medium |
-| 5 | Initial-Exec model (optional) | High |
-| 6 | General-Dynamic (for DSOs) | High |
+| Order | Component | Complexity | Status |
+|-------|-----------|------------|--------|
+| 1 | Parser + symbol tracking | Low | **Done** |
+| 2 | IR representation | Low | **Done** |
+| 3 | x86-64 Local-Exec codegen | Medium | **Done** |
+| 4 | ARM64 Local-Exec codegen | Medium | Not started |
+| 5 | Initial-Exec model (optional) | High | Not started |
+| 6 | General-Dynamic (for DSOs) | High | Not started |
 
 #### Complexity Assessment
 
@@ -355,12 +355,12 @@ TLS is **significantly more complex** than alignment:
 
 ### Other C11 Features
 
-| Feature | Description | Complexity |
-|---------|-------------|------------|
-| `_Static_assert(expr, msg)` | Compile-time assertion | Easy |
-| `_Generic(expr, type: val, ...)` | Type-generic selection | Moderate |
-| Anonymous structs/unions | `struct { struct { int x; }; };` | Moderate |
-| `<stdalign.h>` | `alignas`/`alignof` macros | Preprocessor only |
+| Feature | Description | Complexity | Status |
+|---------|-------------|------------|--------|
+| `_Static_assert(expr, msg)` | Compile-time assertion | Easy | **Done** |
+| `_Generic(expr, type: val, ...)` | Type-generic selection | Moderate | Not started |
+| Anonymous structs/unions | `struct { struct { int x; }; };` | Moderate | **Done** |
+| `<stdalign.h>` | `alignas`/`alignof` macros | Preprocessor only | **Done** |
 
 #### `_Static_assert` Implementation
 

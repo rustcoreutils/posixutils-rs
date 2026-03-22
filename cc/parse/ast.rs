@@ -170,6 +170,9 @@ pub enum ExprKind {
     /// Integer literal
     IntLit(i64),
 
+    /// 128-bit integer literal (__int128 / __uint128_t)
+    Int128Lit(i128),
+
     /// Floating-point literal
     FloatLit(f64),
 
@@ -928,7 +931,7 @@ pub enum ForInit {
 #[derive(Debug, Clone)]
 pub enum BlockItem {
     Declaration(Declaration),
-    Statement(Stmt),
+    Statement(Box<Stmt>),
 }
 
 // ============================================================================

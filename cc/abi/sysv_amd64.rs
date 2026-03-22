@@ -14,7 +14,7 @@
 // Key rules:
 // - Arguments passed in RDI, RSI, RDX, RCX, R8, R9 (INTEGER) and XMM0-XMM7 (SSE)
 // - Return values in RAX, RDX (INTEGER) or XMM0, XMM1 (SSE)
-// - Structs > 16 bytes use sret (hidden pointer in RDI)
+// - Structs > 16 bytes: returned via sret (hidden pointer in RDI), passed by value on stack
 // - Structs 9-16 bytes may use two registers
 // - Each eightbyte is classified independently, then merged
 //
@@ -196,6 +196,14 @@ impl Abi for SysVAmd64Abi {
             return ArgClass::Extend { signed, size_bits };
         }
 
+        // 128-bit integer types: two GP registers
+        if kind == TypeKind::Int128 {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits,
+            };
+        }
+
         // Integer and pointer types
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
@@ -272,6 +280,14 @@ impl Abi for SysVAmd64Abi {
         // Void return
         if kind == TypeKind::Void {
             return ArgClass::Ignore;
+        }
+
+        // 128-bit integer types: return in RAX+RDX
+        if kind == TypeKind::Int128 {
+            return ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits,
+            };
         }
 
         // Integer and pointer types - return in RAX

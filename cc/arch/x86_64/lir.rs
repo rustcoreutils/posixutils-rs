@@ -246,6 +246,23 @@ pub enum X86Inst {
     /// NEG - Two's complement negation
     Neg { size: OperandSize, dst: Reg },
 
+    /// ADC - Add with carry (dst += src + CF)
+    Adc {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// SBB - Subtract with borrow (dst -= src + CF)
+    Sbb {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// MUL - Unsigned multiply (1-operand form: RDX:RAX = RAX * src)
+    Mul1 { size: OperandSize, src: GpOperand },
+
     // ========================================================================
     // Bitwise Operations
     // ========================================================================
@@ -291,6 +308,22 @@ pub enum X86Inst {
     Sar {
         size: OperandSize,
         count: ShiftCount,
+        dst: Reg,
+    },
+
+    /// SHLD - Double-precision shift left (dst = (dst:src) << count)
+    Shld {
+        size: OperandSize,
+        count: ShiftCount,
+        src: Reg,
+        dst: Reg,
+    },
+
+    /// SHRD - Double-precision shift right (dst = (src:dst) >> count)
+    Shrd {
+        size: OperandSize,
+        count: ShiftCount,
+        src: Reg,
         dst: Reg,
     },
 
@@ -343,6 +376,10 @@ pub enum X86Inst {
 
     /// RET - Return from function
     Ret,
+
+    /// REP STOSQ - Store RAX to [RDI], repeat RCX times, advancing RDI
+    /// Used for zero-initializing stack frames
+    RepStosq,
 
     /// UD2 - Undefined instruction (trap)
     /// Used for __builtin_unreachable() to signal unreachable code
@@ -717,6 +754,35 @@ impl EmitAsm for X86Inst {
                 );
             }
 
+            X86Inst::Adc { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    adc{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Sbb { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    sbb{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Mul1 { size, src } => {
+                let _ = writeln!(
+                    out,
+                    "    mul{} {}",
+                    size.x86_suffix(),
+                    src.format(*size, target)
+                );
+            }
+
             // Bitwise Operations
             X86Inst::Not { size, dst } => {
                 let _ = writeln!(
@@ -795,6 +861,46 @@ impl EmitAsm for X86Inst {
                     "    sar{} {}, {}",
                     size.x86_suffix(),
                     count_str,
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Shld {
+                size,
+                count,
+                src,
+                dst,
+            } => {
+                let count_str = match count {
+                    ShiftCount::Imm(n) => format!("${}", n),
+                    ShiftCount::Cl => "%cl".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    shld{} {}, {}, {}",
+                    size.x86_suffix(),
+                    count_str,
+                    src.name_for_size(size.bits()),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Shrd {
+                size,
+                count,
+                src,
+                dst,
+            } => {
+                let count_str = match count {
+                    ShiftCount::Imm(n) => format!("${}", n),
+                    ShiftCount::Cl => "%cl".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    shrd{} {}, {}, {}",
+                    size.x86_suffix(),
+                    count_str,
+                    src.name_for_size(size.bits()),
                     dst.name_for_size(size.bits())
                 );
             }
@@ -881,6 +987,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Ret => {
                 let _ = writeln!(out, "    ret");
+            }
+
+            X86Inst::RepStosq => {
+                let _ = writeln!(out, "    rep stosq");
             }
 
             X86Inst::Ud2 => {

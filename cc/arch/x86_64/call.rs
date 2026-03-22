@@ -12,7 +12,7 @@
 use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
-use crate::abi::{ArgClass, RegClass};
+use crate::abi::{Abi, ArgClass, RegClass};
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeKind, TypeTable};
@@ -35,6 +35,9 @@ impl X86_64CodeGen {
         let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
         let mut temp_int_idx = 0;
         let mut temp_fp_idx = 0;
+        // Track total stack qwords for correct 16-byte alignment calculation.
+        // Large structs and long doubles occupy multiple qwords.
+        let mut total_stack_qwords: usize = 0;
 
         let abi_info = insn
             .abi_info
@@ -50,8 +53,9 @@ impl X86_64CodeGen {
                 .is_some_and(|&ty| types.kind(ty) == TypeKind::LongDouble);
 
             if is_longdouble {
-                // Long double is always passed on the stack by value
+                // Long double is always passed on the stack by value (16 bytes = 2 qwords)
                 stack_arg_indices.push(i);
+                total_stack_qwords += 2;
                 continue;
             }
 
@@ -67,21 +71,23 @@ impl X86_64CodeGen {
 
                     if !has_gp || !has_fp {
                         stack_arg_indices.push(i);
+                        total_stack_qwords += gp_needed.max(fp_needed).max(1);
                     }
                     temp_int_idx += gp_needed;
                     temp_fp_idx += fp_needed;
                 }
-                ArgClass::Indirect { .. } => {
-                    // Indirect arguments are passed as pointers (one GP register)
-                    if temp_int_idx >= int_arg_regs.len() {
-                        stack_arg_indices.push(i);
-                    }
-                    temp_int_idx += 1;
+                ArgClass::Indirect { size_bits, .. } => {
+                    // Large struct parameters (> 16 bytes): passed by value on the stack
+                    // per SysV AMD64 ABI MEMORY class. Always a stack arg — never in
+                    // a register. Don't consume a GP register.
+                    stack_arg_indices.push(i);
+                    total_stack_qwords += (*size_bits as usize).div_ceil(64);
                 }
                 ArgClass::Extend { .. } => {
                     // Extended small integers use one GP register
                     if temp_int_idx >= int_arg_regs.len() {
                         stack_arg_indices.push(i);
+                        total_stack_qwords += 1;
                     }
                     temp_int_idx += 1;
                 }
@@ -89,6 +95,7 @@ impl X86_64CodeGen {
                     // HFA uses FP registers (primarily AArch64, but handle for completeness)
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
                         stack_arg_indices.push(i);
+                        total_stack_qwords += 1;
                     }
                     temp_fp_idx += *count as usize;
                 }
@@ -103,7 +110,7 @@ impl X86_64CodeGen {
             }
         }
 
-        let needs_padding = stack_arg_indices.len() % 2 == 1;
+        let needs_padding = total_stack_qwords % 2 == 1;
 
         CallArgInfo {
             stack_arg_indices,
@@ -185,6 +192,58 @@ impl X86_64CodeGen {
                     }),
                 });
             } else {
+                // Check if this is an __int128 arg (needs 16 bytes = 2 stack slots)
+                let is_int128 = arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128);
+                if is_int128 {
+                    let arg_loc = self.get_location(arg).clone();
+                    // Push hi first (stack grows down), then lo
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_hi_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Push {
+                        src: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_lo_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    self.push_lir(X86Inst::Push {
+                        src: GpOperand::Reg(Reg::Rax),
+                    });
+                    stack_args += 2;
+                    continue;
+                }
+                // Check if this is a large struct arg (> 16 bytes, MEMORY class)
+                let is_large_struct = arg_type.is_some_and(|t| {
+                    let k = types.kind(t);
+                    (k == TypeKind::Struct || k == TypeKind::Union) && types.size_bits(t) > 128
+                });
+                if is_large_struct {
+                    // Large struct: arg pseudo is the struct's ADDRESS. Copy all
+                    // qwords to the stack in reverse order (stack grows down).
+                    let struct_bytes =
+                        arg_type.map(|t| types.size_bits(t) / 8).unwrap_or(8) as usize;
+                    let num_qwords = struct_bytes.div_ceil(8);
+                    self.emit_move(arg, Reg::R11, 64); // Load struct base address
+                    for q in (0..num_qwords).rev() {
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::R11,
+                                offset: (q * 8) as i32,
+                            }),
+                            dst: GpOperand::Reg(Reg::Rax),
+                        });
+                        self.push_lir(X86Inst::Push {
+                            src: GpOperand::Reg(Reg::Rax),
+                        });
+                    }
+                    stack_args += num_qwords;
+                    continue;
+                }
                 let arg_size = if let Some(typ) = arg_type {
                     types.size_bits(typ).max(32)
                 } else {
@@ -340,6 +399,117 @@ impl X86_64CodeGen {
                 }
                 self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size);
                 fp_arg_idx += 1;
+            } else if arg_type.is_some_and(|t| {
+                let k = types.kind(t);
+                (k == TypeKind::Struct || k == TypeKind::Union)
+                    && types.size_bits(t) > 64
+                    && types.size_bits(t) <= 128
+            }) {
+                // Medium struct (9-16 bytes, e.g., {double, double}):
+                // Load two 8-byte fields into register pairs per ABI classification.
+                // The arg pseudo holds the struct's address.
+                let abi = crate::abi::SysVAmd64Abi;
+                let arg_class = abi.classify_param(arg_type.unwrap(), types);
+                if let crate::abi::ArgClass::Direct { ref classes, .. } = arg_class {
+                    if classes.iter().all(|c| *c == crate::abi::RegClass::Sse) && classes.len() == 2
+                    {
+                        // Two SSE registers: load two 8-byte doubles from struct address.
+                        // The arg pseudo holds a pointer (from symaddr), not struct bytes.
+                        // For Loc::Stack, MOV loads the pointer; LEA would give the
+                        // address of the stack slot itself (pointer-to-pointer → garbage).
+                        let arg_loc = self.get_location(arg);
+                        let base = match arg_loc {
+                            Loc::Reg(r) => r,
+                            Loc::Stack(offset) => {
+                                let adjusted = offset + self.callee_saved_offset;
+                                self.push_lir(X86Inst::Mov {
+                                    size: OperandSize::B64,
+                                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                                        base: Reg::Rbp,
+                                        offset: -adjusted,
+                                    }),
+                                    dst: GpOperand::Reg(Reg::R11),
+                                });
+                                Reg::R11
+                            }
+                            _ => {
+                                self.emit_move(arg, Reg::R11, 64);
+                                Reg::R11
+                            }
+                        };
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
+                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                        });
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 8 }),
+                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                        });
+                        fp_arg_idx += 2;
+                    } else if classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                        && classes.len() == 2
+                    {
+                        // Two integer registers
+                        let arg_loc = self.get_location(arg);
+                        let addr = match arg_loc {
+                            Loc::Reg(r) => r,
+                            _ => {
+                                self.emit_move(arg, Reg::R10, 64);
+                                Reg::R10
+                            }
+                        };
+                        // Load first 8 bytes
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: addr,
+                                offset: 0,
+                            }),
+                            dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                        });
+                        // Load second 8 bytes
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: addr,
+                                offset: 8,
+                            }),
+                            dst: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                        });
+                        int_arg_idx += 2;
+                    } else {
+                        // Mixed or single class — fall through to integer
+                        self.setup_int_arg(
+                            arg,
+                            arg_size,
+                            int_arg_regs[int_arg_idx],
+                            saved_arg_regs,
+                        );
+                        int_arg_idx += 1;
+                    }
+                } else {
+                    // Indirect — shouldn't happen for medium structs but handle anyway
+                    self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
+                    int_arg_idx += 1;
+                }
+            } else if arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+                // __int128 argument: load lo and hi halves into two consecutive GP registers
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    let arg_loc = self.get_location(arg).clone();
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_lo_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(self.int128_hi_mem_loc(&arg_loc)),
+                        dst: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
+                    });
+                }
+                int_arg_idx += 2;
             } else {
                 self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
                 int_arg_idx += 1;
@@ -438,7 +608,10 @@ impl X86_64CodeGen {
         };
 
         let dst_loc = self.get_location(target);
-        let ret_size = insn.size.max(32);
+        let ret_size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
 
         let abi_info = insn
             .abi_info

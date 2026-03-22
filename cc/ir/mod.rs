@@ -46,7 +46,7 @@ const DEFAULT_LOCAL_CAPACITY: usize = 64;
 ///
 /// This carries the argument and return value classifications from the
 /// frontend through the IR to the backend. It replaces the binary
-/// is_sret_call/is_two_reg_return flags with richer type information.
+/// boolean flags with richer type information.
 #[derive(Debug, Clone)]
 pub struct CallAbiInfo {
     /// Per-argument classification (parallel to src for Call instructions)
@@ -158,8 +158,9 @@ pub enum Opcode {
     Store, // Store to memory
 
     // SSA-specific
-    Phi,  // Phi node for SSA
-    Copy, // Copy (for out-of-SSA)
+    Phi,       // Phi node for SSA
+    PhiSource, // Phi source: explicit defining instruction for phi operand in predecessor block
+    Copy,      // Copy (for out-of-SSA)
 
     // Other
     SymAddr, // Get address of symbol
@@ -338,6 +339,7 @@ impl Opcode {
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::Phi => "phi",
+            Opcode::PhiSource => "phisrc",
             Opcode::Copy => "copy",
             Opcode::SymAddr => "symaddr",
             Opcode::Call => "call",
@@ -457,7 +459,7 @@ pub enum PseudoKind {
     /// Symbol reference (variable, function)
     Sym(String),
     /// Constant integer value
-    Val(i64),
+    Val(i128),
     /// Constant float value
     FVal(f64),
 }
@@ -534,7 +536,7 @@ impl Pseudo {
     }
 
     /// Create a constant value pseudo
-    pub fn val(id: PseudoId, value: i64) -> Self {
+    pub fn val(id: PseudoId, value: i128) -> Self {
         Self {
             id,
             kind: PseudoKind::Val(value),
@@ -623,6 +625,8 @@ pub struct AsmConstraint {
     /// Note: Early clobber (&) is parsed but not explicitly handled since our
     /// simple register allocator doesn't share registers between inputs/outputs
     pub constraint: String,
+    /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
+    pub size: u32,
 }
 
 /// Data for an inline assembly instruction
@@ -681,15 +685,9 @@ pub struct Instruction {
     /// For variadic calls: index where variadic arguments start (0-based)
     /// All arguments at this index and beyond are variadic (should be passed on stack)
     pub variadic_arg_start: Option<usize>,
-    /// For calls: true if this call returns a large struct via sret (hidden pointer arg).
-    /// The first element of `src` is the sret pointer when this is true.
-    pub is_sret_call: bool,
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
-    /// For calls/returns: true if this returns a 9-16 byte struct via two registers
-    /// (RAX+RDX on x86-64, X0+X1 on AArch64) per ABI.
-    pub is_two_reg_return: bool,
     /// For indirect calls: pseudo containing the function pointer address.
     /// When this is Some, the call is indirect (call through function pointer).
     pub indirect_target: Option<PseudoId>,
@@ -698,8 +696,7 @@ pub struct Instruction {
     /// For inline assembly: the asm data (template, operands, clobbers)
     pub asm_data: Option<Box<AsmData>>,
     /// For calls: rich ABI classification for arguments and return value.
-    /// When present, this provides more detailed information than is_sret_call
-    /// and is_two_reg_return, including per-argument register class info.
+    /// Derive sret/two-reg-return status via `returns_via_sret()` / `returns_two_regs()`.
     pub abi_info: Option<Box<CallAbiInfo>>,
     /// For atomic operations: memory ordering constraint
     pub memory_order: MemoryOrder,
@@ -724,9 +721,7 @@ impl Default for Instruction {
             switch_default: None,
             arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             variadic_arg_start: None,
-            is_sret_call: false,
             is_noreturn_call: false,
-            is_two_reg_return: false,
             indirect_target: None,
             pos: None,
             asm_data: None,
@@ -860,7 +855,7 @@ impl Instruction {
     ) -> Self {
         Self {
             op: Opcode::Switch,
-            target: Some(value),
+            src: vec![value],
             switch_cases: cases,
             switch_default: default,
             size,
@@ -938,14 +933,8 @@ impl Instruction {
         ret_type: TypeId,
         ret_size: u32,
     ) -> Self {
-        let mut insn = Self::new(Opcode::Call).with_type_and_size(ret_type, ret_size);
+        let mut insn = Self::call(target, "<indirect>", args, arg_types, ret_type, ret_size);
         insn.indirect_target = Some(func_addr);
-        insn.func_name = Some("<indirect>".to_string());
-        if let Some(t) = target {
-            insn.target = Some(t);
-        }
-        insn.src = args;
-        insn.arg_types = arg_types;
         insn
     }
 
@@ -961,6 +950,15 @@ impl Instruction {
     pub fn phi(target: PseudoId, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Phi)
             .with_target(target)
+            .with_type_and_size(typ, size)
+    }
+
+    /// Create a phi source instruction (placed in predecessor block).
+    /// Back-pointer to owning phi is stored in phi_list by the caller.
+    pub fn phi_source(target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
+        Self::new(Opcode::PhiSource)
+            .with_target(target)
+            .with_src(src)
             .with_type_and_size(typ, size)
     }
 
@@ -987,6 +985,33 @@ impl Instruction {
             asm_data: Some(Box::new(data)),
             ..Default::default()
         }
+    }
+
+    /// Check if this call/return uses a hidden sret pointer for the return value.
+    pub fn returns_via_sret(&self) -> bool {
+        self.abi_info
+            .as_ref()
+            .map(|ai| matches!(ai.ret, ArgClass::Indirect { .. }))
+            .unwrap_or(false)
+    }
+
+    /// Check if this call/return uses two registers for the return value.
+    pub fn returns_two_regs(&self) -> bool {
+        self.abi_info
+            .as_ref()
+            .map(|ai| match &ai.ret {
+                ArgClass::Direct { classes, .. } => classes.len() == 2,
+                _ => false,
+            })
+            .unwrap_or(false)
+    }
+
+    /// Convert this instruction to a no-op, clearing all operands.
+    pub fn kill(&mut self) {
+        self.op = Opcode::Nop;
+        self.src.clear();
+        self.target = None;
+        self.phi_list.clear();
     }
 }
 
@@ -1030,6 +1055,14 @@ impl fmt::Display for Instruction {
                     write!(f, " {} ({})", pseudo, bb)?;
                 }
             }
+            Opcode::PhiSource => {
+                if let Some(src) = self.src.first() {
+                    write!(f, " {}", src)?;
+                }
+                if let Some((bb, pseudo)) = self.phi_list.first() {
+                    write!(f, " (-> {}:{})", bb, pseudo)?;
+                }
+            }
             Opcode::Call => {
                 if let Some(func) = &self.func_name {
                     write!(f, " {}", func)?;
@@ -1042,6 +1075,17 @@ impl fmt::Display for Instruction {
                     write!(f, "{}", arg)?;
                 }
                 write!(f, ")")?;
+            }
+            Opcode::Switch => {
+                if let Some(val) = self.src.first() {
+                    write!(f, " {}", val)?;
+                }
+                for (case_val, bb) in &self.switch_cases {
+                    write!(f, ", {} => {}", case_val, bb)?;
+                }
+                if let Some(default_bb) = &self.switch_default {
+                    write!(f, ", default => {}", default_bb)?;
+                }
             }
             Opcode::Load | Opcode::Store => {
                 for (i, src) in self.src.iter().enumerate() {
@@ -1179,7 +1223,9 @@ impl BasicBlock {
         self.children.retain(|c| keep.contains(c));
     }
 
-    /// Remove phi entries for a specific predecessor
+    /// Remove phi entries for a specific predecessor.
+    /// Note: corresponding PhiSource instructions in the removed predecessor
+    /// block become dead and are cleaned up by a subsequent DCE pass.
     pub fn remove_phi_predecessor(&mut self, pred: BasicBlockId) {
         for insn in &mut self.insns {
             if insn.op == Opcode::Phi {
@@ -1230,6 +1276,21 @@ pub struct LocalVar {
     pub explicit_align: Option<u32>,
 }
 
+/// A parameter whose local storage is filled implicitly by the backend prologue
+/// (e.g. complex / two-SSE struct params passed in XMM registers).
+/// The inliner uses this to generate explicit struct copies at inline sites.
+#[derive(Debug, Clone, Copy)]
+pub struct ImplicitParamCopy {
+    /// Index into the call instruction's source list
+    pub arg_index: u32,
+    /// Callee's local Sym pseudo that receives the data
+    pub local_sym: PseudoId,
+    /// Struct size in bytes
+    pub size_bytes: usize,
+    /// Type for the 8-byte load/store operations (typically `long`)
+    pub qword_type: TypeId,
+}
+
 /// A function in IR form
 #[derive(Debug, Clone)]
 pub struct Function {
@@ -1257,6 +1318,15 @@ pub struct Function {
     pub is_noreturn: bool,
     /// Is this function declared with the inline keyword?
     pub is_inline: bool,
+    /// Parameters whose data is supplied implicitly by the backend prologue
+    /// (e.g. complex / two-SSE struct params).  When inlining the function,
+    /// the inliner must generate an explicit struct copy from the caller's
+    /// address argument into the local.
+    pub implicit_param_copies: Vec<ImplicitParamCopy>,
+    /// Block ID -> index in `blocks` vec (O(1) lookup)
+    block_idx: HashMap<BasicBlockId, usize>,
+    /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
+    pseudo_idx: HashMap<PseudoId, usize>,
 }
 
 impl Default for Function {
@@ -1274,6 +1344,9 @@ impl Default for Function {
             is_static: false,
             is_noreturn: false,
             is_inline: false,
+            implicit_param_copies: Vec::new(),
+            block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
+            pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
         }
     }
 }
@@ -1295,22 +1368,38 @@ impl Function {
 
     /// Add a basic block
     pub fn add_block(&mut self, block: BasicBlock) {
+        let idx = self.blocks.len();
+        self.block_idx.insert(block.id, idx);
         self.blocks.push(block);
     }
 
     /// Get a block by ID
     pub fn get_block(&self, id: BasicBlockId) -> Option<&BasicBlock> {
-        self.blocks.iter().find(|b| b.id == id)
+        self.block_idx
+            .get(&id)
+            .and_then(|&idx| self.blocks.get(idx))
     }
 
     /// Get a mutable block by ID
     pub fn get_block_mut(&mut self, id: BasicBlockId) -> Option<&mut BasicBlock> {
-        self.blocks.iter_mut().find(|b| b.id == id)
+        self.block_idx
+            .get(&id)
+            .and_then(|&idx| self.blocks.get_mut(idx))
     }
 
     /// Add a pseudo for tracking
     pub fn add_pseudo(&mut self, pseudo: Pseudo) {
+        let idx = self.pseudos.len();
+        self.pseudo_idx.insert(pseudo.id, idx);
         self.pseudos.push(pseudo);
+    }
+
+    /// Rebuild block index after bulk mutation of `self.blocks`
+    pub fn rebuild_block_idx(&mut self) {
+        self.block_idx.clear();
+        for (idx, block) in self.blocks.iter().enumerate() {
+            self.block_idx.insert(block.id, idx);
+        }
     }
 
     /// Add a local variable
@@ -1353,7 +1442,7 @@ impl Function {
 
     /// Create a new constant integer pseudo and return its ID
     /// The pseudo is added to self.pseudos
-    pub fn create_const_pseudo(&mut self, value: i64) -> PseudoId {
+    pub fn create_const_pseudo(&mut self, value: i128) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, value);
         self.add_pseudo(pseudo);
@@ -1362,10 +1451,29 @@ impl Function {
 
     /// Get a pseudo by its ID
     pub fn get_pseudo(&self, id: PseudoId) -> Option<&Pseudo> {
-        self.pseudos.iter().find(|p| p.id == id)
+        self.pseudo_idx
+            .get(&id)
+            .and_then(|&idx| self.pseudos.get(idx))
+    }
+
+    /// Get the constant integer value of a pseudo, if it is a Val.
+    pub fn const_val(&self, id: PseudoId) -> Option<i128> {
+        self.get_pseudo(id).and_then(|p| match &p.kind {
+            PseudoKind::Val(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// Get the symbol name of a pseudo, if it is a Sym.
+    pub fn sym_name_of(&self, id: PseudoId) -> Option<&str> {
+        self.get_pseudo(id).and_then(|p| match &p.kind {
+            PseudoKind::Sym(name) => Some(name.as_str()),
+            _ => None,
+        })
     }
 
     /// Check if block a dominates block b
+    #[cfg(test)]
     pub fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
         if a == b {
             return true;
@@ -1418,7 +1526,7 @@ pub enum Initializer {
     #[default]
     None,
     /// Integer initializer
-    Int(i64),
+    Int(i128),
     /// Float/double initializer
     Float(f64),
     /// String literal initializer (for char arrays)
@@ -1523,18 +1631,6 @@ impl GlobalDef {
         }
     }
 
-    /// Create a thread-local global variable definition
-    pub fn thread_local(name: impl Into<String>, typ: TypeId, init: Initializer) -> Self {
-        Self {
-            name: name.into(),
-            typ,
-            init,
-            is_thread_local: true,
-            is_static: false,
-            explicit_align: None,
-        }
-    }
-
     /// Set explicit alignment from _Alignas specifier
     pub fn with_align(mut self, align: Option<u32>) -> Self {
         self.explicit_align = align;
@@ -1617,31 +1713,7 @@ impl Module {
         align: Option<u32>,
         is_static: bool,
     ) {
-        let name = name.into();
-        // Check for existing tentative definition
-        if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
-            // Replace tentative definition with actual definition
-            if matches!(existing.init, Initializer::None) {
-                // C99 6.9.2: Multiple declarations must have compatible types.
-                // The parser should enforce this; assert here as a safety check.
-                debug_assert_eq!(
-                    existing.typ, typ,
-                    "tentative definition type mismatch for '{}'",
-                    name
-                );
-                existing.init = init;
-                if align.is_some() {
-                    existing.explicit_align = align;
-                }
-                existing.is_static = is_static;
-                return;
-            }
-        }
-        self.globals.push(
-            GlobalDef::new(name, typ, init)
-                .with_align(align)
-                .with_static(is_static),
-        );
+        self.add_global_impl(name, typ, init, align, is_static, false);
     }
 
     /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
@@ -1655,32 +1727,46 @@ impl Module {
         align: Option<u32>,
         is_static: bool,
     ) {
+        self.add_global_impl(name, typ, init, align, is_static, true);
+    }
+
+    fn add_global_impl(
+        &mut self,
+        name: impl Into<String>,
+        typ: TypeId,
+        init: Initializer,
+        align: Option<u32>,
+        is_static: bool,
+        is_thread_local: bool,
+    ) {
         let name = name.into();
         // Check for existing tentative definition
         if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
-                // C99 6.9.2: Multiple declarations must have compatible types.
-                // The parser should enforce this; assert here as a safety check.
                 debug_assert_eq!(
                     existing.typ, typ,
                     "tentative definition type mismatch for '{}'",
                     name
                 );
                 existing.init = init;
-                existing.is_thread_local = true;
                 existing.is_static = is_static;
+                if is_thread_local {
+                    existing.is_thread_local = true;
+                }
                 if align.is_some() {
                     existing.explicit_align = align;
                 }
                 return;
             }
         }
-        self.globals.push(
-            GlobalDef::thread_local(name, typ, init)
-                .with_align(align)
-                .with_static(is_static),
-        );
+        let mut def = GlobalDef::new(name, typ, init)
+            .with_align(align)
+            .with_static(is_static);
+        if is_thread_local {
+            def.is_thread_local = true;
+        }
+        self.globals.push(def);
     }
 
     /// Add a string literal and return its label
@@ -2072,5 +2158,121 @@ mod tests {
         assert!(matches!(module.globals[0].init, Initializer::Int(100)));
         assert!(module.globals[0].is_thread_local);
         assert_eq!(module.globals[0].explicit_align, Some(8));
+    }
+
+    #[test]
+    fn test_switch_insn_uses_src() {
+        let insn = Instruction::switch_insn(
+            PseudoId(5),
+            vec![(0, BasicBlockId(1)), (1, BasicBlockId(2))],
+            Some(BasicBlockId(3)),
+            32,
+        );
+        assert!(insn.target.is_none());
+        assert_eq!(insn.src.len(), 1);
+        assert_eq!(insn.src[0], PseudoId(5));
+        assert_eq!(insn.switch_cases.len(), 2);
+        assert_eq!(insn.switch_default, Some(BasicBlockId(3)));
+        let s = format!("{}", insn);
+        assert!(s.contains("switch"));
+        assert!(s.contains("%5"));
+        assert!(s.contains("default"));
+    }
+
+    #[test]
+    fn test_instruction_kill() {
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::binop(
+            Opcode::Add,
+            PseudoId(3),
+            PseudoId(1),
+            PseudoId(2),
+            types.int_id,
+            32,
+        );
+        insn.phi_list.push((BasicBlockId(0), PseudoId(10)));
+        assert_eq!(insn.op, Opcode::Add);
+        assert!(insn.target.is_some());
+        assert!(!insn.src.is_empty());
+        assert!(!insn.phi_list.is_empty());
+        insn.kill();
+        assert_eq!(insn.op, Opcode::Nop);
+        assert!(insn.target.is_none());
+        assert!(insn.src.is_empty());
+        assert!(insn.phi_list.is_empty());
+    }
+
+    #[test]
+    fn test_function_const_val() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+        let mut func = Function::new("test_const_val", types.int_id);
+        let val_id = func.create_const_pseudo(42);
+        assert_eq!(func.const_val(val_id), Some(42));
+        let reg_id = func.alloc_pseudo();
+        let reg = Pseudo::reg(reg_id, reg_id.0);
+        func.add_pseudo(reg);
+        assert_eq!(func.const_val(reg_id), None);
+        assert_eq!(func.const_val(PseudoId(9999)), None);
+    }
+
+    #[test]
+    fn test_function_sym_name_of() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+        let mut func = Function::new("test_sym_name", types.int_id);
+        let sym_id = func.alloc_pseudo();
+        let sym = Pseudo::sym(sym_id, "my_symbol".to_string());
+        func.add_pseudo(sym);
+        assert_eq!(func.sym_name_of(sym_id), Some("my_symbol"));
+        let reg_id = func.alloc_pseudo();
+        let reg = Pseudo::reg(reg_id, reg_id.0);
+        func.add_pseudo(reg);
+        assert_eq!(func.sym_name_of(reg_id), None);
+        assert_eq!(func.sym_name_of(PseudoId(9999)), None);
+    }
+
+    #[test]
+    fn test_returns_via_sret() {
+        let mut insn = Instruction::new(Opcode::Call);
+        assert!(!insn.returns_via_sret());
+        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+            vec![],
+            ArgClass::Direct {
+                classes: vec![RegClass::Integer],
+                size_bits: 64,
+            },
+        )));
+        assert!(!insn.returns_via_sret());
+        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+            vec![],
+            ArgClass::Indirect {
+                align: 8,
+                size_bits: 256,
+            },
+        )));
+        assert!(insn.returns_via_sret());
+    }
+
+    #[test]
+    fn test_returns_two_regs() {
+        let mut insn = Instruction::new(Opcode::Ret);
+        assert!(!insn.returns_two_regs());
+        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+            vec![],
+            ArgClass::Direct {
+                classes: vec![RegClass::Integer],
+                size_bits: 64,
+            },
+        )));
+        assert!(!insn.returns_two_regs());
+        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+            vec![],
+            ArgClass::Direct {
+                classes: vec![RegClass::Integer, RegClass::Integer],
+                size_bits: 128,
+            },
+        )));
+        assert!(insn.returns_two_regs());
     }
 }

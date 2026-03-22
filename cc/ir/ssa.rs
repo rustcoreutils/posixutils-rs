@@ -135,8 +135,6 @@ struct VarInfo {
     addr_taken: bool,
     /// Is all usage in a single block?
     single_block: Option<BasicBlockId>,
-    /// Block where this variable was declared (for scope-aware phi placement)
-    decl_block: Option<BasicBlockId>,
 }
 
 /// Analyze a variable to determine if it can be promoted to SSA.
@@ -144,7 +142,6 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
     let local = func.get_local(var_name)?;
     let sym_id = local.sym;
     let typ = local.typ;
-    let decl_block = local.decl_block;
 
     // Check basic promotability - only scalar types can be promoted
     // Volatile and atomic variables must go through memory
@@ -155,7 +152,6 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
     let mut info = VarInfo {
         typ,
         size: types.size_bits(typ),
-        decl_block,
         ..Default::default()
     };
 
@@ -231,18 +227,8 @@ fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &Var
     // Compute IDF of definition blocks
     let idf = idf_compute(converter.func, &var_info.def_blocks);
 
-    // Insert phi node at each IDF block, but only if it's dominated by the declaration block.
-    // This ensures that variables declared inside inner scopes don't get phi nodes
-    // at outer loop headers where they're not in scope.
+    // Insert phi node at each IDF block.
     for bb_id in idf {
-        // Filter: only insert phi if the IDF block is dominated by the declaration block
-        if let Some(decl_bb) = var_info.decl_block {
-            if !converter.func.dominates(decl_bb, bb_id) {
-                // This IDF block is not dominated by the declaration block,
-                // so the variable is not in scope here - skip phi insertion
-                continue;
-            }
-        }
         let target = converter.alloc_phi();
 
         // Create phi instruction
@@ -373,23 +359,15 @@ fn rename_insn(
                 let addr = insn.src[0];
 
                 // Look up what variable this address corresponds to
-                let var_name = converter
-                    .func
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .and_then(|p| match &p.kind {
-                        PseudoKind::Sym(name) => Some(name.clone()),
-                        _ => None,
-                    });
+                let var_name = converter.func.sym_name_of(addr);
 
                 if let Some(name) = var_name {
-                    if converter.to_rename.contains(&name) {
+                    if converter.to_rename.contains(name) {
                         // Get the value being stored
                         let val = insn.src[1];
 
                         // Push as new definition
-                        def_stack.push(&name, bb_id, val);
+                        def_stack.push(name, bb_id, val);
 
                         // Mark store for removal
                         converter.dead_stores.push(InsnRef::new(bb_id, insn_idx));
@@ -403,20 +381,12 @@ fn rename_insn(
             if !insn.src.is_empty() {
                 let addr = insn.src[0];
 
-                let var_name = converter
-                    .func
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .and_then(|p| match &p.kind {
-                        PseudoKind::Sym(name) => Some(name.clone()),
-                        _ => None,
-                    });
+                let var_name = converter.func.sym_name_of(addr);
 
                 if let Some(name) = var_name {
-                    if converter.to_rename.contains(&name) {
+                    if converter.to_rename.contains(name) {
                         // Get the reaching definition
-                        let val = lookup_var(converter.func, bb_id, &name, def_stack)
+                        let val = lookup_var(converter.func, bb_id, name, def_stack)
                             .unwrap_or_else(|| converter.undef_pseudo());
 
                         // Replace load with the value
@@ -484,6 +454,8 @@ fn rename_block(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &m
 }
 
 /// Fill in phi operands from predecessor blocks.
+/// Creates PhiSource instructions in each predecessor block that feed
+/// into the phi nodes, following sparse's OP_PHISOURCE design.
 fn fill_phi_operands(converter: &mut SsaConverter) {
     // Collect phi info first
     let phi_info: Vec<(BasicBlockId, usize, String)> = converter
@@ -505,11 +477,30 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
             .map(|bb| bb.parents.clone())
             .unwrap_or_default();
 
-        // For each predecessor, find the reaching definition
+        // Get phi target and type info
+        let (phi_target, phi_typ, phi_size) = {
+            let bb = match converter.func.get_block(bb_id) {
+                Some(bb) => bb,
+                None => continue,
+            };
+            let phi_insn = match bb.insns.get(phi_idx) {
+                Some(insn) => insn,
+                None => continue,
+            };
+            let phi_target = match phi_insn.target {
+                Some(t) => t,
+                None => continue,
+            };
+            let phi_typ = match phi_insn.typ {
+                Some(t) => t,
+                None => continue,
+            };
+            (phi_target, phi_typ, phi_insn.size)
+        };
+
+        // For each predecessor, find the reaching definition and create PhiSource
         for pred_id in preds {
-            // Find the definition in the predecessor
             let val = lookup_var_in_pred(converter.func, pred_id, &var_name).unwrap_or_else(|| {
-                // Create undef pseudo
                 let id = PseudoId(converter.next_pseudo_id);
                 converter.next_pseudo_id += 1;
                 let pseudo = Pseudo::undef(id);
@@ -517,10 +508,22 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
                 id
             });
 
-            // Add to phi_list
+            // Allocate PhiSource target pseudo
+            let phisrc_pseudo = converter.alloc_phi();
+
+            // Create PhiSource instruction with back-pointer to owning phi
+            let mut phisrc = Instruction::phi_source(phisrc_pseudo, val, phi_typ, phi_size);
+            phisrc.phi_list = vec![(bb_id, phi_target)];
+
+            // Insert into predecessor block before terminator
+            if let Some(pred_bb) = converter.func.get_block_mut(pred_id) {
+                pred_bb.insert_before_terminator(phisrc);
+            }
+
+            // Add PhiSource target to phi's phi_list
             if let Some(bb) = converter.func.get_block_mut(bb_id) {
                 if let Some(phi_insn) = bb.insns.get_mut(phi_idx) {
-                    phi_insn.phi_list.push((pred_id, val));
+                    phi_insn.phi_list.push((pred_id, phisrc_pseudo));
                 }
             }
         }
@@ -584,21 +587,12 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
 
 /// Remove dead stores that were converted to SSA.
 fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
-    // Sort by block and index (descending) so we can remove from end first
-    let mut sorted: Vec<_> = dead_stores.to_vec();
-    sorted.sort_by(|a, b| {
-        if a.bb == b.bb {
-            b.idx.cmp(&a.idx) // Descending by index
-        } else {
-            a.bb.0.cmp(&b.bb.0)
-        }
-    });
-
-    for insn_ref in sorted {
+    // Converting to Nop is index-stable so iteration order doesn't matter.
+    for insn_ref in dead_stores {
         if let Some(bb) = func.get_block_mut(insn_ref.bb) {
             if insn_ref.idx < bb.insns.len() {
                 // Convert to Nop instead of removing to preserve indices
-                bb.insns[insn_ref.idx].op = Opcode::Nop;
+                bb.insns[insn_ref.idx].kill();
             }
         }
     }
@@ -758,6 +752,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry, then_bb, else_bb, merge];
+        func.rebuild_block_idx();
         func
     }
 
@@ -848,6 +843,7 @@ mod tests {
 
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry];
+        func.rebuild_block_idx();
 
         // This should NOT panic - the SSA converter should find max ID from instructions
         ssa_convert(&mut func, &types);
@@ -856,5 +852,359 @@ mod tests {
         // and used next_pseudo_id >= 101 for any new IDs
         // (We can't easily verify the internal counter, but the lack of panic
         // indicates the fix is working)
+    }
+
+    // ========================================================================
+    // Regression test: phi insertion in goto-dispatch CFG
+    //
+    // The bug: insert_phi_nodes() had a filter that skipped phi node insertion
+    // at IDF blocks not dominated by the variable's declaration block. This
+    // was too aggressive for function-scope variables used in goto-dispatch
+    // patterns (like CPython's ceval.c), where a variable declared at function
+    // scope is modified in case handlers and read back at a dispatch label
+    // connected by goto back-edges.
+    //
+    // The fix: remove the decl_block dominance filter from insert_phi_nodes().
+    // ========================================================================
+
+    fn make_goto_dispatch_cfg(types: &TypeTable) -> Function {
+        // Create a CFG mimicking CPython's ceval.c goto-dispatch pattern:
+        //
+        //   int x = 0;
+        //   int opcode = get_opcode(); // simulated
+        //   goto dispatch;
+        //
+        // dispatch:
+        //   switch(opcode) {
+        //     case 0: goto handler0;
+        //     case 1: goto handler1;
+        //     default: goto done;
+        //   }
+        //
+        // handler0:
+        //   x = 10;
+        //   opcode = 1; // next opcode
+        //   goto dispatch;
+        //
+        // handler1:
+        //   x = 20;
+        //   goto done;
+        //
+        // done:
+        //   return x;
+        //
+        //       entry(0)
+        //         |
+        //         v
+        //  +-> dispatch(1) --+--+
+        //  |    |    |       |  |
+        //  |    v    |       |  v
+        //  | handler0(2)     | handler1(3)
+        //  |    |            |  |
+        //  +----+            |  v
+        //                    +-> done(4)
+
+        let int_id = types.int_id;
+        let mut func = Function::new("test_dispatch", int_id);
+
+        // Symbol pseudo for local variable 'x' (declared at function scope = entry block)
+        let x_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
+        func.add_local(
+            "x",
+            x_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(0)), // declared in entry
+            None,
+        );
+
+        // Value pseudos
+        let val0 = PseudoId(1);
+        func.add_pseudo(Pseudo::val(val0, 0));
+        let val10 = PseudoId(2);
+        func.add_pseudo(Pseudo::val(val10, 10));
+        let val20 = PseudoId(3);
+        func.add_pseudo(Pseudo::val(val20, 20));
+        let val1 = PseudoId(4);
+        func.add_pseudo(Pseudo::val(val1, 1));
+
+        // Pseudo for switch value (simulated opcode)
+        let opcode_sym = PseudoId(5);
+        func.add_pseudo(Pseudo::sym(opcode_sym, "opcode".to_string()));
+        func.add_local(
+            "opcode",
+            opcode_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(0)),
+            None,
+        );
+
+        // Reg pseudos for loads
+        let load_result = PseudoId(6);
+        func.add_pseudo(Pseudo::reg(load_result, 0));
+        let load_x_done = PseudoId(7);
+        func.add_pseudo(Pseudo::reg(load_x_done, 1));
+
+        // entry(0): x = 0; opcode = 0; goto dispatch
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.children = vec![BasicBlockId(1)];
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(val0, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(val0, opcode_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::br(BasicBlockId(1)));
+
+        // dispatch(1): load opcode; switch(opcode) { 0->handler0, 1->handler1, default->done }
+        let mut dispatch = BasicBlock::new(BasicBlockId(1));
+        dispatch.parents = vec![BasicBlockId(0), BasicBlockId(2)]; // entry + handler0 back-edge
+        dispatch.children = vec![BasicBlockId(2), BasicBlockId(3), BasicBlockId(4)];
+        dispatch.add_insn(Instruction::load(load_result, opcode_sym, 0, int_id, 32));
+        dispatch.add_insn(Instruction::switch_insn(
+            load_result,
+            vec![
+                (0, BasicBlockId(2)), // case 0 -> handler0
+                (1, BasicBlockId(3)), // case 1 -> handler1
+            ],
+            Some(BasicBlockId(4)), // default -> done
+            32,
+        ));
+
+        // handler0(2): x = 10; opcode = 1; goto dispatch (back-edge)
+        let mut handler0 = BasicBlock::new(BasicBlockId(2));
+        handler0.parents = vec![BasicBlockId(1)];
+        handler0.children = vec![BasicBlockId(1)]; // back-edge to dispatch
+        handler0.add_insn(Instruction::store(val10, x_sym, 0, int_id, 32));
+        handler0.add_insn(Instruction::store(val1, opcode_sym, 0, int_id, 32));
+        handler0.add_insn(Instruction::br(BasicBlockId(1)));
+
+        // handler1(3): x = 20; goto done
+        let mut handler1 = BasicBlock::new(BasicBlockId(3));
+        handler1.parents = vec![BasicBlockId(1)];
+        handler1.children = vec![BasicBlockId(4)];
+        handler1.add_insn(Instruction::store(val20, x_sym, 0, int_id, 32));
+        handler1.add_insn(Instruction::br(BasicBlockId(4)));
+
+        // done(4): return x
+        let mut done = BasicBlock::new(BasicBlockId(4));
+        done.parents = vec![BasicBlockId(1), BasicBlockId(3)];
+        done.add_insn(Instruction::load(load_x_done, x_sym, 0, int_id, 32));
+        done.add_insn(Instruction::ret(Some(load_x_done)));
+
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry, dispatch, handler0, handler1, done];
+        func.rebuild_block_idx();
+        func
+    }
+
+    #[test]
+    fn test_goto_dispatch_phi_insertion() {
+        // Regression test for the phi insertion bug.
+        // In a goto-dispatch CFG, variable 'x' is:
+        //   - defined in entry(0), handler0(2), handler1(3)
+        //   - read in done(4)
+        //   - the dispatch(1) block is a merge point on the back-edge from handler0
+        //
+        // The IDF of def_blocks {0, 2, 3} should include dispatch(1) and done(4).
+        // The old buggy code would skip dispatch(1) if it wasn't dominated by decl_block.
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_goto_dispatch_cfg(&types);
+
+        ssa_convert(&mut func, &types);
+
+        // dispatch(1) must have a phi for 'x' because it's a merge point
+        // where the value of x from entry (x=0) meets the value from handler0 (x=10)
+        let dispatch = func.get_block(BasicBlockId(1)).unwrap();
+        let dispatch_has_phi_x = dispatch.phi_map.contains_key("x");
+        assert!(
+            dispatch_has_phi_x,
+            "dispatch block (bb1) must have a phi node for 'x' - \
+             this is the goto-dispatch pattern regression"
+        );
+
+        // done(4) should also have a phi for 'x' because it merges values
+        // from dispatch(1) (default case) and handler1(3)
+        let done = func.get_block(BasicBlockId(4)).unwrap();
+        let done_has_phi_x = done.phi_map.contains_key("x");
+        assert!(
+            done_has_phi_x,
+            "done block (bb4) must have a phi node for 'x'"
+        );
+
+        // Verify the phi in dispatch has the correct predecessors (entry and handler0)
+        let phi_idx = dispatch.phi_map["x"];
+        let phi_insn = &dispatch.insns[phi_idx];
+        assert_eq!(phi_insn.op, Opcode::Phi);
+        assert_eq!(
+            phi_insn.phi_list.len(),
+            2,
+            "dispatch phi for 'x' should have 2 operands (from entry and handler0)"
+        );
+
+        // Check predecessor block IDs in the phi_list
+        let phi_preds: Vec<BasicBlockId> = phi_insn.phi_list.iter().map(|(bb, _)| *bb).collect();
+        assert!(
+            phi_preds.contains(&BasicBlockId(0)),
+            "dispatch phi should have entry(0) as predecessor"
+        );
+        assert!(
+            phi_preds.contains(&BasicBlockId(2)),
+            "dispatch phi should have handler0(2) as predecessor"
+        );
+    }
+
+    #[test]
+    fn test_goto_dispatch_loads_replaced() {
+        // Verify that after SSA conversion, loads of 'x' are replaced
+        // with SSA values (Copy instructions), not left as memory loads.
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_goto_dispatch_cfg(&types);
+
+        ssa_convert(&mut func, &types);
+
+        // The load of x in done(4) should have been converted to a Copy
+        let done = func.get_block(BasicBlockId(4)).unwrap();
+        let has_load = done.insns.iter().any(|i| i.op == Opcode::Load);
+        assert!(
+            !has_load,
+            "done block should not have any Load instructions after SSA conversion \
+             (they should be converted to Copy)"
+        );
+
+        let has_copy = done.insns.iter().any(|i| i.op == Opcode::Copy);
+        assert!(
+            has_copy,
+            "done block should have a Copy instruction (the promoted load of x)"
+        );
+    }
+
+    // ========================================================================
+    // PhiSource tests: verify SSA conversion emits PhiSource instructions
+    // ========================================================================
+
+    #[test]
+    fn test_phisource_in_predecessors() {
+        // After SSA conversion, predecessor blocks should have PhiSource instructions
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_simple_if_cfg(&types);
+
+        ssa_convert(&mut func, &types);
+
+        // merge(3) has phi for 'x' with predecessors then(1) and else(2)
+        let merge = func.get_block(BasicBlockId(3)).unwrap();
+        assert!(merge.phi_map.contains_key("x"));
+        let phi_idx = merge.phi_map["x"];
+        let phi_insn = &merge.insns[phi_idx];
+        assert_eq!(phi_insn.op, Opcode::Phi);
+
+        // Check that predecessor blocks have PhiSource instructions
+        let then_bb = func.get_block(BasicBlockId(1)).unwrap();
+        let then_has_phisrc = then_bb.insns.iter().any(|i| i.op == Opcode::PhiSource);
+        assert!(
+            then_has_phisrc,
+            "then block should have PhiSource instruction"
+        );
+
+        // else(2) should also have PhiSource (for the reaching def from entry)
+        let else_bb = func.get_block(BasicBlockId(2)).unwrap();
+        let else_has_phisrc = else_bb.insns.iter().any(|i| i.op == Opcode::PhiSource);
+        assert!(
+            else_has_phisrc,
+            "else block should have PhiSource instruction"
+        );
+    }
+
+    #[test]
+    fn test_phisource_has_backpointer() {
+        // Each PhiSource should have a back-pointer to its owning Phi
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_simple_if_cfg(&types);
+
+        ssa_convert(&mut func, &types);
+
+        let merge = func.get_block(BasicBlockId(3)).unwrap();
+        let phi_idx = merge.phi_map["x"];
+        let phi_target = merge.insns[phi_idx].target.unwrap();
+
+        // Find PhiSource instructions in predecessor blocks
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                if insn.op == Opcode::PhiSource {
+                    // PhiSource must have a back-pointer in phi_list
+                    assert!(
+                        !insn.phi_list.is_empty(),
+                        "PhiSource must have a back-pointer"
+                    );
+                    let (phi_bb, phi_pseudo) = insn.phi_list[0];
+                    // Back-pointer should reference the merge block's phi
+                    assert_eq!(phi_bb, BasicBlockId(3));
+                    assert_eq!(phi_pseudo, phi_target);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_phisource_targets_match_phi_list() {
+        // The phi_list entries on the Phi should reference PhiSource targets
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_goto_dispatch_cfg(&types);
+
+        ssa_convert(&mut func, &types);
+
+        let dispatch = func.get_block(BasicBlockId(1)).unwrap();
+        if let Some(&phi_idx) = dispatch.phi_map.get("x") {
+            let phi_insn = &dispatch.insns[phi_idx];
+
+            for (pred_bb, phisrc_pseudo) in &phi_insn.phi_list {
+                // Find the PhiSource instruction in the predecessor block
+                let pred = func.get_block(*pred_bb).unwrap();
+                let phisrc = pred
+                    .insns
+                    .iter()
+                    .find(|i| i.op == Opcode::PhiSource && i.target == Some(*phisrc_pseudo));
+                assert!(
+                    phisrc.is_some(),
+                    "PhiSource for pseudo {:?} not found in predecessor block {:?}",
+                    phisrc_pseudo,
+                    pred_bb
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_goto_dispatch_phisource_instructions() {
+        // Verify PhiSource instructions exist in predecessor blocks of the dispatch phi
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_goto_dispatch_cfg(&types);
+
+        ssa_convert(&mut func, &types);
+
+        // entry(0) should have PhiSource before its terminator
+        let entry = func.get_block(BasicBlockId(0)).unwrap();
+        let entry_phisrcs: Vec<_> = entry
+            .insns
+            .iter()
+            .filter(|i| i.op == Opcode::PhiSource)
+            .collect();
+        assert!(
+            !entry_phisrcs.is_empty(),
+            "entry block should have PhiSource instructions"
+        );
+
+        // handler0(2) should have PhiSource for the back-edge
+        let handler0 = func.get_block(BasicBlockId(2)).unwrap();
+        let handler0_phisrcs: Vec<_> = handler0
+            .insns
+            .iter()
+            .filter(|i| i.op == Opcode::PhiSource)
+            .collect();
+        assert!(
+            !handler0_phisrcs.is_empty(),
+            "handler0 block should have PhiSource instructions"
+        );
     }
 }

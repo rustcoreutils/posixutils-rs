@@ -37,7 +37,7 @@ impl Aarch64CodeGen {
         typ.map(|t| types.size_bits(t)).unwrap_or(size).max(32)
     }
     /// Emit a floating-point load instruction
-    pub(super) fn emit_fp_load(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    pub(super) fn emit_fp_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
         let addr = match insn.src.first() {
             Some(&s) => s,
@@ -77,7 +77,7 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot (FP-relative for alloca safety)
-                    let total_offset = self.stack_offset(frame_size, offset) + insn.offset as i32;
+                    let total_offset = self.stack_offset(offset) + insn.offset as i32;
                     self.push_lir(Aarch64Inst::LdrFp {
                         size: fp_size,
                         addr: MemAddr::BaseOffset {
@@ -88,7 +88,7 @@ impl Aarch64CodeGen {
                     });
                 } else {
                     // Spilled address - load address first (FP-relative for alloca safety)
-                    let adjusted = self.stack_offset(frame_size, offset);
+                    let adjusted = self.stack_offset(offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
                         addr: MemAddr::BaseOffset {
@@ -150,7 +150,7 @@ impl Aarch64CodeGen {
                 }
             }
             _ => {
-                self.emit_move(addr, Reg::X16, 64, frame_size);
+                self.emit_move(addr, Reg::X16, 64);
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
                     addr: MemAddr::BaseOffset {
@@ -164,7 +164,7 @@ impl Aarch64CodeGen {
 
         // Move to final destination if needed
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, size, frame_size, types);
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, size, types);
         }
     }
 
@@ -175,7 +175,6 @@ impl Aarch64CodeGen {
         dst: VReg,
         typ: Option<TypeId>,
         size: u32,
-        frame_size: i32,
         types: &TypeTable,
     ) {
         let loc = self.get_location(src);
@@ -191,7 +190,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(frame_size, offset);
+                let actual_offset = self.stack_offset(offset);
                 // FP-relative for alloca safety
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
@@ -231,7 +230,7 @@ impl Aarch64CodeGen {
             Loc::Imm(v) => {
                 // Load integer immediate and move to FP
                 let (scratch0, _, _) = Reg::scratch_regs();
-                self.emit_mov_imm(scratch0, v, 64);
+                self.emit_mov_imm(scratch0, v as i64, 64);
                 self.push_lir(Aarch64Inst::FmovFromGp {
                     size: fp_size,
                     src: scratch0,
@@ -264,7 +263,6 @@ impl Aarch64CodeGen {
         dst: &Loc,
         typ: Option<TypeId>,
         size: u32,
-        frame_size: i32,
         types: &TypeTable,
     ) {
         let fp_size = Self::fp_size_from_type(typ, size, types);
@@ -279,7 +277,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = self.stack_offset(frame_size, *offset);
+                let actual_offset = self.stack_offset(*offset);
                 // FP-relative for alloca safety
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
@@ -303,7 +301,7 @@ impl Aarch64CodeGen {
     }
 
     /// Emit FP binary operation (fadd, fsub, fmul, fdiv)
-    pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
         let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -321,8 +319,8 @@ impl Aarch64CodeGen {
         };
 
         // Load operands
-        self.emit_fp_move(src1, VReg::V17, insn.typ, size, frame_size, types);
-        self.emit_fp_move(src2, VReg::V18, insn.typ, size, frame_size, types);
+        self.emit_fp_move(src1, VReg::V17, insn.typ, size, types);
+        self.emit_fp_move(src2, VReg::V18, insn.typ, size, types);
 
         match insn.op {
             Opcode::FAdd => {
@@ -361,12 +359,12 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
-            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, frame_size, types);
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
         }
     }
 
     /// Emit FP negation
-    pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
+    pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
         let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let src = match insn.src.first() {
@@ -383,7 +381,7 @@ impl Aarch64CodeGen {
             _ => VReg::V16,
         };
 
-        self.emit_fp_move(src, VReg::V17, insn.typ, size, frame_size, types);
+        self.emit_fp_move(src, VReg::V17, insn.typ, size, types);
 
         self.push_lir(Aarch64Inst::Fneg {
             size: fp_size,
@@ -392,17 +390,12 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
-            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, frame_size, types);
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
         }
     }
 
     /// Emit FP comparison
-    pub(super) fn emit_fp_compare(
-        &mut self,
-        insn: &Instruction,
-        frame_size: i32,
-        types: &TypeTable,
-    ) {
+    pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
         let fp_size = Self::fp_size_from_type(insn.typ, insn.size, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -415,8 +408,8 @@ impl Aarch64CodeGen {
         };
 
         // Load operands to FP registers
-        self.emit_fp_move(src1, VReg::V17, insn.typ, size, frame_size, types);
-        self.emit_fp_move(src2, VReg::V18, insn.typ, size, frame_size, types);
+        self.emit_fp_move(src1, VReg::V17, insn.typ, size, types);
+        self.emit_fp_move(src2, VReg::V18, insn.typ, size, types);
 
         // Perform comparison
         self.push_lir(Aarch64Inst::Fcmp {
@@ -432,31 +425,34 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        // Set result based on condition
+        // Set result based on condition.
+        // AArch64 fcmp sets NZCV: Equal(0100), Less(1000), Greater(0010), NaN(0011).
+        // Ordered comparisons must return false for NaN:
+        //   OLt: use 'lo' (C=0) — NaN has C=1 → false ✓
+        //   OLe: use 'ls' (C=0 OR Z=1) — NaN has C=1,Z=0 → false ✓
+        //   OGt: use 'gt' (Z=0 AND N=V) — NaN has N≠V → false ✓
+        //   OGe: use 'ge' (N=V) — NaN has N≠V → false ✓
+        //   OEq: use 'eq' (Z=1) — NaN has Z=0 → false ✓
+        //   ONe: use 'ne' (Z=0) — NaN has Z=0 → true ✓ (correct for unordered not-equal)
         let cond = match insn.op {
             Opcode::FCmpOEq => CondCode::Eq,
             Opcode::FCmpONe => CondCode::Ne,
-            Opcode::FCmpOLt => CondCode::Slt,
-            Opcode::FCmpOLe => CondCode::Sle,
-            Opcode::FCmpOGt => CondCode::Sgt,
-            Opcode::FCmpOGe => CondCode::Sge,
+            Opcode::FCmpOLt => CondCode::Ult, // 'lo' = C clear, NaN-safe
+            Opcode::FCmpOLe => CondCode::Ule, // 'ls' = C=0 OR Z=1, NaN-safe
+            Opcode::FCmpOGt => CondCode::Sgt, // 'gt' = Z=0 AND N=V, NaN-safe
+            Opcode::FCmpOGe => CondCode::Sge, // 'ge' = N=V, NaN-safe
             _ => return,
         };
 
         self.push_lir(Aarch64Inst::Cset { cond, dst: dst_reg });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 32, frame_size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
         }
     }
 
     /// Emit integer to float conversion
-    pub(super) fn emit_int_to_float(
-        &mut self,
-        insn: &Instruction,
-        frame_size: i32,
-        types: &TypeTable,
-    ) {
+    pub(super) fn emit_int_to_float(&mut self, insn: &Instruction, types: &TypeTable) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -479,7 +475,7 @@ impl Aarch64CodeGen {
 
         // Load source to integer register
         let (scratch0, _, _) = Reg::scratch_regs();
-        self.emit_move(src, scratch0, src_size, frame_size);
+        self.emit_move(src, scratch0, src_size);
 
         // Convert integer to float
         // scvtf/ucvtf: signed/unsigned int to float
@@ -504,17 +500,12 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, frame_size, types);
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, types);
         }
     }
 
     /// Emit float to integer conversion
-    pub(super) fn emit_float_to_int(
-        &mut self,
-        insn: &Instruction,
-        frame_size: i32,
-        types: &TypeTable,
-    ) {
+    pub(super) fn emit_float_to_int(&mut self, insn: &Instruction, types: &TypeTable) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -536,7 +527,7 @@ impl Aarch64CodeGen {
         };
 
         // Load source to FP register
-        self.emit_fp_move(src, VReg::V17, insn.src_typ, src_size, frame_size, types);
+        self.emit_fp_move(src, VReg::V17, insn.src_typ, src_size, types);
 
         // Convert float to integer using truncation toward zero
         // fcvtzu/fcvtzs: float to unsigned/signed int with truncation
@@ -561,17 +552,12 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, dst_size, frame_size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, dst_size);
         }
     }
 
     /// Emit float to float conversion (size change)
-    pub(super) fn emit_float_to_float(
-        &mut self,
-        insn: &Instruction,
-        frame_size: i32,
-        types: &TypeTable,
-    ) {
+    pub(super) fn emit_float_to_float(&mut self, insn: &Instruction, types: &TypeTable) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -593,7 +579,7 @@ impl Aarch64CodeGen {
         };
 
         // Load source to FP register
-        self.emit_fp_move(src, VReg::V17, insn.src_typ, src_size, frame_size, types);
+        self.emit_fp_move(src, VReg::V17, insn.src_typ, src_size, types);
 
         // Convert between float sizes if types differ
         // fcvt: convert between single and double precision
@@ -624,7 +610,7 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
-            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, frame_size, types);
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, dst_size, types);
         }
     }
 }

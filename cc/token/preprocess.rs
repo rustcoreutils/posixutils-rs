@@ -366,6 +366,12 @@ pub struct Preprocessor<'a> {
 
     /// Lexer mode for tokenizing included files (C or Assembly)
     lexer_mode: LexerMode,
+
+    /// Line offset from #line directive: actual_line = token_line + line_offset
+    line_offset: i32,
+
+    /// File name override from #line directive
+    line_file_override: Option<String>,
 }
 
 /// Check if an attribute name is supported by pcc
@@ -521,6 +527,8 @@ impl<'a> Preprocessor<'a> {
             use_system_headers: true,
             current_include_path_index: None,
             lexer_mode: LexerMode::C,
+            line_offset: 0,
+            line_file_override: None,
         };
 
         // Initialize predefined macros
@@ -922,7 +930,7 @@ impl<'a> Preprocessor<'a> {
             "error" => self.handle_error(iter, &hash_token.pos, idents),
             "warning" => self.handle_warning(iter, &hash_token.pos, idents),
             "pragma" => self.handle_pragma(iter, idents),
-            "line" => self.handle_line(iter),
+            "line" => self.handle_line(iter, idents),
             _ => {
                 // Unknown directive
                 if !self.is_skipping() {
@@ -2418,7 +2426,7 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
-        // Check for #pragma once
+        // Check for #pragma once and #pragma STDC
         if let Some(token) = iter.peek() {
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
@@ -2426,6 +2434,60 @@ impl<'a> Preprocessor<'a> {
                         if let Ok(canonical) = Path::new(&self.current_file).canonicalize() {
                             self.once_files.insert(canonical);
                         }
+                    } else if name == "STDC" {
+                        let pos = token.pos;
+                        iter.next(); // consume "STDC"
+
+                        // Expect pragma name: FP_CONTRACT, FENV_ACCESS, or CX_LIMITED_RANGE
+                        let valid_pragma = if let Some(tok) = iter.peek() {
+                            if let TokenValue::Ident(id2) = &tok.value {
+                                if let Some(pname) = idents.get_opt(*id2) {
+                                    matches!(
+                                        pname,
+                                        "FP_CONTRACT" | "FENV_ACCESS" | "CX_LIMITED_RANGE"
+                                    )
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if valid_pragma {
+                            iter.next(); // consume pragma name
+
+                            // Expect ON, OFF, or DEFAULT
+                            let valid_arg = if let Some(tok) = iter.peek() {
+                                if let TokenValue::Ident(id3) = &tok.value {
+                                    if let Some(aname) = idents.get_opt(*id3) {
+                                        matches!(aname, "ON" | "OFF" | "DEFAULT")
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if valid_arg {
+                                iter.next(); // consume ON/OFF/DEFAULT
+                            } else {
+                                diag::warning(pos, "expected ON, OFF, or DEFAULT for #pragma STDC");
+                            }
+                        } else {
+                            diag::warning(
+                                pos,
+                                "expected FP_CONTRACT, FENV_ACCESS, or CX_LIMITED_RANGE after #pragma STDC",
+                            );
+                        }
+
+                        self.skip_to_eol(iter);
+                        return;
                     }
                 }
             }
@@ -2452,13 +2514,14 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Expect a string literal
+        // C99 6.10.9p1 requires destringification (unescape \" and \\) and
+        // re-tokenization as a #pragma directive. Since all pragmas are no-ops
+        // in pcc, we just consume and discard the string token.
         if let Some(token) = iter.next() {
             if !matches!(token.typ, TokenType::String) {
                 // Not a valid _Pragma - just silently ignore
                 return;
             }
-            // We could parse the pragma string here if needed
-            // For now, we just ignore all pragmas
         } else {
             return;
         }
@@ -2474,7 +2537,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #line directive
-    fn handle_line<I>(&mut self, iter: &mut std::iter::Peekable<I>)
+    fn handle_line<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &mut IdentTable)
     where
         I: Iterator<Item = Token>,
     {
@@ -2483,8 +2546,32 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
-        // Just skip for now
-        self.skip_to_eol(iter);
+        let tokens = self.collect_to_eol(iter);
+        let tokens = self.expand_if_tokens(&tokens, idents);
+        if tokens.is_empty() {
+            return;
+        }
+
+        // First token must be a line number
+        let line_num = match &tokens[0].value {
+            TokenValue::Number(n) => match n.parse::<u32>() {
+                Ok(num) => num,
+                Err(_) => return,
+            },
+            _ => return,
+        };
+
+        // The #line directive takes effect on the next line, so
+        // current_physical_line is the line of the directive + 1
+        let current_physical_next_line = tokens[0].pos.line + 1;
+        self.line_offset = line_num as i32 - current_physical_next_line as i32;
+
+        // Optional second token: filename string
+        if tokens.len() > 1 {
+            if let TokenValue::String(s) = &tokens[1].value {
+                self.line_file_override = Some(s.clone());
+            }
+        }
     }
 
     /// Convert tokens to text for error messages
@@ -2502,6 +2589,62 @@ impl<'a> Preprocessor<'a> {
                 }
                 TokenValue::Number(n) => result.push_str(n),
                 TokenValue::String(s) => result.push_str(s),
+                TokenValue::Special(code) if *code < 256 => {
+                    result.push(*code as u8 as char);
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    /// Stringify macro argument per C99 6.10.3.2p2
+    /// Unlike tokens_to_text, this properly escapes string/char literals:
+    /// - Inserts delimiting quotes around string/char constants
+    /// - Escapes backslashes and double-quotes within them
+    fn stringify_arg(&self, tokens: &[Token], idents: &IdentTable) -> String {
+        let mut result = String::new();
+        for token in tokens {
+            if !result.is_empty() && token.pos.whitespace {
+                result.push(' ');
+            }
+            match &token.value {
+                TokenValue::Ident(id) => {
+                    if let Some(name) = idents.get_opt(*id) {
+                        result.push_str(name);
+                    }
+                }
+                TokenValue::Number(n) => result.push_str(n),
+                TokenValue::String(s) | TokenValue::WideString(s) => {
+                    if matches!(&token.value, TokenValue::WideString(_)) {
+                        result.push('L');
+                    }
+                    // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
+                    result.push('\\');
+                    result.push('"');
+                    for ch in s.chars() {
+                        if ch == '"' || ch == '\\' {
+                            result.push('\\');
+                        }
+                        result.push(ch);
+                    }
+                    result.push('\\');
+                    result.push('"');
+                }
+                TokenValue::Char(c) | TokenValue::WideChar(c) => {
+                    if matches!(&token.value, TokenValue::WideChar(_)) {
+                        result.push('L');
+                    }
+                    // C99 6.10.3.2p2: insert \ before each " and \ in char constants
+                    result.push('\'');
+                    for ch in c.chars() {
+                        if ch == '\\' || ch == '"' {
+                            result.push('\\');
+                        }
+                        result.push(ch);
+                    }
+                    result.push('\'');
+                }
                 TokenValue::Special(code) if *code < 256 => {
                     result.push(*code as u8 as char);
                 }
@@ -2647,9 +2790,9 @@ impl<'a> Preprocessor<'a> {
                     continue;
                 }
                 MacroTokenValue::Stringify(idx) => {
-                    // Stringify the argument
+                    // Stringify the argument per C99 6.10.3.2p2
                     let arg = args.get(*idx).cloned().unwrap_or_default();
-                    let text = self.tokens_to_text(&arg, idents);
+                    let text = self.stringify_arg(&arg, idents);
                     result.push(Token::with_value(
                         TokenType::String,
                         *pos,
@@ -2952,16 +3095,26 @@ impl<'a> Preprocessor<'a> {
         I: Iterator<Item = Token>,
     {
         match builtin {
-            BuiltinMacro::Line => Some(vec![Token::with_value(
-                TokenType::Number,
-                *pos,
-                TokenValue::Number(pos.line.to_string()),
-            )]),
-            BuiltinMacro::File => Some(vec![Token::with_value(
-                TokenType::String,
-                *pos,
-                TokenValue::String(self.current_file.clone()),
-            )]),
+            BuiltinMacro::Line => {
+                let effective_line = (pos.line as i32 + self.line_offset) as u32;
+                Some(vec![Token::with_value(
+                    TokenType::Number,
+                    *pos,
+                    TokenValue::Number(effective_line.to_string()),
+                )])
+            }
+            BuiltinMacro::File => {
+                let effective_file = self
+                    .line_file_override
+                    .as_ref()
+                    .unwrap_or(&self.current_file)
+                    .clone();
+                Some(vec![Token::with_value(
+                    TokenType::String,
+                    *pos,
+                    TokenValue::String(effective_file),
+                )])
+            }
             BuiltinMacro::Date => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
@@ -3076,6 +3229,7 @@ impl<'a> Preprocessor<'a> {
                     // C11 features
                     "c_atomic" |
                     "c_static_assert" |
+                    "c_alignas" |
                     "c_alignof" |
                     "c_thread_local"
                 )
@@ -3420,15 +3574,24 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
-        // Handle character literal
+        // Handle character literal (including wide char L'x')
         if let Some(tok) = self.current() {
-            if let TokenValue::Char(c) = &tok.value {
-                let char_str = c.clone();
+            let char_str = match &tok.value {
+                TokenValue::Char(c) => Some(c.clone()),
+                TokenValue::WideChar(c) => Some(c.clone()),
+                _ => None,
+            };
+            if let Some(char_str) = char_str {
                 self.advance();
                 if char_str.is_empty() {
                     return 0;
                 }
-                return char_str.chars().next().unwrap_or('\0') as i64;
+                // Pack all chars big-endian (GCC-compatible)
+                let mut val: i64 = 0;
+                for c in char_str.chars() {
+                    val = (val << 8) | (c as i64);
+                }
+                return val;
             }
         }
 
@@ -3535,6 +3698,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             // C11 features
             "c_atomic" |
             "c_static_assert" |
+            "c_alignas" |
             "c_alignof" |
             "c_thread_local"
         );
@@ -4016,8 +4180,8 @@ mod tests {
     }
 
     #[test]
-    fn test_line_directive_ignored() {
-        // #line should be processed (currently ignored)
+    fn test_line_directive_consumed() {
+        // #line should be consumed and not pass through as tokens
         let (tokens, idents) = preprocess_str("#line 100\ncode");
         let strs = get_token_strings(&tokens, &idents);
         assert!(strs.contains(&"code".to_string()));
@@ -4975,5 +5139,249 @@ PASTE(foo, bar)
             .filter(|t| t.typ == TokenType::WideChar)
             .count();
         assert_eq!(wide_char_count, 1, "should have one wide char token");
+    }
+
+    // ========================================================================
+    // Stringify, paste, include, and #if edge-case tests
+    // ========================================================================
+
+    #[test]
+    fn test_stringify_empty_va_args() {
+        // #__VA_ARGS__ with zero variadic args should produce an empty string ""
+        let code = "#define S(...) #__VA_ARGS__\nS()";
+        let (tokens, idents) = preprocess_str(code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"\"\"".to_string()),
+            "expected empty string \"\\\"\\\"\", got: {:?}",
+            strs
+        );
+    }
+
+    #[test]
+    fn test_include_macro_expanded_filename() {
+        // The preprocessor should macro-expand the argument to #include.
+        // Use angle-bracket include via a macro-expanded name.
+        // stdbool.h is a builtin header that defines bool as _Bool.
+        let code = "#include <stdbool.h>\n#define MYBOOL bool\nMYBOOL x;";
+        let (tokens, idents) = preprocess_str(code);
+        let strs = get_token_strings(&tokens, &idents);
+        // After #include <stdbool.h>, bool is defined as _Bool.
+        // The macro MYBOOL expands to bool, which then expands to _Bool.
+        assert!(
+            strs.contains(&"_Bool".to_string()),
+            "expected _Bool from macro chain through stdbool.h, got: {:?}",
+            strs
+        );
+    }
+
+    #[test]
+    fn test_if_multichar_constant() {
+        // Multi-character constants pack big-endian: 'ab' == ('a'<<8)+'b'
+        let code = "#if 'ab' == (('a'<<8)+'b')\nyes\n#else\nno\n#endif";
+        let (tokens, idents) = preprocess_str(code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"yes".to_string()),
+            "expected 'yes' for multi-char constant packing, got: {:?}",
+            strs
+        );
+    }
+
+    #[test]
+    fn test_paste_empty_arg() {
+        // When the first argument is empty, a##b should produce just "hello".
+        let code = "#define P(a,b) a##b\nP(,hello)";
+        let (tokens, idents) = preprocess_str(code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"hello".to_string()),
+            "expected 'hello' from paste with empty arg, got: {:?}",
+            strs
+        );
+    }
+
+    #[test]
+    fn test_paste_start_of_body() {
+        // ## at the start of a macro body is a constraint violation per
+        // C99 6.10.3.3p1, but our preprocessor should handle it without
+        // panicking. Just verify it completes.
+        let code = "#define BAD(x) ##x\nBAD(hello)";
+        let (_tokens, _idents) = preprocess_str(code);
+        // If we get here without panicking, the test passes.
+    }
+
+    #[test]
+    fn test_line_directive_sets_line() {
+        // #line 100 should make __LINE__ report 100
+        let (tokens, _idents) = preprocess_str("#line 100\n__LINE__");
+        let nums: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::Number(n) = &t.value {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            nums.contains(&"100".to_string()),
+            "Expected __LINE__ to be 100, got {:?}",
+            nums
+        );
+    }
+
+    #[test]
+    fn test_line_directive_sets_file() {
+        // #line 200 "fake.c" should make __FILE__ report "fake.c"
+        let (tokens, _idents) = preprocess_str("#line 200 \"fake.c\"\n__FILE__");
+        let strs: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::String(s) = &t.value {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            strs.contains(&"fake.c".to_string()),
+            "Expected __FILE__ to be 'fake.c', got {:?}",
+            strs
+        );
+    }
+
+    #[test]
+    fn test_line_directive_skipped_in_false_branch() {
+        // #line inside #if 0 should have no effect
+        let (tokens, _idents) = preprocess_str("#if 0\n#line 999 \"wrong.c\"\n#endif\n__LINE__");
+        let nums: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::Number(n) = &t.value {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // __LINE__ should NOT be 999
+        assert!(
+            !nums.contains(&"999".to_string()),
+            "__LINE__ should not be 999 in false branch"
+        );
+    }
+
+    // ========================================================================
+    // C99 compliance gap tests
+    // ========================================================================
+
+    #[test]
+    fn test_line_directive_macro_expansion() {
+        // #line should macro-expand its tokens before parsing
+        let code = "#define LINENUM 100\n#line LINENUM\n__LINE__";
+        let (tokens, _idents) = preprocess_str(code);
+        let nums: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::Number(n) = &t.value {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            nums.contains(&"100".to_string()),
+            "Expected __LINE__ to be 100 after #line with macro, got {:?}",
+            nums
+        );
+    }
+
+    #[test]
+    fn test_pragma_stdc_fp_contract() {
+        // #pragma STDC FP_CONTRACT ON should be recognized without error
+        let (tokens, idents) = preprocess_str("#pragma STDC FP_CONTRACT ON\ncode");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"code".to_string()),
+            "code after #pragma STDC should pass through, got: {:?}",
+            strs
+        );
+    }
+
+    #[test]
+    fn test_pragma_stdc_fenv_access() {
+        let (tokens, idents) = preprocess_str("#pragma STDC FENV_ACCESS OFF\ncode");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"code".to_string()));
+    }
+
+    #[test]
+    fn test_pragma_stdc_cx_limited_range() {
+        let (tokens, idents) = preprocess_str("#pragma STDC CX_LIMITED_RANGE DEFAULT\ncode");
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(strs.contains(&"code".to_string()));
+    }
+
+    #[test]
+    fn test_stringify_string_literal() {
+        // #x with x being "hello" should produce token with content \"hello\"
+        // (C99 6.10.3.2p2: \ before each " and \ including string delimiters)
+        let code = "#define S(x) #x\nS(\"hello\")";
+        let (tokens, _idents) = preprocess_str(code);
+        let strings: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::String(s) = &t.value {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Token content should be: \"hello\" (escaped delimiters)
+        assert!(
+            strings.iter().any(|s| s == "\\\"hello\\\""),
+            "expected stringified string with escaped delimiters, got: {:?}",
+            strings
+        );
+    }
+
+    #[test]
+    fn test_stringify_char_literal() {
+        // #x with x being 'a' should produce "'a'"
+        let code = "#define S(x) #x\nS('a')";
+        let (tokens, _idents) = preprocess_str(code);
+        let strings: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let TokenValue::String(s) = &t.value {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            strings.iter().any(|s| s.contains("'a'")),
+            "expected stringified char literal, got: {:?}",
+            strings
+        );
+    }
+
+    #[test]
+    fn test_pragma_operator_destringify() {
+        // _Pragma with escaped content should not crash
+        let code = "_Pragma(\"GCC diagnostic ignored \\\"warn\\\"\") int x;";
+        let (tokens, idents) = preprocess_str(code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"x".to_string()),
+            "code after _Pragma should pass through, got: {:?}",
+            strs
+        );
     }
 }

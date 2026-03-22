@@ -414,6 +414,14 @@ fn process_file(
     let mut module =
         ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug > 0);
 
+    // Check for errors during linearization (e.g., unsupported global initializers)
+    if diag::has_error() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compilation failed",
+        ));
+    }
+
     // Print compilation statistics if requested
     if args.stats {
         print_stats(path, &strings, &types, &symbols, &module);
@@ -573,39 +581,36 @@ fn preprocess_args() -> Vec<String> {
     let raw_args: Vec<String> = std::env::args().collect();
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
-    let mut seen_o = false;
+    let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
     let mut seen_fpic = false;
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
 
         if arg == "-O" {
-            // Deduplicate -O flags
-            if seen_o {
-                // Skip this duplicate, also skip the level arg if present
-                if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            seen_o = true;
             // Standalone -O: check if next arg is a valid optimization level
-            if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
-                // Next arg is a level like "1", "2", etc. - merge them
-                result.push(format!("-O{}", raw_args[i + 1]));
+            let new_flag = if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
+                let flag = format!("-O{}", raw_args[i + 1]);
                 i += 2;
-                continue;
+                flag
+            } else {
+                i += 1;
+                "-O1".to_string()
+            };
+            // Last -O flag wins (GCC convention)
+            if let Some(idx) = o_flag_idx {
+                result[idx] = new_flag;
+            } else {
+                o_flag_idx = Some(result.len());
+                result.push(new_flag);
             }
-            // Next arg is not a valid level (or no next arg) - use default -O1
-            result.push("-O1".to_string());
-            i += 1;
         } else if arg.starts_with("-O") && arg.len() > 2 {
-            // -O0, -O1, -O2, -O3, -Os, -Oz, -Ofast, -Og - pass through (first one only)
-            if !seen_o {
+            // -O0, -O1, -O2, -O3, -Os, -Oz, -Ofast, -Og — last one wins
+            if let Some(idx) = o_flag_idx {
+                result[idx] = arg.clone();
+            } else {
+                o_flag_idx = Some(result.len());
                 result.push(arg.clone());
-                seen_o = true;
             }
             i += 1;
         } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
@@ -1062,33 +1067,33 @@ mod tests {
 
         let mut result = Vec::with_capacity(raw_args.len());
         let mut i = 0;
-        let mut seen_o = false;
+        let mut o_flag_idx: Option<usize> = None;
         let mut seen_fpic = false;
 
         while i < raw_args.len() {
             let arg = &raw_args[i];
 
             if arg == "-O" {
-                if seen_o {
-                    if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                    continue;
-                }
-                seen_o = true;
-                if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
-                    result.push(format!("-O{}", raw_args[i + 1]));
+                let new_flag = if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
+                    let flag = format!("-O{}", raw_args[i + 1]);
                     i += 2;
-                    continue;
+                    flag
+                } else {
+                    i += 1;
+                    "-O1".to_string()
+                };
+                if let Some(idx) = o_flag_idx {
+                    result[idx] = new_flag;
+                } else {
+                    o_flag_idx = Some(result.len());
+                    result.push(new_flag);
                 }
-                result.push("-O1".to_string());
-                i += 1;
             } else if arg.starts_with("-O") && arg.len() > 2 {
-                if !seen_o {
+                if let Some(idx) = o_flag_idx {
+                    result[idx] = arg.clone();
+                } else {
+                    o_flag_idx = Some(result.len());
                     result.push(arg.clone());
-                    seen_o = true;
                 }
                 i += 1;
             } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
@@ -1357,6 +1362,23 @@ mod tests {
     fn test_preprocess_rdynamic() {
         let result = run_preprocess(&["-rdynamic", "foo.c"]);
         assert!(result.contains(&"--pcc-linker-flag=-rdynamic".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_last_o_flag_wins() {
+        // GCC convention: last -O flag wins
+        let result = run_preprocess(&["-O3", "-Wall", "-O0"]);
+        assert!(result.contains(&"-O0".to_string()));
+        assert!(!result.contains(&"-O3".to_string()));
+
+        let result = run_preprocess(&["-O0", "-O2"]);
+        assert!(result.contains(&"-O2".to_string()));
+        assert!(!result.contains(&"-O0".to_string()));
+
+        // Standalone -O followed by -O2
+        let result = run_preprocess(&["-O", "1", "-O2"]);
+        assert!(result.contains(&"-O2".to_string()));
+        assert!(!result.contains(&"-O1".to_string()));
     }
 
     #[test]

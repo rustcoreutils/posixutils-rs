@@ -1404,8 +1404,15 @@ impl Terminal {
             while !*NEED_QUIT.lock().unwrap() {
                 let result = getch();
                 match result {
-                    Ok(Some(new_input)) => sender.send(Ok(new_input)).unwrap(),
-                    Err(err) => sender.send(Err(err)).unwrap(),
+                    Ok(Some(new_input)) => {
+                        if sender.send(Ok(new_input)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = sender.send(Err(err));
+                        break;
+                    }
                     _ => {}
                 }
             }

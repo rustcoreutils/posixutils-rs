@@ -745,8 +745,14 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     /// Skip a block comment (/* ... */)
     fn skip_block_comment(&mut self) {
         let pos = self.pos(); // Save position for warning
-                              // Track both current and next character to properly detect */
-                              // This handles cases like /***/ or /**/
+                              // Save newline state before the comment and restore it after.
+                              // This matches sparse's drop_stream_comment() behavior:
+                              // a comment is transparent to newline tracking, so the token
+                              // after the comment inherits the newline flag from before it.
+                              // This prevents multi-line comments inside macros from breaking
+                              // the EOL boundary, while also preserving start-of-line status
+                              // for tokens that follow a comment at the beginning of a line.
+        let saved_newline = self.newline;
         let mut next = self.nextchar();
         loop {
             let curr = next;
@@ -760,11 +766,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 break;
             }
         }
-        // Reset newline flag - comments don't create new logical lines.
-        // This is important for multi-line comments inside macro definitions:
-        // the token after the comment should NOT have newline=true just because
-        // the comment spanned multiple lines.
-        self.newline = false;
+        self.newline = saved_newline;
     }
 
     /// Get a special token (operator/punctuator)
@@ -810,6 +812,79 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 // Different assemblers (e.g., GAS, Apple as) use ';' with different
                 // meanings (statement separator vs. comment). Comment handling is
                 // left to the assembler.
+            }
+        }
+
+        // C99 6.4.6 Digraphs: alternate token spellings
+        // Must be checked before two-char operator table
+        if first == b'<' {
+            let next = self.peekchar();
+            if next == b':' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'[' as u32),
+                ));
+            }
+            if next == b'%' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'{' as u32),
+                ));
+            }
+        }
+        if first == b':' {
+            let next = self.peekchar();
+            if next == b'>' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b']' as u32),
+                ));
+            }
+        }
+        if first == b'%' {
+            let next = self.peekchar();
+            if next == b'>' as i32 {
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'}' as u32),
+                ));
+            }
+            if next == b':' as i32 {
+                self.nextchar();
+                // Check for %:%: (digraph for ##)
+                let third = self.peekchar();
+                if third == b'%' as i32 {
+                    // Save position in case we need to back out
+                    let saved_offset = self.offset;
+                    let saved_col = self.col;
+                    self.nextchar(); // consume second %
+                    let fourth = self.peekchar();
+                    if fourth == b':' as i32 {
+                        self.nextchar(); // consume second :
+                        return Some(Token::with_value(
+                            TokenType::Special,
+                            pos,
+                            TokenValue::Special(SpecialToken::HashHash as u32),
+                        ));
+                    }
+                    // Not %:%: — back out the third char (%)
+                    self.offset = saved_offset;
+                    self.col = saved_col;
+                }
+                // Just %: → #
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(b'#' as u32),
+                ));
             }
         }
 
@@ -1984,5 +2059,50 @@ mod tests {
         let (tokens, strings) = tokenize_str("x");
         let text = tokens_to_text(&tokens, &strings);
         assert!(text.ends_with('\n'));
+    }
+
+    // ========================================================================
+    // C99 6.4.6 Digraph tests
+    // ========================================================================
+
+    #[test]
+    fn test_digraph_brackets() {
+        // <: and :> are digraphs for [ and ]
+        let (tokens, _) = tokenize_str("<:0:>");
+        // StreamBegin, [, 0, ], StreamEnd
+        assert_eq!(tokens.len(), 5);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'[' as u32));
+        assert!(matches!(&tokens[2].value, TokenValue::Number(n) if n == "0"));
+        assert!(matches!(&tokens[3].value, TokenValue::Special(c) if *c == b']' as u32));
+    }
+
+    #[test]
+    fn test_digraph_braces() {
+        // <% and %> are digraphs for { and }
+        let (tokens, _) = tokenize_str("<% %>");
+        // StreamBegin, {, }, StreamEnd
+        assert_eq!(tokens.len(), 4);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'{' as u32));
+        assert!(matches!(&tokens[2].value, TokenValue::Special(c) if *c == b'}' as u32));
+    }
+
+    #[test]
+    fn test_digraph_hash() {
+        // %: is digraph for #
+        let (tokens, _) = tokenize_str("%: define");
+        // StreamBegin, #, define, StreamEnd
+        assert_eq!(tokens.len(), 4);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'#' as u32));
+    }
+
+    #[test]
+    fn test_digraph_hashhash() {
+        // %:%: is digraph for ##
+        let (tokens, _) = tokenize_str("%:%:");
+        // StreamBegin, ##, StreamEnd
+        assert_eq!(tokens.len(), 3);
+        assert!(
+            matches!(&tokens[1].value, TokenValue::Special(c) if *c == SpecialToken::HashHash as u32)
+        );
     }
 }

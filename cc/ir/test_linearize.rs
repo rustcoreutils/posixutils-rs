@@ -538,12 +538,12 @@ fn test_switch_basic() {
 
     // Build switch body: { case 1: return 10; case 2: return 20; default: return 0; }
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Case(Expr::int(1, &ctx.types))),
-        BlockItem::Statement(Stmt::Return(Some(Expr::int(10, &ctx.types)))),
-        BlockItem::Statement(Stmt::Case(Expr::int(2, &ctx.types))),
-        BlockItem::Statement(Stmt::Return(Some(Expr::int(20, &ctx.types)))),
-        BlockItem::Statement(Stmt::Default),
-        BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
     ]);
 
     let switch_stmt = Stmt::Switch {
@@ -600,25 +600,25 @@ fn test_switch_with_break() {
     let x_sym = ctx.var("x", int_type);
 
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Case(Expr::int(1, &ctx.types))),
-        BlockItem::Statement(Stmt::Expr(Expr::typed_unpositioned(
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
                 target: Box::new(Expr::var_typed(x_sym, int_type)),
                 value: Box::new(Expr::int(10, &ctx.types)),
             },
             int_type,
-        ))),
-        BlockItem::Statement(Stmt::Break),
-        BlockItem::Statement(Stmt::Default),
-        BlockItem::Statement(Stmt::Expr(Expr::typed_unpositioned(
+        )))),
+        BlockItem::Statement(Box::new(Stmt::Break)),
+        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
                 target: Box::new(Expr::var_typed(x_sym, int_type)),
                 value: Box::new(Expr::int(0, &ctx.types)),
             },
             int_type,
-        ))),
+        )))),
     ]);
 
     let switch_stmt = Stmt::Switch {
@@ -771,8 +771,8 @@ fn test_do_while_with_break() {
         else_stmt: None,
     };
     let body = Stmt::Block(vec![
-        BlockItem::Statement(assign),
-        BlockItem::Statement(if_break),
+        BlockItem::Statement(Box::new(assign)),
+        BlockItem::Statement(Box::new(if_break)),
     ]);
 
     let do_while = Stmt::DoWhile {
@@ -837,16 +837,16 @@ fn test_goto_forward() {
 
     // Block: { goto end; x = 1; end: x = 2; return x; }
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Goto(end_id)),
-        BlockItem::Statement(Stmt::Expr(Expr::typed_unpositioned(
+        BlockItem::Statement(Box::new(Stmt::Goto(end_id))),
+        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
                 target: Box::new(Expr::var_typed(x_sym, int_type)),
                 value: Box::new(Expr::int(1, &ctx.types)),
             },
             int_type,
-        ))),
-        BlockItem::Statement(Stmt::Label {
+        )))),
+        BlockItem::Statement(Box::new(Stmt::Label {
             name: end_id,
             stmt: Box::new(Stmt::Expr(Expr::typed_unpositioned(
                 ExprKind::Assign {
@@ -856,8 +856,10 @@ fn test_goto_forward() {
                 },
                 int_type,
             ))),
-        }),
-        BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            x_sym, int_type,
+        ))))),
     ]);
 
     let func = FunctionDef {
@@ -927,12 +929,14 @@ fn test_goto_backward() {
     };
 
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Stmt::Label {
+        BlockItem::Statement(Box::new(Stmt::Label {
             name: loop_id,
             stmt: Box::new(increment),
-        }),
-        BlockItem::Statement(if_goto),
-        BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+        })),
+        BlockItem::Statement(Box::new(if_goto)),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            x_sym, int_type,
+        ))))),
     ]);
 
     let func = FunctionDef {
@@ -1001,9 +1005,9 @@ fn test_nested_loop_break() {
 
     // Outer loop body: { inner_loop; x = 1; break; }
     let outer_body = Stmt::Block(vec![
-        BlockItem::Statement(inner_loop),
-        BlockItem::Statement(assign),
-        BlockItem::Statement(Stmt::Break),
+        BlockItem::Statement(Box::new(inner_loop)),
+        BlockItem::Statement(Box::new(assign)),
+        BlockItem::Statement(Box::new(Stmt::Break)),
     ]);
 
     let outer_loop = Stmt::While {
@@ -1078,8 +1082,8 @@ fn test_nested_loop_continue() {
 
     // Outer loop body: { inner_loop; x = 1; }
     let outer_body = Stmt::Block(vec![
-        BlockItem::Statement(inner_loop),
-        BlockItem::Statement(assign),
+        BlockItem::Statement(Box::new(inner_loop)),
+        BlockItem::Statement(Box::new(assign)),
     ]);
 
     let outer_loop = Stmt::While {
@@ -2022,7 +2026,9 @@ fn test_local_var_emits_load_store() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+                x_sym, int_type,
+            ))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2081,7 +2087,7 @@ fn test_ssa_converts_local_to_phi() {
                 }],
             }),
             // if (cond) x = 2;
-            BlockItem::Statement(Stmt::If {
+            BlockItem::Statement(Box::new(Stmt::If {
                 cond: Expr::var_typed(cond_sym, int_type),
                 then_stmt: Box::new(Stmt::Expr(Expr::assign(
                     Expr::var_typed(x_sym, int_type),
@@ -2089,9 +2095,11 @@ fn test_ssa_converts_local_to_phi() {
                     &ctx.types,
                 ))),
                 else_stmt: None,
-            }),
+            })),
             // return x;
-            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+                x_sym, int_type,
+            ))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2145,16 +2153,16 @@ fn test_ssa_loop_variable() {
                 }],
             }),
             // while (i < 10) { i = i + 1; }
-            BlockItem::Statement(Stmt::While {
+            BlockItem::Statement(Box::new(Stmt::While {
                 cond: Expr::binary(BinaryOp::Lt, i_var(), Expr::int(10, &ctx.types), &ctx.types),
                 body: Box::new(Stmt::Expr(Expr::assign(
                     i_var(),
                     Expr::binary(BinaryOp::Add, i_var(), Expr::int(1, &ctx.types), &ctx.types),
                     &ctx.types,
                 ))),
-            }),
+            })),
             // return i;
-            BlockItem::Statement(Stmt::Return(Some(i_var()))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(i_var())))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2622,7 +2630,7 @@ fn test_string_literal_char_array_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2673,7 +2681,7 @@ fn test_string_literal_char_pointer_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2881,10 +2889,8 @@ fn test_static_local_pre_increment() {
     let test_id = ctx.str("test");
 
     // Create static int type
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     // Create declaration: static int counter = 0;
@@ -2892,7 +2898,7 @@ fn test_static_local_pre_increment() {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -2915,7 +2921,7 @@ fn test_static_local_pre_increment() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(inc_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(inc_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -2959,17 +2965,15 @@ fn test_static_local_pre_decrement() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -2990,7 +2994,7 @@ fn test_static_local_pre_decrement() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(dec_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(dec_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3029,17 +3033,15 @@ fn test_static_local_post_increment() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3058,7 +3060,7 @@ fn test_static_local_post_increment() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(inc_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(inc_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3097,17 +3099,15 @@ fn test_static_local_post_decrement() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let counter_sym = ctx.var("counter", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: counter_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(10, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3126,7 +3126,7 @@ fn test_static_local_post_decrement() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(dec_expr))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(dec_expr)))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3165,17 +3165,15 @@ fn test_static_local_compound_assignment() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let sum_sym = ctx.var("sum", static_int_type);
 
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             symbol: sum_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3198,11 +3196,11 @@ fn test_static_local_compound_assignment() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Expr(compound_assign)),
-            BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(
+            BlockItem::Statement(Box::new(Stmt::Expr(compound_assign))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
                 sum_sym,
                 static_int_type,
-            )))),
+            ))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -3439,21 +3437,14 @@ fn test_static_local_address_in_initializer() {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
 
-    let static_int_type = ctx.types.intern(Type::with_modifiers(
-        crate::types::TypeKind::Int,
-        TypeModifiers::STATIC,
-    ));
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
+    let static_int_type = ctx.types.int_id;
     let x_sym = ctx.var("x", static_int_type);
 
     let static_int_ptr_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Pointer,
-        modifiers: TypeModifiers::STATIC,
         base: Some(ctx.types.int_id),
-        array_size: None,
-        params: None,
-        variadic: false,
-        noreturn: false,
-        composite: None,
+        ..Default::default()
     });
     let p_sym = ctx.var("p", static_int_ptr_type);
 
@@ -3462,7 +3453,7 @@ fn test_static_local_address_in_initializer() {
         declarators: vec![InitDeclarator {
             symbol: x_sym,
             typ: static_int_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(Expr::int(0, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3482,7 +3473,7 @@ fn test_static_local_address_in_initializer() {
         declarators: vec![InitDeclarator {
             symbol: p_sym,
             typ: static_int_ptr_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(addr_of_x),
             vla_sizes: vec![],
             explicit_align: None,
@@ -3497,7 +3488,7 @@ fn test_static_local_address_in_initializer() {
         body: Stmt::Block(vec![
             BlockItem::Declaration(x_decl),
             BlockItem::Declaration(p_decl),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4237,7 +4228,7 @@ fn test_mixed_designated_positional_struct_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4333,7 +4324,7 @@ fn test_mixed_designated_positional_array_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4481,7 +4472,7 @@ fn test_designator_chain_nested_struct_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4555,7 +4546,7 @@ fn test_designator_chain_array_member_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4617,7 +4608,7 @@ fn test_repeated_designator_last_wins_array() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4716,7 +4707,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -4799,7 +4790,7 @@ fn test_union_first_named_member_positional_init() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5056,10 +5047,9 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         },
     ];
 
-    // Create a static struct type (type must have STATIC modifier for static locals)
+    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::STATIC,
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5068,11 +5058,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             align: 1,
             is_complete: true,
         })),
-        base: None,
-        array_size: None,
-        params: None,
-        noreturn: false,
-        variadic: false,
+        ..Default::default()
     });
 
     let s_sym = ctx.var("s", struct_type);
@@ -5107,7 +5093,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         declarators: vec![InitDeclarator {
             symbol: s_sym,
             typ: struct_type,
-            storage_class: crate::types::TypeModifiers::empty(),
+            storage_class: TypeModifiers::STATIC,
             init: Some(init_list),
             vla_sizes: vec![],
             explicit_align: None,
@@ -5120,7 +5106,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         params: vec![],
         body: Stmt::Block(vec![
             BlockItem::Declaration(decl),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5254,7 +5240,7 @@ fn test_bitfield_designated_init_local_var() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5341,7 +5327,6 @@ fn test_large_struct_copy_from_array() {
 
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::empty(),
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5350,11 +5335,7 @@ fn test_large_struct_copy_from_array() {
             align: 8,
             is_complete: true,
         })),
-        base: None,
-        array_size: None,
-        params: None,
-        noreturn: false,
-        variadic: false,
+        ..Default::default()
     });
 
     // Create array type: struct pair[2]
@@ -5391,7 +5372,7 @@ fn test_large_struct_copy_from_array() {
                     explicit_align: None,
                 }],
             }),
-            BlockItem::Statement(Stmt::Return(None)),
+            BlockItem::Statement(Box::new(Stmt::Return(None))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5481,7 +5462,6 @@ fn test_compound_literal_zero_init_lvalue() {
 
     let struct_type = ctx.types.intern(Type {
         kind: crate::types::TypeKind::Struct,
-        modifiers: TypeModifiers::empty(),
         composite: Some(Box::new(CompositeType {
             tag: None,
             members,
@@ -5490,11 +5470,7 @@ fn test_compound_literal_zero_init_lvalue() {
             align: 8,
             is_complete: true,
         })),
-        base: None,
-        array_size: None,
-        params: None,
-        noreturn: false,
-        variadic: false,
+        ..Default::default()
     });
 
     let struct_ptr_type = ctx.types.pointer_to(struct_type);
@@ -5549,8 +5525,8 @@ fn test_compound_literal_zero_init_lvalue() {
             typ: struct_ptr_type,
         }],
         body: Stmt::Block(vec![
-            BlockItem::Statement(Stmt::Expr(assign)),
-            BlockItem::Statement(Stmt::Return(None)),
+            BlockItem::Statement(Box::new(Stmt::Expr(assign))),
+            BlockItem::Statement(Box::new(Stmt::Return(None))),
         ]),
         pos: test_pos(),
         is_static: false,
@@ -5669,7 +5645,9 @@ fn test_conditional_short_circuit_arrow() {
             symbol: Some(entry_sym),
             typ: struct_ptr_type,
         }],
-        body: Stmt::Block(vec![BlockItem::Statement(Stmt::Return(Some(conditional)))]),
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Return(Some(
+            conditional,
+        ))))]),
         pos: test_pos(),
         is_static: false,
         is_inline: false,
@@ -5706,4 +5684,25 @@ fn test_conditional_short_circuit_arrow() {
         "Should NOT use select instruction with pointer dereference (causes UB): {}",
         ir
     );
+}
+
+// ========================================================================
+// Phase 1: Foundation Helper Tests
+// ========================================================================
+
+#[test]
+fn test_bitfield_storage_type() {
+    let strings = StringTable::new();
+    let types = TypeTable::new(&Target::host());
+    let symbols = SymbolTable::new();
+    let target = Target::host();
+    let linearizer = Linearizer::new(&symbols, &types, &strings, &target);
+
+    assert_eq!(linearizer.bitfield_storage_type(1), types.uchar_id);
+    assert_eq!(linearizer.bitfield_storage_type(2), types.ushort_id);
+    assert_eq!(linearizer.bitfield_storage_type(4), types.uint_id);
+    assert_eq!(linearizer.bitfield_storage_type(8), types.ulong_id);
+    // Fallback for unexpected sizes
+    assert_eq!(linearizer.bitfield_storage_type(3), types.uint_id);
+    assert_eq!(linearizer.bitfield_storage_type(16), types.uint_id);
 }

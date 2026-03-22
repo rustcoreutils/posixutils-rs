@@ -36,7 +36,7 @@ fn get_pseudo(func: &Function, id: PseudoId) -> Option<&Pseudo> {
 
 /// Get the constant integer value of a pseudo, if it is a constant.
 #[cfg(test)]
-fn get_const_val(func: &Function, id: PseudoId) -> Option<i64> {
+fn get_const_val(func: &Function, id: PseudoId) -> Option<i128> {
     get_pseudo(func, id).and_then(|p| match &p.kind {
         PseudoKind::Val(v) => Some(*v),
         _ => None,

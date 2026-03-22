@@ -16,7 +16,7 @@
 //
 
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const DEFAULT_USE_CAPACITY: usize = 4;
 const DEFAULT_LIVE_CAPACITY: usize = 64;
@@ -62,15 +62,10 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
     // Source operands
     uses.extend(insn.src.iter().copied());
 
-    // Phi sources
-    for (_, pseudo) in &insn.phi_list {
-        uses.push(*pseudo);
-    }
-
-    // Switch value (stored in target for switch)
-    if insn.op == Opcode::Switch {
-        if let Some(target) = insn.target {
-            uses.push(target);
+    // Phi sources (PhiSource.phi_list is a back-pointer, not an operand)
+    if insn.op != Opcode::PhiSource {
+        for (_, pseudo) in &insn.phi_list {
+            uses.push(*pseudo);
         }
     }
 
@@ -89,16 +84,13 @@ fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
     uses
 }
 
-/// Find all instructions that define a pseudo.
-/// Returns vec of (block_index, instruction_index) for each definition.
-/// After inlining, a pseudo may have multiple definitions from different branches
-/// (e.g., the return target is written to from multiple return paths).
-fn find_all_defs(func: &Function, id: PseudoId) -> Vec<(usize, usize)> {
-    let mut defs = Vec::new();
+/// Build a map from each pseudo to the instructions that define it.
+fn build_def_map(func: &Function) -> HashMap<PseudoId, Vec<(usize, usize)>> {
+    let mut defs: HashMap<PseudoId, Vec<(usize, usize)>> = HashMap::new();
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            if insn.target == Some(id) {
-                defs.push((bb_idx, insn_idx));
+            if let Some(target) = insn.target {
+                defs.entry(target).or_default().push((bb_idx, insn_idx));
             }
         }
     }
@@ -107,6 +99,7 @@ fn find_all_defs(func: &Function, id: PseudoId) -> Vec<(usize, usize)> {
 
 /// Eliminate dead code using mark-sweep algorithm.
 fn eliminate_dead_code(func: &mut Function) -> bool {
+    let def_map = build_def_map(func);
     let mut live: HashSet<PseudoId> = HashSet::with_capacity(DEFAULT_LIVE_CAPACITY);
     let mut worklist: VecDeque<PseudoId> = VecDeque::with_capacity(DEFAULT_LIVE_CAPACITY);
 
@@ -126,15 +119,16 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
 
     // Phase 2: Propagate liveness transitively
     while let Some(id) = worklist.pop_front() {
-        // Find all instructions that define this pseudo
-        // (there may be multiple after inlining, e.g., return target written from multiple paths)
-        for (bb_idx, insn_idx) in find_all_defs(func, id) {
-            let insn = &func.blocks[bb_idx].insns[insn_idx];
+        // Look up all instructions that define this pseudo (O(1) via def_map)
+        if let Some(def_sites) = def_map.get(&id) {
+            for &(bb_idx, insn_idx) in def_sites {
+                let insn = &func.blocks[bb_idx].insns[insn_idx];
 
-            // Mark all operands of the defining instruction as live
-            for use_id in get_uses(insn) {
-                if live.insert(use_id) {
-                    worklist.push_back(use_id);
+                // Mark all operands of the defining instruction as live
+                for use_id in get_uses(insn) {
+                    if live.insert(use_id) {
+                        worklist.push_back(use_id);
+                    }
                 }
             }
         }
@@ -157,11 +151,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
             // If this instruction has a target that's not live, it's dead
             if let Some(target) = insn.target {
                 if !live.contains(&target) {
-                    // Convert to Nop
-                    insn.op = Opcode::Nop;
-                    insn.src.clear();
-                    insn.target = None;
-                    insn.phi_list.clear();
+                    insn.kill();
                     changed = true;
                 }
             }
@@ -291,6 +281,7 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
 
     // Remove unreachable blocks
     func.blocks.retain(|bb| reachable.contains(&bb.id));
+    func.rebuild_block_idx();
 
     // Update parent/child references and phi nodes to remove dead blocks
     for bb in &mut func.blocks {
@@ -512,6 +503,97 @@ mod tests {
         assert!(!changed); // Store is a root, not dead
 
         assert_eq!(func.blocks[0].insns[1].op, Opcode::Store);
+    }
+
+    #[test]
+    fn test_dead_phi_and_phisource_eliminated() {
+        // Build a 2-block CFG: entry → merge
+        // merge has a dead Phi (result unused), entry has a PhiSource feeding it.
+        // DCE should nop both.
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.int_id);
+
+        // Pseudos:
+        //   %0 = val(10)         -- source value for phi
+        //   %1 = phisource target (written by PhiSource in entry)
+        //   %2 = phi target (written by Phi in merge) -- DEAD (unused)
+        func.add_pseudo(Pseudo::val(PseudoId(0), 10));
+        func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        func.add_pseudo(Pseudo::phi(PseudoId(2), 0));
+
+        // Entry block (bb0): Entry, PhiSource, Br → bb1
+        let mut bb0 = BasicBlock::new(BasicBlockId(0));
+        bb0.children = vec![BasicBlockId(1)];
+        bb0.add_insn(Instruction::new(Opcode::Entry));
+
+        // PhiSource: %1 = phisrc %0, back-pointer → (bb1, %2)
+        let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        phisrc.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
+        bb0.add_insn(phisrc);
+
+        bb0.add_insn(Instruction::br(BasicBlockId(1)));
+        func.add_block(bb0);
+
+        // Merge block (bb1): Phi, Ret (no value — phi is dead)
+        let mut bb1 = BasicBlock::new(BasicBlockId(1));
+        bb1.parents = vec![BasicBlockId(0)];
+
+        // Phi: %2 = phi [bb0: %1]
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        phi.phi_list = vec![(BasicBlockId(0), PseudoId(1))];
+        bb1.add_insn(phi);
+
+        bb1.add_insn(Instruction::ret(None));
+        func.add_block(bb1);
+        func.entry = BasicBlockId(0);
+
+        // Before DCE: PhiSource and Phi are present
+        assert_eq!(func.blocks[0].insns[1].op, Opcode::PhiSource);
+        assert_eq!(func.blocks[1].insns[0].op, Opcode::Phi);
+
+        let changed = run(&mut func);
+        assert!(changed);
+
+        // After DCE: both should be nop'd (dead — phi result %2 is unused)
+        assert_eq!(func.blocks[0].insns[1].op, Opcode::Nop);
+        assert_eq!(func.blocks[1].insns[0].op, Opcode::Nop);
+    }
+
+    #[test]
+    fn test_phisource_backpointer_not_false_use() {
+        // Verify the DCE fix: PhiSource.phi_list is a back-pointer, not an operand.
+        // The phi_list pseudo should NOT keep a defining instruction live.
+        let types = TypeTable::new(&Target::host());
+
+        // Build a PhiSource with back-pointer to (bb1, %2)
+        let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        phisrc.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
+
+        let uses = get_uses(&phisrc);
+
+        // Should contain src (%0) but NOT the back-pointer pseudo (%2)
+        assert!(uses.contains(&PseudoId(0)), "src should be a use");
+        assert!(
+            !uses.contains(&PseudoId(2)),
+            "phi_list back-pointer should NOT be a use for PhiSource"
+        );
+    }
+
+    #[test]
+    fn test_phi_list_is_use_for_phi() {
+        // Verify that Phi instructions still report phi_list pseudos as uses
+        let types = TypeTable::new(&Target::host());
+
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        phi.phi_list = vec![(BasicBlockId(0), PseudoId(1))];
+
+        let uses = get_uses(&phi);
+
+        // Phi should report %1 as a use
+        assert!(
+            uses.contains(&PseudoId(1)),
+            "phi_list pseudo should be a use for Phi"
+        );
     }
 
     #[test]

@@ -311,7 +311,7 @@ impl X86_64CodeGen {
 
         // Move to final destination if needed
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 32);
+            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
         }
     }
 
@@ -595,7 +595,7 @@ impl X86_64CodeGen {
                 };
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(*val),
+                    src: GpOperand::Imm(*val as i64),
                     dst: GpOperand::Mem(temp_addr.clone()),
                 });
                 temp_addr

@@ -10,7 +10,7 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
+use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
@@ -319,6 +319,29 @@ impl X86_64CodeGen {
             _ => {}
         };
 
+        // Check if src2 is in dst_xmm — if so, moving src1 to dst_xmm would
+        // clobber src2. Save src2 to a scratch register first.
+        let src2_loc = self.get_location(src2);
+        let src2_saved = if let Loc::Xmm(x) = src2_loc {
+            if x == dst_xmm {
+                let scratch = if dst_xmm == XmmReg::Xmm15 {
+                    XmmReg::Xmm14
+                } else {
+                    XmmReg::Xmm15
+                };
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(x),
+                    dst: XmmOperand::Reg(scratch),
+                });
+                Some(scratch)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Move first operand to destination XMM register
         self.emit_fp_move(
             src1,
@@ -327,8 +350,10 @@ impl X86_64CodeGen {
         );
 
         // Apply operation with second operand
-        let src2_loc = self.get_location(src2);
         match src2_loc {
+            Loc::Xmm(_) if src2_saved.is_some() => {
+                emit_fp_binop_lir(self, XmmOperand::Reg(src2_saved.unwrap()), dst_xmm);
+            }
             Loc::Xmm(x) => {
                 emit_fp_binop_lir(self, XmmOperand::Reg(x), dst_xmm);
             }
@@ -419,16 +444,18 @@ impl X86_64CodeGen {
         } else {
             XmmReg::Xmm15
         };
+        // Use R10 (scratch) to avoid clobbering RAX which may hold
+        // a live pseudo (the register allocator allocates RAX to pseudos
+        // but doesn't know FP operations use it as scratch).
         if fp_size == FpSize::Single {
-            // Create sign mask in scratch register: all zeros except sign bit
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
                 src: GpOperand::Imm(0x80000000),
-                dst: GpOperand::Reg(Reg::Rax),
+                dst: GpOperand::Reg(Reg::R10),
             });
             self.push_lir(X86Inst::MovGpXmm {
                 size: OperandSize::B32,
-                src: Reg::Rax,
+                src: Reg::R10,
                 dst: scratch_xmm,
             });
             self.push_lir(X86Inst::XorFp {
@@ -439,11 +466,11 @@ impl X86_64CodeGen {
         } else {
             self.push_lir(X86Inst::MovAbs {
                 imm: 0x8000000000000000u64 as i64,
-                dst: Reg::Rax,
+                dst: Reg::R10,
             });
             self.push_lir(X86Inst::MovGpXmm {
                 size: OperandSize::B64,
-                src: Reg::Rax,
+                src: Reg::R10,
                 dst: scratch_xmm,
             });
             self.push_lir(X86Inst::XorFp {
@@ -474,21 +501,31 @@ impl X86_64CodeGen {
         };
         // Use type-aware FP size determination
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let move_size = Self::size_from_type(insn.typ, insn.size, types);
+
+        // Check if src2 is in Xmm0 before we clobber it with src1.
+        // If so, move src2 to Xmm15 first to avoid losing its value.
+        let src2_loc = self.get_location(src2);
+        if matches!(src2_loc, Loc::Xmm(XmmReg::Xmm0)) {
+            self.push_lir(X86Inst::MovFp {
+                size: fp_size,
+                src: XmmOperand::Reg(XmmReg::Xmm0),
+                dst: XmmOperand::Reg(XmmReg::Xmm15),
+            });
+        }
 
         // Load first operand to XMM0
-        self.emit_fp_move(
-            src1,
-            XmmReg::Xmm0,
-            Self::size_from_type(insn.typ, insn.size, types),
-        );
+        self.emit_fp_move(src1, XmmReg::Xmm0, move_size);
 
         // Compare with second operand using ucomiss/ucomisd
+        // Re-read src2 location; if it was Xmm0, it's now in Xmm15.
         let src2_loc = self.get_location(src2);
         match src2_loc {
             Loc::Xmm(x) => {
+                let actual_reg = if x == XmmReg::Xmm0 { XmmReg::Xmm15 } else { x };
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
-                    src: XmmOperand::Reg(x),
+                    src: XmmOperand::Reg(actual_reg),
                     dst: XmmReg::Xmm0,
                 });
             }
@@ -504,11 +541,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, _) => {
-                self.emit_fp_imm_to_xmm(
-                    v,
-                    XmmReg::Xmm15,
-                    Self::size_from_type(insn.typ, insn.size, types),
-                );
+                self.emit_fp_imm_to_xmm(v, XmmReg::Xmm15, move_size);
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -516,11 +549,7 @@ impl X86_64CodeGen {
                 });
             }
             _ => {
-                self.emit_fp_move(
-                    src2,
-                    XmmReg::Xmm15,
-                    Self::size_from_type(insn.typ, insn.size, types),
-                );
+                self.emit_fp_move(src2, XmmReg::Xmm15, move_size);
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -529,27 +558,78 @@ impl X86_64CodeGen {
             }
         }
 
-        // Set result based on comparison type
+        // Set result based on comparison type.
+        // IEEE 754: ucomisd sets PF=1 for unordered (NaN). Ordered comparisons
+        // must check PF to return false when either operand is NaN.
+        // - seta/setae already exclude NaN (CF=1 for NaN → seta/setae = 0)
+        // - sete/setb/setbe incorrectly return true for NaN (ZF=1 or CF=1)
+        // - setne incorrectly returns false for NaN (ZF=1)
         let dst_loc = self.get_location(target);
-        // Use R10 as scratch to avoid clobbering live values in Rax
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
             _ => Reg::R10,
         };
 
-        // Use appropriate setcc instruction
-        // Note: FP comparisons set flags differently - need to handle unordered (NaN) cases
-        let cc = match insn.op {
-            Opcode::FCmpOEq => CondCode::Eq,  // Equal (ZF=1, PF=0)
-            Opcode::FCmpONe => CondCode::Ne,  // Not equal
-            Opcode::FCmpOLt => CondCode::Ult, // Below (CF=1) - for ordered less than
-            Opcode::FCmpOLe => CondCode::Ule, // Below or equal
-            Opcode::FCmpOGt => CondCode::Ugt, // Above (CF=0, ZF=0)
-            Opcode::FCmpOGe => CondCode::Uge, // Above or equal
-            _ => return,
+        // IEEE 754: ucomisd sets PF=1 for NaN. Ordered comparisons must
+        // exclude NaN by checking PF. seta/setae are already NaN-safe
+        // (CF=1 for NaN makes them return 0). sete/setb/setbe/setne need
+        // a parity check to handle NaN correctly.
+        let scratch = if dst_reg == Reg::R11 {
+            Reg::R10
+        } else {
+            Reg::R11
         };
+        match insn.op {
+            Opcode::FCmpOEq | Opcode::FCmpOLt | Opcode::FCmpOLe => {
+                // result = setcc(dst) AND setnp(scratch)
+                let cc = match insn.op {
+                    Opcode::FCmpOEq => CondCode::Eq,
+                    Opcode::FCmpOLt => CondCode::Ult,
+                    Opcode::FCmpOLe => CondCode::Ule,
+                    _ => unreachable!(),
+                };
+                self.push_lir(X86Inst::SetCC { cc, dst: dst_reg });
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Np,
+                    dst: scratch,
+                });
+                self.push_lir(X86Inst::And {
+                    size: OperandSize::B8,
+                    src: GpOperand::Reg(scratch),
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpONe => {
+                // result = setne(dst) OR setp(scratch)
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Ne,
+                    dst: dst_reg,
+                });
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::P,
+                    dst: scratch,
+                });
+                self.push_lir(X86Inst::Or {
+                    size: OperandSize::B8,
+                    src: GpOperand::Reg(scratch),
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpOGt => {
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Ugt,
+                    dst: dst_reg,
+                });
+            }
+            Opcode::FCmpOGe => {
+                self.push_lir(X86Inst::SetCC {
+                    cc: CondCode::Uge,
+                    dst: dst_reg,
+                });
+            }
+            _ => return,
+        }
 
-        self.push_lir(X86Inst::SetCC { cc, dst: dst_reg });
         self.push_lir(X86Inst::Movzx {
             src_size: OperandSize::B8,
             dst_size: OperandSize::B32,
@@ -558,7 +638,7 @@ impl X86_64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 32);
+            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
         }
     }
 
@@ -585,19 +665,110 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm0,
         };
 
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
+        let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == 64;
+
         // Move integer to R10 first (scratch register)
         self.emit_move(src, Reg::R10, src_size);
 
-        // Convert using cvtsi2ss/cvtsi2sd
-        // Use type-aware FP size for destination
-        let int_size = OperandSize::from_bits(src_size);
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
-        self.push_lir(X86Inst::CvtIntToFp {
-            int_size,
-            fp_size,
-            src: GpOperand::Reg(Reg::R10),
-            dst: dst_xmm,
-        });
+        if is_unsigned_64 {
+            // Unsigned 64-bit to float/double: cvtsi2sd treats input as signed,
+            // so values >= 2^63 produce wrong results. Use split conversion:
+            //   test r10, r10
+            //   js .unsigned_path
+            //   cvtsi2sd r10, xmm_dst    ; signed path (value < 2^63)
+            //   jmp .done
+            // .unsigned_path:
+            //   mov r10, r11
+            //   shr 1, r11               ; val/2
+            //   and 1, r10               ; save low bit
+            //   or r10, r11              ; (val/2) | (val&1) to avoid rounding loss
+            //   cvtsi2sd r11, xmm_dst    ; convert half-value (positive)
+            //   addsd xmm_dst, xmm_dst   ; multiply by 2
+            // .done:
+            let uid = self.unique_label_counter;
+            self.unique_label_counter += 1;
+            // Use high block_id values (10000+) to avoid colliding with basic block IDs
+            let unsigned_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+
+            // test r10, r10 — check sign bit
+            self.push_lir(X86Inst::Test {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            // js .unsigned_path (SF=1 after test means bit 63 set)
+            self.push_lir(X86Inst::Jcc {
+                cc: CondCode::Slt,
+                target: unsigned_label.clone(),
+            });
+            // Signed path: value < 2^63, cvtsi2sd works directly
+            self.push_lir(X86Inst::CvtIntToFp {
+                int_size: OperandSize::B64,
+                fp_size,
+                src: GpOperand::Reg(Reg::R10),
+                dst: dst_xmm,
+            });
+            self.push_lir(X86Inst::Jmp {
+                target: done_label.clone(),
+            });
+            // Unsigned path: value >= 2^63
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(unsigned_label)));
+            // mov r10, r11
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Reg(Reg::R11),
+            });
+            // shr $1, r11
+            self.push_lir(X86Inst::Shr {
+                size: OperandSize::B64,
+                count: ShiftCount::Imm(1),
+                dst: Reg::R11,
+            });
+            // and $1, r10
+            self.push_lir(X86Inst::And {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(1),
+                dst: Reg::R10,
+            });
+            // or r10, r11
+            self.push_lir(X86Inst::Or {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R10),
+                dst: Reg::R11,
+            });
+            // cvtsi2sd r11, xmm_dst
+            self.push_lir(X86Inst::CvtIntToFp {
+                int_size: OperandSize::B64,
+                fp_size,
+                src: GpOperand::Reg(Reg::R11),
+                dst: dst_xmm,
+            });
+            // addsd xmm_dst, xmm_dst (double the value)
+            // addsd/addss xmm_dst, xmm_dst (double the value)
+            self.push_lir(X86Inst::AddFp {
+                size: fp_size,
+                src: XmmOperand::Reg(dst_xmm),
+                dst: dst_xmm,
+            });
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        } else {
+            // Signed conversion, or unsigned 32-bit (zero-extended to 64-bit fits signed)
+            let int_size = if insn.op == Opcode::UCvtF && src_size == 32 {
+                // Zero-extend 32-bit unsigned to 64-bit signed for correct conversion
+                OperandSize::B64
+            } else {
+                OperandSize::from_bits(src_size)
+            };
+            self.push_lir(X86Inst::CvtIntToFp {
+                int_size,
+                fp_size,
+                src: GpOperand::Reg(Reg::R10),
+                dst: dst_xmm,
+            });
+        }
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
             self.emit_fp_move_from_xmm(
@@ -636,8 +807,17 @@ impl X86_64CodeGen {
             _ => Reg::R10, // Use scratch register R10
         };
 
-        // Convert using cvttss2si/cvttsd2si (truncate toward zero)
-        let int_size = OperandSize::from_bits(dst_size);
+        // Convert using cvttss2si/cvttsd2si (truncate toward zero).
+        // For unsigned 32-bit targets, use 64-bit conversion to avoid
+        // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
+        let is_unsigned = types
+            .modifiers(dst_typ)
+            .contains(crate::types::TypeModifiers::UNSIGNED);
+        let int_size = if is_unsigned && dst_size == 32 {
+            OperandSize::B64 // cvttsd2siq then truncate
+        } else {
+            OperandSize::from_bits(dst_size)
+        };
         self.push_lir(X86Inst::CvtFpToInt {
             fp_size,
             int_size,
@@ -836,26 +1016,28 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                // Integer immediate to float
+                let v = v as i64;
+                // Integer immediate to float — use R10 (scratch) to avoid clobbering
+                // RAX which is allocatable and may hold a live pseudo
                 if size <= 32 {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(v),
-                        dst: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(Reg::R10),
                     });
                     self.push_lir(X86Inst::MovGpXmm {
                         size: OperandSize::B32,
-                        src: Reg::Rax,
+                        src: Reg::R10,
                         dst,
                     });
                 } else {
                     self.push_lir(X86Inst::MovAbs {
                         imm: v,
-                        dst: Reg::Rax,
+                        dst: Reg::R10,
                     });
                     self.push_lir(X86Inst::MovGpXmm {
                         size: OperandSize::B64,
-                        src: Reg::Rax,
+                        src: Reg::R10,
                         dst,
                     });
                 }

@@ -42,8 +42,14 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
         ("__SIZEOF_LONG_LONG__", Some("8")),
         ("__SIZEOF_FLOAT__", Some("4")),
         ("__SIZEOF_DOUBLE__", Some("8")),
-        ("__CHAR_UNSIGNED__", char_unsigned),
     ];
+
+    // __CHAR_UNSIGNED__: only define when char is unsigned.
+    // An empty-body #define still satisfies #ifdef, so we must
+    // not add the macro at all when char is signed.
+    if let Some(val) = char_unsigned {
+        macros.push(("__CHAR_UNSIGNED__", Some(val)));
+    }
 
     // LP64 macros only on LP64 targets (Unix), not on LLP64 (Windows)
     if target.long_width == 64 {

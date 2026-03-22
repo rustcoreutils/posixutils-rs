@@ -208,7 +208,7 @@ impl<'a> Parser<'a> {
                         self.current_pos(),
                     )
                 })?;
-                designators.push(Designator::Index(index));
+                designators.push(Designator::Index(index as i64));
             } else {
                 break;
             }
@@ -228,6 +228,56 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Compute common type for ternary operator branches (C99 6.5.15, 6.3.1.8)
+    fn ternary_common_type(&mut self, then_typ: TypeId, else_typ: TypeId) -> TypeId {
+        let then_kind = self.types.kind(then_typ);
+        let else_kind = self.types.kind(else_typ);
+
+        // If either is a pointer, use pointer type
+        if then_kind == TypeKind::Pointer {
+            return then_typ;
+        }
+        if else_kind == TypeKind::Pointer {
+            return else_typ;
+        }
+
+        // If either is void, result is void
+        if then_kind == TypeKind::Void || else_kind == TypeKind::Void {
+            return self.types.void_id;
+        }
+
+        // Both arithmetic: apply usual arithmetic conversions
+        // Float types take precedence
+        if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
+            if then_kind == TypeKind::LongDouble || else_kind == TypeKind::LongDouble {
+                return self.types.longdouble_id;
+            }
+            if then_kind == TypeKind::Double || else_kind == TypeKind::Double {
+                return self.types.double_id;
+            }
+            return self.types.float_id;
+        }
+
+        // Integer types: promote both, then pick the wider/unsigned
+        let then_size = self.types.size_bits(then_typ).max(32); // integer promotion
+        let else_size = self.types.size_bits(else_typ).max(32);
+
+        // Pick the wider type, or int if both are narrow
+        if then_size >= else_size && then_size >= 32 {
+            if then_size == 32 {
+                return self.types.int_id;
+            }
+            return then_typ;
+        }
+        if else_size >= then_size && else_size >= 32 {
+            if else_size == 32 {
+                return self.types.int_id;
+            }
+            return else_typ;
+        }
+        self.types.int_id
+    }
+
     /// Parse a conditional (ternary) expression: cond ? then : else
     pub(crate) fn parse_conditional_expr(&mut self) -> ParseResult<Expr> {
         let cond = self.parse_logical_or_expr()?;
@@ -244,26 +294,26 @@ impl<'a> Parser<'a> {
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
-            // Decay arrays to pointers
+            // Decay arrays to pointers, functions to pointer-to-function
             let then_decayed = if self.types.kind(then_typ) == TypeKind::Array {
                 let elem = self.types.base_type(then_typ).unwrap_or(self.types.char_id);
-                self.types.pointer_to(elem)
+                self.types.intern(Type::pointer(elem))
             } else if self.types.kind(then_typ) == TypeKind::Function {
-                self.types.pointer_to(then_typ)
+                self.types.intern(Type::pointer(then_typ))
             } else {
                 then_typ
             };
-            let _else_decayed = if self.types.kind(else_typ) == TypeKind::Array {
+            let else_decayed = if self.types.kind(else_typ) == TypeKind::Array {
                 let elem = self.types.base_type(else_typ).unwrap_or(self.types.char_id);
-                self.types.pointer_to(elem)
+                self.types.intern(Type::pointer(elem))
             } else if self.types.kind(else_typ) == TypeKind::Function {
-                self.types.pointer_to(else_typ)
+                self.types.intern(Type::pointer(else_typ))
             } else {
                 else_typ
             };
 
-            // Use decayed then type (for now; proper impl would compute common type)
-            let typ = then_decayed;
+            // Compute common type of then and else branches (C99 6.5.15)
+            let typ = self.ternary_common_type(then_decayed, else_decayed);
 
             let pos = cond.pos;
             Ok(Self::typed_expr(
@@ -538,10 +588,22 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // Deref produces the base type of the pointer
+            // Deref produces the base type of the pointer.
+            // Function types: *func is a no-op in C (6.5.3.2, 6.3.2.1).
+            // A function identifier has function type which decays to pointer-
+            // to-function in expression context; base_type of pointer-to-function
+            // is the function type.  But if the operand already has function type
+            // (not yet decayed), base_type would give the return type — wrong.
+            // In that case, keep the function type as-is.
             let typ = operand
                 .typ
-                .and_then(|t| self.types.base_type(t))
+                .map(|t| {
+                    if self.types.kind(t) == crate::types::TypeKind::Function {
+                        t // *func_name is a no-op; result is still function type
+                    } else {
+                        self.types.base_type(t).unwrap_or(self.types.int_id)
+                    }
+                })
                 .unwrap_or(self.types.int_id);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
@@ -563,8 +625,16 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // Neg has same type as operand
-            let typ = operand.typ.unwrap_or(self.types.int_id);
+            // C99 6.3.1.1: integer promotion — types smaller than int promote to int
+            let op_typ = operand.typ.unwrap_or(self.types.int_id);
+            let typ = {
+                let kind = self.types.kind(op_typ);
+                if matches!(kind, TypeKind::Bool | TypeKind::Char | TypeKind::Short) {
+                    self.types.int_id
+                } else {
+                    op_typ
+                }
+            };
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Neg,
@@ -733,6 +803,9 @@ impl<'a> Parser<'a> {
                 | "struct"
                 | "union"
                 | "enum"
+                | "__int128"
+                | "__int128_t"
+                | "__uint128_t"
                 | "__builtin_va_list"
                 | "typeof"
                 | "__typeof__"
@@ -767,6 +840,9 @@ impl<'a> Parser<'a> {
                 "_Atomic" => {
                     self.advance();
                     mods |= TypeModifiers::ATOMIC;
+                }
+                n if super::is_nullability_qualifier(n) => {
+                    self.advance();
                 }
                 _ => break,
             }
@@ -976,6 +1052,22 @@ impl<'a> Parser<'a> {
                 "_Bool" => {
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
+                    parsed_something = true;
+                }
+                "__int128" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                    parsed_something = true;
+                }
+                "__int128_t" => {
+                    self.advance();
+                    base_kind = Some(TypeKind::Int128);
+                    parsed_something = true;
+                }
+                "__uint128_t" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::UNSIGNED;
+                    base_kind = Some(TypeKind::Int128);
                     parsed_something = true;
                 }
                 "__builtin_va_list" => {
@@ -1643,6 +1735,12 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.float16_id
             }
+        } else if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
+            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                self.types.uint128_id
+            } else {
+                self.types.int128_id
+            }
         } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
             // If either is unsigned long long, result is unsigned long long
             if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
@@ -2280,7 +2378,7 @@ impl<'a> Parser<'a> {
                                             index_pos,
                                         )
                                         })?;
-                                    path.push(OffsetOfPath::Index(index_val));
+                                    path.push(OffsetOfPath::Index(index_val as i64));
                                 } else {
                                     break;
                                 }
@@ -2568,6 +2666,68 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        "__builtin_object_size" => {
+                            // __builtin_object_size(ptr, type) - returns (size_t)-1
+                            // at compile time without optimization (conservative "don't know")
+                            self.expect_special(b'(')?;
+                            let _ptr = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let _otype = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(-1),
+                                self.types.ulong_id,
+                                token_pos,
+                            ));
+                        }
+                        name if name.starts_with("__builtin___") => {
+                            // Fortified builtins: __builtin___snprintf_chk etc.
+                            // Strip __builtin_ prefix → __snprintf_chk, which is a
+                            // real libc function (declared by macOS/glibc headers).
+                            let real_name = &name["__builtin_".len()..];
+                            // Parse arguments first (must consume tokens regardless)
+                            self.expect_special(b'(')?;
+                            let mut args = Vec::new();
+                            if !self.is_special(b')') {
+                                args.push(self.parse_assignment_expr()?);
+                                while self.is_special(b',') {
+                                    self.advance();
+                                    args.push(self.parse_assignment_expr()?);
+                                }
+                            }
+                            self.expect_special(b')')?;
+                            // Look up the real function by its de-prefixed name
+                            let real_name_id = self.idents.lookup(real_name);
+                            let symbol_id = real_name_id.and_then(|id| {
+                                self.symbols
+                                    .lookup_id(id, crate::symbol::Namespace::Ordinary)
+                            });
+                            if let Some(symbol_id) = symbol_id {
+                                let func_type = self.symbols.get(symbol_id).typ;
+                                let ret_type =
+                                    self.types.base_type(func_type).unwrap_or(self.types.int_id);
+                                let func_expr = Self::typed_expr(
+                                    ExprKind::Ident(symbol_id),
+                                    func_type,
+                                    token_pos,
+                                );
+                                return Ok(Self::typed_expr(
+                                    ExprKind::Call {
+                                        func: Box::new(func_expr),
+                                        args,
+                                    },
+                                    ret_type,
+                                    token_pos,
+                                ));
+                            }
+                            // Not declared — return 0 as fallback
+                            diag::error(token_pos, &format!("undeclared function '{}'", real_name));
+                            return Ok(Self::typed_expr(
+                                ExprKind::IntLit(0),
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
                         _ => {}
                     }
 
@@ -2672,7 +2832,7 @@ impl<'a> Parser<'a> {
                     // (C11 6.4.5: "type is array of char" not "pointer to char")
                     // The array-to-pointer decay happens when used in most contexts,
                     // but sizeof("hello") needs to return 6, not sizeof(char*).
-                    let array_size = parsed.len() + 1; // +1 for null terminator
+                    let array_size = parsed.chars().count() + 1; // +1 for null terminator
                     let str_type = self
                         .types
                         .intern(Type::array(self.types.char_id, array_size));
@@ -2765,6 +2925,18 @@ impl<'a> Parser<'a> {
 
                         // Regular cast expression
                         let expr = self.parse_unary_expr()?;
+
+                        // Fold cast-to-Int128 of constant expressions into Int128Lit
+                        if self.types.kind(typ) == TypeKind::Int128 {
+                            if let Some(val) = self.eval_const_expr(&expr) {
+                                return Ok(Self::typed_expr(
+                                    ExprKind::Int128Lit(val),
+                                    typ,
+                                    paren_pos,
+                                ));
+                            }
+                        }
+
                         return Ok(Self::typed_expr(
                             ExprKind::Cast {
                                 cast_type: typ,

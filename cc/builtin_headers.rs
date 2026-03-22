@@ -25,6 +25,9 @@ pub const STDBOOL_H: &str = include_str!("include/stdbool.h");
 /// Builtin limits.h - implementation limits
 pub const LIMITS_H: &str = include_str!("include/limits.h");
 
+/// Builtin stdalign.h - C11 alignment specifiers
+pub const STDALIGN_H: &str = include_str!("include/stdalign.h");
+
 /// Builtin stdatomic.h - C11 atomic operations
 pub const STDATOMIC_H: &str = include_str!("include/stdatomic.h");
 
@@ -50,6 +53,7 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "stdbool.h" => Some(STDBOOL_H),
         "stddef.h" => Some(STDDEF_H),
         "limits.h" => Some(LIMITS_H),
+        "stdalign.h" => Some(STDALIGN_H),
         "stdatomic.h" => Some(STDATOMIC_H),
         "float.h" => Some(FLOAT_H),
         "cpuid.h" => Some(CPUID_H),

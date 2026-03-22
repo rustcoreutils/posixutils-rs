@@ -81,6 +81,21 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     // Frame/return address introspection
     "__builtin_frame_address",
     "__builtin_return_address",
+    // Object size and fortified builtins (macOS _chk functions)
+    "__builtin_object_size",
+    "__builtin___snprintf_chk",
+    "__builtin___vsnprintf_chk",
+    "__builtin___sprintf_chk",
+    "__builtin___fprintf_chk",
+    "__builtin___printf_chk",
+    "__builtin___memcpy_chk",
+    "__builtin___memmove_chk",
+    "__builtin___memset_chk",
+    "__builtin___stpcpy_chk",
+    "__builtin___strcat_chk",
+    "__builtin___strcpy_chk",
+    "__builtin___strncat_chk",
+    "__builtin___strncpy_chk",
     // C11 atomic builtins (Clang-style)
     "__c11_atomic_init",
     "__c11_atomic_load",

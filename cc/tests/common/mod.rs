@@ -94,6 +94,30 @@ fn compile_and_run_single(
 
     let exit_code = run_output.status.code().unwrap_or(-1);
 
+    // On failure, dump generated assembly for diagnosis
+    if exit_code != 0 {
+        let asm_path = std::env::temp_dir().join(format!("pcc_asm_{}_{}.s", name, config_name));
+        let mut asm_args = vec![
+            "-S".to_string(),
+            "-o".to_string(),
+            asm_path.to_string_lossy().to_string(),
+        ];
+        asm_args.extend(extra_opts.iter().cloned());
+        asm_args.push(c_path.to_string_lossy().to_string());
+        let asm_output = run_test_base("pcc", &asm_args, &[]);
+        if asm_output.status.success() {
+            if let Ok(asm) = std::fs::read_to_string(&asm_path) {
+                eprintln!(
+                    "=== Generated assembly for '{}' [{}] ===",
+                    name, config_name
+                );
+                eprintln!("{}", asm);
+                eprintln!("=== End assembly ===");
+            }
+        }
+        let _ = std::fs::remove_file(&asm_path);
+    }
+
     // Cleanup exe (c_file auto-cleaned by NamedTempFile drop)
     let _ = std::fs::remove_file(&exe_path);
 

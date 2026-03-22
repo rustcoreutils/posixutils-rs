@@ -1043,8 +1043,23 @@ impl fmt::Display for Instruction {
 
         write!(f, "{}", self.op.name())?;
 
-        // Size suffix
-        if self.size > 0 {
+        // Size suffix (for conversions, show src_size→size)
+        if self.src_size > 0
+            && self.src_size != self.size
+            && matches!(
+                self.op,
+                Opcode::Sext
+                    | Opcode::Zext
+                    | Opcode::Trunc
+                    | Opcode::FCvtS
+                    | Opcode::FCvtU
+                    | Opcode::SCvtF
+                    | Opcode::UCvtF
+                    | Opcode::FCvtF
+            )
+        {
+            write!(f, ".{}to{}", self.src_size, self.size)?;
+        } else if self.size > 0 {
             write!(f, ".{}", self.size)?;
         }
 

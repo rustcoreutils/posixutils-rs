@@ -177,15 +177,17 @@ const HEX: u8 = 4;
 const EXP: u8 = 8;
 const DOT: u8 = 16;
 const VALID_SECOND: u8 = 32; // Can be second char of 2-char operator
+const QUOTE: u8 = 64; // ' "
+const COMMENT: u8 = 128; // /
 
-/// Character classification table
-fn char_class(c: u8) -> u8 {
+/// Classify a single byte (mirrors the old match arms exactly, plus QUOTE and COMMENT).
+const fn classify_char(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => DIGIT | HEX,
         b'A'..=b'D' | b'F' => LETTER | HEX,
-        b'E' => LETTER | HEX | EXP, // E for exponent
+        b'E' => LETTER | HEX | EXP,
         b'G'..=b'O' => LETTER,
-        b'P' => LETTER | EXP, // P for hex float exponent
+        b'P' => LETTER | EXP,
         b'Q'..=b'Z' => LETTER,
         b'a'..=b'd' | b'f' => LETTER | HEX,
         b'e' => LETTER | HEX | EXP,
@@ -195,8 +197,30 @@ fn char_class(c: u8) -> u8 {
         b'_' => LETTER,
         b'.' => DOT | VALID_SECOND,
         b'=' | b'+' | b'-' | b'>' | b'<' | b'&' | b'|' | b'#' => VALID_SECOND,
+        b'\'' | b'"' => QUOTE,
+        b'/' => COMMENT,
         _ => 0,
     }
+}
+
+/// Build the 256-byte lookup table at compile time.
+const fn build_char_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i: usize = 0;
+    while i < 256 {
+        table[i] = classify_char(i as u8);
+        i += 1;
+    }
+    table
+}
+
+/// Compile-time character classification table.
+const CHAR_TABLE: [u8; 256] = build_char_table();
+
+/// Character classification via table lookup.
+#[inline(always)]
+fn char_class(c: u8) -> u8 {
+    CHAR_TABLE[c as usize]
 }
 
 #[inline]
@@ -770,15 +794,12 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 
     /// Get a special token (operator/punctuator)
-    fn get_special(&mut self, first: u8) -> Option<Token> {
+    fn get_special(&mut self, first: u8, class: u8) -> Option<Token> {
         let pos = self.pos();
 
         // Check for string/char literals
-        if first == b'"' {
-            return Some(self.get_string_or_char(b'"', false));
-        }
-        if first == b'\'' {
-            return Some(self.get_string_or_char(b'\'', false));
+        if class & QUOTE != 0 {
+            return Some(self.get_string_or_char(first, false));
         }
 
         // Check for .digit (floating point number)
@@ -790,10 +811,10 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         }
 
         // Check for comments (mode-dependent)
-        match self.mode {
-            LexerMode::C => {
-                // C mode: // and /* */ comments
-                if first == b'/' {
+        if class & COMMENT != 0 {
+            match self.mode {
+                LexerMode::C => {
+                    // C mode: // and /* */ comments
                     let next = self.peekchar();
                     if next == b'/' as i32 {
                         self.nextchar();
@@ -806,12 +827,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                         return None; // No token, continue tokenizing
                     }
                 }
-            }
-            LexerMode::Assembly => {
-                // Assembly mode: do not treat ';' as a line comment delimiter.
-                // Different assemblers (e.g., GAS, Apple as) use ';' with different
-                // meanings (statement separator vs. comment). Comment handling is
-                // left to the assembler.
+                LexerMode::Assembly => {
+                    // Assembly mode: comment handling is left to the assembler.
+                }
             }
         }
 
@@ -996,7 +1014,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
-        self.get_special(c)
+        self.get_special(c, class)
     }
 
     /// Tokenize the entire input, returning all tokens
@@ -2104,5 +2122,104 @@ mod tests {
         assert!(
             matches!(&tokens[1].value, TokenValue::Special(c) if *c == SpecialToken::HashHash as u32)
         );
+    }
+
+    // ========================================================================
+    // Character classification table tests
+    // ========================================================================
+
+    #[test]
+    fn test_char_table_digits() {
+        for c in b'0'..=b'9' {
+            let cl = char_class(c);
+            assert_eq!(cl & DIGIT, DIGIT, "digit {}", c as char);
+            assert_eq!(cl & HEX, HEX, "digit hex {}", c as char);
+            assert_eq!(cl & LETTER, 0, "digit not letter {}", c as char);
+        }
+    }
+
+    #[test]
+    fn test_char_table_hex_letters() {
+        for c in [b'A', b'B', b'C', b'D', b'F', b'a', b'b', b'c', b'd', b'f'] {
+            let cl = char_class(c);
+            assert_eq!(cl & LETTER, LETTER, "hex letter {}", c as char);
+            assert_eq!(cl & HEX, HEX, "hex flag {}", c as char);
+        }
+    }
+
+    #[test]
+    fn test_char_table_exp_letters() {
+        for c in [b'E', b'e', b'P', b'p'] {
+            let cl = char_class(c);
+            assert_eq!(cl & EXP, EXP, "exp {}", c as char);
+            assert_eq!(cl & LETTER, LETTER, "exp letter {}", c as char);
+        }
+        // E and e are also hex
+        assert_ne!(char_class(b'E') & HEX, 0);
+        assert_ne!(char_class(b'e') & HEX, 0);
+        // P and p are NOT hex
+        assert_eq!(char_class(b'P') & HEX, 0);
+        assert_eq!(char_class(b'p') & HEX, 0);
+    }
+
+    #[test]
+    fn test_char_table_plain_letters() {
+        // Non-hex, non-exp uppercase
+        for c in b'G'..=b'O' {
+            let cl = char_class(c);
+            assert_eq!(cl, LETTER, "plain upper {}", c as char);
+        }
+        for c in b'Q'..=b'Z' {
+            let cl = char_class(c);
+            assert_eq!(cl, LETTER, "plain upper {}", c as char);
+        }
+        // Non-hex, non-exp lowercase
+        for c in b'g'..=b'o' {
+            let cl = char_class(c);
+            assert_eq!(cl, LETTER, "plain lower {}", c as char);
+        }
+        for c in b'q'..=b'z' {
+            let cl = char_class(c);
+            assert_eq!(cl, LETTER, "plain lower {}", c as char);
+        }
+        assert_eq!(char_class(b'_'), LETTER);
+    }
+
+    #[test]
+    fn test_char_table_dot() {
+        let cl = char_class(b'.');
+        assert_ne!(cl & DOT, 0);
+        assert_ne!(cl & VALID_SECOND, 0);
+    }
+
+    #[test]
+    fn test_char_table_valid_second() {
+        for c in [b'=', b'+', b'-', b'>', b'<', b'&', b'|', b'#'] {
+            assert_ne!(
+                char_class(c) & VALID_SECOND,
+                0,
+                "valid_second {}",
+                c as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_char_table_quote() {
+        assert_ne!(char_class(b'\'') & QUOTE, 0);
+        assert_ne!(char_class(b'"') & QUOTE, 0);
+    }
+
+    #[test]
+    fn test_char_table_comment() {
+        assert_ne!(char_class(b'/') & COMMENT, 0);
+    }
+
+    #[test]
+    fn test_char_table_zero_for_others() {
+        // Control characters, whitespace, misc punctuation not in the table
+        for c in [0u8, b' ', b'\t', b'\n', b'@', b'$', b'`', b'~', 0x80, 0xFF] {
+            assert_eq!(char_class(c), 0, "zero for byte {:#x}", c);
+        }
     }
 }

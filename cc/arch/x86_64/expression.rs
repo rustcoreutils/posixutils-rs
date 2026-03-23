@@ -731,7 +731,10 @@ impl X86_64CodeGen {
             Opcode::Asr => {
                 self.emit_int128_asr(src1, src2, &dst_loc);
             }
-            _ => {}
+            _ => panic!(
+                "emit_int128_binop: unexpected opcode {:?} (mapping pass should have expanded it)",
+                insn.op
+            ),
         }
     }
 

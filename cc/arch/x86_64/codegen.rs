@@ -1717,7 +1717,7 @@ impl X86_64CodeGen {
                 self.emit_fence(insn);
             }
 
-            // Int128 decomposition ops (from hwmap expansion)
+            // Int128 decomposition ops (from mapping pass expansion)
             Opcode::Lo64 => self.emit_lo64(insn),
             Opcode::Hi64 => self.emit_hi64(insn),
             Opcode::Pair64 => self.emit_pair64(insn),

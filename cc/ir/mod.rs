@@ -16,7 +16,6 @@
 
 pub mod dce;
 pub mod dominate;
-pub mod hwmap;
 pub mod inline;
 pub mod instcombine;
 pub mod linearize;
@@ -233,7 +232,7 @@ pub enum Opcode {
     AtomicFetchXor, // Atomic fetch-and-xor
     Fence,          // Memory fence
 
-    // Int128 decomposition ops (used by hwmap expansion)
+    // Int128 decomposition ops (used by mapping pass expansion)
     Lo64,   // Extract low 64 bits from 128-bit pseudo
     Hi64,   // Extract high 64 bits from 128-bit pseudo
     Pair64, // Combine two 64-bit pseudos into 128-bit: target = (src[0]=lo, src[1]=hi)

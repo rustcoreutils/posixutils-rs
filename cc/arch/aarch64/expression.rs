@@ -24,7 +24,7 @@ impl Aarch64CodeGen {
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
 
-        // 128-bit shifts are still handled by the backend (hwmap doesn't expand them)
+        // 128-bit shifts are still handled by the backend (mapping pass doesn't expand them)
         if size == 128 {
             if matches!(insn.op, Opcode::Shl | Opcode::Lsr | Opcode::Asr) {
                 self.emit_int128_binop(insn);
@@ -330,7 +330,7 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // Handle truncation FROM 128-bit (Zext/Sext TO 128 handled by hwmap)
+        // Handle truncation FROM 128-bit (Zext/Sext TO 128 handled by mapping pass)
         if insn.src_size == 128 && insn.op == Opcode::Trunc {
             self.emit_int128_trunc(insn);
             return;

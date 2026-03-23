@@ -92,10 +92,10 @@ struct Args {
     dump_ast: bool,
 
     /// Dump IR at a named stage (for debugging)
-    /// Stages: post-linearize, post-hwmap, post-opt, post-lower, all
+    /// Stages: post-linearize, post-mapping, post-opt, post-lower, all
     /// Bare --dump-ir = post-opt (backward compat)
     #[arg(long = "dump-ir", value_name = "stage", default_missing_value = "post-opt",
-          num_args = 0..=1, help = gettext("Dump IR at stage (post-linearize, post-hwmap, post-opt, post-lower, all)"))]
+          num_args = 0..=1, help = gettext("Dump IR at stage (post-linearize, post-mapping, post-opt, post-lower, all)"))]
     dump_ir: Option<String>,
 
     /// Filter IR dumps to a specific function name
@@ -222,7 +222,7 @@ struct Args {
 /// Valid stage names for --dump-ir.
 const DUMP_IR_STAGES: &[&str] = &[
     "post-linearize",
-    "post-hwmap",
+    "post-mapping",
     "post-opt",
     "post-lower",
     "all",
@@ -498,9 +498,9 @@ fn process_file(
     dump_ir(args, &module, "post-linearize");
 
     // Hardware mapping pass — centralized target-specific lowering decisions
-    ir::hwmap::hwmap_module(&mut module, &types, target);
+    arch::mapping::run_mapping(&mut module, &types, target);
 
-    dump_ir(args, &module, "post-hwmap");
+    dump_ir(args, &module, "post-mapping");
 
     // Optimize IR (if enabled)
     if args.opt_level > 0 {

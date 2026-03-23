@@ -15,6 +15,7 @@ pub mod aarch64;
 pub mod codegen;
 pub mod dwarf;
 pub mod lir;
+pub mod mapping;
 pub mod regalloc;
 pub mod x86_64;
 

@@ -709,7 +709,7 @@ impl X86_64CodeGen {
 
     /// Emit 128-bit shift operations (Shl, Lsr, Asr).
     /// Other int128 ops (Add, Sub, And, Or, Xor, Mul, Neg, Not, comparisons)
-    /// are expanded by the hwmap pass into 64-bit sequences.
+    /// are expanded by the mapping pass into 64-bit sequences.
     fn emit_int128_binop(&mut self, insn: &Instruction) {
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),

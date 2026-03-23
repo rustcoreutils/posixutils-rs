@@ -84,12 +84,12 @@ impl StringTable {
         };
         // Pre-intern empty string as ID 0
         let empty_id = table.intern_internal("");
-        debug_assert_eq!(empty_id, StringId::EMPTY);
+        assert_eq!(empty_id, StringId::EMPTY);
 
         // Pre-intern all keywords at deterministic slots 1..=KEYWORD_COUNT
         for (i, &s) in crate::kw::KEYWORD_STRINGS.iter().enumerate() {
             let id = table.intern_internal(s);
-            debug_assert_eq!(id.0, (i + 1) as u32, "keyword '{}' got wrong ID", s);
+            assert_eq!(id.0, (i + 1) as u32, "keyword '{}' got wrong ID", s);
         }
 
         table

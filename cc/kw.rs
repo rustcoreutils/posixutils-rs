@@ -47,11 +47,16 @@ pub const DECL_START: u32 =
 // ============================================================================
 
 /// Helper macro: recursive counter that assigns sequential StringId values starting from 1.
+/// Entries named `_` are anonymous — they get interned and tagged but no `pub const` is emitted.
 macro_rules! define_ids {
     // Base case: no more entries
     ($counter:expr; ) => {};
-    // Recursive case: emit one const, recurse with counter+1
-    ($counter:expr; ($name:ident, $str:literal, $tags:expr) $(, ($name_rest:ident, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
+    // Anonymous entry (name is `_`): skip const, just recurse
+    ($counter:expr; (_, $str:literal, $tags:expr) $(, ($name_rest:tt, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
+        define_ids!($counter + 1; $(($name_rest, $str_rest, $tags_rest)),*);
+    };
+    // Named entry: emit pub const, then recurse
+    ($counter:expr; ($name:ident, $str:literal, $tags:expr) $(, ($name_rest:tt, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
         pub const $name: StringId = StringId($counter);
         define_ids!($counter + 1; $(($name_rest, $str_rest, $tags_rest)),*);
     };
@@ -59,11 +64,11 @@ macro_rules! define_ids {
 
 /// Main keyword definition macro. Generates:
 /// - KEYWORD_COUNT: total number of keywords
-/// - One `pub const NAME: StringId` per keyword
-/// - KEYWORD_STRINGS: array of string literals
-/// - KEYWORD_TAGS: array of tag bitmasks
+/// - One `pub const NAME: StringId` per named keyword (entries with `_` are anonymous)
+/// - KEYWORD_STRINGS: array of string literals (all entries)
+/// - KEYWORD_TAGS: array of tag bitmasks (all entries)
 macro_rules! define_keywords {
-    ( $( ($name:ident, $str:literal, $tags:expr) ),* $(,)? ) => {
+    ( $( ($name:tt, $str:literal, $tags:expr) ),* $(,)? ) => {
         pub const KEYWORD_COUNT: usize = [ $( $str ),* ].len();
         define_ids!(1u32; $( ($name, $str, $tags) ),* );
         pub(crate) const KEYWORD_STRINGS: [&str; KEYWORD_COUNT] = [ $( $str ),* ];
@@ -153,19 +158,19 @@ define_keywords! {
     (GNU_ASM2,          "__asm",             ASM_KW),
 
     // ---- Static assert (ASSERT_KW) ----
-    (STATIC_ASSERT,     "_Static_assert",    ASSERT_KW),
-    (STATIC_ASSERT_C23, "static_assert",     ASSERT_KW),
+    (_,                 "_Static_assert",    ASSERT_KW),
+    (_,                 "static_assert",     ASSERT_KW),
 
     // ---- Alignas (ALIGNAS_KW) ----
     (ALIGNAS,           "_Alignas",          ALIGNAS_KW),
 
     // ---- Nullability qualifiers (NULLABILITY) ----
-    (NONNULL,           "_Nonnull",          NULLABILITY),
-    (GNU_NONNULL,       "__nonnull",         NULLABILITY),
-    (NULLABLE,          "_Nullable",         NULLABILITY),
-    (GNU_NULLABLE,      "__nullable",        NULLABILITY),
-    (NULL_UNSPECIFIED,  "_Null_unspecified",  NULLABILITY),
-    (GNU_NULL_UNSPECIFIED, "__null_unspecified", NULLABILITY),
+    (_,                 "_Nonnull",          NULLABILITY),
+    (_,                 "__nonnull",         NULLABILITY),
+    (_,                 "_Nullable",         NULLABILITY),
+    (_,                 "__nullable",        NULLABILITY),
+    (_,                 "_Null_unspecified",  NULLABILITY),
+    (_,                 "__null_unspecified", NULLABILITY),
 
     // ---- Statement keywords (STMT_KW) ----
     (IF,                "if",                STMT_KW),
@@ -189,7 +194,7 @@ define_keywords! {
     (ALIGNOF_C23,       "alignof",           0),
 
     // ---- Wide char prefix ----
-    (WIDE_PREFIX,       "L",                 0),
+    (_,                 "L",                 0),
 
     // ---- Preprocessor directives ----
     (DEFINE,            "define",            0),
@@ -206,9 +211,9 @@ define_keywords! {
     (LINE,              "line",              0),
 
     // ---- Preprocessor special names ----
-    (DEFINED,           "defined",           0),
-    (VA_ARGS,           "__VA_ARGS__",       0),
-    (ONCE,              "once",              0),
+    (_,                 "defined",           0),
+    (_,                 "__VA_ARGS__",       0),
+    (_,                 "once",              0),
 
     // ---- Predefined identifiers ----
     (FUNC,              "__func__",          0),
@@ -266,19 +271,19 @@ define_keywords! {
     (BUILTIN_FRAME_ADDRESS, "__builtin_frame_address", BUILTIN),
     (BUILTIN_RETURN_ADDRESS, "__builtin_return_address", BUILTIN),
     (BUILTIN_OBJECT_SIZE, "__builtin_object_size", BUILTIN),
-    (BUILTIN_SNPRINTF_CHK, "__builtin___snprintf_chk", BUILTIN),
-    (BUILTIN_VSNPRINTF_CHK, "__builtin___vsnprintf_chk", BUILTIN),
-    (BUILTIN_SPRINTF_CHK, "__builtin___sprintf_chk", BUILTIN),
-    (BUILTIN_FPRINTF_CHK, "__builtin___fprintf_chk", BUILTIN),
-    (BUILTIN_PRINTF_CHK, "__builtin___printf_chk", BUILTIN),
-    (BUILTIN_MEMCPY_CHK, "__builtin___memcpy_chk", BUILTIN),
-    (BUILTIN_MEMMOVE_CHK, "__builtin___memmove_chk", BUILTIN),
-    (BUILTIN_MEMSET_CHK, "__builtin___memset_chk", BUILTIN),
-    (BUILTIN_STPCPY_CHK, "__builtin___stpcpy_chk", BUILTIN),
-    (BUILTIN_STRCAT_CHK, "__builtin___strcat_chk", BUILTIN),
-    (BUILTIN_STRCPY_CHK, "__builtin___strcpy_chk", BUILTIN),
-    (BUILTIN_STRNCAT_CHK, "__builtin___strncat_chk", BUILTIN),
-    (BUILTIN_STRNCPY_CHK, "__builtin___strncpy_chk", BUILTIN),
+    (_, "__builtin___snprintf_chk", BUILTIN),
+    (_, "__builtin___vsnprintf_chk", BUILTIN),
+    (_, "__builtin___sprintf_chk", BUILTIN),
+    (_, "__builtin___fprintf_chk", BUILTIN),
+    (_, "__builtin___printf_chk", BUILTIN),
+    (_, "__builtin___memcpy_chk", BUILTIN),
+    (_, "__builtin___memmove_chk", BUILTIN),
+    (_, "__builtin___memset_chk", BUILTIN),
+    (_, "__builtin___stpcpy_chk", BUILTIN),
+    (_, "__builtin___strcat_chk", BUILTIN),
+    (_, "__builtin___strcpy_chk", BUILTIN),
+    (_, "__builtin___strncat_chk", BUILTIN),
+    (_, "__builtin___strncpy_chk", BUILTIN),
 
     // ---- C11 atomic builtins (BUILTIN) ----
     (C11_ATOMIC_INIT,    "__c11_atomic_init",    BUILTIN),
@@ -303,54 +308,54 @@ define_keywords! {
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms
-    (ATTR_NORETURN,             "noreturn",             SUPPORTED_ATTR),
-    (ATTR_UNUSED,               "unused",               SUPPORTED_ATTR),
-    (ATTR_ALIGNED,              "aligned",              SUPPORTED_ATTR),
-    (ATTR_PACKED,               "packed",               SUPPORTED_ATTR),
-    (ATTR_DEPRECATED,           "deprecated",           SUPPORTED_ATTR),
-    (ATTR_WEAK,                 "weak",                 SUPPORTED_ATTR),
-    (ATTR_SECTION,              "section",              SUPPORTED_ATTR),
-    (ATTR_VISIBILITY,           "visibility",           SUPPORTED_ATTR),
-    (ATTR_CONSTRUCTOR,          "constructor",          SUPPORTED_ATTR),
-    (ATTR_DESTRUCTOR,           "destructor",           SUPPORTED_ATTR),
-    (ATTR_USED,                 "used",                 SUPPORTED_ATTR),
-    (ATTR_NOINLINE,             "noinline",             SUPPORTED_ATTR),
-    (ATTR_ALWAYS_INLINE,        "always_inline",        SUPPORTED_ATTR),
-    (ATTR_HOT,                  "hot",                  SUPPORTED_ATTR),
-    (ATTR_COLD,                 "cold",                 SUPPORTED_ATTR),
-    (ATTR_WARN_UNUSED_RESULT,   "warn_unused_result",   SUPPORTED_ATTR),
-    (ATTR_FORMAT,               "format",               SUPPORTED_ATTR),
-    (ATTR_FALLTHROUGH,          "fallthrough",          SUPPORTED_ATTR),
-    (ATTR_NONSTRING,            "nonstring",            SUPPORTED_ATTR),
-    (ATTR_MALLOC,               "malloc",               SUPPORTED_ATTR),
-    (ATTR_PURE,                 "pure",                 SUPPORTED_ATTR),
-    (ATTR_SENTINEL,             "sentinel",             SUPPORTED_ATTR),
-    (ATTR_NO_SANITIZE_MEMORY,   "no_sanitize_memory",   SUPPORTED_ATTR),
-    (ATTR_NO_SANITIZE_ADDRESS,  "no_sanitize_address",  SUPPORTED_ATTR),
-    (ATTR_NO_SANITIZE_THREAD,   "no_sanitize_thread",   SUPPORTED_ATTR),
+    (_, "noreturn",             SUPPORTED_ATTR),
+    (_, "unused",               SUPPORTED_ATTR),
+    (_, "aligned",              SUPPORTED_ATTR),
+    (_, "packed",               SUPPORTED_ATTR),
+    (_, "deprecated",           SUPPORTED_ATTR),
+    (_, "weak",                 SUPPORTED_ATTR),
+    (_, "section",              SUPPORTED_ATTR),
+    (_, "visibility",           SUPPORTED_ATTR),
+    (_, "constructor",          SUPPORTED_ATTR),
+    (_, "destructor",           SUPPORTED_ATTR),
+    (_, "used",                 SUPPORTED_ATTR),
+    (_, "noinline",             SUPPORTED_ATTR),
+    (_, "always_inline",        SUPPORTED_ATTR),
+    (_, "hot",                  SUPPORTED_ATTR),
+    (_, "cold",                 SUPPORTED_ATTR),
+    (_, "warn_unused_result",   SUPPORTED_ATTR),
+    (_, "format",               SUPPORTED_ATTR),
+    (_, "fallthrough",          SUPPORTED_ATTR),
+    (_, "nonstring",            SUPPORTED_ATTR),
+    (_, "malloc",               SUPPORTED_ATTR),
+    (_, "pure",                 SUPPORTED_ATTR),
+    (_, "sentinel",             SUPPORTED_ATTR),
+    (_, "no_sanitize_memory",   SUPPORTED_ATTR),
+    (_, "no_sanitize_address",  SUPPORTED_ATTR),
+    (_, "no_sanitize_thread",   SUPPORTED_ATTR),
     // GNU forms (__foo__)
     // Note: __noreturn__ is already defined above with NORETURN_KW | SUPPORTED_ATTR
-    (GNU_ATTR_UNUSED,           "__unused__",           SUPPORTED_ATTR),
-    (GNU_ATTR_ALIGNED,          "__aligned__",          SUPPORTED_ATTR),
-    (GNU_ATTR_PACKED,           "__packed__",           SUPPORTED_ATTR),
-    (GNU_ATTR_DEPRECATED,       "__deprecated__",       SUPPORTED_ATTR),
-    (GNU_ATTR_WEAK,             "__weak__",             SUPPORTED_ATTR),
-    (GNU_ATTR_SECTION,          "__section__",          SUPPORTED_ATTR),
-    (GNU_ATTR_VISIBILITY,       "__visibility__",       SUPPORTED_ATTR),
-    (GNU_ATTR_CONSTRUCTOR,      "__constructor__",      SUPPORTED_ATTR),
-    (GNU_ATTR_DESTRUCTOR,       "__destructor__",       SUPPORTED_ATTR),
-    (GNU_ATTR_USED,             "__used__",             SUPPORTED_ATTR),
-    (GNU_ATTR_NOINLINE,         "__noinline__",         SUPPORTED_ATTR),
-    (GNU_ATTR_ALWAYS_INLINE,    "__always_inline__",    SUPPORTED_ATTR),
-    (GNU_ATTR_HOT,              "__hot__",              SUPPORTED_ATTR),
-    (GNU_ATTR_COLD,             "__cold__",             SUPPORTED_ATTR),
-    (GNU_ATTR_WARN_UNUSED_RESULT, "__warn_unused_result__", SUPPORTED_ATTR),
-    (GNU_ATTR_FORMAT,           "__format__",           SUPPORTED_ATTR),
-    (GNU_ATTR_FALLTHROUGH,      "__fallthrough__",      SUPPORTED_ATTR),
-    (GNU_ATTR_NONSTRING,        "__nonstring__",        SUPPORTED_ATTR),
-    (GNU_ATTR_MALLOC,           "__malloc__",           SUPPORTED_ATTR),
-    (GNU_ATTR_PURE,             "__pure__",             SUPPORTED_ATTR),
-    (GNU_ATTR_SENTINEL,         "__sentinel__",         SUPPORTED_ATTR),
+    (_, "__unused__",           SUPPORTED_ATTR),
+    (_, "__aligned__",          SUPPORTED_ATTR),
+    (_, "__packed__",           SUPPORTED_ATTR),
+    (_, "__deprecated__",       SUPPORTED_ATTR),
+    (_, "__weak__",             SUPPORTED_ATTR),
+    (_, "__section__",          SUPPORTED_ATTR),
+    (_, "__visibility__",       SUPPORTED_ATTR),
+    (_, "__constructor__",      SUPPORTED_ATTR),
+    (_, "__destructor__",       SUPPORTED_ATTR),
+    (_, "__used__",             SUPPORTED_ATTR),
+    (_, "__noinline__",         SUPPORTED_ATTR),
+    (_, "__always_inline__",    SUPPORTED_ATTR),
+    (_, "__hot__",              SUPPORTED_ATTR),
+    (_, "__cold__",             SUPPORTED_ATTR),
+    (_, "__warn_unused_result__", SUPPORTED_ATTR),
+    (_, "__format__",           SUPPORTED_ATTR),
+    (_, "__fallthrough__",      SUPPORTED_ATTR),
+    (_, "__nonstring__",        SUPPORTED_ATTR),
+    (_, "__malloc__",           SUPPORTED_ATTR),
+    (_, "__pure__",             SUPPORTED_ATTR),
+    (_, "__sentinel__",         SUPPORTED_ATTR),
 }
 
 // ============================================================================
@@ -365,18 +370,6 @@ pub fn has_tag(id: StringId, mask: u32) -> bool {
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0
 }
 
-/// Get the full tag bitmask for a StringId.
-/// Returns 0 for non-keyword IDs.
-#[inline]
-pub fn tags(id: StringId) -> u32 {
-    let idx = id.0 as usize;
-    if idx > 0 && idx <= KEYWORD_COUNT {
-        KEYWORD_TAGS[idx - 1]
-    } else {
-        0
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -386,6 +379,13 @@ mod tests {
     use super::*;
     use crate::strings::StringTable;
     use std::collections::HashSet;
+
+    /// Look up a pre-interned keyword by string, panicking if not found.
+    fn id(table: &StringTable, s: &str) -> StringId {
+        table
+            .lookup(s)
+            .unwrap_or_else(|| panic!("keyword '{}' not interned", s))
+    }
 
     #[test]
     fn test_keyword_ids_deterministic() {
@@ -400,8 +400,9 @@ mod tests {
         assert_eq!(table.get(RETURN), "return");
         assert_eq!(table.get(BUILTIN_VA_START), "__builtin_va_start");
         assert_eq!(table.get(C11_ATOMIC_LOAD), "__c11_atomic_load");
-        assert_eq!(table.get(ATTR_NORETURN), "noreturn");
-        assert_eq!(table.get(GNU_ATTR_PACKED), "__packed__");
+        // Anonymous entries verified via lookup
+        assert!(table.lookup("noreturn").is_some());
+        assert!(table.lookup("__packed__").is_some());
     }
 
     #[test]
@@ -419,187 +420,173 @@ mod tests {
 
     #[test]
     fn test_tags_type_spec() {
-        let type_specs = [
-            VOID,
-            CHAR,
-            SHORT,
-            INT,
-            LONG,
-            FLOAT,
-            DOUBLE,
-            SIGNED,
-            UNSIGNED,
-            BOOL,
-            COMPLEX,
-            FLOAT16,
-            FLOAT32,
-            FLOAT64,
-            INT128,
-            INT128_T,
-            UINT128_T,
-            BUILTIN_VA_LIST,
-            STRUCT,
-            UNION,
-            ENUM,
-            TYPEOF,
-            GNU_TYPEOF,
-            GNU_TYPEOF2,
-            ATOMIC,
-        ];
-        for &id in &type_specs {
-            assert!(
-                has_tag(id, TYPE_SPEC),
-                "'{}' (id={}) should have TYPE_SPEC",
-                KEYWORD_STRINGS[id.0 as usize - 1],
-                id.0
-            );
+        for &s in &[
+            "void",
+            "char",
+            "short",
+            "int",
+            "long",
+            "float",
+            "double",
+            "signed",
+            "unsigned",
+            "_Bool",
+            "_Complex",
+            "_Float16",
+            "_Float32",
+            "_Float64",
+            "__int128",
+            "__int128_t",
+            "__uint128_t",
+            "__builtin_va_list",
+            "struct",
+            "union",
+            "enum",
+            "typeof",
+            "__typeof__",
+            "__typeof",
+            "_Atomic",
+        ] {
+            let table = StringTable::new();
+            let sid = id(&table, s);
+            assert!(has_tag(sid, TYPE_SPEC), "'{}' should have TYPE_SPEC", s);
         }
     }
 
     #[test]
     fn test_tags_qualifier() {
-        let qualifiers = [
-            CONST,
-            VOLATILE,
-            RESTRICT,
-            ATOMIC,
-            GNU_CONST,
-            GNU_CONST2,
-            GNU_VOLATILE,
-            GNU_VOLATILE2,
-            GNU_RESTRICT,
-            GNU_RESTRICT2,
-        ];
-        for &id in &qualifiers {
-            assert!(
-                has_tag(id, QUALIFIER),
-                "'{}' should have QUALIFIER",
-                KEYWORD_STRINGS[id.0 as usize - 1]
-            );
+        for &s in &[
+            "const",
+            "volatile",
+            "restrict",
+            "_Atomic",
+            "__const__",
+            "__const",
+            "__volatile__",
+            "__volatile",
+            "__restrict__",
+            "__restrict",
+        ] {
+            let table = StringTable::new();
+            let sid = id(&table, s);
+            assert!(has_tag(sid, QUALIFIER), "'{}' should have QUALIFIER", s);
         }
     }
 
     #[test]
     fn test_tags_type_keyword() {
-        // Exact 25 members that match is_type_keyword()
-        let type_keywords = [
-            VOID,
-            BOOL,
-            COMPLEX,
-            ATOMIC,
-            CHAR,
-            SHORT,
-            INT,
-            LONG,
-            FLOAT,
-            DOUBLE,
-            FLOAT16,
-            FLOAT32,
-            FLOAT64,
-            SIGNED,
-            UNSIGNED,
-            CONST,
-            VOLATILE,
-            STRUCT,
-            UNION,
-            ENUM,
-            INT128,
-            INT128_T,
-            UINT128_T,
-            BUILTIN_VA_LIST,
-            TYPEOF,
-            GNU_TYPEOF,
-            GNU_TYPEOF2,
-        ];
-        for &id in &type_keywords {
+        for &s in &[
+            "void",
+            "_Bool",
+            "_Complex",
+            "_Atomic",
+            "char",
+            "short",
+            "int",
+            "long",
+            "float",
+            "double",
+            "_Float16",
+            "_Float32",
+            "_Float64",
+            "signed",
+            "unsigned",
+            "const",
+            "volatile",
+            "struct",
+            "union",
+            "enum",
+            "__int128",
+            "__int128_t",
+            "__uint128_t",
+            "__builtin_va_list",
+            "typeof",
+            "__typeof__",
+            "__typeof",
+        ] {
+            let table = StringTable::new();
+            let sid = id(&table, s);
             assert!(
-                has_tag(id, TYPE_KEYWORD),
+                has_tag(sid, TYPE_KEYWORD),
                 "'{}' should have TYPE_KEYWORD",
-                KEYWORD_STRINGS[id.0 as usize - 1]
+                s
             );
         }
     }
 
     #[test]
     fn test_tags_decl_start() {
-        // All 43+ entries from current is_declaration_start()
-        let decl_start = [
-            VOID,
-            CHAR,
-            SHORT,
-            INT,
-            LONG,
-            FLOAT,
-            DOUBLE,
-            FLOAT16,
-            FLOAT32,
-            FLOAT64,
-            COMPLEX,
-            ATOMIC,
-            ALIGNAS,
-            SIGNED,
-            UNSIGNED,
-            CONST,
-            VOLATILE,
-            STATIC,
-            EXTERN,
-            AUTO,
-            REGISTER,
-            TYPEDEF,
-            INLINE,
-            GNU_INLINE2,
-            GNU_INLINE,
-            NORETURN,
-            GNU_NORETURN,
-            STRUCT,
-            UNION,
-            ENUM,
-            BOOL,
-            GNU_ATTRIBUTE,
-            GNU_ATTRIBUTE2,
-            INT128,
-            INT128_T,
-            UINT128_T,
-            BUILTIN_VA_LIST,
-            TYPEOF,
-            GNU_TYPEOF,
-            GNU_TYPEOF2,
-            THREAD_LOCAL,
-            GNU_THREAD,
-            STATIC_ASSERT,
-            STATIC_ASSERT_C23,
-        ];
-        for &id in &decl_start {
-            assert!(
-                has_tag(id, DECL_START),
-                "'{}' should have DECL_START",
-                KEYWORD_STRINGS[id.0 as usize - 1]
-            );
+        for &s in &[
+            "void",
+            "char",
+            "short",
+            "int",
+            "long",
+            "float",
+            "double",
+            "_Float16",
+            "_Float32",
+            "_Float64",
+            "_Complex",
+            "_Atomic",
+            "_Alignas",
+            "signed",
+            "unsigned",
+            "const",
+            "volatile",
+            "static",
+            "extern",
+            "auto",
+            "register",
+            "typedef",
+            "inline",
+            "__inline",
+            "__inline__",
+            "_Noreturn",
+            "__noreturn__",
+            "struct",
+            "union",
+            "enum",
+            "_Bool",
+            "__attribute__",
+            "__attribute",
+            "__int128",
+            "__int128_t",
+            "__uint128_t",
+            "__builtin_va_list",
+            "typeof",
+            "__typeof__",
+            "__typeof",
+            "_Thread_local",
+            "__thread",
+            "_Static_assert",
+            "static_assert",
+        ] {
+            let table = StringTable::new();
+            let sid = id(&table, s);
+            assert!(has_tag(sid, DECL_START), "'{}' should have DECL_START", s);
         }
     }
 
     #[test]
     fn test_tags_nullability() {
-        let nullability = [
-            NONNULL,
-            GNU_NONNULL,
-            NULLABLE,
-            GNU_NULLABLE,
-            NULL_UNSPECIFIED,
-            GNU_NULL_UNSPECIFIED,
-        ];
-        for &id in &nullability {
-            assert!(
-                has_tag(id, NULLABILITY),
-                "'{}' should have NULLABILITY",
-                KEYWORD_STRINGS[id.0 as usize - 1]
-            );
+        for &s in &[
+            "_Nonnull",
+            "__nonnull",
+            "_Nullable",
+            "__nullable",
+            "_Null_unspecified",
+            "__null_unspecified",
+        ] {
+            let table = StringTable::new();
+            let sid = id(&table, s);
+            assert!(has_tag(sid, NULLABILITY), "'{}' should have NULLABILITY", s);
         }
     }
 
     #[test]
     fn test_tags_builtin() {
-        // Spot-check some builtins
+        // Spot-check some builtins (named constants)
         let builtins = [
             BUILTIN_VA_START,
             BUILTIN_VA_END,
@@ -616,11 +603,11 @@ mod tests {
             C11_ATOMIC_STORE,
             C11_ATOMIC_EXCHANGE,
         ];
-        for &id in &builtins {
+        for &bid in &builtins {
             assert!(
-                has_tag(id, BUILTIN),
+                has_tag(bid, BUILTIN),
                 "'{}' should have BUILTIN",
-                KEYWORD_STRINGS[id.0 as usize - 1]
+                KEYWORD_STRINGS[bid.0 as usize - 1]
             );
         }
         // Count total builtins
@@ -634,23 +621,24 @@ mod tests {
 
     #[test]
     fn test_tags_supported_attr() {
-        let attrs = [
-            ATTR_NORETURN,
-            GNU_NORETURN,
-            ATTR_UNUSED,
-            GNU_ATTR_UNUSED,
-            ATTR_ALIGNED,
-            GNU_ATTR_ALIGNED,
-            ATTR_PACKED,
-            GNU_ATTR_PACKED,
-            ATTR_ALWAYS_INLINE,
-            GNU_ATTR_ALWAYS_INLINE,
-        ];
-        for &id in &attrs {
+        for &s in &[
+            "noreturn",
+            "__noreturn__",
+            "unused",
+            "__unused__",
+            "aligned",
+            "__aligned__",
+            "packed",
+            "__packed__",
+            "always_inline",
+            "__always_inline__",
+        ] {
+            let table = StringTable::new();
+            let sid = id(&table, s);
             assert!(
-                has_tag(id, SUPPORTED_ATTR),
+                has_tag(sid, SUPPORTED_ATTR),
                 "'{}' should have SUPPORTED_ATTR",
-                KEYWORD_STRINGS[id.0 as usize - 1]
+                s
             );
         }
     }

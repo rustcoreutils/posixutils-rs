@@ -646,7 +646,7 @@ impl<'a> Parser<'a> {
         self.peek() == TokenType::Ident
             && self
                 .get_ident_id(self.current())
-                .is_some_and(|id| super::is_nullability_qualifier(id))
+                .is_some_and(super::is_nullability_qualifier)
     }
 
     /// Check if current token is __asm or __asm__

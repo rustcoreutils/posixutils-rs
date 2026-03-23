@@ -3206,21 +3206,25 @@ impl<'a> Preprocessor<'a> {
             return false;
         }
 
+        // Try to get the first token from the argument list
+        let first_tok = match args[0].first() {
+            Some(tok) => tok,
+            None => return false,
+        };
+
         // Try to get StringId directly for O(1) tag-based lookup
-        let arg_id = args[0].first().and_then(|tok| {
-            if let TokenValue::Ident(id) = &tok.value {
-                Some(*id)
-            } else {
-                None
-            }
-        });
+        let arg_id = if let TokenValue::Ident(id) = &first_tok.value {
+            Some(*id)
+        } else {
+            None
+        };
 
         match builtin {
             BuiltinMacro::HasAttribute => {
                 if let Some(id) = arg_id {
                     crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR)
                 } else {
-                    let name = self.token_to_string(args[0].first().unwrap(), idents);
+                    let name = self.token_to_string(first_tok, idents);
                     is_supported_attribute(&name)
                 }
             }
@@ -3228,16 +3232,12 @@ impl<'a> Preprocessor<'a> {
                 if let Some(id) = arg_id {
                     crate::builtins::is_builtin_id(id)
                 } else {
-                    let name = self.token_to_string(args[0].first().unwrap(), idents);
+                    let name = self.token_to_string(first_tok, idents);
                     crate::builtins::is_builtin(name.as_str())
                 }
             }
             BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
-                let name = if let Some(tok) = args[0].first() {
-                    self.token_to_string(tok, idents)
-                } else {
-                    return false;
-                };
+                let name = self.token_to_string(first_tok, idents);
                 // Return true for features/extensions we implement
                 matches!(
                     name.as_str(),

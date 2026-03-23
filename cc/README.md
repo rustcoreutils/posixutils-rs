@@ -34,6 +34,8 @@ Key source files:
 | `parse/parser.rs` | Recursive descent parser producing AST |
 | `parse/ast.rs` | AST node definitions |
 | `types.rs` | C type system |
+| `strings.rs` | String interning (StringId), pre-interns keywords at startup |
+| `kw.rs` | Pre-interned keyword constants and tag-based classification |
 | `symbol.rs` | Symbol table with scope management |
 | `ir/linearize.rs` | AST → IR conversion, SSA construction |
 | `ir/mod.rs` | Intermediate representation definitions |

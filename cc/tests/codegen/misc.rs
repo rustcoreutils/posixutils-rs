@@ -3886,6 +3886,43 @@ int main(void) {
     );
 }
 
+/// Bug AL: Inlining a function with a MEMORY-class struct parameter (>32 bytes,
+/// passed on stack) caused symaddr of the Arg pseudo to produce a pointer-to-pointer
+/// instead of the struct address. The fix converts symaddr-on-Arg to copy during
+/// inlining, since call_args already provides the struct address.
+#[test]
+fn codegen_inline_large_struct_param() {
+    let code = r#"
+typedef struct {
+    long a[16]; // 128 bytes, MEMORY class on x86-64
+} BigStruct;
+
+int convert(void *obj, BigStruct *out) {
+    out->a[0] = 42;
+    out->a[1] = 99;
+    return 1;
+}
+
+long use_big(int how, BigStruct s) {
+    return s.a[0] + s.a[1] + how;
+}
+
+int main() {
+    BigStruct local;
+    int ok = convert((void*)0x1234, &local);
+    if (!ok) return 1;
+    long result = use_big(10, local);
+    // 42 + 99 + 10 = 151
+    if (result != 151) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("codegen_inline_large_struct_param", code),
+        0
+    );
+}
+
 // ============================================================================
 // __int128 codegen tests
 // ============================================================================

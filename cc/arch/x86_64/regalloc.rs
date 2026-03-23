@@ -1052,7 +1052,8 @@ impl RegAlloc {
 
                             // Stack slot reuse uses block-level interference checks
                             // (live_in/live_out from dataflow fixpoint) which are correct
-                            // for all CFG shapes. Addr-taken syms need stable addresses.
+                            // for all CFG shapes. Addr-taken syms need stable addresses
+                            // because symaddr-derived pointers may escape to callees.
                             let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
 
                             self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);

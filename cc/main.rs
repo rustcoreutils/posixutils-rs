@@ -219,6 +219,28 @@ struct Args {
     unsupported_mflags: Vec<String>,
 }
 
+/// Valid stage names for --dump-ir.
+const DUMP_IR_STAGES: &[&str] = &[
+    "post-linearize",
+    "post-hwmap",
+    "post-opt",
+    "post-lower",
+    "all",
+];
+
+/// Validate --dump-ir stage name. Returns error message if invalid.
+fn validate_dump_ir_stage(stage: &str) -> Result<(), String> {
+    if DUMP_IR_STAGES.contains(&stage) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown --dump-ir stage '{}'. Valid stages: {}",
+            stage,
+            DUMP_IR_STAGES.join(", ")
+        ))
+    }
+}
+
 /// Check if IR should be dumped at the given stage.
 fn should_dump_ir(args: &Args, stage: &str) -> bool {
     match args.dump_ir.as_deref() {
@@ -437,6 +459,12 @@ fn process_file(
             io::ErrorKind::InvalidData,
             "compilation failed",
         ));
+    }
+
+    if let Some(stage) = &args.dump_ir {
+        if let Err(msg) = validate_dump_ir_stage(stage) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+        }
     }
 
     if args.dump_ast {

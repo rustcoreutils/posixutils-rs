@@ -4761,3 +4761,52 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("codegen_float16_mega", code, &[]), 0);
 }
+
+/// Test that the AddC→AdcC carry chain survives optimization.
+/// The optimizer must not insert flag-clobbering instructions between
+/// the add-with-carry pair. This test exercises large int128 values
+/// that require actual carry propagation.
+#[test]
+fn codegen_int128_carry_chain_optimized() {
+    let code = r#"
+typedef __int128 int128;
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    /* Add with carry: build 0xFFFFFFFFFFFFFFFF via runtime to avoid
+       constant-folding into a negative i128 literal */
+    unsigned long long max64 = ~0ULL;
+    uint128 a = (uint128)max64;
+    uint128 b = 1;
+    uint128 sum = a + b;
+    /* sum should be 0x0000000000000001_0000000000000000 */
+    if ((unsigned long long)sum != 0) return 1;
+    if ((unsigned long long)(sum >> 64) != 1) return 2;
+
+    /* Sub with borrow: 0x1_0000000000000000 - 1 must borrow */
+    uint128 f = (uint128)1 << 64;
+    uint128 g = f - 1;
+    if ((unsigned long long)g != 0xFFFFFFFFFFFFFFFFULL) return 5;
+    if ((unsigned long long)(g >> 64) != 0) return 6;
+
+    /* Negation of 1: should produce all-1s */
+    int128 h = 1;
+    int128 neg_h = -h;
+    if (neg_h != -1) return 7;
+
+    /* Multiply with carry: (2^63) * 2 = 2^64 (crosses lo/hi boundary) */
+    unsigned long long half = 0x8000000000000000ULL;
+    uint128 i = (uint128)half;
+    uint128 j = 2;
+    uint128 prod = i * j;
+    if ((unsigned long long)prod != 0) return 8;
+    if ((unsigned long long)(prod >> 64) != 1) return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("codegen_int128_carry_chain_optimized", code),
+        0
+    );
+}

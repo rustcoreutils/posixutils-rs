@@ -346,7 +346,8 @@ fn map_int128_expand(insn: &Instruction, types: &TypeTable) -> Option<HwMapActio
             }
             Some(HwMapAction::Expand)
         }
-        // Comparisons: size==128 is the operand size, result is int/bool
+        // Comparisons: size==128 is the operand size, result is int/bool.
+        // Verify via src_typ that operands are actually int128 (not long double).
         Opcode::SetEq
         | Opcode::SetNe
         | Opcode::SetLt
@@ -356,7 +357,15 @@ fn map_int128_expand(insn: &Instruction, types: &TypeTable) -> Option<HwMapActio
         | Opcode::SetB
         | Opcode::SetBe
         | Opcode::SetA
-        | Opcode::SetAe => Some(HwMapAction::Expand),
+        | Opcode::SetAe => {
+            // insn.typ on comparisons is the operand type (not result type).
+            // Check it's actually Int128, not some other 128-bit type.
+            let typ = insn.typ?;
+            if types.kind(typ) != TypeKind::Int128 {
+                return None;
+            }
+            Some(HwMapAction::Expand)
+        }
         _ => None,
     }
 }
@@ -462,29 +471,14 @@ fn map_float16_softfloat(insn: &Instruction, types: &TypeTable) -> Option<HwMapA
         | Opcode::FCmpOLe
         | Opcode::FCmpOGt
         | Opcode::FCmpOGe => {
-            // Comparisons store the operand type in src_typ or check size
             if let Some(src_typ) = insn.src_typ {
                 if types.kind(src_typ) == TypeKind::Float16 {
                     return Some(HwMapAction::Expand);
                 }
             }
-            // Also check by size: Float16 operations have size==16
+            // Fallback: check operand size (Float16 = 16 bits)
             if insn.size == 16 {
-                if let Some(typ) = insn.typ {
-                    // Result type is int, but check if this is a float comparison
-                    if matches!(
-                        insn.op,
-                        Opcode::FCmpOEq
-                            | Opcode::FCmpONe
-                            | Opcode::FCmpOLt
-                            | Opcode::FCmpOLe
-                            | Opcode::FCmpOGt
-                            | Opcode::FCmpOGe
-                    ) {
-                        let _ = typ;
-                        return Some(HwMapAction::Expand);
-                    }
-                }
+                return Some(HwMapAction::Expand);
             }
             None
         }
@@ -754,6 +748,7 @@ fn expand_insn(
     types: &TypeTable,
     target: &Target,
 ) {
+    // Int128 expansion: typ is Int128 for arith/bitwise, or operand type for comparisons
     if insn.size == 128 {
         if let Some(typ) = insn.typ {
             if types.kind(typ) == TypeKind::Int128 {
@@ -762,7 +757,30 @@ fn expand_insn(
             }
         }
     }
-    expand_float16(insn, func, new_insns, types, target);
+
+    // Float16 soft-float expansion (x86-64 only)
+    if matches!(
+        insn.op,
+        Opcode::FAdd
+            | Opcode::FSub
+            | Opcode::FMul
+            | Opcode::FDiv
+            | Opcode::FNeg
+            | Opcode::FCmpOEq
+            | Opcode::FCmpONe
+            | Opcode::FCmpOLt
+            | Opcode::FCmpOLe
+            | Opcode::FCmpOGt
+            | Opcode::FCmpOGe
+    ) {
+        expand_float16(insn, func, new_insns, types, target);
+        return;
+    }
+
+    panic!(
+        "expand_insn: unhandled Expand for {} (size={}) in function {}",
+        insn.op, insn.size, func.name
+    );
 }
 
 /// Allocate a new 64-bit register pseudo.
@@ -770,6 +788,20 @@ fn alloc_reg64(func: &mut Function) -> PseudoId {
     let id = func.alloc_pseudo();
     func.add_pseudo(Pseudo::reg(id, id.0));
     id
+}
+
+/// Extract lo and hi 64-bit halves from a 128-bit pseudo.
+fn extract_halves(
+    func: &mut Function,
+    new_insns: &mut Vec<Instruction>,
+    src: PseudoId,
+    long_type: TypeId,
+) -> (PseudoId, PseudoId) {
+    let lo = alloc_reg64(func);
+    new_insns.push(Instruction::unop(Opcode::Lo64, lo, src, long_type, 64));
+    let hi = alloc_reg64(func);
+    new_insns.push(Instruction::unop(Opcode::Hi64, hi, src, long_type, 64));
+    (lo, hi)
 }
 
 /// Expand an int128 instruction into 64-bit operations using Lo64/Hi64/Pair64.
@@ -783,32 +815,16 @@ fn expand_int128(
     let long_type = types.ulong_id;
 
     match insn.op {
-        // Bitwise: Lo64+Hi64 both operands, 64-bit op on each half, Pair64
+        // Bitwise: independent 64-bit ops on lo/hi halves
         Opcode::And | Opcode::Or | Opcode::Xor => {
-            let src1 = insn.src[0];
-            let src2 = insn.src[1];
+            let (a_lo, a_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
+            let (b_lo, b_hi) = extract_halves(func, new_insns, insn.src[1], long_type);
 
-            let a_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, a_lo, src1, long_type, 64));
-
-            let a_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, a_hi, src1, long_type, 64));
-
-            let b_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, b_lo, src2, long_type, 64));
-
-            let b_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, b_hi, src2, long_type, 64));
-
-            // 64-bit op on lo halves
             let r_lo = alloc_reg64(func);
             new_insns.push(Instruction::binop(insn.op, r_lo, a_lo, b_lo, long_type, 64));
-
-            // 64-bit op on hi halves
             let r_hi = alloc_reg64(func);
             new_insns.push(Instruction::binop(insn.op, r_hi, a_hi, b_hi, long_type, 64));
 
-            // Combine into 128-bit result
             let int128_type = insn.typ.unwrap();
             new_insns.push(Instruction::binop(
                 Opcode::Pair64,
@@ -820,13 +836,9 @@ fn expand_int128(
             ));
         }
 
-        // Not: Lo64+Hi64, Not each, Pair64
+        // Not: decompose, not each half
         Opcode::Not => {
-            let src = insn.src[0];
-            let s_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, s_lo, src, long_type, 64));
-            let s_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, s_hi, src, long_type, 64));
+            let (s_lo, s_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
 
             let r_lo = alloc_reg64(func);
             new_insns.push(Instruction::unop(Opcode::Not, r_lo, s_lo, long_type, 64));
@@ -844,18 +856,12 @@ fn expand_int128(
             ));
         }
 
-        // Neg: SubC(0, lo), SbcC(0, hi, carry), Pair64
+        // Neg: 0 - value with borrow chain
         Opcode::Neg => {
-            let src = insn.src[0];
-            let s_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, s_lo, src, long_type, 64));
-            let s_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, s_hi, src, long_type, 64));
-
+            let (s_lo, s_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
             let zero = func.create_const_pseudo(0);
 
             let r_lo = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(r_lo, r_lo.0));
             new_insns.push(Instruction::binop(
                 Opcode::SubC,
                 r_lo,
@@ -864,11 +870,9 @@ fn expand_int128(
                 long_type,
                 64,
             ));
-
             let r_hi = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(r_hi, r_hi.0));
             let mut sbc = Instruction::binop(Opcode::SbcC, r_hi, zero, s_hi, long_type, 64);
-            sbc.src.push(r_lo); // src[2] = borrow producer
+            sbc.src.push(r_lo);
             new_insns.push(sbc);
 
             let int128_type = insn.typ.unwrap();
@@ -882,22 +886,12 @@ fn expand_int128(
             ));
         }
 
-        // Add: AddC(lo,lo), AdcC(hi,hi,carry), Pair64
+        // Add: carry chain
         Opcode::Add => {
-            let src1 = insn.src[0];
-            let src2 = insn.src[1];
-
-            let a_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, a_lo, src1, long_type, 64));
-            let a_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, a_hi, src1, long_type, 64));
-            let b_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, b_lo, src2, long_type, 64));
-            let b_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, b_hi, src2, long_type, 64));
+            let (a_lo, a_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
+            let (b_lo, b_hi) = extract_halves(func, new_insns, insn.src[1], long_type);
 
             let r_lo = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(r_lo, r_lo.0));
             new_insns.push(Instruction::binop(
                 Opcode::AddC,
                 r_lo,
@@ -906,11 +900,9 @@ fn expand_int128(
                 long_type,
                 64,
             ));
-
             let r_hi = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(r_hi, r_hi.0));
             let mut adc = Instruction::binop(Opcode::AdcC, r_hi, a_hi, b_hi, long_type, 64);
-            adc.src.push(r_lo); // src[2] = carry producer
+            adc.src.push(r_lo);
             new_insns.push(adc);
 
             let int128_type = insn.typ.unwrap();
@@ -924,22 +916,12 @@ fn expand_int128(
             ));
         }
 
-        // Sub: SubC(lo,lo), SbcC(hi,hi,borrow), Pair64
+        // Sub: borrow chain
         Opcode::Sub => {
-            let src1 = insn.src[0];
-            let src2 = insn.src[1];
-
-            let a_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, a_lo, src1, long_type, 64));
-            let a_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, a_hi, src1, long_type, 64));
-            let b_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, b_lo, src2, long_type, 64));
-            let b_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, b_hi, src2, long_type, 64));
+            let (a_lo, a_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
+            let (b_lo, b_hi) = extract_halves(func, new_insns, insn.src[1], long_type);
 
             let r_lo = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(r_lo, r_lo.0));
             new_insns.push(Instruction::binop(
                 Opcode::SubC,
                 r_lo,
@@ -948,11 +930,9 @@ fn expand_int128(
                 long_type,
                 64,
             ));
-
             let r_hi = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(r_hi, r_hi.0));
             let mut sbc = Instruction::binop(Opcode::SbcC, r_hi, a_hi, b_hi, long_type, 64);
-            sbc.src.push(r_lo); // src[2] = borrow producer
+            sbc.src.push(r_lo);
             new_insns.push(sbc);
 
             let int128_type = insn.typ.unwrap();
@@ -966,21 +946,11 @@ fn expand_int128(
             ));
         }
 
-        // Mul: a*b = (a_lo*b_lo) + ((a_lo*b_hi + a_hi*b_lo) << 64)
+        // Mul: cross-product decomposition
         Opcode::Mul => {
-            let src1 = insn.src[0];
-            let src2 = insn.src[1];
+            let (a_lo, a_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
+            let (b_lo, b_hi) = extract_halves(func, new_insns, insn.src[1], long_type);
 
-            let a_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, a_lo, src1, long_type, 64));
-            let a_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, a_hi, src1, long_type, 64));
-            let b_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, b_lo, src2, long_type, 64));
-            let b_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, b_hi, src2, long_type, 64));
-
-            // low_result = a_lo * b_lo (lower 64 bits)
             let low_result = alloc_reg64(func);
             new_insns.push(Instruction::binop(
                 Opcode::Mul,
@@ -991,9 +961,7 @@ fn expand_int128(
                 64,
             ));
 
-            // high_part = umulhi(a_lo, b_lo) (upper 64 bits of full 128-bit product)
             let high_part = alloc_reg64(func);
-            func.add_pseudo(Pseudo::reg(high_part, high_part.0));
             new_insns.push(Instruction::binop(
                 Opcode::UMulHi,
                 high_part,
@@ -1003,7 +971,6 @@ fn expand_int128(
                 64,
             ));
 
-            // cross1 = a_lo * b_hi
             let cross1 = alloc_reg64(func);
             new_insns.push(Instruction::binop(
                 Opcode::Mul,
@@ -1014,7 +981,6 @@ fn expand_int128(
                 64,
             ));
 
-            // cross2 = a_hi * b_lo
             let cross2 = alloc_reg64(func);
             new_insns.push(Instruction::binop(
                 Opcode::Mul,
@@ -1025,7 +991,6 @@ fn expand_int128(
                 64,
             ));
 
-            // final_hi = high_part + cross1 + cross2
             let sum1 = alloc_reg64(func);
             new_insns.push(Instruction::binop(
                 Opcode::Add,
@@ -1056,19 +1021,10 @@ fn expand_int128(
             ));
         }
 
-        // Eq/Ne: xor lo halves, xor hi halves, or results, compare to 0
+        // Eq/Ne: xor+or reduction, then 64-bit compare against 0
         Opcode::SetEq | Opcode::SetNe => {
-            let src1 = insn.src[0];
-            let src2 = insn.src[1];
-
-            let a_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, a_lo, src1, long_type, 64));
-            let a_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, a_hi, src1, long_type, 64));
-            let b_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, b_lo, src2, long_type, 64));
-            let b_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, b_hi, src2, long_type, 64));
+            let (a_lo, a_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
+            let (b_lo, b_hi) = extract_halves(func, new_insns, insn.src[1], long_type);
 
             let xor_lo = alloc_reg64(func);
             new_insns.push(Instruction::binop(
@@ -1099,13 +1055,12 @@ fn expand_int128(
             ));
 
             let zero = func.create_const_pseudo(0);
-            // Final comparison is 64-bit (comparing reduced or-result against 0)
             new_insns.push(Instruction::binop(
                 insn.op, result, or_result, zero, long_type, 64,
             ));
         }
 
-        // Ordered comparisons: compare hi halves, if equal compare lo halves (unsigned)
+        // Ordered comparisons: hi compare + Select(hi_eq, lo_cmp, hi_cmp)
         Opcode::SetLt
         | Opcode::SetLe
         | Opcode::SetGt
@@ -1114,20 +1069,9 @@ fn expand_int128(
         | Opcode::SetBe
         | Opcode::SetA
         | Opcode::SetAe => {
-            let src1 = insn.src[0];
-            let src2 = insn.src[1];
+            let (a_lo, a_hi) = extract_halves(func, new_insns, insn.src[0], long_type);
+            let (b_lo, b_hi) = extract_halves(func, new_insns, insn.src[1], long_type);
 
-            let a_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, a_lo, src1, long_type, 64));
-            let a_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, a_hi, src1, long_type, 64));
-            let b_lo = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Lo64, b_lo, src2, long_type, 64));
-            let b_hi = alloc_reg64(func);
-            new_insns.push(Instruction::unop(Opcode::Hi64, b_hi, src2, long_type, 64));
-
-            // All decomposed comparisons are 64-bit
-            // hi_eq = (a_hi == b_hi)
             let hi_eq = alloc_reg64(func);
             new_insns.push(Instruction::binop(
                 Opcode::SetEq,
@@ -1138,13 +1082,12 @@ fn expand_int128(
                 64,
             ));
 
-            // hi_cmp = signed/unsigned comparison on hi halves (original op)
             let hi_cmp = alloc_reg64(func);
             new_insns.push(Instruction::binop(
                 insn.op, hi_cmp, a_hi, b_hi, long_type, 64,
             ));
 
-            // lo_cmp = UNSIGNED comparison on lo halves
+            // Low halves always use unsigned compare
             let lo_op = match insn.op {
                 Opcode::SetLt | Opcode::SetB => Opcode::SetB,
                 Opcode::SetLe | Opcode::SetBe => Opcode::SetBe,
@@ -1155,7 +1098,6 @@ fn expand_int128(
             let lo_cmp = alloc_reg64(func);
             new_insns.push(Instruction::binop(lo_op, lo_cmp, a_lo, b_lo, long_type, 64));
 
-            // result = hi_eq ? lo_cmp : hi_cmp
             new_insns.push(Instruction::select(
                 result, hi_eq, lo_cmp, hi_cmp, long_type, 64,
             ));

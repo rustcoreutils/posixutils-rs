@@ -591,7 +591,8 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Reg(r) => {
-                // Register: treat as containing the low 64 bits
+                // After optimization, a 64-bit value feeding Pair64 may be
+                // register-allocated. Lo64 of such a value is the register itself.
                 if *r != dst {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
@@ -629,7 +630,8 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Reg(_) => {
-                // Register holds a scalar; hi half is 0
+                // After optimization, a 64-bit value feeding Pair64 may be
+                // register-allocated. Hi64 of such a value is always 0.
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Imm(0),

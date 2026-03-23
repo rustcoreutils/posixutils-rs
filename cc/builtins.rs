@@ -128,6 +128,7 @@ pub fn is_builtin_id(id: crate::strings::StringId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strings::StringTable;
 
     #[test]
     fn test_is_builtin() {
@@ -136,5 +137,22 @@ mod tests {
         assert!(is_builtin("__c11_atomic_load"));
         assert!(!is_builtin("__builtin_nonexistent"));
         assert!(!is_builtin("printf"));
+    }
+
+    /// Verify every SUPPORTED_BUILTINS entry has the BUILTIN tag in kw.rs,
+    /// ensuring the string list and tag-based lookup can never diverge.
+    #[test]
+    fn test_supported_builtins_match_kw_tags() {
+        let table = StringTable::new();
+        for &name in SUPPORTED_BUILTINS {
+            let id = table
+                .lookup(name)
+                .unwrap_or_else(|| panic!("builtin '{}' not pre-interned in kw.rs", name));
+            assert!(
+                is_builtin_id(id),
+                "builtin '{}' is in SUPPORTED_BUILTINS but missing BUILTIN tag in kw.rs",
+                name
+            );
+        }
     }
 }

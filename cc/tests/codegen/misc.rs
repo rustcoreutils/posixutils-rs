@@ -4810,3 +4810,178 @@ int main(void) {
         0
     );
 }
+
+/// Test uint128 large constant sign-extension bug fix.
+/// Verifies that (uint128)0xFFFFFFFFFFFFFFFFULL has hi=0, lo=max64.
+#[test]
+fn codegen_uint128_large_constant() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+
+int main(void) {
+    /* Build 0xFFFFFFFFFFFFFFFF via runtime to ensure it's not constant-folded
+       differently. */
+    unsigned long long max64 = ~0ULL;
+    uint128 val = (uint128)max64;
+
+    /* lo half should be all 1s, hi half should be 0 */
+    unsigned long long lo = (unsigned long long)val;
+    unsigned long long hi = (unsigned long long)(val >> 64);
+    if (lo != max64) return 1;
+    if (hi != 0) return 2;
+
+    /* Zero */
+    uint128 z = 0;
+    if ((unsigned long long)z != 0) return 3;
+    if ((unsigned long long)(z >> 64) != 0) return 4;
+
+    /* Value 1 */
+    uint128 one = 1;
+    if ((unsigned long long)one != 1) return 5;
+    if ((unsigned long long)(one >> 64) != 0) return 6;
+
+    /* Constant that fills both halves */
+    uint128 full = ((uint128)max64 << 64) | (uint128)max64;
+    if ((unsigned long long)full != max64) return 7;
+    if ((unsigned long long)(full >> 64) != max64) return 8;
+
+    /* Value that fits in 64 bits exactly */
+    uint128 mid = (uint128)0x123456789ABCDEF0ULL;
+    if ((unsigned long long)mid != 0x123456789ABCDEF0ULL) return 9;
+    if ((unsigned long long)(mid >> 64) != 0) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_uint128_large_constant", code, &[]),
+        0
+    );
+}
+
+/// Test int128 constant shifts (Shl/Lsr/Asr) decomposed in the mapping pass.
+#[test]
+fn codegen_int128_const_shifts() {
+    let code = r#"
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+
+int main(void) {
+    unsigned long long max64 = ~0ULL;
+
+    /* ===== SHL tests (returns 1-19) ===== */
+    {
+        uint128 a = 1;
+
+        /* shift by 0: identity */
+        uint128 r = a << 0;
+        if ((unsigned long long)r != 1) return 1;
+        if ((unsigned long long)(r >> 64) != 0) return 2;
+
+        /* shift by 1 */
+        r = a << 1;
+        if ((unsigned long long)r != 2) return 3;
+
+        /* shift by 32 */
+        r = a << 32;
+        if ((unsigned long long)r != (1ULL << 32)) return 4;
+
+        /* shift by 63: crosses lo/hi boundary */
+        r = a << 63;
+        if ((unsigned long long)r != (1ULL << 63)) return 5;
+        if ((unsigned long long)(r >> 64) != 0) return 6;
+
+        /* shift by 64: lo moves to hi entirely */
+        r = a << 64;
+        if ((unsigned long long)r != 0) return 7;
+        if ((unsigned long long)(r >> 64) != 1) return 8;
+
+        /* shift by 65 */
+        r = a << 65;
+        if ((unsigned long long)r != 0) return 9;
+        if ((unsigned long long)(r >> 64) != 2) return 10;
+
+        /* shift by 127 */
+        r = a << 127;
+        if ((unsigned long long)r != 0) return 11;
+        if ((unsigned long long)(r >> 64) != (1ULL << 63)) return 12;
+    }
+
+    /* ===== LSR tests (returns 20-39) ===== */
+    {
+        /* Start with hi bit set */
+        uint128 a = (uint128)1 << 127;
+
+        /* shift by 0: identity */
+        uint128 r = a >> 0;
+        if ((unsigned long long)(r >> 64) != (1ULL << 63)) return 20;
+
+        /* shift by 1 */
+        r = a >> 1;
+        if ((unsigned long long)(r >> 64) != (1ULL << 62)) return 21;
+
+        /* shift by 32 */
+        r = a >> 32;
+        if ((unsigned long long)(r >> 64) != (1ULL << 31)) return 22;
+
+        /* shift by 63 */
+        r = a >> 63;
+        if ((unsigned long long)(r >> 64) != 1) return 23;
+        if ((unsigned long long)r != 0) return 24;
+
+        /* shift by 64 */
+        r = a >> 64;
+        if ((unsigned long long)(r >> 64) != 0) return 25;
+        if ((unsigned long long)r != (1ULL << 63)) return 26;
+
+        /* shift by 65 */
+        r = a >> 65;
+        if ((unsigned long long)r != (1ULL << 62)) return 27;
+
+        /* shift by 127 */
+        r = a >> 127;
+        if ((unsigned long long)r != 1) return 28;
+        if ((unsigned long long)(r >> 64) != 0) return 29;
+    }
+
+    /* ===== ASR tests (returns 40-59) ===== */
+    {
+        /* Negative int128 */
+        int128 neg = -1;
+
+        /* shift by 0: identity */
+        int128 r = neg >> 0;
+        if (r != -1) return 40;
+
+        /* shift by 1: still all 1s */
+        r = neg >> 1;
+        if (r != -1) return 41;
+
+        /* shift by 63 */
+        r = neg >> 63;
+        if (r != -1) return 42;
+
+        /* shift by 64 */
+        r = neg >> 64;
+        if (r != -1) return 43;
+
+        /* shift by 127 */
+        r = neg >> 127;
+        if (r != -1) return 44;
+
+        /* Negative with specific pattern: -2 = 0xFFF...FFFE */
+        int128 neg2 = -2;
+        r = neg2 >> 1;
+        if (r != -1) return 45;
+
+        /* Large positive shifted right arithmetically stays positive */
+        int128 big = (int128)1 << 126;  /* 0x40...0 */
+        r = big >> 1;
+        if ((unsigned long long)(r >> 64) != (1ULL << 61)) return 46;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_int128_const_shifts", code, &[]), 0);
+}

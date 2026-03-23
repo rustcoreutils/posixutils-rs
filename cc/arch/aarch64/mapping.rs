@@ -9,10 +9,11 @@
 // AArch64 instruction mapping
 //
 
+use crate::abi::CallingConv;
 use crate::arch::mapping::{
-    alloc_reg64, build_binop_rtlib_call, build_convert_rtlib_call, build_rtlib_call_explicit,
-    int_suffix_for_longdouble, longdouble_needs_rtlib, map_int128_divmod, map_int128_expand,
-    map_int128_float_convert, ArchMapper, MappedInsn, MappingCtx, RtlibCallParams,
+    build_binop_rtlib_call, build_convert_rtlib_call, int_suffix_for_longdouble,
+    longdouble_needs_rtlib, map_int128_divmod, map_int128_expand, map_int128_float_convert,
+    ArchMapper, MappedInsn, MappingCtx,
 };
 use crate::ir::{Instruction, Opcode};
 use crate::types::TypeKind;
@@ -110,24 +111,23 @@ impl Aarch64Mapper {
                 let ld_type = ctx.types.longdouble_id;
 
                 // Allocate pseudo for cmp call result
-                let cmp_result = alloc_reg64(ctx.func);
+                let cmp_result = ctx.func.create_reg_pseudo();
                 let zero = ctx.func.create_const_pseudo(0);
 
                 // Build the rtlib call: cmp_result = __lttf2(left, right)
                 let arg_vals = insn.src.clone();
                 let arg_types = vec![ld_type; arg_vals.len()];
-                let call = build_rtlib_call_explicit(
-                    RtlibCallParams {
-                        target_pseudo: cmp_result,
-                        arg_vals: &arg_vals,
-                        func_name: name,
-                        arg_types,
-                        ret_type: int_type,
-                        pos: insn.pos,
-                    },
+                let mut call = Instruction::call_with_abi(
+                    Some(cmp_result),
+                    name,
+                    arg_vals,
+                    arg_types,
+                    int_type,
+                    CallingConv::C,
                     ctx.types,
                     ctx.target,
                 );
+                call.pos = insn.pos;
 
                 // Build the int comparison: result = cmp_op(cmp_result, 0)
                 let cmp =

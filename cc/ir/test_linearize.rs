@@ -3789,16 +3789,19 @@ fn test_float16_to_float_conversion() {
     };
     let module = ctx.linearize(&tu);
 
-    // Find call to __extendhfsf2
+    // Float16→float now emits FCvtF with src_typ=Float16 (mapping pass lowers to rtlib)
     let func = &module.functions[0];
-    let has_rtlib_call = func.blocks.iter().any(|bb| {
+    let has_fcvtf = func.blocks.iter().any(|bb| {
         bb.insns.iter().any(|insn| {
-            insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__extendhfsf2")
+            insn.op == Opcode::FCvtF
+                && insn
+                    .src_typ
+                    .is_some_and(|t| ctx.types.kind(t) == TypeKind::Float16)
         })
     });
     assert!(
-        has_rtlib_call,
-        "Float16 to float conversion should call __extendhfsf2"
+        has_fcvtf,
+        "Float16 to float conversion should emit FCvtF with Float16 src_typ"
     );
 }
 
@@ -3838,16 +3841,19 @@ fn test_float_to_float16_conversion() {
     };
     let module = ctx.linearize(&tu);
 
-    // Find call to __truncsfhf2
+    // float→Float16 now emits FCvtF with Float16 dst type (mapping pass lowers to rtlib)
     let func = &module.functions[0];
-    let has_rtlib_call = func.blocks.iter().any(|bb| {
+    let has_fcvtf = func.blocks.iter().any(|bb| {
         bb.insns.iter().any(|insn| {
-            insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__truncsfhf2")
+            insn.op == Opcode::FCvtF
+                && insn
+                    .typ
+                    .is_some_and(|t| ctx.types.kind(t) == TypeKind::Float16)
         })
     });
     assert!(
-        has_rtlib_call,
-        "Float to Float16 conversion should call __truncsfhf2"
+        has_fcvtf,
+        "Float to Float16 conversion should emit FCvtF with Float16 dst type"
     );
 }
 
@@ -3887,16 +3893,19 @@ fn test_float16_to_int_conversion() {
     };
     let module = ctx.linearize(&tu);
 
-    // Find call to __fixhfsi
+    // Float16→int now emits FCvtS with Float16 src_typ (mapping pass lowers to rtlib)
     let func = &module.functions[0];
-    let has_rtlib_call = func.blocks.iter().any(|bb| {
-        bb.insns
-            .iter()
-            .any(|insn| insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__fixhfsi"))
+    let has_fcvts = func.blocks.iter().any(|bb| {
+        bb.insns.iter().any(|insn| {
+            insn.op == Opcode::FCvtS
+                && insn
+                    .src_typ
+                    .is_some_and(|t| ctx.types.kind(t) == TypeKind::Float16)
+        })
     });
     assert!(
-        has_rtlib_call,
-        "Float16 to int conversion should call __fixhfsi"
+        has_fcvts,
+        "Float16 to int conversion should emit FCvtS with Float16 src_typ"
     );
 }
 
@@ -3936,16 +3945,19 @@ fn test_int_to_float16_conversion() {
     };
     let module = ctx.linearize(&tu);
 
-    // Find call to __floatsihf
+    // int→Float16 now emits SCvtF with Float16 dst type (mapping pass lowers to rtlib)
     let func = &module.functions[0];
-    let has_rtlib_call = func.blocks.iter().any(|bb| {
-        bb.insns
-            .iter()
-            .any(|insn| insn.op == Opcode::Call && insn.func_name.as_deref() == Some("__floatsihf"))
+    let has_scvtf = func.blocks.iter().any(|bb| {
+        bb.insns.iter().any(|insn| {
+            insn.op == Opcode::SCvtF
+                && insn
+                    .typ
+                    .is_some_and(|t| ctx.types.kind(t) == TypeKind::Float16)
+        })
     });
     assert!(
-        has_rtlib_call,
-        "Int to Float16 conversion should call __floatsihf"
+        has_scvtf,
+        "Int to Float16 conversion should emit SCvtF with Float16 dst type"
     );
 }
 

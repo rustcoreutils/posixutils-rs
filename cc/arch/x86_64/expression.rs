@@ -610,7 +610,7 @@ impl X86_64CodeGen {
         let loc = self.get_location(pseudo);
         match &loc {
             Loc::Imm(v) => {
-                let hi = (*v >> 64) as i64;
+                let hi = (*v >> 64) as u64 as i64;
                 if hi > i32::MAX as i64 || hi < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs { imm: hi, dst });
                 } else {

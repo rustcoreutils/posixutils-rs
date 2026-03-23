@@ -10,10 +10,12 @@
 //
 
 use crate::arch::mapping::{
-    expand_float16_arith, expand_float16_cmp, expand_float16_neg, map_int128_divmod,
-    map_int128_expand, map_int128_float_convert, ArchMapper, MappedInsn, MappingCtx,
+    build_f16_convert_call, expand_float16_arith, expand_float16_cmp, expand_float16_neg,
+    float_suffix, map_int128_divmod, map_int128_expand, map_int128_float_convert, ArchMapper,
+    MappedInsn, MappingCtx,
 };
 use crate::ir::{Instruction, Opcode};
+use crate::rtlib::RtlibNames;
 use crate::types::TypeKind;
 
 /// x86-64 instruction mapper.
@@ -90,8 +92,85 @@ impl X86_64Mapper {
                 }
                 None
             }
-            // Float16 conversions handled by linearizer, no mapping needed
-            Opcode::FCvtF => None,
+            // Float16↔float/double/longdouble conversions
+            Opcode::FCvtF => {
+                let src_typ = insn.src_typ?;
+                let dst_typ = insn.typ?;
+                let src_kind = types.kind(src_typ);
+                let dst_kind = types.kind(dst_typ);
+                if src_kind == TypeKind::Float16 {
+                    let to_suffix = float_suffix(dst_kind, ctx.target);
+                    let rtlib = RtlibNames::new(ctx.target);
+                    let func_name = rtlib.float16_convert("hf", to_suffix)?;
+                    let call = build_f16_convert_call(
+                        insn, func_name, src_typ, dst_typ, types, ctx.target,
+                    );
+                    Some(MappedInsn::Replace(vec![call]))
+                } else if dst_kind == TypeKind::Float16 {
+                    let from_suffix = float_suffix(src_kind, ctx.target);
+                    let rtlib = RtlibNames::new(ctx.target);
+                    let func_name = rtlib.float16_convert(from_suffix, "hf")?;
+                    let call = build_f16_convert_call(
+                        insn, func_name, src_typ, dst_typ, types, ctx.target,
+                    );
+                    Some(MappedInsn::Replace(vec![call]))
+                } else {
+                    None
+                }
+            }
+            // Float16↔integer conversions
+            Opcode::FCvtS | Opcode::FCvtU => {
+                // Float16 → int
+                let src_typ = insn.src_typ?;
+                if types.kind(src_typ) != TypeKind::Float16 {
+                    return None;
+                }
+                let dst_typ = insn.typ?;
+                let dst_size = types.size_bits(dst_typ);
+                let is_unsigned = insn.op == Opcode::FCvtU;
+                let to_suffix = if is_unsigned {
+                    if dst_size <= 32 {
+                        "usi"
+                    } else {
+                        "udi"
+                    }
+                } else if dst_size <= 32 {
+                    "si"
+                } else {
+                    "di"
+                };
+                let rtlib = RtlibNames::new(ctx.target);
+                let func_name = rtlib.float16_convert("hf", to_suffix)?;
+                let call =
+                    build_f16_convert_call(insn, func_name, src_typ, dst_typ, types, ctx.target);
+                Some(MappedInsn::Replace(vec![call]))
+            }
+            Opcode::SCvtF | Opcode::UCvtF => {
+                // int → Float16
+                let dst_typ = insn.typ?;
+                if types.kind(dst_typ) != TypeKind::Float16 {
+                    return None;
+                }
+                let src_typ = insn.src_typ?;
+                let src_size = types.size_bits(src_typ);
+                let is_unsigned = insn.op == Opcode::UCvtF;
+                let from_suffix = if is_unsigned {
+                    if src_size <= 32 {
+                        "usi"
+                    } else {
+                        "udi"
+                    }
+                } else if src_size <= 32 {
+                    "si"
+                } else {
+                    "di"
+                };
+                let rtlib = RtlibNames::new(ctx.target);
+                let func_name = rtlib.float16_convert(from_suffix, "hf")?;
+                let call =
+                    build_f16_convert_call(insn, func_name, src_typ, dst_typ, types, ctx.target);
+                Some(MappedInsn::Replace(vec![call]))
+            }
             _ => None,
         }
     }
@@ -463,5 +542,228 @@ mod tests {
             target: &target,
         };
         assert_legal(&mapper.map_insn(&insn, &mut ctx));
+    }
+
+    // ========================================================================
+    // Int128 constant shifts
+    // ========================================================================
+
+    #[test]
+    fn test_x86_64_int128_const_shl_expands() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // Create Shl.128 with constant shift amount
+        let mut func = make_minimal_func(&types);
+        let shift_const = func.create_const_pseudo(5);
+        let insn = Instruction::binop(
+            Opcode::Shl,
+            PseudoId(2),
+            PseudoId(0),
+            shift_const,
+            types.int128_id,
+            128,
+        );
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_expand(&mapper.map_insn(&insn, &mut ctx));
+    }
+
+    #[test]
+    fn test_x86_64_int128_const_lsr_expands() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        let mut func = make_minimal_func(&types);
+        let shift_const = func.create_const_pseudo(64);
+        let insn = Instruction::binop(
+            Opcode::Lsr,
+            PseudoId(2),
+            PseudoId(0),
+            shift_const,
+            types.uint128_id,
+            128,
+        );
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_expand(&mapper.map_insn(&insn, &mut ctx));
+    }
+
+    #[test]
+    fn test_x86_64_int128_const_asr_expands() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        let mut func = make_minimal_func(&types);
+        let shift_const = func.create_const_pseudo(127);
+        let insn = Instruction::binop(
+            Opcode::Asr,
+            PseudoId(2),
+            PseudoId(0),
+            shift_const,
+            types.int128_id,
+            128,
+        );
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_expand(&mapper.map_insn(&insn, &mut ctx));
+    }
+
+    #[test]
+    fn test_x86_64_int128_variable_shift_legal() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // Variable shift (PseudoId(1) is a register, not a constant) → stays Legal
+        let insn = Instruction::binop(
+            Opcode::Shl,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            types.int128_id,
+            128,
+        );
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+    }
+
+    // ========================================================================
+    // Float16 conversions
+    // ========================================================================
+
+    #[test]
+    fn test_x86_64_float16_to_float_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // Float16 → float should expand to __extendhfsf2
+        let insn = make_convert_insn(Opcode::FCvtF, types.float_id, 32, types.float16_id, 16);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__extendhfsf2");
+    }
+
+    #[test]
+    fn test_x86_64_float_to_float16_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // float → Float16 should expand to __truncsfhf2
+        let insn = make_convert_insn(Opcode::FCvtF, types.float16_id, 16, types.float_id, 32);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__truncsfhf2");
+    }
+
+    #[test]
+    fn test_x86_64_float16_to_double_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        let insn = make_convert_insn(Opcode::FCvtF, types.double_id, 64, types.float16_id, 16);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__extendhfdf2");
+    }
+
+    #[test]
+    fn test_x86_64_float16_to_int_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // Float16 → int (signed) should call __fixhfsi
+        let insn = make_convert_insn(Opcode::FCvtS, types.int_id, 32, types.float16_id, 16);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__fixhfsi");
+    }
+
+    #[test]
+    fn test_x86_64_int_to_float16_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // int (signed) → Float16 should call __floatsihf
+        let insn = make_convert_insn(Opcode::SCvtF, types.float16_id, 16, types.int_id, 32);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floatsihf");
+    }
+
+    #[test]
+    fn test_x86_64_float16_to_uint_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // Float16 → unsigned int should call __fixunshfsi
+        let insn = make_convert_insn(Opcode::FCvtU, types.uint_id, 32, types.float16_id, 16);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__fixunshfsi");
+    }
+
+    #[test]
+    fn test_x86_64_uint_to_float16_conversion() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        // unsigned int → Float16 should call __floatunsihf
+        let insn = make_convert_insn(Opcode::UCvtF, types.float16_id, 16, types.uint_id, 32);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floatunsihf");
     }
 }

@@ -284,7 +284,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 if size > 8 {
                     // 128-bit: emit as two quads (little-endian: lo then hi)
                     let lo = *val as i64;
-                    let hi = (*val >> 64) as i64;
+                    let hi = (*val >> 64) as u64 as i64;
                     self.push_directive(Directive::Quad(lo));
                     self.push_directive(Directive::Quad(hi));
                 } else {

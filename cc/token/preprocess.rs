@@ -895,11 +895,11 @@ impl<'a> Preprocessor<'a> {
             None => return, // Empty directive, ignore
         };
 
-        // Get directive name
-        let directive_name = match &directive_token.typ {
+        // Get directive StringId
+        let directive_id = match &directive_token.typ {
             TokenType::Ident => {
                 if let TokenValue::Ident(id) = &directive_token.value {
-                    idents.get_opt(*id).map(|s| s.to_string())
+                    Some(*id)
                 } else {
                     None
                 }
@@ -907,8 +907,8 @@ impl<'a> Preprocessor<'a> {
             _ => None,
         };
 
-        let directive = match directive_name {
-            Some(name) => name,
+        let directive_id = match directive_id {
+            Some(id) => id,
             None => {
                 // Consume rest of line
                 self.skip_to_eol(iter);
@@ -916,27 +916,28 @@ impl<'a> Preprocessor<'a> {
             }
         };
 
-        match directive.as_str() {
-            "define" => self.handle_define(iter, idents),
-            "undef" => self.handle_undef(iter, idents),
-            "ifdef" => self.handle_ifdef(iter, idents, hash_token.pos),
-            "ifndef" => self.handle_ifndef(iter, idents, hash_token.pos),
-            "if" => self.handle_if(iter, idents, hash_token.pos),
-            "elif" => self.handle_elif(iter, idents),
-            "else" => self.handle_else(iter),
-            "endif" => self.handle_endif(iter),
-            "include" => self.handle_include(iter, output, idents, hash_token, false),
-            "include_next" => self.handle_include(iter, output, idents, hash_token, true),
-            "error" => self.handle_error(iter, &hash_token.pos, idents),
-            "warning" => self.handle_warning(iter, &hash_token.pos, idents),
-            "pragma" => self.handle_pragma(iter, idents),
-            "line" => self.handle_line(iter, idents),
+        match directive_id {
+            crate::kw::DEFINE => self.handle_define(iter, idents),
+            crate::kw::UNDEF => self.handle_undef(iter, idents),
+            crate::kw::IFDEF => self.handle_ifdef(iter, idents, hash_token.pos),
+            crate::kw::IFNDEF => self.handle_ifndef(iter, idents, hash_token.pos),
+            crate::kw::IF => self.handle_if(iter, idents, hash_token.pos),
+            crate::kw::ELIF => self.handle_elif(iter, idents),
+            crate::kw::ELSE => self.handle_else(iter),
+            crate::kw::ENDIF => self.handle_endif(iter),
+            crate::kw::INCLUDE => self.handle_include(iter, output, idents, hash_token, false),
+            crate::kw::INCLUDE_NEXT => self.handle_include(iter, output, idents, hash_token, true),
+            crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
+            crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
+            crate::kw::PRAGMA => self.handle_pragma(iter, idents),
+            crate::kw::LINE => self.handle_line(iter, idents),
             _ => {
                 // Unknown directive
                 if !self.is_skipping() {
+                    let name = idents.get_opt(directive_id).unwrap_or("unknown");
                     diag::warning(
                         hash_token.pos,
-                        &format!("unknown preprocessor directive #{}", directive),
+                        &format!("unknown preprocessor directive #{}", name),
                     );
                 }
                 self.skip_to_eol(iter);
@@ -3205,20 +3206,38 @@ impl<'a> Preprocessor<'a> {
             return false;
         }
 
-        // Get the argument name
-        let name = if let Some(tok) = args[0].first() {
-            self.token_to_string(tok, idents)
-        } else {
-            return false;
-        };
+        // Try to get StringId directly for O(1) tag-based lookup
+        let arg_id = args[0].first().and_then(|tok| {
+            if let TokenValue::Ident(id) = &tok.value {
+                Some(*id)
+            } else {
+                None
+            }
+        });
 
         match builtin {
-            BuiltinMacro::HasAttribute => is_supported_attribute(&name),
+            BuiltinMacro::HasAttribute => {
+                if let Some(id) = arg_id {
+                    crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR)
+                } else {
+                    let name = self.token_to_string(args[0].first().unwrap(), idents);
+                    is_supported_attribute(&name)
+                }
+            }
             BuiltinMacro::HasBuiltin => {
-                // Use centralized builtin registry
-                crate::builtins::is_builtin(name.as_str())
+                if let Some(id) = arg_id {
+                    crate::builtins::is_builtin_id(id)
+                } else {
+                    let name = self.token_to_string(args[0].first().unwrap(), idents);
+                    crate::builtins::is_builtin(name.as_str())
+                }
             }
             BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
+                let name = if let Some(tok) = args[0].first() {
+                    self.token_to_string(tok, idents)
+                } else {
+                    return false;
+                };
                 // Return true for features/extensions we implement
                 matches!(
                     name.as_str(),

@@ -12,12 +12,15 @@
 // for use by other crates (cflow, ctags, cxref).
 //
 
+#![recursion_limit = "512"]
+
 pub mod abi;
 pub mod arch;
 pub mod builtin_headers;
 pub mod builtins;
 pub mod diag;
 pub mod ir;
+pub mod kw;
 pub mod opt;
 pub mod os;
 pub mod parse;

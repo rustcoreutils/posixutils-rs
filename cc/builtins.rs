@@ -113,10 +113,16 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
 ];
 
 /// Check if a name is a supported builtin function.
-/// Used by __has_builtin() in the preprocessor.
+/// Used by __has_builtin() in the preprocessor when only a string is available.
 #[inline]
 pub fn is_builtin(name: &str) -> bool {
     SUPPORTED_BUILTINS.contains(&name)
+}
+
+/// Check if a StringId is a supported builtin function (O(1) via tag lookup).
+#[inline]
+pub fn is_builtin_id(id: crate::strings::StringId) -> bool {
+    crate::kw::has_tag(id, crate::kw::BUILTIN)
 }
 
 #[cfg(test)]

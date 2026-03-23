@@ -687,16 +687,18 @@ impl<'a> Parser<'a> {
 
         // sizeof and _Alignof
         if self.peek() == TokenType::Ident {
-            if let Some(name) = self.get_ident_name(self.current()) {
-                if name == "sizeof" {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                if name_id == crate::kw::SIZEOF {
                     self.advance();
                     return self.parse_sizeof();
                 }
-                if name == "_Alignof"
-                    || name == "__alignof__"
-                    || name == "__alignof"
-                    || name == "alignof"
-                {
+                if matches!(
+                    name_id,
+                    crate::kw::ALIGNOF
+                        | crate::kw::GNU_ALIGNOF
+                        | crate::kw::GNU_ALIGNOF2
+                        | crate::kw::ALIGNOF_C23
+                ) {
                     self.advance();
                     return self.parse_alignof();
                 }
@@ -780,37 +782,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Check if identifier is a type-starting keyword (for cast/sizeof disambiguation)
-    pub(crate) fn is_type_keyword(name: &str) -> bool {
-        matches!(
-            name,
-            "void"
-                | "_Bool"
-                | "_Complex"
-                | "_Atomic"
-                | "char"
-                | "short"
-                | "int"
-                | "long"
-                | "float"
-                | "double"
-                | "_Float16"
-                | "_Float32"
-                | "_Float64"
-                | "signed"
-                | "unsigned"
-                | "const"
-                | "volatile"
-                | "struct"
-                | "union"
-                | "enum"
-                | "__int128"
-                | "__int128_t"
-                | "__uint128_t"
-                | "__builtin_va_list"
-                | "typeof"
-                | "__typeof__"
-                | "__typeof"
-        )
+    pub(crate) fn is_type_keyword(id: crate::strings::StringId) -> bool {
+        crate::kw::has_tag(id, crate::kw::TYPE_KEYWORD)
     }
 
     /// Consume type qualifiers (const, volatile, restrict)
@@ -823,25 +796,24 @@ impl<'a> Parser<'a> {
                 Some(id) => id,
                 None => break,
             };
-            let name = self.str(name_id);
-            match name {
-                "const" | "__const" | "__const__" => {
+            match name_id {
+                crate::kw::CONST | crate::kw::GNU_CONST2 | crate::kw::GNU_CONST => {
                     self.advance();
                     mods |= TypeModifiers::CONST;
                 }
-                "volatile" | "__volatile" | "__volatile__" => {
+                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE2 | crate::kw::GNU_VOLATILE => {
                     self.advance();
                     mods |= TypeModifiers::VOLATILE;
                 }
-                "restrict" | "__restrict" | "__restrict__" => {
+                crate::kw::RESTRICT | crate::kw::GNU_RESTRICT2 | crate::kw::GNU_RESTRICT => {
                     self.advance();
                     mods |= TypeModifiers::RESTRICT;
                 }
-                "_Atomic" => {
+                crate::kw::ATOMIC => {
                     self.advance();
                     mods |= TypeModifiers::ATOMIC;
                 }
-                n if super::is_nullability_qualifier(n) => {
+                _ if super::is_nullability_qualifier(name_id) => {
                     self.advance();
                 }
                 _ => break,
@@ -891,8 +863,7 @@ impl<'a> Parser<'a> {
 
         // Check if this looks like a type name (keyword or typedef)
         let name_id = self.get_ident_id(self.current())?;
-        let name = self.str(name_id);
-        if !Self::is_type_keyword(name) && self.symbols.lookup_typedef(name_id).is_none() {
+        if !Self::is_type_keyword(name_id) && self.symbols.lookup_typedef(name_id).is_none() {
             // Not a type keyword and not a typedef
             return None;
         }
@@ -914,35 +885,33 @@ impl<'a> Parser<'a> {
                 Some(id) => id,
                 None => break,
             };
-            let name = self.str(name_id);
-
-            match name {
-                "const" => {
+            match name_id {
+                crate::kw::CONST => {
                     self.advance();
                     modifiers |= TypeModifiers::CONST;
                     parsed_something = true;
                 }
-                "volatile" => {
+                crate::kw::VOLATILE => {
                     self.advance();
                     modifiers |= TypeModifiers::VOLATILE;
                     parsed_something = true;
                 }
-                "signed" => {
+                crate::kw::SIGNED => {
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;
                     parsed_something = true;
                 }
-                "unsigned" => {
+                crate::kw::UNSIGNED => {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                     parsed_something = true;
                 }
-                "_Complex" => {
+                crate::kw::COMPLEX => {
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                     parsed_something = true;
                 }
-                "_Atomic" => {
+                crate::kw::ATOMIC => {
                     self.advance();
                     // _Atomic can be:
                     // 1. Type specifier: _Atomic(type-name)
@@ -971,7 +940,7 @@ impl<'a> Parser<'a> {
                     }
                     parsed_something = true;
                 }
-                "short" => {
+                crate::kw::SHORT => {
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
                     if base_kind.is_none() {
@@ -979,7 +948,7 @@ impl<'a> Parser<'a> {
                     }
                     parsed_something = true;
                 }
-                "long" => {
+                crate::kw::LONG => {
                     self.advance();
                     if modifiers.contains(TypeModifiers::LONG) {
                         modifiers |= TypeModifiers::LONGLONG;
@@ -995,17 +964,17 @@ impl<'a> Parser<'a> {
                     }
                     parsed_something = true;
                 }
-                "void" => {
+                crate::kw::VOID => {
                     self.advance();
                     base_kind = Some(TypeKind::Void);
                     parsed_something = true;
                 }
-                "char" => {
+                crate::kw::CHAR => {
                     self.advance();
                     base_kind = Some(TypeKind::Char);
                     parsed_something = true;
                 }
-                "int" => {
+                crate::kw::INT => {
                     self.advance();
                     if base_kind.is_none()
                         || !matches!(
@@ -1017,12 +986,12 @@ impl<'a> Parser<'a> {
                     }
                     parsed_something = true;
                 }
-                "float" => {
+                crate::kw::FLOAT => {
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                     parsed_something = true;
                 }
-                "double" => {
+                crate::kw::DOUBLE => {
                     self.advance();
                     // Handle long double
                     if modifiers.contains(TypeModifiers::LONG) {
@@ -1032,50 +1001,50 @@ impl<'a> Parser<'a> {
                     }
                     parsed_something = true;
                 }
-                "_Float16" => {
+                crate::kw::FLOAT16 => {
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                     parsed_something = true;
                 }
-                "_Float32" => {
+                crate::kw::FLOAT32 => {
                     // _Float32 is an alias for float (TS 18661-3 / C23)
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                     parsed_something = true;
                 }
-                "_Float64" => {
+                crate::kw::FLOAT64 => {
                     // _Float64 is an alias for double (TS 18661-3 / C23)
                     self.advance();
                     base_kind = Some(TypeKind::Double);
                     parsed_something = true;
                 }
-                "_Bool" => {
+                crate::kw::BOOL => {
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                     parsed_something = true;
                 }
-                "__int128" => {
+                crate::kw::INT128 => {
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                     parsed_something = true;
                 }
-                "__int128_t" => {
+                crate::kw::INT128_T => {
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                     parsed_something = true;
                 }
-                "__uint128_t" => {
+                crate::kw::UINT128_T => {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                     base_kind = Some(TypeKind::Int128);
                     parsed_something = true;
                 }
-                "__builtin_va_list" => {
+                crate::kw::BUILTIN_VA_LIST => {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                     parsed_something = true;
                 }
-                "typeof" | "__typeof__" | "__typeof" => {
+                crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2 => {
                     self.advance(); // consume typeof
                     if !self.is_special(b'(') {
                         return None;
@@ -1105,7 +1074,7 @@ impl<'a> Parser<'a> {
                     let expr_type = expr.typ.unwrap_or(self.types.int_id);
                     return Some(self.parse_pointer_chain(expr_type));
                 }
-                "struct" => {
+                crate::kw::STRUCT => {
                     self.advance(); // consume 'struct'
                                     // For struct tag reference, look up directly in symbol table
                     if let Some(tag_name) = self.get_ident_id(self.current()) {
@@ -1168,7 +1137,7 @@ impl<'a> Parser<'a> {
                     }
                     return None;
                 }
-                "union" => {
+                crate::kw::UNION => {
                     self.advance(); // consume 'union'
                                     // For union tag reference, look up directly in symbol table
                     if let Some(tag_name) = self.get_ident_id(self.current()) {
@@ -1231,7 +1200,7 @@ impl<'a> Parser<'a> {
                     }
                     return None;
                 }
-                "enum" => {
+                crate::kw::ENUM => {
                     if let Ok(enum_type) = self.parse_enum_specifier() {
                         let mut typ = enum_type;
                         typ.modifiers |= modifiers | self.consume_type_qualifiers();
@@ -1779,11 +1748,10 @@ impl<'a> Parser<'a> {
                 let token_pos = token.pos;
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
-                    let name_str = self.idents.get_opt(name_id).unwrap_or("");
 
                     // Check for varargs builtins that need special parsing
-                    match name_str {
-                        "__builtin_va_start" => {
+                    match name_id {
+                        crate::kw::BUILTIN_VA_START => {
                             // __builtin_va_start(ap, last_param)
                             self.expect_special(b'(')?;
                             let ap = self.parse_assignment_expr()?;
@@ -1800,7 +1768,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_va_arg" => {
+                        crate::kw::BUILTIN_VA_ARG => {
                             // __builtin_va_arg(ap, type)
                             self.expect_special(b'(')?;
                             let ap = self.parse_assignment_expr()?;
@@ -1817,7 +1785,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_va_end" => {
+                        crate::kw::BUILTIN_VA_END => {
                             // __builtin_va_end(ap)
                             self.expect_special(b'(')?;
                             let ap = self.parse_assignment_expr()?;
@@ -1828,7 +1796,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_va_copy" => {
+                        crate::kw::BUILTIN_VA_COPY => {
                             // __builtin_va_copy(dest, src)
                             self.expect_special(b'(')?;
                             let dest = self.parse_assignment_expr()?;
@@ -1844,7 +1812,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_bswap16" => {
+                        crate::kw::BUILTIN_BSWAP16 => {
                             // __builtin_bswap16(x) - returns uint16_t
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
@@ -1855,7 +1823,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_bswap32" => {
+                        crate::kw::BUILTIN_BSWAP32 => {
                             // __builtin_bswap32(x) - returns uint32_t
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
@@ -1866,7 +1834,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_bswap64" => {
+                        crate::kw::BUILTIN_BSWAP64 => {
                             // __builtin_bswap64(x) - returns uint64_t
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
@@ -1877,7 +1845,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_ctz" => {
+                        crate::kw::BUILTIN_CTZ => {
                             // __builtin_ctz(x) - returns int, counts trailing zeros in unsigned int
                             // Result is undefined if x is 0
                             self.expect_special(b'(')?;
@@ -1889,7 +1857,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_ctzl" => {
+                        crate::kw::BUILTIN_CTZL => {
                             // __builtin_ctzl(x) - returns int, counts trailing zeros in unsigned long
                             // Result is undefined if x is 0
                             self.expect_special(b'(')?;
@@ -1901,7 +1869,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_ctzll" => {
+                        crate::kw::BUILTIN_CTZLL => {
                             // __builtin_ctzll(x) - returns int, counts trailing zeros in unsigned long long
                             // Result is undefined if x is 0
                             self.expect_special(b'(')?;
@@ -1913,7 +1881,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_clz" => {
+                        crate::kw::BUILTIN_CLZ => {
                             // __builtin_clz(x) - returns int, counts leading zeros in unsigned int
                             // Result is undefined if x is 0
                             self.expect_special(b'(')?;
@@ -1925,7 +1893,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_clzl" => {
+                        crate::kw::BUILTIN_CLZL => {
                             // __builtin_clzl(x) - returns int, counts leading zeros in unsigned long
                             // Result is undefined if x is 0
                             self.expect_special(b'(')?;
@@ -1937,7 +1905,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_clzll" => {
+                        crate::kw::BUILTIN_CLZLL => {
                             // __builtin_clzll(x) - returns int, counts leading zeros in unsigned long long
                             // Result is undefined if x is 0
                             self.expect_special(b'(')?;
@@ -1949,7 +1917,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_popcount" => {
+                        crate::kw::BUILTIN_POPCOUNT => {
                             // __builtin_popcount(x) - returns int, counts set bits in unsigned int
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
@@ -1960,7 +1928,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_popcountl" => {
+                        crate::kw::BUILTIN_POPCOUNTL => {
                             // __builtin_popcountl(x) - returns int, counts set bits in unsigned long
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
@@ -1971,7 +1939,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_popcountll" => {
+                        crate::kw::BUILTIN_POPCOUNTLL => {
                             // __builtin_popcountll(x) - returns int, counts set bits in unsigned long long
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
@@ -1982,7 +1950,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_alloca" => {
+                        crate::kw::BUILTIN_ALLOCA => {
                             // __builtin_alloca(size) - returns void*
                             self.expect_special(b'(')?;
                             let size = self.parse_assignment_expr()?;
@@ -1996,7 +1964,7 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         // Memory builtins - generate calls to C library functions
-                        "__builtin_memset" => {
+                        crate::kw::BUILTIN_MEMSET => {
                             // __builtin_memset(dest, c, n) - returns void*
                             self.expect_special(b'(')?;
                             let dest = self.parse_assignment_expr()?;
@@ -2015,7 +1983,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_memcpy" => {
+                        crate::kw::BUILTIN_MEMCPY => {
                             // __builtin_memcpy(dest, src, n) - returns void*
                             self.expect_special(b'(')?;
                             let dest = self.parse_assignment_expr()?;
@@ -2034,7 +2002,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_memmove" => {
+                        crate::kw::BUILTIN_MEMMOVE => {
                             // __builtin_memmove(dest, src, n) - returns void*
                             self.expect_special(b'(')?;
                             let dest = self.parse_assignment_expr()?;
@@ -2054,7 +2022,7 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         // Infinity builtins - return float constants
-                        "__builtin_inf" | "__builtin_huge_val" => {
+                        crate::kw::BUILTIN_INF | crate::kw::BUILTIN_HUGE_VAL => {
                             self.expect_special(b'(')?;
                             self.expect_special(b')')?;
                             return Ok(Self::typed_expr(
@@ -2063,7 +2031,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_inff" | "__builtin_huge_valf" => {
+                        crate::kw::BUILTIN_INFF | crate::kw::BUILTIN_HUGE_VALF => {
                             self.expect_special(b'(')?;
                             self.expect_special(b')')?;
                             return Ok(Self::typed_expr(
@@ -2072,7 +2040,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_infl" | "__builtin_huge_vall" => {
+                        crate::kw::BUILTIN_INFL | crate::kw::BUILTIN_HUGE_VALL => {
                             self.expect_special(b'(')?;
                             self.expect_special(b')')?;
                             return Ok(Self::typed_expr(
@@ -2083,7 +2051,7 @@ impl<'a> Parser<'a> {
                         }
                         // NaN builtins - returns quiet NaN
                         // The string argument is typically empty "" for quiet NaN
-                        "__builtin_nan" | "__builtin_nans" => {
+                        crate::kw::BUILTIN_NAN | crate::kw::BUILTIN_NANS => {
                             self.expect_special(b'(')?;
                             let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                             self.expect_special(b')')?;
@@ -2093,7 +2061,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_nanf" | "__builtin_nansf" => {
+                        crate::kw::BUILTIN_NANF | crate::kw::BUILTIN_NANSF => {
                             self.expect_special(b'(')?;
                             let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                             self.expect_special(b')')?;
@@ -2103,7 +2071,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_nanl" | "__builtin_nansl" => {
+                        crate::kw::BUILTIN_NANL | crate::kw::BUILTIN_NANSL => {
                             self.expect_special(b'(')?;
                             let _arg = self.parse_assignment_expr()?; // string argument (ignored)
                             self.expect_special(b')')?;
@@ -2114,7 +2082,7 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         // FLT_ROUNDS - returns current rounding mode (1 = to nearest)
-                        "__builtin_flt_rounds" => {
+                        crate::kw::BUILTIN_FLT_ROUNDS => {
                             self.expect_special(b'(')?;
                             self.expect_special(b')')?;
                             return Ok(Self::typed_expr(
@@ -2124,7 +2092,7 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         // Fabs builtins - absolute value for floats
-                        "__builtin_fabs" => {
+                        crate::kw::BUILTIN_FABS => {
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
@@ -2134,7 +2102,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_fabsf" => {
+                        crate::kw::BUILTIN_FABSF => {
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
@@ -2144,7 +2112,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_fabsl" => {
+                        crate::kw::BUILTIN_FABSL => {
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
@@ -2155,7 +2123,7 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         // Signbit builtins - test sign bit of floats
-                        "__builtin_signbit" => {
+                        crate::kw::BUILTIN_SIGNBIT => {
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
@@ -2165,7 +2133,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_signbitf" => {
+                        crate::kw::BUILTIN_SIGNBITF => {
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
@@ -2175,7 +2143,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_signbitl" => {
+                        crate::kw::BUILTIN_SIGNBITL => {
                             self.expect_special(b'(')?;
                             let arg = self.parse_assignment_expr()?;
                             self.expect_special(b')')?;
@@ -2185,7 +2153,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_unreachable" => {
+                        crate::kw::BUILTIN_UNREACHABLE => {
                             // __builtin_unreachable() - marks code as unreachable
                             // Takes no arguments, returns void
                             // Behavior is undefined if actually reached at runtime
@@ -2197,7 +2165,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_constant_p" => {
+                        crate::kw::BUILTIN_CONSTANT_P => {
                             // __builtin_constant_p(expr) - returns 1 if expr is a constant, 0 otherwise
                             // This is evaluated at compile time, not runtime
                             self.expect_special(b'(')?;
@@ -2211,7 +2179,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_expect" => {
+                        crate::kw::BUILTIN_EXPECT => {
                             // __builtin_expect(expr, c) - branch prediction hint
                             // Returns expr, the second argument is the expected value (for optimization hints)
                             // We just return expr since we don't do branch prediction optimization
@@ -2222,7 +2190,7 @@ impl<'a> Parser<'a> {
                             self.expect_special(b')')?;
                             return Ok(expr);
                         }
-                        "__builtin_assume_aligned" => {
+                        crate::kw::BUILTIN_ASSUME_ALIGNED => {
                             // __builtin_assume_aligned(ptr, align) or
                             // __builtin_assume_aligned(ptr, align, offset)
                             // Returns ptr, hints that ptr is aligned to align bytes
@@ -2239,7 +2207,7 @@ impl<'a> Parser<'a> {
                             self.expect_special(b')')?;
                             return Ok(ptr);
                         }
-                        "__builtin_prefetch" => {
+                        crate::kw::BUILTIN_PREFETCH => {
                             // __builtin_prefetch(addr) or
                             // __builtin_prefetch(addr, rw) or
                             // __builtin_prefetch(addr, rw, locality)
@@ -2264,7 +2232,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_types_compatible_p" => {
+                        crate::kw::BUILTIN_TYPES_COMPATIBLE_P => {
                             // __builtin_types_compatible_p(type1, type2) - returns 1 if types are compatible
                             // This is evaluated at compile time, ignoring top-level qualifiers
                             self.expect_special(b'(')?;
@@ -2280,7 +2248,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_frame_address" => {
+                        crate::kw::BUILTIN_FRAME_ADDRESS => {
                             // __builtin_frame_address(level) - returns void*, address of frame at level
                             // Level 0 is the current frame, 1 is the caller's frame, etc.
                             // Returns NULL for invalid levels (beyond stack bounds)
@@ -2295,7 +2263,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_return_address" => {
+                        crate::kw::BUILTIN_RETURN_ADDRESS => {
                             // __builtin_return_address(level) - returns void*, return address at level
                             // Level 0 is the current function's return address
                             // Returns NULL for invalid levels (beyond stack bounds)
@@ -2310,7 +2278,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "setjmp" | "_setjmp" => {
+                        crate::kw::SETJMP | crate::kw::SETJMP2 => {
                             // setjmp(env) - saves execution context, returns int
                             // Returns 0 on direct call, non-zero when returning via longjmp
                             self.expect_special(b'(')?;
@@ -2322,7 +2290,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "longjmp" | "_longjmp" => {
+                        crate::kw::LONGJMP | crate::kw::LONGJMP2 => {
                             // longjmp(env, val) - restores execution context (never returns)
                             // Causes corresponding setjmp to return val (or 1 if val == 0)
                             self.expect_special(b'(')?;
@@ -2339,7 +2307,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_offsetof" | "offsetof" => {
+                        crate::kw::BUILTIN_OFFSETOF | crate::kw::OFFSETOF => {
                             // __builtin_offsetof(type, member-designator)
                             // Returns the byte offset of a member within a struct/union
                             // member-designator can be .field or [index] chains
@@ -2395,7 +2363,7 @@ impl<'a> Parser<'a> {
                         // ================================================================
                         // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
                         // ================================================================
-                        "__c11_atomic_init" => {
+                        crate::kw::C11_ATOMIC_INIT => {
                             // __c11_atomic_init(ptr, val) - initialize atomic (no ordering)
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2411,7 +2379,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_load" => {
+                        crate::kw::C11_ATOMIC_LOAD => {
                             // __c11_atomic_load(ptr, order) - returns *ptr atomically
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2431,7 +2399,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_store" => {
+                        crate::kw::C11_ATOMIC_STORE => {
                             // __c11_atomic_store(ptr, val, order) - *ptr = val atomically
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2450,7 +2418,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_exchange" => {
+                        crate::kw::C11_ATOMIC_EXCHANGE => {
                             // __c11_atomic_exchange(ptr, val, order) - swap and return old
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2473,7 +2441,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_compare_exchange_strong" => {
+                        crate::kw::C11_ATOMIC_COMPARE_EXCHANGE_STRONG => {
                             // __c11_atomic_compare_exchange_strong(ptr, expected, desired, succ, fail)
                             // Note: fail_order is parsed but ignored (we use succ_order for both)
                             self.expect_special(b'(')?;
@@ -2499,7 +2467,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_compare_exchange_weak" => {
+                        crate::kw::C11_ATOMIC_COMPARE_EXCHANGE_WEAK => {
                             // __c11_atomic_compare_exchange_weak(ptr, expected, desired, succ, fail)
                             // Note: Implemented as strong (no spurious failures)
                             self.expect_special(b'(')?;
@@ -2525,7 +2493,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_fetch_add" => {
+                        crate::kw::C11_ATOMIC_FETCH_ADD => {
                             // __c11_atomic_fetch_add(ptr, val, order) - add and return old
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2548,7 +2516,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_fetch_sub" => {
+                        crate::kw::C11_ATOMIC_FETCH_SUB => {
                             // __c11_atomic_fetch_sub(ptr, val, order) - subtract and return old
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2571,7 +2539,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_fetch_and" => {
+                        crate::kw::C11_ATOMIC_FETCH_AND => {
                             // __c11_atomic_fetch_and(ptr, val, order) - AND and return old
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2594,7 +2562,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_fetch_or" => {
+                        crate::kw::C11_ATOMIC_FETCH_OR => {
                             // __c11_atomic_fetch_or(ptr, val, order) - OR and return old
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2617,7 +2585,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_fetch_xor" => {
+                        crate::kw::C11_ATOMIC_FETCH_XOR => {
                             // __c11_atomic_fetch_xor(ptr, val, order) - XOR and return old
                             self.expect_special(b'(')?;
                             let ptr = self.parse_assignment_expr()?;
@@ -2640,7 +2608,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_thread_fence" => {
+                        crate::kw::C11_ATOMIC_THREAD_FENCE => {
                             // __c11_atomic_thread_fence(order) - memory fence
                             self.expect_special(b'(')?;
                             let order = self.parse_assignment_expr()?;
@@ -2653,7 +2621,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__c11_atomic_signal_fence" => {
+                        crate::kw::C11_ATOMIC_SIGNAL_FENCE => {
                             // __c11_atomic_signal_fence(order) - compiler barrier
                             self.expect_special(b'(')?;
                             let order = self.parse_assignment_expr()?;
@@ -2666,7 +2634,7 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        "__builtin_object_size" => {
+                        crate::kw::BUILTIN_OBJECT_SIZE => {
                             // __builtin_object_size(ptr, type) - returns (size_t)-1
                             // at compile time without optimization (conservative "don't know")
                             self.expect_special(b'(')?;
@@ -2680,63 +2648,70 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
-                        name if name.starts_with("__builtin___") => {
-                            // Fortified builtins: __builtin___snprintf_chk etc.
-                            // Strip __builtin_ prefix → __snprintf_chk, which is a
-                            // real libc function (declared by macOS/glibc headers).
-                            let real_name = &name["__builtin_".len()..];
-                            // Parse arguments first (must consume tokens regardless)
-                            self.expect_special(b'(')?;
-                            let mut args = Vec::new();
-                            if !self.is_special(b')') {
-                                args.push(self.parse_assignment_expr()?);
-                                while self.is_special(b',') {
-                                    self.advance();
+                        _ => {
+                            let name_str = self.idents.get_opt(name_id).unwrap_or("");
+                            if name_str.starts_with("__builtin___") {
+                                // Fortified builtins: __builtin___snprintf_chk etc.
+                                // Strip __builtin_ prefix → __snprintf_chk, which is a
+                                // real libc function (declared by macOS/glibc headers).
+                                let real_name = &name_str["__builtin_".len()..];
+                                // Parse arguments first (must consume tokens regardless)
+                                self.expect_special(b'(')?;
+                                let mut args = Vec::new();
+                                if !self.is_special(b')') {
                                     args.push(self.parse_assignment_expr()?);
+                                    while self.is_special(b',') {
+                                        self.advance();
+                                        args.push(self.parse_assignment_expr()?);
+                                    }
                                 }
-                            }
-                            self.expect_special(b')')?;
-                            // Look up the real function by its de-prefixed name
-                            let real_name_id = self.idents.lookup(real_name);
-                            let symbol_id = real_name_id.and_then(|id| {
-                                self.symbols
-                                    .lookup_id(id, crate::symbol::Namespace::Ordinary)
-                            });
-                            if let Some(symbol_id) = symbol_id {
-                                let func_type = self.symbols.get(symbol_id).typ;
-                                let ret_type =
-                                    self.types.base_type(func_type).unwrap_or(self.types.int_id);
-                                let func_expr = Self::typed_expr(
-                                    ExprKind::Ident(symbol_id),
-                                    func_type,
+                                self.expect_special(b')')?;
+                                // Look up the real function by its de-prefixed name
+                                let real_name_id = self.idents.lookup(real_name);
+                                let symbol_id = real_name_id.and_then(|id| {
+                                    self.symbols
+                                        .lookup_id(id, crate::symbol::Namespace::Ordinary)
+                                });
+                                if let Some(symbol_id) = symbol_id {
+                                    let func_type = self.symbols.get(symbol_id).typ;
+                                    let ret_type = self
+                                        .types
+                                        .base_type(func_type)
+                                        .unwrap_or(self.types.int_id);
+                                    let func_expr = Self::typed_expr(
+                                        ExprKind::Ident(symbol_id),
+                                        func_type,
+                                        token_pos,
+                                    );
+                                    return Ok(Self::typed_expr(
+                                        ExprKind::Call {
+                                            func: Box::new(func_expr),
+                                            args,
+                                        },
+                                        ret_type,
+                                        token_pos,
+                                    ));
+                                }
+                                // Not declared — return 0 as fallback
+                                diag::error(
                                     token_pos,
+                                    &format!("undeclared function '{}'", real_name),
                                 );
                                 return Ok(Self::typed_expr(
-                                    ExprKind::Call {
-                                        func: Box::new(func_expr),
-                                        args,
-                                    },
-                                    ret_type,
+                                    ExprKind::IntLit(0),
+                                    self.types.int_id,
                                     token_pos,
                                 ));
                             }
-                            // Not declared — return 0 as fallback
-                            diag::error(token_pos, &format!("undeclared function '{}'", real_name));
-                            return Ok(Self::typed_expr(
-                                ExprKind::IntLit(0),
-                                self.types.int_id,
-                                token_pos,
-                            ));
                         }
-                        _ => {}
                     }
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
                     // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
                     // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave similarly
-                    if name_str == "__func__"
-                        || name_str == "__FUNCTION__"
-                        || name_str == "__PRETTY_FUNCTION__"
+                    if name_id == crate::kw::FUNC
+                        || name_id == crate::kw::FUNCTION
+                        || name_id == crate::kw::PRETTY_FUNCTION
                     {
                         // These behave like a string literal (const char[])
                         // Linearization handles mapping to __func__ behavior
@@ -2766,6 +2741,7 @@ impl<'a> Parser<'a> {
                     } else {
                         // C99 6.5.1: Undeclared identifier is an error
                         // (implicit int was removed in C99)
+                        let name_str = self.idents.get_opt(name_id).unwrap_or("");
                         diag::error(token_pos, &format!("undeclared identifier '{}'", name_str));
                         // Return a dummy expression to continue parsing
                         Ok(Self::typed_expr(

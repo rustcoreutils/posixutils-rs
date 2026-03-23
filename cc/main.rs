@@ -9,12 +9,15 @@
 // pcc - A POSIX C99 compiler
 //
 
+#![recursion_limit = "512"]
+
 mod abi;
 mod arch;
 mod builtin_headers;
 mod builtins;
 mod diag;
 mod ir;
+mod kw;
 mod opt;
 mod os;
 mod parse;

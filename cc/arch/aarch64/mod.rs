@@ -16,6 +16,7 @@ mod features;
 mod float;
 pub mod lir;
 pub mod macros;
+pub(crate) mod mapping;
 pub mod regalloc;
 
 pub use macros::get_macros;

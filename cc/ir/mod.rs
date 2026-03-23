@@ -22,9 +22,10 @@ pub mod linearize;
 pub mod lower;
 pub mod ssa;
 
-use crate::abi::ArgClass;
+use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;
-use crate::types::TypeId;
+use crate::target::Target;
+use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -231,6 +232,16 @@ pub enum Opcode {
     AtomicFetchOr,  // Atomic fetch-and-or
     AtomicFetchXor, // Atomic fetch-and-xor
     Fence,          // Memory fence
+
+    // Int128 decomposition ops (used by mapping pass expansion)
+    Lo64,   // Extract low 64 bits from 128-bit pseudo
+    Hi64,   // Extract high 64 bits from 128-bit pseudo
+    Pair64, // Combine two 64-bit pseudos into 128-bit: target = (src[0]=lo, src[1]=hi)
+    AddC,   // 64-bit add with carry output: target = src[0] + src[1], sets carry
+    AdcC, // 64-bit add with carry in+out: target = src[0] + src[1] + carry; src[2] = carry producer
+    SubC, // 64-bit sub with borrow output: target = src[0] - src[1], sets borrow
+    SbcC, // 64-bit sub with borrow in+out: target = src[0] - src[1] - borrow; src[2] = borrow producer
+    UMulHi, // Upper 64 bits of unsigned 64×64 multiply: target = (src[0] * src[1]) >> 64
 }
 
 impl Opcode {
@@ -383,6 +394,14 @@ impl Opcode {
             Opcode::AtomicFetchOr => "atomic_fetch_or",
             Opcode::AtomicFetchXor => "atomic_fetch_xor",
             Opcode::Fence => "fence",
+            Opcode::Lo64 => "lo64",
+            Opcode::Hi64 => "hi64",
+            Opcode::Pair64 => "pair64",
+            Opcode::AddC => "addc",
+            Opcode::AdcC => "adcc",
+            Opcode::SubC => "subc",
+            Opcode::SbcC => "sbcc",
+            Opcode::UMulHi => "umulhi",
         }
     }
 }
@@ -924,6 +943,37 @@ impl Instruction {
         insn
     }
 
+    /// Create a call instruction with ABI classification.
+    ///
+    /// This is the canonical way for IR passes to synthesize call instructions
+    /// (e.g., runtime library calls). It classifies parameters and return value
+    /// using the given calling convention, attaches `CallAbiInfo`, and returns
+    /// a ready-to-emit instruction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_with_abi(
+        target: Option<PseudoId>,
+        func_name: &str,
+        args: Vec<PseudoId>,
+        arg_types: Vec<TypeId>,
+        ret_type: TypeId,
+        conv: CallingConv,
+        types: &TypeTable,
+        target_info: &Target,
+    ) -> Self {
+        let ret_size = types.size_bits(ret_type);
+        let abi = get_abi_for_conv(conv, target_info);
+        let param_classes: Vec<_> = arg_types
+            .iter()
+            .map(|&t| abi.classify_param(t, types))
+            .collect();
+        let ret_class = abi.classify_return(ret_type, types);
+        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+
+        let mut insn = Self::call(target, func_name, args, arg_types, ret_type, ret_size);
+        insn.abi_info = Some(call_abi_info);
+        insn
+    }
+
     /// Create an indirect call instruction (call through function pointer)
     pub fn call_indirect(
         target: Option<PseudoId>,
@@ -1024,8 +1074,23 @@ impl fmt::Display for Instruction {
 
         write!(f, "{}", self.op.name())?;
 
-        // Size suffix
-        if self.size > 0 {
+        // Size suffix (for conversions, show src_size→size)
+        if self.src_size > 0
+            && self.src_size != self.size
+            && matches!(
+                self.op,
+                Opcode::Sext
+                    | Opcode::Zext
+                    | Opcode::Trunc
+                    | Opcode::FCvtS
+                    | Opcode::FCvtU
+                    | Opcode::SCvtF
+                    | Opcode::UCvtF
+                    | Opcode::FCvtF
+            )
+        {
+            write!(f, ".{}to{}", self.src_size, self.size)?;
+        } else if self.size > 0 {
             write!(f, ".{}", self.size)?;
         }
 
@@ -1440,8 +1505,16 @@ impl Function {
         id
     }
 
-    /// Create a new constant integer pseudo and return its ID
-    /// The pseudo is added to self.pseudos
+    /// Create a new register pseudo and return its ID.
+    /// The pseudo is added to self.pseudos.
+    pub fn create_reg_pseudo(&mut self) -> PseudoId {
+        let id = self.alloc_pseudo();
+        self.add_pseudo(Pseudo::reg(id, id.0));
+        id
+    }
+
+    /// Create a new constant integer pseudo and return its ID.
+    /// The pseudo is added to self.pseudos.
     pub fn create_const_pseudo(&mut self, value: i128) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, value);
@@ -2274,5 +2347,105 @@ mod tests {
             },
         )));
         assert!(insn.returns_two_regs());
+    }
+
+    // ========================================================================
+    // Function::create_reg_pseudo
+    // ========================================================================
+
+    #[test]
+    fn test_create_reg_pseudo() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.int_id);
+        func.next_pseudo = 10;
+
+        let id1 = func.create_reg_pseudo();
+        assert_eq!(id1, PseudoId(10));
+        assert_eq!(func.next_pseudo, 11);
+
+        // Verify the pseudo was registered
+        let pseudo = func.get_pseudo(id1).expect("pseudo must exist");
+        assert!(matches!(pseudo.kind, PseudoKind::Reg(_)));
+
+        let id2 = func.create_reg_pseudo();
+        assert_eq!(id2, PseudoId(11));
+        assert_eq!(func.next_pseudo, 12);
+
+        // IDs must be distinct
+        assert_ne!(id1, id2);
+    }
+
+    // ========================================================================
+    // Instruction::call_with_abi
+    // ========================================================================
+
+    #[test]
+    fn test_call_with_abi_basic() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+
+        let insn = Instruction::call_with_abi(
+            Some(PseudoId(2)),
+            "__divti3",
+            vec![PseudoId(0), PseudoId(1)],
+            vec![types.int128_id, types.int128_id],
+            types.int128_id,
+            CallingConv::C,
+            &types,
+            &target,
+        );
+
+        assert_eq!(insn.op, Opcode::Call);
+        assert_eq!(insn.target, Some(PseudoId(2)));
+        assert_eq!(insn.func_name.as_deref(), Some("__divti3"));
+        assert_eq!(insn.src.len(), 2);
+        assert_eq!(insn.arg_types.len(), 2);
+        assert!(insn.abi_info.is_some());
+
+        let abi = insn.abi_info.as_ref().unwrap();
+        assert_eq!(abi.params.len(), 2);
+    }
+
+    #[test]
+    fn test_call_with_abi_conversion() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+
+        // float → signed int128 (__fixsfti)
+        let insn = Instruction::call_with_abi(
+            Some(PseudoId(1)),
+            "__fixsfti",
+            vec![PseudoId(0)],
+            vec![types.float_id],
+            types.int128_id,
+            CallingConv::C,
+            &types,
+            &target,
+        );
+
+        assert_eq!(insn.op, Opcode::Call);
+        assert_eq!(insn.func_name.as_deref(), Some("__fixsfti"));
+        assert!(insn.abi_info.is_some());
+        assert_eq!(insn.abi_info.as_ref().unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_call_with_abi_sets_size() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+
+        let insn = Instruction::call_with_abi(
+            Some(PseudoId(1)),
+            "__addtf3",
+            vec![PseudoId(0)],
+            vec![types.double_id],
+            types.double_id,
+            CallingConv::C,
+            &types,
+            &target,
+        );
+
+        // Size should be set from ret_type
+        assert_eq!(insn.size, types.size_bits(types.double_id));
     }
 }

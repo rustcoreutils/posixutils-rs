@@ -587,6 +587,14 @@ impl Aarch64CodeGen {
         let src_kind = insn.src_typ.map(|t| types.kind(t));
         let dst_kind = insn.typ.map(|t| types.kind(t));
         let needs_convert = match (src_kind, dst_kind) {
+            (
+                Some(TypeKind::Float16),
+                Some(TypeKind::Float | TypeKind::Double | TypeKind::LongDouble),
+            ) => true,
+            (
+                Some(TypeKind::Float | TypeKind::Double | TypeKind::LongDouble),
+                Some(TypeKind::Float16),
+            ) => true,
             (Some(TypeKind::Float), Some(TypeKind::Double | TypeKind::LongDouble)) => true,
             (Some(TypeKind::Double | TypeKind::LongDouble), Some(TypeKind::Float)) => true,
             // On aarch64, Double and LongDouble are the same, no conversion needed

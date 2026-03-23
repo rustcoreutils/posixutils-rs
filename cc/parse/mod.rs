@@ -19,16 +19,8 @@ mod test_parser;
 // Re-export parser used by main.rs
 pub use parser::Parser;
 
-/// Check if a name is a C11 nullability qualifier.
+/// Check if a StringId is a C11 nullability qualifier.
 /// Single source of truth — used by all qualifier-parsing paths.
-pub(crate) fn is_nullability_qualifier(name: &str) -> bool {
-    matches!(
-        name,
-        "_Nonnull"
-            | "__nonnull"
-            | "_Nullable"
-            | "__nullable"
-            | "_Null_unspecified"
-            | "__null_unspecified"
-    )
+pub(crate) fn is_nullability_qualifier(id: crate::strings::StringId) -> bool {
+    crate::kw::has_tag(id, crate::kw::NULLABILITY)
 }

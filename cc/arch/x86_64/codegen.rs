@@ -1717,6 +1717,16 @@ impl X86_64CodeGen {
                 self.emit_fence(insn);
             }
 
+            // Int128 decomposition ops (from mapping pass expansion)
+            Opcode::Lo64 => self.emit_lo64(insn),
+            Opcode::Hi64 => self.emit_hi64(insn),
+            Opcode::Pair64 => self.emit_pair64(insn),
+            Opcode::AddC => self.emit_addc(insn, false),
+            Opcode::AdcC => self.emit_addc(insn, true),
+            Opcode::SubC => self.emit_subc(insn, false),
+            Opcode::SbcC => self.emit_subc(insn, true),
+            Opcode::UMulHi => self.emit_umulhi(insn),
+
             // Skip no-ops and unimplemented
             _ => {}
         }
@@ -2836,7 +2846,7 @@ impl X86_64CodeGen {
         match &src_loc {
             Loc::Imm(v) => {
                 let lo = *v as i64;
-                let hi = (*v >> 64) as i64;
+                let hi = (*v >> 64) as u64 as i64;
                 // Store lo half
                 if lo > i32::MAX as i64 || lo < i32::MIN as i64 {
                     self.push_lir(X86Inst::MovAbs {

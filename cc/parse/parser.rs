@@ -391,7 +391,7 @@ impl<'a> Parser<'a> {
         if self.peek() == TokenType::Ident {
             if let Some(name_id) = self.get_ident_id(self.current()) {
                 let is_type = self.symbols.lookup_typedef(name_id).is_some()
-                    || Self::is_type_keyword(self.str(name_id));
+                    || crate::kw::has_tag(name_id, crate::kw::TYPE_KEYWORD);
                 // If not a type, this is a grouped declarator
                 return !is_type;
             }
@@ -491,8 +491,8 @@ impl<'a> Parser<'a> {
         if self.peek() != TokenType::Ident {
             return false;
         }
-        if let Some(name) = self.get_ident_name(self.current()) {
-            name == "__attribute__" || name == "__attribute"
+        if let Some(id) = self.get_ident_id(self.current()) {
+            crate::kw::has_tag(id, crate::kw::ATTR_KW)
         } else {
             false
         }
@@ -645,8 +645,8 @@ impl<'a> Parser<'a> {
     fn is_nullability_qualifier(&self) -> bool {
         self.peek() == TokenType::Ident
             && self
-                .get_ident_name(self.current())
-                .is_some_and(|n| super::is_nullability_qualifier(n.as_str()))
+                .get_ident_id(self.current())
+                .is_some_and(super::is_nullability_qualifier)
     }
 
     /// Check if current token is __asm or __asm__
@@ -654,8 +654,8 @@ impl<'a> Parser<'a> {
         if self.peek() != TokenType::Ident {
             return false;
         }
-        if let Some(name) = self.get_ident_name(self.current()) {
-            name == "__asm__" || name == "__asm" || name == "asm"
+        if let Some(id) = self.get_ident_id(self.current()) {
+            crate::kw::has_tag(id, crate::kw::ASM_KW)
         } else {
             false
         }
@@ -695,18 +695,16 @@ impl<'a> Parser<'a> {
         let mut is_volatile = false;
         let mut _is_goto = false;
         while self.peek() == TokenType::Ident {
-            if let Some(name) = self.get_ident_name(self.current()) {
-                match name.as_str() {
-                    "volatile" | "__volatile__" => {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                match name_id {
+                    crate::kw::VOLATILE | crate::kw::GNU_VOLATILE => {
                         is_volatile = true;
                         self.advance();
                     }
-                    "inline" | "__inline__" => {
-                        // inline qualifier - just consume it (affects inlining decisions)
+                    crate::kw::INLINE | crate::kw::GNU_INLINE => {
                         self.advance();
                     }
-                    "goto" => {
-                        // goto qualifier - indicates asm can jump to C labels
+                    crate::kw::GOTO => {
                         _is_goto = true;
                         self.advance();
                     }
@@ -948,34 +946,34 @@ impl Parser<'_> {
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
         // Check for keywords
         if self.peek() == TokenType::Ident {
-            if let Some(name) = self.get_ident_name(self.current()) {
-                match name.as_str() {
-                    "if" => return self.parse_if_stmt(),
-                    "while" => return self.parse_while_stmt(),
-                    "do" => return self.parse_do_while_stmt(),
-                    "for" => return self.parse_for_stmt(),
-                    "return" => return self.parse_return_stmt(),
-                    "break" => {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                match name_id {
+                    crate::kw::IF => return self.parse_if_stmt(),
+                    crate::kw::WHILE => return self.parse_while_stmt(),
+                    crate::kw::DO => return self.parse_do_while_stmt(),
+                    crate::kw::FOR => return self.parse_for_stmt(),
+                    crate::kw::RETURN => return self.parse_return_stmt(),
+                    crate::kw::BREAK => {
                         self.advance();
                         self.expect_special(b';')?;
                         return Ok(Stmt::Break);
                     }
-                    "continue" => {
+                    crate::kw::CONTINUE => {
                         self.advance();
                         self.expect_special(b';')?;
                         return Ok(Stmt::Continue);
                     }
-                    "goto" => {
+                    crate::kw::GOTO => {
                         self.advance();
                         let label = self.expect_identifier()?;
                         self.expect_special(b';')?;
                         return Ok(Stmt::Goto(label));
                     }
-                    "switch" => return self.parse_switch_stmt(),
-                    "case" => return self.parse_case_label(),
-                    "default" => return self.parse_default_label(),
+                    crate::kw::SWITCH => return self.parse_switch_stmt(),
+                    crate::kw::CASE => return self.parse_case_label(),
+                    crate::kw::DEFAULT => return self.parse_default_label(),
                     // GCC extended inline assembly
-                    "__asm__" | "__asm" | "asm" => {
+                    crate::kw::ASM | crate::kw::GNU_ASM | crate::kw::GNU_ASM2 => {
                         return self.parse_asm_statement();
                     }
                     _ => {}
@@ -1026,8 +1024,8 @@ impl Parser<'_> {
         let then_stmt = self.parse_statement()?;
 
         let else_stmt = if self.peek() == TokenType::Ident {
-            if let Some(name) = self.get_ident_name(self.current()) {
-                if name == "else" {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                if name_id == crate::kw::ELSE {
                     self.advance();
                     Some(Box::new(self.parse_statement()?))
                 } else {
@@ -1303,55 +1301,7 @@ impl Parser<'_> {
         }
 
         if let Some(name_id) = self.get_ident_id(self.current()) {
-            let name = self.str(name_id);
-            // Check for type keywords first
-            if matches!(
-                name,
-                "void"
-                    | "char"
-                    | "short"
-                    | "int"
-                    | "long"
-                    | "float"
-                    | "double"
-                    | "_Float16"
-                    | "_Float32"
-                    | "_Float64"
-                    | "_Complex"
-                    | "_Atomic"
-                    | "_Alignas"
-                    | "signed"
-                    | "unsigned"
-                    | "const"
-                    | "volatile"
-                    | "static"
-                    | "extern"
-                    | "auto"
-                    | "register"
-                    | "typedef"
-                    | "inline"
-                    | "__inline"
-                    | "__inline__"
-                    | "_Noreturn"
-                    | "__noreturn__"
-                    | "struct"
-                    | "union"
-                    | "enum"
-                    | "_Bool"
-                    | "__attribute__"
-                    | "__attribute"
-                    | "__int128"
-                    | "__int128_t"
-                    | "__uint128_t"
-                    | "__builtin_va_list"
-                    | "typeof"
-                    | "__typeof__"
-                    | "__typeof"
-                    | "_Thread_local"
-                    | "__thread"
-                    | "_Static_assert"
-                    | "static_assert"
-            ) {
+            if crate::kw::has_tag(name_id, crate::kw::DECL_START) {
                 return true;
             }
             // Also check for typedef names
@@ -1716,67 +1666,65 @@ impl Parser<'_> {
                 Some(id) => id,
                 None => break,
             };
-            let name = self.str(name_id);
-
-            match name {
+            match name_id {
                 // Skip __attribute__ in the type specifier loop
-                "__attribute__" | "__attribute" => {
+                crate::kw::GNU_ATTRIBUTE | crate::kw::GNU_ATTRIBUTE2 => {
                     self.skip_extensions();
                     continue;
                 }
-                "const" => {
+                crate::kw::CONST => {
                     self.advance();
                     modifiers |= TypeModifiers::CONST;
                 }
-                "volatile" => {
+                crate::kw::VOLATILE => {
                     self.advance();
                     modifiers |= TypeModifiers::VOLATILE;
                 }
-                "static" => {
+                crate::kw::STATIC => {
                     self.advance();
                     modifiers |= TypeModifiers::STATIC;
                 }
-                "extern" => {
+                crate::kw::EXTERN => {
                     self.advance();
                     modifiers |= TypeModifiers::EXTERN;
                 }
-                "register" => {
+                crate::kw::REGISTER => {
                     self.advance();
                     modifiers |= TypeModifiers::REGISTER;
                 }
-                "auto" => {
+                crate::kw::AUTO => {
                     self.advance();
                     modifiers |= TypeModifiers::AUTO;
                 }
-                "typedef" => {
+                crate::kw::TYPEDEF => {
                     self.advance();
                     modifiers |= TypeModifiers::TYPEDEF;
                 }
-                "_Thread_local" | "__thread" => {
+                crate::kw::THREAD_LOCAL | crate::kw::GNU_THREAD => {
                     self.advance();
                     modifiers |= TypeModifiers::THREAD_LOCAL;
                 }
-                "inline" | "__inline" | "__inline__" => {
+                crate::kw::INLINE | crate::kw::GNU_INLINE2 | crate::kw::GNU_INLINE => {
                     self.advance();
                     modifiers |= TypeModifiers::INLINE;
                 }
-                "_Noreturn" | "__noreturn__" => {
+                crate::kw::NORETURN | crate::kw::GNU_NORETURN => {
                     self.advance();
                     modifiers |= TypeModifiers::NORETURN;
                 }
-                "signed" => {
+                crate::kw::SIGNED => {
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;
                 }
-                "unsigned" => {
+                crate::kw::UNSIGNED => {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
-                "_Complex" => {
+                crate::kw::COMPLEX => {
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
-                "_Atomic" => {
+                crate::kw::ATOMIC => {
                     self.advance();
                     // _Atomic can be:
                     // 1. Type specifier: _Atomic(type-name)
@@ -1803,7 +1751,7 @@ impl Parser<'_> {
                         modifiers |= TypeModifiers::ATOMIC;
                     }
                 }
-                "_Alignas" => {
+                crate::kw::ALIGNAS => {
                     // C11 alignment specifier: _Alignas(type-name) or _Alignas(constant-expression)
                     let alignas_pos = self.current_pos();
                     self.advance();
@@ -1837,14 +1785,14 @@ impl Parser<'_> {
                         }
                     }
                 }
-                "short" => {
+                crate::kw::SHORT => {
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
                     if base_kind.is_none() {
                         base_kind = Some(TypeKind::Short);
                     }
                 }
-                "long" => {
+                crate::kw::LONG => {
                     self.advance();
                     if modifiers.contains(TypeModifiers::LONG) {
                         modifiers |= TypeModifiers::LONGLONG;
@@ -1859,15 +1807,15 @@ impl Parser<'_> {
                         }
                     }
                 }
-                "void" => {
+                crate::kw::VOID => {
                     self.advance();
                     base_kind = Some(TypeKind::Void);
                 }
-                "char" => {
+                crate::kw::CHAR => {
                     self.advance();
                     base_kind = Some(TypeKind::Char);
                 }
-                "int" => {
+                crate::kw::INT => {
                     self.advance();
                     if base_kind.is_none()
                         || !matches!(
@@ -1878,11 +1826,11 @@ impl Parser<'_> {
                         base_kind = Some(TypeKind::Int);
                     }
                 }
-                "float" => {
+                crate::kw::FLOAT => {
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
-                "double" => {
+                crate::kw::DOUBLE => {
                     self.advance();
                     // Handle long double
                     if modifiers.contains(TypeModifiers::LONG) {
@@ -1891,42 +1839,42 @@ impl Parser<'_> {
                         base_kind = Some(TypeKind::Double);
                     }
                 }
-                "_Float16" => {
+                crate::kw::FLOAT16 => {
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                 }
-                "_Float32" => {
+                crate::kw::FLOAT32 => {
                     // _Float32 is an alias for float (TS 18661-3 / C23)
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
-                "_Float64" => {
+                crate::kw::FLOAT64 => {
                     // _Float64 is an alias for double (TS 18661-3 / C23)
                     self.advance();
                     base_kind = Some(TypeKind::Double);
                 }
-                "_Bool" => {
+                crate::kw::BOOL => {
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                 }
-                "__int128" => {
+                crate::kw::INT128 => {
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
-                "__int128_t" => {
+                crate::kw::INT128_T => {
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
-                "__uint128_t" => {
+                crate::kw::UINT128_T => {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                     base_kind = Some(TypeKind::Int128);
                 }
-                "__builtin_va_list" => {
+                crate::kw::BUILTIN_VA_LIST => {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
-                "typeof" | "__typeof__" | "__typeof" => {
+                crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2 => {
                     self.advance(); // consume typeof
                     self.expect_special(b'(')?;
 
@@ -1954,7 +1902,7 @@ impl Parser<'_> {
                         ..result_type
                     });
                 }
-                "enum" => {
+                crate::kw::ENUM => {
                     let mut enum_type = self.parse_enum_specifier()?;
                     // Consume trailing qualifiers (e.g., "enum foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -1962,14 +1910,14 @@ impl Parser<'_> {
                     enum_type.modifiers |= modifiers | trailing_mods;
                     return Ok(enum_type);
                 }
-                "struct" => {
+                crate::kw::STRUCT => {
                     let mut struct_type = self.parse_struct_or_union_specifier(false)?;
                     // Consume trailing qualifiers (e.g., "struct foo const")
                     let trailing_mods = self.consume_type_qualifiers();
                     struct_type.modifiers |= modifiers | trailing_mods;
                     return Ok(struct_type);
                 }
-                "union" => {
+                crate::kw::UNION => {
                     let mut union_type = self.parse_struct_or_union_specifier(true)?;
                     // Consume trailing qualifiers (e.g., "union foo const")
                     let trailing_mods = self.consume_type_qualifiers();
@@ -2418,25 +2366,25 @@ impl Parser<'_> {
 
             // Parse pointer qualifiers (const, volatile, restrict, _Atomic, nullability)
             while self.peek() == TokenType::Ident {
-                if let Some(name) = self.get_ident_name(self.current()) {
-                    match name.as_str() {
-                        "const" => {
+                if let Some(name_id) = self.get_ident_id(self.current()) {
+                    match name_id {
+                        crate::kw::CONST => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::CONST;
                         }
-                        "volatile" => {
+                        crate::kw::VOLATILE => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::VOLATILE;
                         }
-                        "restrict" => {
+                        crate::kw::RESTRICT => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
-                        "_Atomic" => {
+                        crate::kw::ATOMIC => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::ATOMIC;
                         }
-                        n if super::is_nullability_qualifier(n) => {
+                        _ if super::is_nullability_qualifier(name_id) => {
                             self.advance();
                         }
                         _ => break,
@@ -2509,9 +2457,12 @@ impl Parser<'_> {
             // Parse optional qualifiers and static (C99 6.7.5.3)
             // These are valid in function parameter array declarators
             while self.peek() == TokenType::Ident {
-                if let Some(name) = self.get_ident_name(self.current()) {
-                    match name.as_str() {
-                        "static" | "const" | "volatile" | "restrict" => {
+                if let Some(name_id) = self.get_ident_id(self.current()) {
+                    match name_id {
+                        crate::kw::STATIC
+                        | crate::kw::CONST
+                        | crate::kw::VOLATILE
+                        | crate::kw::RESTRICT => {
                             self.advance();
                         }
                         _ => break,
@@ -2770,21 +2721,21 @@ impl Parser<'_> {
 
             // Parse pointer qualifiers
             while self.peek() == TokenType::Ident {
-                if let Some(name) = self.get_ident_name(self.current()) {
-                    match name.as_str() {
-                        "const" => {
+                if let Some(name_id) = self.get_ident_id(self.current()) {
+                    match name_id {
+                        crate::kw::CONST => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::CONST;
                         }
-                        "volatile" => {
+                        crate::kw::VOLATILE => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::VOLATILE;
                         }
-                        "restrict" => {
+                        crate::kw::RESTRICT => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
-                        n if super::is_nullability_qualifier(n) => {
+                        _ if super::is_nullability_qualifier(name_id) => {
                             self.advance();
                         }
                         _ => break,
@@ -2875,8 +2826,8 @@ impl Parser<'_> {
 
         // Check for (void)
         if self.peek() == TokenType::Ident {
-            if let Some(name) = self.get_ident_name(self.current()) {
-                if name == "void" {
+            if let Some(name_id) = self.get_ident_id(self.current()) {
+                if name_id == crate::kw::VOID {
                     let saved_pos = self.pos;
                     self.advance();
                     if self.is_special(b')') {
@@ -2993,9 +2944,8 @@ impl Parser<'_> {
         if self.peek() != TokenType::Ident {
             return false;
         }
-        if let Some(name_id) = self.get_ident_id(self.current()) {
-            let name = self.str(name_id);
-            matches!(name, "_Static_assert" | "static_assert")
+        if let Some(id) = self.get_ident_id(self.current()) {
+            crate::kw::has_tag(id, crate::kw::ASSERT_KW)
         } else {
             false
         }
@@ -3249,21 +3199,21 @@ impl Parser<'_> {
 
             // Parse pointer qualifiers
             while self.peek() == TokenType::Ident {
-                if let Some(name) = self.get_ident_name(self.current()) {
-                    match name.as_str() {
-                        "const" => {
+                if let Some(name_id) = self.get_ident_id(self.current()) {
+                    match name_id {
+                        crate::kw::CONST => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::CONST;
                         }
-                        "volatile" => {
+                        crate::kw::VOLATILE => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::VOLATILE;
                         }
-                        "restrict" => {
+                        crate::kw::RESTRICT => {
                             self.advance();
                             ptr_modifiers |= TypeModifiers::RESTRICT;
                         }
-                        n if super::is_nullability_qualifier(n) => {
+                        _ if super::is_nullability_qualifier(name_id) => {
                             self.advance();
                         }
                         _ => break,

@@ -202,10 +202,7 @@ fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInf
             let copy_typ = copy.typ;
 
             // Create a temporary pseudo to hold the original source value
-            let temp_id = super::PseudoId(func.next_pseudo);
-            func.next_pseudo += 1;
-            let temp_pseudo = super::Pseudo::reg(temp_id, temp_id.0);
-            func.add_pseudo(temp_pseudo);
+            let temp_id = func.create_reg_pseudo();
 
             // Emit: temp = copy source (save the source before it gets overwritten)
             result.push(CopyInfo {

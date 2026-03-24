@@ -453,7 +453,7 @@ impl fmt::Display for MemoryOrder {
 // ============================================================================
 
 /// Unique ID for a pseudo (virtual register)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PseudoId(pub u32);
 
 impl fmt::Display for PseudoId {
@@ -463,9 +463,10 @@ impl fmt::Display for PseudoId {
 }
 
 /// Type of pseudo value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum PseudoKind {
     /// Void (no value)
+    #[default]
     Void,
     /// Undefined value
     Undef,
@@ -484,7 +485,7 @@ pub enum PseudoKind {
 }
 
 /// A pseudo (virtual register or value) in SSA form
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Pseudo {
     pub id: PseudoId,
     pub kind: PseudoKind,
@@ -495,16 +496,6 @@ pub struct Pseudo {
 impl PartialEq for Pseudo {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id && self.kind == other.kind
-    }
-}
-
-impl Default for Pseudo {
-    fn default() -> Self {
-        Self {
-            id: PseudoId(0),
-            kind: PseudoKind::Void,
-            name: None,
-        }
     }
 }
 
@@ -1722,7 +1713,7 @@ impl GlobalDef {
 // ============================================================================
 
 /// A module containing multiple functions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Module {
     /// Functions
     pub functions: Vec<Function>,
@@ -1749,22 +1740,6 @@ pub struct Module {
 }
 
 impl Module {
-    /// Create a new module
-    pub fn new() -> Self {
-        Self {
-            functions: Vec::new(),
-            globals: Vec::new(),
-            strings: Vec::new(),
-            wide_strings: Vec::new(),
-            debug: false,
-            source_files: Vec::new(),
-            extern_symbols: HashSet::new(),
-            extern_tls_symbols: HashSet::new(),
-            comp_dir: None,
-            source_name: None,
-        }
-    }
-
     /// Add a function
     pub fn add_function(&mut self, func: Function) {
         self.functions.push(func);
@@ -1854,12 +1829,6 @@ impl Module {
         let label = format!(".LWC{}", self.wide_strings.len());
         self.wide_strings.push((label.clone(), content));
         label
-    }
-}
-
-impl Default for Module {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -2060,7 +2029,7 @@ mod tests {
     #[test]
     fn test_module() {
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         module.add_global("counter", types.int_id, Initializer::Int(0));
 
@@ -2073,7 +2042,7 @@ mod tests {
 
     #[test]
     fn test_module_extern_symbols() {
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // New module should have empty extern_symbols
         assert!(module.extern_symbols.is_empty());
@@ -2181,7 +2150,7 @@ mod tests {
     #[test]
     fn test_add_global_aligned_tentative_definition() {
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Add a tentative definition (no initializer)
         module.add_global_aligned("x", types.int_id, Initializer::None, None, false);
@@ -2198,7 +2167,7 @@ mod tests {
     #[test]
     fn test_add_global_aligned_non_tentative_not_replaced() {
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Add a real definition (with initializer)
         module.add_global_aligned("x", types.int_id, Initializer::Int(10), None, false);
@@ -2212,7 +2181,7 @@ mod tests {
     #[test]
     fn test_add_global_tls_aligned_tentative_definition() {
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Add a TLS tentative definition
         module.add_global_tls_aligned("tls_var", types.int_id, Initializer::None, None, false);

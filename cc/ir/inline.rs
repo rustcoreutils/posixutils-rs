@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn test_analyze_simple_function() {
         let func = make_simple_func("test", true);
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.functions.push(func);
 
         let call_counts = build_call_count_map(&module);
@@ -1337,7 +1337,7 @@ mod tests {
     #[test]
     fn test_address_taken_function_not_removed() {
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Create a static function "handler" that would be removed if not address-taken
         let mut handler = Function::new("handler", types.int_id);
@@ -1404,7 +1404,7 @@ mod tests {
         // are NOT removed by dead function elimination.
         // This tests the fix for: static const struct { func_ptr fn; } = { my_func };
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Create a static function "callback" with no direct callers
         let mut callback = Function::new("callback", types.int_id);
@@ -1463,7 +1463,7 @@ mod tests {
     fn test_global_struct_initializer_func_ref_preserved() {
         // Test function refs inside struct initializers in globals
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Create static function "my_handler"
         let mut handler = Function::new("my_handler", types.int_id);
@@ -1516,7 +1516,7 @@ mod tests {
     fn test_global_array_initializer_func_ref_preserved() {
         // Test function refs inside array initializers in globals
         let types = TypeTable::new(&Target::host());
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         // Create static function "arr_func"
         let mut func = Function::new("arr_func", types.int_id);

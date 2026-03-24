@@ -214,7 +214,7 @@ impl<'a> Linearizer<'a> {
         target: &'a Target,
     ) -> Self {
         Self {
-            module: Module::new(),
+            module: Module::default(),
             current_func: None,
             current_bb: None,
             next_pseudo: 0,

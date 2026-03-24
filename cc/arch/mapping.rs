@@ -1838,7 +1838,7 @@ mod tests {
     fn test_run_mapping_empty() {
         let target = Target::new(Arch::X86_64, Os::Linux);
         let types = TypeTable::new(&target);
-        let mut module = Module::new();
+        let mut module = Module::default();
 
         run_mapping(&mut module, &types, &target);
     }
@@ -1848,7 +1848,7 @@ mod tests {
         let target = Target::new(Arch::X86_64, Os::Linux);
         let types = TypeTable::new(&target);
 
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.add_function(make_test_func(&types));
         module.add_function(make_test_func(&types));
 
@@ -1860,7 +1860,7 @@ mod tests {
         let target = Target::new(Arch::X86_64, Os::Linux);
         let types = TypeTable::new(&target);
 
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.add_function(make_test_func(&types));
 
         run_mapping(&mut module, &types, &target);
@@ -1879,7 +1879,7 @@ mod tests {
 
         for target in &targets {
             let types = TypeTable::new(target);
-            let mut module = Module::new();
+            let mut module = Module::default();
             module.add_function(make_test_func(&types));
             run_mapping(&mut module, &types, target);
         }
@@ -1890,7 +1890,7 @@ mod tests {
         let target = Target::new(Arch::X86_64, Os::Linux);
         let types = TypeTable::new(&target);
 
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.add_function(make_test_func(&types));
         let orig_insn_count = module.functions[0].blocks[0].insns.len();
 
@@ -1905,7 +1905,7 @@ mod tests {
         let target = Target::new(Arch::Aarch64, Os::Linux);
         let types = TypeTable::new(&target);
 
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.add_function(make_test_func(&types));
         let orig_insn_count = module.functions[0].blocks[0].insns.len();
 
@@ -1943,7 +1943,7 @@ mod tests {
         func.add_block(bb);
         func.entry = BasicBlockId(0);
 
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.add_function(func);
         run_mapping(&mut module, &types, &target);
 
@@ -1984,7 +1984,7 @@ mod tests {
         func.add_block(bb);
         func.entry = BasicBlockId(0);
 
-        let mut module = Module::new();
+        let mut module = Module::default();
         module.add_function(func);
         run_mapping(&mut module, &types, &target);
 

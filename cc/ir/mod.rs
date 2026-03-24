@@ -19,6 +19,9 @@ pub mod dominate;
 pub mod inline;
 pub mod instcombine;
 pub mod linearize;
+mod linearize_emit;
+mod linearize_init;
+mod linearize_stmt;
 pub mod lower;
 pub mod ssa;
 

@@ -15,8 +15,8 @@
 
 use super::*;
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, FunctionDef,
-    InitDeclarator, InitElement, Parameter, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, ForInit,
+    FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;

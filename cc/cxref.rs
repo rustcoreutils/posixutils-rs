@@ -77,7 +77,7 @@ struct SymbolRef {
 }
 
 /// Information about a symbol across files
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct SymbolInfo {
     /// References organized by file, then by function scope
     /// Map: file -> Map: function (or empty for global) -> refs
@@ -85,12 +85,6 @@ struct SymbolInfo {
 }
 
 impl SymbolInfo {
-    fn new() -> Self {
-        Self {
-            refs: BTreeMap::new(),
-        }
-    }
-
     fn add_ref(&mut self, file: &str, function: &str, line: u32, is_definition: bool) {
         self.refs
             .entry(file.to_string())
@@ -105,6 +99,7 @@ impl SymbolInfo {
 }
 
 /// Cross-reference table
+#[derive(Default)]
 struct CrossRef {
     /// All symbols: name -> info
     symbols: BTreeMap<String, SymbolInfo>,
@@ -115,14 +110,6 @@ struct CrossRef {
 }
 
 impl CrossRef {
-    fn new() -> Self {
-        Self {
-            symbols: BTreeMap::new(),
-            current_file: String::new(),
-            current_function: String::new(),
-        }
-    }
-
     fn set_file(&mut self, file: &str) {
         self.current_file = file.to_string();
     }
@@ -132,17 +119,21 @@ impl CrossRef {
     }
 
     fn add_definition(&mut self, name: &str, line: u32) {
-        self.symbols
-            .entry(name.to_string())
-            .or_insert_with(SymbolInfo::new)
-            .add_ref(&self.current_file, &self.current_function, line, true);
+        self.symbols.entry(name.to_string()).or_default().add_ref(
+            &self.current_file,
+            &self.current_function,
+            line,
+            true,
+        );
     }
 
     fn add_reference(&mut self, name: &str, line: u32) {
-        self.symbols
-            .entry(name.to_string())
-            .or_insert_with(SymbolInfo::new)
-            .add_ref(&self.current_file, &self.current_function, line, false);
+        self.symbols.entry(name.to_string()).or_default().add_ref(
+            &self.current_file,
+            &self.current_function,
+            line,
+            false,
+        );
     }
 }
 
@@ -561,7 +552,7 @@ fn main() -> ExitCode {
     }
 
     // Build cross-reference
-    let mut xref = CrossRef::new();
+    let mut xref = CrossRef::default();
     let mut streams = StreamTable::new();
 
     for file in &args.files {
@@ -586,7 +577,7 @@ fn main() -> ExitCode {
                 // In non-combined mode, print and reset after each file
                 if !args.combined {
                     print_xref(&xref, args.width, args.silent, &mut *output_file);
-                    xref = CrossRef::new();
+                    xref = CrossRef::default();
                 }
             }
             _ => {

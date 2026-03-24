@@ -2925,7 +2925,7 @@ impl Parser<'_> {
 
     /// Parse a translation unit (top-level)
     pub fn parse_translation_unit(&mut self) -> ParseResult<TranslationUnit> {
-        let mut tu = TranslationUnit::new();
+        let mut tu = TranslationUnit::default();
 
         self.skip_stream_tokens();
 

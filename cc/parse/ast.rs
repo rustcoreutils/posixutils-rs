@@ -1032,24 +1032,14 @@ pub enum ExternalDecl {
 }
 
 /// A translation unit (entire source file)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TranslationUnit {
     pub items: Vec<ExternalDecl>,
 }
 
 impl TranslationUnit {
-    pub fn new() -> Self {
-        TranslationUnit { items: Vec::new() }
-    }
-
     pub fn add(&mut self, item: ExternalDecl) {
         self.items.push(item);
-    }
-}
-
-impl Default for TranslationUnit {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1311,7 +1301,7 @@ mod tests {
         let x_sym = symbols
             .declare(Symbol::variable(x_name, types.int_id, 0))
             .unwrap();
-        let mut tu = TranslationUnit::new();
+        let mut tu = TranslationUnit::default();
 
         // Add a declaration
         let decl = Declaration::simple(x_sym, types.int_id, None);

@@ -6171,156 +6171,8 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
-        // Set current position for debug info
-        self.current_pos = Some(expr.pos);
-
+    fn linearize_compound_literal(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            ExprKind::IntLit(val) => {
-                let typ = self.expr_type(expr);
-                self.emit_const(*val as i128, typ)
-            }
-
-            ExprKind::Int128Lit(val) => {
-                let typ = self.expr_type(expr);
-                self.emit_const(*val, typ)
-            }
-
-            ExprKind::FloatLit(val) => {
-                let typ = self.expr_type(expr);
-                self.emit_fconst(*val, typ)
-            }
-
-            ExprKind::CharLit(c) => {
-                let typ = self.expr_type(expr);
-                self.emit_const(*c as u8 as i8 as i128, typ)
-            }
-
-            ExprKind::StringLit(s) => {
-                let label = self.module.add_string(s.clone());
-                self.emit_string_sym(expr, label)
-            }
-
-            ExprKind::WideStringLit(s) => {
-                let label = self.module.add_wide_string(s.clone());
-                self.emit_string_sym(expr, label)
-            }
-
-            ExprKind::Ident(symbol_id) => self.linearize_ident(expr, *symbol_id),
-
-            ExprKind::FuncName => self.linearize_func_name(),
-
-            ExprKind::Unary { op, operand } => self.linearize_unary(expr, *op, operand),
-
-            ExprKind::Binary { op, left, right } => self.linearize_binary(expr, *op, left, right),
-
-            ExprKind::Assign { op, target, value } => self.emit_assign(*op, target, value),
-
-            ExprKind::PostInc(operand) => self.linearize_postop(operand, true),
-
-            ExprKind::PostDec(operand) => self.linearize_postop(operand, false),
-
-            ExprKind::Conditional {
-                cond,
-                then_expr,
-                else_expr,
-            } => self.linearize_ternary(expr, cond, then_expr, else_expr),
-
-            ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
-
-            ExprKind::Member {
-                expr: inner_expr,
-                member,
-            } => self.linearize_member(expr, inner_expr, *member),
-
-            ExprKind::Arrow {
-                expr: inner_expr,
-                member,
-            } => self.linearize_arrow(expr, inner_expr, *member),
-
-            ExprKind::Index { array, index } => self.linearize_index(expr, array, index),
-
-            ExprKind::Cast {
-                cast_type,
-                expr: inner_expr,
-            } => self.linearize_cast(inner_expr, *cast_type),
-
-            ExprKind::SizeofType(typ) => {
-                let size = self.types.size_bits(*typ) / 8;
-                // sizeof returns size_t, which is unsigned long in our implementation
-                let result_typ = self.types.ulong_id;
-                self.emit_const(size as i128, result_typ)
-            }
-
-            ExprKind::SizeofExpr(inner_expr) => {
-                // Check if this is a VLA variable - need runtime sizeof
-                if let ExprKind::Ident(symbol_id) = &inner_expr.kind {
-                    if let Some(info) = self.locals.get(symbol_id).cloned() {
-                        if let (Some(size_sym), Some(elem_type)) =
-                            (info.vla_size_sym, info.vla_elem_type)
-                        {
-                            // VLA: compute sizeof at runtime as num_elements * sizeof(element)
-                            let result_typ = self.types.ulong_id;
-                            let elem_size = self.types.size_bytes(elem_type) as i64;
-
-                            // Load the stored number of elements
-                            let num_elements = self.alloc_pseudo();
-                            let load_insn =
-                                Instruction::load(num_elements, size_sym, 0, result_typ, 64);
-                            self.emit(load_insn);
-
-                            // Multiply by element size
-                            let elem_size_const = self.emit_const(elem_size as i128, result_typ);
-                            let result = self.alloc_pseudo();
-                            let mul_insn = Instruction::new(Opcode::Mul)
-                                .with_target(result)
-                                .with_src(num_elements)
-                                .with_src(elem_size_const)
-                                .with_size(64)
-                                .with_type(result_typ);
-                            self.emit(mul_insn);
-                            return result;
-                        }
-                    }
-                }
-
-                // Non-VLA: compute size at compile time
-                let inner_typ = self.expr_type(inner_expr);
-                let size = self.types.size_bits(inner_typ) / 8;
-                // sizeof returns size_t, which is unsigned long in our implementation
-                let result_typ = self.types.ulong_id;
-                self.emit_const(size as i128, result_typ)
-            }
-
-            ExprKind::AlignofType(typ) => {
-                let align = self.types.alignment(*typ);
-                // _Alignof returns size_t
-                let result_typ = self.types.ulong_id;
-                self.emit_const(align as i128, result_typ)
-            }
-
-            ExprKind::AlignofExpr(inner_expr) => {
-                let inner_typ = self.expr_type(inner_expr);
-                let align = self.types.alignment(inner_typ);
-                // _Alignof returns size_t
-                let result_typ = self.types.ulong_id;
-                self.emit_const(align as i128, result_typ)
-            }
-
-            ExprKind::Comma(exprs) => {
-                let mut result = self.emit_const(0, self.types.int_id);
-                for e in exprs {
-                    result = self.linearize_expr(e);
-                }
-                result
-            }
-
-            ExprKind::InitList { .. } => {
-                // InitList is handled specially in linearize_local_decl and linearize_global_decl
-                // It shouldn't be reached here during normal expression evaluation
-                panic!("InitList should be handled in declaration context, not as standalone expression")
-            }
-
             ExprKind::CompoundLiteral { typ, elements } => {
                 // Compound literals have automatic storage at block scope
                 // Create an anonymous local variable, similar to how local variables work
@@ -6381,7 +6233,12 @@ impl<'a> Linearizer<'a> {
                 }
                 result
             }
+            _ => unreachable!(),
+        }
+    }
 
+    fn linearize_va_op(&mut self, expr: &Expr) -> PseudoId {
+        match &expr.kind {
             // ================================================================
             // Variadic function support (va_* builtins)
             // ================================================================
@@ -6447,7 +6304,12 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+            _ => unreachable!(),
+        }
+    }
 
+    fn linearize_builtin(&mut self, expr: &Expr) -> PseudoId {
+        match &expr.kind {
             // ================================================================
             // Byte-swapping builtins
             // ================================================================
@@ -6781,42 +6643,12 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+            _ => unreachable!(),
+        }
+    }
 
-            ExprKind::OffsetOf { type_id, path } => {
-                // __builtin_offsetof(type, member-designator)
-                // Compute the byte offset of the member within the struct
-                let mut offset: u64 = 0;
-                let mut current_type = *type_id;
-
-                for element in path {
-                    match element {
-                        OffsetOfPath::Field(field_id) => {
-                            // Look up the field in the current struct type
-                            let struct_type = self.resolve_struct_type(current_type);
-                            let member_info = self
-                                .types
-                                .find_member(struct_type, *field_id)
-                                .expect("offsetof: field not found in struct type");
-                            offset += member_info.offset as u64;
-                            current_type = member_info.typ;
-                        }
-                        OffsetOfPath::Index(index) => {
-                            // Array indexing: offset += index * sizeof(element)
-                            let elem_type = self
-                                .types
-                                .base_type(current_type)
-                                .expect("offsetof: array index on non-array type");
-                            let elem_size = self.types.size_bytes(elem_type);
-                            offset += (*index as u64) * (elem_size as u64);
-                            current_type = elem_type;
-                        }
-                    }
-                }
-
-                // Return the offset as a constant
-                self.emit_const(offset as i128, self.types.ulong_id)
-            }
-
+    fn linearize_c11_atomic(&mut self, expr: &Expr) -> PseudoId {
+        match &expr.kind {
             // ================================================================
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
             // ================================================================
@@ -7073,6 +6905,243 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+            _ => unreachable!(),
+        }
+    }
+
+    fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
+        // Set current position for debug info
+        self.current_pos = Some(expr.pos);
+
+        match &expr.kind {
+            ExprKind::IntLit(val) => {
+                let typ = self.expr_type(expr);
+                self.emit_const(*val as i128, typ)
+            }
+
+            ExprKind::Int128Lit(val) => {
+                let typ = self.expr_type(expr);
+                self.emit_const(*val, typ)
+            }
+
+            ExprKind::FloatLit(val) => {
+                let typ = self.expr_type(expr);
+                self.emit_fconst(*val, typ)
+            }
+
+            ExprKind::CharLit(c) => {
+                let typ = self.expr_type(expr);
+                self.emit_const(*c as u8 as i8 as i128, typ)
+            }
+
+            ExprKind::StringLit(s) => {
+                let label = self.module.add_string(s.clone());
+                self.emit_string_sym(expr, label)
+            }
+
+            ExprKind::WideStringLit(s) => {
+                let label = self.module.add_wide_string(s.clone());
+                self.emit_string_sym(expr, label)
+            }
+
+            ExprKind::Ident(symbol_id) => self.linearize_ident(expr, *symbol_id),
+
+            ExprKind::FuncName => self.linearize_func_name(),
+
+            ExprKind::Unary { op, operand } => self.linearize_unary(expr, *op, operand),
+
+            ExprKind::Binary { op, left, right } => self.linearize_binary(expr, *op, left, right),
+
+            ExprKind::Assign { op, target, value } => self.emit_assign(*op, target, value),
+
+            ExprKind::PostInc(operand) => self.linearize_postop(operand, true),
+
+            ExprKind::PostDec(operand) => self.linearize_postop(operand, false),
+
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => self.linearize_ternary(expr, cond, then_expr, else_expr),
+
+            ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
+
+            ExprKind::Member {
+                expr: inner_expr,
+                member,
+            } => self.linearize_member(expr, inner_expr, *member),
+
+            ExprKind::Arrow {
+                expr: inner_expr,
+                member,
+            } => self.linearize_arrow(expr, inner_expr, *member),
+
+            ExprKind::Index { array, index } => self.linearize_index(expr, array, index),
+
+            ExprKind::Cast {
+                cast_type,
+                expr: inner_expr,
+            } => self.linearize_cast(inner_expr, *cast_type),
+
+            ExprKind::SizeofType(typ) => {
+                let size = self.types.size_bits(*typ) / 8;
+                // sizeof returns size_t, which is unsigned long in our implementation
+                let result_typ = self.types.ulong_id;
+                self.emit_const(size as i128, result_typ)
+            }
+
+            ExprKind::SizeofExpr(inner_expr) => {
+                // Check if this is a VLA variable - need runtime sizeof
+                if let ExprKind::Ident(symbol_id) = &inner_expr.kind {
+                    if let Some(info) = self.locals.get(symbol_id).cloned() {
+                        if let (Some(size_sym), Some(elem_type)) =
+                            (info.vla_size_sym, info.vla_elem_type)
+                        {
+                            // VLA: compute sizeof at runtime as num_elements * sizeof(element)
+                            let result_typ = self.types.ulong_id;
+                            let elem_size = self.types.size_bytes(elem_type) as i64;
+
+                            // Load the stored number of elements
+                            let num_elements = self.alloc_pseudo();
+                            let load_insn =
+                                Instruction::load(num_elements, size_sym, 0, result_typ, 64);
+                            self.emit(load_insn);
+
+                            // Multiply by element size
+                            let elem_size_const = self.emit_const(elem_size as i128, result_typ);
+                            let result = self.alloc_pseudo();
+                            let mul_insn = Instruction::new(Opcode::Mul)
+                                .with_target(result)
+                                .with_src(num_elements)
+                                .with_src(elem_size_const)
+                                .with_size(64)
+                                .with_type(result_typ);
+                            self.emit(mul_insn);
+                            return result;
+                        }
+                    }
+                }
+
+                // Non-VLA: compute size at compile time
+                let inner_typ = self.expr_type(inner_expr);
+                let size = self.types.size_bits(inner_typ) / 8;
+                // sizeof returns size_t, which is unsigned long in our implementation
+                let result_typ = self.types.ulong_id;
+                self.emit_const(size as i128, result_typ)
+            }
+
+            ExprKind::AlignofType(typ) => {
+                let align = self.types.alignment(*typ);
+                // _Alignof returns size_t
+                let result_typ = self.types.ulong_id;
+                self.emit_const(align as i128, result_typ)
+            }
+
+            ExprKind::AlignofExpr(inner_expr) => {
+                let inner_typ = self.expr_type(inner_expr);
+                let align = self.types.alignment(inner_typ);
+                // _Alignof returns size_t
+                let result_typ = self.types.ulong_id;
+                self.emit_const(align as i128, result_typ)
+            }
+
+            ExprKind::Comma(exprs) => {
+                let mut result = self.emit_const(0, self.types.int_id);
+                for e in exprs {
+                    result = self.linearize_expr(e);
+                }
+                result
+            }
+
+            ExprKind::InitList { .. } => {
+                // InitList is handled specially in linearize_local_decl and linearize_global_decl
+                // It shouldn't be reached here during normal expression evaluation
+                panic!("InitList should be handled in declaration context, not as standalone expression")
+            }
+
+            ExprKind::CompoundLiteral { .. } => self.linearize_compound_literal(expr),
+
+            ExprKind::VaStart { .. }
+            | ExprKind::VaArg { .. }
+            | ExprKind::VaEnd { .. }
+            | ExprKind::VaCopy { .. } => self.linearize_va_op(expr),
+
+            ExprKind::Bswap16 { .. }
+            | ExprKind::Bswap32 { .. }
+            | ExprKind::Bswap64 { .. }
+            | ExprKind::Ctz { .. }
+            | ExprKind::Ctzl { .. }
+            | ExprKind::Ctzll { .. }
+            | ExprKind::Clz { .. }
+            | ExprKind::Clzl { .. }
+            | ExprKind::Clzll { .. }
+            | ExprKind::Popcount { .. }
+            | ExprKind::Popcountl { .. }
+            | ExprKind::Popcountll { .. }
+            | ExprKind::Alloca { .. }
+            | ExprKind::Memset { .. }
+            | ExprKind::Memcpy { .. }
+            | ExprKind::Memmove { .. }
+            | ExprKind::Fabs { .. }
+            | ExprKind::Fabsf { .. }
+            | ExprKind::Fabsl { .. }
+            | ExprKind::Signbit { .. }
+            | ExprKind::Signbitf { .. }
+            | ExprKind::Signbitl { .. }
+            | ExprKind::Unreachable
+            | ExprKind::FrameAddress { .. }
+            | ExprKind::ReturnAddress { .. }
+            | ExprKind::Setjmp { .. }
+            | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
+
+            ExprKind::OffsetOf { type_id, path } => {
+                // __builtin_offsetof(type, member-designator)
+                // Compute the byte offset of the member within the struct
+                let mut offset: u64 = 0;
+                let mut current_type = *type_id;
+
+                for element in path {
+                    match element {
+                        OffsetOfPath::Field(field_id) => {
+                            // Look up the field in the current struct type
+                            let struct_type = self.resolve_struct_type(current_type);
+                            let member_info = self
+                                .types
+                                .find_member(struct_type, *field_id)
+                                .expect("offsetof: field not found in struct type");
+                            offset += member_info.offset as u64;
+                            current_type = member_info.typ;
+                        }
+                        OffsetOfPath::Index(index) => {
+                            // Array indexing: offset += index * sizeof(element)
+                            let elem_type = self
+                                .types
+                                .base_type(current_type)
+                                .expect("offsetof: array index on non-array type");
+                            let elem_size = self.types.size_bytes(elem_type);
+                            offset += (*index as u64) * (elem_size as u64);
+                            current_type = elem_type;
+                        }
+                    }
+                }
+
+                // Return the offset as a constant
+                self.emit_const(offset as i128, self.types.ulong_id)
+            }
+
+            ExprKind::C11AtomicInit { .. }
+            | ExprKind::C11AtomicLoad { .. }
+            | ExprKind::C11AtomicStore { .. }
+            | ExprKind::C11AtomicExchange { .. }
+            | ExprKind::C11AtomicCompareExchangeStrong { .. }
+            | ExprKind::C11AtomicCompareExchangeWeak { .. }
+            | ExprKind::C11AtomicFetchAdd { .. }
+            | ExprKind::C11AtomicFetchSub { .. }
+            | ExprKind::C11AtomicFetchAnd { .. }
+            | ExprKind::C11AtomicFetchOr { .. }
+            | ExprKind::C11AtomicFetchXor { .. }
+            | ExprKind::C11AtomicThreadFence { .. }
+            | ExprKind::C11AtomicSignalFence { .. } => self.linearize_c11_atomic(expr),
 
             ExprKind::StmtExpr { stmts, result } => {
                 // GNU statement expression: ({ stmt; stmt; expr; })

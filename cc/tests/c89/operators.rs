@@ -276,3 +276,314 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_operators_mega", code, &[]), 0);
 }
+
+// ============================================================================
+// Mega-test: Operator coverage gaps — compound assignments, bitwise NOT,
+// comma operator, precedence (15 levels), associativity
+// ============================================================================
+
+#[test]
+fn c89_operators_comprehensive_mega() {
+    let code = r#"
+int side_effect_var;
+int side_effect_fn(int v) { side_effect_var = v; return v; }
+
+int main(void) {
+    // ========== COMPOUND ASSIGNMENT OPS (returns 1-19) ==========
+    {
+        int a;
+
+        // -=
+        a = 10; a -= 3;
+        if (a != 7) return 1;
+
+        // /=
+        a = 20; a /= 4;
+        if (a != 5) return 2;
+
+        // %=
+        a = 17; a %= 5;
+        if (a != 2) return 3;
+
+        // &=
+        a = 0xFF; a &= 0x0F;
+        if (a != 0x0F) return 4;
+
+        // |=
+        a = 0xF0; a |= 0x0F;
+        if (a != 0xFF) return 5;
+
+        // ^=
+        a = 0xFF; a ^= 0x0F;
+        if (a != 0xF0) return 6;
+
+        // <<=
+        a = 1; a <<= 4;
+        if (a != 16) return 7;
+
+        // >>=
+        a = 256; a >>= 3;
+        if (a != 32) return 8;
+
+        // Verify += and *= too (should exist but confirm)
+        a = 5; a += 10;
+        if (a != 15) return 9;
+
+        a = 6; a *= 7;
+        if (a != 42) return 10;
+
+        // Compound assignment on array element
+        int arr[3] = {10, 20, 30};
+        arr[1] += 5;
+        if (arr[1] != 25) return 11;
+
+        // Compound assignment on struct member
+        struct { int x; } s = {100};
+        s.x -= 30;
+        if (s.x != 70) return 12;
+    }
+
+    // ========== BITWISE NOT (returns 20-29) ==========
+    {
+        unsigned int a = 0;
+        unsigned int b = ~a;
+        if (b != 0xFFFFFFFF) return 20;
+
+        unsigned char c = 0x0F;
+        // ~ promotes to int, mask to get byte
+        int d = ~c;
+        if ((d & 0xFF) != 0xF0) return 21;
+
+        // Double complement = identity
+        int e = 42;
+        if (~~e != 42) return 22;
+
+        // Bitwise NOT in expression
+        unsigned int f = 0xAAAAAAAA;
+        if ((~f) != 0x55555555) return 23;
+    }
+
+    // ========== COMMA OPERATOR (returns 30-39) ==========
+    {
+        // Comma evaluates left, discards, returns right
+        int a = (1, 2, 3);
+        if (a != 3) return 30;
+
+        // Side effects in comma
+        int x = 0, y = 0;
+        int r = (x = 10, y = 20, x + y);
+        if (r != 30) return 31;
+        if (x != 10 || y != 20) return 32;
+
+        // Comma in for-loop (multiple inits/posts)
+        int i, sum = 0;
+        for (i = 0, sum = 0; i < 5; i++, sum += i) {}
+        if (sum != 15) return 33;  // 1+2+3+4+5
+
+        // Comma vs assignment precedence
+        // a = (1, 2) assigns 2; (a = 1, 2) assigns 1, expr is 2
+        a = (1, 2);
+        if (a != 2) return 34;
+    }
+
+    // ========== OPERATOR PRECEDENCE (returns 40-69) ==========
+    // Test that operators bind at the correct level
+
+    // Level 3 (* / %) before Level 4 (+ -)
+    {
+        int r = 2 + 3 * 4;       // 2 + 12 = 14, not 20
+        if (r != 14) return 40;
+
+        r = 10 - 6 / 2;          // 10 - 3 = 7, not 2
+        if (r != 7) return 41;
+
+        r = 2 + 10 % 3;          // 2 + 1 = 3, not 0
+        if (r != 3) return 42;
+    }
+
+    // Level 5 (<< >>) before Level 6 (< <= > >=)
+    {
+        int r = 1 << 2 < 8;      // (1<<2) < 8 = 4 < 8 = 1
+        if (r != 1) return 43;
+    }
+
+    // Level 6 (< <= > >=) before Level 7 (== !=)
+    {
+        int r = 1 < 2 == 1;      // (1<2) == 1 = 1 == 1 = 1
+        if (r != 1) return 44;
+
+        r = 5 >= 5 != 0;         // (5>=5) != 0 = 1 != 0 = 1
+        if (r != 1) return 45;
+    }
+
+    // Level 7 (== !=) before Level 8 (&)
+    {
+        int r = 1 & 3 == 3;      // 1 & (3==3) = 1 & 1 = 1
+        if (r != 1) return 46;
+    }
+
+    // Level 8 (&) before Level 9 (^)
+    {
+        int r = 0xF & 0x3 ^ 0x1; // (0xF & 0x3) ^ 0x1 = 3 ^ 1 = 2
+        if (r != 2) return 47;
+    }
+
+    // Level 9 (^) before Level 10 (|)
+    {
+        int r = 0x1 | 0x2 ^ 0x3; // 0x1 | (0x2 ^ 0x3) = 0x1 | 0x1 = 0x1
+        if (r != 1) return 48;
+    }
+
+    // Level 10 (|) before Level 11 (&&)
+    {
+        int r = 0 | 1 && 1;      // (0|1) && 1 = 1 && 1 = 1
+        if (r != 1) return 49;
+    }
+
+    // Level 11 (&&) before Level 12 (||)
+    {
+        int r = 0 && 1 || 1;     // (0&&1) || 1 = 0 || 1 = 1
+        if (r != 1) return 50;
+
+        r = 1 || 0 && 0;         // 1 || (0&&0) = 1 || 0 = 1
+        if (r != 1) return 51;
+    }
+
+    // Level 12 (||) before Level 13 (?:)
+    {
+        int r = 0 || 1 ? 10 : 20; // (0||1) ? 10 : 20 = 10
+        if (r != 10) return 52;
+    }
+
+    // Level 13 (?:) before Level 14 (=)
+    {
+        int a;
+        a = 1 ? 42 : 99;         // a = (1 ? 42 : 99) = 42
+        if (a != 42) return 53;
+    }
+
+    // Level 14 (=) before Level 15 (,)
+    {
+        int a, b;
+        a = 1, b = 2;            // (a=1), (b=2)
+        if (a != 1 || b != 2) return 54;
+    }
+
+    // Level 1 (postfix) before Level 2 (unary)
+    {
+        int arr[3] = {10, 20, 30};
+        int *p = arr;
+        int r = *p++;             // *(p++), gets arr[0]=10, p moves to arr[1]
+        if (r != 10) return 55;
+        if (*p != 20) return 56;
+    }
+
+    // Unary before multiplicative
+    {
+        int r = -3 * -2;         // (-3) * (-2) = 6
+        if (r != 6) return 57;
+    }
+
+    // sizeof before arithmetic
+    {
+        int r = sizeof(int) + 1;  // (sizeof(int)) + 1 = 4 + 1 = 5
+        if (r != 5) return 58;
+    }
+
+    // Complex mixed precedence
+    {
+        int r = 2 + 3 * 4 - 1;   // 2 + 12 - 1 = 13
+        if (r != 13) return 59;
+
+        r = 1 + 2 << 3;          // (1+2) << 3 = 3 << 3 = 24
+        if (r != 24) return 60;
+
+        r = 10 >> 1 + 1;         // 10 >> (1+1) = 10 >> 2 = 2
+        if (r != 2) return 61;
+    }
+
+    // ========== OPERATOR ASSOCIATIVITY (returns 70-79) ==========
+
+    // Right-to-left: assignment
+    {
+        int a, b, c;
+        a = b = c = 42;          // a = (b = (c = 42))
+        if (a != 42 || b != 42 || c != 42) return 70;
+    }
+
+    // Right-to-left: ternary
+    {
+        int r = 1 ? 2 : 0 ? 3 : 4;  // 1 ? 2 : (0 ? 3 : 4)
+        if (r != 2) return 71;
+
+        r = 0 ? 2 : 1 ? 3 : 4;      // 0 ? 2 : (1 ? 3 : 4) = 3
+        if (r != 3) return 72;
+    }
+
+    // Left-to-right: subtraction
+    {
+        int r = 10 - 3 - 2;      // (10-3) - 2 = 5, not 10-(3-2)=9
+        if (r != 5) return 73;
+    }
+
+    // Left-to-right: division
+    {
+        int r = 24 / 4 / 2;      // (24/4) / 2 = 3, not 24/(4/2)=12
+        if (r != 3) return 74;
+    }
+
+    // Left-to-right: shift
+    {
+        int r = 16 >> 2 >> 1;    // (16>>2) >> 1 = 4 >> 1 = 2
+        if (r != 2) return 75;
+    }
+
+    // Right-to-left: compound assignment
+    {
+        int a = 10, b = 20;
+        a += b -= 5;             // a += (b -= 5) => b=15, a=25
+        if (a != 25 || b != 15) return 76;
+    }
+
+    // Left-to-right: comparison chaining
+    {
+        // 1 < 2 < 3 means (1<2) < 3 = 1 < 3 = 1
+        int r = 1 < 2 < 3;
+        if (r != 1) return 77;
+
+        // 3 > 2 > 1 means (3>2) > 1 = 1 > 1 = 0
+        r = 3 > 2 > 1;
+        if (r != 0) return 78;
+    }
+
+    // ========== SHORT-CIRCUIT WITH SIDE EFFECTS (returns 80-89) ==========
+    {
+        // && short-circuits: right side not evaluated if left is false
+        side_effect_var = 0;
+        int r = 0 && side_effect_fn(42);
+        if (side_effect_var != 0) return 80;  // fn not called
+
+        // || short-circuits: right side not evaluated if left is true
+        side_effect_var = 0;
+        r = 1 || side_effect_fn(42);
+        if (side_effect_var != 0) return 81;  // fn not called
+
+        // && does evaluate right when left is true
+        side_effect_var = 0;
+        r = 1 && side_effect_fn(42);
+        if (side_effect_var != 42) return 82;
+
+        // || does evaluate right when left is false
+        side_effect_var = 0;
+        r = 0 || side_effect_fn(42);
+        if (side_effect_var != 42) return 83;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_operators_comprehensive_mega", code, &[]),
+        0,
+    );
+}

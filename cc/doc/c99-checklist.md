@@ -169,88 +169,88 @@
 ## 4. Operators
 
 ### 4.1 Arithmetic Operators
-- [ ] `+` (addition)
-- [ ] `-` (subtraction)
-- [ ] `*` (multiplication)
-- [ ] `/` (division)
-- [ ] `%` (modulo)
-- [ ] `+` (unary plus)
-- [ ] `-` (unary minus)
-- [ ] `++` (prefix increment)
-- [ ] `++` (postfix increment)
-- [ ] `--` (prefix decrement)
-- [ ] `--` (postfix decrement)
+- [x] `+` (addition)
+- [x] `-` (subtraction)
+- [x] `*` (multiplication)
+- [x] `/` (division)
+- [x] `%` (modulo)
+- [x] `+` (unary plus)
+- [x] `-` (unary minus)
+- [x] `++` (prefix increment)
+- [x] `++` (postfix increment)
+- [x] `--` (prefix decrement)
+- [x] `--` (postfix decrement)
 
 ### 4.2 Relational Operators
-- [ ] `<` (less than)
-- [ ] `>` (greater than)
-- [ ] `<=` (less than or equal)
-- [ ] `>=` (greater than or equal)
-- [ ] `==` (equality)
-- [ ] `!=` (inequality)
+- [x] `<` (less than)
+- [x] `>` (greater than)
+- [x] `<=` (less than or equal)
+- [x] `>=` (greater than or equal)
+- [x] `==` (equality)
+- [x] `!=` (inequality)
 
 ### 4.3 Logical Operators
-- [ ] `&&` (logical AND)
-- [ ] `||` (logical OR)
-- [ ] `!` (logical NOT)
-- [ ] Short-circuit evaluation for `&&`
-- [ ] Short-circuit evaluation for `||`
+- [x] `&&` (logical AND)
+- [x] `||` (logical OR)
+- [x] `!` (logical NOT)
+- [x] Short-circuit evaluation for `&&`
+- [x] Short-circuit evaluation for `||`
 
 ### 4.4 Bitwise Operators
-- [ ] `&` (bitwise AND)
-- [ ] `|` (bitwise OR)
-- [ ] `^` (bitwise XOR)
-- [ ] `~` (bitwise NOT / complement)
-- [ ] `<<` (left shift)
-- [ ] `>>` (right shift)
+- [x] `&` (bitwise AND)
+- [x] `|` (bitwise OR)
+- [x] `^` (bitwise XOR)
+- [x] `~` (bitwise NOT / complement)
+- [x] `<<` (left shift)
+- [x] `>>` (right shift)
 
 ### 4.5 Assignment Operators
-- [ ] `=` (simple assignment)
-- [ ] `+=` (addition assignment)
-- [ ] `-=` (subtraction assignment)
-- [ ] `*=` (multiplication assignment)
-- [ ] `/=` (division assignment)
-- [ ] `%=` (modulo assignment)
-- [ ] `&=` (bitwise AND assignment)
-- [ ] `|=` (bitwise OR assignment)
-- [ ] `^=` (bitwise XOR assignment)
-- [ ] `<<=` (left shift assignment)
-- [ ] `>>=` (right shift assignment)
+- [x] `=` (simple assignment)
+- [x] `+=` (addition assignment)
+- [x] `-=` (subtraction assignment)
+- [x] `*=` (multiplication assignment)
+- [x] `/=` (division assignment)
+- [x] `%=` (modulo assignment)
+- [x] `&=` (bitwise AND assignment)
+- [x] `|=` (bitwise OR assignment)
+- [x] `^=` (bitwise XOR assignment)
+- [x] `<<=` (left shift assignment)
+- [x] `>>=` (right shift assignment)
 
 ### 4.6 Other Operators
-- [ ] `sizeof` (unary, type)
-- [ ] `sizeof` (unary, expression)
-- [ ] `sizeof` on VLA *(C99 new)*
-- [ ] `&` (address-of)
-- [ ] `*` (dereference)
-- [ ] `->` (member access through pointer)
-- [ ] `.` (direct member access)
-- [ ] `[]` (array subscript)
-- [ ] `()` (function call)
-- [ ] `(type)` (cast)
-- [ ] `?:` (conditional/ternary)
-- [ ] `,` (comma operator)
+- [x] `sizeof` (unary, type)
+- [x] `sizeof` (unary, expression)
+- [x] `sizeof` on VLA *(C99 new)*
+- [x] `&` (address-of)
+- [x] `*` (dereference)
+- [x] `->` (member access through pointer)
+- [x] `.` (direct member access)
+- [x] `[]` (array subscript)
+- [x] `()` (function call)
+- [x] `(type)` (cast)
+- [x] `?:` (conditional/ternary)
+- [x] `,` (comma operator)
 
 ### 4.7 Operator Precedence (15 Levels)
-- [ ] Level 1: `()` `[]` `->` `.` (postfix `++` `--`)
-- [ ] Level 2: `!` `~` `++` `--` `+` `-` `*` `&` `sizeof` `(type)` (unary, right-to-left)
-- [ ] Level 3: `*` `/` `%`
-- [ ] Level 4: `+` `-`
-- [ ] Level 5: `<<` `>>`
-- [ ] Level 6: `<` `<=` `>` `>=`
-- [ ] Level 7: `==` `!=`
-- [ ] Level 8: `&`
-- [ ] Level 9: `^`
-- [ ] Level 10: `|`
-- [ ] Level 11: `&&`
-- [ ] Level 12: `||`
-- [ ] Level 13: `?:` (right-to-left)
-- [ ] Level 14: `=` `+=` `-=` etc. (right-to-left)
-- [ ] Level 15: `,`
+- [x] Level 1: `()` `[]` `->` `.` (postfix `++` `--`)
+- [x] Level 2: `!` `~` `++` `--` `+` `-` `*` `&` `sizeof` `(type)` (unary, right-to-left)
+- [x] Level 3: `*` `/` `%`
+- [x] Level 4: `+` `-`
+- [x] Level 5: `<<` `>>`
+- [x] Level 6: `<` `<=` `>` `>=`
+- [x] Level 7: `==` `!=`
+- [x] Level 8: `&`
+- [x] Level 9: `^`
+- [x] Level 10: `|`
+- [x] Level 11: `&&`
+- [x] Level 12: `||`
+- [x] Level 13: `?:` (right-to-left)
+- [x] Level 14: `=` `+=` `-=` etc. (right-to-left)
+- [x] Level 15: `,`
 
 ### 4.8 Operator Associativity
-- [ ] Left-to-right for most binary operators
-- [ ] Right-to-left for unary, assignment, conditional
+- [x] Left-to-right for most binary operators
+- [x] Right-to-left for unary, assignment, conditional
 
 ---
 
@@ -921,7 +921,7 @@
 | 1. Keywords | 37 | 0 | 0% |
 | 2. Types | 45+ | 0 | 0% |
 | 3. Qualifiers | 15 | 0 | 0% |
-| 4. Operators | 60+ | 0 | 0% |
+| 4. Operators | 63 | 63 | 100% |
 | 5. Expressions | 35 | 0 | 0% |
 | 6. Statements | 27 | 27 | 100% |
 | 7. Declarations | 55 | 0 | 0% |

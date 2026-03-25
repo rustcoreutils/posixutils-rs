@@ -14,6 +14,7 @@
 // - initializers: designated init, compound literals
 //
 
+mod expressions;
 mod features;
 mod initializers;
 mod types;

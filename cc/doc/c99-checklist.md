@@ -156,7 +156,7 @@
 - [ ] `static` at file scope — internal linkage
 - [ ] `static` at block scope — static storage duration
 - [ ] `register` — hint for register allocation
-- [ ] Only one storage class per declaration (except `_Thread_local` in C11)
+- [ ] Only one storage class per declaration
 
 ### 3.3 Function Specifiers
 - [ ] `inline` *(C99 new)*
@@ -257,55 +257,54 @@
 ## 5. Expressions
 
 ### 5.1 Primary Expressions
-- [ ] Identifiers
-- [ ] Constants (integer, floating, character)
-- [ ] String literals
-- [ ] Parenthesized expressions `(expr)`
-- [ ] Generic selection `_Generic` *(C11 — NOT in C99)*
+- [x] Identifiers
+- [x] Constants (integer, floating, character)
+- [x] String literals
+- [x] Parenthesized expressions `(expr)`
 
 ### 5.2 Postfix Expressions
-- [ ] Array subscripting `a[i]`
-- [ ] Function calls `f(args)`
-- [ ] Structure/union member access `.`
-- [ ] Structure/union member access through pointer `->`
-- [ ] Postfix increment `x++`
-- [ ] Postfix decrement `x--`
-- [ ] Compound literals `(type){initializer-list}` *(C99 new)*
+- [x] Array subscripting `a[i]`
+- [x] Function calls `f(args)`
+- [x] Structure/union member access `.`
+- [x] Structure/union member access through pointer `->`
+- [x] Postfix increment `x++`
+- [x] Postfix decrement `x--`
+- [x] Compound literals `(type){initializer-list}` *(C99 new)*
 
 ### 5.3 Unary Expressions
-- [ ] Prefix increment `++x`
-- [ ] Prefix decrement `--x`
-- [ ] Address-of `&x`
-- [ ] Dereference `*p`
-- [ ] Unary plus `+x`
-- [ ] Unary minus `-x`
-- [ ] Bitwise NOT `~x`
-- [ ] Logical NOT `!x`
-- [ ] `sizeof expr`
-- [ ] `sizeof(type)`
+- [x] Prefix increment `++x`
+- [x] Prefix decrement `--x`
+- [x] Address-of `&x`
+- [x] Dereference `*p`
+- [x] Unary plus `+x`
+- [x] Unary minus `-x`
+- [x] Bitwise NOT `~x`
+- [x] Logical NOT `!x`
+- [x] `sizeof expr`
+- [x] `sizeof(type)`
 
 ### 5.4 Cast Expressions
-- [ ] Explicit type casts `(type)expr`
-- [ ] Cast to void
-- [ ] Cast between integer types
-- [ ] Cast between floating types
-- [ ] Cast between pointer types
-- [ ] Cast pointer ↔ integer (implementation-defined)
+- [x] Explicit type casts `(type)expr`
+- [x] Cast to void
+- [x] Cast between integer types
+- [x] Cast between floating types
+- [x] Cast between pointer types
+- [x] Cast pointer ↔ integer (implementation-defined)
 
 ### 5.5 Constant Expressions
-- [ ] Integer constant expressions
-- [ ] Arithmetic constant expressions
-- [ ] Address constants
-- [ ] Null pointer constants
-- [ ] Compile-time evaluation
+- [x] Integer constant expressions
+- [x] Arithmetic constant expressions
+- [x] Address constants
+- [x] Null pointer constants
+- [x] Compile-time evaluation
 
 ### 5.6 Implicit Conversions
-- [ ] Integer promotions
-- [ ] Usual arithmetic conversions
-- [ ] Default argument promotions
-- [ ] Array-to-pointer decay
-- [ ] Function-to-pointer decay
-- [ ] Lvalue conversion
+- [x] Integer promotions
+- [x] Usual arithmetic conversions
+- [x] Default argument promotions
+- [x] Array-to-pointer decay
+- [x] Function-to-pointer decay
+- [x] Lvalue conversion
 
 ---
 
@@ -869,7 +868,6 @@
 
 ### Declarations
 - [ ] declaration-specifiers init-declarator-list? `;`
-- [ ] static_assert-declaration (C11 only, NOT C99)
 
 ### Function Definition
 - [ ] declaration-specifiers declarator declaration-list? compound-statement
@@ -922,7 +920,7 @@
 | 2. Types | 45+ | 0 | 0% |
 | 3. Qualifiers | 15 | 0 | 0% |
 | 4. Operators | 63 | 63 | 100% |
-| 5. Expressions | 35 | 0 | 0% |
+| 5. Expressions | 34 | 34 | 100% |
 | 6. Statements | 27 | 27 | 100% |
 | 7. Declarations | 55 | 0 | 0% |
 | 8. Preprocessor | 50 | 50 | 100% |

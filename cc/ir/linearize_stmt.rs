@@ -1205,6 +1205,30 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Label { stmt, .. } => {
                 self.collect_cases_from_stmt(stmt, case_values, has_default);
             }
+            // Recurse into nested statements for Duff's device pattern
+            // (case labels inside loops/blocks within a switch)
+            Stmt::Block(items) => {
+                for item in items {
+                    if let BlockItem::Statement(s) = item {
+                        self.collect_cases_from_stmt(s, case_values, has_default);
+                    }
+                }
+            }
+            Stmt::DoWhile { body, .. } | Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                self.collect_cases_from_stmt(body, case_values, has_default);
+            }
+            Stmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.collect_cases_from_stmt(then_stmt, case_values, has_default);
+                if let Some(e) = else_stmt {
+                    self.collect_cases_from_stmt(e, case_values, has_default);
+                }
+            }
+            // Stop at inner switch — its case labels belong to it
+            Stmt::Switch { .. } => {}
             _ => {}
         }
     }
@@ -1664,6 +1688,225 @@ impl<'a> super::linearize::Linearizer<'a> {
                     self.switch_bb(def_bb);
                 }
             }
+
+            // Duff's device: case labels can appear inside loops/blocks
+            // within a switch body. Propagate switch context through them.
+            Stmt::DoWhile { body, cond } => {
+                let body_bb = self.alloc_bb();
+                let cond_bb = self.alloc_bb();
+                let exit_bb = self.alloc_bb();
+
+                if let Some(current) = self.current_bb {
+                    if !self.is_terminated() {
+                        self.emit(Instruction::br(body_bb));
+                        self.link_bb(current, body_bb);
+                    }
+                }
+
+                self.break_targets.push(exit_bb);
+                self.continue_targets.push(cond_bb);
+
+                self.switch_bb(body_bb);
+                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
+                if !self.is_terminated() {
+                    if let Some(current) = self.current_bb {
+                        self.emit(Instruction::br(cond_bb));
+                        self.link_bb(current, cond_bb);
+                    }
+                }
+
+                self.break_targets.pop();
+                self.continue_targets.pop();
+
+                self.switch_bb(cond_bb);
+                let cond_val = self.linearize_expr(cond);
+                if let Some(cond_end_bb) = self.current_bb {
+                    self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+                    self.link_bb(cond_end_bb, body_bb);
+                    self.link_bb(cond_end_bb, exit_bb);
+                }
+
+                self.switch_bb(exit_bb);
+            }
+
+            Stmt::While { cond, body } => {
+                let cond_bb = self.alloc_bb();
+                let body_bb = self.alloc_bb();
+                let exit_bb = self.alloc_bb();
+
+                if let Some(current) = self.current_bb {
+                    if !self.is_terminated() {
+                        self.emit(Instruction::br(cond_bb));
+                        self.link_bb(current, cond_bb);
+                    }
+                }
+
+                self.switch_bb(cond_bb);
+                let cond_val = self.linearize_expr(cond);
+                if let Some(cond_end_bb) = self.current_bb {
+                    self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+                    self.link_bb(cond_end_bb, body_bb);
+                    self.link_bb(cond_end_bb, exit_bb);
+                }
+
+                self.break_targets.push(exit_bb);
+                self.continue_targets.push(cond_bb);
+
+                self.switch_bb(body_bb);
+                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
+                if !self.is_terminated() {
+                    if let Some(current) = self.current_bb {
+                        self.emit(Instruction::br(cond_bb));
+                        self.link_bb(current, cond_bb);
+                    }
+                }
+
+                self.break_targets.pop();
+                self.continue_targets.pop();
+
+                self.switch_bb(exit_bb);
+            }
+
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+            } => {
+                self.push_scope();
+
+                if let Some(init) = init {
+                    match init {
+                        ForInit::Declaration(decl) => self.linearize_local_decl(decl),
+                        ForInit::Expression(expr) => {
+                            self.linearize_expr(expr);
+                        }
+                    }
+                }
+
+                let cond_bb = self.alloc_bb();
+                let body_bb = self.alloc_bb();
+                let post_bb = self.alloc_bb();
+                let exit_bb = self.alloc_bb();
+
+                if let Some(current) = self.current_bb {
+                    if !self.is_terminated() {
+                        self.emit(Instruction::br(cond_bb));
+                        self.link_bb(current, cond_bb);
+                    }
+                }
+
+                self.switch_bb(cond_bb);
+                if let Some(cond_expr) = cond {
+                    let cond_val = self.linearize_expr(cond_expr);
+                    if let Some(cond_end_bb) = self.current_bb {
+                        self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
+                        self.link_bb(cond_end_bb, body_bb);
+                        self.link_bb(cond_end_bb, exit_bb);
+                    }
+                } else {
+                    self.emit(Instruction::br(body_bb));
+                    self.link_bb(cond_bb, body_bb);
+                }
+
+                self.break_targets.push(exit_bb);
+                self.continue_targets.push(post_bb);
+
+                self.switch_bb(body_bb);
+                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
+                if !self.is_terminated() {
+                    if let Some(current) = self.current_bb {
+                        self.emit(Instruction::br(post_bb));
+                        self.link_bb(current, post_bb);
+                    }
+                }
+
+                self.break_targets.pop();
+                self.continue_targets.pop();
+
+                self.switch_bb(post_bb);
+                if let Some(post_expr) = post {
+                    self.linearize_expr(post_expr);
+                }
+                self.emit(Instruction::br(cond_bb));
+                self.link_bb(post_bb, cond_bb);
+
+                self.switch_bb(exit_bb);
+                self.pop_scope();
+            }
+
+            Stmt::Block(items) => {
+                self.push_scope();
+                for item in items {
+                    match item {
+                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
+                        BlockItem::Statement(s) => {
+                            self.linearize_switch_stmt(
+                                s,
+                                case_values,
+                                case_bbs,
+                                default_bb,
+                                case_idx,
+                            );
+                        }
+                    }
+                }
+                self.pop_scope();
+            }
+
+            Stmt::If {
+                cond,
+                then_stmt,
+                else_stmt,
+            } => {
+                let then_bb = self.alloc_bb();
+                let merge_bb = self.alloc_bb();
+                let else_bb = if else_stmt.is_some() {
+                    self.alloc_bb()
+                } else {
+                    merge_bb
+                };
+
+                let cond_val = self.linearize_expr(cond);
+                if let Some(current) = self.current_bb {
+                    self.emit(Instruction::cbr(cond_val, then_bb, else_bb));
+                    self.link_bb(current, then_bb);
+                    self.link_bb(current, else_bb);
+                }
+
+                self.switch_bb(then_bb);
+                self.linearize_switch_stmt(then_stmt, case_values, case_bbs, default_bb, case_idx);
+                self.link_to_merge_if_needed(merge_bb);
+
+                if let Some(else_s) = else_stmt {
+                    self.switch_bb(else_bb);
+                    self.linearize_switch_stmt(else_s, case_values, case_bbs, default_bb, case_idx);
+                    self.link_to_merge_if_needed(merge_bb);
+                }
+
+                self.switch_bb(merge_bb);
+            }
+
+            Stmt::Label { name, stmt } => {
+                let name_str = self.str(*name).to_string();
+                let label_bb = self.get_or_create_label(&name_str);
+
+                if !self.is_terminated() {
+                    if let Some(current) = self.current_bb {
+                        self.emit(Instruction::br(label_bb));
+                        self.link_bb(current, label_bb);
+                    }
+                }
+
+                self.switch_bb(label_bb);
+                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, case_idx);
+            }
+
+            // Inner switch owns its own cases — delegate to normal linearizer
+            Stmt::Switch { .. } => {
+                self.linearize_stmt(stmt);
+            }
+
             _ => {
                 // Regular statement - linearize it
                 self.linearize_stmt(stmt);

@@ -312,46 +312,46 @@
 ## 6. Statements
 
 ### 6.1 Labeled Statements
-- [ ] Identifier labels `label:`
-- [ ] `case` constant-expression `:`
-- [ ] `default:`
+- [x] Identifier labels `label:`
+- [x] `case` constant-expression `:`
+- [x] `default:`
 
 ### 6.2 Compound Statements (Blocks)
-- [ ] `{ declarations statements }`
-- [ ] Mixed declarations and statements *(C99 new)*
-- [ ] Empty blocks `{}`
-- [ ] Nested blocks with shadowing
+- [x] `{ declarations statements }`
+- [x] Mixed declarations and statements *(C99 new)*
+- [x] Empty blocks `{}`
+- [x] Nested blocks with shadowing
 
 ### 6.3 Expression Statements
-- [ ] Expression followed by `;`
-- [ ] Null statement `;`
+- [x] Expression followed by `;`
+- [x] Null statement `;`
 
 ### 6.4 Selection Statements
-- [ ] `if (expr) statement`
-- [ ] `if (expr) statement else statement`
-- [ ] Dangling else resolution (bind to nearest `if`)
-- [ ] `switch (expr) statement`
-- [ ] `switch` with integer expression
-- [ ] `case` labels (integer constant expressions)
-- [ ] `default` label
-- [ ] Fall-through between cases
-- [ ] Duff's device pattern
+- [x] `if (expr) statement`
+- [x] `if (expr) statement else statement`
+- [x] Dangling else resolution (bind to nearest `if`)
+- [x] `switch (expr) statement`
+- [x] `switch` with integer expression
+- [x] `case` labels (integer constant expressions)
+- [x] `default` label
+- [x] Fall-through between cases
+- [x] Duff's device pattern
 
 ### 6.5 Iteration Statements
-- [ ] `while (expr) statement`
-- [ ] `do statement while (expr);`
-- [ ] `for (expr; expr; expr) statement`
-- [ ] `for` with declaration `for (int i = 0; ...)` *(C99 new)*
-- [ ] Infinite loops `for(;;)`, `while(1)`
-- [ ] Omitted `for` clauses
+- [x] `while (expr) statement`
+- [x] `do statement while (expr);`
+- [x] `for (expr; expr; expr) statement`
+- [x] `for` with declaration `for (int i = 0; ...)` *(C99 new)*
+- [x] Infinite loops `for(;;)`, `while(1)`
+- [x] Omitted `for` clauses
 
 ### 6.6 Jump Statements
-- [ ] `goto identifier;`
-- [ ] `continue;`
-- [ ] `break;`
-- [ ] `return;`
-- [ ] `return expression;`
-- [ ] `goto` into block (jump past VLA — undefined)
+- [x] `goto identifier;`
+- [x] `continue;`
+- [x] `break;`
+- [x] `return;`
+- [x] `return expression;`
+- [x] `goto` into block (jump past VLA — undefined)
 
 ---
 
@@ -923,9 +923,9 @@
 | 3. Qualifiers | 15 | 0 | 0% |
 | 4. Operators | 60+ | 0 | 0% |
 | 5. Expressions | 35 | 0 | 0% |
-| 6. Statements | 25 | 0 | 0% |
+| 6. Statements | 27 | 27 | 100% |
 | 7. Declarations | 55 | 0 | 0% |
-| 8. Preprocessor | 50 | 0 | 0% |
+| 8. Preprocessor | 50 | 50 | 100% |
 | 9. Lexical | 50 | 0 | 0% |
 | 10. C99 Features | 70 | 0 | 0% |
 | 11. Std Library | 120+ | 0 | 0% |

@@ -376,3 +376,253 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_control_flow_mega", code, &[]), 0);
 }
+
+// ============================================================================
+// Mega-test: Statement edge cases (null stmt, empty blocks, dangling else,
+// omitted for clauses, void return, expression statements)
+// ============================================================================
+
+#[test]
+fn c89_statements_edge_cases_mega() {
+    let code = r#"
+// Helper: void return
+void set_value(int *p, int v) {
+    *p = v;
+    return;
+}
+
+void set_if(int *p, int v, int cond) {
+    if (!cond) return;
+    *p = v;
+}
+
+int main(void) {
+    // ========== NULL STATEMENT (returns 1-9) ==========
+    {
+        ;                          // standalone null statement
+
+        int i = 0;
+        for (i = 0; i < 5; i++) ; // null for body
+        if (i != 5) return 1;
+
+        while (0) ;                // null while body (never executes)
+
+        if (1) ; else ;            // null in both if/else branches
+
+        do ; while (0);            // null do-while body
+
+        // Multiple null statements
+        ; ; ;
+    }
+
+    // ========== EMPTY BLOCKS (returns 10-19) ==========
+    {
+        {}                         // standalone empty block
+
+        if (1) {} else {}          // empty blocks in if/else
+
+        int i;
+        for (i = 0; i < 3; i++) {} // empty for body
+        if (i != 3) return 10;
+
+        while (0) {}               // empty while body
+
+        do {} while (0);           // empty do-while body
+
+        // Nested empty blocks
+        { { { } } }
+    }
+
+    // ========== DANGLING ELSE (returns 20-29) ==========
+    {
+        // C99 6.8.4.1: else binds to nearest if
+        int x = 0;
+        if (0)
+            if (1)
+                x = 1;
+            else
+                x = 2;
+        // outer if(0) is false => entire body skipped, x stays 0
+        if (x != 0) return 20;
+
+        int y = 0;
+        if (1)
+            if (0)
+                y = 1;
+            else
+                y = 2;
+        // outer if(1) true, inner if(0) false => else executes, y = 2
+        if (y != 2) return 21;
+
+        // Triple nesting
+        int z = 0;
+        if (1)
+            if (1)
+                if (0)
+                    z = 1;
+                else
+                    z = 2;
+        if (z != 2) return 22;
+    }
+
+    // ========== OMITTED FOR CLAUSES (returns 30-39) ==========
+    {
+        // for(;cond;) — omitted init and post
+        int i = 0, sum = 0;
+        for (; i < 5;) { sum += i; i++; }
+        if (sum != 10) return 30;   // 0+1+2+3+4
+
+        // for(init;;) — omitted cond and post (infinite, break out)
+        for (i = 0;;) { if (i >= 3) break; i++; }
+        if (i != 3) return 31;
+
+        // for(init; cond;) — omitted post
+        sum = 0;
+        for (i = 0; i < 5;) { sum += i; i++; }
+        if (sum != 10) return 32;
+
+        // for(; ;post) — omitted init and cond
+        i = 0;
+        for (; ; i++) { if (i >= 4) break; }
+        if (i != 4) return 33;
+
+        // for(init; ;post) — omitted cond only
+        sum = 0;
+        for (i = 0; ; i++) {
+            if (i >= 5) break;
+            sum += i;
+        }
+        if (sum != 10) return 34;
+    }
+
+    // ========== VOID RETURN (returns 40-49) ==========
+    {
+        int val = 0;
+        set_value(&val, 42);
+        if (val != 42) return 40;
+
+        // Early void return (cond = 0 => returns early, no write)
+        val = 0;
+        set_if(&val, 99, 0);
+        if (val != 0) return 41;
+
+        // Normal path (cond = 1 => writes)
+        set_if(&val, 99, 1);
+        if (val != 99) return 42;
+    }
+
+    // ========== EXPRESSION STATEMENTS (returns 50-59) ==========
+    {
+        int a = 0;
+        a++;                       // postfix increment as expr stmt
+        if (a != 1) return 50;
+
+        a += 5;                    // compound assignment as expr stmt
+        if (a != 6) return 51;
+
+        ++a;                       // prefix increment as expr stmt
+        if (a != 7) return 52;
+
+        a--;                       // postfix decrement
+        if (a != 6) return 53;
+
+        (void)a;                   // cast-to-void expr stmt
+
+        int b = 10;
+        a = b = 20;               // chained assignment as expr stmt
+        if (a != 20) return 54;
+        if (b != 20) return 55;
+
+        a, b;                      // comma operator as expr stmt (no side effect)
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_statements_edge_cases_mega", code, &[]),
+        0
+    );
+}
+
+// ============================================================================
+// Test: Duff's device (switch interleaved with do-while)
+// ============================================================================
+
+#[test]
+fn c89_duffs_device() {
+    let code = r#"
+#include <string.h>
+
+// Classic Duff's device: unrolled memory copy
+void duff_copy(char *to, const char *from, int count) {
+    int n = (count + 7) / 8;
+    switch (count % 8) {
+    case 0: do { *to++ = *from++;
+    case 7:      *to++ = *from++;
+    case 6:      *to++ = *from++;
+    case 5:      *to++ = *from++;
+    case 4:      *to++ = *from++;
+    case 3:      *to++ = *from++;
+    case 2:      *to++ = *from++;
+    case 1:      *to++ = *from++;
+            } while (--n > 0);
+    }
+}
+
+int main(void) {
+    // Test 1: copy "hello world" (11 chars)
+    {
+        const char *src = "hello world";
+        char dst[12];
+        memset(dst, 0, sizeof(dst));
+        duff_copy(dst, src, 11);
+        dst[11] = '\0';
+        if (strcmp(dst, "hello world") != 0) return 1;
+    }
+
+    // Test 2: copy exactly 8 bytes (no partial first iteration)
+    {
+        const char *src = "abcdefgh";
+        char dst[9];
+        memset(dst, 0, sizeof(dst));
+        duff_copy(dst, src, 8);
+        dst[8] = '\0';
+        if (strcmp(dst, "abcdefgh") != 0) return 2;
+    }
+
+    // Test 3: copy 1 byte
+    {
+        const char *src = "X";
+        char dst[2];
+        memset(dst, 0, sizeof(dst));
+        duff_copy(dst, src, 1);
+        dst[1] = '\0';
+        if (dst[0] != 'X') return 3;
+    }
+
+    // Test 4: copy 16 bytes (two full iterations)
+    {
+        const char *src = "0123456789abcdef";
+        char dst[17];
+        memset(dst, 0, sizeof(dst));
+        duff_copy(dst, src, 16);
+        dst[16] = '\0';
+        if (strcmp(dst, "0123456789abcdef") != 0) return 4;
+    }
+
+    // Test 5: copy 3 bytes (partial first iteration)
+    {
+        const char *src = "abc";
+        char dst[4];
+        memset(dst, 0, sizeof(dst));
+        duff_copy(dst, src, 3);
+        dst[3] = '\0';
+        if (strcmp(dst, "abc") != 0) return 5;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c89_duffs_device", code, &[]), 0);
+}

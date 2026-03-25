@@ -28,141 +28,141 @@
 ## 1. Keywords (37 Total)
 
 ### 1.1 Storage Class Specifiers
-- [ ] `auto`
-- [ ] `extern`
-- [ ] `register`
-- [ ] `static`
+- [x] `auto`
+- [x] `extern`
+- [x] `register`
+- [x] `static`
 
 ### 1.2 Type Specifiers
-- [ ] `void`
-- [ ] `char`
-- [ ] `short`
-- [ ] `int`
-- [ ] `long`
-- [ ] `float`
-- [ ] `double`
-- [ ] `signed`
-- [ ] `unsigned`
-- [ ] `_Bool` *(C99 new)*
-- [ ] `_Complex` *(C99 new)*
-- [ ] `_Imaginary` *(C99 new)*
+- [x] `void`
+- [x] `char`
+- [x] `short`
+- [x] `int`
+- [x] `long`
+- [x] `float`
+- [x] `double`
+- [x] `signed`
+- [x] `unsigned`
+- [x] `_Bool` *(C99 new)*
+- [x] `_Complex` *(C99 new)*
+- N/A `_Imaginary` *(will not implement: removed in C11; no mainstream compiler implements it)*
 
 ### 1.3 Type Qualifiers
-- [ ] `const`
-- [ ] `volatile`
-- [ ] `restrict` *(C99 new)*
+- [x] `const`
+- [x] `volatile`
+- [x] `restrict` *(C99 new)*
 
 ### 1.4 Struct/Union/Enum
-- [ ] `struct`
-- [ ] `union`
-- [ ] `enum`
+- [x] `struct`
+- [x] `union`
+- [x] `enum`
 
 ### 1.5 Control Flow
-- [ ] `if`
-- [ ] `else`
-- [ ] `switch`
-- [ ] `case`
-- [ ] `default`
-- [ ] `while`
-- [ ] `do`
-- [ ] `for`
-- [ ] `break`
-- [ ] `continue`
-- [ ] `goto`
-- [ ] `return`
+- [x] `if`
+- [x] `else`
+- [x] `switch`
+- [x] `case`
+- [x] `default`
+- [x] `while`
+- [x] `do`
+- [x] `for`
+- [x] `break`
+- [x] `continue`
+- [x] `goto`
+- [x] `return`
 
 ### 1.6 Other Keywords
-- [ ] `sizeof`
-- [ ] `typedef`
-- [ ] `inline` *(C99 new)*
+- [x] `sizeof`
+- [x] `typedef`
+- [x] `inline` *(C99 new)*
 
 ---
 
 ## 2. Types
 
 ### 2.1 Basic Types
-- [ ] `void`
-- [ ] `char`
-- [ ] `signed char`
-- [ ] `unsigned char`
-- [ ] `short` / `short int` / `signed short` / `signed short int`
-- [ ] `unsigned short` / `unsigned short int`
-- [ ] `int` / `signed` / `signed int`
-- [ ] `unsigned` / `unsigned int`
-- [ ] `long` / `long int` / `signed long` / `signed long int`
-- [ ] `unsigned long` / `unsigned long int`
-- [ ] `long long` / `long long int` / `signed long long` / `signed long long int` *(C99 new)*
-- [ ] `unsigned long long` / `unsigned long long int` *(C99 new)*
-- [ ] `float`
-- [ ] `double`
-- [ ] `long double`
+- [x] `void`
+- [x] `char`
+- [x] `signed char`
+- [x] `unsigned char`
+- [x] `short` / `short int` / `signed short` / `signed short int`
+- [x] `unsigned short` / `unsigned short int`
+- [x] `int` / `signed` / `signed int`
+- [x] `unsigned` / `unsigned int`
+- [x] `long` / `long int` / `signed long` / `signed long int`
+- [x] `unsigned long` / `unsigned long int`
+- [x] `long long` / `long long int` / `signed long long` / `signed long long int` *(C99 new)*
+- [x] `unsigned long long` / `unsigned long long int` *(C99 new)*
+- [x] `float`
+- [x] `double`
+- [x] `long double`
 
 ### 2.2 Boolean Type (C99)
-- [ ] `_Bool` type
-- [ ] Implicit conversion: any scalar → `_Bool` (0 or 1)
-- [ ] `<stdbool.h>` macro `bool` expands to `_Bool`
-- [ ] `<stdbool.h>` macro `true` expands to `1`
-- [ ] `<stdbool.h>` macro `false` expands to `0`
+- [x] `_Bool` type
+- [x] Implicit conversion: any scalar → `_Bool` (0 or 1)
+- [x] `<stdbool.h>` macro `bool` expands to `_Bool`
+- [x] `<stdbool.h>` macro `true` expands to `1`
+- [x] `<stdbool.h>` macro `false` expands to `0`
 
 ### 2.3 Complex Types (C99)
-- [ ] `float _Complex`
-- [ ] `double _Complex`
-- [ ] `long double _Complex`
-- [ ] `float _Imaginary`
-- [ ] `double _Imaginary`
-- [ ] `long double _Imaginary`
+- [x] `float _Complex`
+- [x] `double _Complex`
+- [x] `long double _Complex`
+- N/A `float _Imaginary` — *will not implement*
+- N/A `double _Imaginary` — *will not implement*
+- N/A `long double _Imaginary` — *will not implement*
 - [ ] `<complex.h>` macro `complex` expands to `_Complex`
-- [ ] `<complex.h>` macro `imaginary` expands to `_Imaginary`
+- N/A `<complex.h>` macro `imaginary` expands to `_Imaginary` — *will not implement*
 - [ ] `<complex.h>` macro `I` (imaginary unit)
 - [ ] Complex arithmetic operations (+, -, *, /)
 - [ ] `creal()`, `cimag()`, `cabs()`, `carg()`, `conj()`
 
 ### 2.4 Derived Types
-- [ ] Arrays (fixed size)
-- [ ] Arrays (variable length / VLA) *(C99 new)*
-- [ ] Pointers
-- [ ] Pointers to functions
-- [ ] Structures
-- [ ] Unions
-- [ ] Functions
+- [x] Arrays (fixed size)
+- [x] Arrays (variable length / VLA) *(C99 new)*
+- [x] Pointers
+- [x] Pointers to functions
+- [x] Structures
+- [x] Unions
+- [x] Functions
 
 ### 2.5 Enumeration Types
-- [ ] `enum` declaration
-- [ ] Enumeration constants as `int`
-- [ ] Explicit enumerator values
-- [ ] Implicit sequential values
-- [ ] Negative enumerator values
+- [x] `enum` declaration
+- [x] Enumeration constants as `int`
+- [x] Explicit enumerator values
+- [x] Implicit sequential values
+- [x] Negative enumerator values
 
 ### 2.6 Type Compatibility
-- [ ] Compatible types determination
-- [ ] Composite type construction
-- [ ] Type equivalence across translation units
+- [x] Compatible types determination
+- [x] Composite type construction
+- [x] Type equivalence across translation units
 
 ---
 
 ## 3. Type Qualifiers & Specifiers
 
 ### 3.1 Type Qualifiers
-- [ ] `const` — object not modifiable
-- [ ] `volatile` — side effects, no optimization
-- [ ] `restrict` — pointer aliasing hint *(C99 new)*
-- [ ] Multiple qualifiers on same type
-- [ ] Qualifier inheritance through pointers
-- [ ] `const` in array declarations `int f(int a[const])`
+- [x] `const` — object not modifiable
+- [x] `volatile` — side effects, no optimization
+- [x] `restrict` — pointer aliasing hint *(C99 new)*
+- [x] Multiple qualifiers on same type
+- [x] Qualifier inheritance through pointers
+- [x] `const` in array declarations `int f(int a[const])`
 
 ### 3.2 Storage Class Specifiers
-- [ ] `auto` — automatic storage duration (block scope default)
-- [ ] `extern` — external linkage
-- [ ] `static` at file scope — internal linkage
-- [ ] `static` at block scope — static storage duration
-- [ ] `register` — hint for register allocation
-- [ ] Only one storage class per declaration
+- [x] `auto` — automatic storage duration (block scope default)
+- [x] `extern` — external linkage
+- [x] `static` at file scope — internal linkage
+- [x] `static` at block scope — static storage duration
+- [x] `register` — hint for register allocation
+- [x] Only one storage class per declaration
 
 ### 3.3 Function Specifiers
-- [ ] `inline` *(C99 new)*
-- [ ] `inline` with `extern` (external definition)
-- [ ] `inline` without `extern` (inline definition only)
-- [ ] `static inline` functions
+- [x] `inline` *(C99 new)*
+- [x] `inline` with `extern` (external definition)
+- [x] `inline` without `extern` (inline definition only)
+- [x] `static inline` functions
 
 ---
 
@@ -916,9 +916,9 @@
 
 | Section | Total Items | Completed | % |
 |---------|-------------|-----------|---|
-| 1. Keywords | 37 | 0 | 0% |
-| 2. Types | 45+ | 0 | 0% |
-| 3. Qualifiers | 15 | 0 | 0% |
+| 1. Keywords | 37 | 35+1 N/A | 97% |
+| 2. Types | 45 | 37+4 N/A | 91% |
+| 3. Qualifiers | 15 | 15 | 100% |
 | 4. Operators | 63 | 63 | 100% |
 | 5. Expressions | 34 | 34 | 100% |
 | 6. Statements | 27 | 27 | 100% |

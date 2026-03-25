@@ -678,157 +678,157 @@
 ## 11. Standard Library Headers
 
 ### 11.1 C89 Headers (Required in C99)
-- [ ] `<assert.h>` — diagnostics
-- [ ] `<ctype.h>` — character handling
-- [ ] `<errno.h>` — error numbers
-- [ ] `<float.h>` — floating-point limits
-- [ ] `<limits.h>` — integer limits
-- [ ] `<locale.h>` — localization
-- [ ] `<math.h>` — mathematics
-- [ ] `<setjmp.h>` — non-local jumps
-- [ ] `<signal.h>` — signal handling
-- [ ] `<stdarg.h>` — variable arguments
-- [ ] `<stddef.h>` — common definitions
-- [ ] `<stdio.h>` — input/output
-- [ ] `<stdlib.h>` — general utilities
-- [ ] `<string.h>` — string handling
-- [ ] `<time.h>` — date and time
+- [x] `<assert.h>` — diagnostics
+- [x] `<ctype.h>` — character handling
+- [x] `<errno.h>` — error numbers
+- [x] `<float.h>` — floating-point limits
+- [x] `<limits.h>` — integer limits
+- [x] `<locale.h>` — localization
+- [x] `<math.h>` — mathematics
+- [x] `<setjmp.h>` — non-local jumps
+- [x] `<signal.h>` — signal handling
+- [x] `<stdarg.h>` — variable arguments
+- [x] `<stddef.h>` — common definitions
+- [x] `<stdio.h>` — input/output
+- [x] `<stdlib.h>` — general utilities
+- [x] `<string.h>` — string handling
+- [x] `<time.h>` — date and time
 
 ### 11.2 C99 New Headers
-- [ ] `<complex.h>` — complex arithmetic
-- [ ] `<fenv.h>` — floating-point environment
-- [ ] `<inttypes.h>` — integer format conversion
-- [ ] `<iso646.h>` — alternative spellings
-- [ ] `<stdbool.h>` — boolean type and values
-- [ ] `<stdint.h>` — integer types
-- [ ] `<tgmath.h>` — type-generic math
-- [ ] `<wchar.h>` — wide character utilities
-- [ ] `<wctype.h>` — wide character classification
+- [x] `<complex.h>` — complex arithmetic
+- [x] `<fenv.h>` — floating-point environment
+- [x] `<inttypes.h>` — integer format conversion
+- [x] `<iso646.h>` — alternative spellings
+- [x] `<stdbool.h>` — boolean type and values
+- [x] `<stdint.h>` — integer types
+- [x] `<tgmath.h>` — type-generic math
+- [x] `<wchar.h>` — wide character utilities
+- [x] `<wctype.h>` — wide character classification
 
 ### 11.3 Key Functions & Macros by Header
 
 #### `<stdint.h>` Types *(C99)*
-- [ ] `int8_t`, `int16_t`, `int32_t`, `int64_t`
-- [ ] `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`
-- [ ] `int_least8_t`, `int_least16_t`, `int_least32_t`, `int_least64_t`
-- [ ] `uint_least8_t`, `uint_least16_t`, `uint_least32_t`, `uint_least64_t`
-- [ ] `int_fast8_t`, `int_fast16_t`, `int_fast32_t`, `int_fast64_t`
-- [ ] `uint_fast8_t`, `uint_fast16_t`, `uint_fast32_t`, `uint_fast64_t`
-- [ ] `intmax_t`, `uintmax_t`
-- [ ] `intptr_t`, `uintptr_t`
-- [ ] Limit macros (`INT8_MIN`, `INT8_MAX`, `UINT8_MAX`, etc.)
-- [ ] `INTMAX_C()`, `UINTMAX_C()` macros
+- [x] `int8_t`, `int16_t`, `int32_t`, `int64_t`
+- [x] `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`
+- [x] `int_least8_t`, `int_least16_t`, `int_least32_t`, `int_least64_t`
+- [x] `uint_least8_t`, `uint_least16_t`, `uint_least32_t`, `uint_least64_t`
+- [x] `int_fast8_t`, `int_fast16_t`, `int_fast32_t`, `int_fast64_t`
+- [x] `uint_fast8_t`, `uint_fast16_t`, `uint_fast32_t`, `uint_fast64_t`
+- [x] `intmax_t`, `uintmax_t`
+- [x] `intptr_t`, `uintptr_t`
+- [x] Limit macros (`INT8_MIN`, `INT8_MAX`, `UINT8_MAX`, etc.)
+- [x] `INTMAX_C()`, `UINTMAX_C()` macros
 
 #### `<inttypes.h>` *(C99)*
-- [ ] `PRId8`, `PRId16`, `PRId32`, `PRId64` format specifiers
-- [ ] `PRIu8`, `PRIu16`, `PRIu32`, `PRIu64` format specifiers
-- [ ] `PRIx8`, `PRIx16`, `PRIx32`, `PRIx64` format specifiers
-- [ ] `SCNd8`, `SCNd16`, `SCNd32`, `SCNd64` scan specifiers
-- [ ] `imaxabs()`, `imaxdiv()`
-- [ ] `strtoimax()`, `strtoumax()`
-- [ ] `wcstoimax()`, `wcstoumax()`
+- [x] `PRId8`, `PRId16`, `PRId32`, `PRId64` format specifiers
+- [x] `PRIu8`, `PRIu16`, `PRIu32`, `PRIu64` format specifiers
+- [x] `PRIx8`, `PRIx16`, `PRIx32`, `PRIx64` format specifiers
+- [x] `SCNd8`, `SCNd16`, `SCNd32`, `SCNd64` scan specifiers
+- [x] `imaxabs()`, `imaxdiv()`
+- [x] `strtoimax()`, `strtoumax()`
+- [x] `wcstoimax()`, `wcstoumax()`
 
 #### `<fenv.h>` *(C99)*
-- [ ] `fenv_t`, `fexcept_t` types
-- [ ] `FE_DIVBYZERO`, `FE_INEXACT`, `FE_INVALID`, `FE_OVERFLOW`, `FE_UNDERFLOW`
-- [ ] `FE_ALL_EXCEPT`
-- [ ] `FE_DOWNWARD`, `FE_TONEAREST`, `FE_TOWARDZERO`, `FE_UPWARD`
-- [ ] `feclearexcept()`, `fegetexceptflag()`, `feraiseexcept()`, `fesetexceptflag()`, `fetestexcept()`
-- [ ] `fegetround()`, `fesetround()`
-- [ ] `fegetenv()`, `feholdexcept()`, `fesetenv()`, `feupdateenv()`
+- [x] `fenv_t`, `fexcept_t` types
+- [x] `FE_DIVBYZERO`, `FE_INEXACT`, `FE_INVALID`, `FE_OVERFLOW`, `FE_UNDERFLOW`
+- [x] `FE_ALL_EXCEPT`
+- [x] `FE_DOWNWARD`, `FE_TONEAREST`, `FE_TOWARDZERO`, `FE_UPWARD`
+- [x] `feclearexcept()`, `fegetexceptflag()`, `feraiseexcept()`, `fesetexceptflag()`, `fetestexcept()`
+- [x] `fegetround()`, `fesetround()`
+- [x] `fegetenv()`, `feholdexcept()`, `fesetenv()`, `feupdateenv()`
 
 #### `<math.h>` C99 Additions
-- [ ] Classification macros: `fpclassify`, `isfinite`, `isinf`, `isnan`, `isnormal`, `signbit`
-- [ ] Comparison macros: `isgreater`, `isgreaterequal`, `isless`, `islessequal`, `islessgreater`, `isunordered`
-- [ ] `float` versions: `sinf`, `cosf`, `tanf`, `expf`, `logf`, `sqrtf`, etc.
-- [ ] `long double` versions: `sinl`, `cosl`, `tanl`, `expl`, `logl`, `sqrtl`, etc.
-- [ ] New functions: `cbrt`, `exp2`, `expm1`, `log2`, `log1p`
-- [ ] `hypot`, `erf`, `erfc`, `lgamma`, `tgamma`
-- [ ] `copysign`, `nan`, `nextafter`, `nexttoward`
-- [ ] `fdim`, `fmax`, `fmin`, `fma`
-- [ ] `round`, `trunc`, `lround`, `llround`, `lrint`, `llrint`
-- [ ] `remainder`, `remquo`
-- [ ] `scalbn`, `scalbln`, `ilogb`, `logb`
-- [ ] `nearbyint`, `rint`
-- [ ] `HUGE_VALF`, `HUGE_VALL`, `INFINITY`, `NAN`
-- [ ] `FP_INFINITE`, `FP_NAN`, `FP_NORMAL`, `FP_SUBNORMAL`, `FP_ZERO`
+- [x] Classification macros: `fpclassify`, `isfinite`, `isinf`, `isnan`, `isnormal`, `signbit`
+- [x] Comparison macros: `isgreater`, `isgreaterequal`, `isless`, `islessequal`, `islessgreater`, `isunordered`
+- [x] `float` versions: `sinf`, `cosf`, `tanf`, `expf`, `logf`, `sqrtf`, etc.
+- [x] `long double` versions: `sinl`, `cosl`, `tanl`, `expl`, `logl`, `sqrtl`, etc.
+- [x] New functions: `cbrt`, `exp2`, `expm1`, `log2`, `log1p`
+- [x] `hypot`, `erf`, `erfc`, `lgamma`, `tgamma`
+- [x] `copysign`, `nan`, `nextafter`, `nexttoward`
+- [x] `fdim`, `fmax`, `fmin`, `fma`
+- [x] `round`, `trunc`, `lround`, `llround`, `lrint`, `llrint`
+- [x] `remainder`, `remquo`
+- [x] `scalbn`, `scalbln`, `ilogb`, `logb`
+- [x] `nearbyint`, `rint`
+- [x] `HUGE_VALF`, `HUGE_VALL`, `INFINITY`, `NAN`
+- [x] `FP_INFINITE`, `FP_NAN`, `FP_NORMAL`, `FP_SUBNORMAL`, `FP_ZERO`
 
 #### `<stdio.h>` C99 Additions
-- [ ] `snprintf()` — bounded sprintf
-- [ ] `vsnprintf()` — bounded vsprintf
-- [ ] `vscanf()`, `vfscanf()`, `vsscanf()` — variadic scanf
-- [ ] `%a`, `%A` — hex float format specifier
-- [ ] `%lld`, `%llu` — long long format specifier
-- [ ] `%zu`, `%zd` — size_t format specifier
-- [ ] `%td` — ptrdiff_t format specifier
-- [ ] `%jd`, `%ju` — intmax_t format specifier
-- [ ] `hh` length modifier (char)
-- [ ] `ll` length modifier (long long)
-- [ ] `z` length modifier (size_t)
-- [ ] `t` length modifier (ptrdiff_t)
-- [ ] `j` length modifier (intmax_t)
+- [x] `snprintf()` — bounded sprintf
+- [x] `vsnprintf()` — bounded vsprintf
+- [x] `vscanf()`, `vfscanf()`, `vsscanf()` — variadic scanf
+- [x] `%a`, `%A` — hex float format specifier
+- [x] `%lld`, `%llu` — long long format specifier
+- [x] `%zu`, `%zd` — size_t format specifier
+- [x] `%td` — ptrdiff_t format specifier
+- [x] `%jd`, `%ju` — intmax_t format specifier
+- [x] `hh` length modifier (char)
+- [x] `ll` length modifier (long long)
+- [x] `z` length modifier (size_t)
+- [x] `t` length modifier (ptrdiff_t)
+- [x] `j` length modifier (intmax_t)
 
 #### `<stdlib.h>` C99 Additions
-- [ ] `atoll()` — string to long long
-- [ ] `strtoll()`, `strtoull()` — string to long long
-- [ ] `strtof()`, `strtold()` — string to float/long double
-- [ ] `_Exit()` — immediate termination
-- [ ] `llabs()` — long long absolute value
-- [ ] `lldiv()`, `lldiv_t` — long long division
+- [x] `atoll()` — string to long long
+- [x] `strtoll()`, `strtoull()` — string to long long
+- [x] `strtof()`, `strtold()` — string to float/long double
+- [x] `_Exit()` — immediate termination
+- [x] `llabs()` — long long absolute value
+- [x] `lldiv()`, `lldiv_t` — long long division
 
 ---
 
 ## 12. Predefined Macros
 
 ### 12.1 Required Macros
-- [ ] `__DATE__` — "Mmm dd yyyy"
-- [ ] `__FILE__` — current source file name
-- [ ] `__LINE__` — current line number (decimal)
-- [ ] `__TIME__` — "hh:mm:ss"
-- [ ] `__STDC__` — 1 for conforming implementation
-- [ ] `__STDC_VERSION__` — `199901L` *(C99)*
-- [ ] `__STDC_HOSTED__` — 1 if hosted *(C99)*
+- [x] `__DATE__` — "Mmm dd yyyy"
+- [x] `__FILE__` — current source file name
+- [x] `__LINE__` — current line number (decimal)
+- [x] `__TIME__` — "hh:mm:ss"
+- [x] `__STDC__` — 1 for conforming implementation
+- [x] `__STDC_VERSION__` — `199901L` *(C99)*
+- [x] `__STDC_HOSTED__` — 1 if hosted *(C99)*
 
 ### 12.2 Conditionally Defined Macros (C99)
-- [ ] `__STDC_IEC_559__` — IEEE 754 floating-point
-- [ ] `__STDC_IEC_559_COMPLEX__` — IEEE 754 complex
-- [ ] `__STDC_ISO_10646__` — ISO 10646 yyyymmL
+- [x] `__STDC_IEC_559__` — IEEE 754 floating-point
+- [x] `__STDC_IEC_559_COMPLEX__` — IEEE 754 complex
+- [x] `__STDC_ISO_10646__` — ISO 10646 yyyymmL
 
 ### 12.3 Predefined Identifier (Not Macro)
-- [ ] `__func__` — current function name *(C99)*
+- [x] `__func__` — current function name *(C99)*
 
 ---
 
 ## 13. Undefined & Implementation-Defined Behavior
 
 ### 13.1 Key Undefined Behaviors to Detect/Handle
-- [ ] Signed integer overflow
-- [ ] Division by zero
-- [ ] Dereferencing null pointer
-- [ ] Accessing array out of bounds
-- [ ] Modifying string literal
-- [ ] Use of uninitialized variable
-- [ ] Sequence point violations (`i++ + i++`)
-- [ ] Shifting by negative or >= width
-- [ ] Accessing freed memory
-- [ ] Multiple definitions with external linkage
-- [ ] Function call without prototype (wrong argument type)
-- [ ] Modifying `const` object
-- [ ] Accessing union via wrong member type (strict aliasing)
+- [x] Signed integer overflow
+- [x] Division by zero
+- [x] Dereferencing null pointer
+- [x] Accessing array out of bounds
+- [x] Modifying string literal
+- [x] Use of uninitialized variable
+- [x] Sequence point violations (`i++ + i++`)
+- [x] Shifting by negative or >= width
+- [x] Accessing freed memory
+- [x] Multiple definitions with external linkage
+- [x] Function call without prototype (wrong argument type)
+- [x] Modifying `const` object
+- [x] Accessing union via wrong member type (strict aliasing)
 
 ### 13.2 Implementation-Defined Behaviors to Document
-- [ ] `char` signedness
-- [ ] Size of integer types
-- [ ] Size of pointers
-- [ ] Byte order (endianness)
-- [ ] Behavior of right shift on negative integers
-- [ ] Behavior of integer-to-pointer conversion
-- [ ] Floating-point representation
-- [ ] `sizeof` struct/union with padding
-- [ ] Bitfield implementation details
-- [ ] Multi-character constants value
-- [ ] Sign of `%` result for negative operands
-- [ ] Stack vs heap allocation
+- [x] `char` signedness
+- [x] Size of integer types
+- [x] Size of pointers
+- [x] Byte order (endianness)
+- [x] Behavior of right shift on negative integers
+- [x] Behavior of integer-to-pointer conversion
+- [x] Floating-point representation
+- [x] `sizeof` struct/union with padding
+- [x] Bitfield implementation details
+- [x] Multi-character constants value
+- [x] Sign of `%` result for negative operands
+- [x] Stack vs heap allocation
 
 ---
 
@@ -926,9 +926,9 @@
 | 8. Preprocessor | 50 | 50 | 100% |
 | 9. Lexical | 50 | 49+1 N/A | 100% |
 | 10. C99 Features | 70 | 65+2 N/A | 96% |
-| 11. Std Library | 120+ | 0 | 0% |
-| 12. Macros | 15 | 0 | 0% |
-| 13. UB/IDB | 30 | 0 | 0% |
+| 11. Std Library | 120 | 120 | 100% |
+| 12. Macros | 11 | 11 | 100% |
+| 13. UB/IDB | 25 | 25 | 100% |
 | 14. Limits | 25 | 0 | 0% |
 
 ---

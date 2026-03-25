@@ -31,6 +31,9 @@ pub const STDALIGN_H: &str = include_str!("include/stdalign.h");
 /// Builtin stdatomic.h - C11 atomic operations
 pub const STDATOMIC_H: &str = include_str!("include/stdatomic.h");
 
+/// Builtin complex.h - C99 complex arithmetic
+pub const COMPLEX_H: &str = include_str!("include/complex.h");
+
 /// Builtin float.h - floating-point characteristics
 pub const FLOAT_H: &str = include_str!("include/float.h");
 
@@ -50,6 +53,7 @@ pub const EMMINTRIN_H: &str = include_str!("include/emmintrin.h");
 pub fn get_builtin_header(name: &str) -> Option<&'static str> {
     match name {
         "stdarg.h" => Some(STDARG_H),
+        "complex.h" => Some(COMPLEX_H),
         "stdbool.h" => Some(STDBOOL_H),
         "stddef.h" => Some(STDDEF_H),
         "limits.h" => Some(LIMITS_H),

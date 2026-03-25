@@ -111,11 +111,11 @@
 - N/A `float _Imaginary` — *will not implement*
 - N/A `double _Imaginary` — *will not implement*
 - N/A `long double _Imaginary` — *will not implement*
-- [ ] `<complex.h>` macro `complex` expands to `_Complex`
+- [x] `<complex.h>` macro `complex` expands to `_Complex`
 - N/A `<complex.h>` macro `imaginary` expands to `_Imaginary` — *will not implement*
-- [ ] `<complex.h>` macro `I` (imaginary unit)
-- [ ] Complex arithmetic operations (+, -, *, /)
-- [ ] `creal()`, `cimag()`, `cabs()`, `carg()`, `conj()`
+- [x] `<complex.h>` macro `I` (imaginary unit)
+- [x] Complex arithmetic operations (+, -, *, /)
+- [x] `creal()`, `cimag()`, `cabs()`, `carg()`, `conj()`
 
 ### 2.4 Derived Types
 - [x] Arrays (fixed size)
@@ -570,95 +570,95 @@
 ## 10. C99-Specific Features
 
 ### 10.1 Variable Length Arrays (VLAs)
-- [ ] VLA declaration in block scope
-- [ ] VLA with runtime-determined size
-- [ ] `sizeof` on VLA (runtime evaluation)
-- [ ] VLA as function parameter `f(int n, int a[n])`
-- [ ] VLA in prototype `f(int n, int a[*])`
-- [ ] Multi-dimensional VLA
-- [ ] Pointer to VLA
-- [ ] Typedef of VLA type (variably modified type)
-- [ ] VLA in `for` loop scope
-- [ ] Goto/switch jumping into VLA scope (undefined)
+- [x] VLA declaration in block scope
+- [x] VLA with runtime-determined size
+- [x] `sizeof` on VLA (runtime evaluation)
+- [x] VLA as function parameter `f(int n, int a[n])`
+- [x] VLA in prototype `f(int n, int a[*])`
+- [x] Multi-dimensional VLA
+- [x] Pointer to VLA
+- [x] Typedef of VLA type (variably modified type)
+- [x] VLA in `for` loop scope
+- [x] Goto/switch jumping into VLA scope (undefined)
 
 ### 10.2 Designated Initializers
-- [ ] Struct field designator `.field = value`
-- [ ] Array index designator `[index] = value`
-- [ ] Nested designators `.a.b = value`
-- [ ] Array range (GCC extension, NOT C99)
-- [ ] Mixing designated and positional
-- [ ] Out-of-order initialization
-- [ ] Overwriting previous initializer
+- [x] Struct field designator `.field = value`
+- [x] Array index designator `[index] = value`
+- [x] Nested designators `.a.b = value`
+- N/A Array range (GCC extension, NOT C99)
+- [x] Mixing designated and positional
+- [x] Out-of-order initialization
+- [x] Overwriting previous initializer
 
 ### 10.3 Compound Literals
-- [ ] Array compound literal `(int[]){1, 2, 3}`
-- [ ] Struct compound literal `(struct S){.x = 1}`
-- [ ] Compound literal as lvalue
-- [ ] Compound literal storage duration (block scope = automatic)
-- [ ] Compound literal storage duration (file scope = static)
-- [ ] Compound literal as function argument
-- [ ] Modifiable compound literal
+- [x] Array compound literal `(int[]){1, 2, 3}`
+- [x] Struct compound literal `(struct S){.x = 1}`
+- [x] Compound literal as lvalue
+- [x] Compound literal storage duration (block scope = automatic)
+- [x] Compound literal storage duration (file scope = static)
+- [x] Compound literal as function argument
+- [x] Modifiable compound literal
 
 ### 10.4 Flexible Array Members
-- [ ] Struct with flexible array member `struct { int n; int data[]; }`
-- [ ] `sizeof` struct (excludes flexible member)
-- [ ] Flexible member must be last
-- [ ] Single flexible member per struct
-- [ ] Allocation size calculation
-- [ ] Nested struct with flexible array (not allowed)
+- [x] Struct with flexible array member `struct { int n; int data[]; }`
+- [x] `sizeof` struct (excludes flexible member)
+- [x] Flexible member must be last
+- [x] Single flexible member per struct
+- [x] Allocation size calculation
+- [x] Nested struct with flexible array (not allowed)
 
 ### 10.5 `restrict` Qualifier
-- [ ] Basic `restrict` pointer declaration
-- [ ] `restrict` in function parameters
-- [ ] `restrict` semantics for optimization
-- [ ] Multiple `restrict` pointers
-- [ ] `restrict` on array parameters
+- [x] Basic `restrict` pointer declaration
+- [x] `restrict` in function parameters
+- [x] `restrict` semantics for optimization
+- [x] Multiple `restrict` pointers
+- [x] `restrict` on array parameters
 
 ### 10.6 Inline Functions
-- [ ] `inline` function definition
-- [ ] `static inline` — always generates code
-- [ ] `extern inline` — external definition
-- [ ] `inline` only — inline definition (no standalone)
-- [ ] Inline in header files
-- [ ] Inline function with static variables
+- [x] `inline` function definition
+- [x] `static inline` — always generates code
+- [x] `extern inline` — external definition
+- [x] `inline` only — inline definition (no standalone)
+- [x] Inline in header files
+- [x] Inline function with static variables
 
 ### 10.7 `_Bool` Type
-- [ ] `_Bool` declaration
-- [ ] Conversion to `_Bool` (0 if zero, 1 otherwise)
-- [ ] `_Bool` in expressions
-- [ ] `<stdbool.h>` macros
+- [x] `_Bool` declaration
+- [x] Conversion to `_Bool` (0 if zero, 1 otherwise)
+- [x] `_Bool` in expressions
+- [x] `<stdbool.h>` macros
 
 ### 10.8 `long long` Type
-- [ ] `long long int` declaration
-- [ ] `unsigned long long int` declaration
-- [ ] `long long` constants with `LL` suffix
-- [ ] Arithmetic on `long long`
-- [ ] `LLONG_MIN`, `LLONG_MAX`, `ULLONG_MAX` in `<limits.h>`
-- [ ] `printf`/`scanf` with `%lld`, `%llu`
+- [x] `long long int` declaration
+- [x] `unsigned long long int` declaration
+- [x] `long long` constants with `LL` suffix
+- [x] Arithmetic on `long long`
+- [x] `LLONG_MIN`, `LLONG_MAX`, `ULLONG_MAX` in `<limits.h>`
+- [x] `printf`/`scanf` with `%lld`, `%llu`
 
 ### 10.9 Complex Numbers
-- [ ] `_Complex` type declarations
-- [ ] `_Imaginary` type declarations
-- [ ] Complex arithmetic
-- [ ] `<complex.h>` functions
-- [ ] `I` macro
-- [ ] `CMPLX`, `CMPLXF`, `CMPLXL` macros
+- [x] `_Complex` type declarations
+- N/A `_Imaginary` type declarations — *will not implement*
+- [x] Complex arithmetic
+- [x] `<complex.h>` functions
+- [x] `I` macro
+- [x] `CMPLX`, `CMPLXF`, `CMPLXL` macros
 
 ### 10.10 Mixed Declarations and Statements
-- [ ] Declaration after statement in block
-- [ ] Declaration in `for` loop initializer
-- [ ] Declaration after `case` label
+- [x] Declaration after statement in block
+- [x] Declaration in `for` loop initializer
+- [x] Declaration after `case` label
 
 ### 10.11 `__func__` Identifier
-- [ ] Predefined `__func__` in function body
-- [ ] Type: `static const char[]`
-- [ ] Value: function name
+- [x] Predefined `__func__` in function body
+- [x] Type: `static const char[]`
+- [x] Value: function name
 
 ### 10.12 Hexadecimal Floating-Point Literals
-- [ ] Format: `0xh.hhhhpd`
-- [ ] Binary exponent (`p` or `P`)
-- [ ] Exact representation of floats
-- [ ] Suffix for float/long double
+- [x] Format: `0xh.hhhhpd`
+- [x] Binary exponent (`p` or `P`)
+- [x] Exact representation of floats
+- [x] Suffix for float/long double
 
 ### 10.13 Variadic Macros
 - [x] `#define M(...) use __VA_ARGS__`
@@ -917,7 +917,7 @@
 | Section | Total Items | Completed | % |
 |---------|-------------|-----------|---|
 | 1. Keywords | 37 | 35+1 N/A | 97% |
-| 2. Types | 45 | 37+4 N/A | 91% |
+| 2. Types | 45 | 41+4 N/A | 100% |
 | 3. Qualifiers | 15 | 15 | 100% |
 | 4. Operators | 63 | 63 | 100% |
 | 5. Expressions | 34 | 34 | 100% |
@@ -925,7 +925,7 @@
 | 7. Declarations | 55 | 55 | 100% |
 | 8. Preprocessor | 50 | 50 | 100% |
 | 9. Lexical | 50 | 49+1 N/A | 100% |
-| 10. C99 Features | 70 | 0 | 0% |
+| 10. C99 Features | 70 | 65+2 N/A | 96% |
 | 11. Std Library | 120+ | 0 | 0% |
 | 12. Macros | 15 | 0 | 0% |
 | 13. UB/IDB | 30 | 0 | 0% |

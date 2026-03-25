@@ -2141,6 +2141,25 @@ impl<'a> Parser<'a> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_COMPLEX => Some((|| {
+                // __builtin_complex(real, imag) - construct complex value
+                self.expect_special(b'(')?;
+                let real = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let imag = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                // Determine complex type from argument types
+                let real_typ = real.typ.unwrap_or(self.types.double_id);
+                let complex_typ = self.types.make_complex(real_typ);
+                Ok(Self::typed_expr(
+                    ExprKind::BuiltinComplex {
+                        real: Box::new(real),
+                        imag: Box::new(imag),
+                    },
+                    complex_typ,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_UNREACHABLE => Some((|| {
                 // __builtin_unreachable() - marks code as unreachable
                 // Takes no arguments, returns void
@@ -2954,8 +2973,11 @@ impl<'a> Parser<'a> {
         let is_float64_suffix = !is_hex && s_lower.ends_with("f64");
 
         // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
-        let num_str = if is_hex {
-            // For hex, only strip u/l suffixes (not f which is a hex digit)
+        let num_str = if is_hex && is_float {
+            // Hex float: strip f/l suffixes (they appear after p-exponent, not as hex digits)
+            s_lower.trim_end_matches(['u', 'l', 'f'])
+        } else if is_hex {
+            // Hex integer: only strip u/l (f is a hex digit)
             s_lower.trim_end_matches(['u', 'l'])
         } else if is_float16_suffix {
             s_lower.trim_end_matches("f16")

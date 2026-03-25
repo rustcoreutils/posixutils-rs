@@ -264,6 +264,7 @@ define_keywords! {
     (BUILTIN_NANS,      "__builtin_nans",     BUILTIN),
     (BUILTIN_NANSF,     "__builtin_nansf",    BUILTIN),
     (BUILTIN_NANSL,     "__builtin_nansl",    BUILTIN),
+    (BUILTIN_COMPLEX,   "__builtin_complex",  BUILTIN),
     (BUILTIN_EXPECT,    "__builtin_expect",   BUILTIN),
     (BUILTIN_ASSUME_ALIGNED, "__builtin_assume_aligned", BUILTIN),
     (BUILTIN_PREFETCH,  "__builtin_prefetch", BUILTIN),

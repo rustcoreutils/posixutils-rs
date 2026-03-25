@@ -506,6 +506,12 @@ pub enum ExprKind {
     /// Used for optimization hints and silencing warnings.
     Unreachable,
 
+    /// __builtin_complex(real, imag) — construct complex value from two reals
+    BuiltinComplex {
+        real: Box<Expr>,
+        imag: Box<Expr>,
+    },
+
     /// __builtin_frame_address(level)
     /// Returns the frame pointer address at the given level.
     /// Level 0 is the current frame, 1 is the caller's frame, etc.

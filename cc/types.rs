@@ -946,6 +946,17 @@ impl TypeTable {
         }
     }
 
+    /// Get the complex type for a float base type (e.g., double → double _Complex)
+    #[inline]
+    pub fn make_complex(&self, id: TypeId) -> TypeId {
+        match self.get(id).kind {
+            TypeKind::Float => self.complex_float_id,
+            TypeKind::Double => self.complex_double_id,
+            TypeKind::LongDouble => self.complex_longdouble_id,
+            _ => self.complex_double_id, // default to double _Complex
+        }
+    }
+
     /// Check if type is an arithmetic type (integer, float, or complex)
     #[inline]
     pub fn is_arithmetic(&self, id: TypeId) -> bool {

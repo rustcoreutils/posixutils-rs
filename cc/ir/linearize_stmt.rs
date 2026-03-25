@@ -322,28 +322,40 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
                 } else if self.types.is_complex(typ) {
-                    // Complex type initialization - linearize_expr returns an address
-                    // to a temp containing the complex value. Copy from temp to local.
-                    let value_addr = self.linearize_expr(init);
+                    let init_typ = self.expr_type(init);
                     let base_typ = self.types.complex_base(typ);
                     let base_bits = self.types.size_bits(base_typ);
                     let base_bytes = (base_bits / 8) as i64;
 
-                    // Load real and imag parts from source temp
-                    let val_real = self.alloc_pseudo();
-                    let val_imag = self.alloc_pseudo();
-                    self.emit(Instruction::load(
-                        val_real, value_addr, 0, base_typ, base_bits,
-                    ));
-                    self.emit(Instruction::load(
-                        val_imag, value_addr, base_bytes, base_typ, base_bits,
-                    ));
-
-                    // Store to local variable
-                    self.emit(Instruction::store(val_real, sym_id, 0, base_typ, base_bits));
-                    self.emit(Instruction::store(
-                        val_imag, sym_id, base_bytes, base_typ, base_bits,
-                    ));
+                    if self.types.is_complex(init_typ) {
+                        // Complex-to-complex: linearize_expr returns an address
+                        // to a temp containing the complex value. Copy from temp.
+                        let value_addr = self.linearize_expr(init);
+                        let val_real = self.alloc_pseudo();
+                        let val_imag = self.alloc_pseudo();
+                        self.emit(Instruction::load(
+                            val_real, value_addr, 0, base_typ, base_bits,
+                        ));
+                        self.emit(Instruction::load(
+                            val_imag, value_addr, base_bytes, base_typ, base_bits,
+                        ));
+                        self.emit(Instruction::store(val_real, sym_id, 0, base_typ, base_bits));
+                        self.emit(Instruction::store(
+                            val_imag, sym_id, base_bytes, base_typ, base_bits,
+                        ));
+                    } else {
+                        // Real scalar to complex: set real = value, imag = 0.0
+                        let val = self.linearize_expr(init);
+                        let converted = self.emit_convert(val, init_typ, base_typ);
+                        self.emit(Instruction::store(
+                            converted, sym_id, 0, base_typ, base_bits,
+                        ));
+                        // Store 0.0 for imaginary part
+                        let zero = self.emit_fconst(0.0, base_typ);
+                        self.emit(Instruction::store(
+                            zero, sym_id, base_bytes, base_typ, base_bits,
+                        ));
+                    }
                 } else {
                     // Check for large struct/union initialization (> 64 bits)
                     // linearize_expr returns an address for large aggregates

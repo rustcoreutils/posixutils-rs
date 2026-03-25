@@ -21,5 +21,6 @@ mod control_flow;
 mod datatypes;
 mod functions;
 mod globals;
+mod lexical;
 mod operators;
 mod storage;

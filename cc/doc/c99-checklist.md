@@ -498,73 +498,73 @@
 ## 9. Lexical Elements
 
 ### 9.1 Character Set
-- [ ] Basic source character set (91 characters)
-- [ ] Basic execution character set
-- [ ] Extended characters
-- [ ] Universal character names `\uXXXX` *(C99 new)*
-- [ ] Universal character names `\UXXXXXXXX` *(C99 new)*
-- [ ] Trigraphs (??=, ??(, ??/, etc.) — *deprecated but required*
+- [x] Basic source character set (91 characters)
+- [x] Basic execution character set
+- [x] Extended characters
+- [x] Universal character names `\uXXXX` *(C99 new)*
+- [x] Universal character names `\UXXXXXXXX` *(C99 new)*
+- N/A Trigraphs (??=, ??(, ??/, etc.) — *will not implement: deprecated in C99, removed in C11*
 - [x] Digraphs (<:, :>, <%, %>, %:, %:%:) *(C99 new)*
 
 ### 9.2 Tokens
-- [ ] Keywords (identifiers reserved by language)
-- [ ] Identifiers
-- [ ] Constants
-- [ ] String literals
-- [ ] Punctuators
-- [ ] Header names (in `#include`)
+- [x] Keywords (identifiers reserved by language)
+- [x] Identifiers
+- [x] Constants
+- [x] String literals
+- [x] Punctuators
+- [x] Header names (in `#include`)
 
 ### 9.3 Comments
-- [ ] Block comments `/* ... */`
-- [ ] Nested block comments (not allowed)
-- [ ] Line comments `// ...` *(C99 new)*
-- [ ] Comment at end of file
-- [ ] Comment spanning multiple lines
+- [x] Block comments `/* ... */`
+- [x] Nested block comments (not allowed)
+- [x] Line comments `// ...` *(C99 new)*
+- [x] Comment at end of file
+- [x] Comment spanning multiple lines
 
 ### 9.4 Identifiers
-- [ ] Start with letter or underscore
-- [ ] Contain letters, digits, underscores
-- [ ] Case sensitive
-- [ ] Reserved identifiers (`_X`, `__x`, etc.)
-- [ ] Minimum significant characters: 63 internal, 31 external *(C99 increased)*
-- [ ] Universal character names in identifiers *(C99 new)*
+- [x] Start with letter or underscore
+- [x] Contain letters, digits, underscores
+- [x] Case sensitive
+- [x] Reserved identifiers (`_X`, `__x`, etc.)
+- [x] Minimum significant characters: 63 internal, 31 external *(C99 increased)*
+- [x] Universal character names in identifiers *(C99 new)*
 
 ### 9.5 Integer Constants
-- [ ] Decimal constants
-- [ ] Octal constants (leading `0`)
-- [ ] Hexadecimal constants (`0x` or `0X`)
-- [ ] Integer suffixes: `u`, `U`
-- [ ] Integer suffixes: `l`, `L`
-- [ ] Integer suffixes: `ll`, `LL` *(C99 new)*
-- [ ] Combined suffixes: `ul`, `UL`, `ull`, `ULL`, etc.
-- [ ] Correct type selection per suffix
+- [x] Decimal constants
+- [x] Octal constants (leading `0`)
+- [x] Hexadecimal constants (`0x` or `0X`)
+- [x] Integer suffixes: `u`, `U`
+- [x] Integer suffixes: `l`, `L`
+- [x] Integer suffixes: `ll`, `LL` *(C99 new)*
+- [x] Combined suffixes: `ul`, `UL`, `ull`, `ULL`, etc.
+- [x] Correct type selection per suffix
 
 ### 9.6 Floating Constants
-- [ ] Decimal floating constants
-- [ ] Hexadecimal floating constants *(C99 new)*
-- [ ] Exponent notation (`e`, `E`)
-- [ ] Binary exponent for hex floats (`p`, `P`) *(C99 new)*
-- [ ] Float suffix `f`, `F`
-- [ ] Long double suffix `l`, `L`
-- [ ] No suffix = `double`
+- [x] Decimal floating constants
+- [x] Hexadecimal floating constants *(C99 new)*
+- [x] Exponent notation (`e`, `E`)
+- [x] Binary exponent for hex floats (`p`, `P`) *(C99 new)*
+- [x] Float suffix `f`, `F`
+- [x] Long double suffix `l`, `L`
+- [x] No suffix = `double`
 
 ### 9.7 Character Constants
-- [ ] Single character `'x'`
-- [ ] Escape sequences: `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`
-- [ ] Escape sequences: `\\`, `\'`, `\"`, `\?`
-- [ ] Octal escape `\nnn`
-- [ ] Hexadecimal escape `\xhh`
-- [ ] Wide character constant `L'x'`
-- [ ] Multi-character constants (implementation-defined)
+- [x] Single character `'x'`
+- [x] Escape sequences: `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`
+- [x] Escape sequences: `\\`, `\'`, `\"`, `\?`
+- [x] Octal escape `\nnn`
+- [x] Hexadecimal escape `\xhh`
+- [x] Wide character constant `L'x'`
+- [x] Multi-character constants (implementation-defined)
 
 ### 9.8 String Literals
-- [ ] Basic string literal `"hello"`
-- [ ] Adjacent string literal concatenation
-- [ ] Escape sequences in strings
-- [ ] Wide string literal `L"hello"`
-- [ ] Adjacent wide/narrow string concatenation rules
-- [ ] Null termination
-- [ ] Modifying string literal (undefined behavior)
+- [x] Basic string literal `"hello"`
+- [x] Adjacent string literal concatenation
+- [x] Escape sequences in strings
+- [x] Wide string literal `L"hello"`
+- [x] Adjacent wide/narrow string concatenation rules
+- [x] Null termination
+- [x] Modifying string literal (undefined behavior)
 
 ---
 
@@ -926,7 +926,7 @@
 | 6. Statements | 27 | 27 | 100% |
 | 7. Declarations | 55 | 0 | 0% |
 | 8. Preprocessor | 50 | 50 | 100% |
-| 9. Lexical | 50 | 0 | 0% |
+| 9. Lexical | 50 | 49+1 N/A | 100% |
 | 10. C99 Features | 70 | 0 | 0% |
 | 11. Std Library | 120+ | 0 | 0% |
 | 12. Macros | 15 | 0 | 0% |

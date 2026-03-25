@@ -3390,7 +3390,7 @@ impl Parser<'_> {
         if self.is_special(b'(') {
             // Could be function definition or declaration
             self.advance();
-            let (params, variadic) = self.parse_parameter_list()?;
+            let (mut params, variadic) = self.parse_parameter_list()?;
             self.expect_special(b')')?;
 
             // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
@@ -3401,6 +3401,51 @@ impl Parser<'_> {
                 attrs.has_noreturn() || typ_from_table.modifiers.contains(TypeModifiers::NORETURN);
             // Extract calling convention from attributes
             let calling_conv = attrs.calling_conv().unwrap_or_default();
+
+            // K&R (old-style) parameter declarations: type declarations between ) and {
+            // e.g., int add(a, b) int a; int b; { ... }
+            // The parameter list already parsed bare names with implicit int.
+            // Now parse explicit type declarations and update parameter types.
+            if self.is_declaration_start() && !self.is_special(b'{') {
+                while self.is_declaration_start() {
+                    let knr_type = self.parse_type_specifier()?;
+                    let knr_base_id = self.intern_type_with_tag(&knr_type);
+                    loop {
+                        let (decl_name, mut decl_typ, _vla, _fparams) =
+                            self.parse_declarator(knr_base_id)?;
+                        // C99 6.7.5.3: array/function params adjusted to pointers
+                        let typ = self.types.get(decl_typ);
+                        if typ.kind == TypeKind::Array {
+                            let elem = typ.base.unwrap_or(self.types.void_id);
+                            decl_typ = self.types.intern(Type {
+                                kind: TypeKind::Pointer,
+                                base: Some(elem),
+                                ..Default::default()
+                            });
+                        } else if typ.kind == TypeKind::Function {
+                            decl_typ = self.types.intern(Type {
+                                kind: TypeKind::Pointer,
+                                base: Some(decl_typ),
+                                ..Default::default()
+                            });
+                        }
+                        // Update matching parameter type
+                        if decl_name != StringId::EMPTY {
+                            for param in &mut params {
+                                if param.0 == Some(decl_name) {
+                                    param.1 = decl_typ;
+                                }
+                            }
+                        }
+                        if self.is_special(b',') {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect_special(b';')?;
+                }
+            }
 
             if self.is_special(b'{') {
                 // Function definition

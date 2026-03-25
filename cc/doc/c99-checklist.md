@@ -357,81 +357,81 @@
 ## 7. Declarations
 
 ### 7.1 Declaration Syntax
-- [ ] Declaration specifiers + declarators
-- [ ] Multiple declarators per declaration
-- [ ] Abstract declarators (in casts, sizeof, prototypes)
-- [ ] Declarator with initializer
+- [x] Declaration specifiers + declarators
+- [x] Multiple declarators per declaration
+- [x] Abstract declarators (in casts, sizeof, prototypes)
+- [x] Declarator with initializer
 
 ### 7.2 Variable Declarations
-- [ ] Simple variable `int x;`
-- [ ] With initializer `int x = 5;`
-- [ ] Multiple variables `int x, y, z;`
-- [ ] Pointer variable `int *p;`
-- [ ] Array variable `int a[10];`
-- [ ] Array without size (external/incomplete) `extern int a[];`
-- [ ] Pointer to array `int (*p)[10];`
-- [ ] Array of pointers `int *a[10];`
+- [x] Simple variable `int x;`
+- [x] With initializer `int x = 5;`
+- [x] Multiple variables `int x, y, z;`
+- [x] Pointer variable `int *p;`
+- [x] Array variable `int a[10];`
+- [x] Array without size (external/incomplete) `extern int a[];`
+- [x] Pointer to array `int (*p)[10];`
+- [x] Array of pointers `int *a[10];`
 
 ### 7.3 Function Declarations
-- [ ] Function prototype `int f(int, char);`
-- [ ] Function prototype with parameter names `int f(int x, char c);`
-- [ ] Function returning pointer `int *f(void);`
-- [ ] Pointer to function `int (*pf)(int);`
-- [ ] Function returning pointer to function
-- [ ] Empty parameter list `f()` (unspecified params, K&R style)
-- [ ] Void parameter list `f(void)` (no parameters)
-- [ ] Variadic function `f(int, ...)`
+- [x] Function prototype `int f(int, char);`
+- [x] Function prototype with parameter names `int f(int x, char c);`
+- [x] Function returning pointer `int *f(void);`
+- [x] Pointer to function `int (*pf)(int);`
+- [x] Function returning pointer to function
+- [x] Empty parameter list `f()` (unspecified params, K&R style)
+- [x] Void parameter list `f(void)` (no parameters)
+- [x] Variadic function `f(int, ...)`
 
 ### 7.4 Function Definitions
-- [ ] Function body with compound statement
-- [ ] K&R style parameter declarations
-- [ ] Modern prototype-style parameters
-- [ ] `static` functions (internal linkage)
-- [ ] `inline` functions *(C99 new)*
+- [x] Function body with compound statement
+- [x] K&R style parameter declarations
+- [x] Modern prototype-style parameters
+- [x] `static` functions (internal linkage)
+- [x] `inline` functions *(C99 new)*
 
 ### 7.5 Structure Declarations
-- [ ] `struct` with tag
-- [ ] Anonymous `struct`
-- [ ] `struct` with members
-- [ ] Nested `struct`
-- [ ] Forward declaration `struct tag;`
-- [ ] Self-referential `struct` (linked list)
-- [ ] Bit-fields `int x : 5;`
-- [ ] Bit-field with zero width (alignment)
-- [ ] Flexible array member `int data[];` *(C99 new)*
+- [x] `struct` with tag
+- [x] Anonymous `struct`
+- [x] `struct` with members
+- [x] Nested `struct`
+- [x] Forward declaration `struct tag;`
+- [x] Self-referential `struct` (linked list)
+- [x] Bit-fields `int x : 5;`
+- [x] Bit-field with zero width (alignment)
+- [x] Flexible array member `int data[];` *(C99 new)*
 
 ### 7.6 Union Declarations
-- [ ] `union` with tag
-- [ ] Anonymous `union`
-- [ ] `union` with members
-- [ ] `union` member access
+- [x] `union` with tag
+- [x] Anonymous `union`
+- [x] `union` with members
+- [x] `union` member access
 
 ### 7.7 Enumeration Declarations
-- [ ] `enum` with tag
-- [ ] Anonymous `enum`
-- [ ] Enumerators with explicit values
-- [ ] Enumerators with implicit values
+- [x] `enum` with tag
+- [x] Anonymous `enum`
+- [x] Enumerators with explicit values
+- [x] Enumerators with implicit values
 
 ### 7.8 Typedef
-- [ ] Simple typedef `typedef int INT;`
-- [ ] Pointer typedef `typedef int *PINT;`
-- [ ] Function pointer typedef `typedef int (*FP)(int);`
-- [ ] Array typedef `typedef int ARR[10];`
-- [ ] Struct typedef `typedef struct { } S;`
-- [ ] Typedef redeclaration (same type, allowed)
+- [x] Simple typedef `typedef int INT;`
+- [x] Pointer typedef `typedef int *PINT;`
+- [x] Function pointer typedef `typedef int (*FP)(int);`
+- [x] Array typedef `typedef int ARR[10];`
+- [x] Struct typedef `typedef struct { } S;`
+- [x] Typedef redeclaration (same type, allowed)
 
 ### 7.9 Initializers
-- [ ] Scalar initializer `int x = 5;`
-- [ ] Brace-enclosed initializer `int a[] = {1, 2, 3};`
-- [ ] Nested brace initializers for structs/arrays
-- [ ] String literal initializer for char arrays
-- [ ] Partial initialization (rest zero-initialized)
-- [ ] Designated initializers `{.field = val}` *(C99 new)*
-- [ ] Designated initializers `{[index] = val}` *(C99 new)*
-- [ ] Mixed designated/positional initializers *(C99 new)*
-- [ ] Out-of-order designated initializers *(C99 new)*
-- [ ] Compound literals `(int[]){1, 2, 3}` *(C99 new)*
-- [ ] Compound literals in initializers *(C99 new)*
+- [x] Scalar initializer `int x = 5;`
+- [x] Brace-enclosed initializer `int a[] = {1, 2, 3};`
+- [x] Nested brace initializers for structs/arrays
+- [x] String literal initializer for char arrays
+- [x] Partial initialization (rest zero-initialized)
+- [x] Designated initializers `{.field = val}` *(C99 new)*
+- [x] Designated initializers `{[index] = val}` *(C99 new)*
+- [x] Mixed designated/positional initializers *(C99 new)*
+- [x] Out-of-order designated initializers *(C99 new)*
+- [x] Compound literals `(int[]){1, 2, 3}` *(C99 new)*
+- [x] Compound literals in initializers *(C99 new)*
 
 ---
 
@@ -922,7 +922,7 @@
 | 4. Operators | 63 | 63 | 100% |
 | 5. Expressions | 34 | 34 | 100% |
 | 6. Statements | 27 | 27 | 100% |
-| 7. Declarations | 55 | 0 | 0% |
+| 7. Declarations | 55 | 55 | 100% |
 | 8. Preprocessor | 50 | 50 | 100% |
 | 9. Lexical | 50 | 49+1 N/A | 100% |
 | 10. C99 Features | 70 | 0 | 0% |

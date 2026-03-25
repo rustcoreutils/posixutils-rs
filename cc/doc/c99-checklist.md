@@ -835,80 +835,80 @@
 ## 14. Translation Limits
 
 ### 14.1 C99 Minimum Translation Limits
-- [ ] 127 nesting levels of blocks
-- [ ] 63 nesting levels of conditional inclusion
-- [ ] 12 pointer, array, function declarators
-- [ ] 63 nesting levels of parenthesized declarators
-- [ ] 63 nesting levels of parenthesized expressions
-- [ ] 63 significant initial characters (internal identifier)
-- [ ] 31 significant initial characters (external identifier)
-- [ ] 4095 external identifiers in one translation unit
-- [ ] 511 identifiers with block scope in one block
-- [ ] 4095 macro identifiers simultaneously defined
-- [ ] 127 parameters in one function definition
-- [ ] 127 arguments in one function call
-- [ ] 127 parameters in one macro definition
-- [ ] 127 arguments in one macro invocation
-- [ ] 4095 characters in logical source line
-- [ ] 4095 characters in string literal (after concatenation)
-- [ ] 65535 bytes in an object
-- [ ] 15 nesting levels of `#include`
-- [ ] 1023 case labels in switch
-- [ ] 1023 members in struct or union
-- [ ] 1023 enumeration constants in enum
-- [ ] 63 levels of nested struct/union in declaration
+- [x] 127 nesting levels of blocks
+- [x] 63 nesting levels of conditional inclusion
+- [x] 12 pointer, array, function declarators
+- [x] 63 nesting levels of parenthesized declarators
+- [x] 63 nesting levels of parenthesized expressions
+- [x] 63 significant initial characters (internal identifier)
+- [x] 31 significant initial characters (external identifier)
+- [x] 4095 external identifiers in one translation unit
+- [x] 511 identifiers with block scope in one block
+- [x] 4095 macro identifiers simultaneously defined
+- [x] 127 parameters in one function definition
+- [x] 127 arguments in one function call
+- [x] 127 parameters in one macro definition
+- [x] 127 arguments in one macro invocation
+- [x] 4095 characters in logical source line
+- [x] 4095 characters in string literal (after concatenation)
+- [x] 65535 bytes in an object
+- [x] 15 nesting levels of `#include`
+- [x] 1023 case labels in switch
+- [x] 1023 members in struct or union
+- [x] 1023 enumeration constants in enum
+- [x] 63 levels of nested struct/union in declaration
 
 ---
 
 ## Appendix A: C99 Grammar Summary (Key Productions)
 
 ### Translation Unit
-- [ ] external-declaration*
-- [ ] function-definition | declaration
+- [x] external-declaration*
+- [x] function-definition | declaration
 
 ### Declarations
-- [ ] declaration-specifiers init-declarator-list? `;`
+- [x] declaration-specifiers init-declarator-list? `;`
 
 ### Function Definition
-- [ ] declaration-specifiers declarator declaration-list? compound-statement
+- [x] declaration-specifiers declarator declaration-list? compound-statement
 
 ### Statements
-- [ ] labeled-statement | compound-statement | expression-statement | selection-statement | iteration-statement | jump-statement
+- [x] labeled-statement | compound-statement | expression-statement | selection-statement | iteration-statement | jump-statement
 
 ---
 
 ## Appendix B: ABI Considerations
 
-- [ ] Calling conventions documented
-- [ ] Structure layout and alignment
-- [ ] Stack frame layout
-- [ ] Register usage conventions
-- [ ] Floating-point ABI
-- [ ] Variadic argument passing
-- [ ] Return value handling (small struct, large struct, floats)
+- [x] Calling conventions documented
+- [x] Structure layout and alignment
+- [x] Stack frame layout
+- [x] Register usage conventions
+- [x] Floating-point ABI
+- [x] Variadic argument passing
+- [x] Return value handling (small struct, large struct, floats)
 
 ---
 
 ## Appendix C: Testing Strategy
 
 ### Unit Tests
-- [ ] Each keyword
-- [ ] Each operator
-- [ ] Each type
-- [ ] Each preprocessor directive
-- [ ] Each escape sequence
-- [ ] Each conversion rule
+- [x] Each keyword
+- [x] Each operator
+- [x] Each type
+- [x] Each preprocessor directive
+- [x] Each escape sequence
+- [x] Each conversion rule
 
 ### Integration Tests
-- [ ] CPython compilation ✓
-- [ ] Standard library compilation
-- [ ] POSIX utility compilation
-- [ ] Open source C99 projects
+- [x] CPython compilation ✓
+- [x] Standard library compilation
+- [x] POSIX utility compilation
+- [x] Open source C99 projects
 
 ### Conformance Tests
 - [ ] GCC torture tests (C99 subset)
 - [ ] clang test suite (C99 subset)
-- [ ] Custom C99 conformance suite
+- [x] Custom C99 conformance suite
 
 ---
 
@@ -929,7 +929,7 @@
 | 11. Std Library | 120 | 120 | 100% |
 | 12. Macros | 11 | 11 | 100% |
 | 13. UB/IDB | 25 | 25 | 100% |
-| 14. Limits | 25 | 0 | 0% |
+| 14. Limits | 22 | 22 | 100% |
 
 ---
 

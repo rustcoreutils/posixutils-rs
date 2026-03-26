@@ -52,6 +52,10 @@ pub struct Aarch64CodeGen {
     pub(super) num_fixed_gp_params: usize,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// Thread-local storage symbols (need TLS access)
+    pub(super) tls_symbols: HashSet<String>,
+    /// Shared library mode (affects TLS model selection)
+    shared_mode: bool,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -88,6 +92,8 @@ impl Aarch64CodeGen {
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
             extern_symbols: HashSet::new(),
+            tls_symbols: HashSet::new(),
+            shared_mode: false,
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
@@ -1766,6 +1772,12 @@ impl Aarch64CodeGen {
 
     /// Load address of a global symbol into a register
     pub(super) fn emit_load_addr(&mut self, name: &str, dst: Reg) {
+        // Thread-local storage: compute TLS address directly
+        if self.tls_symbols.contains(name) {
+            self.emit_tls_addr(name, dst);
+            return;
+        }
+
         // Local labels (starting with '.') don't get the _ prefix on macOS
         let sym = if name.starts_with('.') {
             Symbol::local(name)
@@ -1800,8 +1812,79 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Check if a TLS symbol should use the Initial Exec model.
+    /// IE is used for extern TLS symbols or when building shared libraries.
+    /// Local Exec is used for locally-defined TLS in non-shared executables.
+    fn use_tls_ie(&self, name: &str) -> bool {
+        self.shared_mode || self.extern_symbols.contains(name)
+    }
+
+    /// Emit TLS address computation into dst register.
+    /// After this call, dst holds the address of the TLS variable.
+    fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
+        let sym = Symbol::global(name);
+        if self.use_tls_ie(name) {
+            // Initial Exec model (extern TLS or shared library):
+            //   adrp  dst, :gottpoff:sym
+            //   ldr   dst, [dst, :gottpoff_lo12:sym]
+            //   mrs   tmp, tpidr_el0
+            //   add   dst, tmp, dst
+            let tmp = Reg::X16; // scratch register
+            self.push_lir(Aarch64Inst::AdrpGottpoff {
+                sym: sym.clone(),
+                dst,
+            });
+            self.push_lir(Aarch64Inst::LdrGottpoffLo12 {
+                sym,
+                base: dst,
+                dst,
+            });
+            self.push_lir(Aarch64Inst::Mrs {
+                sysreg: "tpidr_el0",
+                dst: tmp,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: tmp,
+                src2: GpOperand::Reg(dst),
+                dst,
+            });
+        } else {
+            // Local Exec model (locally-defined TLS in executable):
+            //   mrs   dst, tpidr_el0
+            //   add   dst, dst, :tprel_hi12:sym
+            //   add   dst, dst, :tprel_lo12_nc:sym
+            self.push_lir(Aarch64Inst::Mrs {
+                sysreg: "tpidr_el0",
+                dst,
+            });
+            self.push_lir(Aarch64Inst::AddTprelHi12 {
+                sym: sym.clone(),
+                base: dst,
+                dst,
+            });
+            self.push_lir(Aarch64Inst::AddTprelLo12Nc {
+                sym,
+                base: dst,
+                dst,
+            });
+        }
+    }
+
     /// Load value of a global symbol into a register with specified size
     pub(super) fn emit_load_global(&mut self, name: &str, dst: Reg, size: OperandSize) {
+        // Thread-local storage: compute TLS address, then load value
+        if self.tls_symbols.contains(name) {
+            self.emit_tls_addr(name, dst);
+            // dst now holds the address of the TLS variable; load from it
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                addr: MemAddr::Base(dst),
+                dst,
+            });
+            return;
+        }
+
         // Local labels (starting with '.') don't get the _ prefix on macOS
         let sym = if name.starts_with('.') {
             Symbol::local(name)
@@ -3602,6 +3685,15 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
 
+        // Collect thread-local storage symbols (both defined and extern)
+        self.tls_symbols = module
+            .globals
+            .iter()
+            .filter(|g| g.is_thread_local)
+            .map(|g| g.name.clone())
+            .chain(module.extern_tls_symbols.iter().cloned())
+            .collect();
+
         // Emit file header
         self.emit_header();
 
@@ -3700,9 +3792,8 @@ impl CodeGenerator for Aarch64CodeGen {
         self.pic_mode = pic;
     }
 
-    fn set_shared_mode(&mut self, _shared: bool) {
-        // AArch64 TLS model selection not yet implemented
-        // For now, this is a no-op
+    fn set_shared_mode(&mut self, shared: bool) {
+        self.shared_mode = shared;
     }
 }
 

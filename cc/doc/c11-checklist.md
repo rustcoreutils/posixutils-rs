@@ -36,13 +36,13 @@
 
 ## 1. New Keywords (+7)
 
-- [ ] `_Alignas` — alignment specifier
-- [ ] `_Alignof` — alignment query operator
-- [ ] `_Atomic` — atomic type qualifier/specifier
+- [x] `_Alignas` — alignment specifier
+- [x] `_Alignof` — alignment query operator
+- [x] `_Atomic` — atomic type qualifier/specifier
 - [ ] `_Generic` — type-generic selection expression
-- [ ] `_Noreturn` — function specifier (never returns)
-- [ ] `_Static_assert` — compile-time assertion
-- [ ] `_Thread_local` — thread storage class specifier
+- [x] `_Noreturn` — function specifier (never returns)
+- [x] `_Static_assert` — compile-time assertion
+- [x] `_Thread_local` — thread storage class specifier
 
 ---
 
@@ -53,14 +53,14 @@
 - [ ] `char32_t` — 32-bit character type for UTF-32 (from `<uchar.h>`)
 
 ### 2.2 Atomic Types
-- [ ] `_Atomic(T)` — atomic version of type T
-- [ ] `_Atomic` as type qualifier on declarations
-- [ ] `atomic_bool` typedef
-- [ ] `atomic_char`, `atomic_schar`, `atomic_uchar`
-- [ ] `atomic_short`, `atomic_ushort`
-- [ ] `atomic_int`, `atomic_uint`
-- [ ] `atomic_long`, `atomic_ulong`
-- [ ] `atomic_llong`, `atomic_ullong`
+- [x] `_Atomic(T)` — atomic version of type T
+- [x] `_Atomic` as type qualifier on declarations
+- [x] `atomic_bool` typedef
+- [x] `atomic_char`, `atomic_schar`, `atomic_uchar`
+- [x] `atomic_short`, `atomic_ushort`
+- [x] `atomic_int`, `atomic_uint`
+- [x] `atomic_long`, `atomic_ulong`
+- [x] `atomic_llong`, `atomic_ullong`
 - [ ] `atomic_intptr_t`, `atomic_uintptr_t`
 - [ ] `atomic_size_t`, `atomic_ptrdiff_t`
 - [ ] `atomic_intmax_t`, `atomic_uintmax_t`
@@ -73,42 +73,42 @@
 ## 3. New Type Qualifiers & Specifiers
 
 ### 3.1 `_Atomic` Type Qualifier
-- [ ] `_Atomic` as qualifier on variable declarations
+- [x] `_Atomic` as qualifier on variable declarations
 - [ ] `_Atomic` cannot qualify array types
 - [ ] `_Atomic` cannot qualify function types
 - [ ] `_Atomic` cannot qualify struct/union with VLA member
 
 ### 3.2 `_Thread_local` Storage Class
-- [ ] `_Thread_local` storage class specifier
-- [ ] `_Thread_local` with `static`
-- [ ] `_Thread_local` with `extern`
-- [ ] Only one storage class except `_Thread_local` + `static`/`extern`
+- [x] `_Thread_local` storage class specifier
+- [x] `_Thread_local` with `static`
+- [x] `_Thread_local` with `extern`
+- [x] Only one storage class except `_Thread_local` + `static`/`extern`
 
 ### 3.3 `_Noreturn` Function Specifier
-- [ ] `_Noreturn` on function declarations
-- [ ] `_Noreturn` on function definitions
-- [ ] Undefined behavior if `_Noreturn` function returns
+- [x] `_Noreturn` on function declarations
+- [x] `_Noreturn` on function definitions
+- [x] Undefined behavior if `_Noreturn` function returns
 
 ### 3.4 `_Alignas` Alignment Specifier
-- [ ] `_Alignas(type-name)` — align to type's requirement
-- [ ] `_Alignas(constant-expression)` — align to explicit value
-- [ ] `_Alignas` on variable declarations
-- [ ] `_Alignas` on struct/union members
-- [ ] Multiple `_Alignas` specifiers (strictest wins)
-- [ ] Cannot weaken natural alignment
-- [ ] Cannot apply to function parameters
-- [ ] Cannot apply to typedef
-- [ ] Cannot apply to bit-field
+- [x] `_Alignas(type-name)` — align to type's requirement
+- [x] `_Alignas(constant-expression)` — align to explicit value
+- [x] `_Alignas` on variable declarations
+- [x] `_Alignas` on struct/union members
+- [x] Multiple `_Alignas` specifiers (strictest wins)
+- [x] Cannot weaken natural alignment
+- [x] Cannot apply to function parameters
+- [x] Cannot apply to typedef
+- [x] Cannot apply to bit-field
 
 ---
 
 ## 4. New Operators & Expressions
 
 ### 4.1 `_Alignof` Operator
-- [ ] `_Alignof(type-name)` — yields `size_t`
-- [ ] `_Alignof` on basic types
-- [ ] `_Alignof` on struct/union types
-- [ ] `_Alignof` on array types (returns element alignment)
+- [x] `_Alignof(type-name)` — yields `size_t`
+- [x] `_Alignof` on basic types
+- [x] `_Alignof` on struct/union types
+- [x] `_Alignof` on array types (returns element alignment)
 
 ### 4.2 `_Generic` Selection Expression
 - [ ] `_Generic(controlling-expr, type: expr, ..., default: expr)` syntax
@@ -125,28 +125,28 @@
 ## 5. New/Changed Declarations
 
 ### 5.1 Static Assert Declaration
-- [ ] `_Static_assert(constant-expression, string-literal)` syntax
-- [ ] At file scope
-- [ ] At block scope
-- [ ] Inside struct/union declaration
-- [ ] Can use `sizeof`, `_Alignof` in constant expression
-- [ ] Compile-time diagnostic message on failure
+- [x] `_Static_assert(constant-expression, string-literal)` syntax
+- [x] At file scope
+- [x] At block scope
+- [x] Inside struct/union declaration
+- [x] Can use `sizeof`, `_Alignof` in constant expression
+- [x] Compile-time diagnostic message on failure
 
 ### 5.2 Anonymous Struct/Union Members
-- [ ] Unnamed struct member within struct
-- [ ] Unnamed union member within struct
+- [x] Unnamed struct member within struct
+- [x] Unnamed union member within struct
 - [ ] Unnamed struct member within union
 - [ ] Unnamed union member within union
-- [ ] Direct field access through containing type
-- [ ] Nested anonymous structs/unions
-- [ ] Initialization of anonymous members
-- [ ] `sizeof` on struct with anonymous members
+- [x] Direct field access through containing type
+- [x] Nested anonymous structs/unions
+- [x] Initialization of anonymous members
+- [x] `sizeof` on struct with anonymous members
 
 ### 5.3 `_Noreturn` Function Definitions
-- [ ] `_Noreturn` on function definitions
+- [x] `_Noreturn` on function definitions
 
 ### 5.4 Grammar Additions
-- [ ] static_assert-declaration as declaration
+- [x] static_assert-declaration as declaration
 - [ ] generic-selection as primary-expression
 
 ---
@@ -182,135 +182,135 @@
 
 ## 8. Static Assertions (`_Static_assert`)
 
-- [ ] `_Static_assert(constant-expression, string-literal)` syntax
-- [ ] File scope static assertion
-- [ ] Block scope static assertion
-- [ ] Inside struct/union declaration
-- [ ] Can use `sizeof`, `_Alignof` in expression
-- [ ] Compile-time diagnostic message on failure
-- [ ] `static_assert` macro from `<assert.h>` expands to `_Static_assert`
+- [x] `_Static_assert(constant-expression, string-literal)` syntax
+- [x] File scope static assertion
+- [x] Block scope static assertion
+- [x] Inside struct/union declaration
+- [x] Can use `sizeof`, `_Alignof` in expression
+- [x] Compile-time diagnostic message on failure
+- [x] `static_assert` macro from `<assert.h>` expands to `_Static_assert`
 
 ---
 
 ## 9. Anonymous Structs and Unions
 
-- [ ] Unnamed struct member in enclosing struct
-- [ ] Unnamed union member in enclosing struct
+- [x] Unnamed struct member in enclosing struct
+- [x] Unnamed union member in enclosing struct
 - [ ] Unnamed struct member in enclosing union
 - [ ] Unnamed union member in enclosing union
-- [ ] Direct field access through containing type
-- [ ] Nested anonymous structs/unions
-- [ ] Initialization of anonymous members
-- [ ] `sizeof` struct/union with anonymous members
+- [x] Direct field access through containing type
+- [x] Nested anonymous structs/unions
+- [x] Initialization of anonymous members
+- [x] `sizeof` struct/union with anonymous members
 
 ---
 
 ## 10. Alignment (`_Alignas` / `_Alignof`)
 
 ### 10.1 `_Alignas` Specifier
-- [ ] `_Alignas(type-name)` specifier
-- [ ] `_Alignas(constant-expression)` specifier
-- [ ] On variable declarations
-- [ ] On struct/union members
-- [ ] Multiple `_Alignas` — strictest (largest) wins
-- [ ] Cannot weaken natural alignment
-- [ ] Cannot apply to function parameters
-- [ ] Cannot apply to typedef
-- [ ] Cannot apply to bit-field
+- [x] `_Alignas(type-name)` specifier
+- [x] `_Alignas(constant-expression)` specifier
+- [x] On variable declarations
+- [x] On struct/union members
+- [x] Multiple `_Alignas` — strictest (largest) wins
+- [x] Cannot weaken natural alignment
+- [x] Cannot apply to function parameters
+- [x] Cannot apply to typedef
+- [x] Cannot apply to bit-field
 
 ### 10.2 `_Alignof` Operator
-- [ ] `_Alignof(type-name)` yields `size_t`
-- [ ] On basic types
-- [ ] On struct/union types
-- [ ] On array types (element alignment)
+- [x] `_Alignof(type-name)` yields `size_t`
+- [x] On basic types
+- [x] On struct/union types
+- [x] On array types (element alignment)
 
 ### 10.3 Convenience Macros (`<stdalign.h>`)
-- [ ] `alignas` macro expands to `_Alignas`
-- [ ] `alignof` macro expands to `_Alignof`
-- [ ] `__alignas_is_defined` expands to `1`
-- [ ] `__alignof_is_defined` expands to `1`
+- [x] `alignas` macro expands to `_Alignas`
+- [x] `alignof` macro expands to `_Alignof`
+- [x] `__alignas_is_defined` expands to `1`
+- [x] `__alignof_is_defined` expands to `1`
 
 ---
 
 ## 11. `_Noreturn` Function Specifier
 
-- [ ] `_Noreturn` on function declarations
-- [ ] `_Noreturn` on function definitions
-- [ ] Applies to: `exit()`, `abort()`, `_Exit()`, `quick_exit()`, `thrd_exit()`
-- [ ] Undefined behavior if `_Noreturn` function returns
-- [ ] `noreturn` macro from `<stdnoreturn.h>` expands to `_Noreturn`
+- [x] `_Noreturn` on function declarations
+- [x] `_Noreturn` on function definitions
+- [x] Applies to: `exit()`, `abort()`, `_Exit()`, `quick_exit()`, `thrd_exit()`
+- [x] Undefined behavior if `_Noreturn` function returns
+- [x] `noreturn` macro from `<stdnoreturn.h>` expands to `_Noreturn`
 
 ---
 
 ## 12. Atomic Types and Operations
 
 ### 12.1 `_Atomic` Type Qualifier/Specifier
-- [ ] `_Atomic` type qualifier
-- [ ] `_Atomic(type-name)` type specifier
-- [ ] `_Atomic` on integer types
-- [ ] `_Atomic` on pointer types
+- [x] `_Atomic` type qualifier
+- [x] `_Atomic(type-name)` type specifier
+- [x] `_Atomic` on integer types
+- [x] `_Atomic` on pointer types
 - [ ] Cannot qualify array, function, struct-with-VLA
 - [ ] Atomic compound assignment operators (`+=`, `-=`, etc.)
 - [ ] Atomic pre/post increment/decrement
-- [ ] Implicit sequentially-consistent ordering for operators
-- [ ] `atomic_init(obj, value)` — non-atomic initialization
-- [ ] `ATOMIC_VAR_INIT(value)` — static initialization macro
+- [x] Implicit sequentially-consistent ordering for operators
+- [x] `atomic_init(obj, value)` — non-atomic initialization
+- [x] `ATOMIC_VAR_INIT(value)` — static initialization macro
 
 ### 12.2 Atomic Operations (`<stdatomic.h>`)
-- [ ] `atomic_store(obj, desired)` / `atomic_store_explicit(obj, desired, order)`
-- [ ] `atomic_load(obj)` / `atomic_load_explicit(obj, order)`
-- [ ] `atomic_exchange(obj, desired)` / `atomic_exchange_explicit(obj, desired, order)`
-- [ ] `atomic_compare_exchange_strong(obj, expected, desired)`
-- [ ] `atomic_compare_exchange_strong_explicit(obj, expected, desired, succ, fail)`
-- [ ] `atomic_compare_exchange_weak(obj, expected, desired)`
-- [ ] `atomic_compare_exchange_weak_explicit(obj, expected, desired, succ, fail)`
-- [ ] `atomic_fetch_add` / `atomic_fetch_add_explicit`
-- [ ] `atomic_fetch_sub` / `atomic_fetch_sub_explicit`
-- [ ] `atomic_fetch_or` / `atomic_fetch_or_explicit`
-- [ ] `atomic_fetch_xor` / `atomic_fetch_xor_explicit`
-- [ ] `atomic_fetch_and` / `atomic_fetch_and_explicit`
+- [x] `atomic_store(obj, desired)` / `atomic_store_explicit(obj, desired, order)`
+- [x] `atomic_load(obj)` / `atomic_load_explicit(obj, order)`
+- [x] `atomic_exchange(obj, desired)` / `atomic_exchange_explicit(obj, desired, order)`
+- [x] `atomic_compare_exchange_strong(obj, expected, desired)`
+- [x] `atomic_compare_exchange_strong_explicit(obj, expected, desired, succ, fail)`
+- [x] `atomic_compare_exchange_weak(obj, expected, desired)`
+- [x] `atomic_compare_exchange_weak_explicit(obj, expected, desired, succ, fail)`
+- [x] `atomic_fetch_add` / `atomic_fetch_add_explicit`
+- [x] `atomic_fetch_sub` / `atomic_fetch_sub_explicit`
+- [x] `atomic_fetch_or` / `atomic_fetch_or_explicit`
+- [x] `atomic_fetch_xor` / `atomic_fetch_xor_explicit`
+- [x] `atomic_fetch_and` / `atomic_fetch_and_explicit`
 
 ### 12.3 Memory Ordering
-- [ ] `memory_order_relaxed` — no synchronization
-- [ ] `memory_order_consume` — data-dependency ordering
-- [ ] `memory_order_acquire` — acquire fence
-- [ ] `memory_order_release` — release fence
-- [ ] `memory_order_acq_rel` — acquire + release
-- [ ] `memory_order_seq_cst` — sequentially consistent (default)
-- [ ] `atomic_thread_fence(order)` — thread fence
-- [ ] `atomic_signal_fence(order)` — signal fence
-- [ ] `kill_dependency(y)` — break dependency chain
+- [x] `memory_order_relaxed` — no synchronization
+- [x] `memory_order_consume` — data-dependency ordering
+- [x] `memory_order_acquire` — acquire fence
+- [x] `memory_order_release` — release fence
+- [x] `memory_order_acq_rel` — acquire + release
+- [x] `memory_order_seq_cst` — sequentially consistent (default)
+- [x] `atomic_thread_fence(order)` — thread fence
+- [x] `atomic_signal_fence(order)` — signal fence
+- [x] `kill_dependency(y)` — break dependency chain
 
 ### 12.4 Atomic Flag
-- [ ] `atomic_flag` type (guaranteed lock-free)
-- [ ] `ATOMIC_FLAG_INIT` initializer
-- [ ] `atomic_flag_test_and_set` / `atomic_flag_test_and_set_explicit`
-- [ ] `atomic_flag_clear` / `atomic_flag_clear_explicit`
+- [x] `atomic_flag` type (guaranteed lock-free)
+- [x] `ATOMIC_FLAG_INIT` initializer
+- [x] `atomic_flag_test_and_set` / `atomic_flag_test_and_set_explicit`
+- [x] `atomic_flag_clear` / `atomic_flag_clear_explicit`
 
 ### 12.5 Lock-Free Property Macros
-- [ ] `ATOMIC_BOOL_LOCK_FREE` (0, 1, or 2)
-- [ ] `ATOMIC_CHAR_LOCK_FREE`
-- [ ] `ATOMIC_CHAR16_T_LOCK_FREE`
-- [ ] `ATOMIC_CHAR32_T_LOCK_FREE`
-- [ ] `ATOMIC_WCHAR_T_LOCK_FREE`
-- [ ] `ATOMIC_SHORT_LOCK_FREE`
-- [ ] `ATOMIC_INT_LOCK_FREE`
-- [ ] `ATOMIC_LONG_LOCK_FREE`
-- [ ] `ATOMIC_LLONG_LOCK_FREE`
-- [ ] `ATOMIC_POINTER_LOCK_FREE`
+- [x] `ATOMIC_BOOL_LOCK_FREE` (0, 1, or 2)
+- [x] `ATOMIC_CHAR_LOCK_FREE`
+- [x] `ATOMIC_CHAR16_T_LOCK_FREE`
+- [x] `ATOMIC_CHAR32_T_LOCK_FREE`
+- [x] `ATOMIC_WCHAR_T_LOCK_FREE`
+- [x] `ATOMIC_SHORT_LOCK_FREE`
+- [x] `ATOMIC_INT_LOCK_FREE`
+- [x] `ATOMIC_LONG_LOCK_FREE`
+- [x] `ATOMIC_LLONG_LOCK_FREE`
+- [x] `ATOMIC_POINTER_LOCK_FREE`
 - [ ] `atomic_is_lock_free(obj)` — runtime query
 
 ---
 
 ## 13. Thread-Local Storage (`_Thread_local`)
 
-- [ ] `_Thread_local` storage class specifier
-- [ ] `_Thread_local` with `static`
-- [ ] `_Thread_local` with `extern`
-- [ ] Each thread gets own instance
-- [ ] Initialized once per thread creation
-- [ ] File scope `_Thread_local` variables
-- [ ] Block scope `_Thread_local static` variables
+- [x] `_Thread_local` storage class specifier
+- [x] `_Thread_local` with `static`
+- [x] `_Thread_local` with `extern`
+- [x] Each thread gets own instance
+- [x] Initialized once per thread creation
+- [x] File scope `_Thread_local` variables
+- [x] Block scope `_Thread_local static` variables
 - [ ] `thread_local` macro from `<threads.h>`
 
 ---
@@ -419,54 +419,54 @@
 
 ## 18. New Standard Headers
 
-- [ ] `<stdalign.h>` — `alignas`, `alignof`, `__alignas_is_defined`, `__alignof_is_defined`
-- [ ] `<stdatomic.h>` — atomic types and operations *(optional)*
-- [ ] `<stdnoreturn.h>` — `noreturn` macro expands to `_Noreturn`
+- [x] `<stdalign.h>` — `alignas`, `alignof`, `__alignas_is_defined`, `__alignof_is_defined`
+- [x] `<stdatomic.h>` — atomic types and operations *(optional)*
+- [x] `<stdnoreturn.h>` — `noreturn` macro expands to `_Noreturn`
 - [ ] `<threads.h>` — threading support *(optional)*
 - [ ] `<uchar.h>` — `char16_t`, `char32_t`, conversion functions
 
 ### 18.1 `<stdalign.h>` Contents
-- [ ] `alignas` macro expands to `_Alignas`
-- [ ] `alignof` macro expands to `_Alignof`
-- [ ] `__alignas_is_defined` expands to `1`
-- [ ] `__alignof_is_defined` expands to `1`
+- [x] `alignas` macro expands to `_Alignas`
+- [x] `alignof` macro expands to `_Alignof`
+- [x] `__alignas_is_defined` expands to `1`
+- [x] `__alignof_is_defined` expands to `1`
 
 ### 18.2 `<stdnoreturn.h>` Contents
-- [ ] `noreturn` macro expands to `_Noreturn`
+- [x] `noreturn` macro expands to `_Noreturn`
 
 ### 18.3 `<assert.h>` C11 Addition
-- [ ] `static_assert` macro expands to `_Static_assert`
+- [x] `static_assert` macro expands to `_Static_assert`
 
 ---
 
 ## 19. New/Changed Predefined Macros
 
 ### 19.1 Changed
-- [ ] `__STDC_VERSION__` — `201112L` (was `199901L` in C99)
+- [x] `__STDC_VERSION__` — `201112L` (was `199901L` in C99)
 
 ### 19.2 New Conditionally-Defined Macros
-- [ ] `__STDC_UTF_16__` — char16_t is UTF-16
-- [ ] `__STDC_UTF_32__` — char32_t is UTF-32
-- [ ] `__STDC_ANALYZABLE__` — Annex L supported
-- [ ] `__STDC_LIB_EXT1__` — Annex K supported
-- [ ] `__STDC_NO_ATOMICS__` — atomics not supported
-- [ ] `__STDC_NO_COMPLEX__` — complex not supported
-- [ ] `__STDC_NO_THREADS__` — threads not supported
-- [ ] `__STDC_NO_VLA__` — VLAs not supported
+- [ ] `__STDC_UTF_16__` — char16_t is UTF-16 *(not defined — no Unicode support yet)*
+- [ ] `__STDC_UTF_32__` — char32_t is UTF-32 *(not defined — no Unicode support yet)*
+- N/A `__STDC_ANALYZABLE__` — Annex L supported *(will not implement)*
+- N/A `__STDC_LIB_EXT1__` — Annex K supported *(will not implement)*
+- [x] `__STDC_NO_ATOMICS__` — atomics not supported *(correctly NOT defined — atomics supported)*
+- [x] `__STDC_NO_COMPLEX__` — complex not supported *(correctly NOT defined — complex supported)*
+- [x] `__STDC_NO_THREADS__` — threads not supported *(correctly NOT defined — hosted impl, system libc provides threads)*
+- [x] `__STDC_NO_VLA__` — VLAs not supported *(correctly NOT defined — VLAs supported)*
 
 ---
 
 ## 20. New Floating-Point Limit Macros (`<float.h>`)
 
-- [ ] `FLT_DECIMAL_DIG` — float round-trip decimal digits
-- [ ] `DBL_DECIMAL_DIG` — double round-trip decimal digits
-- [ ] `LDBL_DECIMAL_DIG` — long double round-trip decimal digits
-- [ ] `FLT_HAS_SUBNORM` — float subnormal support (−1, 0, or 1)
-- [ ] `DBL_HAS_SUBNORM` — double subnormal support
-- [ ] `LDBL_HAS_SUBNORM` — long double subnormal support
-- [ ] `FLT_TRUE_MIN` — smallest positive float subnormal
-- [ ] `DBL_TRUE_MIN` — smallest positive double subnormal
-- [ ] `LDBL_TRUE_MIN` — smallest positive long double subnormal
+- [x] `FLT_DECIMAL_DIG` — float round-trip decimal digits
+- [x] `DBL_DECIMAL_DIG` — double round-trip decimal digits
+- [x] `LDBL_DECIMAL_DIG` — long double round-trip decimal digits
+- [x] `FLT_HAS_SUBNORM` — float subnormal support (−1, 0, or 1)
+- [x] `DBL_HAS_SUBNORM` — double subnormal support
+- [x] `LDBL_HAS_SUBNORM` — long double subnormal support
+- [x] `FLT_TRUE_MIN` — smallest positive float subnormal
+- [x] `DBL_TRUE_MIN` — smallest positive double subnormal
+- [x] `LDBL_TRUE_MIN` — smallest positive long double subnormal
 
 ---
 
@@ -513,29 +513,29 @@
 
 | Section | Items | Done | % |
 |---------|-------|------|---|
-| 1. New Keywords | 7 | 0 | 0% |
-| 2. New Types | 16 | 0 | 0% |
-| 3. New Qualifiers/Specifiers | 16 | 0 | 0% |
-| 4. New Operators/Expressions | 12 | 0 | 0% |
-| 5. New Declarations | 15 | 0 | 0% |
+| 1. New Keywords | 7 | 6 | 86% |
+| 2. New Types | 16 | 10 | 63% |
+| 3. New Qualifiers/Specifiers | 16 | 16 | 100% |
+| 4. New Operators/Expressions | 12 | 4 | 33% |
+| 5. New Declarations | 15 | 12 | 80% |
 | 6. New Lexical Elements | 6 | 0 | 0% |
 | 7. `_Generic` | 10 | 0 | 0% |
-| 8. `_Static_assert` | 7 | 0 | 0% |
-| 9. Anonymous Structs/Unions | 8 | 0 | 0% |
-| 10. Alignment | 17 | 0 | 0% |
-| 11. `_Noreturn` | 5 | 0 | 0% |
-| 12. Atomics | 46 | 0 | 0% |
-| 13. `_Thread_local` | 8 | 0 | 0% |
+| 8. `_Static_assert` | 7 | 7 | 100% |
+| 9. Anonymous Structs/Unions | 8 | 6 | 75% |
+| 10. Alignment | 17 | 17 | 100% |
+| 11. `_Noreturn` | 5 | 5 | 100% |
+| 12. Atomics | 46 | 40 | 87% |
+| 13. `_Thread_local` | 8 | 7 | 88% |
 | 14. Threading | 33 | 0 | 0% |
 | 15. Unicode | 12 | 0 | 0% |
 | 16. Memory Model | 5 | 0 | 0% |
 | 17. New Library Functions | 9 | 0 | 0% |
-| 18. New Headers | 10 | 0 | 0% |
-| 19. New/Changed Macros | 9 | 0 | 0% |
-| 20. Float Limit Macros | 9 | 0 | 0% |
+| 18. New Headers | 10 | 9 | 90% |
+| 19. New/Changed Macros | 9 | 5 | 56% |
+| 20. Float Limit Macros | 9 | 9 | 100% |
 | 21. Removed Features | 1 | 0 | 0% |
 | 22. Changed Semantics | 8 | 0 | 0% |
-| **TOTAL** | **259** | **0** | **0%** |
+| **TOTAL** | **259** | **154** | **59%** |
 
 ---
 

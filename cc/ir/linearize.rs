@@ -2407,6 +2407,14 @@ impl<'a> Linearizer<'a> {
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
+            // After a noreturn call, emit Unreachable and start a dead basic block
+            if is_noreturn_call {
+                let unreachable =
+                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id);
+                self.emit(unreachable);
+                let dead_bb = self.alloc_bb();
+                self.switch_bb(dead_bb);
+            }
             // Return the symbol (address) where struct is stored
             result_sym
         } else {
@@ -2436,6 +2444,14 @@ impl<'a> Linearizer<'a> {
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
+            // After a noreturn call, emit Unreachable and start a dead basic block
+            if is_noreturn_call {
+                let unreachable =
+                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id);
+                self.emit(unreachable);
+                let dead_bb = self.alloc_bb();
+                self.switch_bb(dead_bb);
+            }
             result_sym
         }
     }

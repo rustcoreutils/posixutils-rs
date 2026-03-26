@@ -23,6 +23,9 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__NetBSD__", None),  // Not defined
         // Apple extensions
         ("__APPLE_CC__", Some("1")),
+        // Disable _FORTIFY_SOURCE — macOS headers redirect memset/memcpy/strcpy
+        // to __memset_chk etc. which requires full fortification builtin support
+        ("_FORTIFY_SOURCE", Some("0")),
         // Darwin/BSD feature test macros - enables SIGWINCH, SA_RESTART, etc.
         ("_DARWIN_C_SOURCE", Some("1")),
         // POSIX threads

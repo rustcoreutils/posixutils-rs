@@ -1343,7 +1343,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::C11AtomicFetchOr { .. }
             | ExprKind::C11AtomicFetchXor { .. }
             | ExprKind::C11AtomicThreadFence { .. }
-            | ExprKind::C11AtomicSignalFence { .. } => false,
+            | ExprKind::C11AtomicSignalFence { .. }
+            | ExprKind::BuiltinComplex { .. } => false,
         }
     }
 
@@ -2406,6 +2407,14 @@ impl<'a> Linearizer<'a> {
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
+            // After a noreturn call, emit Unreachable and start a dead basic block
+            if is_noreturn_call {
+                let unreachable =
+                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id);
+                self.emit(unreachable);
+                let dead_bb = self.alloc_bb();
+                self.switch_bb(dead_bb);
+            }
             // Return the symbol (address) where struct is stored
             result_sym
         } else {
@@ -2435,6 +2444,14 @@ impl<'a> Linearizer<'a> {
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
+            // After a noreturn call, emit Unreachable and start a dead basic block
+            if is_noreturn_call {
+                let unreachable =
+                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id);
+                self.emit(unreachable);
+                let dead_bb = self.alloc_bb();
+                self.switch_bb(dead_bb);
+            }
             result_sym
         }
     }
@@ -2737,8 +2754,17 @@ impl<'a> Linearizer<'a> {
         } else if self.types.is_complex(result_typ) {
             // Complex arithmetic: expand to real/imaginary operations
             // For complex types, we need addresses to load real/imag parts
-            let left_addr = self.linearize_lvalue(left);
-            let right_addr = self.linearize_lvalue(right);
+            // If an operand is not complex (e.g., real scalar), promote it
+            let left_addr = if self.types.is_complex(left_typ) {
+                self.linearize_lvalue(left)
+            } else {
+                self.promote_real_to_complex(left, result_typ)
+            };
+            let right_addr = if self.types.is_complex(right_typ) {
+                self.linearize_lvalue(right)
+            } else {
+                self.promote_real_to_complex(right, result_typ)
+            };
             self.emit_complex_binary(op, left_addr, right_addr, result_typ)
         } else {
             // For comparisons, compute common type for both operands
@@ -3643,6 +3669,28 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::BuiltinComplex { real, imag } => {
+                // __builtin_complex(real, imag) - construct complex value
+                let complex_typ = self.expr_type(expr);
+                let base_typ = self.types.complex_base(complex_typ);
+                let base_bits = self.types.size_bits(base_typ);
+                let base_bytes = (base_bits / 8) as i64;
+
+                let real_val = self.linearize_expr(real);
+                let imag_val = self.linearize_expr(imag);
+
+                // Allocate local to hold the complex value
+                let result = self.alloc_local_temp(complex_typ);
+
+                // Store real and imag parts
+                self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
+                self.emit(Instruction::store(
+                    imag_val, result, base_bytes, base_typ, base_bits,
+                ));
+
+                result
+            }
+
             ExprKind::Unreachable => {
                 // __builtin_unreachable() - marks code path as never reached
                 // Emits an instruction that will trap if actually executed
@@ -4218,6 +4266,25 @@ impl<'a> Linearizer<'a> {
                 }
                 // The result is the value of the final expression
                 self.linearize_expr(result)
+            }
+
+            ExprKind::BuiltinComplex { real, imag } => {
+                // __builtin_complex(real, imag) - construct complex value
+                let complex_typ = self.expr_type(expr);
+                let base_typ = self.types.complex_base(complex_typ);
+                let base_bits = self.types.size_bits(base_typ);
+                let base_bytes = (base_bits / 8) as i64;
+
+                let real_val = self.linearize_expr(real);
+                let imag_val = self.linearize_expr(imag);
+
+                // Allocate local to hold the complex value, return its address
+                let result = self.alloc_local_temp(complex_typ);
+                self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
+                self.emit(Instruction::store(
+                    imag_val, result, base_bytes, base_typ, base_bits,
+                ));
+                result
             }
         }
     }

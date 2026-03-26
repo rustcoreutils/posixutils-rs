@@ -224,3 +224,128 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_core_mega", code, &[]), 0);
 }
+
+// ============================================================================
+// Test: <stdnoreturn.h> and _Noreturn
+// ============================================================================
+
+#[test]
+fn c11_noreturn_mega() {
+    let code = r#"
+#include <stdnoreturn.h>
+#include <stdlib.h>
+
+// _Noreturn function declaration
+_Noreturn void die_with_code(int code);
+
+// _Noreturn function definition
+_Noreturn void die_with_code(int code) {
+    exit(code);
+}
+
+// noreturn macro from <stdnoreturn.h>
+noreturn void die_noreturn_macro(int code) {
+    exit(code);
+}
+
+// _Noreturn on void function used in conditional
+_Noreturn void unreachable(void) {
+    exit(99);
+}
+
+int check_value(int x) {
+    if (x > 0)
+        return x;
+    unreachable();
+}
+
+int main(void) {
+    // ========== _NORETURN SECTION (returns 1-9) ==========
+
+    // Verify _Noreturn functions work when called normally
+    // (We test by NOT calling them and verifying other paths work)
+
+    // check_value with positive input should return it
+    if (check_value(42) != 42) return 1;
+    if (check_value(1) != 1) return 2;
+
+    // Test that noreturn macro expands correctly
+    // (If <stdnoreturn.h> didn't work, this wouldn't compile)
+    // die_noreturn_macro would exit, so just verify the function pointer is valid
+    void (*fp)(int) = die_noreturn_macro;
+    if (fp == 0) return 3;
+
+    // _Noreturn function pointer
+    void (*fp2)(int) = die_with_code;
+    if (fp2 == 0) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_noreturn_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Test: Predefined C11 macros
+// ============================================================================
+
+#[test]
+fn c11_predefined_macros_mega() {
+    let code = r#"
+#include <stdatomic.h>
+
+int main(void) {
+    // ========== __STDC_VERSION__ (returns 1-9) ==========
+
+    // Must be C11
+    #if __STDC_VERSION__ != 201112L
+    return 1;
+    #endif
+
+    // ========== __STDC_NO_THREADS__ (returns 10-19) ==========
+
+    // Hosted implementation: threads available via system headers
+    // __STDC_NO_THREADS__ must NOT be defined
+    #ifdef __STDC_NO_THREADS__
+    return 10;
+    #endif
+
+    // ========== Atomics ARE supported (returns 20-29) ==========
+
+    // __STDC_NO_ATOMICS__ must NOT be defined
+    #ifdef __STDC_NO_ATOMICS__
+    return 20;
+    #endif
+
+    // ========== Complex IS supported (returns 30-39) ==========
+
+    #ifdef __STDC_NO_COMPLEX__
+    return 30;
+    #endif
+
+    // ========== VLAs ARE supported (returns 40-49) ==========
+
+    #ifdef __STDC_NO_VLA__
+    return 40;
+    #endif
+
+    // ========== Lock-free macros (returns 50-59) ==========
+
+    // All lock-free macros must be defined and >= 0
+    if (ATOMIC_BOOL_LOCK_FREE < 0) return 50;
+    if (ATOMIC_CHAR_LOCK_FREE < 0) return 51;
+    if (ATOMIC_SHORT_LOCK_FREE < 0) return 52;
+    if (ATOMIC_INT_LOCK_FREE < 0) return 53;
+    if (ATOMIC_LONG_LOCK_FREE < 0) return 54;
+    if (ATOMIC_LLONG_LOCK_FREE < 0) return 55;
+    if (ATOMIC_POINTER_LOCK_FREE < 0) return 56;
+
+    // On most platforms, int and pointer are always lock-free
+    if (ATOMIC_INT_LOCK_FREE < 1) return 57;
+    if (ATOMIC_POINTER_LOCK_FREE < 1) return 58;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_predefined_macros_mega", code, &[]), 0);
+}

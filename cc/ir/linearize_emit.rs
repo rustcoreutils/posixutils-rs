@@ -656,6 +656,28 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Emit complex arithmetic operation
+    /// Promote a real scalar expression to a complex value (real=value, imag=0.0)
+    /// Returns the address of the complex temp
+    pub(crate) fn promote_real_to_complex(&mut self, expr: &Expr, complex_typ: TypeId) -> PseudoId {
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        let val = self.linearize_expr(expr);
+        let expr_typ = self.expr_type(expr);
+        let converted = self.emit_convert(val, expr_typ, base_typ);
+
+        let result = self.alloc_local_temp(complex_typ);
+        self.emit(Instruction::store(
+            converted, result, 0, base_typ, base_bits,
+        ));
+        let zero = self.emit_fconst(0.0, base_typ);
+        self.emit(Instruction::store(
+            zero, result, base_bytes, base_typ, base_bits,
+        ));
+        result
+    }
+
     /// Complex values are stored as two adjacent float/double values (real, imag)
     /// This function expands complex ops to operations on the component parts
     pub(crate) fn emit_complex_binary(

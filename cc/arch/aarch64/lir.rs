@@ -182,6 +182,22 @@ pub enum Aarch64Inst {
     /// Emits: ldr dst, [base, sym@GOTPAGEOFF]
     LdrSymGotPageOff { sym: Symbol, base: Reg, dst: Reg },
 
+    /// MRS - Move system register to general-purpose register
+    /// Used for TLS: mrs dst, tpidr_el0
+    Mrs { sysreg: &'static str, dst: Reg },
+
+    /// TLS Local Exec: add dst, base, :tprel_hi12:sym
+    AddTprelHi12 { sym: Symbol, base: Reg, dst: Reg },
+
+    /// TLS Local Exec: add dst, base, :tprel_lo12_nc:sym
+    AddTprelLo12Nc { sym: Symbol, base: Reg, dst: Reg },
+
+    /// TLS Initial Exec: adrp dst, :gottpoff:sym
+    AdrpGottpoff { sym: Symbol, dst: Reg },
+
+    /// TLS Initial Exec: ldr dst, [base, :gottpoff_lo12:sym]
+    LdrGottpoffLo12 { sym: Symbol, base: Reg, dst: Reg },
+
     // ========================================================================
     // Integer Arithmetic
     // ========================================================================
@@ -966,6 +982,49 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(
                     out,
                     "    ldr {}, [{}, {}@GOTPAGEOFF]",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+
+            // TLS Instructions
+            Aarch64Inst::Mrs { sysreg, dst } => {
+                let _ = writeln!(out, "    mrs {}, {}", dst.name64(), sysreg);
+            }
+
+            Aarch64Inst::AddTprelHi12 { sym, base, dst } => {
+                let sym_name = sym.format_for_target(target);
+                let _ = writeln!(
+                    out,
+                    "    add {}, {}, :tprel_hi12:{}",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+
+            Aarch64Inst::AddTprelLo12Nc { sym, base, dst } => {
+                let sym_name = sym.format_for_target(target);
+                let _ = writeln!(
+                    out,
+                    "    add {}, {}, :tprel_lo12_nc:{}",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+
+            Aarch64Inst::AdrpGottpoff { sym, dst } => {
+                let sym_name = sym.format_for_target(target);
+                let _ = writeln!(out, "    adrp {}, :gottpoff:{}", dst.name64(), sym_name);
+            }
+
+            Aarch64Inst::LdrGottpoffLo12 { sym, base, dst } => {
+                let sym_name = sym.format_for_target(target);
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, :gottpoff_lo12:{}]",
                     dst.name64(),
                     base.name64(),
                     sym_name

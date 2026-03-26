@@ -87,6 +87,10 @@ Not yet implemented (features we want to add):
 - assembly peephole optimizations
 - C11 `_Generic` type-generic selection
 
+Will not implement:
+- C99 `_Imaginary` type (removed in C11; no mainstream compiler implements it)
+- C89 trigraphs (deprecated in C99, removed in C11; GCC/Clang disable by default)
+
 ## Code Quality
 
 Please run `cargo fmt` before committing code, and `cargo clippy` regularly while working. Code should build without warnings.

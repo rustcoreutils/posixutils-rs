@@ -949,10 +949,14 @@ impl TypeTable {
     /// Get the complex type for a float base type (e.g., double → double _Complex)
     #[inline]
     pub fn make_complex(&self, id: TypeId) -> TypeId {
+        if self.is_complex(id) {
+            return id;
+        }
         match self.get(id).kind {
             TypeKind::Float => self.complex_float_id,
             TypeKind::Double => self.complex_double_id,
             TypeKind::LongDouble => self.complex_longdouble_id,
+            TypeKind::Float16 => self.complex_float16_id,
             _ => self.complex_double_id, // default to double _Complex
         }
     }

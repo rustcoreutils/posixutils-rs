@@ -1,0 +1,8 @@
+services:
+  posixutils:
+    build: .
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/workspace:ro
+    working_dir: /workspace

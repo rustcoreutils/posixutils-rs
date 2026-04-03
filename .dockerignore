@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+
+# Version control
+.git/
+.gitignore
+
+# Documentation (not needed for build)
+*.md
+
+# CI/CD
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+.DS_Store

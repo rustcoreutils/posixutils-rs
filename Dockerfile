@@ -4,7 +4,7 @@
 # Stage 1: Chef - Install cargo-chef for dependency caching
 # =============================================================================
 FROM rust:bookworm AS chef
-RUN cargo install cargo-chef
+RUN cargo install --locked cargo-chef@0.1.77
 WORKDIR /app
 
 # =============================================================================
@@ -56,7 +56,7 @@ RUN useradd --create-home --shell /bin/bash posixutils
 
 COPY --from=builder /app/staging/bin/ /usr/local/bin/
 
-# argv[0]-based symlinks (vi->ex, compress->uncompress/zcat)
+# argv[0]-based symlinks (ex->vi, uncompress/zcat->compress)
 RUN ln -sf vi /usr/local/bin/ex && \
     ln -sf compress /usr/local/bin/uncompress && \
     ln -sf compress /usr/local/bin/zcat

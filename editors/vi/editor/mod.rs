@@ -2814,11 +2814,7 @@ impl Editor {
             name,
             modified,
             lines,
-            if lines > 0 {
-                cursor.line * 100 / lines
-            } else {
-                0
-            }
+            (cursor.line * 100).checked_div(lines).unwrap_or(0)
         )
     }
 

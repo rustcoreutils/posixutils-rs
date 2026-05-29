@@ -1992,11 +1992,7 @@ mod transformation {
             debug_assert!((input_len - index) <= 4_usize);
 
             let leftover_bytes = if last_iteration {
-                loop {
-                    let Some(&byte_a) = input.get(index) else {
-                        break;
-                    };
-
+                while let Some(&byte_a) = input.get(index) {
                     let next_bytes = &input[(index + 1_usize)..];
 
                     debug_assert!(next_bytes.len() <= 4_usize);

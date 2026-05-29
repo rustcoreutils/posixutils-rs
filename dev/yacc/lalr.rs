@@ -400,11 +400,9 @@ fn add_action(
                 (Action::Reduce(_), Action::Shift(s)) => {
                     table.insert(symbol, Action::Shift(*s));
                 }
-                (Action::Reduce(r1), Action::Reduce(r2)) => {
+                (Action::Reduce(r1), Action::Reduce(r2)) if r2 < r1 => {
                     // Keep earlier rule
-                    if r2 < r1 {
-                        table.insert(symbol, Action::Reduce(*r2));
-                    }
+                    table.insert(symbol, Action::Reduce(*r2));
                 }
                 _ => {}
             }

@@ -5022,3 +5022,46 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("codegen_int128_const_shifts", code, &[]), 0);
 }
+
+// Regression: do not fold a conditional branch whose target block does
+// observable work before its noreturn-call terminator.
+//
+// Triggered originally by CPython's fork+spawn helper, which has the form
+// `if (param != GLOBAL) { side_effect(); } work(); _exit(...);` — pcc's
+// DCE used to treat the whole block as "trivially unreachable" because the
+// linearizer emits `Unreachable` after `_exit`, and then folded the cbr to
+// an unconditional branch into the `side_effect()` arm.
+#[test]
+fn codegen_cbr_to_noreturn_call_not_folded() {
+    let code = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static int marker_target;
+static void *MARK = &marker_target;
+
+__attribute__((noinline))
+static int run(void *cond_ptr) {
+    if (cond_ptr != MARK) {
+        fputs("BUG\n", stdout);
+        fflush(stdout);
+        exit(1);
+    }
+    fputs("OK\n", stdout);
+    fflush(stdout);
+    _exit(0);
+    return 0;
+}
+
+int main(void) {
+    run(MARK);
+    return 99;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("cbr_to_noreturn_call_not_folded", code),
+        0,
+        "DCE folded a conditional branch whose target ended in a noreturn call + Unreachable, dropping the call"
+    );
+}

@@ -165,14 +165,28 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
 // Unreachable Block Optimization
 // ============================================================================
 
-/// Identify blocks that end with Unreachable terminator.
+/// Identify blocks that are *trivially unreachable* — i.e., entering the
+/// block immediately leads to undefined behavior with no observable work.
+///
+/// A block qualifies only if its first non-trivial instruction is
+/// `Unreachable`. Trivial = `Nop`, `Entry`, `Phi` (no observable effect).
+///
+/// This is intentionally stricter than "block ends in Unreachable": the
+/// linearizer emits `Unreachable` *after* `noreturn` calls (e.g. `_exit`,
+/// `abort`), so a block like `... ; call _exit ; unreachable` is **reachable**
+/// — its call has side effects (process termination with a chosen status).
+/// Folding `cbr cond, A, B` to `br A` when `B` contains such a call would
+/// silently drop the call and is a miscompilation.
 fn find_unreachable_blocks(func: &Function) -> HashSet<BasicBlockId> {
     let mut unreachable_ends = HashSet::new();
 
     for bb in &func.blocks {
-        // Check if the last instruction is Unreachable
-        if let Some(last) = bb.insns.last() {
-            if last.op == Opcode::Unreachable {
+        let first_meaningful = bb
+            .insns
+            .iter()
+            .find(|i| !matches!(i.op, Opcode::Nop | Opcode::Entry | Opcode::Phi));
+        if let Some(insn) = first_meaningful {
+            if insn.op == Opcode::Unreachable {
                 unreachable_ends.insert(bb.id);
             }
         }
@@ -459,6 +473,113 @@ mod tests {
         assert!(func.get_block(BasicBlockId(0)).is_some());
         assert!(func.get_block(BasicBlockId(1)).is_some());
         assert!(func.get_block(BasicBlockId(2)).is_none());
+    }
+
+    #[test]
+    fn test_cbr_to_noreturn_call_block_not_folded() {
+        // Regression for miscompile of CPython _posixsubprocess.c do_fork_exec:
+        // `cbr cond, A, B` where B does `call _exit(); unreachable` must NOT
+        // be folded to `br A`. The call to _exit is observable (chooses exit
+        // status), so B is *reachable* — only its terminator is unreachable.
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.int_id);
+
+        func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        func.add_pseudo(Pseudo::val(PseudoId(1), 0));
+
+        // Entry: cbr %0, .L1 (true: ret), .L2 (false: _exit + unreachable)
+        let mut bb0 = BasicBlock::new(BasicBlockId(0));
+        bb0.children = vec![BasicBlockId(1), BasicBlockId(2)];
+        bb0.add_insn(Instruction::new(Opcode::Entry));
+        bb0.add_insn(Instruction::cbr(
+            PseudoId(0),
+            BasicBlockId(1),
+            BasicBlockId(2),
+        ));
+
+        // True branch
+        let mut bb1 = BasicBlock::new(BasicBlockId(1));
+        bb1.parents = vec![BasicBlockId(0)];
+        bb1.add_insn(Instruction::ret(Some(PseudoId(1))));
+
+        // False branch — calls noreturn `_exit(0)`, then terminator Unreachable.
+        // Pre-fix: this block was treated as unreachable, dropping the call.
+        let mut bb2 = BasicBlock::new(BasicBlockId(2));
+        bb2.parents = vec![BasicBlockId(0)];
+        bb2.add_insn(Instruction::call(
+            None,
+            "_exit",
+            vec![PseudoId(1)],
+            vec![types.int_id],
+            types.void_id,
+            8,
+        ));
+        bb2.add_insn(Instruction::new(Opcode::Unreachable));
+
+        func.add_block(bb0);
+        func.add_block(bb1);
+        func.add_block(bb2);
+        func.entry = BasicBlockId(0);
+
+        run(&mut func);
+
+        // The cbr must remain a Cbr — must NOT be rewritten to an unconditional Br.
+        let term = &func.get_block(BasicBlockId(0)).unwrap().insns[1];
+        assert_eq!(
+            term.op,
+            Opcode::Cbr,
+            "cbr must not be folded when false-target contains observable side effects"
+        );
+
+        // Both targets must still be reachable.
+        assert!(func.get_block(BasicBlockId(1)).is_some());
+        assert!(func.get_block(BasicBlockId(2)).is_some());
+        // The _exit call must survive (Call is a side-effecting root).
+        let bb2 = func.get_block(BasicBlockId(2)).unwrap();
+        assert!(bb2.insns.iter().any(|i| i.op == Opcode::Call));
+    }
+
+    #[test]
+    fn test_cbr_to_trivially_unreachable_block_folded() {
+        // Companion to the test above: when the false-target is *trivially*
+        // unreachable (only Unreachable, no observable work), the fold IS valid.
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.int_id);
+
+        func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        func.add_pseudo(Pseudo::val(PseudoId(1), 0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId(0));
+        bb0.children = vec![BasicBlockId(1), BasicBlockId(2)];
+        bb0.add_insn(Instruction::new(Opcode::Entry));
+        bb0.add_insn(Instruction::cbr(
+            PseudoId(0),
+            BasicBlockId(1),
+            BasicBlockId(2),
+        ));
+
+        let mut bb1 = BasicBlock::new(BasicBlockId(1));
+        bb1.parents = vec![BasicBlockId(0)];
+        bb1.add_insn(Instruction::ret(Some(PseudoId(1))));
+
+        // Trivially unreachable (e.g. from __builtin_unreachable()).
+        let mut bb2 = BasicBlock::new(BasicBlockId(2));
+        bb2.parents = vec![BasicBlockId(0)];
+        bb2.add_insn(Instruction::new(Opcode::Unreachable));
+
+        func.add_block(bb0);
+        func.add_block(bb1);
+        func.add_block(bb2);
+        func.entry = BasicBlockId(0);
+
+        run(&mut func);
+
+        let term = &func.get_block(BasicBlockId(0)).unwrap().insns[1];
+        assert_eq!(
+            term.op,
+            Opcode::Br,
+            "cbr to a trivially unreachable block should be folded to br"
+        );
     }
 
     #[test]

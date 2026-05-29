@@ -140,11 +140,9 @@ impl<'a> Lexer<'a> {
                 // Skip until */
                 loop {
                     match self.advance() {
-                        Some('*') => {
-                            if self.peek() == Some('/') {
-                                self.advance();
-                                return true;
-                            }
+                        Some('*') if self.peek() == Some('/') => {
+                            self.advance();
+                            return true;
                         }
                         None => return true, // Unterminated comment, let parser handle
                         _ => {}

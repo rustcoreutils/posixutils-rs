@@ -19,7 +19,7 @@ SSA-form intermediate representation for pcc C99 compiler. Inspired by Linus Tor
 | `br` | Unconditional branch to `bb_true` |
 | `cbr` | Conditional branch: `src[0]` ? `bb_true` : `bb_false` |
 | `switch` | Multi-way branch via `switch_cases` / `switch_default` |
-| `unreachable` | UB if reached; optimization hint |
+| `unreachable` | UB if reached. Emitted by the linearizer after every `noreturn` call (e.g. `_exit`, `abort`); DCE only treats a block as trivially unreachable when `Unreachable` is its *first* non-trivial instruction (so a `call _exit; unreachable` block is still reachable). |
 | `longjmp` | Non-local jump (never returns) |
 
 ### Integer Arithmetic (binary)
@@ -109,9 +109,10 @@ SSA-form intermediate representation for pcc C99 compiler. Inspired by Linus Tor
 | Opcode | Description |
 |--------|-------------|
 | `phi` | SSA merge: `phi_list` = [(bb, pseudo), ...] |
+| `phisrc` | Phi source: explicit defining instruction for a phi operand in the predecessor block; backpointer in `phi_list` (not a use). Lets DCE keep phi sources live without false uses. |
 | `copy` | Value copy (phi elimination) |
 | `setval` | Create pseudo for constant |
-| `sel` | Ternary: `src[0]` ? `src[1]` : `src[2]` |
+| `select` | Ternary: `src[0]` ? `src[1]` : `src[2]` (pure; enables `cmov`/`csel`) |
 
 ### Call Operations
 
@@ -172,6 +173,25 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 | `popcount32` | Population count (32-bit) |
 | `popcount64` | Population count (64-bit) |
 
+### Floating-Point Builtins
+
+| Opcode | Description |
+|--------|-------------|
+| `fabs32` | Absolute value (`float`) |
+| `fabs64` | Absolute value (`double`) |
+| `signbit32` | Test sign bit (`float`); returns int |
+| `signbit64` | Test sign bit (`double`); returns int |
+
+### Memory Builtins
+
+These lower to libc calls (`memset` / `memcpy` / `memmove`) and are marked as side-effecting roots so DCE preserves them.
+
+| Opcode | Description |
+|--------|-------------|
+| `memset` | `memset(dst, c, n)` |
+| `memcpy` | `memcpy(dst, src, n)` |
+| `memmove` | `memmove(dst, src, n)` (overlap-safe) |
+
 ### Stack & Non-local Jumps
 
 | Opcode | Description |
@@ -179,6 +199,40 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 | `alloca` | Dynamic stack allocation |
 | `setjmp` | Save context; returns 0 or longjmp value |
 | `longjmp` | Restore context (never returns) |
+| `frameaddress` | `__builtin_frame_address(level)` |
+| `returnaddress` | `__builtin_return_address(level)` |
+
+### C11 Atomics
+
+All atomic ops carry a memory-order operand (relaxed/consume/acquire/release/acq-rel/seq-cst) and are side-effecting roots.
+
+| Opcode | Description |
+|--------|-------------|
+| `atomicload` | Atomic load |
+| `atomicstore` | Atomic store |
+| `atomicswap` | Atomic exchange (returns old) |
+| `atomiccas` | Compare-and-swap (returns success/old) |
+| `atomicfetchadd` | Atomic fetch-and-add |
+| `atomicfetchsub` | Atomic fetch-and-subtract |
+| `atomicfetchand` | Atomic fetch-and-and |
+| `atomicfetchor` | Atomic fetch-and-or |
+| `atomicfetchxor` | Atomic fetch-and-xor |
+| `fence` | Thread / signal memory fence |
+
+### Int128 Decomposition
+
+Emitted by the mapping pass when the target lacks native 128-bit ops. They model the two-limb representation explicitly so register allocation and codegen can deal with 64-bit chunks.
+
+| Opcode | Description |
+|--------|-------------|
+| `lo64` | Extract low 64 bits of a 128-bit pseudo |
+| `hi64` | Extract high 64 bits of a 128-bit pseudo |
+| `pair64` | Combine `(lo, hi)` into a 128-bit pseudo |
+| `addc` | 64-bit add producing a carry output |
+| `adcc` | 64-bit add with carry in *and* out |
+| `subc` | 64-bit sub producing a borrow output |
+| `sbcc` | 64-bit sub with borrow in *and* out |
+| `umulhi` | Upper 64 bits of an unsigned 64×64 multiply |
 
 ### Miscellaneous
 
@@ -199,7 +253,7 @@ Reg(u32)    - virtual register %r{n}
 Arg(u32)    - function argument %arg{n}
 Phi(u32)    - phi result %phi{n}
 Sym(String) - symbol reference
-Val(i64)    - integer constant ${n}
+Val(i128)   - integer constant ${n} (wide enough for `__int128` constants)
 FVal(f64)   - float constant ${n}
 ```
 
@@ -261,13 +315,15 @@ extern_symbols          - symbols needing GOT
 
 | File | Purpose |
 |------|---------|
-| `linearize.rs` | AST to IR; builds basic blocks |
+| `linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`) | AST to IR; builds basic blocks. Split by responsibility: top-level/expr in `linearize.rs`, designated initializers in `_init.rs`, statements in `_stmt.rs`, helper emitters in `_emit.rs`. |
 | `ssa.rs` | Memory to SSA; inserts phi nodes |
 | `dominate.rs` | Dominator tree (Cooper algorithm) |
-| `dce.rs` | Dead code elimination |
+| `dce.rs` | Dead code elimination (mark-sweep on SSA roots, fold-branches-to-unreachable, unreachable-block removal) |
 | `instcombine.rs` | Constant folding, algebraic simplification |
 | `inline.rs` | Function inlining |
 | `lower.rs` | Phi elimination to copies |
+
+The driver in `cc/opt.rs` runs `inline → (instcombine + dce)*` to fixed point (up to 10 iterations).
 
 ## Display Format
 

@@ -1814,15 +1814,12 @@ impl MoreControl {
                     }
                 }
 
-                loop {
-                    let Ok(line) = self
-                        .context
-                        .seek_positions
-                        .read_line()
-                        .inspect_err(|e| self.handle_error(e.clone()))
-                    else {
-                        break;
-                    };
+                while let Ok(line) = self
+                    .context
+                    .seek_positions
+                    .read_line()
+                    .inspect_err(|e| self.handle_error(e.clone()))
+                {
                     print!("{line}");
                     if self.context.seek_positions.next().is_none() {
                         break;
@@ -2667,10 +2664,7 @@ fn format_file_header(
 /// Parse count argument of future [`Command`]
 fn parse_count(chars: &[char], i: &mut usize, count: &mut Option<usize>) {
     let mut count_str = String::new();
-    loop {
-        let Some(ch) = chars.get(*i) else {
-            break;
-        };
+    while let Some(ch) = chars.get(*i) {
         if !ch.is_numeric() {
             break;
         }

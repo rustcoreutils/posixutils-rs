@@ -146,7 +146,11 @@ fn write_line_content(
     column_width: usize,
 ) -> io::Result<()> {
     if line.is_padding {
-        write!(output_line, "{:width$}", "", width = column_width).into_io_result()?;
+        if params.pad_columns {
+            write!(output_line, "{:width$}", "", width = column_width).into_io_result()?;
+        }
+        // When pad_columns is false (POSIX `-s` combined with `-t`/`-e`),
+        // padding cells contribute no characters; the cell is empty.
         return Ok(());
     }
 
@@ -170,8 +174,13 @@ fn write_line_content(
     // -i
     line_transform::replace_spaces(&mut tmp, params.output_tabs);
 
-    if params.num_columns == 1 {
-        // Single column output is neither padded nor truncated
+    if params.num_columns == 1 || !params.pad_columns {
+        // Single column output is neither padded nor truncated.
+        //
+        // Likewise, when `-s` is combined with `-t` or `-e`, POSIX requires
+        // that column alignment/truncation be suppressed: cells are emitted
+        // as their raw transformed content with the user's separator
+        // character between them.
         write!(output_line, "{}", &tmp).into_io_result()?;
     } else {
         let mut width = column_width;

@@ -214,6 +214,86 @@ fn pr_number_line() {
     pr_test(&["-9", "-n3", input], "", &output);
 }
 
+// Regression: `-4ats` must parse as `--columns=4 -a -t -s` (default sep <tab>).
+// POSIX.2024: `-s` with `-t` suppresses padding/truncation.
+#[test]
+fn pr_columns_cluster_with_optional_sep() {
+    let input = (1..=12)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let expected = "1\t2\t3\t4\n5\t6\t7\t8\n9\t10\t11\t12\n";
+    pr_test(&["-4ats"], &input, expected);
+}
+
+// Same with --columns long form, ensuring `-ats` cluster still resolves
+// `-s` to default <tab> without requiring an attached value.
+#[test]
+fn pr_columns_long_then_cluster_with_optional_sep() {
+    let input = (1..=12)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let expected = "1\t2\t3\t4\n5\t6\t7\t8\n9\t10\t11\t12\n";
+    pr_test(&["--columns", "4", "-ats"], &input, expected);
+}
+
+// `-s` separated from the cluster (`-at -s`) must also use default <tab>.
+#[test]
+fn pr_columns_separate_s_default_tab() {
+    let input = (1..=12)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let expected = "1\t2\t3\t4\n5\t6\t7\t8\n9\t10\t11\t12\n";
+    pr_test(&["--columns", "4", "-at", "-s"], &input, expected);
+}
+
+// `-s` with an explicit attached value inside a cluster: `-ats,`.
+#[test]
+fn pr_columns_cluster_with_explicit_sep() {
+    let input = (1..=12)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let expected = "1,2,3,4\n5,6,7,8\n9,10,11,12\n";
+    pr_test(&["--columns", "4", "-ats,"], &input, expected);
+}
+
+// Partial last row keeps trailing separators (no implicit trimming) so
+// column positions are preserved. 10 items in 4 across columns: last row
+// is `9,10,<pad>,<pad>` and is emitted as `9\t10\t\t`.
+#[test]
+fn pr_columns_partial_last_row_keeps_seps() {
+    let input = (1..=10)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let expected = "1\t2\t3\t4\n5\t6\t7\t8\n9\t10\t\t\n";
+    pr_test(&["-4ats"], &input, expected);
+}
+
+// POSIX strict: `-s` alone (without `-t` or `-e`) does NOT affect
+// truncation/alignment. Cells are still padded/truncated to column width,
+// but the separator character is used between them.
+//
+// Auto-omit-header (page_length <= 10) is used here to suppress the header
+// without passing `-t`, which would otherwise switch on the no-pad path.
+#[test]
+fn pr_separator_alone_keeps_padding() {
+    let input = "1\n2\n3\n4\n5\n6\n7\n8\n";
+    // -4 -a: 4 cols across. -l9: tiny page (auto-omit-header). -w33: fixed
+    // width so column_width = (33 - 4 + 1) / 4 = 7. No -t/-e, so pad_columns
+    // is true: cells right-padded to 7 chars and joined by <tab>.
+    let expected = "1      \t2      \t3      \t4      \n5      \t6      \t7      \t8      \n";
+    pr_test(&["-4", "-a", "-l9", "-w33", "-s"], input, expected);
+}
+
 #[test]
 fn pr_expand_and_replace() {
     let input = "tests/pr/spaces_and_tabs.txt";

@@ -44,50 +44,56 @@ Phases 1-7 (type system, parser, IR, linearizer, x86-64/ARM64 codegen, stdatomic
 - Reject `&(atomic_struct.member)`
 - Validate `sizeof` on atomic type returns atomic size
 
-### C11 Thread-Local Storage — ARM64 + Dynamic Models
+### C11 Thread-Local Storage — Dynamic Model
 
-Phases 1-3 (parser, symbol table, IR, x86-64 Local-Exec codegen) are done.
+Done: parser, symbol table, IR, x86-64 Local-Exec (`%fs:sym@TPOFF`) and Initial-Exec (`sym@GOTTPOFF`), AArch64 Local-Exec (`mrs tpidr_el0` + `tprel_hi12`/`tprel_lo12_nc`) and Initial-Exec (`gottpoff` / `gottpoff_lo12`).
 
 **Remaining:**
-- ARM64 Local-Exec codegen (`mrs tpidr_el0` + `tprel` relocations)
-- Initial-Exec model (for preemptible symbols)
-- General-Dynamic model (for shared libraries, `__tls_get_addr`)
+- General-Dynamic model (`_Thread_local` in shared libraries; `__tls_get_addr` on x86-64, `tlsdesc` on AArch64).
 
 ---
 
 ## Optimization Passes
 
-The compiler uses SSA-form IR. Passes run iteratively until fixed point.
+The compiler uses SSA-form IR. Already implemented passes (see `cc/ir/`):
 
-### Pass 1: SCCP — Sparse Conditional Constant Propagation
+- `instcombine` — constant folding, algebraic simplification
+- `dce` — mark-sweep DCE, fold-cbr-to-trivially-unreachable, unreachable-block removal
+- `inline` — function inlining (module-level)
+
+`cc/opt.rs` runs `inline → (instcombine + dce)*` to fixed point.
+
+### Future passes (not yet implemented)
+
+#### SCCP — Sparse Conditional Constant Propagation
 
 Propagate constants through CFG along reachable paths only. Lattice: `{UNDEF, CONST(c), UNKNOWN}`.
 
-### Pass 2: CFG Simplification
+#### CFG Simplification
 
 Convert constant branches to unconditional jumps. Merge simple blocks. Remove jumps-to-jumps.
 
-### Pass 3: Copy Propagation & SSA Cleanup
+#### Copy Propagation & SSA Cleanup
 
 `t1 = x; y = t1;` → `y = x`. Simplify φ-nodes where all incoming operands are same.
 
-### Pass 4: Local CSE / Value Numbering
+#### Local CSE / Value Numbering
 
 Inside a block, deduplicate `t1 = a + b; t2 = a + b;` → `t2 = t1`.
 
-### Pass 5: GVN — Global Value Numbering
+#### GVN — Global Value Numbering
 
 Deduplicate computations across blocks using dominator-order value numbering.
 
-### Pass 7: LICM — Loop-Invariant Code Motion
+#### LICM — Loop-Invariant Code Motion
 
 Hoist pure, loop-invariant computations out of loop bodies.
 
-### Pass 8: Loop Canonicalization & Strength Reduction
+#### Loop Canonicalization & Strength Reduction
 
 Normalize induction variables. Replace multiplications with additions.
 
-### Suggested Pass Pipeline
+### Suggested pass pipeline
 
 ```
 InstCombine → SCCP → DCE → CFG simplify → Copy prop → Local CSE → InstCombine

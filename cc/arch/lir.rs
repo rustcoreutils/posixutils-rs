@@ -462,6 +462,12 @@ pub enum Directive {
     /// Switch to read-only data section (.section .rodata or __TEXT,__const)
     Rodata,
 
+    /// Switch to read-only-after-relocations data section
+    /// (`.section .data.rel.ro` on ELF, `.section __DATA,__const` on Mach-O).
+    /// Used for `const`-qualified globals whose initializer contains symbol
+    /// addresses that need dynamic-linker fixups.
+    DataRelRo,
+
     /// Switch to thread-local data section (.section .tdata or __DATA,__thread_data)
     Tdata,
 
@@ -482,6 +488,13 @@ pub enum Directive {
 
     /// .comm symbol, size, align - allocate common (BSS) storage
     Comm { sym: Symbol, size: u32, align: u32 },
+
+    /// Allocate file-scope, internal-linkage BSS storage for a single symbol.
+    /// Emitted as `.local sym` + `.comm sym, size, align` on ELF (which routes
+    /// the symbol to `.bss` with local visibility) and as
+    /// `.zerofill __DATA,__bss,sym,size,log2(align)` on Mach-O. The alignment
+    /// is expressed in bytes; the emitter converts to log2 on Mach-O.
+    BssLocal { sym: Symbol, size: u32, align: u32 },
 
     // ========================================================================
     // Alignment
@@ -633,6 +646,15 @@ impl Directive {
         }
     }
 
+    /// Allocate a local-linkage zero-filled symbol in BSS-class storage.
+    pub fn bss_local(name: impl Into<String>, size: u32, align: u32) -> Self {
+        Directive::BssLocal {
+            sym: Symbol::global(name),
+            size,
+            align,
+        }
+    }
+
     pub fn file(index: u32, path: impl Into<String>) -> Self {
         Directive::File {
             index,
@@ -695,6 +717,17 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".section .rodata");
                 }
             },
+            Directive::DataRelRo => match target.os {
+                // Mach-O has no separate ".data.rel.ro" — the linker handles
+                // relocations inside __DATA,__const transparently. Mirror what
+                // clang emits for `const T * const arr[]`.
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __DATA,__const");
+                }
+                Os::Linux | Os::FreeBSD => {
+                    let _ = writeln!(out, ".section .data.rel.ro,\"aw\",@progbits");
+                }
+            },
             Directive::Tdata => match target.os {
                 Os::MacOS => {
                     let _ = writeln!(out, ".section __DATA,__thread_data,thread_local_regular");
@@ -749,6 +782,37 @@ impl EmitAsm for Directive {
                     align_value
                 );
             }
+            Directive::BssLocal { sym, size, align } => match target.os {
+                Os::MacOS => {
+                    // .zerofill SEG,SECT,name,size,align_log2
+                    let align_log2 = if *align == 0 {
+                        0
+                    } else {
+                        align.trailing_zeros()
+                    };
+                    let _ = writeln!(
+                        out,
+                        ".zerofill __DATA,__bss,{},{},{}",
+                        sym.format_for_target(target),
+                        size,
+                        align_log2
+                    );
+                }
+                Os::Linux | Os::FreeBSD => {
+                    // GAS pattern for static (internal-linkage) BSS:
+                    //   .local <sym>; .comm <sym>, size, align
+                    // The `.local` makes the symbol non-exported; `.comm`
+                    // places it in `.bss` without occupying file bytes.
+                    let _ = writeln!(out, ".local {}", sym.format_for_target(target));
+                    let _ = writeln!(
+                        out,
+                        ".comm {},{},{}",
+                        sym.format_for_target(target),
+                        size,
+                        align
+                    );
+                }
+            },
 
             // Alignment
             Directive::Align(power) => match target.os {
@@ -1110,6 +1174,71 @@ mod tests {
         let mut out = String::new();
         Directive::comm("big_array", 64, 16).emit(&macos, &mut out);
         assert_eq!(out, ".comm _big_array,64,4\n");
+    }
+
+    #[test]
+    fn test_directive_rodata_per_os() {
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let macos = Target::new(Arch::X86_64, Os::MacOS);
+
+        let mut out = String::new();
+        Directive::Rodata.emit(&linux, &mut out);
+        assert_eq!(out, ".section .rodata\n");
+
+        let mut out = String::new();
+        Directive::Rodata.emit(&macos, &mut out);
+        assert_eq!(out, ".section __TEXT,__const\n");
+    }
+
+    #[test]
+    fn test_directive_data_rel_ro_per_os() {
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let macos = Target::new(Arch::X86_64, Os::MacOS);
+        let aarch64_linux = Target::new(Arch::Aarch64, Os::Linux);
+        let aarch64_macos = Target::new(Arch::Aarch64, Os::MacOS);
+
+        let mut out = String::new();
+        Directive::DataRelRo.emit(&linux, &mut out);
+        assert_eq!(out, ".section .data.rel.ro,\"aw\",@progbits\n");
+
+        let mut out = String::new();
+        Directive::DataRelRo.emit(&aarch64_linux, &mut out);
+        assert_eq!(out, ".section .data.rel.ro,\"aw\",@progbits\n");
+
+        let mut out = String::new();
+        Directive::DataRelRo.emit(&macos, &mut out);
+        assert_eq!(out, ".section __DATA,__const\n");
+
+        let mut out = String::new();
+        Directive::DataRelRo.emit(&aarch64_macos, &mut out);
+        assert_eq!(out, ".section __DATA,__const\n");
+    }
+
+    #[test]
+    fn test_directive_bss_local_per_os() {
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let macos = Target::new(Arch::X86_64, Os::MacOS);
+        let aarch64_macos = Target::new(Arch::Aarch64, Os::MacOS);
+
+        // Linux: `.local name` + `.comm name,size,align(bytes)`
+        let mut out = String::new();
+        Directive::bss_local("zerobuf", 4096, 16).emit(&linux, &mut out);
+        assert_eq!(out, ".local zerobuf\n.comm zerobuf,4096,16\n");
+
+        // macOS x86_64: `.zerofill __DATA,__bss,_name,size,align_log2`
+        let mut out = String::new();
+        Directive::bss_local("zerobuf", 4096, 16).emit(&macos, &mut out);
+        assert_eq!(out, ".zerofill __DATA,__bss,_zerobuf,4096,4\n");
+
+        // macOS aarch64: same form with leading underscore
+        let mut out = String::new();
+        Directive::bss_local("z", 8, 8).emit(&aarch64_macos, &mut out);
+        assert_eq!(out, ".zerofill __DATA,__bss,_z,8,3\n");
+
+        // Sub-page alignment: 1 byte → log2 = 0 on macOS
+        let mut out = String::new();
+        Directive::bss_local("b", 1, 1).emit(&macos, &mut out);
+        assert_eq!(out, ".zerofill __DATA,__bss,_b,1,0\n");
     }
 
     #[test]

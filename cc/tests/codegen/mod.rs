@@ -15,3 +15,4 @@ mod inline_asm;
 mod misc;
 mod pic;
 mod regalloc;
+mod sections;

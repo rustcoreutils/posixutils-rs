@@ -1620,6 +1620,56 @@ pub enum Initializer {
     SymAddrOffset(String, i64),
 }
 
+impl Initializer {
+    /// Recursively determine whether this initializer evaluates to all zero bytes.
+    ///
+    /// Used to route static / extern globals whose initial contents are entirely
+    /// zero into `.bss` (which costs nothing in the object file and is lazily
+    /// allocated by the kernel) instead of `.data` (which pays in both file size
+    /// and resident memory).
+    pub fn is_all_zero(&self) -> bool {
+        match self {
+            Initializer::None => true,
+            Initializer::Int(v) => *v == 0,
+            Initializer::Float(v) => v.to_bits() == 0,
+            // A zero-length string is all-zero; a non-empty char array initialized
+            // by a string literal is zero iff every byte is `\0`.
+            Initializer::String(s) => s.chars().all(|c| c == '\0'),
+            Initializer::WideString(s) => s.chars().all(|c| c == '\0'),
+            Initializer::Array { elements, .. } => {
+                elements.iter().all(|(_, init)| init.is_all_zero())
+            }
+            Initializer::Struct { fields, .. } => {
+                fields.iter().all(|(_, _, init)| init.is_all_zero())
+            }
+            // Address-of expressions are never zero — they take an address.
+            Initializer::SymAddr(_) | Initializer::SymAddrOffset(_, _) => false,
+        }
+    }
+
+    /// Recursively determine whether this initializer references any symbol
+    /// address (and therefore needs runtime relocation).
+    ///
+    /// Used to distinguish `.rodata` (pure read-only data) from `.data.rel.ro`
+    /// (read-only data containing pointers that the dynamic linker fixes up).
+    pub fn has_reloc(&self) -> bool {
+        match self {
+            Initializer::SymAddr(_) | Initializer::SymAddrOffset(_, _) => true,
+            Initializer::Array { elements, .. } => {
+                elements.iter().any(|(_, init)| init.has_reloc())
+            }
+            Initializer::Struct { fields, .. } => {
+                fields.iter().any(|(_, _, init)| init.has_reloc())
+            }
+            Initializer::None
+            | Initializer::Int(_)
+            | Initializer::Float(_)
+            | Initializer::String(_)
+            | Initializer::WideString(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for Initializer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1681,6 +1731,10 @@ pub struct GlobalDef {
     pub is_thread_local: bool,
     /// Static storage class (internal linkage)
     pub is_static: bool,
+    /// Top-level `const`-qualified declaration. Used to route the global to
+    /// `.rodata` (no relocations) or `.data.rel.ro` (relocations) instead of
+    /// the writable `.data` section.
+    pub is_const: bool,
     /// Explicit alignment from _Alignas specifier (None = use natural alignment)
     pub explicit_align: Option<u32>,
 }
@@ -1694,6 +1748,7 @@ impl GlobalDef {
             init,
             is_thread_local: false,
             is_static: false,
+            is_const: false,
             explicit_align: None,
         }
     }
@@ -1707,6 +1762,12 @@ impl GlobalDef {
     /// Set static storage class (internal linkage)
     pub fn with_static(mut self, is_static: bool) -> Self {
         self.is_static = is_static;
+        self
+    }
+
+    /// Set top-level const qualification
+    pub fn with_const(mut self, is_const: bool) -> Self {
+        self.is_const = is_const;
         self
     }
 }
@@ -1763,8 +1824,9 @@ impl Module {
         init: Initializer,
         align: Option<u32>,
         is_static: bool,
+        is_const: bool,
     ) {
-        self.add_global_impl(name, typ, init, align, is_static, false);
+        self.add_global_impl(name, typ, init, align, is_static, is_const, false);
     }
 
     /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
@@ -1777,10 +1839,12 @@ impl Module {
         init: Initializer,
         align: Option<u32>,
         is_static: bool,
+        is_const: bool,
     ) {
-        self.add_global_impl(name, typ, init, align, is_static, true);
+        self.add_global_impl(name, typ, init, align, is_static, is_const, true);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_global_impl(
         &mut self,
         name: impl Into<String>,
@@ -1788,6 +1852,7 @@ impl Module {
         init: Initializer,
         align: Option<u32>,
         is_static: bool,
+        is_const: bool,
         is_thread_local: bool,
     ) {
         let name = name.into();
@@ -1802,6 +1867,11 @@ impl Module {
                 );
                 existing.init = init;
                 existing.is_static = is_static;
+                // Const-ness is a property of the declaration that ultimately
+                // provides storage: if either the tentative or the defining
+                // declaration declared the object `const`, the resulting
+                // object is treated as read-only.
+                existing.is_const = existing.is_const || is_const;
                 if is_thread_local {
                     existing.is_thread_local = true;
                 }
@@ -1813,7 +1883,8 @@ impl Module {
         }
         let mut def = GlobalDef::new(name, typ, init)
             .with_align(align)
-            .with_static(is_static);
+            .with_static(is_static)
+            .with_const(is_const);
         if is_thread_local {
             def.is_thread_local = true;
         }
@@ -2156,12 +2227,19 @@ mod tests {
         let mut module = Module::default();
 
         // Add a tentative definition (no initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::None, None, false);
+        module.add_global_aligned("x", types.int_id, Initializer::None, None, false, false);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual definition - should replace the tentative one
-        module.add_global_aligned("x", types.int_id, Initializer::Int(42), Some(4), false);
+        module.add_global_aligned(
+            "x",
+            types.int_id,
+            Initializer::Int(42),
+            Some(4),
+            false,
+            false,
+        );
         assert_eq!(module.globals.len(), 1); // Still only one global
         assert!(matches!(module.globals[0].init, Initializer::Int(42)));
         assert_eq!(module.globals[0].explicit_align, Some(4));
@@ -2173,11 +2251,11 @@ mod tests {
         let mut module = Module::default();
 
         // Add a real definition (with initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None, false);
+        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None, false, false);
         assert_eq!(module.globals.len(), 1);
 
         // Add another definition with same name - should NOT replace (adds new entry)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None, false);
+        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None, false, false);
         assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
     }
 
@@ -2187,7 +2265,14 @@ mod tests {
         let mut module = Module::default();
 
         // Add a TLS tentative definition
-        module.add_global_tls_aligned("tls_var", types.int_id, Initializer::None, None, false);
+        module.add_global_tls_aligned(
+            "tls_var",
+            types.int_id,
+            Initializer::None,
+            None,
+            false,
+            false,
+        );
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
@@ -2197,6 +2282,7 @@ mod tests {
             types.int_id,
             Initializer::Int(100),
             Some(8),
+            false,
             false,
         );
         assert_eq!(module.globals.len(), 1);

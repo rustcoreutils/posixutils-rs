@@ -481,7 +481,7 @@ impl Command {
 fn delete_nested_ranges(mut ranges: Vec<(usize, Range<usize>)>) -> Vec<(usize, Range<usize>)> {
     let mut result: Vec<(usize, Range<usize>)> = Vec::new();
 
-    ranges.sort_by(|(_, a), (_, b)| (a.end - a.start).cmp(&(b.end - b.start)));
+    ranges.sort_by_key(|(_, a)| a.end - a.start);
     for (i, Range { start, end }) in ranges.into_iter() {
         if result.iter().any(|(_, r)| r.start >= start && end >= r.end) {
             continue;
@@ -527,10 +527,7 @@ fn filter_groups_when_line_size_check_in_pattern(
     {
         let mut lengths = vec![];
         let mut i = 0;
-        loop {
-            let Some(slice) = pattern.get(i..) else {
-                break;
-            };
+        while let Some(slice) = pattern.get(i..) {
             let Some(mut a) = slice.find(r#"\{"#) else {
                 break;
             };
@@ -898,10 +895,7 @@ fn parse_address(
 ) -> Result<(), SedError> {
     let tokens = to_address_tokens(chars, i)?;
     let mut is_negative = false;
-    loop {
-        let Some(ch) = chars.get(*i) else {
-            break;
-        };
+    while let Some(ch) = chars.get(*i) {
         match ch {
             '!' => {
                 is_negative = true;
@@ -948,10 +942,7 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
     }
     *i += 1;
     let mut text = String::new();
-    loop {
-        let Some(ch) = chars.get(*i) else {
-            break;
-        };
+    while let Some(ch) = chars.get(*i) {
         match *ch {
             '\n' => {
                 *i += 1;
@@ -977,10 +968,7 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
 /// b [label], r  rfile
 fn parse_word_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>, SedError> {
     let mut label = String::new();
-    loop {
-        let Some(ch) = chars.get(*i) else {
-            break;
-        };
+    while let Some(ch) = chars.get(*i) {
         match ch {
             '\n' | ';' => {
                 *i -= 1;
@@ -1008,10 +996,7 @@ fn parse_word_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
 fn parse_path_attribute(chars: &[char], i: &mut usize) -> Result<PathBuf, SedError> {
     *i += 1;
     let mut path = String::new();
-    loop {
-        let Some(ch) = chars.get(*i) else {
-            break;
-        };
+    while let Some(ch) = chars.get(*i) {
         match ch {
             '\n' | ';' => {
                 *i -= 1;
@@ -1058,10 +1043,7 @@ fn parse_block(chars: &[char], i: &mut usize) -> Result<Vec<Command>, SedError> 
 
     let mut j = 0;
     let mut k = 0;
-    loop {
-        let Some(ch) = block_limits.get(k) else {
-            break;
-        };
+    while let Some(ch) = block_limits.get(k) {
         match ch.1 {
             '{' => j += 1,
             '}' => j -= 1,
@@ -1307,10 +1289,7 @@ fn print_multiline_binary(line: &str) {
         if width >= 1 {
             let line = line.chars().collect::<Vec<_>>();
             let mut chunks = line.chunks(width - 1).peekable();
-            loop {
-                let Some(chunk) = chunks.next() else {
-                    break;
-                };
+            while let Some(chunk) = chunks.next() {
                 if chunk.strip_suffix(&['\n']).is_some() {
                     if chunks.peek().is_some() {
                         println!("\\\n");
@@ -1362,10 +1341,7 @@ fn filter_comments(raw_script: impl AsRef<str>) -> String {
         let mut j = 0;
         let chars = line.chars().collect::<Vec<_>>();
         let mut split_positions = vec![0];
-        loop {
-            let Some(remain) = chars.get(j..) else {
-                break;
-            };
+        while let Some(remain) = chars.get(j..) {
             let Some(a) = remain.iter().position(|ch| ['s', 'y'].contains(ch)) else {
                 break;
             };
@@ -1426,10 +1402,7 @@ impl Script {
             }
         }
 
-        loop {
-            let Some(ch) = chars.get(i) else {
-                break;
-            };
+        while let Some(ch) = chars.get(i) {
             match *ch {
                 ' ' | '\n' => {}
                 ';' => {

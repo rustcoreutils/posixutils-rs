@@ -268,8 +268,7 @@ where
     }
 
     for (idx, block) in func.blocks.iter().enumerate() {
-        let mut ipos = block_start_pos[idx];
-        for insn in &block.insns {
+        for (ipos, insn) in (block_start_pos[idx]..).zip(block.insns.iter()) {
             // Uses: if not yet killed in this block, add to gen
             for &src in &insn.src {
                 if !kill[idx].contains(&src) {
@@ -310,7 +309,6 @@ where
                 first_pos_map[idx].entry(target).or_insert(ipos);
                 last_pos_map[idx].insert(target, ipos);
             }
-            ipos += 1;
         }
     }
 

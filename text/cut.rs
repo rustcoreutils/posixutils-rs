@@ -393,7 +393,7 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
             return Err("Invalid start position (from 0)".to_string());
         }
     }
-    ranges.sort_by(|a, b| a.0.cmp(&b.0));
+    ranges.sort_by_key(|a| a.0);
     // Upper bound: all ranges could be non-overlapping
     let mut filtered_ranges = Vec::with_capacity(ranges.len());
 

@@ -199,12 +199,12 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
                         }
                     }
                 }
-                Opcode::SymAddr => {
-                    // Address taken - can't promote
-                    // SymAddr has the symbol in src[0], not target
-                    if !insn.src.is_empty() && insn.src[0] == sym_id {
-                        info.addr_taken = true;
-                    }
+                Opcode::SymAddr
+                    // Address taken - can't promote.
+                    // SymAddr has the symbol in src[0], not target.
+                    if !insn.src.is_empty() && insn.src[0] == sym_id =>
+                {
+                    info.addr_taken = true;
                 }
                 _ => {}
             }

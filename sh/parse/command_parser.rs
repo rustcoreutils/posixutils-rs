@@ -289,7 +289,7 @@ impl<'src> CommandParser<'src> {
                                     &mut continue_to_apply_alias_substitution,
                                     alias_table,
                                 )?;
-                                command.words.extend(next_word.into_iter());
+                                command.words.extend(next_word);
                             } else {
                                 command.words.push(parse_word_pair(
                                     word,

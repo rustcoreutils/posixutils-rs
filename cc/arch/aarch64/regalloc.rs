@@ -710,7 +710,11 @@ impl RegAlloc {
     }
 
     /// Perform register allocation for a function
-    pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
+    pub fn allocate(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+    ) -> crate::arch::regalloc::LocationMap<Loc> {
         self.reset_state();
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
@@ -728,7 +732,7 @@ impl RegAlloc {
         self.allocate_alloca_to_stack(func);
         self.run_linear_scan(func, types, intervals, &call_positions, &constraint_points);
 
-        self.locations.clone()
+        crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
 
     /// Reset allocator state for a new function

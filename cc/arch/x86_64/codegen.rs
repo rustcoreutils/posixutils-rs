@@ -31,8 +31,12 @@ use std::collections::{HashMap, HashSet};
 pub struct X86_64CodeGen {
     /// Common code generation infrastructure
     pub(super) base: CodeGenBase<X86Inst>,
-    /// Current function's register allocation
-    locations: HashMap<PseudoId, Loc>,
+    /// Current function's register allocation. M2 routes every PseudoId
+    /// → Loc lookup through `LocationMap` so codegen never derives an
+    /// alternative location from `PseudoKind`. The intrinsic-result and
+    /// inline-asm sites that write into the map are the only post-
+    /// allocate writers and remain visible as `.set` calls.
+    locations: crate::arch::regalloc::LocationMap<Loc>,
     /// Current function's pseudos (for looking up values)
     pub(super) pseudos: Vec<Pseudo>,
     /// Callee-saved registers used in current function (for epilogue)
@@ -77,7 +81,7 @@ impl X86_64CodeGen {
     pub fn new(target: Target) -> Self {
         Self {
             base: CodeGenBase::new(target),
-            locations: HashMap::new(),
+            locations: crate::arch::regalloc::LocationMap::new(),
             pseudos: Vec::new(),
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
@@ -664,7 +668,8 @@ impl X86_64CodeGen {
                                 // Find the local for this parameter by name
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
-                                    if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
+                                    if let Some(Loc::Stack(offset)) =
+                                        self.locations.get_ref(local.sym)
                                     {
                                         let offset = *offset;
                                         let (fp_size, imag_offset) = if is_two_sse_struct {
@@ -698,7 +703,8 @@ impl X86_64CodeGen {
                         } else if is_fp {
                             // FP argument (float/double)
                             if fp_arg_idx < fp_arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
+                                {
                                     // Move from FP arg register to stack
                                     let fp_size = if types.size_bits(*typ) == 32 {
                                         FpSize::Single
@@ -717,7 +723,7 @@ impl X86_64CodeGen {
                             // __int128 argument — uses TWO consecutive GP registers
                             // Store to the arg pseudo's stack slot (allocated by regalloc)
                             if int_arg_idx + 1 < int_arg_regs.len() {
-                                if let Some(loc) = self.locations.get(&pseudo.id).cloned() {
+                                if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Store lo half from first GP register
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
@@ -734,7 +740,7 @@ impl X86_64CodeGen {
                             } else {
                                 // Stack-passed int128: copy from incoming arg area
                                 // to the local stack slot.
-                                if let Some(loc) = self.locations.get(&pseudo.id).cloned() {
+                                if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Load lo from incoming, store to local
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
@@ -770,7 +776,8 @@ impl X86_64CodeGen {
                         } else {
                             // Integer argument
                             if int_arg_idx < int_arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
+                                {
                                     // Move from arg register to stack
                                     self.push_lir(X86Inst::Mov {
                                         size: OperandSize::B64,
@@ -1474,7 +1481,7 @@ impl X86_64CodeGen {
             Opcode::SetVal => {
                 if let Some(target) = insn.target {
                     if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
-                        let target_loc = self.locations.get(&target).cloned();
+                        let target_loc = self.locations.get(target);
                         match &pseudo.kind {
                             PseudoKind::Val(v) => {
                                 if let Some(Loc::Reg(r)) = target_loc {
@@ -1733,7 +1740,7 @@ impl X86_64CodeGen {
     }
 
     pub(super) fn get_location(&self, pseudo: PseudoId) -> Loc {
-        self.locations.get(&pseudo).cloned().unwrap_or(Loc::Imm(0))
+        self.locations.get(pseudo).unwrap_or(Loc::Imm(0))
     }
 
     pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32) {
@@ -3500,7 +3507,7 @@ impl X86_64CodeGen {
                         operand_mem.push(None);
                         // Don't add to output_moves (can't store to Imm).
                         // Instead, update the pseudo's location to the temp reg after asm.
-                        self.locations.insert(output.pseudo, Loc::Reg(temp));
+                        self.locations.set(output.pseudo, Loc::Reg(temp));
                         pseudo_to_temp.insert(output.pseudo, temp);
                     }
                     _ if requires_reg => {
@@ -4110,7 +4117,7 @@ impl X86_64CodeGen {
         }
 
         // Target is void, but we need to assign something
-        self.locations.insert(target, Loc::Imm(0));
+        self.locations.set(target, Loc::Imm(0));
     }
 
     /// Emit atomic exchange (swap)
@@ -4138,7 +4145,7 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.insert(target, Loc::Reg(Reg::Rax));
+        self.locations.set(target, Loc::Reg(Reg::Rax));
     }
 
     /// Emit atomic compare-and-swap
@@ -4320,7 +4327,7 @@ impl X86_64CodeGen {
         });
 
         // Result (success flag) is in RAX
-        self.locations.insert(target, Loc::Reg(Reg::Rax));
+        self.locations.set(target, Loc::Reg(Reg::Rax));
     }
 
     /// Emit atomic fetch-and-add
@@ -4348,7 +4355,7 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.insert(target, Loc::Reg(Reg::Rax));
+        self.locations.set(target, Loc::Reg(Reg::Rax));
     }
 
     /// Emit atomic fetch-and-subtract
@@ -4380,7 +4387,7 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.insert(target, Loc::Reg(Reg::Rax));
+        self.locations.set(target, Loc::Reg(Reg::Rax));
     }
 
     /// Emit atomic fetch-and-and
@@ -4477,7 +4484,7 @@ impl X86_64CodeGen {
         });
 
         // Result (old value) is in RAX
-        self.locations.insert(target, Loc::Reg(Reg::Rax));
+        self.locations.set(target, Loc::Reg(Reg::Rax));
     }
 
     /// Emit memory fence
@@ -4504,7 +4511,7 @@ impl X86_64CodeGen {
             }
         }
 
-        self.locations.insert(target, Loc::Imm(0));
+        self.locations.set(target, Loc::Imm(0));
     }
 
     /// Helper to move a value to a register

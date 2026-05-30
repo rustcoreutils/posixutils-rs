@@ -15,6 +15,62 @@ use crate::types::{TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
+// ============================================================================
+// LocationMap — single owner for PseudoId → Loc bindings (M2)
+// ============================================================================
+//
+// Every PseudoId has at most one current Loc, set by the regalloc and
+// observed by the codegen. Bug-class C in the regalloc findings was
+// "two disagreeing location computations" — codegen deriving an alternate
+// Loc from `PseudoKind` instead of asking the allocator. Routing all
+// accesses through this newtype makes that pattern syntactically visible:
+//   * `get(p)` returns the single current binding.
+//   * `set(p, loc)` is the only way to write — call sites stand out in
+//     review (the allocator owns most writes; codegen needs the seam
+//     for intrinsic results that land in fixed ABI registers).
+// The inner HashMap stays private so no caller can stash a stale lookup.
+//
+// `Loc` differs per architecture, so the map is generic. Each backend
+// uses its own `LocationMap<Loc>` instantiation.
+
+#[derive(Debug, Clone, Default)]
+pub struct LocationMap<L: Clone> {
+    inner: HashMap<PseudoId, L>,
+}
+
+impl<L: Clone> LocationMap<L> {
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Look up the current binding, if any.
+    pub fn get(&self, pseudo: PseudoId) -> Option<L> {
+        self.inner.get(&pseudo).cloned()
+    }
+
+    /// Look up the current binding by reference (no clone). Use this
+    /// only when a fast existence check is enough — most callers want
+    /// `get` so the borrow doesn't outlive the immediate match.
+    pub fn get_ref(&self, pseudo: PseudoId) -> Option<&L> {
+        self.inner.get(&pseudo)
+    }
+
+    /// Insert or overwrite a binding. Codegen uses this for the post-
+    /// allocator updates that pin an intrinsic's result pseudo to a
+    /// fixed ABI register (the only legitimate write-after-allocate).
+    pub fn set(&mut self, pseudo: PseudoId, loc: L) {
+        self.inner.insert(pseudo, loc);
+    }
+}
+
+impl<L: Clone> From<HashMap<PseudoId, L>> for LocationMap<L> {
+    fn from(inner: HashMap<PseudoId, L>) -> Self {
+        Self { inner }
+    }
+}
+
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
 const DEFAULT_CALL_POS_CAPACITY: usize = 16;

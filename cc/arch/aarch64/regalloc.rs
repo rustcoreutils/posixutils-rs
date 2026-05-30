@@ -885,11 +885,19 @@ impl RegAlloc {
             },
             |off| Loc::Stack(-off),
             |pseudo, from_reg, to_stack_offset| {
+                // M4 regression fix: the shared helper passes the raw
+                // (positive) stack_offset; aarch64's codegen expects
+                // NEGATIVE offsets for spill slots (per the comment at
+                // `store_spilled_args`). Negate here to match the
+                // `mk_stack_loc` closure above. Without this, prolog
+                // stores landed at `frame_size + offset - 16` (the
+                // incoming-stack-arg region) rather than the local
+                // frame, corrupting the caller's stack.
                 spilled_args.push(SpilledArg {
                     pseudo,
                     from_gp_reg: Some(from_reg),
                     from_fp_reg: None,
-                    to_stack_offset,
+                    to_stack_offset: -to_stack_offset,
                 });
             },
             |reg| free_regs.push(reg),

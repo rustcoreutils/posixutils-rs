@@ -758,81 +758,89 @@ impl RegAlloc {
     /// - First 8 FP args in V0-V7 (D0-D7 for doubles, S0-S7 for floats)
     /// - Remaining args go on the stack in parameter order (not separated by type)
     fn allocate_arguments(&mut self, func: &Function, types: &TypeTable) {
+        use crate::abi::{Aapcs64Abi, ArgClass, RegClass};
+        use crate::arch::regalloc::AbiLowering;
+
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
         let mut int_arg_idx = 0usize;
         let mut fp_arg_idx = 0usize;
-        // Stack offset for overflow args - must be shared across all types
-        // because AAPCS64 places stack args in parameter order
+        // Stack offset for overflow args — shared across all types because
+        // AAPCS64 places stack args in parameter order.
         let mut stack_arg_offset = 16i32;
 
-        // Detect hidden return pointer for large struct returns
-        let sret_pseudo = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
+        // Consume the ABI contract through the shared AbiLowering helper.
+        // AAPCS64 is simpler than SysV AMD64: no `_Complex`-vs-two-SSE-
+        // struct distinction, no x87 long-double special case. The
+        // existing backend dispatched only on `is_float` and `Int128`,
+        // and we preserve those two specialized arms; everything else
+        // goes through the single-GP-register path.
+        let abi = Aapcs64Abi::new();
+        let lowering = AbiLowering::new(func, types);
 
-        // Allocate X8 for hidden return pointer if present
-        if let Some(sret) = sret_pseudo {
-            self.locations.insert(sret.id, Loc::Reg(Reg::X8));
+        // Allocate X8 for the hidden sret return pointer if present.
+        // (Unlike x86_64, X8 is a dedicated indirect-result register, not
+        // one of the eight ordinary arg registers, so the GP arg index is
+        // NOT incremented here.)
+        if let Some(sret_id) = lowering.sret_pseudo {
+            self.locations.insert(sret_id, Loc::Reg(Reg::X8));
         }
 
-        let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
+        for arg in lowering.iter_args(&abi) {
+            let pseudo = arg.pseudo;
 
-        for (i, (_name, typ)) in func.params.iter().enumerate() {
-            for pseudo in &func.pseudos {
-                if let PseudoKind::Arg(arg_idx) = pseudo.kind {
-                    if arg_idx == (i as u32) + arg_idx_offset {
-                        let is_fp = types.is_float(*typ);
-                        if is_fp {
-                            if fp_arg_idx < fp_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::VReg(fp_arg_regs[fp_arg_idx]));
-                                self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
-                                self.fp_pseudos.insert(pseudo.id);
-                            } else {
-                                // Stack args are placed in parameter order per AAPCS64
-                                self.locations
-                                    .insert(pseudo.id, Loc::Stack(stack_arg_offset));
-                                self.fp_pseudos.insert(pseudo.id);
-                                stack_arg_offset += 8;
-                            }
-                            fp_arg_idx += 1;
-                        } else if types.kind(*typ) == TypeKind::Int128 {
-                            // __int128 uses two consecutive GP registers
-                            if int_arg_idx + 1 < int_arg_regs.len() {
-                                // Allocate a 16-byte aligned stack slot for the int128
-                                // (int128 always lives on stack, never in a single reg)
-                                self.stack_offset += 16;
-                                let slot = -self.stack_offset;
-                                self.locations.insert(pseudo.id, Loc::Stack(slot));
-                                // Reserve both GP registers (they'll be stored in prologue)
-                                self.free_regs.retain(|&r| {
-                                    r != int_arg_regs[int_arg_idx]
-                                        && r != int_arg_regs[int_arg_idx + 1]
-                                });
-                            } else {
-                                // Stack args: int128 takes 16 bytes
-                                self.locations
-                                    .insert(pseudo.id, Loc::Stack(stack_arg_offset));
-                                stack_arg_offset += 16;
-                            }
-                            int_arg_idx += 2;
-                        } else {
-                            if int_arg_idx < int_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
-                                self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
-                            } else {
-                                // Stack args are placed in parameter order per AAPCS64
-                                self.locations
-                                    .insert(pseudo.id, Loc::Stack(stack_arg_offset));
-                                stack_arg_offset += 8;
-                            }
-                            int_arg_idx += 1;
-                        }
-                        break;
+            match &arg.class {
+                // Float / double / Float16 / long double — single V register
+                // (or stack slot when V0–V7 are exhausted).
+                ArgClass::Direct { classes, .. }
+                    if classes.len() == 1 && classes[0] == RegClass::Sse =>
+                {
+                    if fp_arg_idx < fp_arg_regs.len() {
+                        self.locations
+                            .insert(pseudo, Loc::VReg(fp_arg_regs[fp_arg_idx]));
+                        self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
+                        self.fp_pseudos.insert(pseudo);
+                    } else {
+                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
+                        self.fp_pseudos.insert(pseudo);
+                        stack_arg_offset += 8;
                     }
+                    fp_arg_idx += 1;
+                }
+                // __int128: two consecutive GP registers when available.
+                // The value always lives in a 16-byte aligned local stack
+                // slot; the prologue spills the register pair into it.
+                _ if arg.is_int128 => {
+                    if int_arg_idx + 1 < int_arg_regs.len() {
+                        self.stack_offset += 16;
+                        let slot = -self.stack_offset;
+                        self.locations.insert(pseudo, Loc::Stack(slot));
+                        self.free_regs.retain(|&r| {
+                            r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
+                        });
+                    } else {
+                        // Overflow: 16 bytes on caller stack.
+                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
+                        stack_arg_offset += 16;
+                    }
+                    int_arg_idx += 2;
+                }
+                // Integer / pointer / extension / mixed aggregate /
+                // HFA-or-Indirect-falling-through: all default to a
+                // single GP register or 8-byte stack slot. This matches
+                // the existing (admittedly limited) AAPCS64 handling
+                // that does not yet differentiate HFAs or large
+                // aggregates from ordinary integers.
+                _ => {
+                    if int_arg_idx < int_arg_regs.len() {
+                        self.locations
+                            .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
+                        self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
+                    } else {
+                        self.locations.insert(pseudo, Loc::Stack(stack_arg_offset));
+                        stack_arg_offset += 8;
+                    }
+                    int_arg_idx += 1;
                 }
             }
         }

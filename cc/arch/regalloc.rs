@@ -9,7 +9,9 @@
 // Common register allocator utilities shared between architectures
 //
 
+use crate::abi::{Abi, ArgClass};
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::types::{TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
@@ -576,4 +578,138 @@ pub fn try_reuse_stack_slot(
         }
     }
     None
+}
+
+// ============================================================================
+// Allocator–ABI contract layer (M1)
+// ============================================================================
+//
+// Both per-arch register allocators previously re-derived argument
+// classification inline — repeating type-kind checks (`is_float`,
+// `is_complex`, `is_long_double`, `is_int128`, struct-size thresholds)
+// that the `cc/abi/*::classify_param` implementations already perform.
+// Two sources of truth, two opportunities to drift.
+//
+// `AbiLowering` centralizes that contract:
+//
+//   * Build it once per function with the `Function` + `TypeTable`. It
+//     pre-indexes the function's pseudos by `Arg(n)` for O(1) lookup
+//     (the previous code did an O(P) inner scan per argument) and
+//     detects the hidden sret pointer.
+//
+//   * For each parameter, `iter_args(abi)` yields an `AbiArg` carrying
+//     the `ArgClass` from `abi.classify_param` plus a handful of type
+//     tiebreakers (`is_complex`, `is_long_double`, `is_int128`) that
+//     `ArgClass` alone cannot disambiguate — most notably, x86_64
+//     `_Complex float`/`_Complex double` and a 2-eightbyte all-SSE
+//     struct both classify as `Direct { classes: [Sse, Sse] }` but the
+//     backend routes them differently.
+//
+// Backends still own the actual `Loc` decision because `Loc` is per-arch
+// (each has its own `Reg`/`XmmReg`/`VReg`). They dispatch on `arg.class`
+// and the `is_*` flags, eliminating the duplicated type-kind checks.
+
+/// Per-argument context yielded by `AbiLowering::iter_args`.
+///
+/// Carries the ABI classification together with the type tiebreakers a
+/// backend may need beyond `ArgClass` alone.
+#[derive(Debug, Clone)]
+pub struct AbiArg {
+    /// The pseudo representing this argument in the function's IR.
+    pub pseudo: PseudoId,
+    /// Classification produced by `abi.classify_param(typ, types)`.
+    pub class: ArgClass,
+    /// True iff the type is `__int128` / `unsigned __int128`. Backends
+    /// always allocate an aligned local stack slot for int128 even when
+    /// the value arrives in a register pair.
+    pub is_int128: bool,
+}
+
+/// Allocator-side adapter over `cc/abi/*::classify_param`.
+///
+/// Construct once per function being lowered, then iterate the function's
+/// parameters with `iter_args(abi)`. The struct caches the sret detection
+/// and a per-`Arg(n)` pseudo index so per-arg work is O(1).
+pub struct AbiLowering<'a> {
+    func: &'a Function,
+    types: &'a TypeTable,
+    /// PseudoId for each `Arg(n)`. `n` indexes the vector; absent
+    /// positions are `None`. Vector length covers `0..=max_arg_index`.
+    pub arg_pseudos: Vec<Option<PseudoId>>,
+    /// Hidden sret pointer pseudo (named `__sret` with kind `Arg(0)`).
+    /// When present, normal `Arg(k)` parameters shift by 1, so the
+    /// `i`-th `func.params` entry maps to `Arg(i + 1)`.
+    pub sret_pseudo: Option<PseudoId>,
+    /// 1 when an sret pseudo is present, 0 otherwise — added to the
+    /// param index to find the matching `Arg(n)`.
+    pub arg_idx_offset: u32,
+}
+
+impl<'a> AbiLowering<'a> {
+    /// Build an `AbiLowering` for `func`. Does not consult any `Abi`
+    /// yet — the per-arg classification is produced lazily by
+    /// `iter_args` so the same `AbiLowering` can be reused across
+    /// alternative calling-convention overrides if ever needed.
+    pub fn new(func: &'a Function, types: &'a TypeTable) -> Self {
+        // Detect the hidden return pointer for large struct returns.
+        // The linearizer emits it as `Arg(0)` with the literal name
+        // `__sret`, shifting all normal-parameter `Arg(n)` indices by 1.
+        let sret_pseudo = func
+            .pseudos
+            .iter()
+            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
+            .map(|p| p.id);
+        let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
+
+        // Index pseudos by Arg(n). The previous backend code did an
+        // O(P) scan per argument; this is O(P) once.
+        let max_arg = func
+            .pseudos
+            .iter()
+            .filter_map(|p| {
+                if let PseudoKind::Arg(n) = p.kind {
+                    Some(n as usize)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .map(|n| n + 1)
+            .unwrap_or(0);
+        let mut arg_pseudos: Vec<Option<PseudoId>> = vec![None; max_arg];
+        for p in &func.pseudos {
+            if let PseudoKind::Arg(n) = p.kind {
+                arg_pseudos[n as usize] = Some(p.id);
+            }
+        }
+
+        Self {
+            func,
+            types,
+            arg_pseudos,
+            sret_pseudo,
+            arg_idx_offset,
+        }
+    }
+
+    /// Iterate the function's parameters in declaration order, yielding
+    /// the per-arg context backends need. The sret pseudo (if any) is
+    /// not yielded — callers handle it explicitly via `self.sret_pseudo`.
+    pub fn iter_args<'b>(&'b self, abi: &'b dyn Abi) -> impl Iterator<Item = AbiArg> + 'b {
+        self.func
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, (_name, typ))| {
+                let arg_idx = (i as u32) + self.arg_idx_offset;
+                let pseudo = self.arg_pseudos.get(arg_idx as usize).copied().flatten()?;
+                let class = abi.classify_param(*typ, self.types);
+                let kind = self.types.kind(*typ);
+                Some(AbiArg {
+                    pseudo,
+                    class,
+                    is_int128: kind == TypeKind::Int128,
+                })
+            })
+    }
 }

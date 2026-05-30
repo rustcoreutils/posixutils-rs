@@ -130,8 +130,33 @@ pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) 
 }
 
 /// Find registers that would conflict with this interval due to constraints.
-/// If a pseudo is live at a constraint point and is NOT an operand of that
-/// instruction, it cannot be allocated to any clobbered register.
+///
+/// A constraint point models an instruction that clobbers one or more
+/// physical registers (e.g. `idivl` clobbers RAX and RDX). For any live
+/// interval that overlaps such a point, we must keep that pseudo out of the
+/// clobbered registers — otherwise its value would be silently destroyed.
+///
+/// There is one exception: pseudos that are direct *operands* of the
+/// constraining instruction (`involved_pseudos`) MAY occupy a clobbered
+/// register, because the constraining instruction itself reads or writes
+/// those registers as part of its semantics. The classic case is the
+/// integer dividend, which must be in RAX/EAX for `idiv` to execute.
+///
+/// Crucially, that "operand exemption" only holds when the operand's value
+/// dies at the constraint point (`interval.end == cp.position`). When the
+/// interval extends *past* the clobber (`interval.end > cp.position`), the
+/// operand's value is still needed afterward, but the clobbering
+/// instruction will have destroyed it. In that case the allocator must
+/// pick a NON-clobbered register; codegen will materialize the value into
+/// the operand-required register (e.g. RAX) with a move just before the
+/// constraint, preserving the original pseudo's contents for later uses.
+///
+/// Without this distinction, `Copy`/CSE/SCCP-class passes that extend a
+/// pseudo's live range across a `mods.32`/`idivl` boundary silently
+/// miscompile (see git history: prior copyprop attempts hung do-while-
+/// continue tests by allocating the dividend to RAX with a use after the
+/// idiv).
+///
 /// Generic over register type R.
 pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
     interval: &LiveInterval,
@@ -140,12 +165,15 @@ pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
     let mut conflicts = HashSet::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
 
     for cp in constraint_points {
-        // If interval is live at this constraint point...
-        // Use <= for end to handle case where interval ends exactly at constraint point
+        // Use <= on both ends so an interval that exactly meets the
+        // constraint point still counts as overlapping.
         if interval.start <= cp.position && cp.position <= interval.end {
-            // ...and this pseudo is NOT involved in the constrained instruction...
-            if !cp.involved_pseudos.contains(&interval.pseudo) {
-                // ...then it cannot be in any clobbered register
+            let is_involved = cp.involved_pseudos.contains(&interval.pseudo);
+            let dies_at_point = interval.end == cp.position;
+            // The operand exemption only applies when the value is
+            // consumed AT the constraint point. If it must survive past
+            // the clobber, it has to live in a non-clobbered register.
+            if !is_involved || !dies_at_point {
                 for &reg in &cp.clobbers {
                     conflicts.insert(reg);
                 }

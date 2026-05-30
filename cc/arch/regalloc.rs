@@ -326,24 +326,42 @@ where
         .map(|p| p.id)
         .collect();
 
-    // Phase B: Compute gen/kill sets and per-pseudo per-block positions
-    let mut gen: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
-    let mut kill: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    // Phase B: per-block first/last use positions, def-block map, and the
+    // set of pseudos written in each block (used to bound liveness via
+    // Phase C's Boissinot Up_and_Mark traversal). Replaces the legacy
+    // gen/kill + backward dataflow fixpoint.
     let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
+    let mut defined_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    // Per-pseudo set of defining blocks. The IR pcc hands to the
+    // allocator is *not* strictly SSA: lower::eliminate_phi_nodes
+    // converts each Phi into one Copy per predecessor edge, all
+    // targeting the same pseudo. A single pseudo therefore has up to
+    // `phi.phi_list.len()` defs spread across predecessor blocks.
+    // Boissinot's Up_and_Mark must stop at ANY of those defs — tracking
+    // only one would cause spurious live-in propagation past the
+    // other defs and inflate the interference graph.
+    //
+    // Arg pseudos are defined implicitly at entry; Sym pseudos at
+    // their declaration block; regular instruction targets at the
+    // block they sit in. All cases push to the same per-pseudo def
+    // set.
+    let mut def_blocks: HashMap<PseudoId, HashSet<usize>> = HashMap::new();
 
-    // Phase B.0: Pre-populate kill[] with Sym pseudo declaration points.
-    // Sym pseudos (local variable stack addresses) are never instruction targets —
-    // they only appear as sources in Load/Store/SymAddr. Without explicit kill points,
-    // backward dataflow propagates every Sym's liveness back to function entry, making
-    // ALL block-scoped locals appear simultaneously live. This prevents stack slot reuse
-    // for variables in different switch/case blocks or computed-goto dispatch targets.
-    // By killing each Sym at its declaration block BEFORE the gen/kill scan, uses of
-    // Sym pseudos in their declaration block won't be added to gen[], bounding liveness
-    // to [decl_block, last_use] and enabling slot reuse for non-overlapping scopes.
+    for &arg_pseudo in &arg_pseudos {
+        def_blocks.entry(arg_pseudo).or_default().insert(0);
+        defined_in[0].insert(arg_pseudo);
+        first_pos_map[0].entry(arg_pseudo).or_insert(0);
+        last_pos_map[0].entry(arg_pseudo).or_insert(0);
+    }
+
     for local_var in func.locals.values() {
         if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
-            kill[block_idx].insert(local_var.sym);
+            def_blocks
+                .entry(local_var.sym)
+                .or_default()
+                .insert(block_idx);
+            defined_in[block_idx].insert(local_var.sym);
             first_pos_map[block_idx]
                 .entry(local_var.sym)
                 .or_insert(block_start_pos[block_idx]);
@@ -355,82 +373,162 @@ where
 
     for (idx, block) in func.blocks.iter().enumerate() {
         for (ipos, insn) in (block_start_pos[idx]..).zip(block.insns.iter()) {
-            // Uses: if not yet killed in this block, add to gen
             for &src in &insn.src {
-                if !kill[idx].contains(&src) {
-                    gen[idx].insert(src);
-                }
                 first_pos_map[idx].entry(src).or_insert(ipos);
                 last_pos_map[idx].insert(src, ipos);
             }
             if let Some(indirect) = insn.indirect_target {
-                if !kill[idx].contains(&indirect) {
-                    gen[idx].insert(indirect);
-                }
                 first_pos_map[idx].entry(indirect).or_insert(ipos);
                 last_pos_map[idx].insert(indirect, ipos);
             }
-            // Inline asm operands are stored in asm_data, not in src/target
             if insn.op == Opcode::Asm {
                 if let Some(asm) = &insn.asm_data {
                     for input in &asm.inputs {
                         let p = input.pseudo;
-                        if !kill[idx].contains(&p) {
-                            gen[idx].insert(p);
-                        }
                         first_pos_map[idx].entry(p).or_insert(ipos);
                         last_pos_map[idx].insert(p, ipos);
                     }
                     for output in &asm.outputs {
                         let p = output.pseudo;
-                        kill[idx].insert(p);
+                        def_blocks.entry(p).or_default().insert(idx);
+                        defined_in[idx].insert(p);
                         first_pos_map[idx].entry(p).or_insert(ipos);
                         last_pos_map[idx].insert(p, ipos);
                     }
                 }
             }
-            // Defs: add to kill
             if let Some(target) = insn.target {
-                kill[idx].insert(target);
+                def_blocks.entry(target).or_default().insert(idx);
+                defined_in[idx].insert(target);
                 first_pos_map[idx].entry(target).or_insert(ipos);
                 last_pos_map[idx].insert(target, ipos);
             }
         }
     }
 
-    // Arguments are implicitly defined at entry block
-    if num_blocks > 0 {
-        for &arg_pseudo in &arg_pseudos {
-            kill[0].insert(arg_pseudo);
-            first_pos_map[0].entry(arg_pseudo).or_insert(0);
-            last_pos_map[0].entry(arg_pseudo).or_insert(0);
-        }
-    }
-
-    // Phase C: Backward dataflow fixpoint for liveness
-    // LIVE_out[B] = ∪ LIVE_in[S] for all successors S of B
-    // LIVE_in[B]  = GEN[B] ∪ (LIVE_out[B] − KILL[B])
-    let mut live_in: Vec<HashSet<PseudoId>> = gen.clone();
+    // Phase C: Boissinot 2011 Up_and_Mark. For each use site, BFS
+    // upward through predecessor edges marking `live_in[B]` and
+    // `live_out[parent]` until reaching the def block (the use was
+    // downstream of the def, so the def block itself is not live-in
+    // for this pseudo). Each (pseudo, block) pair is visited at most
+    // once — no global fixpoint iteration.
+    //
+    // Pseudos with no recorded def site (constants, globals, or
+    // implicit values that flow into the function from a context the
+    // IR doesn't model) propagate all the way back to the entry block
+    // and stop there because the entry block has no predecessors.
+    // This matches the legacy fixpoint's behavior of treating "no kill"
+    // as "live from entry".
+    let mut live_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
     let mut live_out: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for idx in (0..num_blocks).rev() {
-            for &child_id in &func.blocks[idx].children {
-                if let Some(&child_idx) = bb_id_to_idx.get(&child_id) {
-                    for &p in &live_in[child_idx] {
-                        if live_out[idx].insert(p) {
-                            changed = true;
+    let mut worklist: Vec<usize> = Vec::with_capacity(num_blocks);
+
+    let propagate_use = |use_block: usize,
+                         pseudo: PseudoId,
+                         live_in: &mut [HashSet<PseudoId>],
+                         live_out: &mut [HashSet<PseudoId>],
+                         worklist: &mut Vec<usize>| {
+        let defs = def_blocks.get(&pseudo);
+        worklist.clear();
+        // Seed the use block unconditionally — we are AT a use site,
+        // and the caller has already determined the pseudo isn't
+        // defined earlier in this block (else `defined_so_far` would
+        // have suppressed the call). The same-block redef case (e.g.
+        // lower.rs's Copy-before-terminator producing a later def of
+        // the same pseudo) still needs liveness to flow in from
+        // predecessors to satisfy this use.
+        if live_in[use_block].insert(pseudo) {
+            for &parent_id in &func.blocks[use_block].parents {
+                if let Some(&parent_idx) = bb_id_to_idx.get(&parent_id) {
+                    live_out[parent_idx].insert(pseudo);
+                    worklist.push(parent_idx);
+                }
+            }
+        }
+        while let Some(b) = worklist.pop() {
+            // When traversing from a successor (i.e. not the original
+            // use block), stop at any defining block — the def supplies
+            // the value, no need to propagate past.
+            if defs.is_some_and(|d| d.contains(&b)) {
+                continue;
+            }
+            if !live_in[b].insert(pseudo) {
+                continue;
+            }
+            for &parent_id in &func.blocks[b].parents {
+                if let Some(&parent_idx) = bb_id_to_idx.get(&parent_id) {
+                    live_out[parent_idx].insert(pseudo);
+                    worklist.push(parent_idx);
+                }
+            }
+        }
+    };
+
+    for (idx, block) in func.blocks.iter().enumerate() {
+        // For uses appearing in the same block as the def of a pseudo,
+        // we only invoke Up_and_Mark if the def hasn't run yet at that
+        // point — otherwise the use is satisfied locally and the value
+        // need not be live-in. We track defined-so-far separately from
+        // `defined_in` (which is the whole-block summary) by walking
+        // the block in program order.
+        let mut defined_so_far: HashSet<PseudoId> = HashSet::new();
+        // Args and Sym decls are considered defined at the start of
+        // the block they belong to, before any instruction.
+        if idx == 0 {
+            for &arg in &arg_pseudos {
+                defined_so_far.insert(arg);
+            }
+        }
+        for local_var in func.locals.values() {
+            if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
+                if block_idx == idx {
+                    defined_so_far.insert(local_var.sym);
+                }
+            }
+        }
+
+        for insn in &block.insns {
+            for &src in &insn.src {
+                if !defined_so_far.contains(&src) {
+                    propagate_use(idx, src, &mut live_in, &mut live_out, &mut worklist);
+                }
+            }
+            if let Some(indirect) = insn.indirect_target {
+                if !defined_so_far.contains(&indirect) {
+                    propagate_use(idx, indirect, &mut live_in, &mut live_out, &mut worklist);
+                }
+            }
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    for input in &asm.inputs {
+                        if !defined_so_far.contains(&input.pseudo) {
+                            propagate_use(
+                                idx,
+                                input.pseudo,
+                                &mut live_in,
+                                &mut live_out,
+                                &mut worklist,
+                            );
                         }
+                    }
+                    for output in &asm.outputs {
+                        defined_so_far.insert(output.pseudo);
                     }
                 }
             }
-            for &p in &live_out[idx] {
-                if !kill[idx].contains(&p) && live_in[idx].insert(p) {
-                    changed = true;
-                }
+            if let Some(target) = insn.target {
+                defined_so_far.insert(target);
             }
         }
+    }
+
+    // Phase C.1: Args occupy their calling-convention register from
+    // function entry. The allocator needs to see them as live at the
+    // entry-block start so it doesn't reuse the arg register for an
+    // unrelated pseudo whose interval starts at 0. Force them into
+    // live_in[0] regardless of where Boissinot terminated propagation.
+    for &arg_pseudo in &arg_pseudos {
+        live_in[0].insert(arg_pseudo);
     }
 
     // Phase D: Construct intervals from liveness
@@ -441,8 +539,8 @@ where
 
     for idx in 0..num_blocks {
         let mut referenced: HashSet<PseudoId> =
-            HashSet::with_capacity(kill[idx].len() + live_in[idx].len());
-        for &p in &kill[idx] {
+            HashSet::with_capacity(defined_in[idx].len() + live_in[idx].len());
+        for &p in &defined_in[idx] {
             referenced.insert(p);
         }
         for &p in &live_in[idx] {

@@ -628,6 +628,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Add as a global - static locals always have internal linkage
         // Check for thread-local storage
         let modifiers = self.types.modifiers(declarator.typ);
+        // Const at the object level for section selection (see linearize_init.rs)
+        let is_const = super::linearize_init::is_const_object_type(self.types, declarator.typ);
         if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
             self.module.add_global_tls_aligned(
                 &global_name,
@@ -635,6 +637,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 init,
                 declarator.explicit_align,
                 true, // static locals always have internal linkage
+                is_const,
             );
         } else {
             self.module.add_global_aligned(
@@ -643,6 +646,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 init,
                 declarator.explicit_align,
                 true, // static locals always have internal linkage
+                is_const,
             );
         }
     }

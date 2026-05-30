@@ -214,15 +214,22 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             align = align.max(16);
         }
 
-        // Use .comm for uninitialized external (non-static) non-TLS globals
-        // TLS variables can't use .comm
-        let use_bss = matches!(global.init, Initializer::None)
-            && !global.is_static
-            && !global.is_thread_local;
+        // Anonymous compound-literal globals (name starts with '.') are addressed
+        // as locals via `.LC`-style labels — they must remain ordinary data labels.
+        let is_local_label = global.name.starts_with('.');
 
-        if use_bss {
-            // Use .comm for uninitialized external globals
-            self.push_directive(Directive::comm(&global.name, size, align));
+        // Route zero-initialized non-TLS globals to BSS-class storage. This costs
+        // nothing in the object file and lets the kernel lazy-allocate pages.
+        //
+        // The path also handles tentative definitions (`int x;`) and explicit
+        // zero-initializers (`int x = 0;` / `static int arr[1000] = {0};`).
+        let zero_init = !global.is_thread_local && size > 0 && global.init.is_all_zero();
+        if zero_init && !is_local_label {
+            if global.is_static {
+                self.push_directive(Directive::bss_local(&global.name, size, align));
+            } else {
+                self.push_directive(Directive::comm(&global.name, size, align));
+            }
             return;
         }
 
@@ -235,16 +242,22 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // Initialized TLS: .tdata section
                 self.push_directive(Directive::Tdata);
             }
+        } else if global.is_const {
+            // Read-only data. If the initializer contains symbol addresses, the
+            // dynamic linker has to fix them up: put it in `.data.rel.ro` so
+            // it can be mapped read-only after relocations are applied.
+            if global.init.has_reloc() {
+                self.push_directive(Directive::DataRelRo);
+            } else {
+                self.push_directive(Directive::Rodata);
+            }
         } else {
             // Regular data section
             self.push_directive(Directive::Data);
         }
 
-        // Check if this is a local symbol (starts with '.')
-        let is_local = global.name.starts_with('.');
-
-        // Global visibility (if not static and not local)
-        if !global.is_static && !is_local {
+        // Global visibility (if not static and not a `.LC...`-style local label)
+        if !global.is_static && !is_local_label {
             self.push_directive(Directive::global(&global.name));
         }
 
@@ -263,7 +276,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         // Label - use local_label for names starting with '.'
-        if is_local {
+        if is_local_label {
             self.push_directive(Directive::local_label(&global.name));
         } else {
             self.push_directive(Directive::global_label(&global.name));

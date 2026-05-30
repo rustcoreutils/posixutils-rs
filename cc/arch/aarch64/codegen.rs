@@ -35,8 +35,12 @@ use std::collections::{HashMap, HashSet};
 pub struct Aarch64CodeGen {
     /// Common code generation infrastructure
     pub(super) base: CodeGenBase<Aarch64Inst>,
-    /// Current function's register allocation
-    locations: HashMap<PseudoId, Loc>,
+    /// Current function's register allocation. M2 routes every PseudoId
+    /// → Loc lookup through `LocationMap` so codegen never derives an
+    /// alternative location from `PseudoKind`. The intrinsic-result
+    /// sites that write into the map are the only post-allocate writers
+    /// and remain visible as `.set` calls.
+    locations: crate::arch::regalloc::LocationMap<Loc>,
     /// Current function's pseudos (for looking up values)
     pub(super) pseudos: Vec<Pseudo>,
     /// Total frame size for current function
@@ -84,7 +88,7 @@ impl Aarch64CodeGen {
     pub fn new(target: Target) -> Self {
         Self {
             base: CodeGenBase::new(target),
-            locations: HashMap::new(),
+            locations: crate::arch::regalloc::LocationMap::new(),
             pseudos: Vec::new(),
             frame_size: 0,
             callee_saved_size: 0,
@@ -719,7 +723,7 @@ impl Aarch64CodeGen {
             .iter()
             .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
         {
-            if let Some(Loc::Stack(offset)) = self.locations.get(&sret.id) {
+            if let Some(Loc::Stack(offset)) = self.locations.get_ref(sret.id) {
                 if *offset < 0 {
                     self.push_lir(Aarch64Inst::Str {
                         size: OperandSize::B64,
@@ -831,7 +835,7 @@ impl Aarch64CodeGen {
                                 let param_name = &func.params[i].0;
                                 if let Some(local) = func.locals.get(param_name) {
                                     if let Some(&Loc::Stack(offset)) =
-                                        self.locations.get(&local.sym)
+                                        self.locations.get_ref(local.sym)
                                     {
                                         let (fp_size, second_offset) = if is_hfa_two {
                                             // HFA-2: use ABI classification to get base type
@@ -869,7 +873,8 @@ impl Aarch64CodeGen {
                         } else if is_fp {
                             // FP argument
                             if fp_arg_idx < fp_arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
+                                {
                                     if *offset < 0 {
                                         let fp_size = if types.size_bits(*typ) == 32 {
                                             FpSize::Single
@@ -890,7 +895,8 @@ impl Aarch64CodeGen {
                             // Store to the arg pseudo's stack slot (allocated in allocate_arguments).
                             // The IR will Copy from arg pseudo → local variable.
                             if int_arg_idx + 1 < arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
+                                {
                                     if *offset < 0 {
                                         self.push_lir(Aarch64Inst::Stp {
                                             size: OperandSize::B64,
@@ -905,7 +911,8 @@ impl Aarch64CodeGen {
                         } else {
                             // GP argument
                             if int_arg_idx < arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
+                                {
                                     // Move from arg register to stack
                                     if *offset < 0 {
                                         self.push_lir(Aarch64Inst::Str {
@@ -1505,7 +1512,7 @@ impl Aarch64CodeGen {
             Opcode::SetVal => {
                 if let Some(target) = insn.target {
                     if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
-                        match self.locations.get(&target).cloned() {
+                        match self.locations.get(target) {
                             Some(Loc::Reg(r)) => {
                                 if let PseudoKind::Val(v) = &pseudo.kind {
                                     self.emit_mov_imm(r, *v as i64, insn.size);
@@ -1767,7 +1774,7 @@ impl Aarch64CodeGen {
     }
 
     pub(super) fn get_location(&self, pseudo: PseudoId) -> Loc {
-        self.locations.get(&pseudo).cloned().unwrap_or(Loc::Imm(0))
+        self.locations.get(pseudo).unwrap_or(Loc::Imm(0))
     }
 
     /// Load address of a global symbol into a register
@@ -3070,7 +3077,7 @@ impl Aarch64CodeGen {
             dst: Reg::X0,
         });
 
-        self.locations.insert(target, Loc::Reg(Reg::X0));
+        self.locations.set(target, Loc::Reg(Reg::X0));
     }
 
     /// Emit atomic store
@@ -3098,7 +3105,7 @@ impl Aarch64CodeGen {
 
         // Atomic store has no result value
         if let Some(target) = insn.target {
-            self.locations.insert(target, Loc::Imm(0));
+            self.locations.set(target, Loc::Imm(0));
         }
     }
 
@@ -3150,7 +3157,7 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.insert(target, Loc::Reg(Reg::X1));
+        self.locations.set(target, Loc::Reg(Reg::X1));
     }
 
     /// Emit atomic compare-and-swap using LL/SC
@@ -3257,7 +3264,7 @@ impl Aarch64CodeGen {
         // Done label
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
 
-        self.locations.insert(target, Loc::Reg(Reg::X2));
+        self.locations.set(target, Loc::Reg(Reg::X2));
     }
 
     /// Emit atomic fetch-and-add using LL/SC
@@ -3316,7 +3323,7 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.insert(target, Loc::Reg(Reg::X1));
+        self.locations.set(target, Loc::Reg(Reg::X1));
     }
 
     /// Emit atomic fetch-and-subtract using LL/SC
@@ -3375,7 +3382,7 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.insert(target, Loc::Reg(Reg::X1));
+        self.locations.set(target, Loc::Reg(Reg::X1));
     }
 
     /// Emit atomic fetch-and-AND using LL/SC
@@ -3470,7 +3477,7 @@ impl Aarch64CodeGen {
         });
 
         // Result: X1 = old value
-        self.locations.insert(target, Loc::Reg(Reg::X1));
+        self.locations.set(target, Loc::Reg(Reg::X1));
     }
 
     /// Emit memory fence
@@ -3504,7 +3511,7 @@ impl Aarch64CodeGen {
 
         // Fence has no result value, but set target to 0 if present
         if let Some(target) = insn.target {
-            self.locations.insert(target, Loc::Imm(0));
+            self.locations.set(target, Loc::Imm(0));
         }
     }
 

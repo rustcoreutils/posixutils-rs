@@ -4921,7 +4921,10 @@ fn test_valist_local_not_indirect() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Use linearize_no_ssa so mem2reg doesn't drop the unused local before
+    // we get to inspect it (this test checks the linearizer's storage shape,
+    // not what later passes do with an unused declaration).
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
 
     // Check that the function has a local for lva (may have suffix like ".0")
     let test_func = module.functions.iter().find(|f| f.name == "test");

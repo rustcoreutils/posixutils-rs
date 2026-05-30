@@ -457,15 +457,23 @@ fn rename_block(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &m
 /// Creates PhiSource instructions in each predecessor block that feed
 /// into the phi nodes, following sparse's OP_PHISOURCE design.
 fn fill_phi_operands(converter: &mut SsaConverter) {
-    // Collect phi info first
+    // Collect phi info first. Within each block, sort by variable
+    // name so the per-variable order of PhiSource allocation is
+    // deterministic across runs — `alloc_phi` and the undef-pseudo
+    // path both bump `next_pseudo_id`, and HashMap iteration of
+    // `bb.phi_map` would otherwise vary that ordering.
     let phi_info: Vec<(BasicBlockId, usize, String)> = converter
         .func
         .blocks
         .iter()
         .flat_map(|bb| {
-            bb.phi_map
+            let mut entries: Vec<(BasicBlockId, usize, String)> = bb
+                .phi_map
                 .iter()
-                .map(move |(name, &idx)| (bb.id, idx, name.clone()))
+                .map(|(name, &idx)| (bb.id, idx, name.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.2.cmp(&b.2));
+            entries
         })
         .collect();
 
@@ -629,8 +637,12 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
 
     let mut converter = SsaConverter::new(func);
 
-    // Phase 1: Analyze variables and insert phi nodes
-    let local_names: Vec<String> = converter.func.locals.keys().cloned().collect();
+    // Phase 1: Analyze variables and insert phi nodes. Process local
+    // names in sorted order so phi pseudo IDs are stable across runs
+    // (HashMap iteration order is randomized by RandomState and would
+    // otherwise produce non-deterministic IR).
+    let mut local_names: Vec<String> = converter.func.locals.keys().cloned().collect();
+    local_names.sort();
 
     for var_name in &local_names {
         if let Some(var_info) = analyze_variable(converter.func, types, var_name) {

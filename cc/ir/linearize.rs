@@ -10,6 +10,7 @@
 // Converts AST to SSA-form IR with basic blocks and typed pseudo-registers
 //
 
+use super::mem2reg::mem2reg;
 use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer, Instruction, MemoryOrder, Module,
@@ -1083,6 +1084,9 @@ impl<'a> Linearizer<'a> {
             if let Some(ref mut ir_func) = self.current_func {
                 ssa_convert(ir_func, self.types);
                 // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
+                // M3: drop func.locals entries whose Sym is now unused so the
+                // backend regalloc no longer allocates a stack slot for them.
+                mem2reg(ir_func);
             }
         } else {
             // Only set next_pseudo if SSA was NOT run (SSA sets its own)

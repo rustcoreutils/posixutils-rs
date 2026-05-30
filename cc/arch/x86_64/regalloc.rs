@@ -498,7 +498,11 @@ impl RegAlloc {
     }
 
     /// Perform register allocation for a function
-    pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
+    pub fn allocate(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+    ) -> crate::arch::regalloc::LocationMap<Loc> {
         self.reset_state();
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
@@ -521,7 +525,7 @@ impl RegAlloc {
         self.allocate_alloca_to_stack(func);
         self.run_linear_scan(func, types, intervals, &call_positions, &constraint_points);
 
-        self.locations.clone()
+        crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
 
     /// Reset allocator state for a new function
@@ -676,6 +680,8 @@ impl RegAlloc {
     /// - First 8 FP args in XMM0-XMM7
     /// - Remaining args go on the stack in parameter order (not separated by type)
     fn allocate_arguments(&mut self, func: &Function, types: &TypeTable) {
+        use crate::arch::regalloc::AbiLowering;
+
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = XmmReg::arg_regs();
         let mut int_arg_idx = 0;
@@ -685,131 +691,127 @@ impl RegAlloc {
         // 16 = saved rbp (8) + return address (8)
         let mut stack_arg_offset = 16i32;
 
-        // Detect hidden return pointer for large struct returns
-        let sret_pseudo = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
+        // M1: use the shared AbiLowering helper for sret detection and
+        // O(1) Arg(n) → pseudo lookup. The classification dispatch below
+        // retains the original inline type-kind checks to guarantee
+        // byte-identical codegen with the pre-M1 implementation.
+        let lowering = AbiLowering::new(func, types);
+        let arg_idx_offset = lowering.arg_idx_offset;
 
         // Allocate RDI for hidden return pointer if present
-        if let Some(sret) = sret_pseudo {
-            self.locations.insert(sret.id, Loc::Reg(int_arg_regs[0]));
+        if let Some(sret_id) = lowering.sret_pseudo {
+            self.locations.insert(sret_id, Loc::Reg(int_arg_regs[0]));
             self.free_regs.retain(|&r| r != int_arg_regs[0]);
             int_arg_idx += 1;
         }
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
-            for pseudo in &func.pseudos {
-                if let PseudoKind::Arg(arg_idx) = pseudo.kind {
-                    if arg_idx == (i as u32) + arg_idx_offset {
-                        let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
-                        let is_fp = types.is_float(*typ);
-                        let is_complex = types.is_complex(*typ);
-                        let type_size = types.size_bits(*typ);
-                        let is_two_sse_struct = !is_complex
-                            && (types.kind(*typ) == crate::types::TypeKind::Struct
-                                || types.kind(*typ) == crate::types::TypeKind::Union)
-                            && type_size > 64
-                            && type_size <= 128
-                            && {
-                                use crate::abi::{Abi, SysVAmd64Abi};
-                                matches!(
-                                    SysVAmd64Abi.classify_param(*typ, types),
-                                    crate::abi::ArgClass::Direct { ref classes, .. }
-                                        if classes.len() == 2
-                                            && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                                )
-                            };
+            let arg_n = (i as u32) + arg_idx_offset;
+            let Some(pseudo_id) = lowering.arg_pseudos.get(arg_n as usize).copied().flatten()
+            else {
+                continue;
+            };
+            let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble;
+            let is_fp = types.is_float(*typ);
+            let is_complex = types.is_complex(*typ);
+            let type_size = types.size_bits(*typ);
+            let is_two_sse_struct = !is_complex
+                && (types.kind(*typ) == crate::types::TypeKind::Struct
+                    || types.kind(*typ) == crate::types::TypeKind::Union)
+                && type_size > 64
+                && type_size <= 128
+                && {
+                    use crate::abi::{Abi, SysVAmd64Abi};
+                    matches!(
+                        SysVAmd64Abi.classify_param(*typ, types),
+                        crate::abi::ArgClass::Direct { ref classes, .. }
+                            if classes.len() == 2
+                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
+                    )
+                };
 
-                        // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
-                        if is_longdouble {
-                            // Long double takes 16 bytes on stack (80-bit padded to 128-bit)
-                            self.locations
-                                .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
-                            self.fp_pseudos.insert(pseudo.id);
-                            stack_arg_offset += 16;
-                        } else if is_two_sse_struct {
-                            // 2-SSE struct: uses two XMM regs. Don't assign to register —
-                            // the codegen stores both XMM values to the local's stack slot.
-                            // Just consume the FP arg indices without assigning a location;
-                            // the pseudo will get a stack slot from normal allocation.
-                            fp_arg_idx += 2;
-                        } else if is_complex {
-                            // Complex: uses two consecutive XMM registers
-                            if fp_arg_idx + 1 < fp_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                                self.free_xmm_regs.retain(|&r| {
-                                    r != fp_arg_regs[fp_arg_idx] && r != fp_arg_regs[fp_arg_idx + 1]
-                                });
-                                self.fp_pseudos.insert(pseudo.id);
-                            } else {
-                                self.locations
-                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
-                                stack_arg_offset += 16;
-                            }
-                            fp_arg_idx += 2;
-                        } else if is_fp {
-                            if fp_arg_idx < fp_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                                self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
-                                self.fp_pseudos.insert(pseudo.id);
-                            } else {
-                                // Stack args are placed in parameter order per System V AMD64 ABI
-                                self.locations
-                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
-                                stack_arg_offset += 8;
-                            }
-                            fp_arg_idx += 1;
-                        } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
-                            // __int128: uses two GP registers when available.
-                            // Always allocate a local stack slot — for register params,
-                            // store_args_to_stack stores register values; for stack params,
-                            // store_args_to_stack copies from the incoming arg area.
-                            self.stack_offset = (self.stack_offset + 15) & !15;
-                            self.stack_offset += 16;
-                            self.locations
-                                .insert(pseudo.id, Loc::Stack(self.stack_offset));
-                            self.int128_pseudos.insert(pseudo.id);
-                            if int_arg_idx + 1 < int_arg_regs.len() {
-                                self.free_regs.retain(|&r| {
-                                    r != int_arg_regs[int_arg_idx]
-                                        && r != int_arg_regs[int_arg_idx + 1]
-                                });
-                            } else {
-                                stack_arg_offset += 16;
-                            }
-                            int_arg_idx += 2;
-                        } else {
-                            let type_size = types.size_bits(*typ);
-                            let is_large_struct = (types.kind(*typ)
-                                == crate::types::TypeKind::Struct
-                                || types.kind(*typ) == crate::types::TypeKind::Union)
-                                && type_size > 128;
-                            if is_large_struct {
-                                // Large struct (> 16 bytes): always passed on stack per
-                                // SysV AMD64 ABI. Advance by full struct size.
-                                self.locations
-                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
-                                stack_arg_offset += (type_size / 8) as i32;
-                                // Don't increment int_arg_idx — no GP register consumed
-                            } else if int_arg_idx < int_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
-                                self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
-                                int_arg_idx += 1;
-                            } else {
-                                // Stack args are placed in parameter order per System V AMD64 ABI
-                                self.locations
-                                    .insert(pseudo.id, Loc::IncomingArg(stack_arg_offset));
-                                stack_arg_offset += 8;
-                                int_arg_idx += 1;
-                            }
-                        }
-                        break;
-                    }
+            // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
+            if is_longdouble {
+                // Long double takes 16 bytes on stack (80-bit padded to 128-bit)
+                self.locations
+                    .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                self.fp_pseudos.insert(pseudo_id);
+                stack_arg_offset += 16;
+            } else if is_two_sse_struct {
+                // 2-SSE struct: uses two XMM regs. Don't assign to register —
+                // the codegen stores both XMM values to the local's stack slot.
+                // Just consume the FP arg indices without assigning a location;
+                // the pseudo will get a stack slot from normal allocation.
+                fp_arg_idx += 2;
+            } else if is_complex {
+                // Complex: uses two consecutive XMM registers
+                if fp_arg_idx + 1 < fp_arg_regs.len() {
+                    self.locations
+                        .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                    self.free_xmm_regs.retain(|&r| {
+                        r != fp_arg_regs[fp_arg_idx] && r != fp_arg_regs[fp_arg_idx + 1]
+                    });
+                    self.fp_pseudos.insert(pseudo_id);
+                } else {
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += 16;
+                }
+                fp_arg_idx += 2;
+            } else if is_fp {
+                if fp_arg_idx < fp_arg_regs.len() {
+                    self.locations
+                        .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
+                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
+                    self.fp_pseudos.insert(pseudo_id);
+                } else {
+                    // Stack args are placed in parameter order per System V AMD64 ABI
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += 8;
+                }
+                fp_arg_idx += 1;
+            } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
+                // __int128: uses two GP registers when available.
+                // Always allocate a local stack slot — for register params,
+                // store_args_to_stack stores register values; for stack params,
+                // store_args_to_stack copies from the incoming arg area.
+                self.stack_offset = (self.stack_offset + 15) & !15;
+                self.stack_offset += 16;
+                self.locations
+                    .insert(pseudo_id, Loc::Stack(self.stack_offset));
+                self.int128_pseudos.insert(pseudo_id);
+                if int_arg_idx + 1 < int_arg_regs.len() {
+                    self.free_regs.retain(|&r| {
+                        r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
+                    });
+                } else {
+                    stack_arg_offset += 16;
+                }
+                int_arg_idx += 2;
+            } else {
+                let type_size = types.size_bits(*typ);
+                let is_large_struct = (types.kind(*typ) == crate::types::TypeKind::Struct
+                    || types.kind(*typ) == crate::types::TypeKind::Union)
+                    && type_size > 128;
+                if is_large_struct {
+                    // Large struct (> 16 bytes): always passed on stack per
+                    // SysV AMD64 ABI. Advance by full struct size.
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += (type_size / 8) as i32;
+                    // Don't increment int_arg_idx — no GP register consumed
+                } else if int_arg_idx < int_arg_regs.len() {
+                    self.locations
+                        .insert(pseudo_id, Loc::Reg(int_arg_regs[int_arg_idx]));
+                    self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
+                    int_arg_idx += 1;
+                } else {
+                    // Stack args are placed in parameter order per System V AMD64 ABI
+                    self.locations
+                        .insert(pseudo_id, Loc::IncomingArg(stack_arg_offset));
+                    stack_arg_offset += 8;
+                    int_arg_idx += 1;
                 }
             }
         }
@@ -822,29 +824,32 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
-        // Check integer arguments in caller-saved registers
-        let int_arg_regs_set = Reg::arg_regs();
-        for interval in intervals {
-            if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
-                if int_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
-                {
-                    let from_reg = *reg;
-                    self.stack_offset += 8;
-                    let to_stack_offset = self.stack_offset;
-
-                    // Record the spill for codegen to emit stores in prologue
-                    self.spilled_args.push(SpilledArg {
-                        pseudo: interval.pseudo,
-                        from_reg,
-                        to_stack_offset,
-                    });
-
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
-                    self.free_regs.push(from_reg);
+        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
+        let spilled_args = &mut self.spilled_args;
+        let free_regs = &mut self.free_regs;
+        crate::arch::regalloc::spill_gp_args_across_calls(
+            intervals,
+            call_positions,
+            &mut self.locations,
+            &mut self.stack_offset,
+            |reg| int_arg_regs_set.contains(&reg),
+            |loc| {
+                if let Loc::Reg(reg) = loc {
+                    Some(*reg)
+                } else {
+                    None
                 }
-            }
-        }
+            },
+            Loc::Stack,
+            |pseudo, from_reg, to_stack_offset| {
+                spilled_args.push(SpilledArg {
+                    pseudo,
+                    from_reg,
+                    to_stack_offset,
+                });
+            },
+            |reg| free_regs.push(reg),
+        );
 
         // Always spill XMM function parameter arguments to stack.
         // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
@@ -937,16 +942,12 @@ impl RegAlloc {
 
     /// Force alloca results to stack to avoid clobbering issues
     fn allocate_alloca_to_stack(&mut self, func: &Function) {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if insn.op == Opcode::Alloca {
-                    if let Some(target) = insn.target {
-                        self.stack_offset += 8;
-                        self.locations.insert(target, Loc::Stack(self.stack_offset));
-                    }
-                }
-            }
-        }
+        crate::arch::regalloc::assign_alloca_slots(
+            func,
+            &mut self.stack_offset,
+            &mut self.locations,
+            Loc::Stack,
+        );
     }
 
     /// Try to reuse a freed stack slot of the given size and alignment.

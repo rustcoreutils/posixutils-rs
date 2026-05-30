@@ -13,8 +13,32 @@ use super::Initializer;
 use crate::diag::error;
 use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use crate::strings::StringId;
-use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers};
+use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
+
+/// Determine whether a declared object type is `const`-qualified for the
+/// purpose of section selection.
+///
+/// For scalars/pointers/structs the top-level CONST modifier is decisive.
+/// For arrays, C semantics put the qualifier on the element type (e.g.
+/// `const int a[10]` declares an array of const int), but the array as
+/// a whole must still be treated as read-only. We therefore look through
+/// nested array types until we hit a non-array type.
+pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
+    let mut cur = typ;
+    loop {
+        if types.modifiers(cur).contains(TypeModifiers::CONST) {
+            return true;
+        }
+        if types.kind(cur) == TypeKind::Array {
+            if let Some(base) = types.base_type(cur) {
+                cur = base;
+                continue;
+            }
+        }
+        return false;
+    }
+}
 
 impl<'a> super::linearize::Linearizer<'a> {
     // ========================================================================
@@ -75,6 +99,10 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Check for thread-local storage
             let is_static = storage_class.contains(TypeModifiers::STATIC);
+            // Const-qualified at the object level. For arrays, the element type
+            // carries the qualifier (e.g., `const int a[10]`), so look through
+            // arrays to their element type.
+            let is_const = is_const_object_type(self.types, declarator.typ);
             if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
                 self.module.add_global_tls_aligned(
                     &name,
@@ -82,6 +110,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     init,
                     declarator.explicit_align,
                     is_static,
+                    is_const,
                 );
             } else {
                 self.module.add_global_aligned(
@@ -90,6 +119,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     init,
                     declarator.explicit_align,
                     is_static,
+                    is_const,
                 );
             }
         }

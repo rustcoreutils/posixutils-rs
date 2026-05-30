@@ -83,10 +83,18 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
         }
     }
 
-    // Sequentialize parallel copies per block
+    // Sequentialize parallel copies per block. Process blocks in id
+    // order — sequentialize_copies allocates temp pseudos via
+    // `func.create_reg_pseudo()` when it encounters a copy cycle, and
+    // iterating the HashMap in random order would assign different
+    // temp pseudo IDs across runs, producing non-deterministic IR
+    // (and downstream non-deterministic register allocation).
     let mut sequenced_copies: HashMap<BasicBlockId, Vec<CopyInfo>> =
         HashMap::with_capacity(DEFAULT_COPY_CAPACITY);
-    for (bb_id, copies) in copies_to_insert {
+    let mut sorted_bb_ids: Vec<BasicBlockId> = copies_to_insert.keys().copied().collect();
+    sorted_bb_ids.sort();
+    for bb_id in sorted_bb_ids {
+        let copies = copies_to_insert.remove(&bb_id).unwrap();
         let sequenced = sequentialize_copies(&copies, func);
         sequenced_copies.insert(bb_id, sequenced);
     }
@@ -100,8 +108,13 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
         }
     }
 
-    // Insert sequentialized Copy instructions before terminator
-    for (bb_id, copies) in sequenced_copies {
+    // Insert sequentialized Copy instructions before terminator. Sort
+    // by bb_id for determinism (within a block, copies are inserted in
+    // their original sequenced order).
+    let mut sorted_bb_ids: Vec<BasicBlockId> = sequenced_copies.keys().copied().collect();
+    sorted_bb_ids.sort();
+    for bb_id in sorted_bb_ids {
+        let copies = sequenced_copies.remove(&bb_id).unwrap();
         if let Some(bb) = func.get_block_mut(bb_id) {
             for copy_info in copies {
                 let mut copy_insn = Instruction::new(Opcode::Copy)

@@ -359,36 +359,69 @@ impl X86_64CodeGen {
         let label_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
 
-        match &ap_loc {
+        // The va_arg helpers (`emit_va_arg_int`/`_float`) read the va_list
+        // structure from a (base register, offset) pair. There are two
+        // distinct shapes for the `ap_addr` operand:
+        //
+        // 1. `ap_addr` is a `Sym` pseudo — the address of a stack-allocated
+        //    local `va_list`. The stack slot itself *is* the va_list, so we
+        //    can address its fields with `(rbp + sym_offset)` directly.
+        //
+        // 2. `ap_addr` is any other pseudo (Arg, Reg, Copy result, …) that
+        //    *holds* a pointer to a va_list (e.g. inside
+        //    `va_arg(*p_va, …)`). The pseudo's location merely stores the
+        //    pointer value; the va_list lives at the address that pointer
+        //    refers to, so we must load the pointer first and use *that*
+        //    as the base register with offset 0.
+        //
+        // The historical Loc::Stack path conflated the two: it always
+        // treated `rbp + offset` as the va_list, which is correct only for
+        // shape (1). Optimization passes (copyprop, instcombine identity
+        // folds) that eliminate the Copy that previously kept shape (2)'s
+        // pointer in a register expose the bug. Detect the pointer-in-
+        // stack-slot case explicitly and materialize the pointer into R11
+        // (reserved scratch) before delegating to the helpers.
+        let is_sym = self
+            .pseudos
+            .iter()
+            .any(|p| p.id == ap_addr && matches!(&p.kind, crate::ir::PseudoKind::Sym(_)));
+
+        let (base_reg, base_offset) = match &ap_loc {
+            Loc::Stack(ap_offset) if is_sym => (Reg::Rbp, *ap_offset),
             Loc::Stack(ap_offset) => {
-                if types.is_float(arg_type) {
-                    self.emit_va_arg_float(
-                        Reg::Rbp,
-                        *ap_offset,
-                        &dst_loc,
-                        arg_type,
-                        label_suffix,
-                        types,
-                    );
-                } else {
-                    self.emit_va_arg_int(
-                        Reg::Rbp,
-                        *ap_offset,
-                        &dst_loc,
-                        arg_size,
-                        arg_bytes,
-                        label_suffix,
-                    );
-                }
+                // Stack slot holds a pointer; load it into R11 first.
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: *ap_offset,
+                    }),
+                    dst: GpOperand::Reg(Reg::R11),
+                });
+                (Reg::R11, 0)
             }
-            Loc::Reg(ap_reg) => {
-                if types.is_float(arg_type) {
-                    self.emit_va_arg_float(*ap_reg, 0, &dst_loc, arg_type, label_suffix, types);
-                } else {
-                    self.emit_va_arg_int(*ap_reg, 0, &dst_loc, arg_size, arg_bytes, label_suffix);
-                }
-            }
-            _ => {}
+            Loc::Reg(ap_reg) => (*ap_reg, 0),
+            _ => return,
+        };
+
+        if types.is_float(arg_type) {
+            self.emit_va_arg_float(
+                base_reg,
+                base_offset,
+                &dst_loc,
+                arg_type,
+                label_suffix,
+                types,
+            );
+        } else {
+            self.emit_va_arg_int(
+                base_reg,
+                base_offset,
+                &dst_loc,
+                arg_size,
+                arg_bytes,
+                label_suffix,
+            );
         }
     }
 

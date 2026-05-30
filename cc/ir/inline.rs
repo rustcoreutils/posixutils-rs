@@ -269,6 +269,28 @@ struct InlineContext {
     callee_name: String,
     /// Set of local variable names from callee (these need to be renamed)
     callee_locals: HashSet<String>,
+
+    /// Callee block currently being cloned. Set per-block by
+    /// `clone_callee_blocks` so the Ret handling in `clone_instruction` can
+    /// record the right predecessor when materializing the return-value Phi.
+    current_callee_bb: Option<BasicBlockId>,
+    /// One entry per cloned single-value `Ret`:
+    /// `(predecessor_block_in_caller, phisrc_target_pseudo)`.
+    /// `inline_call_site` consumes this to build a single `Phi %return_target`
+    /// at the head of the continuation block — restoring SSA single-def for
+    /// the call's result pseudo. Without this, every cloned `Ret` would
+    /// expand to `Copy %return_target = %x`, producing one shared target
+    /// with multiple definitions which is not valid SSA and silently breaks
+    /// downstream pseudo-merging passes (copyprop, CSE, GVN, SCCP).
+    ret_arms: Vec<(BasicBlockId, PseudoId)>,
+    /// Type captured from the first cloned `Ret`. All `Ret`s in a function
+    /// must agree on type/size; we capture once and reuse for the Phi.
+    ret_typ: Option<crate::types::TypeId>,
+    /// Size (in bits) captured from the first cloned `Ret`.
+    ret_size: u32,
+    /// Pseudos allocated as PhiSource targets in the cloned Ret blocks.
+    /// Added to the caller alongside other inlined pseudos.
+    phisrc_pseudos: Vec<Pseudo>,
 }
 
 /// Global counter for unique inline IDs
@@ -306,6 +328,11 @@ impl InlineContext {
             inline_id: next_inline_id(),
             callee_name: callee.name.clone(),
             callee_locals,
+            current_callee_bb: None,
+            ret_arms: Vec::new(),
+            ret_typ: None,
+            ret_size: 0,
+            phisrc_pseudos: Vec::new(),
         }
     }
 
@@ -439,11 +466,21 @@ fn clone_instruction(
         // Entry instruction: skip (caller already has its own)
         Opcode::Entry => vec![],
 
-        // Return instruction: convert to copy/stores + branch to continuation
+        // Return instruction: convert to phi-source/stores + branch to continuation.
+        //
+        // For a single-value `Ret`, every cloned return path contributes to a
+        // single Phi at the continuation block whose target is the caller's
+        // `return_target`. We emit a PhiSource here in the predecessor; the
+        // matching Phi is materialized by `inline_call_site` after all blocks
+        // are cloned.
+        //
+        // For a two-register struct return, both halves are stored to the
+        // result local's memory (a Sym pseudo). The Sym itself remains
+        // single-defined (it is the local's address); the stores are
+        // side-effecting writes to memory and do not violate SSA.
         Opcode::Ret => {
             let mut result = Vec::new();
 
-            // If returning a value, copy to return target
             if let Some(ret_val) = insn.src.first() {
                 if let Some(target) = ctx.return_target {
                     if insn.returns_two_regs() && insn.src.len() >= 2 {
@@ -457,7 +494,7 @@ fn clone_instruction(
                             remapped_low,
                             target,
                             0,
-                            insn.typ.unwrap_or(super::TypeId::INVALID),
+                            insn.typ.unwrap_or(crate::types::TypeId::INVALID),
                             64,
                         );
                         store_low.pos = insn.pos;
@@ -467,19 +504,39 @@ fn clone_instruction(
                             remapped_high,
                             target,
                             8,
-                            insn.typ.unwrap_or(super::TypeId::INVALID),
+                            insn.typ.unwrap_or(crate::types::TypeId::INVALID),
                             64,
                         );
                         store_high.pos = insn.pos;
                         result.push(store_high);
                     } else {
+                        // Single-value return: emit PhiSource in the predecessor
+                        // and record the arm for `inline_call_site` to assemble
+                        // into a Phi at the continuation block.
                         let remapped_val = ctx.remap_pseudo(*ret_val, callee_func);
-                        let mut copy_insn = Instruction::new(Opcode::Copy);
-                        copy_insn.target = Some(target);
-                        copy_insn.src = vec![remapped_val];
-                        copy_insn.typ = insn.typ;
-                        copy_insn.size = insn.size;
-                        result.push(copy_insn);
+                        let pred_bb_in_caller = ctx
+                            .current_callee_bb
+                            .and_then(|cb| ctx.bb_map.get(&cb).copied())
+                            .expect(
+                                "clone_callee_blocks must set current_callee_bb \
+                                 before cloning a Ret",
+                            );
+                        let phisrc_target = ctx.alloc_pseudo_id();
+                        ctx.phisrc_pseudos
+                            .push(Pseudo::phi(phisrc_target, phisrc_target.0));
+
+                        let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
+                        let mut phisrc =
+                            Instruction::phi_source(phisrc_target, remapped_val, typ, insn.size);
+                        phisrc.phi_list = vec![(ctx.return_continuation_bb, target)];
+                        phisrc.pos = insn.pos;
+                        result.push(phisrc);
+
+                        ctx.ret_arms.push((pred_bb_in_caller, phisrc_target));
+                        if ctx.ret_typ.is_none() {
+                            ctx.ret_typ = insn.typ;
+                            ctx.ret_size = insn.size;
+                        }
                     }
                 }
             }
@@ -662,10 +719,28 @@ fn clone_callee_blocks(ctx: &mut InlineContext, callee: &Function) -> Vec<BasicB
         let mut new_bb = BasicBlock::new(new_bb_id);
         new_bb.parents = callee_bb.parents.clone();
         new_bb.children = callee_bb.children.clone();
+        // Tell clone_instruction which callee block these instructions belong
+        // to. Ret handling needs this to record the predecessor block in the
+        // caller's CFG when contributing to the return-value Phi.
+        ctx.current_callee_bb = Some(callee_bb.id);
         for insn in &callee_bb.insns {
             let cloned = clone_instruction(ctx, insn, callee);
+            // M0 invariant: a callee `Ret` lowers to `PhiSource + Br cont`.
+            // The `Br` is a terminator. If the callee block holds further
+            // instructions after that `Ret` (e.g. an unreachable fallback
+            // `return 0;` in `#ifdef`-fenced code, or `__builtin_unreachable`
+            // after `return`), continuing to clone them would produce a
+            // single block with multiple `Br` terminators — and the
+            // subsequent `lower.rs::insert_before_terminator` would place
+            // phi-elimination copies before the *last* `Br`, leaving them
+            // unreached at runtime. The Phi at the continuation would then
+            // read an undefined value. Truncate at the first cloned `Ret`.
+            let cloned_was_ret = insn.op == Opcode::Ret;
             for new_insn in cloned {
                 new_bb.insns.push(new_insn);
+            }
+            if cloned_was_ret {
+                break;
             }
         }
         new_bb.label = Some(format!(
@@ -674,6 +749,7 @@ fn clone_callee_blocks(ctx: &mut InlineContext, callee: &Function) -> Vec<BasicB
         ));
         blocks.push(new_bb);
     }
+    ctx.current_callee_bb = None;
     blocks
 }
 
@@ -823,6 +899,24 @@ fn inline_call_site(
         ctx.inline_id,
     );
 
+    // Materialize the return-value Phi at the head of the continuation block.
+    //
+    // Each cloned single-value `Ret` emitted a PhiSource in its predecessor
+    // and recorded an arm in `ctx.ret_arms`. We now build one Phi at the
+    // continuation joining all those arms — this restores SSA single-def for
+    // the call's result pseudo.
+    //
+    // Skip when there are no arms (callee never returned; e.g. ends in
+    // `abort()` / infinite loop) or when the call had no result target.
+    if let Some(target) = ctx.return_target {
+        if !ctx.ret_arms.is_empty() {
+            let typ = ctx.ret_typ.unwrap_or(crate::types::TypeId::INVALID);
+            let mut phi = Instruction::phi(target, typ, ctx.ret_size);
+            phi.phi_list = ctx.ret_arms.clone();
+            continuation_bb.insns.insert(0, phi);
+        }
+    }
+
     // Update CFG: set children of call block to just the inlined entry
     let old_children = caller.blocks[call_bb_idx].children.clone();
     caller.blocks[call_bb_idx].children = vec![inlined_entry];
@@ -878,6 +972,12 @@ fn inline_call_site(
     // Add temp pseudos generated for implicit param copies
     for pseudo in implicit_copy_pseudos {
         caller.add_pseudo(pseudo);
+    }
+    // Add PhiSource target pseudos generated for the return-value Phi.
+    for pseudo in std::mem::take(&mut ctx.phisrc_pseudos) {
+        if !caller.pseudos.iter().any(|p| p.id == pseudo.id) {
+            caller.add_pseudo(pseudo);
+        }
     }
 
     // Add callee's local variables to caller's locals with mangled names

@@ -9,9 +9,67 @@
 // Common register allocator utilities shared between architectures
 //
 
+use crate::abi::{Abi, ArgClass};
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::types::{TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
+
+// ============================================================================
+// LocationMap — single owner for PseudoId → Loc bindings (M2)
+// ============================================================================
+//
+// Every PseudoId has at most one current Loc, set by the regalloc and
+// observed by the codegen. Bug-class C in the regalloc findings was
+// "two disagreeing location computations" — codegen deriving an alternate
+// Loc from `PseudoKind` instead of asking the allocator. Routing all
+// accesses through this newtype makes that pattern syntactically visible:
+//   * `get(p)` returns the single current binding.
+//   * `set(p, loc)` is the only way to write — call sites stand out in
+//     review (the allocator owns most writes; codegen needs the seam
+//     for intrinsic results that land in fixed ABI registers).
+// The inner HashMap stays private so no caller can stash a stale lookup.
+//
+// `Loc` differs per architecture, so the map is generic. Each backend
+// uses its own `LocationMap<Loc>` instantiation.
+
+#[derive(Debug, Clone, Default)]
+pub struct LocationMap<L: Clone> {
+    inner: HashMap<PseudoId, L>,
+}
+
+impl<L: Clone> LocationMap<L> {
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Look up the current binding, if any.
+    pub fn get(&self, pseudo: PseudoId) -> Option<L> {
+        self.inner.get(&pseudo).cloned()
+    }
+
+    /// Look up the current binding by reference (no clone). Use this
+    /// only when a fast existence check is enough — most callers want
+    /// `get` so the borrow doesn't outlive the immediate match.
+    pub fn get_ref(&self, pseudo: PseudoId) -> Option<&L> {
+        self.inner.get(&pseudo)
+    }
+
+    /// Insert or overwrite a binding. Codegen uses this for the post-
+    /// allocator updates that pin an intrinsic's result pseudo to a
+    /// fixed ABI register (the only legitimate write-after-allocate).
+    pub fn set(&mut self, pseudo: PseudoId, loc: L) {
+        self.inner.insert(pseudo, loc);
+    }
+}
+
+impl<L: Clone> From<HashMap<PseudoId, L>> for LocationMap<L> {
+    fn from(inner: HashMap<PseudoId, L>) -> Self {
+        Self { inner }
+    }
+}
 
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
@@ -130,8 +188,33 @@ pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) 
 }
 
 /// Find registers that would conflict with this interval due to constraints.
-/// If a pseudo is live at a constraint point and is NOT an operand of that
-/// instruction, it cannot be allocated to any clobbered register.
+///
+/// A constraint point models an instruction that clobbers one or more
+/// physical registers (e.g. `idivl` clobbers RAX and RDX). For any live
+/// interval that overlaps such a point, we must keep that pseudo out of the
+/// clobbered registers — otherwise its value would be silently destroyed.
+///
+/// There is one exception: pseudos that are direct *operands* of the
+/// constraining instruction (`involved_pseudos`) MAY occupy a clobbered
+/// register, because the constraining instruction itself reads or writes
+/// those registers as part of its semantics. The classic case is the
+/// integer dividend, which must be in RAX/EAX for `idiv` to execute.
+///
+/// Crucially, that "operand exemption" only holds when the operand's value
+/// dies at the constraint point (`interval.end == cp.position`). When the
+/// interval extends *past* the clobber (`interval.end > cp.position`), the
+/// operand's value is still needed afterward, but the clobbering
+/// instruction will have destroyed it. In that case the allocator must
+/// pick a NON-clobbered register; codegen will materialize the value into
+/// the operand-required register (e.g. RAX) with a move just before the
+/// constraint, preserving the original pseudo's contents for later uses.
+///
+/// Without this distinction, `Copy`/CSE/SCCP-class passes that extend a
+/// pseudo's live range across a `mods.32`/`idivl` boundary silently
+/// miscompile (see git history: prior copyprop attempts hung do-while-
+/// continue tests by allocating the dividend to RAX with a use after the
+/// idiv).
+///
 /// Generic over register type R.
 pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
     interval: &LiveInterval,
@@ -140,12 +223,15 @@ pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
     let mut conflicts = HashSet::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
 
     for cp in constraint_points {
-        // If interval is live at this constraint point...
-        // Use <= for end to handle case where interval ends exactly at constraint point
+        // Use <= on both ends so an interval that exactly meets the
+        // constraint point still counts as overlapping.
         if interval.start <= cp.position && cp.position <= interval.end {
-            // ...and this pseudo is NOT involved in the constrained instruction...
-            if !cp.involved_pseudos.contains(&interval.pseudo) {
-                // ...then it cannot be in any clobbered register
+            let is_involved = cp.involved_pseudos.contains(&interval.pseudo);
+            let dies_at_point = interval.end == cp.position;
+            // The operand exemption only applies when the value is
+            // consumed AT the constraint point. If it must survive past
+            // the clobber, it has to live in a non-clobbered register.
+            if !is_involved || !dies_at_point {
                 for &reg in &cp.clobbers {
                     conflicts.insert(reg);
                 }
@@ -240,24 +326,42 @@ where
         .map(|p| p.id)
         .collect();
 
-    // Phase B: Compute gen/kill sets and per-pseudo per-block positions
-    let mut gen: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
-    let mut kill: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    // Phase B: per-block first/last use positions, def-block map, and the
+    // set of pseudos written in each block (used to bound liveness via
+    // Phase C's Boissinot Up_and_Mark traversal). Replaces the legacy
+    // gen/kill + backward dataflow fixpoint.
     let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
+    let mut defined_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
+    // Per-pseudo set of defining blocks. The IR pcc hands to the
+    // allocator is *not* strictly SSA: lower::eliminate_phi_nodes
+    // converts each Phi into one Copy per predecessor edge, all
+    // targeting the same pseudo. A single pseudo therefore has up to
+    // `phi.phi_list.len()` defs spread across predecessor blocks.
+    // Boissinot's Up_and_Mark must stop at ANY of those defs — tracking
+    // only one would cause spurious live-in propagation past the
+    // other defs and inflate the interference graph.
+    //
+    // Arg pseudos are defined implicitly at entry; Sym pseudos at
+    // their declaration block; regular instruction targets at the
+    // block they sit in. All cases push to the same per-pseudo def
+    // set.
+    let mut def_blocks: HashMap<PseudoId, HashSet<usize>> = HashMap::new();
 
-    // Phase B.0: Pre-populate kill[] with Sym pseudo declaration points.
-    // Sym pseudos (local variable stack addresses) are never instruction targets —
-    // they only appear as sources in Load/Store/SymAddr. Without explicit kill points,
-    // backward dataflow propagates every Sym's liveness back to function entry, making
-    // ALL block-scoped locals appear simultaneously live. This prevents stack slot reuse
-    // for variables in different switch/case blocks or computed-goto dispatch targets.
-    // By killing each Sym at its declaration block BEFORE the gen/kill scan, uses of
-    // Sym pseudos in their declaration block won't be added to gen[], bounding liveness
-    // to [decl_block, last_use] and enabling slot reuse for non-overlapping scopes.
+    for &arg_pseudo in &arg_pseudos {
+        def_blocks.entry(arg_pseudo).or_default().insert(0);
+        defined_in[0].insert(arg_pseudo);
+        first_pos_map[0].entry(arg_pseudo).or_insert(0);
+        last_pos_map[0].entry(arg_pseudo).or_insert(0);
+    }
+
     for local_var in func.locals.values() {
         if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
-            kill[block_idx].insert(local_var.sym);
+            def_blocks
+                .entry(local_var.sym)
+                .or_default()
+                .insert(block_idx);
+            defined_in[block_idx].insert(local_var.sym);
             first_pos_map[block_idx]
                 .entry(local_var.sym)
                 .or_insert(block_start_pos[block_idx]);
@@ -269,82 +373,162 @@ where
 
     for (idx, block) in func.blocks.iter().enumerate() {
         for (ipos, insn) in (block_start_pos[idx]..).zip(block.insns.iter()) {
-            // Uses: if not yet killed in this block, add to gen
             for &src in &insn.src {
-                if !kill[idx].contains(&src) {
-                    gen[idx].insert(src);
-                }
                 first_pos_map[idx].entry(src).or_insert(ipos);
                 last_pos_map[idx].insert(src, ipos);
             }
             if let Some(indirect) = insn.indirect_target {
-                if !kill[idx].contains(&indirect) {
-                    gen[idx].insert(indirect);
-                }
                 first_pos_map[idx].entry(indirect).or_insert(ipos);
                 last_pos_map[idx].insert(indirect, ipos);
             }
-            // Inline asm operands are stored in asm_data, not in src/target
             if insn.op == Opcode::Asm {
                 if let Some(asm) = &insn.asm_data {
                     for input in &asm.inputs {
                         let p = input.pseudo;
-                        if !kill[idx].contains(&p) {
-                            gen[idx].insert(p);
-                        }
                         first_pos_map[idx].entry(p).or_insert(ipos);
                         last_pos_map[idx].insert(p, ipos);
                     }
                     for output in &asm.outputs {
                         let p = output.pseudo;
-                        kill[idx].insert(p);
+                        def_blocks.entry(p).or_default().insert(idx);
+                        defined_in[idx].insert(p);
                         first_pos_map[idx].entry(p).or_insert(ipos);
                         last_pos_map[idx].insert(p, ipos);
                     }
                 }
             }
-            // Defs: add to kill
             if let Some(target) = insn.target {
-                kill[idx].insert(target);
+                def_blocks.entry(target).or_default().insert(idx);
+                defined_in[idx].insert(target);
                 first_pos_map[idx].entry(target).or_insert(ipos);
                 last_pos_map[idx].insert(target, ipos);
             }
         }
     }
 
-    // Arguments are implicitly defined at entry block
-    if num_blocks > 0 {
-        for &arg_pseudo in &arg_pseudos {
-            kill[0].insert(arg_pseudo);
-            first_pos_map[0].entry(arg_pseudo).or_insert(0);
-            last_pos_map[0].entry(arg_pseudo).or_insert(0);
-        }
-    }
-
-    // Phase C: Backward dataflow fixpoint for liveness
-    // LIVE_out[B] = ∪ LIVE_in[S] for all successors S of B
-    // LIVE_in[B]  = GEN[B] ∪ (LIVE_out[B] − KILL[B])
-    let mut live_in: Vec<HashSet<PseudoId>> = gen.clone();
+    // Phase C: Boissinot 2011 Up_and_Mark. For each use site, BFS
+    // upward through predecessor edges marking `live_in[B]` and
+    // `live_out[parent]` until reaching the def block (the use was
+    // downstream of the def, so the def block itself is not live-in
+    // for this pseudo). Each (pseudo, block) pair is visited at most
+    // once — no global fixpoint iteration.
+    //
+    // Pseudos with no recorded def site (constants, globals, or
+    // implicit values that flow into the function from a context the
+    // IR doesn't model) propagate all the way back to the entry block
+    // and stop there because the entry block has no predecessors.
+    // This matches the legacy fixpoint's behavior of treating "no kill"
+    // as "live from entry".
+    let mut live_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
     let mut live_out: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for idx in (0..num_blocks).rev() {
-            for &child_id in &func.blocks[idx].children {
-                if let Some(&child_idx) = bb_id_to_idx.get(&child_id) {
-                    for &p in &live_in[child_idx] {
-                        if live_out[idx].insert(p) {
-                            changed = true;
+    let mut worklist: Vec<usize> = Vec::with_capacity(num_blocks);
+
+    let propagate_use = |use_block: usize,
+                         pseudo: PseudoId,
+                         live_in: &mut [HashSet<PseudoId>],
+                         live_out: &mut [HashSet<PseudoId>],
+                         worklist: &mut Vec<usize>| {
+        let defs = def_blocks.get(&pseudo);
+        worklist.clear();
+        // Seed the use block unconditionally — we are AT a use site,
+        // and the caller has already determined the pseudo isn't
+        // defined earlier in this block (else `defined_so_far` would
+        // have suppressed the call). The same-block redef case (e.g.
+        // lower.rs's Copy-before-terminator producing a later def of
+        // the same pseudo) still needs liveness to flow in from
+        // predecessors to satisfy this use.
+        if live_in[use_block].insert(pseudo) {
+            for &parent_id in &func.blocks[use_block].parents {
+                if let Some(&parent_idx) = bb_id_to_idx.get(&parent_id) {
+                    live_out[parent_idx].insert(pseudo);
+                    worklist.push(parent_idx);
+                }
+            }
+        }
+        while let Some(b) = worklist.pop() {
+            // When traversing from a successor (i.e. not the original
+            // use block), stop at any defining block — the def supplies
+            // the value, no need to propagate past.
+            if defs.is_some_and(|d| d.contains(&b)) {
+                continue;
+            }
+            if !live_in[b].insert(pseudo) {
+                continue;
+            }
+            for &parent_id in &func.blocks[b].parents {
+                if let Some(&parent_idx) = bb_id_to_idx.get(&parent_id) {
+                    live_out[parent_idx].insert(pseudo);
+                    worklist.push(parent_idx);
+                }
+            }
+        }
+    };
+
+    for (idx, block) in func.blocks.iter().enumerate() {
+        // For uses appearing in the same block as the def of a pseudo,
+        // we only invoke Up_and_Mark if the def hasn't run yet at that
+        // point — otherwise the use is satisfied locally and the value
+        // need not be live-in. We track defined-so-far separately from
+        // `defined_in` (which is the whole-block summary) by walking
+        // the block in program order.
+        let mut defined_so_far: HashSet<PseudoId> = HashSet::new();
+        // Args and Sym decls are considered defined at the start of
+        // the block they belong to, before any instruction.
+        if idx == 0 {
+            for &arg in &arg_pseudos {
+                defined_so_far.insert(arg);
+            }
+        }
+        for local_var in func.locals.values() {
+            if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
+                if block_idx == idx {
+                    defined_so_far.insert(local_var.sym);
+                }
+            }
+        }
+
+        for insn in &block.insns {
+            for &src in &insn.src {
+                if !defined_so_far.contains(&src) {
+                    propagate_use(idx, src, &mut live_in, &mut live_out, &mut worklist);
+                }
+            }
+            if let Some(indirect) = insn.indirect_target {
+                if !defined_so_far.contains(&indirect) {
+                    propagate_use(idx, indirect, &mut live_in, &mut live_out, &mut worklist);
+                }
+            }
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    for input in &asm.inputs {
+                        if !defined_so_far.contains(&input.pseudo) {
+                            propagate_use(
+                                idx,
+                                input.pseudo,
+                                &mut live_in,
+                                &mut live_out,
+                                &mut worklist,
+                            );
                         }
+                    }
+                    for output in &asm.outputs {
+                        defined_so_far.insert(output.pseudo);
                     }
                 }
             }
-            for &p in &live_out[idx] {
-                if !kill[idx].contains(&p) && live_in[idx].insert(p) {
-                    changed = true;
-                }
+            if let Some(target) = insn.target {
+                defined_so_far.insert(target);
             }
         }
+    }
+
+    // Phase C.1: Args occupy their calling-convention register from
+    // function entry. The allocator needs to see them as live at the
+    // entry-block start so it doesn't reuse the arg register for an
+    // unrelated pseudo whose interval starts at 0. Force them into
+    // live_in[0] regardless of where Boissinot terminated propagation.
+    for &arg_pseudo in &arg_pseudos {
+        live_in[0].insert(arg_pseudo);
     }
 
     // Phase D: Construct intervals from liveness
@@ -355,8 +539,8 @@ where
 
     for idx in 0..num_blocks {
         let mut referenced: HashSet<PseudoId> =
-            HashSet::with_capacity(kill[idx].len() + live_in[idx].len());
-        for &p in &kill[idx] {
+            HashSet::with_capacity(defined_in[idx].len() + live_in[idx].len());
+        for &p in &defined_in[idx] {
             referenced.insert(p);
         }
         for &p in &live_in[idx] {
@@ -524,6 +708,94 @@ where
     fp_pseudos
 }
 
+// ============================================================================
+// Backend orchestration helpers (M4)
+// ============================================================================
+//
+// Both backends contain a few short, structurally identical loops in their
+// `RegAlloc::allocate` orchestrators — mostly differing only in stack-offset
+// sign and which `Loc` variant they construct. These helpers centralize the
+// shared shape and let each backend supply the architecture-specific bits as
+// a closure.
+
+/// Assign a fresh stack slot to every `Alloca` instruction's result pseudo.
+///
+/// Both backends bump their stack counter by 8 per Alloca and write a
+/// `Loc::Stack(offset)` for the result. The stack-offset sign differs
+/// (x86_64 stores `+stack_offset`, aarch64 stores `-stack_offset`), so
+/// the caller passes a `mk_stack_loc` closure that converts an i32
+/// counter into the backend's preferred `Loc::Stack` value.
+pub fn assign_alloca_slots<L, F>(
+    func: &Function,
+    stack_offset: &mut i32,
+    locations: &mut HashMap<PseudoId, L>,
+    mk_stack_loc: F,
+) where
+    F: Fn(i32) -> L,
+{
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if insn.op == Opcode::Alloca {
+                if let Some(target) = insn.target {
+                    *stack_offset += 8;
+                    locations.insert(target, mk_stack_loc(*stack_offset));
+                }
+            }
+        }
+    }
+}
+
+/// Spill GP arguments that live in caller-saved registers and cross a
+/// call instruction.
+///
+/// The GP path is identical between backends modulo the per-arch
+/// callbacks: the caller supplies which registers are arg-passing,
+/// how to extract a register from a `Loc`, how to construct the new
+/// `Loc::Stack` for the spilled value, and how to record the spill
+/// metadata for the prologue. The stack-offset sign convention is
+/// folded into `mk_stack_loc` and `record_spill` so this helper
+/// itself is sign-agnostic.
+#[allow(clippy::too_many_arguments)]
+pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
+    intervals: &[LiveInterval],
+    call_positions: &[usize],
+    locations: &mut HashMap<PseudoId, L>,
+    stack_offset: &mut i32,
+    is_arg_reg: IsArg,
+    extract_reg: ExtractReg,
+    mk_stack_loc: MkStackLoc,
+    mut record_spill: RecordSpill,
+    mut push_free: PushFree,
+) where
+    L: Clone,
+    R: Copy,
+    IsArg: Fn(R) -> bool,
+    ExtractReg: Fn(&L) -> Option<R>,
+    MkStackLoc: Fn(i32) -> L,
+    RecordSpill: FnMut(PseudoId, R, i32),
+    PushFree: FnMut(R),
+{
+    for interval in intervals {
+        let Some(loc) = locations.get(&interval.pseudo) else {
+            continue;
+        };
+        let Some(reg) = extract_reg(loc) else {
+            continue;
+        };
+        if !is_arg_reg(reg) {
+            continue;
+        }
+        if !interval_crosses_call(interval, call_positions) {
+            continue;
+        }
+        *stack_offset += 8;
+        let to_offset = *stack_offset;
+        record_spill(interval.pseudo, reg, to_offset);
+        locations.insert(interval.pseudo, mk_stack_loc(to_offset));
+        push_free(reg);
+    }
+}
+
 /// Try to reuse a previously freed stack slot of the given size and alignment.
 /// Uses block-level interference check to verify the candidate pseudo doesn't
 /// overlap with the slot's previous owner.
@@ -548,4 +820,138 @@ pub fn try_reuse_stack_slot(
         }
     }
     None
+}
+
+// ============================================================================
+// Allocator–ABI contract layer (M1)
+// ============================================================================
+//
+// Both per-arch register allocators previously re-derived argument
+// classification inline — repeating type-kind checks (`is_float`,
+// `is_complex`, `is_long_double`, `is_int128`, struct-size thresholds)
+// that the `cc/abi/*::classify_param` implementations already perform.
+// Two sources of truth, two opportunities to drift.
+//
+// `AbiLowering` centralizes that contract:
+//
+//   * Build it once per function with the `Function` + `TypeTable`. It
+//     pre-indexes the function's pseudos by `Arg(n)` for O(1) lookup
+//     (the previous code did an O(P) inner scan per argument) and
+//     detects the hidden sret pointer.
+//
+//   * For each parameter, `iter_args(abi)` yields an `AbiArg` carrying
+//     the `ArgClass` from `abi.classify_param` plus a handful of type
+//     tiebreakers (`is_complex`, `is_long_double`, `is_int128`) that
+//     `ArgClass` alone cannot disambiguate — most notably, x86_64
+//     `_Complex float`/`_Complex double` and a 2-eightbyte all-SSE
+//     struct both classify as `Direct { classes: [Sse, Sse] }` but the
+//     backend routes them differently.
+//
+// Backends still own the actual `Loc` decision because `Loc` is per-arch
+// (each has its own `Reg`/`XmmReg`/`VReg`). They dispatch on `arg.class`
+// and the `is_*` flags, eliminating the duplicated type-kind checks.
+
+/// Per-argument context yielded by `AbiLowering::iter_args`.
+///
+/// Carries the ABI classification together with the type tiebreakers a
+/// backend may need beyond `ArgClass` alone.
+#[derive(Debug, Clone)]
+pub struct AbiArg {
+    /// The pseudo representing this argument in the function's IR.
+    pub pseudo: PseudoId,
+    /// Classification produced by `abi.classify_param(typ, types)`.
+    pub class: ArgClass,
+    /// True iff the type is `__int128` / `unsigned __int128`. Backends
+    /// always allocate an aligned local stack slot for int128 even when
+    /// the value arrives in a register pair.
+    pub is_int128: bool,
+}
+
+/// Allocator-side adapter over `cc/abi/*::classify_param`.
+///
+/// Construct once per function being lowered, then iterate the function's
+/// parameters with `iter_args(abi)`. The struct caches the sret detection
+/// and a per-`Arg(n)` pseudo index so per-arg work is O(1).
+pub struct AbiLowering<'a> {
+    func: &'a Function,
+    types: &'a TypeTable,
+    /// PseudoId for each `Arg(n)`. `n` indexes the vector; absent
+    /// positions are `None`. Vector length covers `0..=max_arg_index`.
+    pub arg_pseudos: Vec<Option<PseudoId>>,
+    /// Hidden sret pointer pseudo (named `__sret` with kind `Arg(0)`).
+    /// When present, normal `Arg(k)` parameters shift by 1, so the
+    /// `i`-th `func.params` entry maps to `Arg(i + 1)`.
+    pub sret_pseudo: Option<PseudoId>,
+    /// 1 when an sret pseudo is present, 0 otherwise — added to the
+    /// param index to find the matching `Arg(n)`.
+    pub arg_idx_offset: u32,
+}
+
+impl<'a> AbiLowering<'a> {
+    /// Build an `AbiLowering` for `func`. Does not consult any `Abi`
+    /// yet — the per-arg classification is produced lazily by
+    /// `iter_args` so the same `AbiLowering` can be reused across
+    /// alternative calling-convention overrides if ever needed.
+    pub fn new(func: &'a Function, types: &'a TypeTable) -> Self {
+        // Detect the hidden return pointer for large struct returns.
+        // The linearizer emits it as `Arg(0)` with the literal name
+        // `__sret`, shifting all normal-parameter `Arg(n)` indices by 1.
+        let sret_pseudo = func
+            .pseudos
+            .iter()
+            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
+            .map(|p| p.id);
+        let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
+
+        // Index pseudos by Arg(n). The previous backend code did an
+        // O(P) scan per argument; this is O(P) once.
+        let max_arg = func
+            .pseudos
+            .iter()
+            .filter_map(|p| {
+                if let PseudoKind::Arg(n) = p.kind {
+                    Some(n as usize)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .map(|n| n + 1)
+            .unwrap_or(0);
+        let mut arg_pseudos: Vec<Option<PseudoId>> = vec![None; max_arg];
+        for p in &func.pseudos {
+            if let PseudoKind::Arg(n) = p.kind {
+                arg_pseudos[n as usize] = Some(p.id);
+            }
+        }
+
+        Self {
+            func,
+            types,
+            arg_pseudos,
+            sret_pseudo,
+            arg_idx_offset,
+        }
+    }
+
+    /// Iterate the function's parameters in declaration order, yielding
+    /// the per-arg context backends need. The sret pseudo (if any) is
+    /// not yielded — callers handle it explicitly via `self.sret_pseudo`.
+    pub fn iter_args<'b>(&'b self, abi: &'b dyn Abi) -> impl Iterator<Item = AbiArg> + 'b {
+        self.func
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, (_name, typ))| {
+                let arg_idx = (i as u32) + self.arg_idx_offset;
+                let pseudo = self.arg_pseudos.get(arg_idx as usize).copied().flatten()?;
+                let class = abi.classify_param(*typ, self.types);
+                let kind = self.types.kind(*typ);
+                Some(AbiArg {
+                    pseudo,
+                    class,
+                    is_int128: kind == TypeKind::Int128,
+                })
+            })
+    }
 }

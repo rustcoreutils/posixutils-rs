@@ -457,15 +457,23 @@ fn rename_block(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &m
 /// Creates PhiSource instructions in each predecessor block that feed
 /// into the phi nodes, following sparse's OP_PHISOURCE design.
 fn fill_phi_operands(converter: &mut SsaConverter) {
-    // Collect phi info first
+    // Collect phi info first. Within each block, sort by variable
+    // name so the per-variable order of PhiSource allocation is
+    // deterministic across runs — `alloc_phi` and the undef-pseudo
+    // path both bump `next_pseudo_id`, and HashMap iteration of
+    // `bb.phi_map` would otherwise vary that ordering.
     let phi_info: Vec<(BasicBlockId, usize, String)> = converter
         .func
         .blocks
         .iter()
         .flat_map(|bb| {
-            bb.phi_map
+            let mut entries: Vec<(BasicBlockId, usize, String)> = bb
+                .phi_map
                 .iter()
-                .map(move |(name, &idx)| (bb.id, idx, name.clone()))
+                .map(|(name, &idx)| (bb.id, idx, name.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.2.cmp(&b.2));
+            entries
         })
         .collect();
 

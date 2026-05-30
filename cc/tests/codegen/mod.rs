@@ -11,6 +11,7 @@
 // Tests for register allocation, inline assembly, PIC, optimization, and debug info.
 //
 
+mod determinism;
 mod inline_asm;
 mod misc;
 mod pic;

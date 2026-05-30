@@ -63,10 +63,15 @@ pub struct X86_64CodeGen {
     pic_mode: bool,
     /// Shared library mode (affects TLS model selection)
     shared_mode: bool,
-    /// Long double constants to emit (label_bits -> value_bits)
-    pub(super) ld_constants: HashMap<u64, [u8; 16]>,
-    /// Double constants to emit (label_bits -> f64 value)
-    pub(super) double_constants: HashMap<u64, f64>,
+    /// Long double constants to emit (label_bits -> value_bits).
+    /// BTreeMap so the .rodata emission order in `emit_ld_constants`
+    /// is deterministic (HashMap iteration would vary the layout
+    /// across runs, breaking reproducible builds).
+    pub(super) ld_constants: std::collections::BTreeMap<u64, [u8; 16]>,
+    /// Double constants to emit (label_bits -> f64 value).
+    /// BTreeMap for the same reason as `ld_constants` — emission
+    /// order in `emit_double_constants` must be reproducible.
+    pub(super) double_constants: std::collections::BTreeMap<u64, f64>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     sym_type_sizes: HashMap<PseudoId, u32>,
     /// When true, locals are addressed via RSP instead of RBP (for dynamic stack alignment)
@@ -95,8 +100,8 @@ impl X86_64CodeGen {
             tls_symbols: HashSet::new(),
             pic_mode: false,
             shared_mode: false,
-            ld_constants: HashMap::new(),
-            double_constants: HashMap::new(),
+            ld_constants: std::collections::BTreeMap::new(),
+            double_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
             use_rsp_locals: false,
             max_local_align: 16,

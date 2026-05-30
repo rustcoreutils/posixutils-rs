@@ -15,6 +15,7 @@
 use crate::ir::dce;
 use crate::ir::inline;
 use crate::ir::instcombine;
+use crate::ir::validate;
 use crate::ir::{Function, Module};
 
 #[cfg(test)]
@@ -82,6 +83,25 @@ pub fn optimize_module(module: &mut Module, level: u32) {
     for func in &mut module.functions {
         optimize_function(func);
     }
+
+    // Phase 3 (debug builds only): structural IR validation.
+    // Runs at the end of optimization, BEFORE `ir::lower::lower_module`
+    // which intentionally introduces multi-def Copies as part of φ-
+    // elimination. Any invariant we want to enforce on optimizer-stage
+    // IR (currently: SSA single-def of every target pseudo) is checked
+    // here. Production builds skip the call entirely.
+    debug_assert!(
+        validate::validate_module(module).is_ok(),
+        "IR validation failed after optimization: {}",
+        validate::validate_module(module)
+            .err()
+            .map(|errs| errs
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  "))
+            .unwrap_or_default()
+    );
 }
 
 /// Optimize a single function by running passes until fixed point.

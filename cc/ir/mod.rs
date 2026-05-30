@@ -24,6 +24,7 @@ mod linearize_init;
 mod linearize_stmt;
 pub mod lower;
 pub mod ssa;
+pub mod validate;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;

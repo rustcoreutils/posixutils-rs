@@ -1184,6 +1184,396 @@ int main(void) {
 }
 
 // ============================================================================
+// Test: Inliner emits a φ-join (not multiple Copies) for multi-`ret` callees
+// ============================================================================
+//
+// Regression for the SSA single-def invariant the inliner is required to
+// preserve. A callee like
+//
+//     static inline int choose(int c, int a, int b) {
+//         if (c) return a;
+//         return b;
+//     }
+//
+// has two `ret` paths. The historical lowering converted each `ret` to a
+// `Copy %ret_target = %x` in the cloned predecessor block — and because the
+// inliner uses one shared `%ret_target`, this produced *multiple definitions*
+// of the same SSA pseudo. That is not valid SSA, and any downstream pass
+// that merges pseudos (copyprop, CSE, GVN, SCCP) would mis-route the
+// continuation's reads to whichever Copy it visited first, silently dropping
+// the other return path.
+//
+// After M0, the inliner emits a `PhiSource` in each predecessor and a single
+// `Phi %ret_target = phi (pred1, ps1), (pred2, ps2)` at the head of the
+// continuation block. SSA single-def is restored.
+//
+// The test compiles at -O so the small callees are inlined and exercises
+// every routing path: c true with both arms, c false with both arms,
+// nested calls, calls used in expressions, and calls whose results are
+// stored to globals.
+#[test]
+fn codegen_inline_multi_ret_phi_join() {
+    let code = r#"
+static inline int choose(int c, int a, int b) {
+    if (c) return a;
+    return b;
+}
+
+static inline int max2(int x, int y) {
+    if (x > y) return x;
+    return y;
+}
+
+int g_sum;
+
+int main(void) {
+    /* basic two-arm: cond true and false */
+    if (choose(1, 7, 9) != 7) return 1;
+    if (choose(0, 7, 9) != 9) return 2;
+
+    /* both arms in arithmetic context */
+    int sum = choose(1, 10, 20) + choose(0, 100, 200);
+    if (sum != 210) return 3;
+
+    /* nested inline */
+    if (max2(choose(1, 3, 1), choose(0, 5, 8)) != 8) return 4;
+    if (max2(choose(0, 3, 1), choose(1, 5, 8)) != 5) return 5;
+
+    /* result stored to a writable global (exercises store after Phi) */
+    g_sum = choose(1, -1, -2);
+    if (g_sum != -1) return 6;
+
+    /* loop with inlined call inside (exercises the Phi across a loop carry) */
+    int acc = 0;
+    for (int i = 0; i < 5; i++) {
+        acc += choose(i & 1, i, -i);
+    }
+    /* i=0: choose(0, 0, -0) =  0
+       i=1: choose(1, 1, -1) =  1
+       i=2: choose(0, 2, -2) = -2
+       i=3: choose(1, 3, -3) =  3
+       i=4: choose(0, 4, -4) = -4
+       sum = -2 */
+    if (acc != -2) return 7;
+
+    return 0;
+}
+"#;
+    let exit_code = compile_and_run_optimized("inline_multi_ret_phi_join", code);
+    assert_eq!(
+        exit_code, 0,
+        "M0 multi-ret φ-join test failed with exit code {}",
+        exit_code
+    );
+}
+
+// ============================================================================
+// M0 edge-case coverage (A–I)
+//
+// Each test isolates one shape of inlined `ret` lowering that M0 must handle.
+// They were written *after* M0 broke CPython at -O2 (asyncio hot paths) to
+// localize the regression to a fast, debuggable scope.
+// ============================================================================
+
+/// (A) Inlined void-returning function. The M0 path skips Phi materialization
+/// when the call has no result target.
+#[test]
+fn codegen_inline_m0_a_void_return() {
+    let code = r#"
+static int g_counter;
+
+static inline void bump(int delta) {
+    g_counter += delta;
+}
+
+int main(void) {
+    g_counter = 0;
+    bump(3);
+    bump(7);
+    if (g_counter != 10) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_a_void_return", code),
+        0
+    );
+}
+
+/// (B) Inlined function with a SINGLE `ret`. 1-arm Phi.
+#[test]
+fn codegen_inline_m0_b_single_ret() {
+    let code = r#"
+static inline int identity(int x) {
+    return x;
+}
+
+int main(void) {
+    if (identity(0) != 0) return 1;
+    if (identity(42) != 42) return 2;
+    if (identity(-7) != -7) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run_optimized("inline_m0_b_single_ret", code), 0);
+}
+
+/// (C) `ret` inside a loop in the callee. PhiSource lands inside the loop;
+/// the Phi sits in the post-inline continuation outside the loop.
+#[test]
+fn codegen_inline_m0_c_ret_in_loop() {
+    let code = r#"
+static inline int find(int needle, int *haystack, int n) {
+    for (int i = 0; i < n; i++) {
+        if (haystack[i] == needle) return i;
+    }
+    return -1;
+}
+
+int main(void) {
+    int arr[16] = {10, 20, 30, 40, 50, 60, 70, 80,
+                   90, 100, 110, 120, 130, 140, 150, 160};
+    if (find(10, arr, 16) != 0) return 1;
+    if (find(160, arr, 16) != 15) return 2;
+    if (find(75, arr, 16) != -1) return 3;
+    if (find(80, arr, 16) != 7) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_c_ret_in_loop", code),
+        0
+    );
+}
+
+/// (D) Inlined function whose result comes from a callee-internal Phi
+/// (ternary). Two Phi nodes in series — callee's inner Phi feeds M0's
+/// outer continuation Phi.
+#[test]
+fn codegen_inline_m0_d_internal_phi() {
+    let code = r#"
+static inline int picker(int c, int a, int b) {
+    return c ? a : b;
+}
+
+int main(void) {
+    if (picker(1, 10, 20) != 10) return 1;
+    if (picker(0, 10, 20) != 20) return 2;
+    if (picker(picker(1, 1, 0), 100, 200) != 100) return 3;
+    if (picker(picker(0, 1, 0), 100, 200) != 200) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_d_internal_phi", code),
+        0
+    );
+}
+
+/// (E) Multiple inlined calls in the same caller. Each call materializes
+/// its own Phi; pseudo and block IDs must stay disjoint.
+#[test]
+fn codegen_inline_m0_e_multiple_calls() {
+    let code = r#"
+static inline int absx(int x) {
+    if (x < 0) return -x;
+    return x;
+}
+
+static inline int max2(int a, int b) {
+    if (a > b) return a;
+    return b;
+}
+
+int main(void) {
+    int t = absx(-5);
+    int u = absx(3);
+    int v = max2(t, u);
+    int w = max2(absx(-9), -2);
+    if (t != 5) return 1;
+    if (u != 3) return 2;
+    if (v != 5) return 3;
+    if (w != 9) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_e_multiple_calls", code),
+        0
+    );
+}
+
+/// (F) Inlined function returning a pointer (size 64). Phi must propagate
+/// the correct size from `Ret`.
+#[test]
+fn codegen_inline_m0_f_pointer_return() {
+    let code = r#"
+static char buf_a[] = "alpha";
+static char buf_b[] = "beta";
+
+static inline char *choose_buf(int which) {
+    if (which) return buf_a;
+    return buf_b;
+}
+
+static int strlen3(const char *s) {
+    int n = 0;
+    while (*s++) n++;
+    return n;
+}
+
+int main(void) {
+    char *p1 = choose_buf(1);
+    char *p2 = choose_buf(0);
+    if (strlen3(p1) != 5) return 1;
+    if (strlen3(p2) != 4) return 2;
+    if (p1[0] != 'a') return 3;
+    if (p2[0] != 'b') return 4;
+    if (choose_buf(1)[1] != 'l') return 5;
+    if (choose_buf(0)[1] != 'e') return 6;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_f_pointer_return", code),
+        0
+    );
+}
+
+/// (G) Inlined function returning a long (size 64, int bank).
+#[test]
+fn codegen_inline_m0_g_long_return() {
+    let code = r#"
+static inline long bigchoice(int c, long a, long b) {
+    if (c) return a;
+    return b;
+}
+
+int main(void) {
+    long x = bigchoice(1, 0x1122334455667788L, 0x99AABBCCDDEEFF00L);
+    long y = bigchoice(0, 0x1122334455667788L, 0x99AABBCCDDEEFF00L);
+    if (x != 0x1122334455667788L) return 1;
+    if (y != (long)0x99AABBCCDDEEFF00L) return 2;
+    long sum = bigchoice(1, 7L, 999L) + bigchoice(0, 999L, 13L);
+    if (sum != 20L) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_g_long_return", code),
+        0
+    );
+}
+
+/// (H) Nested inlining: outer→middle→innermost. Each level emits its own
+/// Phi using fresh IDs from next_inline_id.
+#[test]
+fn codegen_inline_m0_h_nested() {
+    let code = r#"
+static inline int innermost(int c, int a, int b) {
+    if (c) return a;
+    return b;
+}
+
+static inline int middle(int c, int x) {
+    int v = innermost(c, x, -x);
+    if (v < 0) return v - 1;
+    return v + 1;
+}
+
+static inline int outer(int c, int x) {
+    int m = middle(c, x);
+    if (m > 0) return m * 2;
+    return m;
+}
+
+int main(void) {
+    if (outer(1, 5) != 12) return 1;   /* 5  -> innermost=5 -> middle=6 -> outer=12 */
+    if (outer(0, 5) != -6) return 2;   /* 5  -> innermost=-5 -> middle=-6 -> outer=-6 */
+    if (outer(1, 0) != 2) return 3;    /* 0  -> innermost=0 -> middle=1 -> outer=2 */
+    if (outer(0, 0) != 2) return 4;    /* 0  -> innermost=0 -> middle=1 -> outer=2 */
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run_optimized("inline_m0_h_nested", code), 0);
+}
+
+/// (J) Two `ret`s in the SAME callee block (e.g., a real return followed by
+/// an `#ifdef`-fenced fallback `return 0;`). The pre-M0 inliner generated a
+/// single block with two `Br` terminators, and `lower.rs` placed
+/// phi-elimination copies before the *last* `Br` — unreached at runtime —
+/// leaving the M0 Phi reading an undefined register. This was the actual
+/// CPython asyncio fork-multiprocessing crash. The fix in
+/// `clone_callee_blocks` truncates cloning at the first `Ret`.
+#[test]
+fn codegen_inline_m0_j_consecutive_rets_in_block() {
+    let code = r#"
+#define HAS_FAST_PATH 1
+
+static int g_x;
+
+/* Two `return`s with no intervening branch. The second is unreachable
+   but the linearizer keeps both in the same IR block. M0 must clone only
+   up to the first `Ret`. Mirrors `_PyIsPerfTrampolineActive`'s shape. */
+static inline int is_x_one(void) {
+#if HAS_FAST_PATH
+    return g_x == 1;
+#endif
+    return 0;  /* unreachable when HAS_FAST_PATH defined */
+}
+
+int main(void) {
+    g_x = 1;
+    if (is_x_one() != 1) return 1;
+
+    g_x = 7;
+    if (is_x_one() != 0) return 2;
+
+    g_x = -3;
+    if (is_x_one() != 0) return 3;
+
+    g_x = 1;
+    int r = is_x_one() + is_x_one();
+    if (r != 2) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_j_consecutive_rets_in_block", code),
+        0
+    );
+}
+
+/// (I) Mixed Noreturn/abort paths with normal returns. Only the returning
+/// paths contribute to M0's Phi; the noreturn path's Unreachable does not.
+#[test]
+fn codegen_inline_m0_i_mixed_noreturn() {
+    let code = r#"
+#include <stdlib.h>
+
+static inline int validated(int x) {
+    if (x < 0) {
+        exit(99);  /* noreturn — must not become a Phi arm */
+    }
+    if (x == 0) return 100;
+    return x * 2;
+}
+
+int main(void) {
+    if (validated(0) != 100) return 1;
+    if (validated(5) != 10) return 2;
+    if (validated(7) != 14) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run_optimized("inline_m0_i_mixed_noreturn", code),
+        0
+    );
+}
+
+// ============================================================================
 // Test: Large struct parameter ABI (> 16 bytes passed by value on stack)
 // ============================================================================
 

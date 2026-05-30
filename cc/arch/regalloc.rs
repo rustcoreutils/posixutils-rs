@@ -610,6 +610,94 @@ where
     fp_pseudos
 }
 
+// ============================================================================
+// Backend orchestration helpers (M4)
+// ============================================================================
+//
+// Both backends contain a few short, structurally identical loops in their
+// `RegAlloc::allocate` orchestrators — mostly differing only in stack-offset
+// sign and which `Loc` variant they construct. These helpers centralize the
+// shared shape and let each backend supply the architecture-specific bits as
+// a closure.
+
+/// Assign a fresh stack slot to every `Alloca` instruction's result pseudo.
+///
+/// Both backends bump their stack counter by 8 per Alloca and write a
+/// `Loc::Stack(offset)` for the result. The stack-offset sign differs
+/// (x86_64 stores `+stack_offset`, aarch64 stores `-stack_offset`), so
+/// the caller passes a `mk_stack_loc` closure that converts an i32
+/// counter into the backend's preferred `Loc::Stack` value.
+pub fn assign_alloca_slots<L, F>(
+    func: &Function,
+    stack_offset: &mut i32,
+    locations: &mut HashMap<PseudoId, L>,
+    mk_stack_loc: F,
+) where
+    F: Fn(i32) -> L,
+{
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if insn.op == Opcode::Alloca {
+                if let Some(target) = insn.target {
+                    *stack_offset += 8;
+                    locations.insert(target, mk_stack_loc(*stack_offset));
+                }
+            }
+        }
+    }
+}
+
+/// Spill GP arguments that live in caller-saved registers and cross a
+/// call instruction.
+///
+/// The GP path is identical between backends modulo the per-arch
+/// callbacks: the caller supplies which registers are arg-passing,
+/// how to extract a register from a `Loc`, how to construct the new
+/// `Loc::Stack` for the spilled value, and how to record the spill
+/// metadata for the prologue. The stack-offset sign convention is
+/// folded into `mk_stack_loc` and `record_spill` so this helper
+/// itself is sign-agnostic.
+#[allow(clippy::too_many_arguments)]
+pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
+    intervals: &[LiveInterval],
+    call_positions: &[usize],
+    locations: &mut HashMap<PseudoId, L>,
+    stack_offset: &mut i32,
+    is_arg_reg: IsArg,
+    extract_reg: ExtractReg,
+    mk_stack_loc: MkStackLoc,
+    mut record_spill: RecordSpill,
+    mut push_free: PushFree,
+) where
+    L: Clone,
+    R: Copy,
+    IsArg: Fn(R) -> bool,
+    ExtractReg: Fn(&L) -> Option<R>,
+    MkStackLoc: Fn(i32) -> L,
+    RecordSpill: FnMut(PseudoId, R, i32),
+    PushFree: FnMut(R),
+{
+    for interval in intervals {
+        let Some(loc) = locations.get(&interval.pseudo) else {
+            continue;
+        };
+        let Some(reg) = extract_reg(loc) else {
+            continue;
+        };
+        if !is_arg_reg(reg) {
+            continue;
+        }
+        if !interval_crosses_call(interval, call_positions) {
+            continue;
+        }
+        *stack_offset += 8;
+        let to_offset = *stack_offset;
+        record_spill(interval.pseudo, reg, to_offset);
+        locations.insert(interval.pseudo, mk_stack_loc(to_offset));
+        push_free(reg);
+    }
+}
+
 /// Try to reuse a previously freed stack slot of the given size and alignment.
 /// Uses block-level interference check to verify the candidate pseudo doesn't
 /// overlap with the slot's previous owner.

@@ -852,17 +852,12 @@ impl RegAlloc {
 
     /// Force alloca results to stack to avoid clobbering issues
     fn allocate_alloca_to_stack(&mut self, func: &Function) {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if insn.op == Opcode::Alloca {
-                    if let Some(target) = insn.target {
-                        self.stack_offset += 8;
-                        self.locations
-                            .insert(target, Loc::Stack(-self.stack_offset));
-                    }
-                }
-            }
-        }
+        crate::arch::regalloc::assign_alloca_slots(
+            func,
+            &mut self.stack_offset,
+            &mut self.locations,
+            |off| Loc::Stack(-off),
+        );
     }
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
@@ -872,30 +867,33 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
-        // Check GP arguments in caller-saved registers (x0-x7)
-        let int_arg_regs_set = Reg::arg_regs();
-        for interval in intervals {
-            if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
-                if int_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
-                {
-                    let from_reg = *reg;
-                    self.stack_offset += 8;
-                    let to_stack_offset = -self.stack_offset;
-
-                    // Record the spill for codegen to emit stores in prologue
-                    self.spilled_args.push(SpilledArg {
-                        pseudo: interval.pseudo,
-                        from_gp_reg: Some(from_reg),
-                        from_fp_reg: None,
-                        to_stack_offset,
-                    });
-
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
-                    self.free_regs.push(from_reg);
+        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
+        let spilled_args = &mut self.spilled_args;
+        let free_regs = &mut self.free_regs;
+        crate::arch::regalloc::spill_gp_args_across_calls(
+            intervals,
+            call_positions,
+            &mut self.locations,
+            &mut self.stack_offset,
+            |reg| int_arg_regs_set.contains(&reg),
+            |loc| {
+                if let Loc::Reg(reg) = loc {
+                    Some(*reg)
+                } else {
+                    None
                 }
-            }
-        }
+            },
+            |off| Loc::Stack(-off),
+            |pseudo, from_reg, to_stack_offset| {
+                spilled_args.push(SpilledArg {
+                    pseudo,
+                    from_gp_reg: Some(from_reg),
+                    from_fp_reg: None,
+                    to_stack_offset,
+                });
+            },
+            |reg| free_regs.push(reg),
+        );
 
         // Check FP arguments in caller-saved registers (v0-v7)
         let fp_arg_regs_set = VReg::arg_regs();

@@ -629,8 +629,12 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
 
     let mut converter = SsaConverter::new(func);
 
-    // Phase 1: Analyze variables and insert phi nodes
-    let local_names: Vec<String> = converter.func.locals.keys().cloned().collect();
+    // Phase 1: Analyze variables and insert phi nodes. Process local
+    // names in sorted order so phi pseudo IDs are stable across runs
+    // (HashMap iteration order is randomized by RandomState and would
+    // otherwise produce non-deterministic IR).
+    let mut local_names: Vec<String> = converter.func.locals.keys().cloned().collect();
+    local_names.sort();
 
     for var_name in &local_names {
         if let Some(var_info) = analyze_variable(converter.func, types, var_name) {

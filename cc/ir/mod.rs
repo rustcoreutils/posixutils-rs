@@ -458,7 +458,7 @@ impl fmt::Display for MemoryOrder {
 // ============================================================================
 
 /// Unique ID for a pseudo (virtual register)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PseudoId(pub u32);
 
 impl fmt::Display for PseudoId {
@@ -613,7 +613,7 @@ impl fmt::Display for Pseudo {
 // ============================================================================
 
 /// Unique ID for a basic block
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BasicBlockId(pub u32);
 
 impl fmt::Display for BasicBlockId {

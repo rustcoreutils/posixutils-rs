@@ -1050,7 +1050,10 @@ impl RegAlloc {
                                 .map(|a| a as i32)
                                 .unwrap_or(natural_align.max(8));
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-                            let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
+                            // Sym slot reuse disabled — see x86_64
+                            // mirror for the rationale.
+                            let _ = self.addr_taken_syms.contains(&interval.pseudo);
+                            let reusable = false;
                             self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
                             if types.is_float(local.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);

@@ -1082,7 +1082,33 @@ impl RegAlloc {
                                 natural_align.max(8)
                             };
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-                            let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
+                            // Sym slot reuse disabled. The IR-level
+                            // interval of a Sym pseudo only captures
+                            // its direct Store/Load/SymAddr uses,
+                            // not the lifetime of register pseudos
+                            // that derive their values from the
+                            // slot. Linear scan allocated slot
+                            // offsets monotonically and so happened
+                            // not to reuse Sym slots in conflicting
+                            // ways; chordal coloring exposes the
+                            // gap. CPython `_warnings.o::init_filters`
+                            // and `flowgraph.o::_PyCfgBuilder_Addop`
+                            // both miscompiled on the Sym-slot reuse
+                            // pattern even with the
+                            // [[interval-overlap fix]] (the Sym's
+                            // IR interval ends before the derived
+                            // register pseudo's lifetime does, so
+                            // interval-overlap reports no conflict).
+                            //
+                            // Future fix: extend the Sym's interval
+                            // to cover all derived register pseudos'
+                            // lifetimes. Until then, Sym slots are
+                            // permanent. The `addr_taken_syms`
+                            // computation stays in place — it remains
+                            // the correct gating predicate when slot
+                            // reuse is re-enabled.
+                            let _ = self.addr_taken_syms.contains(&interval.pseudo);
+                            let reusable = false;
                             self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
                             if types.is_float(local_var.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);

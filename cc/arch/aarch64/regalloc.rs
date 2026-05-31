@@ -650,6 +650,111 @@ pub struct SpilledArg {
     pub to_stack_offset: i32,
 }
 
+/// Map a clobber-list register name (lowercase, GCC-style) to the
+/// corresponding `Reg`. Accepts the 64-bit canonical name (`x0`, `x29`,
+/// ...), the 32-bit alias (`w0`, `w29`, ...), and special names
+/// (`sp`, `xzr`, `wzr`, `fp`, `lr`). Returns `None` for names the GP
+/// table doesn't know about (V registers, `memory`, `cc`, ...).
+fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
+    let s = raw.trim_start_matches('%').to_ascii_lowercase();
+    Some(match s.as_str() {
+        "x0" | "w0" => Reg::X0,
+        "x1" | "w1" => Reg::X1,
+        "x2" | "w2" => Reg::X2,
+        "x3" | "w3" => Reg::X3,
+        "x4" | "w4" => Reg::X4,
+        "x5" | "w5" => Reg::X5,
+        "x6" | "w6" => Reg::X6,
+        "x7" | "w7" => Reg::X7,
+        "x8" | "w8" => Reg::X8,
+        "x9" | "w9" => Reg::X9,
+        "x10" | "w10" => Reg::X10,
+        "x11" | "w11" => Reg::X11,
+        "x12" | "w12" => Reg::X12,
+        "x13" | "w13" => Reg::X13,
+        "x14" | "w14" => Reg::X14,
+        "x15" | "w15" => Reg::X15,
+        "x16" | "w16" | "ip0" => Reg::X16,
+        "x17" | "w17" | "ip1" => Reg::X17,
+        // x18 platform-reserved — not in Reg enum
+        "x19" | "w19" => Reg::X19,
+        "x20" | "w20" => Reg::X20,
+        "x21" | "w21" => Reg::X21,
+        "x22" | "w22" => Reg::X22,
+        "x23" | "w23" => Reg::X23,
+        "x24" | "w24" => Reg::X24,
+        "x25" | "w25" => Reg::X25,
+        "x26" | "w26" => Reg::X26,
+        "x27" | "w27" => Reg::X27,
+        "x28" | "w28" => Reg::X28,
+        "x29" | "w29" | "fp" => Reg::X29,
+        "x30" | "w30" | "lr" => Reg::X30,
+        "sp" => Reg::SP,
+        "xzr" | "wzr" => Reg::Xzr,
+        _ => None?,
+    })
+}
+
+/// Get constraint info for an instruction (aarch64 — mirror of
+/// x86_64's `get_constraint_info`).
+///
+/// AAPCS64 has no hardware constraints comparable to x86_64's
+/// idiv/shift (sdiv/udiv don't clobber, shifts use any GP register).
+/// The only source of GP clobbers today is inline asm: the parser
+/// collected explicit clobbers into `AsmData.clobbers`; named GP
+/// registers in that list become hard clobbers at the asm position.
+/// Special tokens (`"memory"`, `"cc"`) are filtered out — see x86_64
+/// `get_constraint_info` documentation for the rationale.
+pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
+    if insn.op != Opcode::Asm {
+        return None;
+    }
+    let asm_data = insn.asm_data.as_ref()?;
+    let mut clobbers: Vec<Reg> = asm_data
+        .clobbers
+        .iter()
+        .filter_map(|name| parse_gp_clobber_name(name))
+        .collect();
+    if clobbers.is_empty() {
+        return None;
+    }
+    clobbers.sort();
+    clobbers.dedup();
+
+    let mut involved = Vec::new();
+    if let Some(t) = insn.target {
+        involved.push(t);
+    }
+    involved.extend(insn.src.iter().copied());
+    Some((clobbers, involved))
+}
+
+/// Opcodes whose aarch64 codegen lowering invokes an external function
+/// (libc or otherwise) and therefore clobbers caller-saved registers.
+/// Used by `find_call_positions` to drive the chordal allocator's
+/// cross-call caller-saved forbidding.
+///
+/// Beyond the obvious `Call` / `Longjmp` / `Setjmp`:
+/// - `Fabs32` / `Fabs64` → `fabsf` / `fabs` libc call (features.rs:901+)
+/// - `Signbit32` / `Signbit64` → `__signbitf` / target-specific
+///   signbit-double libc call (features.rs:853+)
+///
+/// Unlike x86_64, aarch64's Memset/Memcpy/Memmove are not lowered to
+/// libc calls inside features.rs — they reach the regular `Opcode::Call`
+/// path, which `is_call_like_aarch64` already covers.
+pub fn is_call_like_aarch64(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Call
+            | Opcode::Longjmp
+            | Opcode::Setjmp
+            | Opcode::Fabs32
+            | Opcode::Fabs64
+            | Opcode::Signbit32
+            | Opcode::Signbit64
+    )
+}
+
 /// Simple linear scan register allocator for AArch64
 pub struct RegAlloc {
     /// Mapping from pseudo to location
@@ -720,7 +825,7 @@ impl RegAlloc {
         self.live_out = result.live_out;
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
-        let call_positions = find_call_positions(func);
+        let call_positions = find_call_positions(func, is_call_like_aarch64);
 
         self.spill_args_across_calls(func, &intervals, &call_positions);
         self.allocate_alloca_to_stack(func);
@@ -1327,17 +1432,26 @@ impl RegAlloc {
                 self.used_callee_saved.push(reg);
             }
         }
-        // Drain any remaining active slots into the free pool so spill
-        // commits below can reuse them via interference checks.
-        crate::arch::regalloc::expire_stack_intervals(
-            &mut self.active_stack,
-            &mut self.free_stack_slots,
-            usize::MAX,
-        );
-        for &spilled in &final_spilled {
+        // Process spill commits in interval.start order with
+        // monotonic expiration. The earlier `usize::MAX` drain
+        // relied on `pseudos_interfere`'s block-level liveness which
+        // misses within-block interference. See the x86_64 mirror
+        // for the full rationale (CPython
+        // `PyThread_acquire_lock_timed` miscompile root cause).
+        let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
+            .iter()
+            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .collect();
+        ordered_spilled.sort_by_key(|&(start, _)| start);
+        for (start, spilled) in ordered_spilled {
             if self.locations.contains_key(&spilled) {
                 continue;
             }
+            crate::arch::regalloc::expire_stack_intervals(
+                &mut self.active_stack,
+                &mut self.free_stack_slots,
+                start,
+            );
             if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
@@ -1386,17 +1500,24 @@ impl RegAlloc {
                 self.used_callee_saved_fp.push(reg);
             }
         }
-        // Same drain-then-reuse pattern as the GP commit; see comment
-        // on expire_stack_intervals in cc/arch/regalloc.rs.
-        crate::arch::regalloc::expire_stack_intervals(
-            &mut self.active_stack,
-            &mut self.free_stack_slots,
-            usize::MAX,
-        );
-        for &spilled in &result.spilled {
+        // Same monotonic-by-start spill commit as `color_gp_bank` —
+        // see the comment there for why the earlier `usize::MAX`
+        // drain was unsafe.
+        let mut ordered_spilled: Vec<(usize, PseudoId)> = result
+            .spilled
+            .iter()
+            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .collect();
+        ordered_spilled.sort_by_key(|&(start, _)| start);
+        for (start, spilled) in ordered_spilled {
             if self.locations.contains_key(&spilled) {
                 continue;
             }
+            crate::arch::regalloc::expire_stack_intervals(
+                &mut self.active_stack,
+                &mut self.free_stack_slots,
+                start,
+            );
             if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
@@ -1408,7 +1529,7 @@ impl RegAlloc {
     }
 
     fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {
-        compute_live_intervals(func, |_: &Instruction| None)
+        compute_live_intervals(func, get_constraint_info_aarch64)
     }
 
     /// Get stack size needed (aligned to max local alignment, minimum 16).
@@ -1443,5 +1564,74 @@ impl RegAlloc {
 impl Default for RegAlloc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gp_clobber_name_64bit_canonical() {
+        assert_eq!(parse_gp_clobber_name("x0"), Some(Reg::X0));
+        assert_eq!(parse_gp_clobber_name("x9"), Some(Reg::X9));
+        assert_eq!(parse_gp_clobber_name("x28"), Some(Reg::X28));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_w_aliases() {
+        // 32-bit `wN` aliases resolve to the underlying XN.
+        assert_eq!(parse_gp_clobber_name("w0"), Some(Reg::X0));
+        assert_eq!(parse_gp_clobber_name("w9"), Some(Reg::X9));
+        assert_eq!(parse_gp_clobber_name("w28"), Some(Reg::X28));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_special() {
+        // ABI-named registers.
+        assert_eq!(parse_gp_clobber_name("fp"), Some(Reg::X29));
+        assert_eq!(parse_gp_clobber_name("lr"), Some(Reg::X30));
+        assert_eq!(parse_gp_clobber_name("ip0"), Some(Reg::X16));
+        assert_eq!(parse_gp_clobber_name("ip1"), Some(Reg::X17));
+        assert_eq!(parse_gp_clobber_name("sp"), Some(Reg::SP));
+        assert_eq!(parse_gp_clobber_name("xzr"), Some(Reg::Xzr));
+        assert_eq!(parse_gp_clobber_name("wzr"), Some(Reg::Xzr));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_leading_percent_and_case() {
+        assert_eq!(parse_gp_clobber_name("%x0"), Some(Reg::X0));
+        assert_eq!(parse_gp_clobber_name("X9"), Some(Reg::X9));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_unknown() {
+        // Special tokens, V-bank registers, and unknown names return
+        // None — the asm clobber walker filters them silently.
+        assert_eq!(parse_gp_clobber_name("memory"), None);
+        assert_eq!(parse_gp_clobber_name("cc"), None);
+        assert_eq!(parse_gp_clobber_name("v0"), None);
+        assert_eq!(parse_gp_clobber_name("d0"), None);
+        assert_eq!(parse_gp_clobber_name("x18"), None); // platform reserved
+        assert_eq!(parse_gp_clobber_name(""), None);
+        assert_eq!(parse_gp_clobber_name("not_a_reg"), None);
+    }
+
+    #[test]
+    fn is_call_like_aarch64_covers_libc_emitters() {
+        assert!(is_call_like_aarch64(Opcode::Call));
+        assert!(is_call_like_aarch64(Opcode::Longjmp));
+        assert!(is_call_like_aarch64(Opcode::Setjmp));
+        assert!(is_call_like_aarch64(Opcode::Fabs32));
+        assert!(is_call_like_aarch64(Opcode::Fabs64));
+        assert!(is_call_like_aarch64(Opcode::Signbit32));
+        assert!(is_call_like_aarch64(Opcode::Signbit64));
+        // Aarch64 doesn't lower Memset/Memcpy/Memmove inside features.rs
+        // — those reach the regular Opcode::Call path instead.
+        assert!(!is_call_like_aarch64(Opcode::Memset));
+        assert!(!is_call_like_aarch64(Opcode::Memcpy));
+        assert!(!is_call_like_aarch64(Opcode::Memmove));
+        assert!(!is_call_like_aarch64(Opcode::Add));
+        assert!(!is_call_like_aarch64(Opcode::Asm));
     }
 }

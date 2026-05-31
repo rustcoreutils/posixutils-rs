@@ -266,25 +266,124 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
     }
 }
 
+/// Opcodes whose x86_64 codegen lowering invokes an external function
+/// (libc or otherwise) and therefore clobbers caller-saved registers.
+/// Used by `find_call_positions` to drive the chordal allocator's
+/// cross-call caller-saved forbidding.
+///
+/// Beyond the obvious `Call` / `Longjmp` / `Setjmp`:
+/// - `Fabs32` / `Fabs64` → `fabsf` / `fabs` libc call (features.rs:1359+)
+/// - `Signbit32` / `Signbit64` → `__signbitf` / target-specific
+///   signbit-double libc call (features.rs:1407+)
+/// - `Memset` / `Memcpy` / `Memmove` → libc memset/memcpy/memmove
+///   (features.rs:1214+)
+///
+/// Before this list existed, the chordal allocator (M6+M7) had a
+/// latent bug: live FP pseudos in the same block as a `Signbit64`
+/// would be allocated to XMM regs that the emitted libc call
+/// clobbered. Linear scan never used those XMM regs (pop'd from
+/// end of palette) so the bug was invisible until M6.
+pub fn is_call_like_x86_64(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Call
+            | Opcode::Longjmp
+            | Opcode::Setjmp
+            | Opcode::Fabs32
+            | Opcode::Fabs64
+            | Opcode::Signbit32
+            | Opcode::Signbit64
+            | Opcode::Memset
+            | Opcode::Memcpy
+            | Opcode::Memmove
+    )
+}
+
+/// Map a clobber-list register name (lowercase, GCC-style) to the
+/// corresponding `Reg`. Accepts the 64-bit canonical name (`rax`,
+/// `r10`, ...), the 32/16/8-bit alias (`eax`, `ax`, `al`, `r10d`,
+/// `r10w`, `r10b`), and the GCC-style "%rax" with leading `%`.
+/// Returns `None` for names the GP table doesn't know about
+/// (XMM registers, `memory`, `cc`, x87 stack, ...).
+fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
+    let s = raw.trim_start_matches('%').to_ascii_lowercase();
+    Some(match s.as_str() {
+        "rax" | "eax" | "ax" | "al" | "ah" => Reg::Rax,
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => Reg::Rbx,
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => Reg::Rcx,
+        "rdx" | "edx" | "dx" | "dl" | "dh" => Reg::Rdx,
+        "rsi" | "esi" | "si" | "sil" => Reg::Rsi,
+        "rdi" | "edi" | "di" | "dil" => Reg::Rdi,
+        "rbp" | "ebp" | "bp" | "bpl" => Reg::Rbp,
+        "rsp" | "esp" | "sp" | "spl" => Reg::Rsp,
+        "r8" | "r8d" | "r8w" | "r8b" => Reg::R8,
+        "r9" | "r9d" | "r9w" | "r9b" => Reg::R9,
+        "r10" | "r10d" | "r10w" | "r10b" => Reg::R10,
+        "r11" | "r11d" | "r11w" | "r11b" => Reg::R11,
+        "r12" | "r12d" | "r12w" | "r12b" => Reg::R12,
+        "r13" | "r13d" | "r13w" | "r13b" => Reg::R13,
+        "r14" | "r14d" | "r14w" | "r14b" => Reg::R14,
+        "r15" | "r15d" | "r15w" | "r15b" => Reg::R15,
+        _ => return None,
+    })
+}
+
 /// Get constraint info for an instruction (used by shared compute_live_intervals).
 /// Returns (clobbered_registers, involved_pseudos) if constraints apply, None otherwise.
 ///
-/// For x86-64:
-/// - Division clobbers Rax/Rdx; all operands are involved (may be in clobbered regs)
-/// - VaArg clobbers Rax/Rcx; only target is involved (sources must NOT be in clobbered regs)
+/// Sources:
+/// - **Opcode-level hardware constraints** (`opcode_constraints`):
+///   division clobbers Rax/Rdx; shifts clobber Rcx; vaarg clobbers
+///   Rax/Rcx; mul (int128 path) clobbers Rax/Rdx.
+/// - **Inline-asm explicit clobbers** (`Opcode::Asm`): the parser
+///   collected the asm's clobber list into `AsmData.clobbers`. Named
+///   GP registers in that list become hard clobbers at the asm
+///   position. Special tokens (`"memory"`, `"cc"`) are not GP
+///   register clobbers and are filtered out here — `"memory"` gets
+///   full barrier semantics in C3 via `InstrConstraints.memory_barrier`;
+///   `"cc"` is a no-op for our allocator since we don't track
+///   condition-code liveness.
+///
+/// `involved_pseudos` includes the instruction's target + sources so
+/// they may legally occupy a clobbered register if needed (the
+/// operand exemption — see `pseudos_interfere` documentation). VaArg
+/// is the exception: its sources must NOT alias the clobbered regs.
 pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
+    // Inline asm: explicit clobbers from the asm clobber list.
+    if insn.op == Opcode::Asm {
+        let asm_data = insn.asm_data.as_ref()?;
+        let mut clobbers: Vec<Reg> = asm_data
+            .clobbers
+            .iter()
+            .filter_map(|name| parse_gp_clobber_name(name))
+            .collect();
+        if clobbers.is_empty() {
+            return None;
+        }
+        clobbers.sort();
+        clobbers.dedup();
+
+        // Asm operands are the involved pseudos — they may occupy a
+        // clobbered register (an "+r"-bound output is the canonical
+        // case where the operand IS in a clobbered slot by design).
+        let mut involved = Vec::new();
+        if let Some(t) = insn.target {
+            involved.push(t);
+        }
+        involved.extend(insn.src.iter().copied());
+        return Some((clobbers, involved));
+    }
+
+    // Opcode-level hardware constraints.
     let constraints = opcode_constraints(insn.op);
     if constraints.clobbers.is_empty() {
         return None;
     }
 
-    // Collect pseudos involved in this instruction.
-    // "Involved" pseudos are ALLOWED to be in clobbered registers.
     let mut involved = Vec::new();
     if let Some(t) = insn.target {
         involved.push(t);
     }
-
     // For VaArg, sources should NOT be in clobbered registers,
     // so we don't add them to involved_pseudos
     if insn.op != Opcode::VaArg {
@@ -517,7 +616,7 @@ impl RegAlloc {
         self.live_out = result.live_out;
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
-        let call_positions = find_call_positions(func);
+        let call_positions = find_call_positions(func, is_call_like_x86_64);
 
         self.spill_args_across_calls(func, &intervals, &call_positions);
         self.spill_args_across_constraints(func, &intervals, &constraint_points);
@@ -1362,17 +1461,36 @@ impl RegAlloc {
                 self.used_callee_saved.push(reg);
             }
         }
-        // Drain any remaining active slots into the free pool so spill
-        // commits below can reuse them via interference checks.
-        crate::arch::regalloc::expire_stack_intervals(
-            &mut self.active_stack,
-            &mut self.free_stack_slots,
-            usize::MAX,
-        );
-        for &spilled in &final_spilled {
+        // Process spill commits in interval.start order with
+        // monotonic expiration. Earlier (M6+M7 v1) drained everything
+        // with `usize::MAX` then relied on `pseudos_interfere` to
+        // gate reuse — but that check uses block-level live_in/out
+        // sets which miss within-block interference. A spilled
+        // register pseudo whose lifetime sits entirely inside one
+        // block has empty live_in/out projections and was happily
+        // assigned to a slot owned by a Sym pseudo still alive in
+        // the same block (root cause of the CPython
+        // `PyThread_acquire_lock_timed` miscompile — slot reused for
+        // `_PyTime_Add` result while `thelock` was still live).
+        //
+        // The monotonic sweep mirrors linear scan's invariant: a
+        // slot is only freed once the owning interval has ended,
+        // and a new interval's start ≥ the freed slot's owner's
+        // end, so they cannot interfere within a block.
+        let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
+            .iter()
+            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .collect();
+        ordered_spilled.sort_by_key(|&(start, _)| start);
+        for (start, spilled) in ordered_spilled {
             if self.locations.contains_key(&spilled) {
                 continue;
             }
+            crate::arch::regalloc::expire_stack_intervals(
+                &mut self.active_stack,
+                &mut self.free_stack_slots,
+                start,
+            );
             if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
@@ -1422,17 +1540,24 @@ impl RegAlloc {
             }
             self.locations.insert(pid, Loc::Xmm(reg));
         }
-        // Same drain-then-reuse pattern as the GP commit; see comment
-        // on expire_stack_intervals in cc/arch/regalloc.rs.
-        crate::arch::regalloc::expire_stack_intervals(
-            &mut self.active_stack,
-            &mut self.free_stack_slots,
-            usize::MAX,
-        );
-        for &spilled in &result.spilled {
+        // Same monotonic-by-start spill commit as `color_gp_bank` —
+        // see the comment there for why the earlier `usize::MAX`
+        // drain was unsafe.
+        let mut ordered_spilled: Vec<(usize, PseudoId)> = result
+            .spilled
+            .iter()
+            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .collect();
+        ordered_spilled.sort_by_key(|&(start, _)| start);
+        for (start, spilled) in ordered_spilled {
             if self.locations.contains_key(&spilled) {
                 continue;
             }
+            crate::arch::regalloc::expire_stack_intervals(
+                &mut self.active_stack,
+                &mut self.free_stack_slots,
+                start,
+            );
             if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
@@ -1464,5 +1589,77 @@ impl RegAlloc {
 impl Default for RegAlloc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gp_clobber_name_64bit_canonical() {
+        assert_eq!(parse_gp_clobber_name("rax"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("rdx"), Some(Reg::Rdx));
+        assert_eq!(parse_gp_clobber_name("r10"), Some(Reg::R10));
+        assert_eq!(parse_gp_clobber_name("r15"), Some(Reg::R15));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_size_aliases() {
+        // 32-bit, 16-bit, 8-bit aliases all resolve to the underlying Reg.
+        assert_eq!(parse_gp_clobber_name("eax"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("ax"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("al"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("ah"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("r10d"), Some(Reg::R10));
+        assert_eq!(parse_gp_clobber_name("r10w"), Some(Reg::R10));
+        assert_eq!(parse_gp_clobber_name("r10b"), Some(Reg::R10));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_leading_percent() {
+        // GCC-style %rax is accepted.
+        assert_eq!(parse_gp_clobber_name("%rax"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("%r10d"), Some(Reg::R10));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_case_insensitive() {
+        assert_eq!(parse_gp_clobber_name("RAX"), Some(Reg::Rax));
+        assert_eq!(parse_gp_clobber_name("R10D"), Some(Reg::R10));
+    }
+
+    #[test]
+    fn parse_gp_clobber_name_unknown() {
+        // Special tokens and non-GP names return None — the asm
+        // clobber walker filters them out silently. "memory" / "cc"
+        // get other treatment (C3 memory barrier; cc is a no-op).
+        assert_eq!(parse_gp_clobber_name("memory"), None);
+        assert_eq!(parse_gp_clobber_name("cc"), None);
+        assert_eq!(parse_gp_clobber_name("xmm0"), None);
+        assert_eq!(parse_gp_clobber_name("st0"), None);
+        assert_eq!(parse_gp_clobber_name(""), None);
+        assert_eq!(parse_gp_clobber_name("not_a_reg"), None);
+    }
+
+    #[test]
+    fn is_call_like_x86_64_covers_libc_emitters() {
+        // Anchor the libc-call-emitting opcodes so a future codegen
+        // change that adds a new builtin → libc lowering doesn't
+        // silently drop out of the chordal allocator's caller-saved
+        // forbidding.
+        assert!(is_call_like_x86_64(Opcode::Call));
+        assert!(is_call_like_x86_64(Opcode::Longjmp));
+        assert!(is_call_like_x86_64(Opcode::Setjmp));
+        assert!(is_call_like_x86_64(Opcode::Fabs32));
+        assert!(is_call_like_x86_64(Opcode::Fabs64));
+        assert!(is_call_like_x86_64(Opcode::Signbit32));
+        assert!(is_call_like_x86_64(Opcode::Signbit64));
+        assert!(is_call_like_x86_64(Opcode::Memset));
+        assert!(is_call_like_x86_64(Opcode::Memcpy));
+        assert!(is_call_like_x86_64(Opcode::Memmove));
+        // Non-call-like opcodes stay off.
+        assert!(!is_call_like_x86_64(Opcode::Add));
+        assert!(!is_call_like_x86_64(Opcode::Asm));
     }
 }

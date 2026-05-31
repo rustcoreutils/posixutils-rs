@@ -191,16 +191,26 @@ pub fn expire_stack_intervals(
     }
 }
 
-/// Find all positions of call instructions in a function.
-/// Used by spill_args_across_calls to identify where arguments may be clobbered.
-/// Includes Call, Longjmp, and Setjmp opcodes since they all invoke external functions
-/// and clobber caller-saved registers.
-pub fn find_call_positions(func: &Function) -> Vec<usize> {
+/// Find all positions of call-like instructions in a function.
+/// Used by spill_args_across_calls and the chordal allocator's cross-call
+/// caller-saved forbidding to identify where caller-saved registers
+/// will be clobbered.
+///
+/// `is_call_like` decides per-opcode. The shared core opcodes are
+/// `Call`, `Longjmp`, `Setjmp`; backends extend that list with any
+/// IR opcodes whose codegen lowering emits a libc call (e.g.
+/// `Fabs32`, `Signbit64` on both arches; `Memcpy`, `Memmove` on
+/// x86_64). Without this, chordal coloring will happily put a live
+/// pseudo into a caller-saved register that the codegen helper's
+/// embedded libc call silently overwrites — see `memory/MEMORY.md`
+/// "Variadic float argument promotion" and the M6+M7 era xmm0
+/// clobber bugs for the historical context.
+pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
     let mut pos = 0usize;
     for block in &func.blocks {
         for insn in &block.insns {
-            if matches!(insn.op, Opcode::Call | Opcode::Longjmp | Opcode::Setjmp) {
+            if is_call_like(insn.op) {
                 call_positions.push(pos);
             }
             pos += 1;

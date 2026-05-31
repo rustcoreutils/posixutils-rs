@@ -670,7 +670,7 @@ pub struct RegAlloc {
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// Active stack slot intervals (interval, offset, size) for reuse tracking
-    active_stack: Vec<(LiveInterval, i32, i32)>,
+    active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
     /// Sym pseudos whose address is taken (cannot participate in slot reuse)
@@ -931,15 +931,13 @@ impl RegAlloc {
         &mut self,
         size: i32,
         alignment: i32,
-        candidate: PseudoId,
-    ) -> Option<i32> {
+        candidate_interval: &LiveInterval,
+    ) -> Option<(i32, Vec<LiveInterval>)> {
         super::super::regalloc::try_reuse_stack_slot(
             &mut self.free_stack_slots,
             size,
             alignment,
-            candidate,
-            &self.live_in,
-            &self.live_out,
+            candidate_interval,
         )
     }
 
@@ -957,9 +955,14 @@ impl RegAlloc {
             self.max_local_align = alignment;
         }
         if reusable {
-            if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval.pseudo) {
+            if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
-                self.active_stack.push((interval.clone(), reused, size));
+                self.active_stack.push(crate::arch::regalloc::ActiveSlot {
+                    current: interval.clone(),
+                    past,
+                    offset: reused,
+                    size,
+                });
                 return;
             }
         }
@@ -970,7 +973,12 @@ impl RegAlloc {
         let offset = -self.stack_offset;
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
-            self.active_stack.push((interval.clone(), offset, size));
+            self.active_stack.push(crate::arch::regalloc::ActiveSlot {
+                current: interval.clone(),
+                past: Vec::new(),
+                offset,
+                size,
+            });
         }
     }
 
@@ -1052,7 +1060,10 @@ impl RegAlloc {
                                 .map(|a| a as i32)
                                 .unwrap_or(natural_align.max(8));
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-                            let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
+                            // Sym slot reuse disabled — see x86_64
+                            // mirror for the rationale.
+                            let _ = self.addr_taken_syms.contains(&interval.pseudo);
+                            let reusable = false;
                             self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
                             if types.is_float(local.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);

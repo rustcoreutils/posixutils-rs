@@ -266,6 +266,109 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
     }
 }
 
+/// True when the IR opcode's codegen lowering uses `R10` and/or `R11`
+/// as a temp register. The constraint declaration prevents the
+/// chordal allocator from placing a *cross-instruction* live pseudo
+/// in R10/R11 — operands of the instruction itself remain exempt
+/// via `involved_pseudos`, so the codegen helper can continue using
+/// the scratch register freely during its lowering.
+///
+/// The list is conservative: any helper whose body reads or writes
+/// R10/R11 anywhere (even on a single conditional branch) is
+/// included. False positives are harmless — they just mean the
+/// allocator avoids R10/R11 for one more class of pseudo. False
+/// negatives would silently miscompile.
+///
+/// The audit was done by grepping `Reg::R10` / `Reg::R11` across the
+/// x86_64 backend and mapping each occurrence back to the
+/// dispatching `Opcode`. Helpers whose only R10/R11 use is the
+/// libc-call argument-spill helper (already covered by
+/// `is_call_like_x86_64`) are not listed — their cross-call clobber
+/// already forbids R10/R11 alongside every other caller-saved
+/// register.
+fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
+    // **Infrastructure only — see the documentation at
+    // `R10_R11_FREEING_DEFERRED` below for why R10/R11 are still
+    // in the reserved-scratch list.** This predicate is the
+    // future-extension point: when the codegen refactor that
+    // moves scratch declarations off hardcoded R10/R11 lands,
+    // adding R10/R11 to `Reg::allocatable()` will start producing
+    // ConstraintPoint forbiddings without changing
+    // `get_constraint_info`.
+    //
+    // Conservative coverage: every opcode whose codegen helper
+    // touches a non-trivial code path is included. Excluded
+    // (truly clean) opcodes:
+    //
+    // - `Br` → single `jmp`.
+    // - `Nop` → no emission.
+    // - `Phi` / `PhiSource` → lowered out by `cc/ir/lower.rs`
+    //   before codegen runs.
+    // - `Unreachable` → `ud2`.
+    // - `Fence` → single `mfence`/`sfence`/`lfence`.
+    // - `VaEnd` → no-op on x86_64 SysV.
+    //
+    // **Entry is dirty** — the function prologue's `rep stosq`
+    // path saves rdi/rcx into R10/R11. Any pseudo whose live
+    // range starts at the entry position needs the prologue-
+    // clobber declaration.
+    !matches!(
+        op,
+        Opcode::Br
+            | Opcode::Nop
+            | Opcode::Phi
+            | Opcode::PhiSource
+            | Opcode::Unreachable
+            | Opcode::Fence
+            | Opcode::VaEnd
+    )
+}
+
+// ============================================================================
+// C4 status — R10/R11 freeing deferred.
+// ============================================================================
+//
+// The C4 milestone intended to add R10/R11 to `Reg::allocatable()`
+// so the chordal allocator could place pseudos in them when their
+// live range doesn't cross an opcode whose codegen helper uses them
+// as scratch. The constraint declaration `opcode_clobbers_r10_r11`
+// above is the infrastructure that *would* make the allocator
+// respect those clobbers.
+//
+// In practice the per-IR-opcode constraint model is **not
+// sufficient**. Inter-instruction codegen paths use R10/R11 in
+// ways no IR-instruction-level constraint can express:
+//
+// 1. `emit_prologue` saves rdi/rcx into R10/R11 around the
+//    `rep stosq` that zeroes the local frame.
+// 2. `emit_variadic_save_area` shuttles arg regs through R10/R11.
+// 3. `spill_args_across_calls` codegen restores spilled args
+//    via R10/R11 in the prologue.
+// 4. Several FP and struct lowerings use R10/R11 between LIR
+//    pushes that span more than one IR instruction's worth of
+//    LIR output.
+//
+// Empirical proof: adding R10/R11 to `Reg::allocatable()` even
+// with `opcode_clobbers_r10_r11` returning `true` for everything
+// but the 7 truly-trivial opcodes still segfaults CPython's
+// `_bootstrap_python` at deepfreeze generation. The crash site
+// (`ucs1lib_default_find`) is in code whose codegen exercises one
+// of the inter-instruction paths.
+//
+// Genuine freeing requires either:
+// - **Codegen refactor**: every `emit_*` helper takes an
+//   allocator-supplied scratch register. Prologue/epilogue/
+//   variadic-save also route through the allocator. Estimated
+//   4000–8000 LOC change.
+// - **Pre-IR scratch-declaration table**: every helper publishes
+//   its scratch needs into a side table the allocator consults
+//   before liveness analysis; ConstraintPoints get added for
+//   prologue/epilogue positions. Estimated 1500–2500 LOC.
+//
+// Both are multi-session milestones in their own right. C4 ships
+// the constraint-declaration infrastructure that enables either
+// approach without lock-in.
+
 /// Opcodes whose x86_64 codegen lowering invokes an external function
 /// (libc or otherwise) and therefore clobbers caller-saved registers.
 /// Used by `find_call_positions` to drive the chordal allocator's
@@ -513,18 +616,34 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     // switches the allocator to consume `InstrConstraints` directly.
     if insn.op == Opcode::Asm {
         let ic = build_asm_instr_constraints_x86_64(insn)?;
-        let (clobbers, involved) = lower_instr_constraints_to_constraint_point(&ic, insn);
+        let (mut clobbers, involved) = lower_instr_constraints_to_constraint_point(&ic, insn);
+        if opcode_clobbers_r10_r11(insn.op) {
+            clobbers.push(Reg::R10);
+            clobbers.push(Reg::R11);
+            clobbers.sort();
+            clobbers.dedup();
+        }
         if clobbers.is_empty() {
             return None;
         }
         return Some((clobbers, involved));
     }
 
-    // Opcode-level hardware constraints.
+    // Opcode-level hardware constraints, plus the C4 R10/R11 scratch
+    // clobbers for any opcode whose codegen helper uses them.
     let constraints = opcode_constraints(insn.op);
-    if constraints.clobbers.is_empty() {
+    let needs_r10_r11 = opcode_clobbers_r10_r11(insn.op);
+    if constraints.clobbers.is_empty() && !needs_r10_r11 {
         return None;
     }
+
+    let mut clobbers: Vec<Reg> = constraints.clobbers.to_vec();
+    if needs_r10_r11 {
+        clobbers.push(Reg::R10);
+        clobbers.push(Reg::R11);
+    }
+    clobbers.sort();
+    clobbers.dedup();
 
     let mut involved = Vec::new();
     if let Some(t) = insn.target {
@@ -536,7 +655,7 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
         involved.extend(insn.src.iter().copied());
     }
 
-    Some((constraints.clobbers.to_vec(), involved))
+    Some((clobbers, involved))
 }
 
 // ============================================================================

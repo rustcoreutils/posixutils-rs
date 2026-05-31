@@ -39,8 +39,7 @@
 // ============================================================================
 
 use crate::arch::regalloc::{
-    compute_live_intervals, expire_intervals, expire_stack_intervals, find_call_positions,
-    find_conflicting_registers, identify_addr_taken_syms, identify_fp_pseudos,
+    compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -52,7 +51,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 // ============================================================================
 
 /// x86-64 physical registers
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reg {
     // 64-bit general purpose registers
     Rax,
@@ -300,7 +299,7 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
 // ============================================================================
 
 /// x86-64 XMM registers for floating-point operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum XmmReg {
     Xmm0,
     Xmm1,
@@ -523,7 +522,7 @@ impl RegAlloc {
         self.spill_args_across_calls(func, &intervals, &call_positions);
         self.spill_args_across_constraints(func, &intervals, &constraint_points);
         self.allocate_alloca_to_stack(func);
-        self.run_linear_scan(func, types, intervals, &call_positions, &constraint_points);
+        self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
@@ -1001,8 +1000,31 @@ impl RegAlloc {
         }
     }
 
-    /// Run the linear scan allocation algorithm
-    fn run_linear_scan(
+    /// Look up an interval by pseudo id (linear scan over the small
+    /// intervals vector; vec is sorted by start position, not pseudo,
+    /// so a linear find is fine).
+    fn interval_by_pseudo(intervals: &[LiveInterval], p: PseudoId) -> Option<&LiveInterval> {
+        intervals.iter().find(|i| i.pseudo == p)
+    }
+
+    /// M6 chordal coloring with stub M7 (spill-on-fail).
+    ///
+    /// Three phases:
+    ///   1. Pre-pass: route non-register-allocated pseudos to their
+    ///      proper Locs (constants → Imm/FImm, Sym → stack slot,
+    ///      int128 → 16-byte stack, long-double → x87 stack, FP
+    ///      crossing call/block boundary → spill XMM caller-saved).
+    ///      The remaining pseudos go into per-bank candidate sets.
+    ///   2. Color: per-bank chordal coloring. ABI-pinned args become
+    ///      pre-colored vertices; constraint clobbers (idiv RAX/RDX,
+    ///      shift Rcx, varargs RAX) and cross-call → caller-saved
+    ///      become per-vertex forbidden colors. In-loop pseudos get a
+    ///      callee-first preferred palette (soft, not forbidden).
+    ///   3. Commit: write Loc::Reg / Loc::Xmm for colored vertices,
+    ///      allocate stack slots for spilled vertices, track
+    ///      `used_callee_saved` for the prologue.
+    #[allow(clippy::too_many_arguments)]
+    fn run_chordal_color(
         &mut self,
         func: &Function,
         types: &TypeTable,
@@ -1010,14 +1032,18 @@ impl RegAlloc {
         call_positions: &[usize],
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
-        for interval in intervals {
-            self.expire_old_intervals(interval.start);
-
+        // -------- Phase 1: pre-pass --------
+        let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
+            std::collections::BTreeSet::new();
+        let mut xmm_candidates: std::collections::BTreeSet<PseudoId> =
+            std::collections::BTreeSet::new();
+        for interval in &intervals {
             if self.locations.contains_key(&interval.pseudo) {
+                // Already assigned by allocate_arguments / spill_args
+                // / alloca passes; arg pseudos become pre-colored
+                // graph vertices in Phase 2.
                 continue;
             }
-
-            // Handle constants and symbols
             if let Some(pseudo) = func.get_pseudo(interval.pseudo) {
                 match &pseudo.kind {
                     PseudoKind::Val(v) => {
@@ -1042,7 +1068,6 @@ impl RegAlloc {
                         if let Some(local_var) = func.locals.get(name) {
                             let size = (types.size_bits(local_var.typ) / 8) as i32;
                             let size = size.max(8);
-                            // Determine alignment: explicit _Alignas takes precedence
                             let natural_align = types.alignment(local_var.typ) as i32;
                             let alignment = if let Some(explicit) = local_var.explicit_align {
                                 explicit as i32
@@ -1050,15 +1075,8 @@ impl RegAlloc {
                                 natural_align.max(8)
                             };
                             let aligned_size = (size + alignment - 1) & !(alignment - 1);
-
-                            // Stack slot reuse uses block-level interference checks
-                            // (live_in/live_out from dataflow fixpoint) which are correct
-                            // for all CFG shapes. Addr-taken syms need stable addresses
-                            // because symaddr-derived pointers may escape to callees.
                             let reusable = !self.addr_taken_syms.contains(&interval.pseudo);
-
-                            self.alloc_stack_slot(&interval, aligned_size, alignment, reusable);
-
+                            self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
                             if types.is_float(local_var.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -1071,110 +1089,297 @@ impl RegAlloc {
                     _ => {}
                 }
             }
-
-            // 128-bit integers always go on the stack (16 bytes, 16-byte aligned)
             if self.int128_pseudos.contains(&interval.pseudo) {
-                self.alloc_stack_slot(&interval, 16, 16, true);
+                self.alloc_stack_slot(interval, 16, 16, true);
                 continue;
             }
-
-            // Allocate register based on type
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
-            let crosses_call = interval_crosses_call(&interval, call_positions);
-
-            // Find registers that conflict due to constraints (e.g., Rax/Rdx for division)
-            let conflicting_regs = find_conflicting_registers(&interval, constraint_points);
-
             if needs_fp {
-                // Long double uses x87 FPU (stack-based), not XMM registers.
-                // Always allocate to stack with 16-byte slots for 80-bit extended precision.
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
-                // FP pseudos that live across basic block boundaries must be
-                // spilled to stack. Phase D's interval collapse is unreliable
-                // for multi-block lifetimes (same issue as stack coloring),
-                // so XMM registers would be prematurely freed and reused.
+                let crosses_call = interval_crosses_call(interval, call_positions);
                 let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
                 if is_longdouble {
-                    // Long double needs 16 bytes (80-bit padded to 128-bit)
-                    self.alloc_stack_slot(&interval, 16, 16, false);
-                } else if crosses_call || crosses_block {
-                    // All XMM registers are caller-saved on x86-64 SysV ABI.
-                    // Values live across function calls or block boundaries
-                    // must be spilled to stack.
-                    self.alloc_stack_slot(&interval, 8, 8, true);
-                } else if let Some(xmm) = self.free_xmm_regs.pop() {
-                    self.locations.insert(interval.pseudo, Loc::Xmm(xmm));
-                    let pos = self
-                        .active_xmm
-                        .partition_point(|(i, _)| i.end <= interval.end);
-                    self.active_xmm.insert(pos, (interval.clone(), xmm));
-                } else {
-                    self.alloc_stack_slot(&interval, 8, 8, true);
+                    self.alloc_stack_slot(interval, 16, 16, false);
+                    continue;
                 }
-            } else if crosses_call || interval.in_loop {
-                // Interval crosses a call or is inside a loop - must use callee-saved register or spill
-                // For loops without calls, this prevents values from being clobbered by register pressure
-                // Also exclude registers that conflict with constraints
-                if let Some(idx) = self
-                    .free_regs
-                    .iter()
-                    .position(|r| r.is_callee_saved() && !conflicting_regs.contains(r))
-                {
-                    let reg = self.free_regs.remove(idx);
-                    if !self.used_callee_saved.contains(&reg) {
-                        self.used_callee_saved.push(reg);
-                    }
-                    self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
-                    self.active.insert(pos, (interval.clone(), reg));
-                } else {
-                    // No callee-saved registers available - spill to stack
-                    self.alloc_stack_slot(&interval, 8, 8, true);
+                if crosses_call || crosses_block {
+                    self.alloc_stack_slot(interval, 8, 8, true);
+                    continue;
                 }
+                xmm_candidates.insert(interval.pseudo);
             } else {
-                // Interval doesn't appear to cross a call. In functions WITH
-                // calls, prefer callee-saved registers to guard against
-                // under-estimated live intervals from complex control flow
-                // (e.g., switch/goto dispatch). In functions WITHOUT calls,
-                // prefer caller-saved to minimize callee-saved usage.
-                let reg_opt = if let Some(idx) = self
-                    .free_regs
-                    .iter()
-                    .position(|r| !r.is_callee_saved() && !conflicting_regs.contains(r))
-                {
-                    Some(self.free_regs.remove(idx))
-                } else if let Some(idx) = self
-                    .free_regs
-                    .iter()
-                    .position(|r| !conflicting_regs.contains(r))
-                {
-                    Some(self.free_regs.remove(idx))
-                } else {
-                    None
-                };
+                gp_candidates.insert(interval.pseudo);
+            }
+        }
 
-                if let Some(reg) = reg_opt {
-                    if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
-                        self.used_callee_saved.push(reg);
-                    }
-                    self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    let pos = self.active.partition_point(|(i, _)| i.end <= interval.end);
-                    self.active.insert(pos, (interval.clone(), reg));
-                } else {
-                    // Reusable: short-lived, no call/loop crossing
-                    self.alloc_stack_slot(&interval, 8, 8, true);
+        // -------- Phase 2: per-bank chordal coloring --------
+        self.color_gp_bank(
+            func,
+            &intervals,
+            call_positions,
+            constraint_points,
+            &gp_candidates,
+        );
+        self.color_xmm_bank(func, &intervals, &xmm_candidates);
+    }
+
+    fn color_gp_bank(
+        &mut self,
+        func: &Function,
+        intervals: &[LiveInterval],
+        call_positions: &[usize],
+        constraint_points: &[ConstraintPoint<Reg>],
+        gp_candidates: &std::collections::BTreeSet<PseudoId>,
+    ) {
+        use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
+        if gp_candidates.is_empty() {
+            return;
+        }
+
+        // Pre-colored vertices: any pseudo already mapped to a GP reg
+        // (ABI-pinned args from allocate_arguments). Add them to the
+        // graph so live conflicts are respected.
+        let mut pre_colored: BTreeMap<PseudoId, Reg> = BTreeMap::new();
+        let mut all_vertices: std::collections::BTreeSet<PseudoId> = gp_candidates.clone();
+        for (&pid, loc) in self.locations.iter() {
+            if let Loc::Reg(r) = loc {
+                pre_colored.insert(pid, *r);
+                all_vertices.insert(pid);
+            }
+        }
+
+        // GP coloring needs def-vs-src edges: some codegen lowerings
+        // (notably x86_64 `cmov` for ternary `(cond)?a:b`) materialize
+        // the target into a register and then read source values,
+        // which would clobber a source sharing the target's register.
+        let graph = build_interference_graph(&all_vertices, func, &self.live_out, true);
+
+        // Forbidden colors. Three sources:
+        //   (a) constraint clobbers (idiv RAX/RDX, etc.) — for pseudos
+        //       live across the constraint that are NOT operands.
+        //   (b) cross-call → all caller-saved registers (HARD
+        //       constraint, NOT a preference: the call clobbers them
+        //       and the value would be lost).
+        //   (c) NB: in-loop is NOT a forbidden constraint, only a
+        //       preference (soft) — see preferred_palette below.
+        let caller_saved: Vec<Reg> = Reg::allocatable()
+            .iter()
+            .copied()
+            .filter(|r| !r.is_callee_saved())
+            .collect();
+        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<Reg>> = BTreeMap::new();
+        for cp in constraint_points {
+            for interval in intervals {
+                if !gp_candidates.contains(&interval.pseudo) {
+                    continue;
                 }
+                if interval.start > cp.position || cp.position > interval.end {
+                    continue;
+                }
+                if cp.involved_pseudos.contains(&interval.pseudo) {
+                    continue;
+                }
+                let entry = forbidden.entry(interval.pseudo).or_default();
+                for &c in &cp.clobbers {
+                    entry.insert(c);
+                }
+            }
+        }
+        let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
+            std::collections::BTreeSet::new();
+        for interval in intervals {
+            if !gp_candidates.contains(&interval.pseudo) {
+                continue;
+            }
+            if interval_crosses_call(interval, call_positions) {
+                let entry = forbidden.entry(interval.pseudo).or_default();
+                for &r in &caller_saved {
+                    entry.insert(r);
+                }
+            } else if interval.in_loop {
+                in_loop_set.insert(interval.pseudo);
+            }
+        }
+
+        // Preferred palettes: in-loop → callee-saved first, else
+        // caller-saved first (to avoid touching callee-saved slots in
+        // the prologue/epilogue when not needed).
+        let caller_first: Vec<Reg> = {
+            let mut v = caller_saved.clone();
+            for &r in Reg::allocatable() {
+                if r.is_callee_saved() {
+                    v.push(r);
+                }
+            }
+            v
+        };
+        let callee_first: Vec<Reg> = {
+            let mut v: Vec<Reg> = Reg::allocatable()
+                .iter()
+                .copied()
+                .filter(|r| r.is_callee_saved())
+                .collect();
+            for &r in &caller_saved {
+                v.push(r);
+            }
+            v
+        };
+        let caller_first_c = caller_first.clone();
+        let callee_first_c = callee_first.clone();
+
+        let order = mcs_ordering(&graph);
+        let result = greedy_color(
+            &graph,
+            &order,
+            Reg::allocatable(),
+            &pre_colored,
+            &forbidden,
+            |v| {
+                if in_loop_set.contains(&v) {
+                    Some(callee_first_c.clone())
+                } else {
+                    Some(caller_first_c.clone())
+                }
+            },
+        );
+
+        // -------- M7 Belady eviction --------
+        // For each pseudo the greedy pass couldn't place, look at its
+        // colored neighbors. If a neighbor's next-use is STRICTLY
+        // further than the failing pseudo's, hand the neighbor's
+        // register to the failing pseudo and spill the neighbor —
+        // Belady's "evict the value used furthest in the future" rule
+        // applied at color-failure time. Eviction only succeeds when
+        // the neighbor's color is also legal for the failing pseudo
+        // (not in its forbidden set, not held by any OTHER neighbor).
+        let uses = crate::arch::regalloc::compute_use_positions(func);
+        let mut colors = result.colors;
+        let mut final_spilled: std::collections::BTreeSet<PseudoId> =
+            std::collections::BTreeSet::new();
+        for spilled in result.spilled {
+            if colors.contains_key(&spilled) {
+                continue;
+            }
+            let interval = match Self::interval_by_pseudo(intervals, spilled) {
+                Some(i) => i,
+                None => {
+                    final_spilled.insert(spilled);
+                    continue;
+                }
+            };
+            let empty = std::collections::BTreeSet::new();
+            let forbid = forbidden.get(&spilled).unwrap_or(&empty);
+            let spilled_next =
+                crate::arch::regalloc::next_use_distance(&uses, spilled, interval.start);
+            // Snapshot the neighbor list before scanning; we mutate
+            // `colors` inside the inner search so the iteration set
+            // needs to be stable.
+            let neighbors: Vec<PseudoId> = graph.neighbors(spilled).collect();
+            let mut best_evict: Option<(PseudoId, Reg, usize)> = None;
+            for &n in &neighbors {
+                if pre_colored.contains_key(&n) {
+                    // Don't evict ABI-pinned args.
+                    continue;
+                }
+                let Some(&color) = colors.get(&n) else {
+                    continue;
+                };
+                if forbid.contains(&color) {
+                    continue;
+                }
+                // Color is legal for `spilled` only if no OTHER
+                // neighbor already holds it.
+                let conflict = neighbors
+                    .iter()
+                    .any(|&m| m != n && colors.get(&m).copied() == Some(color));
+                if conflict {
+                    continue;
+                }
+                let nd = crate::arch::regalloc::next_use_distance(&uses, n, interval.start);
+                if nd > spilled_next && best_evict.is_none_or(|(_, _, d)| nd > d) {
+                    best_evict = Some((n, color, nd));
+                }
+            }
+            if let Some((evicted, color, _)) = best_evict {
+                colors.remove(&evicted);
+                colors.insert(spilled, color);
+                final_spilled.insert(evicted);
+            } else {
+                final_spilled.insert(spilled);
+            }
+        }
+
+        // -------- Phase 3: commit --------
+        for (&pid, &reg) in &colors {
+            if pre_colored.contains_key(&pid) {
+                continue;
+            }
+            self.locations.insert(pid, Loc::Reg(reg));
+            if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
+                self.used_callee_saved.push(reg);
+            }
+        }
+        for &spilled in &final_spilled {
+            if self.locations.contains_key(&spilled) {
+                continue;
+            }
+            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+                self.alloc_stack_slot(interval, 8, 8, true);
             }
         }
     }
 
-    fn expire_old_intervals(&mut self, point: usize) {
-        // Expire integer register intervals
-        expire_intervals(&mut self.active, &mut self.free_regs, point);
-        // Expire XMM register intervals
-        expire_intervals(&mut self.active_xmm, &mut self.free_xmm_regs, point);
-        // Expire stack slot intervals for reuse
-        expire_stack_intervals(&mut self.active_stack, &mut self.free_stack_slots, point);
+    fn color_xmm_bank(
+        &mut self,
+        func: &Function,
+        intervals: &[LiveInterval],
+        xmm_candidates: &std::collections::BTreeSet<PseudoId>,
+    ) {
+        use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
+        if xmm_candidates.is_empty() {
+            return;
+        }
+        let mut pre_colored: BTreeMap<PseudoId, XmmReg> = BTreeMap::new();
+        let mut all_vertices: std::collections::BTreeSet<PseudoId> = xmm_candidates.clone();
+        for (&pid, loc) in self.locations.iter() {
+            if let Loc::Xmm(r) = loc {
+                pre_colored.insert(pid, *r);
+                all_vertices.insert(pid);
+            }
+        }
+        // XMM coloring does NOT need def-vs-src edges: SSE FP ops are
+        // three-operand at the IR level (target, src1, src2) and the
+        // codegen lowers them to either `movsd src1, dst; opsd src2,
+        // dst` (which is safe regardless of register sharing) or to
+        // AVX/SSE3-style three-operand forms. Adding def-vs-src edges
+        // here over-constrains coloring and corrupts FP-heavy code
+        // paths (e.g. _Py_dg_strtod's correction loop) in non-obvious
+        // ways.
+        let graph = build_interference_graph(&all_vertices, func, &self.live_out, false);
+        let forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<XmmReg>> = BTreeMap::new();
+        let order = mcs_ordering(&graph);
+        let result = greedy_color(
+            &graph,
+            &order,
+            XmmReg::allocatable(),
+            &pre_colored,
+            &forbidden,
+            |_| None::<Vec<XmmReg>>,
+        );
+        for (&pid, &reg) in &result.colors {
+            if pre_colored.contains_key(&pid) {
+                continue;
+            }
+            self.locations.insert(pid, Loc::Xmm(reg));
+        }
+        for &spilled in &result.spilled {
+            if self.locations.contains_key(&spilled) {
+                continue;
+            }
+            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+                self.alloc_stack_slot(interval, 8, 8, true);
+            }
+        }
     }
 
     /// Compute live intervals, constraint points, and per-block liveness sets.

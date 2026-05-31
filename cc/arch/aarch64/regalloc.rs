@@ -670,7 +670,7 @@ pub struct RegAlloc {
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// Active stack slot intervals (interval, offset, size) for reuse tracking
-    active_stack: Vec<(LiveInterval, i32, i32)>,
+    active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
     /// Sym pseudos whose address is taken (cannot participate in slot reuse)
@@ -932,7 +932,7 @@ impl RegAlloc {
         size: i32,
         alignment: i32,
         candidate_interval: &LiveInterval,
-    ) -> Option<i32> {
+    ) -> Option<(i32, Vec<LiveInterval>)> {
         super::super::regalloc::try_reuse_stack_slot(
             &mut self.free_stack_slots,
             size,
@@ -955,9 +955,14 @@ impl RegAlloc {
             self.max_local_align = alignment;
         }
         if reusable {
-            if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval) {
+            if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
-                self.active_stack.push((interval.clone(), reused, size));
+                self.active_stack.push(crate::arch::regalloc::ActiveSlot {
+                    current: interval.clone(),
+                    past,
+                    offset: reused,
+                    size,
+                });
                 return;
             }
         }
@@ -968,7 +973,12 @@ impl RegAlloc {
         let offset = -self.stack_offset;
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
-            self.active_stack.push((interval.clone(), offset, size));
+            self.active_stack.push(crate::arch::regalloc::ActiveSlot {
+                current: interval.clone(),
+                past: Vec::new(),
+                offset,
+                size,
+            });
         }
     }
 

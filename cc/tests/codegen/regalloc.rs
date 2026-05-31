@@ -401,6 +401,65 @@ int main(void) {
     );
 }
 
+#[test]
+fn regalloc_slot_multi_owner_history() {
+    // Regression test for the multi-owner slot-reuse bug. Pseudo A
+    // owns slot S during [t0, t1]; A frees S. Pseudo B reuses S
+    // during [t2, t3] where t2 > t1. Pseudo C with lifetime that
+    // spans [t0.something, t3.something] then tries to reuse S
+    // checked-against-B-only (current owner) — sees no overlap and
+    // is granted S, but C's lifetime actually overlaps A's old
+    // window so C silently overwrites the slot in A's tail window.
+    //
+    // The bug was the bottom of the CPython `double_round`
+    // miscompile (assertAlmostEqual segfault — interval-overlap
+    // check only validated against the most-recent owner, not the
+    // full ownership history).
+    //
+    // C-level reproducer is fiddly to engineer reliably without
+    // depending on allocator internals; the test below relies on
+    // running a function with enough register pressure that
+    // chordal coloring triggers spill commits in an order that
+    // exercises the multi-owner case. The function does floating-
+    // point arithmetic interleaved with calls so the FP allocator
+    // path is exercised. CPython's full test suite is the broader
+    // regression coverage.
+    let code = r#"
+#include <stdio.h>
+
+__attribute__((noinline))
+double helper(double a, double b, double c) {
+    return a * b + c;
+}
+
+__attribute__((noinline))
+int compute(double x, double y, int n) {
+    double a = x + 1.0;
+    double b = y + 1.0;
+    double c = helper(a, b, x);
+    double d = helper(b, a, y);
+    double e = c + d;
+    if (n > 0) {
+        e = e + helper(a, c, d);
+    }
+    if (e != e) return 99;
+    return (e > 0.0) ? 1 : 0;
+}
+
+int main(void) {
+    if (compute(1.0, 2.0, 1) != 1) return 1;
+    if (compute(-1.0, -2.0, 1) != 0) return 2;
+    if (compute(0.5, 0.25, 0) != 1) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("regalloc_slot_multi_owner_history", code, &[]),
+        0,
+        "stack slot reuse must check candidate's interval against ALL past owners, not just the current one"
+    );
+}
+
 // ============================================================================
 // Sym (named local) stack coloring tests
 // ============================================================================

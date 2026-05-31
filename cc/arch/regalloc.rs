@@ -95,14 +95,33 @@ pub struct LiveInterval {
 pub struct FreeSlot {
     pub offset: i32,
     pub alignment: i32,
-    /// The previous owner's live interval — the slot is safe to
-    /// reuse for a candidate whose own interval doesn't overlap
-    /// this one. `pseudos_interfere` was previously used here but
-    /// its block-level liveness misses within-block conflicts (a
-    /// register pseudo whose lifetime sits entirely inside one
-    /// block has empty live_in/live_out projections, so the check
-    /// returned false even when intervals genuinely overlapped).
-    pub owner_interval: LiveInterval,
+    /// The live intervals of *every* pseudo that has ever owned
+    /// this slot — current and prior owners. A candidate may
+    /// reuse the slot only if its own interval is disjoint from
+    /// EVERY entry. The "current owner only" approximation
+    /// (checking just the most-recent occupant) is unsafe:
+    /// suppose A owns the slot during [11,17], then frees it; B
+    /// reuses during [81,130], also frees. If a candidate C with
+    /// interval [6,42] now checks "do I overlap B?" it sees no
+    /// conflict — but C overlaps A's old window [11,17] and would
+    /// read garbage during that span. CPython's `double_round`
+    /// miscompile (assertAlmostEqual segfault) hits this exact
+    /// pattern.
+    pub owner_intervals: Vec<LiveInterval>,
+}
+
+/// A stack slot currently assigned to a live pseudo, plus the full
+/// history of past owners. Used by `expire_stack_intervals` and
+/// `try_reuse_stack_slot` to preserve history across reuse cycles.
+#[derive(Debug, Clone)]
+pub struct ActiveSlot {
+    /// The current owner's live interval — drives `expire_stack_intervals`.
+    pub current: LiveInterval,
+    /// Past owners (FIFO) whose intervals already ended but whose
+    /// constraints must still be respected on the next reuse.
+    pub past: Vec<LiveInterval>,
+    pub offset: i32,
+    pub size: i32,
 }
 
 /// A point in the function where register constraints apply.
@@ -139,23 +158,37 @@ pub struct ConstraintPoint<R> {
 /// stp/ldp offsets past the architectural [-512, 504] immediate range
 /// and the assembler rejects the output.
 pub fn expire_stack_intervals(
-    active_stack: &mut Vec<(LiveInterval, i32, i32)>,
+    active_stack: &mut Vec<ActiveSlot>,
     free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
     point: usize,
 ) {
-    active_stack.retain(|(interval, offset, size)| {
-        if interval.end < point {
-            let alignment = if *size >= 16 { 16 } else { 8 };
-            free_slots.entry(*size).or_default().push(FreeSlot {
-                offset: *offset,
-                alignment,
-                owner_interval: interval.clone(),
-            });
+    let mut to_free: Vec<ActiveSlot> = Vec::new();
+    active_stack.retain(|slot| {
+        if slot.current.end < point {
+            to_free.push(slot.clone());
             false
         } else {
             true
         }
     });
+    for slot in to_free {
+        let alignment = if slot.size >= 16 { 16 } else { 8 };
+        // The freed slot's history is `past ++ [current]`.
+        let mut owners = slot.past;
+        owners.push(slot.current);
+        // Merge with any existing FreeSlot at the same offset (an
+        // earlier owner that already freed and is waiting for reuse).
+        let slots = free_slots.entry(slot.size).or_default();
+        if let Some(existing) = slots.iter_mut().find(|s| s.offset == slot.offset) {
+            existing.owner_intervals.extend(owners);
+        } else {
+            slots.push(FreeSlot {
+                offset: slot.offset,
+                alignment,
+                owner_intervals: owners,
+            });
+        }
+    }
 }
 
 /// Find all positions of call instructions in a function.
@@ -1045,36 +1078,47 @@ pub fn next_use_distance(
 
 /// Try to reuse a previously freed stack slot of the given size and alignment.
 ///
-/// Uses interval-overlap on `candidate_interval` against each free
-/// slot's owner_interval. Two intervals `[a.start, a.end]` and
-/// `[b.start, b.end]` are non-overlapping iff `a.end < b.start` or
-/// `b.end < a.start`. The previous implementation walked block-level
-/// liveness via `pseudos_interfere`, which missed the case where
-/// both pseudos' lifetimes sit entirely inside the same block —
-/// both then have empty live_in/live_out projections and the check
-/// reported "no interference" even when they overlap. CPython's
-/// `Python/thread.o` miscompile (slot reused for `_PyTime_Add`
-/// result while `thelock` was still live in the same block)
-/// motivated the switch.
+/// Reuse is safe iff `candidate_interval` is disjoint from **every**
+/// past owner of the slot. Two intervals `[a.start, a.end]` and
+/// `[b.start, b.end]` are disjoint iff `a.end < b.start` or
+/// `b.end < a.start`.
+///
+/// History matters: when slot S is freed by A and reused by B, the
+/// slot's "current owner" is B but A's interval still constrains any
+/// future candidate. The earlier implementation checked only the
+/// most-recent owner — when A.lifetime [11,17] and B.lifetime
+/// [81,130] were both past owners, a candidate C with [6,42] saw
+/// only B (no conflict) but actually collided with A's [11,17].
+/// CPython's `double_round` miscompile (the assertAlmostEqual
+/// segfault) reproduced this exact pattern.
+///
+/// When a slot is reused, the existing `FreeSlot` entry is removed
+/// from `free_stack_slots`; the *new* owner's interval is appended to
+/// the entry when the slot is freed again by `expire_stack_intervals`.
+/// This preserves the full ownership history across the reuse cycle.
+/// To make the history preservation work, this function returns
+/// (offset, history) so the caller can stash history into
+/// `active_stack` and have it re-merged on expire.
 pub fn try_reuse_stack_slot(
     free_stack_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
     size: i32,
     alignment: i32,
     candidate_interval: &LiveInterval,
-) -> Option<i32> {
+) -> Option<(i32, Vec<LiveInterval>)> {
     if let Some(slots) = free_stack_slots.get_mut(&size) {
         if let Some(idx) = slots.iter().position(|s| {
             if s.alignment < alignment {
                 return false;
             }
-            let owner = &s.owner_interval;
-            owner.end < candidate_interval.start || candidate_interval.end < owner.start
+            s.owner_intervals.iter().all(|owner| {
+                owner.end < candidate_interval.start || candidate_interval.end < owner.start
+            })
         }) {
             let slot = slots.remove(idx);
             if slots.is_empty() {
                 free_stack_slots.remove(&size);
             }
-            return Some(slot.offset);
+            return Some((slot.offset, slot.owner_intervals));
         }
     }
     None

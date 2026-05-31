@@ -1038,6 +1038,15 @@ impl RegAlloc {
         let mut xmm_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in &intervals {
+            // Intervals come pre-sorted by start position from
+            // compute_live_intervals, so this monotonic expiration
+            // recovers the linear-scan-era slot-reuse behavior the
+            // chordal sweep would otherwise lose.
+            crate::arch::regalloc::expire_stack_intervals(
+                &mut self.active_stack,
+                &mut self.free_stack_slots,
+                interval.start,
+            );
             if self.locations.contains_key(&interval.pseudo) {
                 // Already assigned by allocate_arguments / spill_args
                 // / alloca passes; arg pseudos become pre-colored
@@ -1319,6 +1328,13 @@ impl RegAlloc {
                 self.used_callee_saved.push(reg);
             }
         }
+        // Drain any remaining active slots into the free pool so spill
+        // commits below can reuse them via interference checks.
+        crate::arch::regalloc::expire_stack_intervals(
+            &mut self.active_stack,
+            &mut self.free_stack_slots,
+            usize::MAX,
+        );
         for &spilled in &final_spilled {
             if self.locations.contains_key(&spilled) {
                 continue;
@@ -1372,6 +1388,13 @@ impl RegAlloc {
             }
             self.locations.insert(pid, Loc::Xmm(reg));
         }
+        // Same drain-then-reuse pattern as the GP commit; see comment
+        // on expire_stack_intervals in cc/arch/regalloc.rs.
+        crate::arch::regalloc::expire_stack_intervals(
+            &mut self.active_stack,
+            &mut self.free_stack_slots,
+            usize::MAX,
+        );
         for &spilled in &result.spilled {
             if self.locations.contains_key(&spilled) {
                 continue;

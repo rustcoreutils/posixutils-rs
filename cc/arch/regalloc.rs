@@ -118,6 +118,40 @@ pub struct ConstraintPoint<R> {
 // Common Functions
 // ============================================================================
 
+/// Release stack slots whose owning interval ended before `point` back
+/// to the free-slot pool, where future `try_reuse_stack_slot` calls
+/// can find them.
+///
+/// Linear scan called this on every iteration with the next interval's
+/// `start`. The chordal allocator (M6) calls it twice per bank: once
+/// in Phase 1 sweeping monotonically by interval start, then once with
+/// `usize::MAX` just before Phase 3 spill commits to drain everything
+/// so spilled pseudos can reuse any non-interfering slot.
+///
+/// Without this, every `alloc_stack_slot` request creates a fresh
+/// slot. On x86_64 that's wasteful but harmless. On aarch64 it pushes
+/// stp/ldp offsets past the architectural [-512, 504] immediate range
+/// and the assembler rejects the output.
+pub fn expire_stack_intervals(
+    active_stack: &mut Vec<(LiveInterval, i32, i32)>,
+    free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
+    point: usize,
+) {
+    active_stack.retain(|(interval, offset, size)| {
+        if interval.end < point {
+            let alignment = if *size >= 16 { 16 } else { 8 };
+            free_slots.entry(*size).or_default().push(FreeSlot {
+                offset: *offset,
+                alignment,
+                owner: interval.pseudo,
+            });
+            false
+        } else {
+            true
+        }
+    });
+}
+
 /// Find all positions of call instructions in a function.
 /// Used by spill_args_across_calls to identify where arguments may be clobbered.
 /// Includes Call, Longjmp, and Setjmp opcodes since they all invoke external functions

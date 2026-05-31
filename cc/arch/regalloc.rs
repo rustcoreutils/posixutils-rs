@@ -118,47 +118,6 @@ pub struct ConstraintPoint<R> {
 // Common Functions
 // ============================================================================
 
-/// Expire old intervals from the active list, returning freed registers to the free list.
-/// Generic over register type R (works with both GP and FP register types).
-pub fn expire_intervals<R: Copy>(
-    active: &mut Vec<(LiveInterval, R)>,
-    free_regs: &mut Vec<R>,
-    point: usize,
-) {
-    let mut to_remove = Vec::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
-    for (i, (interval, reg)) in active.iter().enumerate() {
-        if interval.end < point {
-            free_regs.push(*reg);
-            to_remove.push(i);
-        }
-    }
-    for i in to_remove.into_iter().rev() {
-        active.remove(i);
-    }
-}
-
-/// Expire stack intervals whose live range ended before `point`,
-/// returning their slots to the free list.
-pub fn expire_stack_intervals(
-    active_stack: &mut Vec<(LiveInterval, i32, i32)>,
-    free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
-    point: usize,
-) {
-    active_stack.retain(|(interval, offset, size)| {
-        if interval.end < point {
-            let alignment = if *size >= 16 { 16 } else { 8 };
-            free_slots.entry(*size).or_default().push(FreeSlot {
-                offset: *offset,
-                alignment,
-                owner: interval.pseudo,
-            });
-            false
-        } else {
-            true
-        }
-    });
-}
-
 /// Find all positions of call instructions in a function.
 /// Used by spill_args_across_calls to identify where arguments may be clobbered.
 /// Includes Call, Longjmp, and Setjmp opcodes since they all invoke external functions
@@ -185,61 +144,6 @@ pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) 
     call_positions
         .iter()
         .any(|&call_pos| interval.start <= call_pos && call_pos <= interval.end)
-}
-
-/// Find registers that would conflict with this interval due to constraints.
-///
-/// A constraint point models an instruction that clobbers one or more
-/// physical registers (e.g. `idivl` clobbers RAX and RDX). For any live
-/// interval that overlaps such a point, we must keep that pseudo out of the
-/// clobbered registers — otherwise its value would be silently destroyed.
-///
-/// There is one exception: pseudos that are direct *operands* of the
-/// constraining instruction (`involved_pseudos`) MAY occupy a clobbered
-/// register, because the constraining instruction itself reads or writes
-/// those registers as part of its semantics. The classic case is the
-/// integer dividend, which must be in RAX/EAX for `idiv` to execute.
-///
-/// Crucially, that "operand exemption" only holds when the operand's value
-/// dies at the constraint point (`interval.end == cp.position`). When the
-/// interval extends *past* the clobber (`interval.end > cp.position`), the
-/// operand's value is still needed afterward, but the clobbering
-/// instruction will have destroyed it. In that case the allocator must
-/// pick a NON-clobbered register; codegen will materialize the value into
-/// the operand-required register (e.g. RAX) with a move just before the
-/// constraint, preserving the original pseudo's contents for later uses.
-///
-/// Without this distinction, `Copy`/CSE/SCCP-class passes that extend a
-/// pseudo's live range across a `mods.32`/`idivl` boundary silently
-/// miscompile (see git history: prior copyprop attempts hung do-while-
-/// continue tests by allocating the dividend to RAX with a use after the
-/// idiv).
-///
-/// Generic over register type R.
-pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
-    interval: &LiveInterval,
-    constraint_points: &[ConstraintPoint<R>],
-) -> HashSet<R> {
-    let mut conflicts = HashSet::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
-
-    for cp in constraint_points {
-        // Use <= on both ends so an interval that exactly meets the
-        // constraint point still counts as overlapping.
-        if interval.start <= cp.position && cp.position <= interval.end {
-            let is_involved = cp.involved_pseudos.contains(&interval.pseudo);
-            let dies_at_point = interval.end == cp.position;
-            // The operand exemption only applies when the value is
-            // consumed AT the constraint point. If it must survive past
-            // the clobber, it has to live in a non-clobbered register.
-            if !is_involved || !dies_at_point {
-                for &reg in &cp.clobbers {
-                    conflicts.insert(reg);
-                }
-            }
-        }
-    }
-
-    conflicts
 }
 
 /// Result of liveness analysis: intervals, constraint points, and per-block liveness sets.

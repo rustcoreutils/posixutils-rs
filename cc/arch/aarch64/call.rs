@@ -245,12 +245,12 @@ impl Aarch64CodeGen {
                         Loc::Stack(offset) => {
                             // Load lo/hi from int128 stack slot into two consecutive regs
                             let mem = self.stack_mem(offset);
-                            self.push_lir(Aarch64Inst::Ldp {
-                                size: OperandSize::B64,
-                                addr: mem,
-                                dst1: int_arg_regs[int_arg_idx],
-                                dst2: int_arg_regs[int_arg_idx + 1],
-                            });
+                            self.emit_ldp_legalized(
+                                OperandSize::B64,
+                                mem,
+                                int_arg_regs[int_arg_idx],
+                                int_arg_regs[int_arg_idx + 1],
+                            );
                         }
                         Loc::Imm(v) => {
                             let lo = v as u64 as i64;
@@ -321,12 +321,7 @@ impl Aarch64CodeGen {
                 match loc {
                     Loc::Stack(src_off) => {
                         let mem = self.stack_mem(src_off);
-                        self.push_lir(Aarch64Inst::Ldp {
-                            size: OperandSize::B64,
-                            addr: mem,
-                            dst1: Reg::X9,
-                            dst2: Reg::X10,
-                        });
+                        self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X9, Reg::X10);
                     }
                     Loc::Imm(v) => {
                         let lo = v as u64 as i64;

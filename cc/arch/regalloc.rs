@@ -118,27 +118,20 @@ pub struct ConstraintPoint<R> {
 // Common Functions
 // ============================================================================
 
-/// Expire old intervals from the active list, returning freed registers to the free list.
-/// Generic over register type R (works with both GP and FP register types).
-pub fn expire_intervals<R: Copy>(
-    active: &mut Vec<(LiveInterval, R)>,
-    free_regs: &mut Vec<R>,
-    point: usize,
-) {
-    let mut to_remove = Vec::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
-    for (i, (interval, reg)) in active.iter().enumerate() {
-        if interval.end < point {
-            free_regs.push(*reg);
-            to_remove.push(i);
-        }
-    }
-    for i in to_remove.into_iter().rev() {
-        active.remove(i);
-    }
-}
-
-/// Expire stack intervals whose live range ended before `point`,
-/// returning their slots to the free list.
+/// Release stack slots whose owning interval ended before `point` back
+/// to the free-slot pool, where future `try_reuse_stack_slot` calls
+/// can find them.
+///
+/// Linear scan called this on every iteration with the next interval's
+/// `start`. The chordal allocator (M6) calls it twice per bank: once
+/// in Phase 1 sweeping monotonically by interval start, then once with
+/// `usize::MAX` just before Phase 3 spill commits to drain everything
+/// so spilled pseudos can reuse any non-interfering slot.
+///
+/// Without this, every `alloc_stack_slot` request creates a fresh
+/// slot. On x86_64 that's wasteful but harmless. On aarch64 it pushes
+/// stp/ldp offsets past the architectural [-512, 504] immediate range
+/// and the assembler rejects the output.
 pub fn expire_stack_intervals(
     active_stack: &mut Vec<(LiveInterval, i32, i32)>,
     free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
@@ -185,61 +178,6 @@ pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) 
     call_positions
         .iter()
         .any(|&call_pos| interval.start <= call_pos && call_pos <= interval.end)
-}
-
-/// Find registers that would conflict with this interval due to constraints.
-///
-/// A constraint point models an instruction that clobbers one or more
-/// physical registers (e.g. `idivl` clobbers RAX and RDX). For any live
-/// interval that overlaps such a point, we must keep that pseudo out of the
-/// clobbered registers — otherwise its value would be silently destroyed.
-///
-/// There is one exception: pseudos that are direct *operands* of the
-/// constraining instruction (`involved_pseudos`) MAY occupy a clobbered
-/// register, because the constraining instruction itself reads or writes
-/// those registers as part of its semantics. The classic case is the
-/// integer dividend, which must be in RAX/EAX for `idiv` to execute.
-///
-/// Crucially, that "operand exemption" only holds when the operand's value
-/// dies at the constraint point (`interval.end == cp.position`). When the
-/// interval extends *past* the clobber (`interval.end > cp.position`), the
-/// operand's value is still needed afterward, but the clobbering
-/// instruction will have destroyed it. In that case the allocator must
-/// pick a NON-clobbered register; codegen will materialize the value into
-/// the operand-required register (e.g. RAX) with a move just before the
-/// constraint, preserving the original pseudo's contents for later uses.
-///
-/// Without this distinction, `Copy`/CSE/SCCP-class passes that extend a
-/// pseudo's live range across a `mods.32`/`idivl` boundary silently
-/// miscompile (see git history: prior copyprop attempts hung do-while-
-/// continue tests by allocating the dividend to RAX with a use after the
-/// idiv).
-///
-/// Generic over register type R.
-pub fn find_conflicting_registers<R: Copy + Eq + Hash>(
-    interval: &LiveInterval,
-    constraint_points: &[ConstraintPoint<R>],
-) -> HashSet<R> {
-    let mut conflicts = HashSet::with_capacity(DEFAULT_SMALL_VEC_CAPACITY);
-
-    for cp in constraint_points {
-        // Use <= on both ends so an interval that exactly meets the
-        // constraint point still counts as overlapping.
-        if interval.start <= cp.position && cp.position <= interval.end {
-            let is_involved = cp.involved_pseudos.contains(&interval.pseudo);
-            let dies_at_point = interval.end == cp.position;
-            // The operand exemption only applies when the value is
-            // consumed AT the constraint point. If it must survive past
-            // the clobber, it has to live in a non-clobbered register.
-            if !is_involved || !dies_at_point {
-                for &reg in &cp.clobbers {
-                    conflicts.insert(reg);
-                }
-            }
-        }
-    }
-
-    conflicts
 }
 
 /// Result of liveness analysis: intervals, constraint points, and per-block liveness sets.
@@ -793,6 +731,328 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
         record_spill(interval.pseudo, reg, to_offset);
         locations.insert(interval.pseudo, mk_stack_loc(to_offset));
         push_free(reg);
+    }
+}
+
+// ============================================================================
+// Chordal coloring on the SSA interference graph (M6)
+// ============================================================================
+//
+// SSA interference graphs are chordal (Pereira/Palsberg 2005, Hack
+// 2005): a perfect elimination ordering exists and greedy coloring on
+// that ordering achieves the chromatic number. The two-step recipe:
+//   1. Maximum Cardinality Search (MCS) on the interference graph
+//      yields a perfect elimination ordering.
+//   2. Greedy color in MCS order: pick the lowest-index register not
+//      used by any already-colored neighbor.
+//
+// pcc's IR is not strictly SSA at the allocator boundary —
+// `lower::eliminate_phi_nodes` introduces multi-def Copy patterns. The
+// interference graph is still well-defined: vertex u interferes with
+// vertex v iff u and v are simultaneously live somewhere in the
+// function. We construct it precisely with a per-instruction backward
+// walk (the textbook "for each def, add edges to currently-live"
+// pattern) rather than the coarser block-level all-pairs that would
+// over-constrain coloring with spurious edges.
+//
+// Constraint pre-coloring (e.g. x86_64 `idiv` clobbers RAX/RDX) is
+// expressed via per-pseudo `forbidden` colors passed to greedy_color.
+// ABI-pinned arg pseudos arrive via `pre_colored`. Physical registers
+// don't need to be modeled as graph vertices.
+//
+// Use BTreeMap / BTreeSet throughout so iteration is deterministic —
+// the project's determinism invariant (cc/CLAUDE.md) covers this.
+
+/// Per-pseudo set of interfering pseudos for one register bank.
+#[derive(Debug, Default)]
+pub struct InterferenceGraph {
+    /// Adjacency map. `edges[p]` is the set of pseudos that interfere
+    /// with `p` and belong to the same register bank.
+    pub edges: BTreeMap<PseudoId, std::collections::BTreeSet<PseudoId>>,
+    /// All vertices, including isolated ones (no edges).
+    pub vertices: std::collections::BTreeSet<PseudoId>,
+}
+
+impl InterferenceGraph {
+    pub fn new() -> Self {
+        Self {
+            edges: BTreeMap::new(),
+            vertices: std::collections::BTreeSet::new(),
+        }
+    }
+
+    pub fn add_vertex(&mut self, p: PseudoId) {
+        self.vertices.insert(p);
+        self.edges.entry(p).or_default();
+    }
+
+    pub fn add_edge(&mut self, a: PseudoId, b: PseudoId) {
+        if a == b {
+            return;
+        }
+        self.add_vertex(a);
+        self.add_vertex(b);
+        self.edges.entry(a).or_default().insert(b);
+        self.edges.entry(b).or_default().insert(a);
+    }
+
+    pub fn neighbors(&self, p: PseudoId) -> impl Iterator<Item = PseudoId> + '_ {
+        self.edges
+            .get(&p)
+            .into_iter()
+            .flat_map(|s| s.iter().copied())
+    }
+}
+
+/// Build the interference graph for pseudos in `candidates`.
+///
+/// Walks each basic block backward maintaining the current live set.
+/// For each instruction, the new defs interfere with everything that
+/// is live just after the instruction (i.e. before the backward step
+/// removes them); the def-vs-live edges must be added BEFORE removing
+/// the def from `live`, or edges between same-block adjacent def/use
+/// pairs are silently dropped.
+///
+/// Additionally, each def interferes with the instruction's own
+/// sources. Some codegen lowerings (notably x86_64 `cmov` for ternary
+/// `(cond) ? a : b`) materialize the target into a register and then
+/// read source values, which would clobber a source that shares a
+/// register with the target. The def-vs-src edge enforces disjoint
+/// registers in that case at the cost of an occasional extra move
+/// when the codegen would have allowed sharing. Net effect on .text
+/// size is small; without these edges, register allocation silently
+/// corrupts cmov/conditional-store patterns.
+pub fn build_interference_graph(
+    candidates: &std::collections::BTreeSet<PseudoId>,
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    add_def_src_edges: bool,
+) -> InterferenceGraph {
+    let mut graph = InterferenceGraph::new();
+    for &c in candidates {
+        graph.add_vertex(c);
+    }
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let mut live: std::collections::BTreeSet<PseudoId> = live_out[idx]
+            .iter()
+            .copied()
+            .filter(|p| candidates.contains(p))
+            .collect();
+        for insn in block.insns.iter().rev() {
+            // Collect defs of this instruction.
+            let mut defs: Vec<PseudoId> = Vec::new();
+            if let Some(target) = insn.target {
+                if candidates.contains(&target) {
+                    defs.push(target);
+                }
+            }
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    for output in &asm.outputs {
+                        if candidates.contains(&output.pseudo) {
+                            defs.push(output.pseudo);
+                        }
+                    }
+                }
+            }
+            // Each def interferes with everything currently live AND
+            // with the instruction's other defs AND with each src
+            // (for the lowering-correctness reason described above).
+            for &d in &defs {
+                for &l in live.iter() {
+                    if l != d {
+                        graph.add_edge(d, l);
+                    }
+                }
+                for &d2 in &defs {
+                    if d != d2 {
+                        graph.add_edge(d, d2);
+                    }
+                }
+                if add_def_src_edges {
+                    for &src in &insn.src {
+                        if src != d && candidates.contains(&src) {
+                            graph.add_edge(d, src);
+                        }
+                    }
+                }
+            }
+            // Remove defs from live (they were born here; not live before).
+            for &d in &defs {
+                live.remove(&d);
+            }
+            // Add uses (srcs are live coming INTO this instruction).
+            for &src in &insn.src {
+                if candidates.contains(&src) {
+                    live.insert(src);
+                }
+            }
+            if let Some(indirect) = insn.indirect_target {
+                if candidates.contains(&indirect) {
+                    live.insert(indirect);
+                }
+            }
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    for input in &asm.inputs {
+                        if candidates.contains(&input.pseudo) {
+                            live.insert(input.pseudo);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    graph
+}
+
+/// Maximum Cardinality Search (MCS) ordering. The reverse of this
+/// ordering is a perfect elimination ordering when the graph is
+/// chordal; greedy coloring in MCS order yields an optimal coloring.
+///
+/// Algorithm: start with all weights at 0. Repeatedly pick an
+/// unprocessed vertex with maximum weight (ties broken by smallest
+/// pseudo id for determinism), add it to the ordering, increment
+/// weight of each unprocessed neighbor.
+pub fn mcs_ordering(graph: &InterferenceGraph) -> Vec<PseudoId> {
+    let mut weight: BTreeMap<PseudoId, usize> = BTreeMap::new();
+    for &v in &graph.vertices {
+        weight.insert(v, 0);
+    }
+    let mut order: Vec<PseudoId> = Vec::with_capacity(graph.vertices.len());
+    let mut remaining: std::collections::BTreeSet<PseudoId> = graph.vertices.clone();
+    while !remaining.is_empty() {
+        // Pick max-weight (tie-break: smaller PseudoId wins).
+        let pick = *remaining
+            .iter()
+            .max_by(|a, b| {
+                let wa = weight.get(*a).copied().unwrap_or(0);
+                let wb = weight.get(*b).copied().unwrap_or(0);
+                wa.cmp(&wb).then(b.0.cmp(&a.0))
+            })
+            .unwrap();
+        remaining.remove(&pick);
+        order.push(pick);
+        for n in graph.neighbors(pick) {
+            if remaining.contains(&n) {
+                *weight.entry(n).or_insert(0) += 1;
+            }
+        }
+    }
+    order
+}
+
+/// Result of greedy coloring for one register bank.
+pub struct ColoringResult<R> {
+    pub colors: BTreeMap<PseudoId, R>,
+    pub spilled: Vec<PseudoId>,
+}
+
+/// Greedy color pseudos in `order` using registers from `palette`.
+///
+/// * `pre_colored` — forced color assignments (e.g. ABI-pinned args).
+///   These are honored unchanged.
+/// * `forbidden` — per-vertex sets of colors that MUST NOT be assigned
+///   (correctness constraint, e.g. x86_64 cross-call pseudos forbidden
+///   from caller-saved, or pseudos live across `idiv` forbidden from
+///   RAX/RDX).
+/// * `preferred_palette` — biases the search order for each vertex
+///   (e.g. prefer callee-saved for in-loop pseudos). Returns the
+///   subset to try first; the full `palette` is searched as a
+///   fallback.
+///
+/// Vertices that cannot be colored land in `spilled`.
+pub fn greedy_color<R, PrefFn>(
+    graph: &InterferenceGraph,
+    order: &[PseudoId],
+    palette: &[R],
+    pre_colored: &BTreeMap<PseudoId, R>,
+    forbidden: &BTreeMap<PseudoId, std::collections::BTreeSet<R>>,
+    preferred_palette: PrefFn,
+) -> ColoringResult<R>
+where
+    R: Copy + Eq + Ord + Hash,
+    PrefFn: Fn(PseudoId) -> Option<Vec<R>>,
+{
+    let mut colors: BTreeMap<PseudoId, R> = pre_colored.clone();
+    let mut spilled: Vec<PseudoId> = Vec::new();
+    let empty: std::collections::BTreeSet<R> = std::collections::BTreeSet::new();
+    for &v in order {
+        if colors.contains_key(&v) {
+            continue;
+        }
+        let used: std::collections::BTreeSet<R> = graph
+            .neighbors(v)
+            .filter_map(|n| colors.get(&n).copied())
+            .collect();
+        let forbid = forbidden.get(&v).unwrap_or(&empty);
+        let prefer = preferred_palette(v);
+        let pick = prefer
+            .as_ref()
+            .and_then(|p| {
+                p.iter()
+                    .find(|r| !used.contains(r) && !forbid.contains(r))
+                    .copied()
+            })
+            .or_else(|| {
+                palette
+                    .iter()
+                    .find(|r| !used.contains(r) && !forbid.contains(r))
+                    .copied()
+            });
+        if let Some(r) = pick {
+            colors.insert(v, r);
+        } else {
+            spilled.push(v);
+        }
+    }
+    ColoringResult { colors, spilled }
+}
+
+/// For each pseudo, the sorted positions at which it is used (read).
+/// M7 Belady uses this to compute "next-use distance" — when register
+/// pressure forces a spill, the pseudo with the furthest next use is
+/// the cheapest to evict (reloading later costs less than reloading
+/// sooner).
+pub fn compute_use_positions(func: &Function) -> BTreeMap<PseudoId, Vec<usize>> {
+    let mut uses: BTreeMap<PseudoId, Vec<usize>> = BTreeMap::new();
+    let mut pos = 0usize;
+    for block in &func.blocks {
+        for insn in &block.insns {
+            for &src in &insn.src {
+                uses.entry(src).or_default().push(pos);
+            }
+            if let Some(indirect) = insn.indirect_target {
+                uses.entry(indirect).or_default().push(pos);
+            }
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    for input in &asm.inputs {
+                        uses.entry(input.pseudo).or_default().push(pos);
+                    }
+                }
+            }
+            pos += 1;
+        }
+    }
+    uses
+}
+
+/// Distance from position `p` to the next use of `pseudo`, or
+/// `usize::MAX` if there is no remaining use.
+pub fn next_use_distance(
+    uses: &BTreeMap<PseudoId, Vec<usize>>,
+    pseudo: PseudoId,
+    p: usize,
+) -> usize {
+    let Some(positions) = uses.get(&pseudo) else {
+        return usize::MAX;
+    };
+    let idx = positions.partition_point(|&q| q <= p);
+    if idx < positions.len() {
+        positions[idx] - p
+    } else {
+        usize::MAX
     }
 }
 

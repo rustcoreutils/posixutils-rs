@@ -287,9 +287,20 @@ impl X86_64CodeGen {
         };
 
         let dst_loc = self.get_location(target);
+        // When the target lives on the stack, we need an XMM scratch
+        // register to perform the binop. Must be one outside the
+        // allocator's palette (xmm0-xmm13) so we don't clobber a live
+        // pseudo. Use xmm15 — xmm14 is used as the fallback scratch
+        // elsewhere in this file when dst_xmm == xmm15.
+        //
+        // Pre-fix: this used Xmm0, which silently clobbered chordal-
+        // allocated FP pseudos whose intervals didn't cross a call
+        // (e.g., short-lived temporaries in _Py_dg_strtod's
+        // correction loop). Manifested as infinite loops where the
+        // computation went off the rails.
         let dst_xmm = match &dst_loc {
             Loc::Xmm(x) => *x,
-            _ => XmmReg::Xmm0, // Use XMM0 as work register
+            _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
@@ -422,9 +433,12 @@ impl X86_64CodeGen {
         };
 
         let dst_loc = self.get_location(target);
+        // See emit_fp_binop above: fallback must be a reserved XMM (xmm14
+        // or xmm15) so we don't clobber any chordal-allocated pseudo when
+        // the target lives on the stack.
         let dst_xmm = match &dst_loc {
             Loc::Xmm(x) => *x,
-            _ => XmmReg::Xmm0,
+            _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
@@ -503,30 +517,27 @@ impl X86_64CodeGen {
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
         let move_size = Self::size_from_type(insn.typ, insn.size, types);
 
-        // Check if src2 is in Xmm0 before we clobber it with src1.
-        // If so, move src2 to Xmm15 first to avoid losing its value.
-        let src2_loc = self.get_location(src2);
-        if matches!(src2_loc, Loc::Xmm(XmmReg::Xmm0)) {
-            self.push_lir(X86Inst::MovFp {
-                size: fp_size,
-                src: XmmOperand::Reg(XmmReg::Xmm0),
-                dst: XmmOperand::Reg(XmmReg::Xmm15),
-            });
-        }
+        // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
+        // reserved scratch — not in the allocator palette). src2 cannot
+        // be in Xmm15 (allocator never picks it), so no aliasing check
+        // is needed.
+        //
+        // Pre-fix: this used Xmm0 as the work register and Xmm15 as the
+        // src2-aliasing escape hatch. Under chordal coloring, any FP
+        // pseudo could be allocated to Xmm0, so loading src1 into Xmm0
+        // silently clobbered live values.
 
-        // Load first operand to XMM0
-        self.emit_fp_move(src1, XmmReg::Xmm0, move_size);
+        // Load first operand to XMM15
+        self.emit_fp_move(src1, XmmReg::Xmm15, move_size);
 
         // Compare with second operand using ucomiss/ucomisd
-        // Re-read src2 location; if it was Xmm0, it's now in Xmm15.
         let src2_loc = self.get_location(src2);
         match src2_loc {
             Loc::Xmm(x) => {
-                let actual_reg = if x == XmmReg::Xmm0 { XmmReg::Xmm15 } else { x };
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
-                    src: XmmOperand::Reg(actual_reg),
-                    dst: XmmReg::Xmm0,
+                    src: XmmOperand::Reg(x),
+                    dst: XmmReg::Xmm15,
                 });
             }
             Loc::Stack(offset) => {
@@ -537,23 +548,23 @@ impl X86_64CodeGen {
                         base: Reg::Rbp,
                         offset: -adjusted,
                     }),
-                    dst: XmmReg::Xmm0,
+                    dst: XmmReg::Xmm15,
                 });
             }
             Loc::FImm(v, _) => {
-                self.emit_fp_imm_to_xmm(v, XmmReg::Xmm15, move_size);
+                self.emit_fp_imm_to_xmm(v, XmmReg::Xmm14, move_size);
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmReg::Xmm0,
+                    src: XmmOperand::Reg(XmmReg::Xmm14),
+                    dst: XmmReg::Xmm15,
                 });
             }
             _ => {
-                self.emit_fp_move(src2, XmmReg::Xmm15, move_size);
+                self.emit_fp_move(src2, XmmReg::Xmm14, move_size);
                 self.push_lir(X86Inst::UComiFp {
                     size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmReg::Xmm0,
+                    src: XmmOperand::Reg(XmmReg::Xmm14),
+                    dst: XmmReg::Xmm15,
                 });
             }
         }
@@ -660,9 +671,10 @@ impl X86_64CodeGen {
         };
 
         let dst_loc = self.get_location(target);
+        // Reserved scratch when target lives on the stack (see emit_fp_binop).
         let dst_xmm = match &dst_loc {
             Loc::Xmm(x) => *x,
-            _ => XmmReg::Xmm0,
+            _ => XmmReg::Xmm15,
         };
 
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
@@ -793,11 +805,11 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        // Move float to XMM0 using type-aware source FP size
+        // Move float to XMM15 (reserved scratch — see emit_fp_binop).
         let fp_size = FpSize::from_type_or_bits(insn.src_typ, insn.src_size, types);
         self.emit_fp_move(
             src,
-            XmmReg::Xmm0,
+            XmmReg::Xmm15,
             Self::size_from_type(insn.src_typ, insn.src_size, types),
         );
 
@@ -821,7 +833,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::CvtFpToInt {
             fp_size,
             int_size,
-            src: XmmOperand::Reg(XmmReg::Xmm0),
+            src: XmmOperand::Reg(XmmReg::Xmm15),
             dst: dst_reg,
         });
 
@@ -842,15 +854,24 @@ impl X86_64CodeGen {
         };
 
         let dst_loc = self.get_location(target);
+        // Reserved scratch when target lives on the stack (see emit_fp_binop).
         let dst_xmm = match &dst_loc {
             Loc::Xmm(x) => *x,
-            _ => XmmReg::Xmm0,
+            _ => XmmReg::Xmm15,
         };
 
-        // Move source to XMM0
+        // Scratch for holding the source value before the conversion.
+        // Must not collide with dst_xmm; use Xmm14 when dst is Xmm15.
+        let src_xmm = if dst_xmm == XmmReg::Xmm15 {
+            XmmReg::Xmm14
+        } else {
+            XmmReg::Xmm15
+        };
+
+        // Move source to scratch
         self.emit_fp_move(
             src,
-            XmmReg::Xmm0,
+            src_xmm,
             Self::size_from_type(insn.src_typ, insn.src_size, types),
         );
 
@@ -864,7 +885,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::CvtFpFp {
                     src_size: FpSize::Single,
                     dst_size: FpSize::Double,
-                    src: XmmReg::Xmm0,
+                    src: src_xmm,
                     dst: dst_xmm,
                 });
             }
@@ -873,17 +894,17 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::CvtFpFp {
                     src_size: FpSize::Double,
                     dst_size: FpSize::Single,
-                    src: XmmReg::Xmm0,
+                    src: src_xmm,
                     dst: dst_xmm,
                 });
             }
             _ => {
                 // Same type or types unknown, just move if needed
-                if dst_xmm != XmmReg::Xmm0 {
+                if dst_xmm != src_xmm {
                     let dst_fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types);
                     self.push_lir(X86Inst::MovFp {
                         size: dst_fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        src: XmmOperand::Reg(src_xmm),
                         dst: XmmOperand::Reg(dst_xmm),
                     });
                 }
@@ -902,9 +923,10 @@ impl X86_64CodeGen {
     /// Load a floating-point constant into an XMM register
     pub(super) fn emit_fp_const_load(&mut self, target: PseudoId, value: f64, size: u32) {
         let dst_loc = self.get_location(target);
+        // Reserved scratch when target lives on the stack (see emit_fp_binop).
         let dst_xmm = match &dst_loc {
             Loc::Xmm(x) => *x,
-            _ => XmmReg::Xmm0,
+            _ => XmmReg::Xmm15,
         };
 
         self.emit_fp_imm_to_xmm(value, dst_xmm, size);

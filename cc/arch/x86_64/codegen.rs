@@ -3115,7 +3115,17 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit FP select using conditional branch (CMov doesn't work on XMM regs)
+    /// Emit FP select using conditional branch (CMov doesn't work on XMM regs).
+    ///
+    /// Uses XMM15 as scratch for the merged value. XMM15 is documented as
+    /// codegen-reserved (see `XmmReg::allocatable` — it returns xmm0–xmm13,
+    /// leaving xmm14 and xmm15 out of the allocator's palette specifically
+    /// so codegen helpers like this one can use them without coordinating
+    /// with the allocator. Using xmm0 here clobbers any live xmm0-allocated
+    /// pseudo (chordal coloring may legitimately assign xmm0 to a pseudo
+    /// whose interval doesn't cross a call) and is the classic
+    /// silent-corruption case: the value-loss only manifests in
+    /// downstream computations, often as infinite loops or wrong results.
     fn emit_select_fp(
         &mut self,
         cond: PseudoId,
@@ -3133,8 +3143,8 @@ impl X86_64CodeGen {
         match &cond_loc {
             Loc::Imm(v) => {
                 let val = if *v != 0 { then_val } else { else_val };
-                self.emit_fp_move(val, XmmReg::Xmm0, size);
-                self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size);
+                self.emit_fp_move(val, XmmReg::Xmm15, size);
+                self.emit_fp_move_from_xmm(XmmReg::Xmm15, &dst_loc, size);
                 return;
             }
             Loc::Stack(offset) => {
@@ -3167,17 +3177,17 @@ impl X86_64CodeGen {
             cc: CondCode::Ne,
             target: then_label.clone(),
         });
-        // Else branch: load else_val
-        self.emit_fp_move(else_val, XmmReg::Xmm0, size);
+        // Else branch: load else_val into the reserved scratch xmm15.
+        self.emit_fp_move(else_val, XmmReg::Xmm15, size);
         self.push_lir(X86Inst::Jmp {
             target: done_label.clone(),
         });
-        // Then branch: load then_val
+        // Then branch: load then_val into xmm15.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(then_label)));
-        self.emit_fp_move(then_val, XmmReg::Xmm0, size);
-        // Done
+        self.emit_fp_move(then_val, XmmReg::Xmm15, size);
+        // Done: move xmm15 → dst.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, size);
+        self.emit_fp_move_from_xmm(XmmReg::Xmm15, &dst_loc, size);
     }
 
     /// Emit integer select using CMOVcc
@@ -3306,10 +3316,12 @@ impl X86_64CodeGen {
                 let dst_addr = self.get_x87_mem_addr(dst);
                 self.push_lir(X86Inst::X87Store { addr: dst_addr });
             } else {
-                // Handle regular FP copy (float/double)
+                // Handle regular FP copy (float/double).
+                // Reserved scratch when target lives on the stack (see
+                // emit_fp_binop in float.rs for the full rationale).
                 let dst_xmm = match &dst_loc {
                     Loc::Xmm(x) => *x,
-                    _ => XmmReg::Xmm0,
+                    _ => XmmReg::Xmm15,
                 };
 
                 // Use type-aware size for FP operations

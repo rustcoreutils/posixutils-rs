@@ -931,15 +931,13 @@ impl RegAlloc {
         &mut self,
         size: i32,
         alignment: i32,
-        candidate: PseudoId,
+        candidate_interval: &LiveInterval,
     ) -> Option<i32> {
         super::super::regalloc::try_reuse_stack_slot(
             &mut self.free_stack_slots,
             size,
             alignment,
-            candidate,
-            &self.live_in,
-            &self.live_out,
+            candidate_interval,
         )
     }
 
@@ -957,7 +955,7 @@ impl RegAlloc {
             self.max_local_align = alignment;
         }
         if reusable {
-            if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval.pseudo) {
+            if let Some(reused) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
                 self.active_stack.push((interval.clone(), reused, size));
                 return;

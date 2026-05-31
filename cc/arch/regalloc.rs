@@ -95,8 +95,14 @@ pub struct LiveInterval {
 pub struct FreeSlot {
     pub offset: i32,
     pub alignment: i32,
-    /// The pseudo that previously owned this slot (used for interference checks)
-    pub owner: PseudoId,
+    /// The previous owner's live interval — the slot is safe to
+    /// reuse for a candidate whose own interval doesn't overlap
+    /// this one. `pseudos_interfere` was previously used here but
+    /// its block-level liveness misses within-block conflicts (a
+    /// register pseudo whose lifetime sits entirely inside one
+    /// block has empty live_in/live_out projections, so the check
+    /// returned false even when intervals genuinely overlapped).
+    pub owner_interval: LiveInterval,
 }
 
 /// A point in the function where register constraints apply.
@@ -143,7 +149,7 @@ pub fn expire_stack_intervals(
             free_slots.entry(*size).or_default().push(FreeSlot {
                 offset: *offset,
                 alignment,
-                owner: interval.pseudo,
+                owner_interval: interval.clone(),
             });
             false
         } else {
@@ -188,25 +194,6 @@ pub struct LivenessResult<R> {
     pub live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets (indexed by block index)
     pub live_out: Vec<HashSet<PseudoId>>,
-}
-
-/// Check whether two pseudos interfere (are simultaneously live in any block).
-/// Uses block-level live_in/live_out sets from the dataflow fixpoint, which are
-/// correct for all CFG shapes including computed gotos.
-pub fn pseudos_interfere(
-    live_in: &[HashSet<PseudoId>],
-    live_out: &[HashSet<PseudoId>],
-    a: PseudoId,
-    b: PseudoId,
-) -> bool {
-    for (li, lo) in live_in.iter().zip(live_out.iter()) {
-        let a_live = li.contains(&a) || lo.contains(&a);
-        let b_live = li.contains(&b) || lo.contains(&b);
-        if a_live && b_live {
-            return true;
-        }
-    }
-    false
 }
 
 /// Compute live intervals and constraint points for a function.
@@ -1057,20 +1044,31 @@ pub fn next_use_distance(
 }
 
 /// Try to reuse a previously freed stack slot of the given size and alignment.
-/// Uses block-level interference check to verify the candidate pseudo doesn't
-/// overlap with the slot's previous owner.
-/// Shared between x86_64 and aarch64 register allocators.
+///
+/// Uses interval-overlap on `candidate_interval` against each free
+/// slot's owner_interval. Two intervals `[a.start, a.end]` and
+/// `[b.start, b.end]` are non-overlapping iff `a.end < b.start` or
+/// `b.end < a.start`. The previous implementation walked block-level
+/// liveness via `pseudos_interfere`, which missed the case where
+/// both pseudos' lifetimes sit entirely inside the same block —
+/// both then have empty live_in/live_out projections and the check
+/// reported "no interference" even when they overlap. CPython's
+/// `Python/thread.o` miscompile (slot reused for `_PyTime_Add`
+/// result while `thelock` was still live in the same block)
+/// motivated the switch.
 pub fn try_reuse_stack_slot(
     free_stack_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
     size: i32,
     alignment: i32,
-    candidate: PseudoId,
-    live_in: &[HashSet<PseudoId>],
-    live_out: &[HashSet<PseudoId>],
+    candidate_interval: &LiveInterval,
 ) -> Option<i32> {
     if let Some(slots) = free_stack_slots.get_mut(&size) {
         if let Some(idx) = slots.iter().position(|s| {
-            s.alignment >= alignment && !pseudos_interfere(live_in, live_out, candidate, s.owner)
+            if s.alignment < alignment {
+                return false;
+            }
+            let owner = &s.owner_interval;
+            owner.end < candidate_interval.start || candidate_interval.end < owner.start
         }) {
             let slot = slots.remove(idx);
             if slots.is_empty() {

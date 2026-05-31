@@ -12,6 +12,7 @@
 pub const DEFAULT_LIR_BUFFER_CAPACITY: usize = 5000;
 
 pub mod aarch64;
+pub mod asm_constraints;
 pub mod codegen;
 pub mod dwarf;
 pub mod lir;

@@ -650,6 +650,20 @@ pub struct SpilledArg {
     pub to_stack_offset: i32,
 }
 
+/// Map a single-letter GCC operand-constraint Fixed-register letter
+/// to the corresponding aarch64 GP register. AAPCS64 has no
+/// "specific register" constraint letters in the C2 vocabulary;
+/// all aarch64 inline-asm register operands use `"r"` (Any GP) or
+/// `"w"` (Any V), both of which `parse_constraint` handles directly
+/// without consulting this table. So the current resolver returns
+/// `None` for every letter — but it exists for symmetry with
+/// `parse_x86_64_fixed_letter` and as the future-extension point
+/// for rare aarch64 letters (`"k"`/`"X"`/`"Z"`, ...) when they're
+/// brought in scope.
+pub fn parse_aarch64_fixed_letter(_letter: char) -> Option<Reg> {
+    None
+}
+
 /// Map a clobber-list register name (lowercase, GCC-style) to the
 /// corresponding `Reg`. Accepts the 64-bit canonical name (`x0`, `x29`,
 /// ...), the 32-bit alias (`w0`, `w29`, ...), and special names
@@ -709,15 +723,70 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     if insn.op != Opcode::Asm {
         return None;
     }
+    let ic = build_asm_instr_constraints_aarch64(insn)?;
+    let (clobbers, involved) = lower_instr_constraints_to_constraint_point_aarch64(&ic, insn);
+    if clobbers.is_empty() {
+        return None;
+    }
+    Some((clobbers, involved))
+}
+
+/// Build the per-operand `InstrConstraints` view of an inline-asm
+/// instruction. Mirror of `build_asm_instr_constraints_x86_64`.
+pub fn build_asm_instr_constraints_aarch64(
+    insn: &Instruction,
+) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
+    use crate::arch::asm_constraints::{
+        parse_constraint, InstrConstraints, OperandKind, OperandSpec,
+    };
+
     let asm_data = insn.asm_data.as_ref()?;
+    let mut operands = Vec::new();
+    for ac in asm_data.outputs.iter().chain(asm_data.inputs.iter()) {
+        if let Ok((kind, constraint)) = parse_constraint(&ac.constraint, parse_aarch64_fixed_letter)
+        {
+            let _ = OperandKind::Use;
+            operands.push(OperandSpec {
+                pseudo: ac.pseudo,
+                kind,
+                constraint,
+            });
+        }
+    }
     let mut clobbers: Vec<Reg> = asm_data
         .clobbers
         .iter()
         .filter_map(|name| parse_gp_clobber_name(name))
         .collect();
-    if clobbers.is_empty() {
-        return None;
+    clobbers.sort();
+    clobbers.dedup();
+    let memory_barrier = asm_data.clobbers.iter().any(|c| c == "memory");
+    Some(InstrConstraints {
+        operands,
+        clobbers,
+        memory_barrier,
+    })
+}
+
+/// Mirror of `lower_instr_constraints_to_constraint_point` for aarch64.
+pub fn lower_instr_constraints_to_constraint_point_aarch64(
+    ic: &crate::arch::asm_constraints::InstrConstraints<Reg>,
+    insn: &Instruction,
+) -> (Vec<Reg>, Vec<PseudoId>) {
+    use crate::arch::asm_constraints::{OperandConstraint, OperandKind};
+
+    let mut clobbers = ic.clobbers.clone();
+    for op in &ic.operands {
+        // See `lower_instr_constraints_to_constraint_point` in
+        // the x86_64 mirror for the per-variant rationale.
+        match &op.constraint {
+            OperandConstraint::Fixed(r) => clobbers.push(*r),
+            OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
+            OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
+        }
+        if matches!(op.kind, OperandKind::EarlyClobber) { /* C3: extra interference */ }
     }
+    let _ = ic.memory_barrier;
     clobbers.sort();
     clobbers.dedup();
 
@@ -726,7 +795,13 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
         involved.push(t);
     }
     involved.extend(insn.src.iter().copied());
-    Some((clobbers, involved))
+    for op in &ic.operands {
+        if !involved.contains(&op.pseudo) {
+            involved.push(op.pseudo);
+        }
+    }
+
+    (clobbers, involved)
 }
 
 /// Opcodes whose aarch64 codegen lowering invokes an external function

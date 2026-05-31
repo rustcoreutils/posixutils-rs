@@ -720,16 +720,98 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 /// Special tokens (`"memory"`, `"cc"`) are filtered out — see x86_64
 /// `get_constraint_info` documentation for the rationale.
 pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
-    if insn.op != Opcode::Asm {
+    // Inline-asm path (C2 lowering) — also folds in any C5
+    // scratch-clobber predicate hit, so inline asm in a dirty
+    // opcode position carries both sets of clobbers.
+    if insn.op == Opcode::Asm {
+        let ic = build_asm_instr_constraints_aarch64(insn)?;
+        let (mut clobbers, involved) =
+            lower_instr_constraints_to_constraint_point_aarch64(&ic, insn);
+        if opcode_clobbers_aarch64_scratches(insn.op) {
+            clobbers.extend(AARCH64_SCRATCH_REGS);
+            clobbers.sort();
+            clobbers.dedup();
+        }
+        if clobbers.is_empty() {
+            return None;
+        }
+        return Some((clobbers, involved));
+    }
+
+    // Non-asm opcodes — declare scratches clobbered for the broad
+    // set of opcodes whose codegen helpers touch them. Mirrors the
+    // x86_64 `get_constraint_info` shape (C4).
+    let needs_scratches = opcode_clobbers_aarch64_scratches(insn.op);
+    if !needs_scratches {
         return None;
     }
-    let ic = build_asm_instr_constraints_aarch64(insn)?;
-    let (clobbers, involved) = lower_instr_constraints_to_constraint_point_aarch64(&ic, insn);
-    if clobbers.is_empty() {
-        return None;
+
+    let mut involved = Vec::new();
+    if let Some(t) = insn.target {
+        involved.push(t);
     }
+    involved.extend(insn.src.iter().copied());
+    let mut clobbers: Vec<Reg> = AARCH64_SCRATCH_REGS.to_vec();
+    clobbers.sort();
+    clobbers.dedup();
+
     Some((clobbers, involved))
 }
+
+/// AArch64 codegen scratch registers covered by the C5
+/// constraint-declaration infrastructure. See the
+/// `AARCH64_SCRATCH_FREEING_DEFERRED` block below for why these
+/// are not yet in `Reg::allocatable()`.
+///
+/// `X9` / `X10` / `X11` are the three documented codegen scratches
+/// (the `Reg::scratch_regs()` triple). `X16` / `X17` are AAPCS64
+/// linker-scratch (IP0/IP1) that the pair-address legalizer (commit
+/// `6af088eb`) reuses freely; they're listed for completeness even
+/// though their freeing has its own additional codegen
+/// dependencies.
+const AARCH64_SCRATCH_REGS: &[Reg] = &[Reg::X9, Reg::X10, Reg::X11, Reg::X16, Reg::X17];
+
+/// Conservative predicate — every IR opcode whose codegen helper
+/// is more than a single instruction is assumed to touch at least
+/// one of the AAPCS64 codegen scratches. Mirror of
+/// `opcode_clobbers_r10_r11` in the x86_64 backend; same exclusion
+/// list applies because the trivial opcodes lower identically on
+/// both architectures.
+fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
+    !matches!(
+        op,
+        Opcode::Br
+            | Opcode::Nop
+            | Opcode::Phi
+            | Opcode::PhiSource
+            | Opcode::Unreachable
+            | Opcode::Fence
+            | Opcode::VaEnd
+    )
+}
+
+// ============================================================================
+// C5 status — AArch64 codegen scratch freeing deferred.
+// ============================================================================
+//
+// Same story as x86_64's C4 (see the deferred-freeing block in
+// `cc/arch/x86_64/regalloc.rs`). The per-IR-opcode constraint
+// declarations above are the future-extension point for freeing
+// X9 / X10 / X11 (and eventually X16 / X17), but the codegen
+// paths that use these scratches across instruction boundaries
+// (function prologue, callee-saved save/restore, the pair-address
+// legalizer's X16 materialization, int128 lo/hi shuttle) all
+// require either a wholesale codegen refactor or a pre-IR
+// scratch-declaration table before adding the registers to
+// `Reg::allocatable()` is safe.
+//
+// V16 / V17 / V18 (FP scratches in `cc/arch/aarch64/float.rs`)
+// additionally need V-bank ConstraintPoint plumbing through
+// `color_vreg_bank` — same prerequisite the x86_64 XMM14/XMM15
+// freeing has on `color_xmm_bank`.
+//
+// This commit ships the predicate + integration so the eventual
+// freeing change is just `Reg::allocatable()` modification.
 
 /// Build the per-operand `InstrConstraints` view of an inline-asm
 /// instruction. Mirror of `build_asm_instr_constraints_x86_64`.

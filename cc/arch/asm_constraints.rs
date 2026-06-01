@@ -60,6 +60,16 @@ pub enum OperandConstraint<R> {
     /// allocated; the value is substituted as a literal into the
     /// asm template.
     Imm,
+    /// `"rm"`, `"ri"`, `"rmi"`, `"g"` — the operand satisfies any
+    /// one of these alternatives. The list is non-empty,
+    /// deduplicated, and flattened (no nested `Alternatives`).
+    /// The allocator picks the cheapest fit at lowering time based
+    /// on what the operand's actual location can satisfy. C9 scope:
+    /// alternatives are restricted to `Any` / `Mem` / `Imm` only —
+    /// `Fixed` and `Match` cannot appear inside `Alternatives`
+    /// (mixing pin-to-physreg or pin-to-other-operand with "or
+    /// memory" makes no sense and GCC rejects it too).
+    Alternatives(Vec<OperandConstraint<R>>),
 }
 
 /// Per-operand semantics — whether the operand is read, written, or
@@ -107,20 +117,24 @@ pub struct OperandSpec<R> {
 
 /// Parse a GCC constraint string into a `(kind, constraint)` pair.
 ///
-/// Supported syntax (C2 scope — see plan):
+/// Supported syntax (C9 scope):
 ///
 /// ```text
 ///   modifiers ::= '&'? ('=' | '+')?
-///   constraint ::= modifiers letter
-///   letter ::= 'r' | 'w' | 'm' | 'Q' | 'i' | 'n'
-///            | '0'..'9'
-///            | <any letter that `letter_map` accepts as Fixed(R)>
+///   constraint ::= modifiers body
+///   body ::= class_letter+ | single_letter
+///   class_letter ::= 'r' | 'w' | 'm' | 'Q' | 'i' | 'n' | 'g'
+///   single_letter ::= class_letter | '0'..'9' | <Fixed letter>
 /// ```
 ///
-/// Multi-alternative constraints (`"rm"`, `"ri"`, `"g"`) and rare
-/// per-arch letters (`q`, `l`, `R`, `t`, `I`, `J`, ...) are out of
-/// scope for C2 and produce an error. They become a separate
-/// follow-up after C5 lands.
+/// Multi-character bodies build an `OperandConstraint::Alternatives`
+/// (e.g. `"rm"` → register OR memory; `"g"` is sugar for `"rmi"`).
+/// `Fixed` register letters and `Match` digits cannot appear inside
+/// a multi-character body — GCC's `"ra"` / `"r0"` are nonsensical
+/// (you can't be "either register-class or pinned-to-RAX").
+///
+/// Rare per-arch letters (`q`, `l`, `R`, `t`, `I`, `J`, ...) remain
+/// out of scope (C10).
 ///
 /// `letter_map` is the per-arch resolver for Fixed-register letters
 /// (e.g., x86_64 maps `'a' → Rax`, `'D' → Rdi`; aarch64 currently
@@ -159,25 +173,93 @@ pub fn parse_constraint<R: Copy>(
         (OperandKind::Use, after_amp)
     };
 
-    let mut chars = body.chars();
-    let Some(letter) = chars.next() else {
+    let body_chars: Vec<char> = body.chars().collect();
+    if body_chars.is_empty() {
         return Err(ConstraintParseError::Empty(s.to_string()));
-    };
-    if chars.next().is_some() {
-        return Err(ConstraintParseError::MultiAlternative(s.to_string()));
     }
 
-    let con = match letter {
+    // Single-character body — fast path. Handles Fixed letters and
+    // Match digits, which are illegal inside multi-char bodies.
+    if body_chars.len() == 1 {
+        return Ok((kind, parse_single_letter(body_chars[0], &letter_map, s)?));
+    }
+
+    // Multi-character body: every letter must be a class letter
+    // (Any / Mem / Imm, or `g` sugar). Build the alternatives in
+    // appearance order, dedup, and flatten `g` (which itself is
+    // `Alternatives([Any, Mem, Imm])`).
+    let mut alts: Vec<OperandConstraint<R>> = Vec::with_capacity(body_chars.len());
+    for &c in &body_chars {
+        let sub = parse_single_letter(c, &letter_map, s)?;
+        match sub {
+            OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {
+                push_dedup(&mut alts, sub);
+            }
+            OperandConstraint::Alternatives(inner) => {
+                // `g` sugar — flatten in place.
+                for a in inner {
+                    push_dedup(&mut alts, a);
+                }
+            }
+            OperandConstraint::Fixed(_) | OperandConstraint::Match(_) => {
+                return Err(ConstraintParseError::AlternativeWithFixed(c, s.to_string()));
+            }
+        }
+    }
+
+    // Single-alternative collapse — e.g. `"rr"` → `Any`. Spec-legal:
+    // duplicates have no semantic meaning.
+    let con = if alts.len() == 1 {
+        alts.into_iter().next().unwrap()
+    } else {
+        OperandConstraint::Alternatives(alts)
+    };
+    Ok((kind, con))
+}
+
+/// Parse a single constraint letter into its `OperandConstraint`.
+/// Shared by the single-char fast path and the multi-char alternatives
+/// loop.
+fn parse_single_letter<R: Copy>(
+    letter: char,
+    letter_map: &impl Fn(char) -> Option<R>,
+    full: &str,
+) -> Result<OperandConstraint<R>, ConstraintParseError> {
+    Ok(match letter {
         'r' | 'w' => OperandConstraint::Any,
         'm' | 'Q' => OperandConstraint::Mem,
         'i' | 'n' => OperandConstraint::Imm,
+        // GCC `g` is shorthand for "any general-purpose operand":
+        // register, memory, or immediate. Same as `"rmi"`.
+        'g' => OperandConstraint::Alternatives(vec![
+            OperandConstraint::Any,
+            OperandConstraint::Mem,
+            OperandConstraint::Imm,
+        ]),
         '0'..='9' => OperandConstraint::Match((letter as u8 - b'0') as usize),
         _ => match letter_map(letter) {
             Some(r) => OperandConstraint::Fixed(r),
-            None => return Err(ConstraintParseError::UnknownLetter(letter, s.to_string())),
+            None => {
+                return Err(ConstraintParseError::UnknownLetter(
+                    letter,
+                    full.to_string(),
+                ))
+            }
         },
+    })
+}
+
+/// Insert `con` into `alts` if no kind-equal element is already there.
+/// Alternatives within `Alternatives` are restricted to `Any`/`Mem`/
+/// `Imm` by parse_constraint's check, so a tag-only comparison is
+/// sufficient.
+fn push_dedup<R: Copy>(alts: &mut Vec<OperandConstraint<R>>, con: OperandConstraint<R>) {
+    let same = |a: &OperandConstraint<R>, b: &OperandConstraint<R>| {
+        std::mem::discriminant(a) == std::mem::discriminant(b)
     };
-    Ok((kind, con))
+    if !alts.iter().any(|a| same(a, &con)) {
+        alts.push(con);
+    }
 }
 
 /// Errors from `parse_constraint`. Carried as a diagnostic into the
@@ -189,8 +271,11 @@ pub enum ConstraintParseError {
     /// `"&"` followed by no `=` or `+` — early-clobber on a non-
     /// output makes no sense.
     EarlyClobberOnInput(String),
-    /// `"rm"`, `"ri"`, `"g"` — out of scope for C2.
-    MultiAlternative(String),
+    /// A multi-character constraint body mixed a class letter
+    /// (`r`/`m`/`i`/`g`) with a Fixed-register letter or a Match
+    /// digit (e.g. `"ra"`, `"r0"`). GCC rejects these; we do too.
+    /// Carried char is the offending letter inside the body.
+    AlternativeWithFixed(char, String),
     /// Letter not recognised by this arch.
     UnknownLetter(char, String),
 }
@@ -207,10 +292,11 @@ impl std::fmt::Display for ConstraintParseError {
                     "early-clobber `&` modifier requires `=` or `+` output marker: {s:?}"
                 )
             }
-            ConstraintParseError::MultiAlternative(s) => {
+            ConstraintParseError::AlternativeWithFixed(c, s) => {
                 write!(
                     f,
-                    "multi-alternative inline-asm constraint not supported: {s:?}"
+                    "inline-asm constraint {s:?} cannot mix class letters (r/m/i/g) \
+                     with the Fixed-register / Match-operand letter {c:?}"
                 )
             }
             ConstraintParseError::UnknownLetter(c, s) => {
@@ -325,23 +411,128 @@ mod tests {
     }
 
     #[test]
-    fn reject_multi_alternative() {
-        // GCC's `"rm"` (register OR memory) — out of scope.
-        assert!(matches!(
-            parse_constraint::<Fake>("rm", fake_map),
-            Err(ConstraintParseError::MultiAlternative(_))
-        ));
-        assert!(matches!(
-            parse_constraint::<Fake>("=rm", fake_map),
-            Err(ConstraintParseError::MultiAlternative(_))
-        ));
-    }
-
-    #[test]
     fn reject_unknown_letter() {
         assert!(matches!(
             parse_constraint::<Fake>("z", fake_map),
             Err(ConstraintParseError::UnknownLetter('z', _))
         ));
+    }
+
+    // ========================================================================
+    // C9 — Multi-alternative constraints
+    // ========================================================================
+
+    fn alternative_kinds<R: Copy>(c: &OperandConstraint<R>) -> Vec<&'static str> {
+        match c {
+            OperandConstraint::Alternatives(alts) => alts
+                .iter()
+                .map(|a| match a {
+                    OperandConstraint::Any => "any",
+                    OperandConstraint::Mem => "mem",
+                    OperandConstraint::Imm => "imm",
+                    OperandConstraint::Fixed(_) => "fixed",
+                    OperandConstraint::Match(_) => "match",
+                    OperandConstraint::Alternatives(_) => "nested",
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn parse_multi_alt_rm() {
+        // `"rm"` — register or memory. The most common kernel/UAPI
+        // multi-alt constraint.
+        let (k, c) = parse_constraint::<Fake>("rm", fake_map).unwrap();
+        assert_eq!(k, OperandKind::Use);
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
+
+        let (k, c) = parse_constraint::<Fake>("=rm", fake_map).unwrap();
+        assert_eq!(k, OperandKind::Def);
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
+
+        let (k, c) = parse_constraint::<Fake>("+rm", fake_map).unwrap();
+        assert_eq!(k, OperandKind::UseDef);
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
+    }
+
+    #[test]
+    fn parse_multi_alt_ri() {
+        let (k, c) = parse_constraint::<Fake>("ri", fake_map).unwrap();
+        assert_eq!(k, OperandKind::Use);
+        assert_eq!(alternative_kinds(&c), vec!["any", "imm"]);
+    }
+
+    #[test]
+    fn parse_multi_alt_rmi() {
+        let (k, c) = parse_constraint::<Fake>("rmi", fake_map).unwrap();
+        assert_eq!(k, OperandKind::Use);
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem", "imm"]);
+    }
+
+    #[test]
+    fn parse_g_is_sugar_for_rmi() {
+        // GCC `g` ≡ "register, memory, or immediate" — same as `rmi`.
+        let (k, c) = parse_constraint::<Fake>("g", fake_map).unwrap();
+        assert_eq!(k, OperandKind::Use);
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem", "imm"]);
+    }
+
+    #[test]
+    fn parse_multi_alt_g_flattens() {
+        // `g` inside a multi-char body flattens; the resulting
+        // Alternatives carries Any/Mem/Imm exactly once each.
+        let (_, c) = parse_constraint::<Fake>("rg", fake_map).unwrap();
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem", "imm"]);
+    }
+
+    #[test]
+    fn parse_multi_alt_dedup() {
+        // `"rr"` collapses to a single `Any` — the duplicate has no
+        // semantic value, just dedupes.
+        let (_, c) = parse_constraint::<Fake>("rr", fake_map).unwrap();
+        assert!(matches!(c, OperandConstraint::Any));
+
+        // `"rmm"` collapses to `[Any, Mem]`.
+        let (_, c) = parse_constraint::<Fake>("rmm", fake_map).unwrap();
+        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
+    }
+
+    #[test]
+    fn reject_alternative_with_fixed_letter() {
+        // Mixing a class letter with a Fixed register letter is
+        // nonsensical — GCC rejects, we reject.
+        assert!(matches!(
+            parse_constraint::<Fake>("ra", fake_map),
+            Err(ConstraintParseError::AlternativeWithFixed('a', _))
+        ));
+        // Same for `=` outputs.
+        assert!(matches!(
+            parse_constraint::<Fake>("=mb", fake_map),
+            Err(ConstraintParseError::AlternativeWithFixed('b', _))
+        ));
+    }
+
+    #[test]
+    fn reject_alternative_with_match_digit() {
+        // Match digits also can't appear inside multi-alt bodies.
+        assert!(matches!(
+            parse_constraint::<Fake>("r0", fake_map),
+            Err(ConstraintParseError::AlternativeWithFixed('0', _))
+        ));
+    }
+
+    #[test]
+    fn single_char_fixed_still_works() {
+        // C2/C3 behavior preserved: single-char Fixed letters still
+        // produce `OperandConstraint::Fixed(_)`, not Alternatives.
+        let (_, c) = parse_constraint::<Fake>("=a", fake_map).unwrap();
+        assert!(matches!(c, OperandConstraint::Fixed(Fake::A)));
+    }
+
+    #[test]
+    fn single_char_match_still_works() {
+        let (_, c) = parse_constraint::<Fake>("0", fake_map).unwrap();
+        assert!(matches!(c, OperandConstraint::Match(0)));
     }
 }

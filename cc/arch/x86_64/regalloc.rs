@@ -540,6 +540,15 @@ pub fn lower_instr_constraints_to_constraint_point(
             OperandConstraint::Fixed(r) => clobbers.push(*r),
             OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
             OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
+            // C9 multi-alternative — by construction the
+            // alternatives are restricted to Any/Mem/Imm (no Fixed
+            // or Match), so none impose an allocator clobber. The
+            // allocator picks the most flexible interpretation
+            // (register class) and the codegen later observes the
+            // operand's actual location to choose register vs
+            // memory vs immediate syntax. C9b wires the codegen
+            // side; this lowering is the no-op until then.
+            OperandConstraint::Alternatives(_) => {}
         }
         // Early-clobber outputs are written before all inputs are
         // read, so the allocator must keep them disjoint from every

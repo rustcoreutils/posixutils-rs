@@ -890,6 +890,8 @@ pub fn lower_instr_constraints_to_constraint_point_aarch64(
             OperandConstraint::Fixed(r) => clobbers.push(*r),
             OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
             OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
+            // C9 multi-alternative — see x86_64 mirror.
+            OperandConstraint::Alternatives(_) => {}
         }
         if matches!(op.kind, OperandKind::EarlyClobber) { /* C3: extra interference */ }
     }

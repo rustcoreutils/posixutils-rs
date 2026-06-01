@@ -682,6 +682,161 @@ int main(void) {
     );
 }
 
+// ============================================================================
+// C9 — Multi-Alternative Constraint Tests
+// ============================================================================
+//
+// `"rm"`, `"ri"`, `"rmi"`, and `"g"` (= `"rmi"`) let the compiler choose
+// register vs memory vs immediate based on what fits cheapest given the
+// operand's location. C9a teaches the parser to build
+// `OperandConstraint::Alternatives`; C9b makes the x86_64 codegen's
+// `constraint_requires_register` / `constraint_requires_memory` honor
+// the alternatives (a constraint that lists any non-register class no
+// longer force-loads a spilled value into a temp register; a constraint
+// that lists any non-memory class no longer forces a memory operand).
+//
+// These tests are arch-independent — the patterns work on both x86_64
+// and aarch64 because the assembly inside the asm template uses
+// arch-specific mnemonics in dedicated branches.
+
+/// `"+rm"` with a value that lives in a register. The asm template must
+/// substitute the register form; the value must be incremented in place.
+#[test]
+fn codegen_inline_asm_multi_alt_rm_register_path() {
+    let code = r#"
+int main(void) {
+    int x = 41;
+#if defined(__x86_64__)
+    __asm__("addl $1, %0" : "+rm"(x));
+#elif defined(__aarch64__)
+    __asm__("add %w0, %w0, #1" : "+rm"(x));
+#endif
+    return (x == 42) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_multi_alt_rm_register", code, &[]),
+        0,
+        "+rm with register-resident value must use register syntax"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_multi_alt_rm_register_opt", code),
+        0
+    );
+}
+
+/// `"+m"` on an addr-taken value — value lives in memory by construction.
+#[test]
+fn codegen_inline_asm_multi_alt_m_memory_path() {
+    let code = r#"
+int main(void) {
+    int x = 99;
+    int *p = &x;  // address taken → x stays in memory (mem2reg can't promote)
+#if defined(__x86_64__)
+    __asm__("addl $1, %0" : "+m"(*p));
+#elif defined(__aarch64__)
+    __asm__("ldr w8, %0\n\tadd w8, w8, #1\n\tstr w8, %0" : "+m"(*p));
+#endif
+    return (*p == 100) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_multi_alt_m_memory", code, &[]),
+        0,
+        "+m on addr-taken operand must use memory syntax"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_multi_alt_m_memory_opt", code),
+        0
+    );
+}
+
+/// `"g"` (= `"rmi"`) — most permissive. Tested with both a runtime
+/// value (compiler should use register form) and a const value
+/// (compiler may substitute immediate; today it falls through to
+/// register, which is also correct — C9c later optimizes this).
+#[test]
+fn codegen_inline_asm_multi_alt_g_runtime_value() {
+    let code = r#"
+int main(void) {
+    int x = 7;
+    int r;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0\n\taddl $35, %0" : "=r"(r) : "g"(x));
+#elif defined(__aarch64__)
+    __asm__("add %w0, %w1, #35" : "=r"(r) : "g"(x));
+#endif
+    return (r == 42) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_multi_alt_g_runtime", code, &[]),
+        0,
+        "g constraint must work with a runtime int operand"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_multi_alt_g_runtime_opt", code),
+        0
+    );
+}
+
+/// `"=rm"` output to an addr-taken local — codegen must place the
+/// result into memory (no force-load to a temp register).
+#[test]
+fn codegen_inline_asm_multi_alt_output_rm_to_memory() {
+    let code = r#"
+int main(void) {
+    int dst = 0;
+    int *p = &dst;
+#if defined(__x86_64__)
+    __asm__("movl $123, %0" : "=rm"(*p));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, #123" : "=rm"(*p));
+#endif
+    return (*p == 123) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_multi_alt_output_rm", code, &[]),
+        0,
+        "=rm output to addr-taken location must succeed"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_multi_alt_output_rm_opt", code),
+        0
+    );
+}
+
+/// Multiple multi-alt operands in one asm, mixed input/output.
+#[test]
+fn codegen_inline_asm_multi_alt_mixed_operands() {
+    let code = r#"
+int main(void) {
+    int a = 10, b = 20;
+    int sum;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0\n\taddl %2, %0"
+            : "=r"(sum)
+            : "rm"(a), "rm"(b));
+#elif defined(__aarch64__)
+    __asm__("add %w0, %w1, %w2"
+            : "=r"(sum)
+            : "rm"(a), "rm"(b));
+#endif
+    return (sum == 30) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_multi_alt_mixed", code, &[]),
+        0,
+        "multiple rm-constrained operands in one asm must compile and run"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_multi_alt_mixed_opt", code),
+        0
+    );
+}
+
 /// `__sync_synchronize`-equivalent: a single global barrier between two
 /// unrelated memory accesses. A reordering pass that moved the second
 /// load before the barrier could silently miscompile any code that

@@ -3958,29 +3958,50 @@ impl X86_64CodeGen {
         None
     }
 
-    /// Check if an inline asm constraint requires a register (not memory).
-    /// 'r' = general register, specific letter = specific register.
+    /// Check if an inline asm constraint requires the operand to land
+    /// in a register — i.e., the codegen must force-load a spilled
+    /// value to a temp.
+    ///
+    /// C9 multi-alternative semantics: a constraint that lists *any*
+    /// non-register class (`m`, `o`, `V`, `Q`, `i`, `n`, `g`) does NOT
+    /// require a register, because the operand can use the non-
+    /// register form directly. Only constraints that are register-
+    /// class-only force a load.
     fn constraint_requires_register(constraint: &str) -> bool {
+        let mut has_reg_class = false;
+        let mut has_non_reg_class = false;
         for c in constraint.chars() {
             match c {
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => return true,
-                '=' | '+' | '&' | '%' => continue, // skip modifiers
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => has_reg_class = true,
+                'm' | 'o' | 'V' | 'Q' | 'i' | 'n' | 'g' => has_non_reg_class = true,
                 _ => {}
             }
         }
-        false
+        has_reg_class && !has_non_reg_class
     }
 
-    /// Check if an inline asm constraint requires a memory operand.
+    /// Check if an inline asm constraint requires the operand to be
+    /// in memory — i.e., the codegen must produce a memory operand
+    /// reference rather than a register reference.
+    ///
+    /// C9 multi-alternative semantics: a constraint that lists any
+    /// non-memory class (`r`, `a`..`d`, `S`, `D`, `i`, `n`, `g`) does
+    /// NOT require memory, because the operand can use the register
+    /// or immediate form directly. Only constraints that are memory-
+    /// class-only force a memory operand.
     fn constraint_requires_memory(constraint: &str) -> bool {
+        let mut has_mem_class = false;
+        let mut has_non_mem_class = false;
         for c in constraint.chars() {
             match c {
-                'm' | 'o' | 'V' => return true,
-                '=' | '+' | '&' | '%' => continue,
+                'm' | 'o' | 'V' | 'Q' => has_mem_class = true,
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'i' | 'n' | 'g' => {
+                    has_non_mem_class = true
+                }
                 _ => {}
             }
         }
-        false
+        has_mem_class && !has_non_mem_class
     }
 
     /// Substitute %0, %1, %[name], %l0, %l[name], etc. with actual operand strings

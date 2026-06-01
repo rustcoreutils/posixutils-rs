@@ -2133,27 +2133,42 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Parse an asm constraint string to extract flags
-    /// Returns (is_memory, is_readwrite, matching_output)
-    /// Note: Early clobber (&) is parsed but not used since our simple register
-    /// allocator doesn't share registers between inputs and outputs anyway
+    /// Parse an asm constraint string to extract flags.
+    /// Returns `(is_memory, is_readwrite, matching_output)`.
+    ///
+    /// `is_memory` is true iff the constraint *requires* memory — i.e.,
+    /// every alternative listed is a memory class (`m`, `o`, `V`, `Q`).
+    /// For multi-alt constraints like `"rm"` / `"rmi"` / `"g"` that also
+    /// list a register or immediate class, the linearizer evaluates the
+    /// operand as a value (`linearize_expr`) and lets the codegen
+    /// substitute register vs memory syntax based on the operand's
+    /// actual location. Taking the lvalue (address) for a multi-alt
+    /// like `"rm"` would force every asm substitution to use the
+    /// address bits as if they were the value — broken for the very
+    /// common `"+rm"` increment pattern.
+    ///
+    /// Note: Early clobber (&) is parsed but not used since our simple
+    /// register allocator doesn't share registers between inputs and
+    /// outputs anyway.
     pub(crate) fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>) {
-        let mut is_memory = false;
+        let mut has_memory_class = false;
+        let mut has_non_memory_class = false;
         let mut is_readwrite = false;
         let mut matching = None;
 
         for c in constraint.chars() {
             match c {
                 '+' => is_readwrite = true,
-                '&' | '=' | '%' => {} // Early clobber, output-only, commutative
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' => {} // Register constraints
-                'm' | 'o' | 'V' | 'Q' => is_memory = true,
-                'i' | 'n' | 'g' | 'X' => {} // Immediate, general
+                '&' | '=' | '%' => {} // modifiers
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => has_non_memory_class = true,
+                'm' | 'o' | 'V' | 'Q' => has_memory_class = true,
+                'i' | 'n' | 'g' | 'X' => has_non_memory_class = true,
                 '0'..='9' => matching = Some((c as u8 - b'0') as usize),
                 _ => {} // Ignore unknown constraints
             }
         }
 
+        let is_memory = has_memory_class && !has_non_memory_class;
         (is_memory, is_readwrite, matching)
     }
 

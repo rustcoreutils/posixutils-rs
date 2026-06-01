@@ -483,9 +483,7 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
-    use crate::arch::asm_constraints::{
-        parse_constraint, InstrConstraints, OperandKind, OperandSpec,
-    };
+    use crate::arch::asm_constraints::{parse_constraint, InstrConstraints, OperandSpec};
 
     let asm_data = insn.asm_data.as_ref()?;
     let mut operands = Vec::new();
@@ -497,7 +495,6 @@ pub fn build_asm_instr_constraints_x86_64(
             // through the string). Explicit override only needed if
             // the parser's heuristic mismatches an output we know is
             // a Def — leave to C3 if it shows up.
-            let _ = OperandKind::Use; // silence unused-variant warning
             operands.push(OperandSpec {
                 pseudo: ac.pseudo,
                 kind,

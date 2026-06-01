@@ -818,16 +818,13 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
 pub fn build_asm_instr_constraints_aarch64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
-    use crate::arch::asm_constraints::{
-        parse_constraint, InstrConstraints, OperandKind, OperandSpec,
-    };
+    use crate::arch::asm_constraints::{parse_constraint, InstrConstraints, OperandSpec};
 
     let asm_data = insn.asm_data.as_ref()?;
     let mut operands = Vec::new();
     for ac in asm_data.outputs.iter().chain(asm_data.inputs.iter()) {
         if let Ok((kind, constraint)) = parse_constraint(&ac.constraint, parse_aarch64_fixed_letter)
         {
-            let _ = OperandKind::Use;
             operands.push(OperandSpec {
                 pseudo: ac.pseudo,
                 kind,

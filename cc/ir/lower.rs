@@ -608,6 +608,104 @@ mod tests {
     }
 
     #[test]
+    fn test_sequentialize_two_disjoint_cycles() {
+        // Two independent 2-node cycles in one parallel-copy block:
+        //   a = b, b = a    (cycle 1)
+        //   c = d, d = c    (cycle 2)
+        // Each cycle requires its own temporary; the algorithm must
+        // break them independently and emit all four destination
+        // writes. Validates that the cycle-break loop terminates and
+        // produces a correct sequenced result when the parallel-copy
+        // graph has multiple disjoint strongly-connected components.
+        let mut func = make_minimal_func();
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1), // a
+                source: PseudoId(2), // b
+                size: 32,
+                typ: None,
+            },
+            CopyInfo {
+                target: PseudoId(2), // b
+                source: PseudoId(1), // a
+                size: 32,
+                typ: None,
+            },
+            CopyInfo {
+                target: PseudoId(3), // c
+                source: PseudoId(4), // d
+                size: 32,
+                typ: None,
+            },
+            CopyInfo {
+                target: PseudoId(4), // d
+                source: PseudoId(3), // c
+                size: 32,
+                typ: None,
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        // 4 originals + 1 temp per cycle = 6 copies total.
+        assert_eq!(result.len(), 6, "two disjoint 2-cycles need two temps");
+
+        // All four original destinations must be written.
+        let targets: Vec<_> = result.iter().map(|c| c.target).collect();
+        assert!(targets.contains(&PseudoId(1)));
+        assert!(targets.contains(&PseudoId(2)));
+        assert!(targets.contains(&PseudoId(3)));
+        assert!(targets.contains(&PseudoId(4)));
+
+        // Both temps are fresh pseudos.
+        let temps: Vec<_> = targets.iter().filter(|t| t.0 >= 100).collect();
+        assert_eq!(temps.len(), 2, "exactly one temp per cycle");
+    }
+
+    #[test]
+    fn test_sequentialize_fp_cycle_propagates_type() {
+        // A 2-cycle on float-typed copies. The sequentializer creates
+        // a temp pseudo that carries the source's type through the
+        // emitted Copy instruction. Downstream `identify_fp_pseudos`
+        // walks instruction types to mark FP pseudos for the FP
+        // allocator bank — so the temp's Copy MUST carry the float
+        // type forward, otherwise the temp would be misallocated as
+        // a GP register and corrupt the FP cycle's values.
+        let types = TypeTable::new(&Target::host());
+        let float_type = types.float_id;
+        let mut func = Function::new("test", float_type);
+        func.next_pseudo = 100;
+
+        let copies = vec![
+            CopyInfo {
+                target: PseudoId(1),
+                source: PseudoId(2),
+                size: 32,
+                typ: Some(float_type),
+            },
+            CopyInfo {
+                target: PseudoId(2),
+                source: PseudoId(1),
+                size: 32,
+                typ: Some(float_type),
+            },
+        ];
+
+        let result = sequentialize_copies(&copies, &mut func);
+
+        assert_eq!(result.len(), 3, "FP 2-cycle needs one temp");
+        // Every emitted Copy must carry the float type so the
+        // identify_fp_pseudos scan picks up the temp.
+        for c in &result {
+            assert_eq!(
+                c.typ,
+                Some(float_type),
+                "FP cycle copy must propagate float type to temp"
+            );
+        }
+    }
+
+    #[test]
     fn test_phisource_swap_problem() {
         // Two phis that swap values: %a = phi %b, %b = phi %a
         // PhiSource instructions in predecessor should produce correct copies

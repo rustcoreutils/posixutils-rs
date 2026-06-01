@@ -3052,20 +3052,25 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // Build operand strings for asm substitution
-        // We use the actual locations assigned by the register allocator
-        // so that subsequent Store instructions work correctly.
-        let mut operand_regs: Vec<Option<Reg>> = Vec::new();
-        let mut operand_sizes: Vec<u32> = Vec::new();
-        let mut operand_mem: Vec<Option<String>> = Vec::new();
-        let mut operand_names: Vec<Option<String>> = Vec::new();
+        // Build operand slots for asm substitution. Each `AsmOperandSlot`
+        // bundles (reg, mem, size, name) so per-operand pushes can't go
+        // out of sync — see the x86_64 mirror's commit for the
+        // motivation.
+        let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
+        let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
 
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
             let loc = self.get_location(output.pseudo);
             let requires_mem = Self::constraint_requires_memory(&output.constraint);
-            operand_names.push(output.name.clone());
-            operand_sizes.push(output.size);
+            let op_size = output.size;
+            let op_name = output.name.clone();
+            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
+                reg,
+                mem,
+                size: op_size,
+                name: op_name.clone(),
+            };
             match loc {
                 Loc::Reg(r) if requires_mem => {
                     // Memory-class constraint with the address in a
@@ -3074,18 +3079,15 @@ impl Aarch64CodeGen {
                     // asm template substitutes `wN`/`xN` and the
                     // assembler rejects (`ldr w8, w0` → "expected
                     // label or encodable integer pc offset").
-                    operand_regs.push(None);
-                    operand_mem.push(Some(format!("[{}]", asm_reg_name_64(r))));
+                    slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
                 }
                 Loc::Reg(r) => {
-                    operand_regs.push(Some(r));
-                    operand_mem.push(None);
+                    slots.push(mk(Some(r), None));
                 }
                 _ => {
                     // Memory or other location - emit as memory operand
-                    let mem_str = self.loc_to_asm_string(&loc, output.size);
-                    operand_regs.push(None);
-                    operand_mem.push(Some(mem_str));
+                    let mem_str = self.loc_to_asm_string(&loc, op_size);
+                    slots.push(mk(None, Some(mem_str)));
                 }
             }
         }
@@ -3105,30 +3107,31 @@ impl Aarch64CodeGen {
                 self.get_location(input.pseudo)
             };
             let requires_mem = Self::constraint_requires_memory(&input.constraint);
-
-            operand_names.push(input.name.clone());
-            operand_sizes.push(input.size);
+            let op_size = input.size;
+            let op_name = input.name.clone();
+            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
+                reg,
+                mem,
+                size: op_size,
+                name: op_name.clone(),
+            };
             match loc {
                 Loc::Reg(r) if requires_mem => {
                     // See output-side note: memory-class input with
                     // its address in a register renders as `[xN]`.
-                    operand_regs.push(None);
-                    operand_mem.push(Some(format!("[{}]", asm_reg_name_64(r))));
+                    slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
                 }
                 Loc::Reg(r) => {
-                    operand_regs.push(Some(r));
-                    operand_mem.push(None);
+                    slots.push(mk(Some(r), None));
                 }
                 Loc::Imm(v) => {
                     // Immediate value
-                    operand_regs.push(None);
-                    operand_mem.push(Some(format!("#{}", v as i64)));
+                    slots.push(mk(None, Some(format!("#{}", v as i64))));
                 }
                 _ => {
                     // Memory or other location
-                    let mem_str = self.loc_to_asm_string(&loc, input.size);
-                    operand_regs.push(None);
-                    operand_mem.push(Some(mem_str));
+                    let mem_str = self.loc_to_asm_string(&loc, op_size);
+                    slots.push(mk(None, Some(mem_str)));
                 }
             }
         }
@@ -3145,14 +3148,8 @@ impl Aarch64CodeGen {
             .collect();
 
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
-        let asm_output = self.substitute_asm_operands(
-            &asm_data.template,
-            &operand_regs,
-            &operand_sizes,
-            &operand_mem,
-            &operand_names,
-            &goto_labels_formatted,
-        );
+        let asm_output =
+            self.substitute_asm_operands(&asm_data.template, &slots, &goto_labels_formatted);
 
         // Emit the inline assembly as raw text
         // Split by newlines and emit each line
@@ -3239,21 +3236,10 @@ impl Aarch64CodeGen {
     fn substitute_asm_operands(
         &self,
         template: &str,
-        operand_regs: &[Option<Reg>],
-        operand_sizes: &[u32],
-        operand_mem: &[Option<String>],
-        operand_names: &[Option<String>],
+        slots: &[crate::arch::AsmOperandSlot<Reg>],
         goto_labels: &[(String, String)],
     ) -> String {
-        crate::arch::substitute_asm_operands(
-            self,
-            template,
-            operand_regs,
-            operand_sizes,
-            operand_mem,
-            operand_names,
-            goto_labels,
-        )
+        crate::arch::substitute_asm_operands(self, template, slots, goto_labels)
     }
 
     // ========================================================================

@@ -3450,14 +3450,14 @@ impl X86_64CodeGen {
             }
         }
 
-        // Build operand strings for asm substitution
-        // For constraints requiring specific registers (a,b,c,d,S,D), we use those registers
-        // and emit mov instructions to/from the actual locations.
+        // Build operand slots for asm substitution. Each `AsmOperandSlot`
+        // bundles (reg, mem, size, name) so we can never push only part
+        // of an operand's substitution data and run a stale parallel-
+        // array bug. For constraints requiring specific registers
+        // (a, b, c, d, S, D) we use those registers and emit mov
+        // instructions to/from the actual locations.
         let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
-        let mut operand_regs: Vec<Option<Reg>> = Vec::with_capacity(operand_count);
-        let mut operand_sizes: Vec<u32> = Vec::with_capacity(operand_count);
-        let mut operand_mem: Vec<Option<String>> = Vec::with_capacity(operand_count);
-        let mut operand_names: Vec<Option<String>> = Vec::with_capacity(operand_count);
+        let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
 
         // Track which outputs need to be moved from specific registers after asm
         // (output_idx, specific_reg, actual_loc, size_bits)
@@ -3496,14 +3496,21 @@ impl X86_64CodeGen {
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
             let op_size = output.size;
-            operand_names.push(output.name.clone());
-            operand_sizes.push(op_size);
+            let op_name = output.name.clone();
+            // Helper to build the slot with the shared per-operand
+            // context already filled in. Each branch supplies the
+            // (reg, mem) pair appropriate for its outcome.
+            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
+                reg,
+                mem,
+                size: op_size,
+                name: op_name.clone(),
+            };
 
             // Check for specific register constraint
             if let Some(specific_reg) = Self::constraint_to_specific_reg(&output.constraint) {
                 // Output goes to specific register, then we'll move to actual loc after asm
-                operand_regs.push(Some(specific_reg));
-                operand_mem.push(None);
+                slots.push(mk(Some(specific_reg), None));
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
                     output_moves.push((idx, specific_reg, loc, op_size));
@@ -3518,15 +3525,13 @@ impl X86_64CodeGen {
                             // Use a temp register instead
                             let temp = find_temp_reg(&reserved_regs, &used_regs);
                             used_regs.insert(temp);
-                            operand_regs.push(Some(temp));
-                            operand_mem.push(None);
+                            slots.push(mk(Some(temp), None));
                             // For outputs, move from temp to actual loc after asm
                             remap_restore.push((temp, r, loc.clone(), op_size));
                             // Track this pseudo -> temp mapping for +r inputs
                             pseudo_to_temp.insert(output.pseudo, temp);
                         } else {
-                            operand_regs.push(Some(r));
-                            operand_mem.push(None);
+                            slots.push(mk(Some(r), None));
                             used_regs.insert(r);
                         }
                     }
@@ -3536,8 +3541,7 @@ impl X86_64CodeGen {
                         // modified value — update the location map directly.
                         let temp = find_temp_reg(&reserved_regs, &used_regs);
                         used_regs.insert(temp);
-                        operand_regs.push(Some(temp));
-                        operand_mem.push(None);
+                        slots.push(mk(Some(temp), None));
                         // Don't add to output_moves (can't store to Imm).
                         // Instead, update the pseudo's location to the temp reg after asm.
                         self.locations.set(output.pseudo, Loc::Reg(temp));
@@ -3548,16 +3552,14 @@ impl X86_64CodeGen {
                         // Allocate a temp register; move from temp to actual loc after asm.
                         let temp = find_temp_reg(&reserved_regs, &used_regs);
                         used_regs.insert(temp);
-                        operand_regs.push(Some(temp));
-                        operand_mem.push(None);
+                        slots.push(mk(Some(temp), None));
                         output_moves.push((idx, temp, loc.clone(), op_size));
                         pseudo_to_temp.insert(output.pseudo, temp);
                     }
                     _ => {
                         // Memory or other location - emit as memory operand
                         let mem_str = self.loc_to_asm_string(&loc);
-                        operand_regs.push(None);
-                        operand_mem.push(Some(mem_str));
+                        slots.push(mk(None, Some(mem_str)));
                     }
                 }
             }
@@ -3590,7 +3592,7 @@ impl X86_64CodeGen {
             // But we DO need to load the initial value into the output's register.
             if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
-                    if let Some(reg) = operand_regs[match_idx] {
+                    if let Some(reg) = slots[match_idx].reg {
                         // Load initial value into the register before asm
                         input_moves.push((reg, loc, op_size));
                     }
@@ -3598,14 +3600,18 @@ impl X86_64CodeGen {
                 }
             }
 
-            operand_names.push(input.name.clone());
-            operand_sizes.push(op_size);
+            let op_name = input.name.clone();
+            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
+                reg,
+                mem,
+                size: op_size,
+                name: op_name.clone(),
+            };
 
             // Check for specific register constraint
             if let Some(specific_reg) = Self::constraint_to_specific_reg(constraint_for_reg) {
                 // Input must go to specific register
-                operand_regs.push(Some(specific_reg));
-                operand_mem.push(None);
+                slots.push(mk(Some(specific_reg), None));
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
                     input_moves.push((specific_reg, loc, op_size));
@@ -3615,8 +3621,7 @@ impl X86_64CodeGen {
                 // This happens with +r constraints where input and output share the same pseudo
                 if let Some(&temp) = pseudo_to_temp.get(&input.pseudo) {
                     // Reuse the same temp register as the output
-                    operand_regs.push(Some(temp));
-                    operand_mem.push(None);
+                    slots.push(mk(Some(temp), None));
                     // Add setup move to load value into temp
                     remap_setup.push((temp, temp, loc.clone(), op_size));
                 } else {
@@ -3632,14 +3637,12 @@ impl X86_64CodeGen {
                             used_regs.insert(temp);
                             input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
-                            operand_regs.push(None);
-                            operand_mem.push(Some(mem_str));
+                            slots.push(mk(None, Some(mem_str)));
                         }
                         Loc::Reg(r) if requires_mem => {
                             // Memory constraint with value in register — emit as indirect
                             let mem_str = format!("(%{})", self.reg_name_64(r));
-                            operand_regs.push(None);
-                            operand_mem.push(Some(mem_str));
+                            slots.push(mk(None, Some(mem_str)));
                         }
                         Loc::Reg(r) => {
                             // Check if allocated reg conflicts with reserved
@@ -3647,35 +3650,30 @@ impl X86_64CodeGen {
                                 // Use a temp register instead
                                 let temp = find_temp_reg(&reserved_regs, &used_regs);
                                 used_regs.insert(temp);
-                                operand_regs.push(Some(temp));
-                                operand_mem.push(None);
+                                slots.push(mk(Some(temp), None));
                                 // For inputs, move from actual loc to temp before asm
                                 remap_setup.push((r, temp, loc.clone(), op_size));
                             } else {
-                                operand_regs.push(Some(r));
-                                operand_mem.push(None);
+                                slots.push(mk(Some(r), None));
                                 used_regs.insert(r);
                             }
                         }
                         Loc::Imm(v) => {
                             // Immediate value
-                            operand_regs.push(None);
-                            operand_mem.push(Some(format!("${}", v as i64)));
+                            slots.push(mk(None, Some(format!("${}", v as i64))));
                         }
                         _ if requires_reg => {
                             // Constraint requires register but value is on stack/memory.
                             // Allocate a temp register and load value before asm.
                             let temp = find_temp_reg(&reserved_regs, &used_regs);
                             used_regs.insert(temp);
-                            operand_regs.push(Some(temp));
-                            operand_mem.push(None);
+                            slots.push(mk(Some(temp), None));
                             input_moves.push((temp, loc.clone(), op_size));
                         }
                         _ => {
                             // Memory or other location
                             let mem_str = self.loc_to_asm_string(&loc);
-                            operand_regs.push(None);
-                            operand_mem.push(Some(mem_str));
+                            slots.push(mk(None, Some(mem_str)));
                         }
                     }
                 }
@@ -3704,14 +3702,8 @@ impl X86_64CodeGen {
             .collect();
 
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
-        let asm_output = self.substitute_asm_operands(
-            &asm_data.template,
-            &operand_regs,
-            &operand_sizes,
-            &operand_mem,
-            &operand_names,
-            &goto_labels_formatted,
-        );
+        let asm_output =
+            self.substitute_asm_operands(&asm_data.template, &slots, &goto_labels_formatted);
 
         // Emit the inline assembly as raw text
         // Split by newlines and emit each line
@@ -4033,13 +4025,10 @@ impl X86_64CodeGen {
     fn substitute_asm_operands(
         &self,
         template: &str,
-        regs: &[Option<Reg>],
-        sizes: &[u32],
-        mems: &[Option<String>],
-        names: &[Option<String>],
+        slots: &[crate::arch::AsmOperandSlot<Reg>],
         goto_labels: &[(String, String)],
     ) -> String {
-        crate::arch::substitute_asm_operands(self, template, regs, sizes, mems, names, goto_labels)
+        crate::arch::substitute_asm_operands(self, template, slots, goto_labels)
     }
 
     /// Get a sized register name based on modifier

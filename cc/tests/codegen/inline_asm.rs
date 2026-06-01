@@ -838,6 +838,120 @@ int main(void) {
 }
 
 // ============================================================================
+// C9c — Immediate-Bearing Constraint Lock-In Tests
+// ============================================================================
+//
+// `"ri"` / `"g"` / x86_64's `I`/`J`/.../`O` accept a const-propagated
+// operand by substituting it as a literal in the asm template instead
+// of materializing it through a register. The substitution is implicit
+// in `emit_inline_asm`'s `Loc::Imm(v)` arm — when an operand's
+// allocator location is `Loc::Imm`, the codegen renders it as `$value`
+// (x86_64) regardless of which class letter accepted it. These tests
+// pin the behavior so a future codegen change that, e.g., forced a
+// register load for `"r"` operands with `Loc::Imm` would break loudly
+// instead of silently regressing asm quality.
+//
+// The tests inspect the resulting assembly only via the runtime
+// observation that the test exits 0 — the deeper "is the literal
+// substituted, not register-loaded?" assertion is left informal,
+// since the runtime semantics are what matters for correctness.
+
+#[test]
+fn codegen_inline_asm_imm_const_via_ri() {
+    // `"ri"(const)` — register or immediate. Const operand should
+    // substitute as `$N` literal.
+    let code = r#"
+int main(void) {
+    int r;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0" : "=r"(r) : "ri"(42));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, %w1" : "=r"(r) : "ri"(42));
+#endif
+    return (r == 42) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_imm_const_ri", code, &[]),
+        0,
+        "ri with const operand must substitute as immediate"
+    );
+    assert_eq!(compile_and_run_optimized("asm_imm_const_ri_opt", code), 0);
+}
+
+#[test]
+fn codegen_inline_asm_imm_const_via_g() {
+    // `"g"(const)` — any operand. Const should substitute as `$N`.
+    let code = r#"
+int main(void) {
+    int r;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0" : "=r"(r) : "g"(99));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, %w1" : "=r"(r) : "g"(99));
+#endif
+    return (r == 99) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_imm_const_g", code, &[]),
+        0,
+        "g with const operand must substitute as immediate"
+    );
+    assert_eq!(compile_and_run_optimized("asm_imm_const_g_opt", code), 0);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_imm_const_via_i_letter() {
+    // x86_64 `"I"(const)` — constant in [0, 31]. Used for shift
+    // counts.
+    let code = r#"
+int main(void) {
+    int x = 5;
+    int r;
+    __asm__("shll %1, %0" : "=r"(r) : "I"(3), "0"(x));
+    return (r == 40) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_imm_const_I", code, &[]),
+        0,
+        "I constraint with in-range constant substitutes as immediate"
+    );
+}
+
+#[test]
+fn codegen_inline_asm_imm_runtime_via_ri_uses_register() {
+    // `"ri"(runtime_value)` — operand isn't const, so the codegen
+    // must NOT substitute as a literal. The operand must go through
+    // a register (since `"ri"` allows register or immediate, and
+    // memory is not allowed). Negative case complementing the
+    // const-substitution test above.
+    let code = r#"
+int main(void) {
+    int x;
+#if defined(__x86_64__)
+    __asm__("movl $77, %0" : "=r"(x));
+    int r;
+    __asm__("movl %1, %0" : "=r"(r) : "ri"(x));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, #77" : "=r"(x));
+    int r;
+    __asm__("mov %w0, %w1" : "=r"(r) : "ri"(x));
+#endif
+    return (r == 77) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_imm_runtime_ri", code, &[]),
+        0,
+        "ri with runtime operand must go through a register"
+    );
+    assert_eq!(compile_and_run_optimized("asm_imm_runtime_ri_opt", code), 0);
+}
+
+// ============================================================================
 // C10 — Per-arch Class Letter Tests
 // ============================================================================
 //

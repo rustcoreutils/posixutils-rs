@@ -1952,4 +1952,41 @@ mod tests {
         assert!(!is_call_like_x86_64(Opcode::Add));
         assert!(!is_call_like_x86_64(Opcode::Asm));
     }
+
+    fn make_asm_insn(clobbers: &[&str]) -> Instruction {
+        use crate::ir::AsmData;
+        let mut insn = Instruction::new(Opcode::Asm);
+        insn.asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: clobbers.iter().map(|s| s.to_string()).collect(),
+            goto_labels: Vec::new(),
+        }));
+        insn
+    }
+
+    #[test]
+    fn build_asm_instr_constraints_x86_64_propagates_memory_barrier() {
+        // C6a contract: a `"memory"` clobber on an `Opcode::Asm` must
+        // flip `InstrConstraints.memory_barrier`. This is the load-
+        // bearing flag that future memory-reordering passes (GVN,
+        // LICM, machine scheduler) will consult before crossing.
+        let with_mem = make_asm_insn(&["rax", "memory", "cc"]);
+        let ic = build_asm_instr_constraints_x86_64(&with_mem).expect("has asm_data");
+        assert!(ic.memory_barrier, "\"memory\" clobber must set the flag");
+
+        // Conversely, non-memory clobbers leave the flag clear.
+        let no_mem = make_asm_insn(&["rax", "cc"]);
+        let ic = build_asm_instr_constraints_x86_64(&no_mem).expect("has asm_data");
+        assert!(
+            !ic.memory_barrier,
+            "asm without \"memory\" clobber must not be a barrier"
+        );
+
+        // Empty clobber list: also not a barrier.
+        let bare = make_asm_insn(&[]);
+        let ic = build_asm_instr_constraints_x86_64(&bare).expect("has asm_data");
+        assert!(!ic.memory_barrier);
+    }
 }

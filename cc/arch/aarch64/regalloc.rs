@@ -1832,4 +1832,39 @@ mod tests {
         assert!(!is_call_like_aarch64(Opcode::Add));
         assert!(!is_call_like_aarch64(Opcode::Asm));
     }
+
+    fn make_asm_insn(clobbers: &[&str]) -> Instruction {
+        use crate::ir::AsmData;
+        let mut insn = Instruction::new(Opcode::Asm);
+        insn.asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: clobbers.iter().map(|s| s.to_string()).collect(),
+            goto_labels: Vec::new(),
+        }));
+        insn
+    }
+
+    #[test]
+    fn build_asm_instr_constraints_aarch64_propagates_memory_barrier() {
+        // Mirror of the x86_64 test. `asm volatile("dmb ish" ::: "memory")`
+        // is a heavily-used aarch64 idiom for `__sync_synchronize`-style
+        // barriers — the `"memory"` clobber must drive
+        // `memory_barrier = true` on the lowered constraint.
+        let with_mem = make_asm_insn(&["x0", "memory"]);
+        let ic = build_asm_instr_constraints_aarch64(&with_mem).expect("has asm_data");
+        assert!(ic.memory_barrier, "\"memory\" clobber must set the flag");
+
+        let no_mem = make_asm_insn(&["x0", "cc"]);
+        let ic = build_asm_instr_constraints_aarch64(&no_mem).expect("has asm_data");
+        assert!(
+            !ic.memory_barrier,
+            "asm without \"memory\" clobber must not be a barrier"
+        );
+
+        let bare = make_asm_insn(&[]);
+        let ic = build_asm_instr_constraints_aarch64(&bare).expect("has asm_data");
+        assert!(!ic.memory_barrier);
+    }
 }

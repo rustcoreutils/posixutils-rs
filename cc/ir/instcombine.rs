@@ -13,6 +13,18 @@
 // - Algebraic simplification: x + 0 -> x, x * 1 -> x, etc.
 // - Identity patterns: x - x -> 0, x ^ x -> 0, etc.
 //
+// Memory-ordering contract: InstCombine only rewrites pure
+// arithmetic, bitwise, comparison, and unary opcodes (see the
+// `try_simplify` dispatch). It never touches `Load`, `Store`, `Asm`,
+// `Call`, `Atomic*`, `Fence`, or any other memory-touching op, and
+// it never reorders surviving instructions — each rewrite is an
+// in-place value substitution at a single instruction site. This
+// preserves the relative order of every memory op, which is the
+// contract that lets `Instruction::is_memory_barrier()` mean
+// something. Any future extension that does start touching memory
+// ops or moving instructions across blocks must consult
+// `is_memory_barrier()` before crossing.
+//
 
 use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::TypeId;

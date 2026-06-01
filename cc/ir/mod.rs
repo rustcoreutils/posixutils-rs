@@ -834,6 +834,63 @@ impl Instruction {
         self
     }
 
+    /// Returns true if this instruction acts as a memory-reordering
+    /// barrier — no IR pass may move a `Load`/`Store` (or any other
+    /// memory-touching op) across this instruction in either direction.
+    ///
+    /// Sources of barrier semantics:
+    /// - `Opcode::Asm` with `"memory"` in its clobber list (the
+    ///   "compiler memory barrier" idiom used by `pause`/`yield`
+    ///   spin loops, ticket-lock acquire, `__sync_synchronize`-style
+    ///   fences, etc.).
+    /// - `Opcode::Fence` — explicit C11 `atomic_thread_fence`.
+    /// - `Opcode::Atomic*` — every atomic memory op (including
+    ///   `Relaxed`-ordered ones — see note below).
+    /// - `Opcode::Call` — pcc has no escape/alias analysis; any
+    ///   external call may read or write any memory location the
+    ///   callee can reach. Conservative.
+    /// - `Opcode::Setjmp` / `Opcode::Longjmp` — non-local control flow
+    ///   makes register/memory state observable at any saved jmp_buf.
+    ///
+    /// **Contract**: an IR pass that consults this predicate MUST NOT
+    /// reorder memory operations across an instruction for which it
+    /// returns `true`. This is the load-bearing invariant that lets
+    /// inline `asm("..." ::: "memory")` actually mean something —
+    /// today no pass reorders memory at all (see module docs in
+    /// `cc/ir/dce.rs` and `cc/ir/instcombine.rs`), and any future
+    /// pass that does (GVN, LICM, load-store forwarding, machine
+    /// scheduler) MUST query this before crossing.
+    ///
+    /// Note on relaxed atomics: a `MemoryOrder::Relaxed` atomic op
+    /// has no inter-thread ordering guarantee, but the atomic access
+    /// itself is still a side-effecting memory op that a reordering
+    /// pass cannot freely move past unrelated loads/stores. Future
+    /// finer-grained one-sided predicates
+    /// (`is_acquire_barrier` / `is_release_barrier`) can refine this
+    /// when a pass needs the distinction.
+    pub fn is_memory_barrier(&self) -> bool {
+        match self.op {
+            Opcode::Asm => self
+                .asm_data
+                .as_ref()
+                .is_some_and(|d| d.clobbers.iter().any(|c| c == "memory")),
+            Opcode::Fence
+            | Opcode::Call
+            | Opcode::Setjmp
+            | Opcode::Longjmp
+            | Opcode::AtomicLoad
+            | Opcode::AtomicStore
+            | Opcode::AtomicSwap
+            | Opcode::AtomicCas
+            | Opcode::AtomicFetchAdd
+            | Opcode::AtomicFetchSub
+            | Opcode::AtomicFetchAnd
+            | Opcode::AtomicFetchOr
+            | Opcode::AtomicFetchXor => true,
+            _ => false,
+        }
+    }
+
     /// Create a return instruction
     pub fn ret(src: Option<PseudoId>) -> Self {
         let mut insn = Self::new(Opcode::Ret);
@@ -2507,5 +2564,118 @@ mod tests {
 
         // Size should be set from ret_type
         assert_eq!(insn.size, types.size_bits(types.double_id));
+    }
+
+    // ========================================================================
+    // is_memory_barrier
+    // ========================================================================
+
+    fn make_asm_with_clobbers(clobbers: Vec<&str>) -> Instruction {
+        let mut insn = Instruction::new(Opcode::Asm);
+        insn.asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: clobbers.into_iter().map(String::from).collect(),
+            goto_labels: Vec::new(),
+        }));
+        insn
+    }
+
+    #[test]
+    fn test_is_memory_barrier_pure_ops_are_not_barriers() {
+        for op in [
+            Opcode::Add,
+            Opcode::Sub,
+            Opcode::Mul,
+            Opcode::And,
+            Opcode::Or,
+            Opcode::Xor,
+            Opcode::Shl,
+            Opcode::Lsr,
+            Opcode::Asr,
+            Opcode::Neg,
+            Opcode::Not,
+            Opcode::SetEq,
+            Opcode::Copy,
+            Opcode::Load,
+            Opcode::Store,
+            Opcode::Br,
+            Opcode::Ret,
+            Opcode::Nop,
+        ] {
+            let insn = Instruction::new(op);
+            assert!(
+                !insn.is_memory_barrier(),
+                "{op:?} should not be a memory barrier"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_memory_barrier_fence_and_atomics() {
+        for op in [
+            Opcode::Fence,
+            Opcode::AtomicLoad,
+            Opcode::AtomicStore,
+            Opcode::AtomicSwap,
+            Opcode::AtomicCas,
+            Opcode::AtomicFetchAdd,
+            Opcode::AtomicFetchSub,
+            Opcode::AtomicFetchAnd,
+            Opcode::AtomicFetchOr,
+            Opcode::AtomicFetchXor,
+        ] {
+            let insn = Instruction::new(op);
+            assert!(
+                insn.is_memory_barrier(),
+                "{op:?} should be a memory barrier"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_memory_barrier_call_and_jmp() {
+        // Call is always a barrier (no escape analysis in pcc).
+        assert!(Instruction::new(Opcode::Call).is_memory_barrier());
+        // setjmp/longjmp save/restore arbitrary execution context.
+        assert!(Instruction::new(Opcode::Setjmp).is_memory_barrier());
+        assert!(Instruction::new(Opcode::Longjmp).is_memory_barrier());
+    }
+
+    #[test]
+    fn test_is_memory_barrier_asm_memory_clobber() {
+        // `asm("..." ::: "memory")` — the heavily-used compiler
+        // memory-barrier idiom. Must be a barrier.
+        let with_mem = make_asm_with_clobbers(vec!["memory"]);
+        assert!(with_mem.is_memory_barrier());
+
+        // Mixed with other clobbers — still a barrier as long as
+        // "memory" is in the list.
+        let mixed = make_asm_with_clobbers(vec!["rax", "memory", "cc"]);
+        assert!(mixed.is_memory_barrier());
+    }
+
+    #[test]
+    fn test_is_memory_barrier_asm_without_memory_clobber() {
+        // `asm("..." ::: "cc")` — clobbers condition codes only, not
+        // a memory barrier. Surrounding loads/stores may legally be
+        // reordered across it.
+        let cc_only = make_asm_with_clobbers(vec!["cc"]);
+        assert!(!cc_only.is_memory_barrier());
+
+        // `asm("..." ::: "rax")` — register clobber only.
+        let reg_only = make_asm_with_clobbers(vec!["rax"]);
+        assert!(!reg_only.is_memory_barrier());
+
+        // Asm with no clobber list at all.
+        let bare = make_asm_with_clobbers(vec![]);
+        assert!(!bare.is_memory_barrier());
+
+        // Asm with no asm_data attached (degenerate; shouldn't
+        // happen in well-formed IR but the predicate should be
+        // robust).
+        let no_data = Instruction::new(Opcode::Asm);
+        assert!(!no_data.is_memory_barrier());
     }
 }

@@ -1818,6 +1818,70 @@ impl RegAlloc {
                 self.used_callee_saved.push(reg);
             }
         }
+
+        // -------- M9b post-coloring Copy coalescing --------
+        //
+        // For each `Opcode::Copy { target: t, src: [s] }` in the
+        // function, try to migrate `t`'s location to `s`'s location
+        // (so the Copy becomes identity and M9a elides it). Skip if:
+        // - `t` or `s` isn't a GP candidate
+        // - `t` is pre-colored (ABI-pinned or asm-Fixed; moving it
+        //   would violate the constraint)
+        // - `t` and `s` interfere (a Copy whose targets interfere
+        //   means the IR is asking for `t = s` while both must hold
+        //   distinct values elsewhere — moving t to s.Loc would
+        //   corrupt one of them)
+        // - any neighbor of `t` is already at `s`'s register (the
+        //   move would create a conflict)
+        // - `t`'s forbidden set contains `s`'s register (the
+        //   constraint system reserved that register against `t`)
+        //
+        // Naive non-Briggs heuristic: per-candidate decision, no
+        // global degree analysis. Cargo + CPython gates catch any
+        // mis-coloring.
+        let candidates = crate::arch::regalloc::find_copy_coalesce_candidates(func);
+        for (t, s) in candidates {
+            if !gp_candidates.contains(&t) || !gp_candidates.contains(&s) {
+                continue;
+            }
+            if pre_colored.contains_key(&t) {
+                continue;
+            }
+            let t_loc = self.locations.get(&t).cloned();
+            let s_loc = self.locations.get(&s).cloned();
+            let (Some(Loc::Reg(t_reg)), Some(Loc::Reg(s_reg))) = (t_loc, s_loc) else {
+                continue;
+            };
+            if t_reg == s_reg {
+                continue;
+            }
+            // Interference check.
+            if graph.neighbors(t).any(|n| n == s) {
+                continue;
+            }
+            // Forbidden check.
+            let empty = std::collections::BTreeSet::new();
+            let t_forbid = forbidden.get(&t).unwrap_or(&empty);
+            if t_forbid.contains(&s_reg) {
+                continue;
+            }
+            // Neighbor-occupancy check: no neighbor of t may already
+            // hold s_reg.
+            let conflict = graph.neighbors(t).any(|n| {
+                self.locations
+                    .get(&n)
+                    .map(|l| matches!(l, Loc::Reg(r) if *r == s_reg))
+                    .unwrap_or(false)
+            });
+            if conflict {
+                continue;
+            }
+            self.locations.insert(t, Loc::Reg(s_reg));
+            // Track callee-saved usage if we just claimed one.
+            if s_reg.is_callee_saved() && !self.used_callee_saved.contains(&s_reg) {
+                self.used_callee_saved.push(s_reg);
+            }
+        }
         // Process spill commits in interval.start order with
         // monotonic expiration. Earlier (M6+M7 v1) drained everything
         // with `usize::MAX` then relied on `pseudos_interfere` to

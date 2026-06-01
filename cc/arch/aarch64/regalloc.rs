@@ -1665,6 +1665,49 @@ impl RegAlloc {
                 self.used_callee_saved.push(reg);
             }
         }
+
+        // -------- M9b post-coloring Copy coalescing --------
+        // See the x86_64 mirror for the rationale. Mirror of the
+        // logic adapted to aarch64's `Reg` palette.
+        let candidates = crate::arch::regalloc::find_copy_coalesce_candidates(func);
+        for (t, s) in candidates {
+            if !gp_candidates.contains(&t) || !gp_candidates.contains(&s) {
+                continue;
+            }
+            if pre_colored.contains_key(&t) {
+                continue;
+            }
+            let t_loc = self.locations.get(&t).cloned();
+            let s_loc = self.locations.get(&s).cloned();
+            let (Some(Loc::Reg(t_reg)), Some(Loc::Reg(s_reg))) = (t_loc, s_loc) else {
+                continue;
+            };
+            if t_reg == s_reg {
+                continue;
+            }
+            if graph.neighbors(t).any(|n| n == s) {
+                continue;
+            }
+            let empty = std::collections::BTreeSet::new();
+            let t_forbid = forbidden.get(&t).unwrap_or(&empty);
+            if t_forbid.contains(&s_reg) {
+                continue;
+            }
+            let conflict = graph.neighbors(t).any(|n| {
+                self.locations
+                    .get(&n)
+                    .map(|l| matches!(l, Loc::Reg(r) if *r == s_reg))
+                    .unwrap_or(false)
+            });
+            if conflict {
+                continue;
+            }
+            self.locations.insert(t, Loc::Reg(s_reg));
+            if s_reg.is_callee_saved() && !self.used_callee_saved.contains(&s_reg) {
+                self.used_callee_saved.push(s_reg);
+            }
+        }
+
         // Process spill commits in interval.start order with
         // monotonic expiration. The earlier `usize::MAX` drain
         // relied on `pseudos_interfere`'s block-level liveness which

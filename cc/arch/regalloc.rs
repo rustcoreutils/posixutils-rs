@@ -936,6 +936,47 @@ pub fn build_interference_graph(
     graph
 }
 
+// ============================================================================
+// M9 — Register Coalescing helpers
+// ============================================================================
+//
+// Coalescing reduces the number of `Opcode::Copy` instructions that
+// emit a real `mov` by giving the source and target pseudos the same
+// physical location. After M9b's post-coloring opportunistic merge
+// reassigns matching `Loc`s, the surviving Copy becomes identity and
+// M9a's codegen short-circuit elides it.
+//
+// pcc uses the simplest viable strategy: walk every Copy after
+// chordal coloring completes, and migrate the target pseudo to the
+// source's location when the migration is safe (no interference, no
+// pre-color conflict, no forbidden-set violation, no neighbor of the
+// target already at the source's register). Naive — no Briggs
+// degree analysis, no global iteration to a fixed point — but it
+// captures most low-hanging copies introduced by phi elimination,
+// matched-asm-constraint initializers, and parameter shuffling, and
+// the CPython smoke test catches any allocator drift.
+
+/// Walk `func` and collect every `Opcode::Copy` instruction's
+/// `(target, src)` pair as a coalescing candidate. Skips Copies
+/// without a target or with `src.len() != 1` (degenerate cases).
+pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId)> {
+    let mut out = Vec::new();
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if insn.op != Opcode::Copy {
+                continue;
+            }
+            if insn.src.len() != 1 {
+                continue;
+            }
+            if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+                out.push((target, src));
+            }
+        }
+    }
+    out
+}
+
 /// Maximum Cardinality Search (MCS) ordering. The reverse of this
 /// ordering is a perfect elimination ordering when the graph is
 /// chordal; greedy coloring in MCS order yields an optimal coloring.

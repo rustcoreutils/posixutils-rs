@@ -29,6 +29,24 @@
 //        asm output. Later milestones (M2 "Sym vs pointer pseudo", M3
 //        mem2reg) clean up that shape; I1 will extend to cover it then.
 //
+//   I3 — TERMINATOR TARGETS REFERENCE VALID BLOCKS
+//        Every branch-style instruction (Br/Cbr/Switch) carries
+//        `BasicBlockId` references for its successor(s). All such
+//        references must point at a block actually present in
+//        `func.blocks`. A reference to a deleted or never-created
+//        block ID would crash the codegen layer's label-resolution
+//        pass with a confusing error far from the source bug. I3
+//        catches this at the optimizer/codegen boundary instead.
+//
+//        Covered fields:
+//        - `insn.bb_true`  (used by Br, Cbr)
+//        - `insn.bb_false` (used by Cbr)
+//        - `insn.switch_cases[i].1` (Switch case targets)
+//        - `insn.switch_default`    (Switch default target)
+//
+//        Inline-asm goto targets (`AsmData.goto_labels`) are also
+//        checked.
+//
 //   I2 — MEMORY BARRIERS ARE DCE ROOTS
 //        Every instruction for which `Instruction::is_memory_barrier()`
 //        returns `true` must also have `op.has_side_effects() == true`.
@@ -50,7 +68,7 @@
 // Each new milestone documents the invariant it adds here, and extends
 // `validate_function` with a corresponding check.
 
-use super::{Function, Module, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Module, Opcode, PseudoId};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -80,6 +98,17 @@ pub enum ValidationError {
         block: usize,
         index: usize,
         opcode: Opcode,
+    },
+    /// I3 violation: a branch-style instruction references a
+    /// `BasicBlockId` that doesn't exist in `func.blocks`. Carries
+    /// the offending block id and the location of the bad
+    /// reference.
+    InvalidBranchTarget {
+        function: String,
+        block: usize,
+        index: usize,
+        opcode: Opcode,
+        target: BasicBlockId,
     },
 }
 
@@ -115,6 +144,17 @@ impl fmt::Display for ValidationError {
                 f,
                 "[ir-validate I2] in function `{function}`: bb={block} insn={index} op={opcode:?} \
                  is a memory barrier but not in has_side_effects() — DCE would delete it"
+            ),
+            ValidationError::InvalidBranchTarget {
+                function,
+                block,
+                index,
+                opcode,
+                target,
+            } => write!(
+                f,
+                "[ir-validate I3] in function `{function}`: bb={block} insn={index} op={opcode:?} \
+                 references unknown BasicBlockId {target:?}"
             ),
         }
     }
@@ -152,6 +192,7 @@ pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_single_def(func, &mut errors);
     check_barrier_implies_side_effect(func, &mut errors);
+    check_branch_targets_valid(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -198,6 +239,51 @@ fn check_single_def(func: &Function, out: &mut Vec<ValidationError>) {
                 pseudo,
                 sites,
             });
+        }
+    }
+}
+
+/// I3 — every branch-style instruction's `BasicBlockId` references
+/// must point at a real block in `func.blocks`. Catches CFG-corruption
+/// bugs at the optimizer/codegen boundary, where they would otherwise
+/// surface as label-resolution failures inside the codegen layer.
+fn check_branch_targets_valid(func: &Function, out: &mut Vec<ValidationError>) {
+    use std::collections::HashSet;
+    let valid: HashSet<BasicBlockId> = func.blocks.iter().map(|b| b.id).collect();
+    let check = |bb_idx: usize,
+                 insn_idx: usize,
+                 opcode: Opcode,
+                 target: BasicBlockId,
+                 out: &mut Vec<ValidationError>| {
+        if !valid.contains(&target) {
+            out.push(ValidationError::InvalidBranchTarget {
+                function: func.name.clone(),
+                block: bb_idx,
+                index: insn_idx,
+                opcode,
+                target,
+            });
+        }
+    };
+    for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        for (insn_idx, insn) in bb.insns.iter().enumerate() {
+            if let Some(t) = insn.bb_true {
+                check(bb_idx, insn_idx, insn.op, t, out);
+            }
+            if let Some(t) = insn.bb_false {
+                check(bb_idx, insn_idx, insn.op, t, out);
+            }
+            for (_, target) in &insn.switch_cases {
+                check(bb_idx, insn_idx, insn.op, *target, out);
+            }
+            if let Some(t) = insn.switch_default {
+                check(bb_idx, insn_idx, insn.op, t, out);
+            }
+            if let Some(asm) = &insn.asm_data {
+                for (target, _) in &asm.goto_labels {
+                    check(bb_idx, insn_idx, insn.op, *target, out);
+                }
+            }
         }
     }
 }
@@ -429,5 +515,59 @@ mod tests {
         }));
         push(&mut func, asm);
         assert!(validate_function(&func).is_ok());
+    }
+
+    /// I3 — a valid CFG. Br targets an existing block; validator
+    /// returns Ok.
+    #[test]
+    fn i3_valid_branch_target_passes() {
+        let mut func = fresh_func("valid_br");
+        // Add a second block so Br has a real target.
+        let mut bb1 = crate::ir::BasicBlock::new(BasicBlockId(1));
+        bb1.insns.push(Instruction::ret(None));
+        func.add_block(bb1);
+        push(&mut func, Instruction::br(BasicBlockId(1)));
+        assert!(validate_function(&func).is_ok());
+    }
+
+    /// I3 — Br references a nonexistent BasicBlockId. The validator
+    /// flags it with `InvalidBranchTarget`.
+    #[test]
+    fn i3_invalid_br_target_flagged() {
+        let mut func = fresh_func("invalid_br");
+        push(&mut func, Instruction::br(BasicBlockId(99)));
+        let errors = validate_function(&func).unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidBranchTarget {
+                target,
+                opcode: Opcode::Br,
+                ..
+            } if *target == BasicBlockId(99)
+        )));
+    }
+
+    /// I3 — Cbr's bb_true and bb_false are both checked. A bogus
+    /// bb_false alone is enough to fail validation.
+    #[test]
+    fn i3_invalid_cbr_false_target_flagged() {
+        let mut func = fresh_func("invalid_cbr");
+        let mut bb1 = crate::ir::BasicBlock::new(BasicBlockId(1));
+        bb1.insns.push(Instruction::ret(None));
+        func.add_block(bb1);
+        // bb_true exists, bb_false doesn't.
+        push(
+            &mut func,
+            Instruction::cbr(PseudoId(0), BasicBlockId(1), BasicBlockId(7)),
+        );
+        let errors = validate_function(&func).unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidBranchTarget {
+                target,
+                opcode: Opcode::Cbr,
+                ..
+            } if *target == BasicBlockId(7)
+        )));
     }
 }

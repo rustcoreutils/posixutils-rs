@@ -1566,18 +1566,28 @@ impl RegAlloc {
             if !gp_candidates.contains(&pid) {
                 continue;
             }
-            pre_colored.entry(pid).or_insert(reg);
-            all_vertices.insert(pid);
-            // Phase 3's commit loop skips pre-colored vertices on
-            // the assumption that their locations are already in
+            // If the pseudo is already pre-colored (ABI-pinned, or an
+            // earlier asm operand pinned it), `or_insert` keeps the
+            // existing register. We must mirror exactly that choice
+            // into `self.locations` — committing the asm-requested
+            // register when the allocator is going to honor the
+            // earlier pin would split codegen's view (`self.locations`)
+            // from coloring's view (`pre_colored`), causing
+            // Store/Load to address a register that doesn't hold the
+            // value.
+            //
+            // Phase 3's commit loop skips pre-colored vertices on the
+            // assumption that their locations are already in
             // `self.locations` (true for ABI-pinned args, which
             // `allocate_arguments` inserts before chordal runs).
             // Inline-asm Fixed pre-colors arrive here without going
-            // through `allocate_arguments`, so insert directly. If
+            // through `allocate_arguments`, so we insert directly. If
             // missed, `get_location` defaults to `Loc::Imm(0)` and
             // every Store/Load involving the operand silently
             // writes/reads zero.
-            self.locations.insert(pid, Loc::Reg(reg));
+            let committed = *pre_colored.entry(pid).or_insert(reg);
+            all_vertices.insert(pid);
+            self.locations.insert(pid, Loc::Reg(committed));
         }
 
         // GP coloring needs def-vs-src edges: some codegen lowerings

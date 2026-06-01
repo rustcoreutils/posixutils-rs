@@ -1470,11 +1470,15 @@ impl RegAlloc {
             if !gp_candidates.contains(&pid) {
                 continue;
             }
-            pre_colored.entry(pid).or_insert(reg);
+            // See x86_64 mirror for the rationale: commit whatever
+            // the allocator's pre_colored map actually holds, not the
+            // register we just tried to add. Otherwise an earlier
+            // ABI/asm pin would win in `pre_colored` while
+            // `self.locations` would point at a different register,
+            // splitting coloring's view from codegen's view.
+            let committed = *pre_colored.entry(pid).or_insert(reg);
             all_vertices.insert(pid);
-            // See x86_64 mirror for the `self.locations.insert`
-            // rationale.
-            self.locations.insert(pid, Loc::Reg(reg));
+            self.locations.insert(pid, Loc::Reg(committed));
         }
 
         // GP coloring needs def-vs-src edges: aarch64 `csel` for

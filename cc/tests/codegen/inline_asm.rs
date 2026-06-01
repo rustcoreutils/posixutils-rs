@@ -299,6 +299,80 @@ int main(void) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_fixed_precolor_collides_with_abi_pin() {
+    // Exercises the C3 Fixed-precolor + ABI-pin collision path
+    // surfaced by Copilot review.
+    //
+    // The chordal allocator pre-colors two pseudo sources: (a) ABI-
+    // pinned params via `allocate_arguments` (first int arg → RDI),
+    // and (b) inline-asm `Fixed(R)` operands. When the same pseudo
+    // shows up in both, `pre_colored.entry(pid).or_insert(reg)`
+    // correctly keeps the prior ABI register, but the previous code
+    // then unconditionally overwrote `self.locations[pid]` with the
+    // asm-requested register. Allocator and codegen would disagree —
+    // chordal coloring would use RDI, codegen would read RAX.
+    //
+    // Fix: commit whatever `pre_colored` actually holds to
+    // `self.locations`, never the asm-requested register when an
+    // earlier pin already won.
+    //
+    // Today's linearizer stores incoming ABI-args to local stack
+    // slots at function entry, so the asm operand is loaded back
+    // through a fresh pseudo that's NOT ABI-pinned — meaning the
+    // bug doesn't trigger end-to-end on current pcc. This test
+    // therefore can't fail under the broken code today, but it
+    // anchors the linearizer-side assumption: if a future change
+    // makes the arg pseudo and the asm operand pseudo identical
+    // (e.g. an arg-promotion pass under -O2 that bypasses the
+    // entry Store/Load shuffle), the corrected codegen path here
+    // continues to work. Without the regalloc.rs fix, that future
+    // change would silently miscompile inline asm with no compile-
+    // time signal.
+    let code = r#"
+__attribute__((noinline))
+static int incr_arg1_via_rsi(int arg) {
+    // arg pinned by ABI to RDI (1st int arg); asm forces RSI ("+S").
+    __asm__("addl $5, %0" : "+S"(arg));
+    return arg;
+}
+
+__attribute__((noinline))
+static int incr_arg4_via_rdx(int a, int b, int c, int arg) {
+    // arg pinned by ABI to RCX (4th int arg); asm forces RDX ("+d").
+    (void)a; (void)b; (void)c;
+    __asm__("addl $7, %0" : "+d"(arg));
+    return arg;
+}
+
+__attribute__((noinline))
+static int incr_arg2_via_rax(int a, int arg) {
+    // arg pinned by ABI to RSI (2nd int arg); asm forces RAX ("+a").
+    (void)a;
+    __asm__("addl $9, %0" : "+a"(arg));
+    return arg;
+}
+
+int main(void) {
+    if (incr_arg1_via_rsi(37) != 42) return 1;
+    if (incr_arg4_via_rdx(0, 0, 0, 33) != 40) return 2;
+    if (incr_arg2_via_rax(0, 31) != 40) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_x86_64_fixed_precolor_abi_collide", code, &[]),
+        0,
+        "asm Fixed precolor must not split self.locations from pre_colored when the pseudo is already ABI-pinned"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_x86_64_fixed_precolor_abi_collide_opt", code),
+        0,
+        "ABI-vs-asm-Fixed split-view fix must hold under -O1"
+    );
+}
+
 // ============================================================================
 // AArch64 Inline Assembly Mega-Test
 // ============================================================================

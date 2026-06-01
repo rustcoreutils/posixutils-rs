@@ -2955,6 +2955,14 @@ impl Aarch64CodeGen {
         let is_fp_copy =
             matches!(&src_loc, Loc::VReg(_) | Loc::FImm(..)) || matches!(&dst_loc, Loc::VReg(_));
 
+        // M9a — identity-Copy elision (aarch64 mirror of x86_64
+        // path). Same gating: same location, no narrow-type
+        // extension, not FP. See x86_64::emit_copy_with_type for
+        // the full rationale.
+        if src_loc == dst_loc && actual_size >= 32 && !is_fp_copy {
+            return;
+        }
+
         // Determine if the type is unsigned (for proper sign/zero extension)
         // For plain char, use target.char_signed to determine signedness
         let is_unsigned = typ.is_some_and(|t| {

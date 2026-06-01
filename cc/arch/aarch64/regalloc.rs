@@ -618,7 +618,7 @@ impl VReg {
 // ============================================================================
 
 /// Location of a value
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Loc {
     /// In a register
     Reg(Reg),

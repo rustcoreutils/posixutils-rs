@@ -3292,6 +3292,22 @@ impl X86_64CodeGen {
             || matches!(&dst_loc, Loc::Xmm(_))
             || typ.is_some_and(|t| types.is_float(t));
 
+        // M9a — identity-Copy elision. When the allocator placed the
+        // source and destination pseudos at the same location AND the
+        // copy doesn't carry narrow-type truncation (8/16 bit needs
+        // explicit AND/SHL+SAR) AND it's not a FP copy (FP path has
+        // size-specific quirks), the Copy is a true no-op and can be
+        // skipped entirely. Captures ~1% of reg-to-reg movs in
+        // CPython's `ceval.o` (measured 105/10,653 identity movs in
+        // a clean build). Without coalescing this only catches the
+        // accidental same-location cases that the chordal allocator
+        // already produces by greedy coloring; with M9b's Copy
+        // coalescing, every successfully-coalesced Copy collapses
+        // here.
+        if src_loc == dst_loc && actual_size >= 32 && !is_fp_copy {
+            return;
+        }
+
         // Check if this is long double (uses x87, not XMM)
         let is_longdouble = typ.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
 

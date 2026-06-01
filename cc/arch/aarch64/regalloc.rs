@@ -768,6 +768,34 @@ pub fn build_asm_instr_constraints_aarch64(
     })
 }
 
+/// Walk a function's inline-asm instructions and collect
+/// `(operand_pseudo, fixed_reg)` pairs. Mirror of
+/// `collect_asm_fixed_precolors_x86_64`. AAPCS64 currently has no
+/// Fixed letters in C2 scope, so this function always returns an
+/// empty map today — but the plumbing is wired through
+/// `color_gp_bank` for symmetry and so that when a future
+/// constraint vocabulary expansion brings Fixed letters in scope
+/// the allocator pre-colors them without further changes.
+pub fn collect_asm_fixed_precolors_aarch64(func: &Function) -> BTreeMap<PseudoId, Reg> {
+    let mut out = BTreeMap::new();
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if insn.op != Opcode::Asm {
+                continue;
+            }
+            let Some(ic) = build_asm_instr_constraints_aarch64(insn) else {
+                continue;
+            };
+            for op in &ic.operands {
+                if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) = &op.constraint {
+                    out.entry(op.pseudo).or_insert(*r);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Mirror of `lower_instr_constraints_to_constraint_point` for aarch64.
 pub fn lower_instr_constraints_to_constraint_point_aarch64(
     ic: &crate::arch::asm_constraints::InstrConstraints<Reg>,
@@ -1343,8 +1371,11 @@ impl RegAlloc {
         }
 
         // Pre-colored vertices: any pseudo already mapped to a GP reg
-        // (ABI-pinned args from allocate_arguments). Add them to the
-        // graph so live conflicts are respected.
+        // (ABI-pinned args from allocate_arguments) plus inline-asm
+        // operands with `Fixed(R)` constraints. AAPCS64 has no C2-
+        // scope Fixed letters today so the asm-precolor call is
+        // currently a no-op, but the plumbing is in place for the
+        // future-extension point.
         let mut pre_colored: BTreeMap<PseudoId, Reg> = BTreeMap::new();
         let mut all_vertices: std::collections::BTreeSet<PseudoId> = gp_candidates.clone();
         for (&pid, loc) in self.locations.iter() {
@@ -1352,6 +1383,16 @@ impl RegAlloc {
                 pre_colored.insert(pid, *r);
                 all_vertices.insert(pid);
             }
+        }
+        for (pid, reg) in collect_asm_fixed_precolors_aarch64(func) {
+            if !gp_candidates.contains(&pid) {
+                continue;
+            }
+            pre_colored.entry(pid).or_insert(reg);
+            all_vertices.insert(pid);
+            // See x86_64 mirror for the `self.locations.insert`
+            // rationale.
+            self.locations.insert(pid, Loc::Reg(reg));
         }
 
         // GP coloring needs def-vs-src edges: aarch64 `csel` for

@@ -200,6 +200,105 @@ end_goto:
     assert_eq!(compile_and_run("asm_x86_64_mega", code, &[]), 0);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge() {
+    // The asm-goto CFG plumbing is wired by `linearize_stmt.rs`:
+    // when an `__asm__ goto(...)` is emitted, the linearizer
+    // explicitly `link_bb`s the current block to every goto-label
+    // target plus a fresh fall-through. So liveness propagates
+    // correctly from the goto-target back through the asm block,
+    // and a pseudo live only at the goto target survives the asm
+    // edge with its allocator assignment intact.
+    //
+    // This test guards against future regression in that plumbing:
+    // `val` is computed before the asm, conditionally goto'd-over
+    // (so it's still live at the `match_label:` target), then read.
+    // If the CFG edge didn't exist, chordal coloring would treat
+    // `val` as dying before the asm and could reuse its register
+    // for an intermediate inside the asm block, corrupting the
+    // value the `match_label:` branch reads.
+    let code = r#"
+int main(void) {
+    int val = 0xDEADBEEF;
+    int x = 5;
+    __asm__ goto("cmpl $5, %0\n\t"
+                 "je %l[match_label]"
+                 : : "r"(x) : "cc" : match_label);
+    return 1;  // x != 5 — shouldn't happen
+match_label:
+    if (val != 0xDEADBEEF) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_x86_64_goto_pseudo_survives_edge", code, &[]),
+        0,
+        "pseudo live at asm-goto target must survive the edge"
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_fixed_register_precolor() {
+    // Regression test for C3's Fixed-operand pre-coloring path.
+    //
+    // The chordal allocator now pre-colors the operand pseudo of
+    // `"=a"(...)` / `"a"(...)` / etc. directly to the constraint-
+    // required register. The first commit of C3 had a `get_location`
+    // hole: pre-coloring populated only the chordal `pre_colored`
+    // map, not `self.locations`. The subsequent Store/Load of the
+    // operand then fell through to `Loc::Imm(0)` and silently
+    // wrote/read zero.
+    //
+    // This test exercises every Fixed letter currently in scope
+    // (a, b, c, d, S, D) in both `=` and bare positions so a future
+    // regression in `collect_asm_fixed_precolors_x86_64` or the
+    // `self.locations.insert` in `color_gp_bank` is caught.
+    let code = r#"
+int main(void) {
+    {
+        int r;
+        __asm__("movl $42, %%eax" : "=a"(r));
+        if (r != 42) return 1;
+    }
+    {
+        int r;
+        __asm__("movl $7, %%ebx" : "=b"(r));
+        if (r != 7) return 2;
+    }
+    {
+        int r;
+        __asm__("movl $9, %%ecx" : "=c"(r));
+        if (r != 9) return 3;
+    }
+    {
+        int r;
+        __asm__("movl $13, %%edx" : "=d"(r));
+        if (r != 13) return 4;
+    }
+    {
+        int input = 100;
+        int r;
+        __asm__("movl %1, %0" : "=a"(r) : "S"(input));
+        if (r != 100) return 5;
+    }
+    {
+        int input = 200;
+        int r;
+        __asm__("movl %1, %0" : "=a"(r) : "D"(input));
+        if (r != 200) return 6;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_x86_64_fixed_register_precolor", code, &[]),
+        0,
+        "fixed-register asm operand must read/write the chordal-assigned register"
+    );
+}
+
 // ============================================================================
 // AArch64 Inline Assembly Mega-Test
 // ============================================================================

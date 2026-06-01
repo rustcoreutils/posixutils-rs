@@ -471,6 +471,41 @@ pub fn lower_instr_constraints_to_constraint_point(
     (clobbers, involved)
 }
 
+/// Walk a function's inline-asm instructions and collect
+/// `(operand_pseudo, fixed_reg)` pairs from every `Fixed`-constrained
+/// operand. Used by the chordal allocator to pre-color those
+/// operands so they land in the constraint-required register
+/// directly instead of being placed elsewhere and moved into the
+/// fixed register by the inline-asm codegen.
+///
+/// The codegen's "move-into-fixed-register-around-asm" path stays
+/// in place as a fallback — if pre-coloring conflicts with an
+/// earlier ABI pin and the allocator can't honor it, the codegen
+/// still emits the corrective move. C3 just lets the allocator
+/// honor the constraint *cleanly* in the common case.
+pub fn collect_asm_fixed_precolors_x86_64(func: &Function) -> BTreeMap<PseudoId, Reg> {
+    let mut out = BTreeMap::new();
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if insn.op != Opcode::Asm {
+                continue;
+            }
+            let Some(ic) = build_asm_instr_constraints_x86_64(insn) else {
+                continue;
+            };
+            for op in &ic.operands {
+                if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) = &op.constraint {
+                    // First Fixed seen wins. Duplicate pins on the
+                    // same pseudo across multiple asm blocks would be
+                    // a source bug; ignore the second pin.
+                    out.entry(op.pseudo).or_insert(*r);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
     // Inline asm: route through the C2 per-operand constraint
     // vocabulary and lower the result back to ConstraintPoint so the
@@ -1390,8 +1425,11 @@ impl RegAlloc {
         }
 
         // Pre-colored vertices: any pseudo already mapped to a GP reg
-        // (ABI-pinned args from allocate_arguments). Add them to the
-        // graph so live conflicts are respected.
+        // (ABI-pinned args from allocate_arguments) plus inline-asm
+        // operands with `Fixed(R)` constraints (e.g. `"a"(x)` pins x
+        // to RAX). Add them to the graph so live conflicts are
+        // respected and the operand lands directly in the
+        // constraint-required register — no codegen move needed.
         let mut pre_colored: BTreeMap<PseudoId, Reg> = BTreeMap::new();
         let mut all_vertices: std::collections::BTreeSet<PseudoId> = gp_candidates.clone();
         for (&pid, loc) in self.locations.iter() {
@@ -1399,6 +1437,28 @@ impl RegAlloc {
                 pre_colored.insert(pid, *r);
                 all_vertices.insert(pid);
             }
+        }
+        for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
+            // Only pre-color if the pseudo is a GP candidate. The
+            // C2 lowering already routes Fixed-operand registers
+            // into the ConstraintPoint clobber set, so even if
+            // pre-coloring is skipped here the operand remains
+            // exempt via `involved_pseudos`.
+            if !gp_candidates.contains(&pid) {
+                continue;
+            }
+            pre_colored.entry(pid).or_insert(reg);
+            all_vertices.insert(pid);
+            // Phase 3's commit loop skips pre-colored vertices on
+            // the assumption that their locations are already in
+            // `self.locations` (true for ABI-pinned args, which
+            // `allocate_arguments` inserts before chordal runs).
+            // Inline-asm Fixed pre-colors arrive here without going
+            // through `allocate_arguments`, so insert directly. If
+            // missed, `get_location` defaults to `Loc::Imm(0)` and
+            // every Store/Load involving the operand silently
+            // writes/reads zero.
+            self.locations.insert(pid, Loc::Reg(reg));
         }
 
         // GP coloring needs def-vs-src edges: some codegen lowerings

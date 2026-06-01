@@ -3063,9 +3063,20 @@ impl Aarch64CodeGen {
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
             let loc = self.get_location(output.pseudo);
+            let requires_mem = Self::constraint_requires_memory(&output.constraint);
             operand_names.push(output.name.clone());
             operand_sizes.push(output.size);
             match loc {
+                Loc::Reg(r) if requires_mem => {
+                    // Memory-class constraint with the address in a
+                    // register: render `[xN]` so `ldr`/`str` see a
+                    // valid AAPCS64 memory operand. Without this the
+                    // asm template substitutes `wN`/`xN` and the
+                    // assembler rejects (`ldr w8, w0` → "expected
+                    // label or encodable integer pc offset").
+                    operand_regs.push(None);
+                    operand_mem.push(Some(format!("[{}]", asm_reg_name_64(r))));
+                }
                 Loc::Reg(r) => {
                     operand_regs.push(Some(r));
                     operand_mem.push(None);
@@ -3093,10 +3104,17 @@ impl Aarch64CodeGen {
             } else {
                 self.get_location(input.pseudo)
             };
+            let requires_mem = Self::constraint_requires_memory(&input.constraint);
 
             operand_names.push(input.name.clone());
             operand_sizes.push(input.size);
             match loc {
+                Loc::Reg(r) if requires_mem => {
+                    // See output-side note: memory-class input with
+                    // its address in a register renders as `[xN]`.
+                    operand_regs.push(None);
+                    operand_mem.push(Some(format!("[{}]", asm_reg_name_64(r))));
+                }
                 Loc::Reg(r) => {
                     operand_regs.push(Some(r));
                     operand_mem.push(None);
@@ -3162,6 +3180,28 @@ impl Aarch64CodeGen {
                 }
             }
         }
+    }
+
+    /// Check whether an inline-asm constraint string requires the
+    /// operand to be a memory operand. Mirrors x86_64's equivalent —
+    /// memory-class only (`m`/`o`/`V`/`Q`) returns true; any non-
+    /// memory class letter (`r`/`w`/`i`/`n`/`g`/`X`/`I`...`O` and the
+    /// aarch64 class letters `S`/`Y`/`Z`) defeats the requirement
+    /// because the operand can take its non-memory form. C9 multi-
+    /// alternative `"rm"` therefore returns false (register or
+    /// memory both work; codegen picks register if available).
+    fn constraint_requires_memory(constraint: &str) -> bool {
+        let mut has_mem_class = false;
+        let mut has_non_mem_class = false;
+        for c in constraint.chars() {
+            match c {
+                'm' | 'o' | 'V' | 'Q' => has_mem_class = true,
+                'r' | 'w' | 'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O'
+                | 'S' | 'Y' | 'Z' => has_non_mem_class = true,
+                _ => {}
+            }
+        }
+        has_mem_class && !has_non_mem_class
     }
 
     /// Convert a location to an asm operand string for AArch64

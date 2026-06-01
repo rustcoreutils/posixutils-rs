@@ -705,7 +705,7 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
         "x30" | "w30" | "lr" => Reg::X30,
         "sp" => Reg::SP,
         "xzr" | "wzr" => Reg::Xzr,
-        _ => None?,
+        _ => return None,
     })
 }
 

@@ -614,6 +614,15 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     if insn.op == Opcode::Asm {
         let ic = build_asm_instr_constraints_x86_64(insn)?;
         let (mut clobbers, involved) = lower_instr_constraints_to_constraint_point(&ic, insn);
+        // C4 R10/R11 scratch clobbers apply to the inline-asm path
+        // too: `emit_inline_asm` in `cc/arch/x86_64/codegen.rs` uses
+        // R10/R11 to shuffle operands into Fixed-letter registers,
+        // remap allocated regs that collide with the reserved-scratch
+        // set (`find_temp_reg` falls back to R10 / R11), and host
+        // input/output spill helpers around the asm body. Today
+        // R10/R11 are reserved-scratch so this augmentation is
+        // a no-op; when C4's freeing lands the augmentation becomes
+        // load-bearing for inline asm just like for the IR ops below.
         if opcode_clobbers_r10_r11(insn.op) {
             clobbers.push(Reg::R10);
             clobbers.push(Reg::R11);

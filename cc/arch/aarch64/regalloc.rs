@@ -35,6 +35,7 @@
 //   V8-V15      - Callee-saved (lower 64 bits)
 // ============================================================================
 
+use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
@@ -664,6 +665,32 @@ pub fn parse_aarch64_fixed_letter(_letter: char) -> Option<Reg> {
     None
 }
 
+/// Map a single-letter AAPCS64 operand-constraint *class* letter to
+/// an `OperandConstraint`.
+///
+/// Covered letters (C10 scope):
+/// - `I` — 12-bit positive immediate for ADD/SUB/MOVZ/MOVN.
+/// - `J` — negative `I` (the value `-x` where `x` matches `I`).
+/// - `K` — 32-bit logical (bitfield) immediate.
+/// - `L` — 64-bit logical immediate.
+/// - `M` — 32-bit MOVZ/MOVN immediate.
+/// - `N` — 64-bit MOVZ/MOVN immediate.
+/// - `S` — 32-bit absolute symbolic address (or its low bits).
+/// - `Y` — floating-point zero.
+/// - `Z` — integer zero (the `xzr`/`wzr` zero register; treated as
+///   immediate here since pcc does not directly model `xzr` as an
+///   allocator-visible register).
+///
+/// pcc does not range-check these immediates; the assembler will
+/// reject an out-of-range value, matching GCC's default behaviour.
+pub fn parse_aarch64_class_letter(letter: char) -> Option<OperandConstraint<Reg>> {
+    use OperandConstraint::*;
+    Some(match letter {
+        'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'S' | 'Y' | 'Z' => Imm,
+        _ => return None,
+    })
+}
+
 /// Map a clobber-list register name (lowercase, GCC-style) to the
 /// corresponding `Reg`. Accepts the 64-bit canonical name (`x0`, `x29`,
 /// ...), the 32-bit alias (`w0`, `w29`, ...), and special names
@@ -818,13 +845,18 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
 pub fn build_asm_instr_constraints_aarch64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
-    use crate::arch::asm_constraints::{parse_constraint, InstrConstraints, OperandSpec};
+    use crate::arch::asm_constraints::{
+        parse_constraint_with_classes, InstrConstraints, OperandSpec,
+    };
 
     let asm_data = insn.asm_data.as_ref()?;
     let mut operands = Vec::new();
     for ac in asm_data.outputs.iter().chain(asm_data.inputs.iter()) {
-        if let Ok((kind, constraint)) = parse_constraint(&ac.constraint, parse_aarch64_fixed_letter)
-        {
+        if let Ok((kind, constraint)) = parse_constraint_with_classes(
+            &ac.constraint,
+            parse_aarch64_fixed_letter,
+            parse_aarch64_class_letter,
+        ) {
             operands.push(OperandSpec {
                 pseudo: ac.pseudo,
                 kind,

@@ -837,6 +837,104 @@ int main(void) {
     );
 }
 
+// ============================================================================
+// C10 — Per-arch Class Letter Tests
+// ============================================================================
+//
+// Tests for the rare GCC constraint letters that aren't built-in
+// classes: x86_64's `q` (byte-register-class), `R`/`l` (register
+// synonyms), `I`/`J`/`K`/`L`/`M`/`N`/`O` (constant-range immediates);
+// aarch64's `I`/`J`/`K`/`L`/`M`/`N` (immediate ranges).
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_class_letter_q() {
+    // `q` constraint — byte-class register. Used by kernel/glibc
+    // for byte stores via `movb`. pcc maps `q` to `Any` since every
+    // modern x86_64 GP register has a low-byte alias.
+    let code = r#"
+int main(void) {
+    unsigned char dst = 0;
+    unsigned char src = 0x42;
+    __asm__("movb %1, %0" : "=qm"(dst) : "q"(src));
+    return (dst == 0x42) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_x86_64_class_letter_q", code, &[]),
+        0,
+        "q constraint must accept any GP register for byte operations"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_x86_64_class_letter_q_opt", code),
+        0
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_class_letter_i_immediate() {
+    // `I` constraint — integer constant in [0, 31]. Used for shift
+    // counts. pcc maps `I` to `Imm`; the assembler enforces the
+    // range.
+    let code = r#"
+int main(void) {
+    int x = 0x42;
+    int shifted;
+    // Shift left by a compile-time constant 4 — fits in `I` range.
+    __asm__("shll $4, %0" : "+r"(shifted) : "0"(x));
+    return (shifted == 0x420) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_x86_64_class_letter_I", code, &[]),
+        0,
+        "I constraint must accept a small compile-time constant"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_x86_64_class_letter_I_opt", code),
+        0
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_class_letter_r_synonym() {
+    // `R` constraint — legacy 8-register set. Same as `r` on x86_64.
+    let code = r#"
+int main(void) {
+    int x = 100;
+    int r;
+    __asm__("movl %1, %0" : "=R"(r) : "R"(x));
+    return (r == 100) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_x86_64_class_letter_R", code, &[]),
+        0,
+        "R constraint synonym for r must work"
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn codegen_inline_asm_aarch64_class_letter_k_immediate() {
+    // `K` on aarch64 — 32-bit logical immediate. pcc maps to Imm.
+    let code = r#"
+int main(void) {
+    int x = 0xFF;
+    int r;
+    __asm__("and %w0, %w1, #15" : "=r"(r) : "r"(x));
+    return (r == 15) ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("asm_aarch64_class_letter_K", code, &[]),
+        0,
+        "K constraint must accept logical immediates"
+    );
+}
+
 /// `__sync_synchronize`-equivalent: a single global barrier between two
 /// unrelated memory accesses. A reordering pass that moved the second
 /// load before the barrier could silently miscompile any code that

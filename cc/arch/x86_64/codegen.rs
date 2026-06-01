@@ -3962,22 +3962,31 @@ impl X86_64CodeGen {
     /// in a register — i.e., the codegen must force-load a spilled
     /// value to a temp.
     ///
-    /// C9 multi-alternative semantics: a constraint that lists *any*
-    /// non-register class (`m`, `o`, `V`, `Q`, `i`, `n`, `g`) does NOT
-    /// require a register, because the operand can use the non-
-    /// register form directly. Only constraints that are register-
-    /// class-only force a load.
+    /// C9 multi-alternative semantics: a constraint that explicitly
+    /// lists a memory class (`m`/`o`/`V`/`Q`/`g`) does NOT require a
+    /// register, because memory syntax is acceptable. Immediate
+    /// letters (`i`/`n`/`I`/`J`/`K`/`L`/`M`/`N`/`O`) substitute as
+    /// literals when the operand is `Loc::Imm`, so they don't count
+    /// as "memory" — combined with `r` they still force-load a spilled
+    /// runtime value, since neither register nor immediate is
+    /// satisfied by a memory operand.
+    /// C10 adds the x86_64 class letters `q`/`R`/`l` (register-class
+    /// synonyms) and `X` (any-of-three, same as `g`).
     fn constraint_requires_register(constraint: &str) -> bool {
         let mut has_reg_class = false;
-        let mut has_non_reg_class = false;
+        let mut has_mem_class = false;
         for c in constraint.chars() {
             match c {
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => has_reg_class = true,
-                'm' | 'o' | 'V' | 'Q' | 'i' | 'n' | 'g' => has_non_reg_class = true,
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => has_reg_class = true,
+                'm' | 'o' | 'V' | 'Q' | 'g' | 'X' => has_mem_class = true,
+                // 'i' / 'n' / 'I' / 'J' / 'K' / 'L' / 'M' / 'N' / 'O'
+                // are immediate-class — substitute literal when the
+                // value is const-folded. They don't make memory
+                // acceptable, so they don't disable requires_register.
                 _ => {}
             }
         }
-        has_reg_class && !has_non_reg_class
+        has_reg_class && !has_mem_class
     }
 
     /// Check if an inline asm constraint requires the operand to be
@@ -3995,9 +4004,8 @@ impl X86_64CodeGen {
         for c in constraint.chars() {
             match c {
                 'm' | 'o' | 'V' | 'Q' => has_mem_class = true,
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'i' | 'n' | 'g' => {
-                    has_non_mem_class = true
-                }
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' | 'i' | 'n' | 'g'
+                | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' => has_non_mem_class = true,
                 _ => {}
             }
         }

@@ -2160,9 +2160,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             match c {
                 '+' => is_readwrite = true,
                 '&' | '=' | '%' => {} // modifiers
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' => has_non_memory_class = true,
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => {
+                    has_non_memory_class = true
+                }
                 'm' | 'o' | 'V' | 'Q' => has_memory_class = true,
-                'i' | 'n' | 'g' | 'X' => has_non_memory_class = true,
+                // Immediate / general class letters (C10): `I`/`J`/`K`/
+                // `L`/`M`/`N`/`O` are x86_64 constant-range letters;
+                // aarch64 reuses some of these for its own immediate
+                // ranges. None imply memory.
+                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Y' | 'Z' => {
+                    has_non_memory_class = true
+                }
                 '0'..='9' => matching = Some((c as u8 - b'0') as usize),
                 _ => {} // Ignore unknown constraints
             }

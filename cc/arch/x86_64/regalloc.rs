@@ -38,6 +38,7 @@
 //   Rbx, Rbp, R12-R15          - Callee-saved
 // ============================================================================
 
+use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
     interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
@@ -406,8 +407,10 @@ pub fn is_call_like_x86_64(op: Opcode) -> bool {
 /// to the corresponding x86_64 GP register.
 ///
 /// The C2 vocabulary covers `a` (rax), `b` (rbx), `c` (rcx), `d`
-/// (rdx), `S` (rsi), `D` (rdi). Rarer letters (`q`, `Q`, `R`, `l`,
-/// `t`, ...) are out of scope until after C5 lands.
+/// (rdx), `S` (rsi), `D` (rdi). C10 adds the class-letter resolver
+/// `parse_x86_64_class_letter` for `q`/`R`/`l` (treated as `Any`)
+/// and the constant-range letters `I`/`J`/`K`/`L`/`M`/`N`/`O`/`X`
+/// (treated as `Imm`).
 pub fn parse_x86_64_fixed_letter(letter: char) -> Option<Reg> {
     Some(match letter {
         'a' => Reg::Rax,
@@ -416,6 +419,40 @@ pub fn parse_x86_64_fixed_letter(letter: char) -> Option<Reg> {
         'd' => Reg::Rdx,
         'S' => Reg::Rsi,
         'D' => Reg::Rdi,
+        _ => return None,
+    })
+}
+
+/// Map a single-letter GCC operand-constraint *class* letter to an
+/// `OperandConstraint`. Class letters specify a register class or a
+/// constant range; they're distinct from `parse_x86_64_fixed_letter`
+/// which pins to one specific register.
+///
+/// Covered letters (C10 scope):
+/// - `q` — class of registers usable for 8-bit operations. On modern
+///   x86_64 every GP register has a low-byte alias, so we widen this
+///   to `Any` GP register.
+/// - `R` — legacy 8-register set (rax–rdi, rsp, rbp). Same as `r` on
+///   x86_64; we map to `Any`.
+/// - `l` — index registers (rsi, rdi). Same as `r` on x86_64; we map
+///   to `Any`.
+/// - `I`, `J`, `K`, `L`, `M`, `N`, `O` — constant-range constraints
+///   used for shift counts and small-immediate operands. pcc does not
+///   range-check; the assembler will reject if the operand is out of
+///   range, the same failure mode GCC defaults to with mismatched
+///   immediates.
+/// - `X` — any operand (register, memory, immediate). Same as `g`.
+///
+/// Out of scope:
+/// - `t` (top of x87 FP stack) — pcc's register model doesn't expose
+///   ST(0) to the allocator. Code that needs `t` must use clobber
+///   declarations instead.
+pub fn parse_x86_64_class_letter(letter: char) -> Option<OperandConstraint<Reg>> {
+    use OperandConstraint::*;
+    Some(match letter {
+        'q' | 'R' | 'l' => Any,
+        'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' => Imm,
+        'X' => Alternatives(vec![Any, Mem, Imm]),
         _ => return None,
     })
 }
@@ -483,13 +520,18 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
-    use crate::arch::asm_constraints::{parse_constraint, InstrConstraints, OperandSpec};
+    use crate::arch::asm_constraints::{
+        parse_constraint_with_classes, InstrConstraints, OperandSpec,
+    };
 
     let asm_data = insn.asm_data.as_ref()?;
     let mut operands = Vec::new();
     for ac in asm_data.outputs.iter().chain(asm_data.inputs.iter()) {
-        if let Ok((kind, constraint)) = parse_constraint(&ac.constraint, parse_x86_64_fixed_letter)
-        {
+        if let Ok((kind, constraint)) = parse_constraint_with_classes(
+            &ac.constraint,
+            parse_x86_64_fixed_letter,
+            parse_x86_64_class_letter,
+        ) {
             // Default-kind from the parser is correct for inputs and
             // matches GCC for outputs (`=` and `+` modifiers come
             // through the string). Explicit override only needed if

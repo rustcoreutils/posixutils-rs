@@ -29,6 +29,36 @@
 //        asm output. Later milestones (M2 "Sym vs pointer pseudo", M3
 //        mem2reg) clean up that shape; I1 will extend to cover it then.
 //
+//   I3 — TERMINATOR TARGETS REFERENCE VALID BLOCKS
+//        Every branch-style instruction (Br/Cbr/Switch) carries
+//        `BasicBlockId` references for its successor(s). All such
+//        references must point at a block actually present in
+//        `func.blocks`. A reference to a deleted or never-created
+//        block ID would crash the codegen layer's label-resolution
+//        pass with a confusing error far from the source bug. I3
+//        catches this at the optimizer/codegen boundary instead.
+//
+//        Covered fields:
+//        - `insn.bb_true`  (used by Br, Cbr)
+//        - `insn.bb_false` (used by Cbr)
+//        - `insn.switch_cases[i].1` (Switch case targets)
+//        - `insn.switch_default`    (Switch default target)
+//
+//        Inline-asm goto targets (`AsmData.goto_labels`) are also
+//        checked.
+//
+//   I2 — MEMORY BARRIERS ARE DCE ROOTS
+//        Every instruction for which `Instruction::is_memory_barrier()`
+//        returns `true` must also have `op.has_side_effects() == true`.
+//        Otherwise mark-sweep DCE could delete a barrier whose result is
+//        unused, silently dropping a `Fence`, an `Atomic*`, a Call, or an
+//        `asm("..." ::: "memory")` from the program — a source of
+//        kernel-style spinlock breakage that is invisible at compile
+//        time. The two predicates are kept structurally aligned by this
+//        invariant; if either set drifts, the validator surfaces it
+//        immediately rather than waiting for a memory-reordering pass to
+//        miscompile a real program.
+//
 // The validator is intended to run only in debug builds — production
 // builds skip it for zero overhead. Call via:
 //
@@ -38,7 +68,7 @@
 // Each new milestone documents the invariant it adds here, and extends
 // `validate_function` with a corresponding check.
 
-use super::{Function, Module, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Module, Opcode, PseudoId};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -60,6 +90,25 @@ pub enum ValidationError {
         function: String,
         pseudo: PseudoId,
         sites: Vec<(usize, usize, Opcode)>,
+    },
+    /// I2 violation: an instruction satisfies `is_memory_barrier()` but
+    /// its opcode is not in `has_side_effects()`. DCE would delete it.
+    BarrierWithoutSideEffect {
+        function: String,
+        block: usize,
+        index: usize,
+        opcode: Opcode,
+    },
+    /// I3 violation: a branch-style instruction references a
+    /// `BasicBlockId` that doesn't exist in `func.blocks`. Carries
+    /// the offending block id and the location of the bad
+    /// reference.
+    InvalidBranchTarget {
+        function: String,
+        block: usize,
+        index: usize,
+        opcode: Opcode,
+        target: BasicBlockId,
     },
 }
 
@@ -86,6 +135,27 @@ impl fmt::Display for ValidationError {
                 }
                 Ok(())
             }
+            ValidationError::BarrierWithoutSideEffect {
+                function,
+                block,
+                index,
+                opcode,
+            } => write!(
+                f,
+                "[ir-validate I2] in function `{function}`: bb={block} insn={index} op={opcode:?} \
+                 is a memory barrier but not in has_side_effects() — DCE would delete it"
+            ),
+            ValidationError::InvalidBranchTarget {
+                function,
+                block,
+                index,
+                opcode,
+                target,
+            } => write!(
+                f,
+                "[ir-validate I3] in function `{function}`: bb={block} insn={index} op={opcode:?} \
+                 references unknown BasicBlockId {target:?}"
+            ),
         }
     }
 }
@@ -121,6 +191,8 @@ pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
 pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_single_def(func, &mut errors);
+    check_barrier_implies_side_effect(func, &mut errors);
+    check_branch_targets_valid(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -167,6 +239,69 @@ fn check_single_def(func: &Function, out: &mut Vec<ValidationError>) {
                 pseudo,
                 sites,
             });
+        }
+    }
+}
+
+/// I3 — every branch-style instruction's `BasicBlockId` references
+/// must point at a real block in `func.blocks`. Catches CFG-corruption
+/// bugs at the optimizer/codegen boundary, where they would otherwise
+/// surface as label-resolution failures inside the codegen layer.
+fn check_branch_targets_valid(func: &Function, out: &mut Vec<ValidationError>) {
+    use std::collections::HashSet;
+    let valid: HashSet<BasicBlockId> = func.blocks.iter().map(|b| b.id).collect();
+    let check = |bb_idx: usize,
+                 insn_idx: usize,
+                 opcode: Opcode,
+                 target: BasicBlockId,
+                 out: &mut Vec<ValidationError>| {
+        if !valid.contains(&target) {
+            out.push(ValidationError::InvalidBranchTarget {
+                function: func.name.clone(),
+                block: bb_idx,
+                index: insn_idx,
+                opcode,
+                target,
+            });
+        }
+    };
+    for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        for (insn_idx, insn) in bb.insns.iter().enumerate() {
+            if let Some(t) = insn.bb_true {
+                check(bb_idx, insn_idx, insn.op, t, out);
+            }
+            if let Some(t) = insn.bb_false {
+                check(bb_idx, insn_idx, insn.op, t, out);
+            }
+            for (_, target) in &insn.switch_cases {
+                check(bb_idx, insn_idx, insn.op, *target, out);
+            }
+            if let Some(t) = insn.switch_default {
+                check(bb_idx, insn_idx, insn.op, t, out);
+            }
+            if let Some(asm) = &insn.asm_data {
+                for (target, _) in &asm.goto_labels {
+                    check(bb_idx, insn_idx, insn.op, *target, out);
+                }
+            }
+        }
+    }
+}
+
+/// I2 — every memory-barrier instruction must also have side effects, or
+/// DCE would silently delete it. See the module-level documentation for
+/// the contract this protects.
+fn check_barrier_implies_side_effect(func: &Function, out: &mut Vec<ValidationError>) {
+    for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        for (insn_idx, insn) in bb.insns.iter().enumerate() {
+            if insn.is_memory_barrier() && !insn.op.has_side_effects() {
+                out.push(ValidationError::BarrierWithoutSideEffect {
+                    function: func.name.clone(),
+                    block: bb_idx,
+                    index: insn_idx,
+                    opcode: insn.op,
+                });
+            }
         }
     }
 }
@@ -237,6 +372,7 @@ mod tests {
                 assert_eq!(function, "two_arms");
                 assert_eq!(sites.len(), 2);
             }
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 
@@ -304,5 +440,134 @@ mod tests {
         push(&mut func, psrc);
 
         assert!(validate_function(&func).is_ok());
+    }
+
+    /// I2 — structural enforcement that every barrier opcode is also in
+    /// `has_side_effects()`. This is a meta-test: it walks the cartesian
+    /// product of "is barrier" and "has side effects" for every opcode
+    /// the predicates know about and asserts the implication. If a future
+    /// change adds a new barrier opcode without updating
+    /// `has_side_effects`, this test fails before any miscompilation can
+    /// reach a user.
+    #[test]
+    fn i2_barrier_implies_side_effect_structural() {
+        use crate::ir::AsmData;
+
+        // Every opcode that can return true from is_memory_barrier() under
+        // any input. We can't iterate Opcode directly, so we enumerate
+        // representatives that hit each match arm in is_memory_barrier.
+        let mut samples: Vec<Instruction> = vec![
+            Instruction::new(Opcode::Fence),
+            Instruction::new(Opcode::Call),
+            Instruction::new(Opcode::Setjmp),
+            Instruction::new(Opcode::Longjmp),
+            Instruction::new(Opcode::AtomicLoad),
+            Instruction::new(Opcode::AtomicStore),
+            Instruction::new(Opcode::AtomicSwap),
+            Instruction::new(Opcode::AtomicCas),
+            Instruction::new(Opcode::AtomicFetchAdd),
+            Instruction::new(Opcode::AtomicFetchSub),
+            Instruction::new(Opcode::AtomicFetchAnd),
+            Instruction::new(Opcode::AtomicFetchOr),
+            Instruction::new(Opcode::AtomicFetchXor),
+        ];
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: vec!["memory".to_string()],
+            goto_labels: Vec::new(),
+        }));
+        samples.push(asm);
+
+        for insn in &samples {
+            assert!(
+                insn.is_memory_barrier(),
+                "{:?} should be a barrier",
+                insn.op
+            );
+            assert!(
+                insn.op.has_side_effects(),
+                "{:?} is a barrier but not has_side_effects — DCE would delete it",
+                insn.op
+            );
+        }
+    }
+
+    /// I2 — runtime check: a hand-crafted IR with a barrier-but-not-
+    /// side-effect (constructed by abusing AsmData on a non-Asm op) is
+    /// not actually reachable through normal pcc pipelines, but the
+    /// validator's check covers the contract end-to-end. A simpler
+    /// sanity case: a normal asm-with-memory-clobber passes I2.
+    #[test]
+    fn i2_asm_with_memory_clobber_validates() {
+        use crate::ir::AsmData;
+
+        let mut func = fresh_func("asm_mem_barrier");
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.asm_data = Some(Box::new(AsmData {
+            template: "mfence".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec!["memory".to_string()],
+            goto_labels: vec![],
+        }));
+        push(&mut func, asm);
+        assert!(validate_function(&func).is_ok());
+    }
+
+    /// I3 — a valid CFG. Br targets an existing block; validator
+    /// returns Ok.
+    #[test]
+    fn i3_valid_branch_target_passes() {
+        let mut func = fresh_func("valid_br");
+        // Add a second block so Br has a real target.
+        let mut bb1 = crate::ir::BasicBlock::new(BasicBlockId(1));
+        bb1.insns.push(Instruction::ret(None));
+        func.add_block(bb1);
+        push(&mut func, Instruction::br(BasicBlockId(1)));
+        assert!(validate_function(&func).is_ok());
+    }
+
+    /// I3 — Br references a nonexistent BasicBlockId. The validator
+    /// flags it with `InvalidBranchTarget`.
+    #[test]
+    fn i3_invalid_br_target_flagged() {
+        let mut func = fresh_func("invalid_br");
+        push(&mut func, Instruction::br(BasicBlockId(99)));
+        let errors = validate_function(&func).unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidBranchTarget {
+                target,
+                opcode: Opcode::Br,
+                ..
+            } if *target == BasicBlockId(99)
+        )));
+    }
+
+    /// I3 — Cbr's bb_true and bb_false are both checked. A bogus
+    /// bb_false alone is enough to fail validation.
+    #[test]
+    fn i3_invalid_cbr_false_target_flagged() {
+        let mut func = fresh_func("invalid_cbr");
+        let mut bb1 = crate::ir::BasicBlock::new(BasicBlockId(1));
+        bb1.insns.push(Instruction::ret(None));
+        func.add_block(bb1);
+        // bb_true exists, bb_false doesn't.
+        push(
+            &mut func,
+            Instruction::cbr(PseudoId(0), BasicBlockId(1), BasicBlockId(7)),
+        );
+        let errors = validate_function(&func).unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidBranchTarget {
+                target,
+                opcode: Opcode::Cbr,
+                ..
+            } if *target == BasicBlockId(7)
+        )));
     }
 }

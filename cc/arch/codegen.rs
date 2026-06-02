@@ -471,8 +471,36 @@ pub trait AsmOperandFormatter {
     fn format_reg_default(&self, reg: Self::Reg, size_bits: u32) -> String;
 }
 
-/// Substitute %N, %[name], %lN, %l[name], and size modifiers in asm template.
-/// Architecture-specific register formatting is handled via the AsmOperandFormatter trait.
+/// One inline-asm operand's resolved location, ready for template
+/// substitution. Built once per operand by `emit_inline_asm` on each
+/// backend; consumed by `substitute_asm_operands`.
+///
+/// Exactly one of `reg` or `mem` is meaningful for any given operand:
+/// `reg` holds a physical register if the operand resolved to a
+/// register substitution, and `mem` holds a pre-formatted operand
+/// string (memory operand like `[x0]`/`(%rax)`, or an immediate
+/// literal like `#42`/`$42`). The formatter chooses between them at
+/// substitution time — `mem` wins if set.
+#[derive(Debug, Clone)]
+pub struct AsmOperandSlot<R> {
+    /// Physical register if the operand resolved to a register-class
+    /// substitution; `None` otherwise.
+    pub reg: Option<R>,
+    /// Pre-formatted memory or immediate operand string; `None` if
+    /// the operand is a plain register.
+    pub mem: Option<String>,
+    /// Operand size in bits. Used by the formatter for sized register
+    /// modifiers (`%w0`/`%x0` on aarch64, `%b0`/`%w0`/`%k0`/`%q0` on
+    /// x86_64) and as a default for unmodified register formatting.
+    pub size: u32,
+    /// GCC named-operand alias (e.g. the `[out]` in `%[out]`). `None`
+    /// for positional `%0`/`%1`/... operands.
+    pub name: Option<String>,
+}
+
+/// Substitute `%N`, `%[name]`, `%lN`, `%l[name]`, and size modifiers in
+/// an asm template. Architecture-specific register formatting is handled
+/// via the [`AsmOperandFormatter`] trait.
 ///
 /// Handles:
 /// - `%%` escape sequences -> `%`
@@ -483,10 +511,7 @@ pub trait AsmOperandFormatter {
 pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     formatter: &F,
     template: &str,
-    regs: &[Option<F::Reg>],
-    sizes: &[u32],
-    mems: &[Option<String>],
-    names: &[Option<String>],
+    slots: &[AsmOperandSlot<F::Reg>],
     goto_labels: &[(String, String)],
 ) -> String {
     let mut result = String::with_capacity(template.len() * 2);
@@ -512,16 +537,16 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                         name.push(ch);
                         chars.next();
                     }
-                    // Look up the name in operand names
-                    if let Some(idx) = names
+                    // Look up the name in operand slots
+                    if let Some(idx) = slots
                         .iter()
-                        .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                        .position(|s| s.name.as_deref() == Some(name.as_str()))
                     {
-                        if let Some(ref mem) = mems[idx] {
+                        let slot = &slots[idx];
+                        if let Some(ref mem) = slot.mem {
                             result.push_str(mem);
-                        } else if let Some(reg) = regs[idx] {
-                            let sz = sizes.get(idx).copied().unwrap_or(32);
-                            result.push_str(&formatter.format_reg_default(reg, sz));
+                        } else if let Some(reg) = slot.reg {
+                            result.push_str(&formatter.format_reg_default(reg, slot.size));
                         }
                     } else {
                         // Unknown name, pass through
@@ -544,12 +569,11 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                         }
                     }
                     let idx: usize = num_str.parse().unwrap_or(0);
-                    if idx < regs.len() {
-                        if let Some(ref mem) = mems[idx] {
+                    if let Some(slot) = slots.get(idx) {
+                        if let Some(ref mem) = slot.mem {
                             result.push_str(mem);
-                        } else if let Some(reg) = regs[idx] {
-                            let sz = sizes.get(idx).copied().unwrap_or(32);
-                            result.push_str(&formatter.format_reg_default(reg, sz));
+                        } else if let Some(reg) = slot.reg {
+                            result.push_str(&formatter.format_reg_default(reg, slot.size));
                         }
                     } else {
                         // Unknown operand, pass through
@@ -621,13 +645,14 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                                 name.push(ch);
                                 chars.next();
                             }
-                            if let Some(idx) = names
+                            if let Some(idx) = slots
                                 .iter()
-                                .position(|n| n.as_ref().map(|s| s.as_str()) == Some(name.as_str()))
+                                .position(|s| s.name.as_deref() == Some(name.as_str()))
                             {
-                                if let Some(ref mem) = mems[idx] {
+                                let slot = &slots[idx];
+                                if let Some(ref mem) = slot.mem {
                                     result.push_str(mem);
-                                } else if let Some(reg) = regs[idx] {
+                                } else if let Some(reg) = slot.reg {
                                     result.push_str(&formatter.format_reg_sized(reg, size_mod));
                                 }
                             } else {
@@ -650,10 +675,10 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                                 }
                             }
                             let idx: usize = num_str.parse().unwrap_or(0);
-                            if idx < regs.len() {
-                                if let Some(ref mem) = mems[idx] {
+                            if let Some(slot) = slots.get(idx) {
+                                if let Some(ref mem) = slot.mem {
                                     result.push_str(mem);
-                                } else if let Some(reg) = regs[idx] {
+                                } else if let Some(reg) = slot.reg {
                                     result.push_str(&formatter.format_reg_sized(reg, size_mod));
                                 }
                             } else {

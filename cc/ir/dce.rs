@@ -14,6 +14,14 @@
 // 2. Transitively mark all instructions that roots depend on
 // 3. Delete all unmarked instructions
 //
+// Memory-ordering contract: DCE deletes dead instructions in place
+// (rewriting them to `Opcode::Nop`) and never reorders surviving
+// instructions. The relative order of `Load`, `Store`, `Asm`, `Call`,
+// `Atomic*`, and `Fence` is preserved exactly. This is the contract
+// that lets `Instruction::is_memory_barrier()` mean something —
+// see the doc comment there. Any change to this pass that does start
+// reordering must consult `is_memory_barrier()` before crossing.
+//
 
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use std::collections::{HashMap, HashSet, VecDeque};

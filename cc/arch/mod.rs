@@ -12,6 +12,7 @@
 pub const DEFAULT_LIR_BUFFER_CAPACITY: usize = 5000;
 
 pub mod aarch64;
+pub mod asm_constraints;
 pub mod codegen;
 pub mod dwarf;
 pub mod lir;
@@ -20,7 +21,7 @@ pub mod regalloc;
 pub mod x86_64;
 
 // Re-export inline asm support traits and functions
-pub use codegen::{substitute_asm_operands, AsmOperandFormatter};
+pub use codegen::{substitute_asm_operands, AsmOperandFormatter, AsmOperandSlot};
 
 use crate::target::{Arch, Target};
 

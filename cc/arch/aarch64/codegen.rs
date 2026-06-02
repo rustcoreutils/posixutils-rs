@@ -2955,6 +2955,14 @@ impl Aarch64CodeGen {
         let is_fp_copy =
             matches!(&src_loc, Loc::VReg(_) | Loc::FImm(..)) || matches!(&dst_loc, Loc::VReg(_));
 
+        // M9a — identity-Copy elision (aarch64 mirror of x86_64
+        // path). Same gating: same location, no narrow-type
+        // extension, not FP. See x86_64::emit_copy_with_type for
+        // the full rationale.
+        if src_loc == dst_loc && actual_size >= 32 && !is_fp_copy {
+            return;
+        }
+
         // Determine if the type is unsigned (for proper sign/zero extension)
         // For plain char, use target.char_signed to determine signedness
         let is_unsigned = typ.is_some_and(|t| {
@@ -3044,29 +3052,42 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        // Build operand strings for asm substitution
-        // We use the actual locations assigned by the register allocator
-        // so that subsequent Store instructions work correctly.
-        let mut operand_regs: Vec<Option<Reg>> = Vec::new();
-        let mut operand_sizes: Vec<u32> = Vec::new();
-        let mut operand_mem: Vec<Option<String>> = Vec::new();
-        let mut operand_names: Vec<Option<String>> = Vec::new();
+        // Build operand slots for asm substitution. Each `AsmOperandSlot`
+        // bundles (reg, mem, size, name) so per-operand pushes can't go
+        // out of sync — see the x86_64 mirror's commit for the
+        // motivation.
+        let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
+        let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
 
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
             let loc = self.get_location(output.pseudo);
-            operand_names.push(output.name.clone());
-            operand_sizes.push(output.size);
+            let requires_mem = Self::constraint_requires_memory(&output.constraint);
+            let op_size = output.size;
+            let op_name = output.name.clone();
+            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
+                reg,
+                mem,
+                size: op_size,
+                name: op_name.clone(),
+            };
             match loc {
+                Loc::Reg(r) if requires_mem => {
+                    // Memory-class constraint with the address in a
+                    // register: render `[xN]` so `ldr`/`str` see a
+                    // valid AAPCS64 memory operand. Without this the
+                    // asm template substitutes `wN`/`xN` and the
+                    // assembler rejects (`ldr w8, w0` → "expected
+                    // label or encodable integer pc offset").
+                    slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
+                }
                 Loc::Reg(r) => {
-                    operand_regs.push(Some(r));
-                    operand_mem.push(None);
+                    slots.push(mk(Some(r), None));
                 }
                 _ => {
                     // Memory or other location - emit as memory operand
-                    let mem_str = self.loc_to_asm_string(&loc, output.size);
-                    operand_regs.push(None);
-                    operand_mem.push(Some(mem_str));
+                    let mem_str = self.loc_to_asm_string(&loc, op_size);
+                    slots.push(mk(None, Some(mem_str)));
                 }
             }
         }
@@ -3085,24 +3106,32 @@ impl Aarch64CodeGen {
             } else {
                 self.get_location(input.pseudo)
             };
-
-            operand_names.push(input.name.clone());
-            operand_sizes.push(input.size);
+            let requires_mem = Self::constraint_requires_memory(&input.constraint);
+            let op_size = input.size;
+            let op_name = input.name.clone();
+            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
+                reg,
+                mem,
+                size: op_size,
+                name: op_name.clone(),
+            };
             match loc {
+                Loc::Reg(r) if requires_mem => {
+                    // See output-side note: memory-class input with
+                    // its address in a register renders as `[xN]`.
+                    slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
+                }
                 Loc::Reg(r) => {
-                    operand_regs.push(Some(r));
-                    operand_mem.push(None);
+                    slots.push(mk(Some(r), None));
                 }
                 Loc::Imm(v) => {
                     // Immediate value
-                    operand_regs.push(None);
-                    operand_mem.push(Some(format!("#{}", v as i64)));
+                    slots.push(mk(None, Some(format!("#{}", v as i64))));
                 }
                 _ => {
                     // Memory or other location
-                    let mem_str = self.loc_to_asm_string(&loc, input.size);
-                    operand_regs.push(None);
-                    operand_mem.push(Some(mem_str));
+                    let mem_str = self.loc_to_asm_string(&loc, op_size);
+                    slots.push(mk(None, Some(mem_str)));
                 }
             }
         }
@@ -3119,14 +3148,8 @@ impl Aarch64CodeGen {
             .collect();
 
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
-        let asm_output = self.substitute_asm_operands(
-            &asm_data.template,
-            &operand_regs,
-            &operand_sizes,
-            &operand_mem,
-            &operand_names,
-            &goto_labels_formatted,
-        );
+        let asm_output =
+            self.substitute_asm_operands(&asm_data.template, &slots, &goto_labels_formatted);
 
         // Emit the inline assembly as raw text
         // Split by newlines and emit each line
@@ -3154,6 +3177,28 @@ impl Aarch64CodeGen {
                 }
             }
         }
+    }
+
+    /// Check whether an inline-asm constraint string requires the
+    /// operand to be a memory operand. Mirrors x86_64's equivalent —
+    /// memory-class only (`m`/`o`/`V`/`Q`) returns true; any non-
+    /// memory class letter (`r`/`w`/`i`/`n`/`g`/`X`/`I`...`O` and the
+    /// aarch64 class letters `S`/`Y`/`Z`) defeats the requirement
+    /// because the operand can take its non-memory form. C9 multi-
+    /// alternative `"rm"` therefore returns false (register or
+    /// memory both work; codegen picks register if available).
+    fn constraint_requires_memory(constraint: &str) -> bool {
+        let mut has_mem_class = false;
+        let mut has_non_mem_class = false;
+        for c in constraint.chars() {
+            match c {
+                'm' | 'o' | 'V' | 'Q' => has_mem_class = true,
+                'r' | 'w' | 'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O'
+                | 'S' | 'Y' | 'Z' => has_non_mem_class = true,
+                _ => {}
+            }
+        }
+        has_mem_class && !has_non_mem_class
     }
 
     /// Convert a location to an asm operand string for AArch64
@@ -3191,21 +3236,10 @@ impl Aarch64CodeGen {
     fn substitute_asm_operands(
         &self,
         template: &str,
-        operand_regs: &[Option<Reg>],
-        operand_sizes: &[u32],
-        operand_mem: &[Option<String>],
-        operand_names: &[Option<String>],
+        slots: &[crate::arch::AsmOperandSlot<Reg>],
         goto_labels: &[(String, String)],
     ) -> String {
-        crate::arch::substitute_asm_operands(
-            self,
-            template,
-            operand_regs,
-            operand_sizes,
-            operand_mem,
-            operand_names,
-            goto_labels,
-        )
+        crate::arch::substitute_asm_operands(self, template, slots, goto_labels)
     }
 
     // ========================================================================

@@ -5455,3 +5455,39 @@ int main(void) {
         "DCE folded a conditional branch whose target ended in a noreturn call + Unreachable, dropping the call"
     );
 }
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn codegen_gp_live_across_inline_asm_clobber() {
+    // Forward-looking defensive test for C1 of the constraint-system
+    // milestone.
+    //
+    // C1 wires inline-asm clobber lists into the allocator's
+    // `get_constraint_info` callback. Today the bug this guards
+    // against is not actually triggerable in C: every user-declared
+    // local becomes a `Sym` pseudo which Phase 1 force-spills to
+    // stack, so no GP pseudo holding a named local survives across
+    // the asm in a register. The test passes both with and without
+    // the C1 fix.
+    //
+    // The defensive value lights up the moment any later milestone
+    // promotes Sym pseudos to registers (mem2reg-style). At that
+    // point a value held in RAX across an asm declaring `: "rax"`
+    // gets clobbered, and this test fails loudly.
+    let code = r#"
+int compute(int a) {
+    int x = a + 1;
+    __asm__ volatile("movq $0, %%rax" : : : "rax");
+    return x;
+}
+
+int main(void) {
+    return compute(41) != 42;
+}
+"#;
+    assert_eq!(
+        compile_and_run("gp_live_across_inline_asm_clobber", code, &[]),
+        0,
+        "GP value corrupted across inline asm that declared the host register in its clobber list"
+    );
+}

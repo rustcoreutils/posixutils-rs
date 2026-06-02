@@ -1965,8 +1965,30 @@ impl<'a> super::linearize::Linearizer<'a> {
         // no follow-up store is required.
         let mut skip_post_handling: Vec<bool> = Vec::new();
 
+        // Pre-scan inputs to learn which outputs will be tied to a matching
+        // input (e.g. `"0"(x)`).  When a `+r` output IS tied to a matching
+        // input, the tied input later emits a Copy that overwrites the
+        // output's pseudo with the input's value — which makes the read-
+        // half load redundant *and* an SSA violation (the optimizer-stage
+        // validator I1 rejects two definitions of the same pseudo).
+        // Bare `+r` with no tied input must still load the lvalue's
+        // current value (only producer of the initial register contents),
+        // so the load is gated on whether any input matches this output.
+        let tied_inputs: Vec<bool> = {
+            let mut out_has_tied_input = vec![false; outputs.len()];
+            for op in inputs {
+                let (_, _, matching) = self.parse_asm_constraint(&op.constraint);
+                if let Some(idx) = matching {
+                    if idx < out_has_tied_input.len() {
+                        out_has_tied_input[idx] = true;
+                    }
+                }
+            }
+            out_has_tied_input
+        };
+
         // Process output operands
-        for op in outputs {
+        for (output_idx, op) in outputs.iter().enumerate() {
             // Parse constraint to get flags
             let (is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
 
@@ -2019,21 +2041,27 @@ impl<'a> super::linearize::Linearizer<'a> {
             let param_info = self.get_param_if_ident(&op.expr);
 
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
-            // so that input and output use the same register
+            // so that input and output use the same register — unless a
+            // tied matching input (e.g. `"0"(x)`) will later supply its own
+            // value via a Copy into the same pseudo, which would otherwise
+            // produce a double-definition (and violates the SSA-style
+            // validator invariant after optimization).
             if is_readwrite {
-                if let Some((_, param_pseudo)) = &param_info {
-                    // Parameter: copy value directly (no memory address)
-                    self.emit(
-                        Instruction::new(Opcode::Copy)
-                            .with_target(pseudo)
-                            .with_src(*param_pseudo)
-                            .with_type(typ)
-                            .with_size(size),
-                    );
-                } else {
-                    // Local or global: load from memory address
-                    let addr = self.linearize_lvalue(&op.expr);
-                    self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+                if !tied_inputs[output_idx] {
+                    if let Some((_, param_pseudo)) = &param_info {
+                        // Parameter: copy value directly (no memory address)
+                        self.emit(
+                            Instruction::new(Opcode::Copy)
+                                .with_target(pseudo)
+                                .with_src(*param_pseudo)
+                                .with_type(typ)
+                                .with_size(size),
+                        );
+                    } else {
+                        // Local or global: load from memory address
+                        let addr = self.linearize_lvalue(&op.expr);
+                        self.emit(Instruction::load(pseudo, addr, 0, typ, size));
+                    }
                 }
 
                 // Also add as input, using the SAME pseudo and marking as matching

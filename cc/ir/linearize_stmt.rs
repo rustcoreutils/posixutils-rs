@@ -1959,23 +1959,64 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut ir_inputs = Vec::new();
         // Track which outputs are parameters (need var_map update instead of store)
         let mut param_outputs: Vec<Option<String>> = Vec::new();
+        // Track which outputs need no post-asm processing — true for
+        // memory-class outputs (`=m`/`+m`/`=o`/`+o`/...), where the asm
+        // wrote the new value directly through the memory operand and
+        // no follow-up store is required.
+        let mut skip_post_handling: Vec<bool> = Vec::new();
 
         // Process output operands
         for op in outputs {
-            // Create a pseudo for the output
-            let pseudo = self.alloc_pseudo();
-
             // Parse constraint to get flags
-            let (_is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
+            let (is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
-            // Check if this output is a parameter (SSA value, not memory location)
-            let param_info = self.get_param_if_ident(&op.expr);
-
             let typ = self.expr_type(&op.expr);
             let size = self.types.size_bits(typ);
+
+            // For memory-class outputs (`=m`/`+m`/...): the asm operand
+            // is the ADDRESS of the lvalue, not a register holding a
+            // value. The asm performs the read/write through that
+            // address with its own `ldr`/`str` (or x86 equivalents), so
+            // no initial Load or post-asm Store is needed at the IR
+            // level. Just use the lvalue address as the asm operand
+            // pseudo directly.
+            if is_memory {
+                let addr = self.linearize_lvalue(&op.expr);
+
+                if is_readwrite {
+                    // `+m` — also add as matching input so the same
+                    // operand number works on both sides.
+                    ir_inputs.push(AsmConstraint {
+                        pseudo: addr,
+                        name: name.clone(),
+                        matching_output: Some(ir_outputs.len()),
+                        constraint: op.constraint.clone(),
+                        size,
+                    });
+                }
+
+                ir_outputs.push(AsmConstraint {
+                    pseudo: addr,
+                    name,
+                    matching_output: None,
+                    constraint: op.constraint.clone(),
+                    size,
+                });
+
+                param_outputs.push(None);
+                skip_post_handling.push(true);
+                continue;
+            }
+
+            // Non-memory output (register or value class): allocate a
+            // fresh pseudo for the asm to write into.
+            let pseudo = self.alloc_pseudo();
+
+            // Check if this output is a parameter (SSA value, not memory location)
+            let param_info = self.get_param_if_ident(&op.expr);
 
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register
@@ -2017,6 +2058,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Track if this is a parameter output
             param_outputs.push(param_info.map(|(name, _)| name));
+            skip_post_handling.push(false);
         }
 
         // Process input operands
@@ -2117,6 +2159,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Store outputs back to their destinations
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
+            // Memory-class outputs (`=m`/`+m`/...) need no post-asm
+            // handling — the asm wrote the new value directly through
+            // the memory operand.
+            if skip_post_handling[i] {
+                continue;
+            }
+
             let out_pseudo = ir_outputs[i].pseudo;
 
             // Check if this output is a parameter (update var_map instead of memory store)

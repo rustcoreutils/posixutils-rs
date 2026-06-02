@@ -3517,8 +3517,22 @@ impl X86_64CodeGen {
                 }
             } else {
                 let requires_reg = Self::constraint_requires_register(&output.constraint);
+                let requires_mem = Self::constraint_requires_memory(&output.constraint);
                 // No specific register - use allocated location
                 match loc {
+                    Loc::Reg(r) if requires_mem => {
+                        // Memory-class output (e.g. `"=m"(*p)`/`"+m"(*p)`):
+                        // the pseudo holds the ADDRESS of the lvalue
+                        // (set up by the linearizer's `is_memory`
+                        // branch). Render as indirect `(%rN)` so the
+                        // asm modifies the memory directly. Without
+                        // this guard the template substitutes `%eax`
+                        // and `addl $1, %0` becomes `addl $1, %eax`,
+                        // incrementing the address bits instead of
+                        // the value at that address.
+                        let mem_str = format!("(%{})", self.reg_name_64(r));
+                        slots.push(mk(None, Some(mem_str)));
+                    }
                     Loc::Reg(r) => {
                         // Check if allocated reg conflicts with reserved
                         if reserved_regs.contains(&r) {

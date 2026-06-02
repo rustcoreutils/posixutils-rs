@@ -81,14 +81,28 @@ fn test_0_files() {
     run_test_more(&["-p", "\":n\""], "ABC", "", "", 0);
 }
 
+// POSIX: empty stdin is valid input, not an error. `cat /dev/null | more` must
+// exit cleanly. (Earlier code returned MoreError::InputRead when
+// `lines().next()` yielded None on empty stdin; the implicit-stdin path now
+// uses `read_to_string`, which returns Ok on EOF.)
 #[test]
-fn test_0_files_error() {
+fn test_0_files_empty_stdin() {
+    run_test_more(&["-p", "\":n\""], "", "", "", 0);
+}
+
+// POSIX regression: with no file operands, all of stdin must be paginated,
+// not just the first line. Earlier code used
+// `BufReader::new(stdin).lines().next()`, so `printf 'a\nb\nc\n' | more`
+// displayed only "a" and exited.  In filter mode (stdout is not a tty during
+// `cargo test`), the full content must reach stdout.
+#[test]
+fn test_0_files_multiline_stdin_not_truncated() {
     run_test_more(
-        &["-p", "\":n\""],
+        &[],
+        "alpha\nbravo\ncharlie\n",
+        "alpha\nbravo\ncharlie\n",
         "",
-        "Couldn't read from stdin\n",
-        "Couldn't read from stdin\n",
-        1,
+        0,
     );
 }
 

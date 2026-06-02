@@ -1011,6 +1011,67 @@ int main(void) {
     );
 }
 
+/// `+r`(out) paired with a tied matching input (`"0"(in)`) must not double-
+/// define the output's pseudo.  The linearizer used to emit BOTH a Load (the
+/// `+r` read-half) AND a Copy (from the tied input) targeting the same
+/// pseudo — fine at -O0 (no validator) but rejected by the optimizer-stage
+/// I1 invariant ("single definition per pseudo") at -O2.  This test pins
+/// the behavior down for several lvalue shapes so a regression in the
+/// linearizer's tied-input handling is caught no matter which constraint
+/// letter happens to surface it.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_tied_input_no_double_def() {
+    // Local int.
+    assert_eq!(
+        compile_and_run_optimized(
+            "asm_tied_int_local",
+            r#"
+int main(void) {
+    int src = 0x42;
+    int dst;
+    __asm__("shll $4, %0" : "+r"(dst) : "0"(src));
+    return (dst == 0x420) ? 0 : 1;
+}
+"#,
+        ),
+        0
+    );
+
+    // Global int (different lvalue path — Load from .data, not from frame).
+    assert_eq!(
+        compile_and_run_optimized(
+            "asm_tied_int_global",
+            r#"
+int g = 7;
+int main(void) {
+    int out;
+    __asm__("addl $3, %0" : "+r"(out) : "0"(g));
+    return (out == 10) ? 0 : 1;
+}
+"#,
+        ),
+        0
+    );
+
+    // Parameter source (the `param_info.is_some()` linearizer branch — also
+    // historically emitted the wrong Copy when a tied input was present).
+    assert_eq!(
+        compile_and_run_optimized(
+            "asm_tied_int_param",
+            r#"
+int helper(int src) {
+    int dst;
+    __asm__("addl $1, %0" : "+r"(dst) : "0"(src));
+    return dst;
+}
+int main(void) { return (helper(41) == 42) ? 0 : 1; }
+"#,
+        ),
+        0
+    );
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_inline_asm_x86_64_class_letter_r_synonym() {

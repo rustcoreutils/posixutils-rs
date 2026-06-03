@@ -106,7 +106,13 @@ pub fn write_sysv_symbol_table<W: Write>(w: &mut W, members: &[MemberInfo]) -> i
             name_blob.extend(symbol.as_bytes());
             name_blob.push(0);
         }
-        next_member_offset += (MEMBER_HEADER_SIZE + member.size) as u32;
+        // System V archives pad each member payload to a 2-byte boundary
+        // (typically with `\n`). The pad byte sits AFTER `member.size` and
+        // BEFORE the next member's header, so the offset of the next
+        // member's header advances by the unpadded payload plus the pad
+        // byte (if the payload size is odd).
+        let padded = member.size + (member.size % 2);
+        next_member_offset += (MEMBER_HEADER_SIZE + padded) as u32;
     }
 
     let mut payload = Vec::with_capacity(table_size as usize);
@@ -190,5 +196,39 @@ mod tests {
             symbols: vec!["a".to_string(), "bc".to_string()],
         };
         assert_eq!(m.symbol_bytes(), 2 + 3); // "a\0" + "bc\0"
+    }
+
+    #[test]
+    fn odd_sized_member_pad_advances_next_offset() {
+        // Two members, the first one odd-sized. The symbol-table offset
+        // for the second member's symbol must include the 1-byte newline
+        // pad between member 0's payload and member 1's header.
+        let members = vec![
+            MemberInfo {
+                size: 7, // odd → +1 pad byte before member 1's header
+                symbols: vec!["m0".to_string()],
+            },
+            MemberInfo {
+                size: 10, // even
+                symbols: vec!["m1".to_string()],
+            },
+        ];
+        let mut out = Vec::new();
+        write_sysv_symbol_table(&mut out, &members).unwrap();
+        let payload = &out[60..];
+        // Count = 2.
+        assert_eq!(&payload[0..4], &[0, 0, 0, 2]);
+        // Payload: 4 (count) + 8 (2 * offset) + 6 ("m0\0m1\0") = 18; even, no pad.
+        // table_size = 18.
+        // Offset0 = MAGIC (8) + table_member_header (60) + table_size (18) = 86.
+        // Member 0 lays out as: 60 header + 7 payload + 1 pad = 68 bytes.
+        // Offset1 = 86 + 68 = 154.
+        let off0 = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+        let off1 = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+        assert_eq!(off0, 86, "offset for first symbol wrong");
+        assert_eq!(
+            off1, 154,
+            "offset for second symbol must account for member-0 pad"
+        );
     }
 }

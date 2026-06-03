@@ -25,10 +25,18 @@
 use std::ffi::CString;
 use std::io;
 
-// libc-rs doesn't surface `iswprint` / `wint_t` portably, so for non-ASCII
-// code points we route through libc directly via FFI.
+// libc-rs doesn't surface `wint_t` for Linux or macOS targets (only for
+// teeos / hurd), so we mirror the platform's underlying `wint_t` choice
+// here. On glibc/musl: `unsigned int`. On Darwin: `int`. Both are 32-bit
+// integers on x86_64/aarch64; the ABI for register-passing is identical,
+// but we still match signedness for strict type correctness.
+#[cfg(target_vendor = "apple")]
+type WintT = libc::c_int;
+#[cfg(not(target_vendor = "apple"))]
+type WintT = libc::c_uint;
+
 extern "C" {
-    fn iswprint(c: u32) -> libc::c_int;
+    fn iswprint(c: WintT) -> libc::c_int;
 }
 
 /// True if `c` is printable under the current `LC_CTYPE`.
@@ -44,10 +52,11 @@ pub fn isprint(c: char) -> bool {
         // any int input; we pass a value in [0, 255].
         unsafe { libc::isprint(code as libc::c_int) != 0 }
     } else {
-        // SAFETY: iswprint is thread-safe; wint_t is at least 32 bits on
-        // supported platforms (glibc, musl, macOS) and accepts any wide-char
-        // codepoint.
-        unsafe { iswprint(code) != 0 }
+        // SAFETY: iswprint is thread-safe; `WintT` matches the platform's
+        // wint_t (32-bit unsigned on glibc/musl, 32-bit signed on Darwin),
+        // and every Unicode codepoint (max 0x10FFFF) fits losslessly in
+        // both representations because the high bit is always clear.
+        unsafe { iswprint(code as WintT) != 0 }
     }
 }
 

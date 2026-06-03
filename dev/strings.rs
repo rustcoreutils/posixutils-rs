@@ -50,33 +50,38 @@ type StringsResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Decode one printable character from the head of `bytes`.
 ///
-/// Tries a UTF-8 decode of up to 4 leading bytes; on failure, falls back to
-/// treating the first byte as Latin-1. Returns `Some(c)` iff the decoded
-/// character is printable in the current `LC_CTYPE` locale (`plib::locale::isprint`).
+/// Attempts a UTF-8 decode of up to 4 leading bytes. Returns `Some(c)` iff
+/// a complete UTF-8 character was decoded *and* it is printable in the
+/// current `LC_CTYPE` locale (`plib::locale::isprint`). Returns `None` for
+/// invalid UTF-8 lead bytes — the caller advances by one byte and treats
+/// the position as a string-terminator, matching the historical behaviour
+/// of `read_printable_char_utf8`.
 ///
 /// Per POSIX 115860-115861: `<newline>` and NUL terminate a printable string,
 /// so they (and every other control character) yield `None` here, which the
 /// outer loop interprets as a string boundary.
+///
+/// When `Some(c)` is returned, `c.len_utf8()` equals the number of input
+/// bytes consumed (UTF-8 is byte-deterministic), so the caller can safely
+/// advance the byte offset by that amount.
 fn read_printable_char(bytes: &[u8]) -> Option<char> {
     if bytes.is_empty() {
         return None;
     }
     let max_seq = bytes.len().min(4);
-    let c = match std::str::from_utf8(&bytes[..max_seq]) {
-        Ok(s) => s.chars().next().unwrap(),
+    let s = match std::str::from_utf8(&bytes[..max_seq]) {
+        Ok(s) => s,
         Err(e) => {
             let valid = e.valid_up_to();
-            if valid > 0 {
-                std::str::from_utf8(&bytes[..valid])
-                    .unwrap()
-                    .chars()
-                    .next()
-                    .unwrap()
-            } else {
-                bytes[0] as char
+            if valid == 0 {
+                // Invalid UTF-8 lead byte; treat as non-printable terminator.
+                return None;
             }
+            // We have a valid prefix; decode that.
+            std::str::from_utf8(&bytes[..valid]).unwrap()
         }
     };
+    let c = s.chars().next().unwrap();
     if locale::isprint(c) {
         Some(c)
     } else {
@@ -159,4 +164,29 @@ fn main() {
     let args = Args::parse();
     process_files(&args.input_files, args.output_options);
     std::process::exit(diag::exit_status());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_char_rejects_invalid_utf8_lead_byte() {
+        // 0xC0 is a UTF-8 lead byte but cannot start a valid sequence
+        // (it would encode a 2-byte representation of a 1-byte codepoint).
+        // We must return None so the outer loop advances by exactly 1
+        // input byte and does NOT swallow the following 'A'.
+        let r = read_printable_char(&[0xC0, b'A', b'B']);
+        assert!(r.is_none(), "expected None for invalid UTF-8 lead byte");
+    }
+
+    #[test]
+    fn read_char_returns_consumed_matching_input() {
+        // After init_locale runs (in tests, separately for each call), the
+        // C.UTF-8 locale is in effect from cargo test. For valid UTF-8,
+        // c.len_utf8() must equal the number of input bytes consumed.
+        // ASCII 'A' = 1 input byte, len_utf8 = 1.
+        let c = read_printable_char(b"A").unwrap();
+        assert_eq!(c.len_utf8(), 1);
+    }
 }

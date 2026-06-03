@@ -99,14 +99,21 @@ fn strip_file(path: &str, previous_contents: &[u8]) -> Vec<u8> {
 }
 
 fn strings_test(args: &[&str], stdout: &str) {
-    run_test(TestPlan {
-        cmd: "strings".to_string(),
-        args: args.iter().map(|s| s.to_string()).collect(),
-        stdin_data: "".to_string(),
-        expected_out: stdout.to_string(),
-        expected_err: "".to_string(),
-        expected_exit_code: 0,
-    });
+    strings_test_env(args, &[], stdout);
+}
+
+/// Like `strings_test` but injects per-invocation env vars into the spawned
+/// `strings` subprocess. Used to pin `LC_CTYPE` for tests where the expected
+/// output depends on `iswprint(3)`'s behavior (which differs between glibc
+/// and Darwin for Latin-1 supplement codepoints). Goes through
+/// `run_test_base_with_env` to avoid the racy `std::env::set_var` pattern.
+fn strings_test_env(args: &[&str], env_vars: &[(&str, &str)], stdout: &str) {
+    let args_v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let output = plib::testing::run_test_base_with_env("strings", &args_v, b"", env_vars);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.status.success());
 }
 
 #[test]
@@ -545,17 +552,26 @@ fn test_strings_print_multiple() {
 
 #[test]
 fn test_strings_utf8_file() {
-    std::env::set_var("LC_CTYPE", "UTF-8");
-    strings_test(
+    // POSIX-style locale name (the bare "UTF-8" used historically isn't a
+    // valid locale on glibc and silently falls back to "C"; C.UTF-8 is
+    // universally available since glibc 2.35 / FreeBSD 11).
+    strings_test_env(
         &["tests/strings/utf8.bin"],
+        &[("LC_CTYPE", "C.UTF-8")],
         include_str!("strings/utf8.correct.txt"),
     );
 }
 
 #[test]
 fn test_strings_object_file() {
-    strings_test(
+    // Pin LC_CTYPE so iswprint behavior is identical on glibc and Darwin.
+    // The object file contains valid-UTF-8 Latin-1 supplement byte runs
+    // (e.g. `~À`, `nÀÃ`, `üÿÿÿ`) that macOS's default locale considers
+    // printable but the C locale does not. Pinning to "C" keeps only the
+    // ASCII strings, matching object.correct.txt across platforms.
+    strings_test_env(
         &["tests/strings/object.o"],
+        &[("LC_CTYPE", "C"), ("LC_ALL", "C"), ("LANG", "C")],
         include_str!("strings/object.correct.txt"),
     );
 }

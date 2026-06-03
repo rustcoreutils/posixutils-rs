@@ -8,7 +8,7 @@
 //
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// open file, or stdin
@@ -37,4 +37,93 @@ pub fn input_reader(
 ) -> io::Result<io::BufReader<Box<dyn Read>>> {
     let file = input_stream(pathname, dashed_stdin)?;
     Ok(io::BufReader::new(file))
+}
+
+/// Atomically replace `path` with `bytes`.
+///
+/// Writes to a temp file in the same directory as `path`, syncs it, then
+/// `rename(2)`s over the original — so a reader that has the old `path` open
+/// keeps seeing the old bytes, and a crash mid-write leaves either the old
+/// content intact or, on success, the new content fully visible.
+///
+/// If `path` already exists, the new file inherits its mode (`st_mode &
+/// 0o7777`); otherwise the umask determines it.
+///
+/// Used by utilities like `ar` and `strip` that rewrite a binary in place
+/// where a partial write would corrupt the artifact on disk.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Tempfile is created in the same directory as `path` so the final
+    // `rename(2)` stays within one filesystem and is atomic.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.as_file_mut().write_all(bytes)?;
+    tmp.as_file_mut().sync_all()?;
+
+    // Preserve the existing file's mode if it exists. New files get their
+    // mode from the umask via NamedTempFile's default.
+    if let Ok(meta) = fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        let perms = std::fs::Permissions::from_mode(mode);
+        tmp.as_file().set_permissions(perms)?;
+    }
+
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn write_atomic_replaces_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.bin");
+        fs::write(&path, b"original").unwrap();
+
+        write_atomic(&path, b"replaced").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replaced");
+    }
+
+    #[test]
+    fn write_atomic_creates_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.bin");
+        assert!(!path.exists());
+
+        write_atomic(&path, b"hello").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_atomic_preserves_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("executable.bin");
+        fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_atomic(&path, b"replaced").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn write_atomic_no_leftover_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        write_atomic(&path, b"data").unwrap();
+
+        // Only the target file should exist in the directory.
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], "file.bin");
+    }
 }

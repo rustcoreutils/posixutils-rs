@@ -1565,7 +1565,9 @@ version = "0.7.0"
 dependencies = [
  "cfg-if",
  "errno",
+ "gettext-rs",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

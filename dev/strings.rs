@@ -10,8 +10,9 @@
 use std::ffi::OsString;
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use object::{Object, ObjectSection};
+use plib::{diag, locale};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OffsetFormat {
@@ -47,69 +48,41 @@ struct Args {
 
 type StringsResult = Result<(), Box<dyn std::error::Error>>;
 
-enum CharacterSet {
-    Ascii,
-    Utf8,
-}
-
-impl CharacterSet {
-    fn from_locale(var: String) -> Self {
-        if var.contains("UTF-8") {
-            CharacterSet::Utf8
-        } else {
-            // if UTF-8 is not explicitly specified, we assume ASCII.
-            // This behavior is consistent with the GNU implementation
-            // of strings.
-            CharacterSet::Ascii
-        }
+/// Decode one printable character from the head of `bytes`.
+///
+/// Attempts a UTF-8 decode of up to 4 leading bytes. Returns `Some(c)` iff
+/// a complete UTF-8 character was decoded *and* it is printable in the
+/// current `LC_CTYPE` locale (`plib::locale::isprint`). Returns `None` for
+/// invalid UTF-8 lead bytes — the caller advances by one byte and treats
+/// the position as a string-terminator, matching the historical behaviour
+/// of `read_printable_char_utf8`.
+///
+/// Per POSIX 115860-115861: `<newline>` and NUL terminate a printable string,
+/// so they (and every other control character) yield `None` here, which the
+/// outer loop interprets as a string boundary.
+///
+/// When `Some(c)` is returned, `c.len_utf8()` equals the number of input
+/// bytes consumed (UTF-8 is byte-deterministic), so the caller can safely
+/// advance the byte offset by that amount.
+fn read_printable_char(bytes: &[u8]) -> Option<char> {
+    if bytes.is_empty() {
+        return None;
     }
-
-    fn from_env() -> Self {
-        // the precedence is specified at:
-        // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html#tag_08_02
-        if let Ok(locale) = std::env::var("LC_ALL") {
-            CharacterSet::from_locale(locale)
-        } else if let Ok(locale) = std::env::var("LC_CTYPE") {
-            CharacterSet::from_locale(locale)
-        } else if let Ok(locale) = std::env::var("LANG") {
-            CharacterSet::from_locale(locale)
-        } else {
-            // we chose to default to ASCII if no locale is set
-            // to match the behavior of the GNU implementation
-            CharacterSet::Ascii
-        }
-    }
-}
-
-fn read_printable_char_utf8(bytes: &[u8]) -> Option<char> {
-    // we limit the number of bytes to check to 4
-    // because that is the maximum number of bytes
-    // in a valid UTF-8 sequence.
-    let max_utf8_sequence_len = bytes.len().min(4);
-    let s = match std::str::from_utf8(&bytes[..max_utf8_sequence_len]) {
+    let max_seq = bytes.len().min(4);
+    let s = match std::str::from_utf8(&bytes[..max_seq]) {
         Ok(s) => s,
         Err(e) => {
-            let max = e.valid_up_to();
-            if max > 0 {
-                // we know the string is valid UTF-8 so unwrap is safe
-                std::str::from_utf8(&bytes[..max]).unwrap()
-            } else {
+            let valid = e.valid_up_to();
+            if valid == 0 {
+                // Invalid UTF-8 lead byte; treat as non-printable terminator.
                 return None;
             }
+            // We have a valid prefix; decode that.
+            std::str::from_utf8(&bytes[..valid]).unwrap()
         }
     };
-    // we know the string isn't empty so unwrap is safe
     let c = s.chars().next().unwrap();
-    if !c.is_control() || c.is_whitespace() {
-        Some(c)
-    } else {
-        None
-    }
-}
-
-fn read_printable_ascii_char(bytes: &[u8]) -> Option<char> {
-    let c = bytes[0] as char;
-    if c.is_ascii_graphic() || c.is_whitespace() {
+    if locale::isprint(c) {
         Some(c)
     } else {
         None
@@ -133,15 +106,12 @@ fn print_string(s: &str, starting_offset: usize, format: Option<OffsetFormat>) {
     }
 }
 
-fn print_strings<F>(bytes: &[u8], options: OutputOptions, read_char: F)
-where
-    F: Fn(&[u8]) -> Option<char>,
-{
+fn print_strings(bytes: &[u8], options: OutputOptions) {
     let mut offset = 0;
     let mut print_buffer = String::new();
 
     while offset < bytes.len() {
-        if let Some(c) = read_char(&bytes[offset..]) {
+        if let Some(c) = read_printable_char(&bytes[offset..]) {
             print_buffer.push(c);
             offset += c.len_utf8();
         } else {
@@ -157,14 +127,11 @@ where
     }
 }
 
-fn print_file<F>(path: OsString, output_options: OutputOptions, read_char: F) -> StringsResult
-where
-    F: Fn(&[u8]) -> Option<char> + Copy,
-{
+fn print_file(path: &OsString, output_options: OutputOptions) -> StringsResult {
     let bytes = std::fs::read(path)?;
 
     if output_options.scan_all {
-        print_strings(&bytes, output_options, read_char);
+        print_strings(&bytes, output_options);
         return Ok(());
     }
 
@@ -172,34 +139,54 @@ where
         for section in parsed_object.sections() {
             // skip empty sections
             if !section.kind().is_bss() {
-                print_strings(section.data()?, output_options, read_char);
+                print_strings(section.data()?, output_options);
             }
         }
     } else {
-        print_strings(&bytes, output_options, read_char);
+        print_strings(&bytes, output_options);
     }
 
     Ok(())
 }
 
-fn main() -> StringsResult {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
-
-    let args = Args::parse();
-
-    match CharacterSet::from_env() {
-        CharacterSet::Utf8 => {
-            for file in args.input_files {
-                print_file(file, args.output_options, read_printable_char_utf8)?;
-            }
-        }
-        CharacterSet::Ascii => {
-            for file in args.input_files {
-                print_file(file, args.output_options, read_printable_ascii_char)?;
-            }
+fn process_files(files: &[OsString], opts: OutputOptions) {
+    for file in files {
+        if let Err(err) = print_file(file, opts) {
+            // Log and continue with subsequent files; exit status will
+            // reflect the error via plib::diag::exit_status().
+            diag::error(&format!("{}: {}", file.to_string_lossy(), err));
         }
     }
-    Ok(())
+}
+
+fn main() {
+    diag::init_locale("strings");
+    let args = Args::parse();
+    process_files(&args.input_files, args.output_options);
+    std::process::exit(diag::exit_status());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_char_rejects_invalid_utf8_lead_byte() {
+        // 0xC0 is a UTF-8 lead byte but cannot start a valid sequence
+        // (it would encode a 2-byte representation of a 1-byte codepoint).
+        // We must return None so the outer loop advances by exactly 1
+        // input byte and does NOT swallow the following 'A'.
+        let r = read_printable_char(&[0xC0, b'A', b'B']);
+        assert!(r.is_none(), "expected None for invalid UTF-8 lead byte");
+    }
+
+    #[test]
+    fn read_char_returns_consumed_matching_input() {
+        // After init_locale runs (in tests, separately for each call), the
+        // C.UTF-8 locale is in effect from cargo test. For valid UTF-8,
+        // c.len_utf8() must equal the number of input bytes consumed.
+        // ASCII 'A' = 1 input byte, len_utf8 = 1.
+        let c = read_printable_char(b"A").unwrap();
+        assert_eq!(c.len_utf8(), 1);
+    }
 }

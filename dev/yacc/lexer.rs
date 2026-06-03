@@ -13,8 +13,8 @@
 //! character literals, actions ({...}), and markers (%%). Handles C-style
 //! comments and escape sequences per ISO C.
 
-use crate::diag;
 use crate::error::YaccError;
+use plib::diag;
 
 /// Token types for yacc grammar files
 #[derive(Debug, Clone, PartialEq)]
@@ -98,7 +98,7 @@ impl<'a> Lexer<'a> {
 
     /// Create a lexical error, also logging it via diag
     fn lexical_error(&self, line: usize, column: usize, msg: String) -> YaccError {
-        diag::error(diag::Position::new(line as u32, column as u16), &msg);
+        diag::error_at(diag::Position::new(line as u32, column as u16), &msg);
         YaccError::Lexical { line, column, msg }
     }
 

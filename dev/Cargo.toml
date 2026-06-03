@@ -15,9 +15,9 @@ chrono.workspace = true
 ar = "0.9"
 regex.workspace = true
 regex-syntax = "0.8"
+plib = { path = "../plib" }
 
 [dev-dependencies]
-plib = { path = "../plib" }
 tempfile = "3"
 
 [lints]

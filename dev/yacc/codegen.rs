@@ -14,11 +14,11 @@
 //! - Dense parse tables (action/goto indexed by state × symbol)
 //! - Stack-based parser with error recovery per POSIX
 
-use crate::diag;
 use crate::error::YaccError;
 use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL};
 use crate::lalr::{Action, LALRAutomaton};
 use crate::Options;
+use plib::diag;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -1537,7 +1537,7 @@ fn transform_action(
                         // P1-3: POSIX allows warning when %union used but type undetermined
                         if has_union {
                             let lhs_name = grammar.symbol_name(prod.lhs);
-                            diag::warning(
+                            diag::warning_at(
                                 diag::Position::line_only(prod.line as u32),
                                 &format!(
                                     "$$ has no declared type; '{}' lacks a %type declaration",
@@ -1627,7 +1627,7 @@ fn transform_action(
                     // P1-3: POSIX allows warning when %union used but type undetermined
                     if has_union && sym_tag.is_none() && n > 0 && (n as usize) <= rhs_len {
                         if let Some(ref name) = sym_name {
-                            diag::warning(
+                            diag::warning_at(
                                 diag::Position::line_only(prod.line as u32),
                                 &format!(
                                     "${} has no declared type; '{}' lacks a %type declaration",

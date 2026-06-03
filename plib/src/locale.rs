@@ -89,7 +89,15 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
     // SAFETY: tm is a POD struct that we initialize via localtime_r; the
     // returned pointer is either &raw mut tm or null, which we check.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t: libc::time_t = epoch_secs as libc::time_t;
+    // Reject out-of-range timestamps explicitly. On supported targets
+    // (Linux/macOS x86_64+aarch64) `time_t` is i64 and this conversion
+    // always succeeds (clippy::useless_conversion fires here), but on a
+    // 32-bit `time_t` target it correctly surfaces the Y2038-era overflow
+    // instead of truncating silently.
+    #[allow(clippy::useless_conversion)]
+    let t: libc::time_t = epoch_secs
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timestamp out of range"))?;
     let ret = unsafe { libc::localtime_r(&t, &mut tm) };
     if ret.is_null() {
         return Err(io::Error::new(

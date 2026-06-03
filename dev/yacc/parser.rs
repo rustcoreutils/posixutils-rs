@@ -13,9 +13,9 @@
 //! %left/%right/%nonassoc, %union, %start), rules section (productions with
 //! semantic actions), and optional programs section (C code epilogue).
 
-use crate::diag;
 use crate::error::YaccError;
 use crate::lexer::{PositionedToken, Token};
+use plib::diag;
 
 /// Associativity of operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +136,7 @@ impl<'a> Parser<'a> {
 
     /// Create a syntax error, also logging it via diag
     fn syntax_error(&self, line: usize, msg: String) -> YaccError {
-        diag::error(diag::Position::line_only(line as u32), &msg);
+        diag::error_at(diag::Position::line_only(line as u32), &msg);
         YaccError::Syntax { line, msg }
     }
 

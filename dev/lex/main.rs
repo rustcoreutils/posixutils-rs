@@ -9,7 +9,6 @@
 
 mod codegen;
 mod dfa;
-pub mod diag;
 mod lexfile;
 mod nfa;
 mod pattern_escape;
@@ -19,6 +18,7 @@ use clap::Parser;
 use dfa::Dfa;
 use gettextrs::gettext;
 use nfa::Nfa;
+use plib::diag;
 use regex_syntax::ast::parse::ParserBuilder;
 use regex_syntax::hir::{translate::TranslatorBuilder, Hir};
 use std::fs;
@@ -258,7 +258,15 @@ fn write_stats<W: Write + ?Sized>(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    diag::init_locale("lex");
+    if let Err(err) = run() {
+        diag::error(&format!("{}", err));
+    }
+    std::process::exit(diag::exit_status());
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let mut args = Args::parse();
 
@@ -267,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(String::from("-"));
     }
 
-    // Initialize diagnostics with the input filename
+    // Set the source filename used by diag::error_at / warning_at positions.
     let input_name = if args.files.len() == 1 && args.files[0] != "-" {
         args.files[0].clone()
     } else if args.files.len() == 1 {
@@ -280,7 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
             .unwrap_or_else(|| "<stdin>".to_string())
     };
-    diag::init(&input_name);
+    diag::set_source(&input_name);
 
     // POSIX says multiple input files are concatenated
     let rawinput = concat_input_files(&args.files)?;
@@ -297,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rules = parse_rules(&lexinfo)?;
 
     if rules.is_empty() {
-        eprintln!("Warning: no rules defined");
+        diag::warning(&gettext("no rules defined"));
     }
 
     // Get all start conditions

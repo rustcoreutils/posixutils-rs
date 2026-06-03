@@ -8,7 +8,6 @@
 //
 
 mod codegen;
-pub mod diag;
 mod error;
 mod first_follow;
 mod grammar;
@@ -23,6 +22,7 @@ use std::fs;
 use std::process;
 
 use error::YaccError;
+use plib::diag;
 
 /// Command-line options for yacc
 #[derive(Debug, Clone)]
@@ -155,8 +155,8 @@ fn print_usage() {
 }
 
 fn run(opts: &Options) -> Result<(), YaccError> {
-    // Initialize diagnostics with the grammar filename
-    diag::init(&opts.grammar_file);
+    // Set the source filename used by diag::error_at / warning_at positions.
+    diag::set_source(&opts.grammar_file);
 
     // Read input grammar
     let input = fs::read_to_string(&opts.grammar_file)
@@ -196,27 +196,25 @@ fn run(opts: &Options) -> Result<(), YaccError> {
     // Handle shift/reduce conflicts
     match expect_sr {
         Some(expected) if sr_conflicts != expected => {
-            // Mismatch: report error
-            eprintln!(
+            diag::error(&format!(
                 "{}: expected {} shift/reduce conflict{}, found {}",
                 opts.grammar_file,
                 expected,
                 if expected == 1 { "" } else { "s" },
                 sr_conflicts
-            );
+            ));
             conflict_error = true;
         }
         Some(_) => {
             // Matches expected: suppress warning
         }
         None if sr_conflicts > 0 => {
-            // No %expect: report warning
-            eprintln!(
+            diag::warning(&format!(
                 "{}: {} shift/reduce conflict{}",
                 opts.grammar_file,
                 sr_conflicts,
                 if sr_conflicts == 1 { "" } else { "s" }
-            );
+            ));
         }
         None => {}
     }
@@ -224,27 +222,25 @@ fn run(opts: &Options) -> Result<(), YaccError> {
     // Handle reduce/reduce conflicts
     match expect_rr {
         Some(expected) if rr_conflicts != expected => {
-            // Mismatch: report error
-            eprintln!(
+            diag::error(&format!(
                 "{}: expected {} reduce/reduce conflict{}, found {}",
                 opts.grammar_file,
                 expected,
                 if expected == 1 { "" } else { "s" },
                 rr_conflicts
-            );
+            ));
             conflict_error = true;
         }
         Some(_) => {
             // Matches expected: suppress warning
         }
         None if rr_conflicts > 0 => {
-            // No %expect-rr: report warning
-            eprintln!(
+            diag::warning(&format!(
                 "{}: {} reduce/reduce conflict{}",
                 opts.grammar_file,
                 rr_conflicts,
                 if rr_conflicts == 1 { "" } else { "s" }
-            );
+            ));
         }
         None => {}
     }
@@ -259,17 +255,18 @@ fn run(opts: &Options) -> Result<(), YaccError> {
 }
 
 fn main() {
+    diag::init_locale("yacc");
     let opts = match parse_args() {
         Ok(opts) => opts,
         Err(e) => {
-            eprintln!("yacc: {}", e);
+            diag::error(&format!("{}", e));
             print_usage();
             process::exit(1);
         }
     };
 
     if let Err(e) = run(&opts) {
-        eprintln!("yacc: {}", e);
-        process::exit(1);
+        diag::error(&format!("{}", e));
     }
+    process::exit(diag::exit_status());
 }

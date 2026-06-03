@@ -11,6 +11,8 @@ rust-version.workspace = true
 cfg-if = "1.0"
 libc.workspace = true
 errno.workspace = true
+gettext-rs.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

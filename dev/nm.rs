@@ -17,7 +17,8 @@ use object::{
 };
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
+use plib::diag;
 use std::collections::HashMap;
 use std::fs;
 
@@ -102,43 +103,51 @@ fn print_symbol(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, S
 
 fn show_object_file(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let file_path = &args.file;
-    {
-        let filedata = match fs::read(file_path) {
-            Ok(file) => file,
-            Err(err) => {
-                println!("Failed to open file '{}': {}", file_path, err,);
-                return Err(Box::new(err));
-            }
-        };
-        let file = match object::File::parse(&*filedata) {
-            Ok(file) => file,
-            Err(err) => {
-                println!("Failed to parse file '{}': {}", file_path, err);
-                return Err(Box::new(err));
-            }
-        };
-
-        let section_kinds = file.sections().map(|s| (s.index(), s.kind())).collect();
-
-        for symbol in file.symbols() {
-            print_symbol(&symbol, &section_kinds);
+    let filedata = match fs::read(file_path) {
+        Ok(file) => file,
+        Err(err) => {
+            diag::error(&format!(
+                "{}: {}: {}",
+                file_path,
+                gettext("failed to open file"),
+                err
+            ));
+            return Err(Box::new(err));
         }
-        for symbol in file.dynamic_symbols() {
-            print_symbol(&symbol, &section_kinds);
+    };
+    let file = match object::File::parse(&*filedata) {
+        Ok(file) => file,
+        Err(err) => {
+            diag::error(&format!(
+                "{}: {}: {}",
+                file_path,
+                gettext("failed to parse file"),
+                err
+            ));
+            return Err(Box::new(err));
         }
+    };
+
+    let section_kinds = file.sections().map(|s| (s.index(), s.kind())).collect();
+
+    for symbol in file.symbols() {
+        print_symbol(&symbol, &section_kinds);
+    }
+    for symbol in file.dynamic_symbols() {
+        print_symbol(&symbol, &section_kinds);
     }
 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("nm");
 
     let args = Args::parse();
 
-    show_object_file(&args)?;
+    // Ignore error from show_object_file: diag has already logged it,
+    // exit_status() will reflect it via the recorded error count.
+    let _ = show_object_file(&args);
 
-    Ok(())
+    std::process::exit(diag::exit_status());
 }

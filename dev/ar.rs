@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::DateTime;
 use clap::{Parser, Subcommand};
 use gettextrs::gettext;
 use object::{Object, ObjectSymbol, SymbolKind};
+use plib::diag;
 use std::ffi::{OsStr, OsString};
 use std::io::{stdout, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -162,11 +162,11 @@ struct ArchiveMember {
 impl ArchiveMember {
     fn read(file_path: &Path) -> ArResult<Self> {
         if !file_path.exists() {
-            return Err(format!("ar: {}: No such file or directory", file_path.display()).into());
+            return Err(format!("{}: No such file or directory", file_path.display()).into());
         }
 
         if !file_path.is_file() {
-            return Err(format!("ar: {}: Is a directory", file_path.display()).into());
+            return Err(format!("{}: Is a directory", file_path.display()).into());
         }
 
         let file_metadata = file_path.metadata()?;
@@ -236,11 +236,11 @@ struct Archive {
 impl Archive {
     fn read_from_file(path: &Path) -> ArResult<Self> {
         if !path.exists() {
-            return Err(format!("ar: {}: No such file or directory", path.display()).into());
+            return Err(format!("{}: No such file or directory", path.display()).into());
         }
 
         if !path.is_file() {
-            return Err(format!("ar: {}: Is a directory", path.display()).into());
+            return Err(format!("{}: Is a directory", path.display()).into());
         }
 
         let file_data = std::fs::read(path)?;
@@ -251,7 +251,7 @@ impl Archive {
         let mut archive_size = 0;
 
         for member in parsed_archive.members() {
-            let member = member.map_err(|_| "ar: invalid archive format")?;
+            let member = member.map_err(|_| "invalid archive format")?;
 
             let data = member.data(&*file_data)?;
             let name = OsString::from_vec(member.name().to_vec());
@@ -264,10 +264,10 @@ impl Archive {
 
             members.push(ArchiveMember {
                 name,
-                date: member.date().ok_or("ar: invalid archive format")?,
-                uid: member.uid().ok_or("ar: invalid archive format")?,
-                gid: member.gid().ok_or("ar: invalid archive format")?,
-                mode: member.mode().ok_or("ar: invalid archive format")?,
+                date: member.date().ok_or("invalid archive format")?,
+                uid: member.uid().ok_or("invalid archive format")?,
+                gid: member.gid().ok_or("invalid archive format")?,
+                mode: member.mode().ok_or("invalid archive format")?,
                 size: data.len() as u64,
                 data: data.to_vec(),
                 symbols,
@@ -292,52 +292,15 @@ impl Archive {
     }
 
     fn write_symbol_table<W: Write>(&self, writer: &mut W) -> ArResult<()> {
-        // format definition taken from: https://en.wikipedia.org/wiki/Ar_(Unix)
-
-        // The symbol table is made up of the following:
-        // - a big endian i32 for the number of symbols
-        // - for each symbol, an i32 offset to the archive member where the symbol is defined
-        // - for each symbol, the symbol name followed by a null terminator
-        let mut symbol_table_size = (4 + self.symbol_count * 4 + self.symbol_bytes) as u32;
-
-        // data section needs to be 2 byte aligned
-        if symbol_table_size % 2 != 0 {
-            symbol_table_size += 1;
-        }
-        let mut table_offsets = Vec::with_capacity(self.symbol_count as usize * 4);
-        let mut table_symbols = Vec::with_capacity(self.symbol_bytes as usize);
-        let mut total_offset =
-            object::archive::MAGIC.len() as u32 + MEMBER_HEADER_SIZE as u32 + symbol_table_size;
-
-        for member in &self.members {
-            for symbol in &member.symbols {
-                table_offsets.extend_from_slice(&total_offset.to_be_bytes());
-                table_symbols.extend(symbol.as_bytes());
-                table_symbols.push(b'\0');
-            }
-            total_offset += (MEMBER_HEADER_SIZE + member.size) as u32;
-        }
-
-        let mut symbol_table = Vec::with_capacity(symbol_table_size as usize);
-        symbol_table.extend(&(self.symbol_count as u32).to_be_bytes());
-        symbol_table.extend(&table_offsets);
-        symbol_table.extend(&table_symbols);
-        // to remain 2 byte aligned, the symbol table is padded with '\0' instead of '\n'
-        if symbol_table.len() % 2 != 0 {
-            symbol_table.push(b'\0');
-        }
-
-        writer.write_all(&pad_metadata_with_spaces::<16>("/".to_string())?)?;
-        writer.write_all(&pad_metadata_with_spaces::<12>("0".to_string())?)?;
-        writer.write_all(&pad_metadata_with_spaces::<6>("0".to_string())?)?;
-        writer.write_all(&pad_metadata_with_spaces::<6>("0".to_string())?)?;
-        writer.write_all(&pad_metadata_with_spaces::<8>("0".to_string())?)?;
-        writer.write_all(&pad_metadata_with_spaces::<10>(
-            symbol_table_size.to_string(),
-        )?)?;
-        writer.write_all(&object::archive::TERMINATOR)?;
-        writer.write_all(&symbol_table)?;
-
+        let members: Vec<plib::archive::MemberInfo> = self
+            .members
+            .iter()
+            .map(|m| plib::archive::MemberInfo {
+                size: m.size,
+                symbols: m.symbols.clone(),
+            })
+            .collect();
+        plib::archive::write_sysv_symbol_table(writer, &members)?;
         Ok(())
     }
 
@@ -422,7 +385,7 @@ impl Archive {
 /// If the input string is longer than N, an error is returned.
 fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
     if s.len() > N {
-        return Err("ar: file metadata cannot fit into archive format".into());
+        return Err("file metadata cannot fit into archive format".into());
     }
     let mut result = [b' '; N];
     for (i, byte) in s.as_bytes().iter().enumerate() {
@@ -436,7 +399,7 @@ fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
 /// of 15 bytes, followed by a '/' character and space padding.
 fn format_name_for_header(name: &OsStr) -> ArResult<[u8; 16]> {
     if name.len() > 15 {
-        return Err(format!("ar: {}: file name is too long", name.to_string_lossy()).into());
+        return Err(format!("{}: file name is too long", name.to_string_lossy()).into());
     }
     let mut result = [b' '; 16];
     for (i, byte) in name.as_bytes().iter().enumerate() {
@@ -480,15 +443,16 @@ fn delete_cmd(args: DeleteArgs) -> ArResult<()> {
             archive.delete(index);
         }
     }
-    let mut out_file = std::fs::File::create(archive_path)?;
-    archive.write(&mut out_file)?;
+    let mut buf = Vec::new();
+    archive.write(&mut buf)?;
+    plib::io::write_atomic(archive_path, &buf)?;
     Ok(())
 }
 
 fn move_cmd(args: MoveArgs) -> ArResult<()> {
     if args.insert_args.insert_after || args.insert_args.insert_before {
         if args.files.len() < 2 {
-            return Err("ar: missing archive operand".into());
+            return Err("missing archive operand".into());
         }
 
         let posname = &args.files[0];
@@ -496,11 +460,7 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
         let mut archive = Archive::read_from_file(archive_path)?;
 
         if archive.member_index(posname).is_none() {
-            return Err(format!(
-                "ar: {}: No such file or directory",
-                posname.to_string_lossy()
-            )
-            .into());
+            return Err(format!("{}: No such file or directory", posname.to_string_lossy()).into());
         }
         for file in args.files.iter().skip(2) {
             let target = archive.member_index(posname).unwrap();
@@ -512,12 +472,13 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
                     archive.move_before(index, target);
                 }
             } else {
-                return Err(format!("ar: no entry {} in archive", file.to_string_lossy()).into());
+                return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
             }
         }
 
-        let mut out_file = std::fs::File::create(archive_path)?;
-        archive.write(&mut out_file)?;
+        let mut buf = Vec::new();
+        archive.write(&mut buf)?;
+        plib::io::write_atomic(archive_path, &buf)?;
     } else {
         let archive_path = Path::new(&args.files[0]);
         let mut archive = Archive::read_from_file(archive_path)?;
@@ -527,11 +488,12 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
             if let Some(index) = index {
                 archive.move_to_end(index);
             } else {
-                return Err(format!("ar: no entry {} in archive", file.to_string_lossy()).into());
+                return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
             }
         }
-        let mut out_file = std::fs::File::create(archive_path)?;
-        archive.write(&mut out_file)?;
+        let mut buf = Vec::new();
+        archive.write(&mut buf)?;
+        plib::io::write_atomic(archive_path, &buf)?;
     }
     Ok(())
 }
@@ -557,13 +519,17 @@ fn print_cmd(args: PrintArgs) -> ArResult<()> {
                 }
                 stdout().write_all(&member.data)?;
             } else {
-                eprintln!("ar: {}: No such file or directory", file.to_string_lossy());
+                diag::error(&format!(
+                    "{}: No such file or directory",
+                    file.to_string_lossy()
+                ));
             }
         }
     }
     if args.regenerate_symbol_table {
-        let mut out_file = std::fs::File::create(archive_path)?;
-        archive.write(&mut out_file)?;
+        let mut buf = Vec::new();
+        archive.write(&mut buf)?;
+        plib::io::write_atomic(archive_path, &buf)?;
     }
 
     Ok(())
@@ -589,8 +555,9 @@ fn quick_append_cmd(args: QuickAppendArgs) -> ArResult<()> {
 
     archive.insert(members, InsertPosition::End);
 
-    let mut out_file = std::fs::File::create(archive_path)?;
-    archive.write(&mut out_file)?;
+    let mut buf = Vec::new();
+    archive.write(&mut buf)?;
+    plib::io::write_atomic(archive_path, &buf)?;
 
     Ok(())
 }
@@ -600,12 +567,12 @@ fn replace_cmd(args: ReplaceArgs) -> ArResult<()> {
 
     let archive_path = if special_insert_position {
         if args.files.len() < 2 {
-            return Err("ar: missing archive operand".into());
+            return Err("missing archive operand".into());
         }
         Path::new(&args.files[1])
     } else {
         if args.files.is_empty() {
-            return Err("ar: missing archive operand".into());
+            return Err("missing archive operand".into());
         }
         Path::new(&args.files[0])
     };
@@ -657,8 +624,9 @@ fn replace_cmd(args: ReplaceArgs) -> ArResult<()> {
     };
 
     archive.insert(to_be_added, insert_position);
-    let mut out_file = std::fs::File::create(archive_path)?;
-    archive.write(&mut out_file)?;
+    let mut buf = Vec::new();
+    archive.write(&mut buf)?;
+    plib::io::write_atomic(archive_path, &buf)?;
 
     Ok(())
 }
@@ -674,7 +642,9 @@ fn format_mode(mode: u64) -> String {
 }
 
 fn list_member(member: &ArchiveMember, verbose: bool) {
-    let date = DateTime::from_timestamp(member.date as i64, 0).unwrap();
+    // Honor LC_TIME and TZ via libc strftime; chrono's format is locale-blind.
+    let date =
+        plib::locale::strftime(DATE_FORMAT, member.date as i64).unwrap_or_else(|_| String::new());
     if verbose {
         println!(
             "{} {}/{} {} {} {}",
@@ -682,7 +652,7 @@ fn list_member(member: &ArchiveMember, verbose: bool) {
             member.uid,
             member.gid,
             member.size,
-            date.format(DATE_FORMAT),
+            date,
             member.name.to_string_lossy()
         );
     } else {
@@ -704,15 +674,16 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
                 list_member(archive.get_member(index), args.verbose);
             } else {
                 return Err(
-                    format!("ar: {}: No such file or directory", archive_path.display()).into(),
+                    format!("{}: No such file or directory", archive_path.display()).into(),
                 );
             }
         }
     }
 
     if args.regenerate_symbol_table {
-        let mut out_file = std::fs::File::create(archive_path)?;
-        archive.write(&mut out_file)?;
+        let mut buf = Vec::new();
+        archive.write(&mut buf)?;
+        plib::io::write_atomic(archive_path, &buf)?;
     }
     Ok(())
 }
@@ -748,23 +719,25 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
                 )?;
             } else {
                 return Err(
-                    format!("ar: {}: No such file or directory", file.to_string_lossy()).into(),
+                    format!("{}: No such file or directory", file.to_string_lossy()).into(),
                 );
             }
         }
     }
 
     if args.regenerate_symbol_table {
-        let mut out_file = std::fs::File::create(archive_path)?;
-        archive.write(&mut out_file)?;
+        let mut buf = Vec::new();
+        archive.write(&mut buf)?;
+        plib::io::write_atomic(archive_path, &buf)?;
     }
 
     Ok(())
 }
 
-fn main() -> ArResult<()> {
+fn main() {
+    diag::init_locale("ar");
     let args = Args::parse();
-    match args.command {
+    let result = match args.command {
         Commands::Delete(args) => delete_cmd(args),
         Commands::Move(args) => move_cmd(args),
         Commands::Print(args) => print_cmd(args),
@@ -772,5 +745,9 @@ fn main() -> ArResult<()> {
         Commands::Replace(args) => replace_cmd(args),
         Commands::List(args) => list_cmd(args),
         Commands::Extract(args) => extract_cmd(args),
+    };
+    if let Err(err) = result {
+        diag::error(&format!("{}", err));
     }
+    std::process::exit(diag::exit_status());
 }

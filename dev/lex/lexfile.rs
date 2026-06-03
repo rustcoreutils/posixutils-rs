@@ -15,11 +15,11 @@
 //! - `%option noinput` - suppress `input()` function generation
 //! - `%option nounput` - suppress `unput()` function generation
 
-use crate::diag;
 use crate::pattern_escape::{expand_posix_bracket_constructs, translate_escape_sequences};
 use crate::pattern_validate::{
     parse_anchoring_and_trailing_context, validate_pattern_restrictions,
 };
+use plib::diag;
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -164,14 +164,14 @@ impl ParseState {
 
     /// Report an error at the current line and return an error marker
     fn error(&self, msg: &str) -> String {
-        diag::error(diag::Position::line_only(self.line_number as u32), msg);
+        diag::error_at(diag::Position::line_only(self.line_number as u32), msg);
         // Return a simple marker - the actual message was already printed by diag
         "parse error".to_string()
     }
 
     /// Report a warning at the current line
     fn warning(&self, msg: &str) {
-        diag::warning(diag::Position::line_only(self.line_number as u32), msg);
+        diag::warning_at(diag::Position::line_only(self.line_number as u32), msg);
     }
 
     fn push_rule(&mut self, rule: LexRule) {

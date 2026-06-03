@@ -13,20 +13,20 @@
 //! type tags), productions (rules with semantic actions), and the complete
 //! grammar with augmented start symbol and dense symbol indexing for tables.
 
-use crate::diag;
 use crate::error::YaccError;
 use crate::parser::{Associativity, CodeBlock, ParsedGrammar, RhsElement, Symbol as ParsedSymbol};
+use plib::diag;
 use std::collections::HashMap;
 
 /// Create a grammar error, also logging it via diag
 fn grammar_error(msg: String) -> YaccError {
-    diag::error(diag::Position::line_only(0), &msg);
+    diag::error_at(diag::Position::line_only(0), &msg);
     YaccError::Grammar(msg)
 }
 
 /// Create a grammar error with line number, also logging it via diag
 fn grammar_error_at(line: usize, msg: String) -> YaccError {
-    diag::error(diag::Position::line_only(line as u32), &msg);
+    diag::error_at(diag::Position::line_only(line as u32), &msg);
     YaccError::Grammar(msg)
 }
 
@@ -409,7 +409,7 @@ impl Grammar {
         if !name.starts_with('@') && !name.starts_with('\'') {
             // Skip internal symbols like @1 (mid-rule actions) and 'c' (char literals)
             if name.starts_with("yy") || name.starts_with("YY") {
-                diag::warning(
+                diag::warning_at(
                     diag::Position::line_only(0),
                     &format!(
                         "symbol '{}' begins with 'yy' or 'YY' which is reserved",

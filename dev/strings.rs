@@ -10,8 +10,9 @@
 use std::ffi::OsString;
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use object::{Object, ObjectSection};
+use plib::{diag, locale};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OffsetFormat {
@@ -47,69 +48,36 @@ struct Args {
 
 type StringsResult = Result<(), Box<dyn std::error::Error>>;
 
-enum CharacterSet {
-    Ascii,
-    Utf8,
-}
-
-impl CharacterSet {
-    fn from_locale(var: String) -> Self {
-        if var.contains("UTF-8") {
-            CharacterSet::Utf8
-        } else {
-            // if UTF-8 is not explicitly specified, we assume ASCII.
-            // This behavior is consistent with the GNU implementation
-            // of strings.
-            CharacterSet::Ascii
-        }
+/// Decode one printable character from the head of `bytes`.
+///
+/// Tries a UTF-8 decode of up to 4 leading bytes; on failure, falls back to
+/// treating the first byte as Latin-1. Returns `Some(c)` iff the decoded
+/// character is printable in the current `LC_CTYPE` locale (`plib::locale::isprint`).
+///
+/// Per POSIX 115860-115861: `<newline>` and NUL terminate a printable string,
+/// so they (and every other control character) yield `None` here, which the
+/// outer loop interprets as a string boundary.
+fn read_printable_char(bytes: &[u8]) -> Option<char> {
+    if bytes.is_empty() {
+        return None;
     }
-
-    fn from_env() -> Self {
-        // the precedence is specified at:
-        // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html#tag_08_02
-        if let Ok(locale) = std::env::var("LC_ALL") {
-            CharacterSet::from_locale(locale)
-        } else if let Ok(locale) = std::env::var("LC_CTYPE") {
-            CharacterSet::from_locale(locale)
-        } else if let Ok(locale) = std::env::var("LANG") {
-            CharacterSet::from_locale(locale)
-        } else {
-            // we chose to default to ASCII if no locale is set
-            // to match the behavior of the GNU implementation
-            CharacterSet::Ascii
-        }
-    }
-}
-
-fn read_printable_char_utf8(bytes: &[u8]) -> Option<char> {
-    // we limit the number of bytes to check to 4
-    // because that is the maximum number of bytes
-    // in a valid UTF-8 sequence.
-    let max_utf8_sequence_len = bytes.len().min(4);
-    let s = match std::str::from_utf8(&bytes[..max_utf8_sequence_len]) {
-        Ok(s) => s,
+    let max_seq = bytes.len().min(4);
+    let c = match std::str::from_utf8(&bytes[..max_seq]) {
+        Ok(s) => s.chars().next().unwrap(),
         Err(e) => {
-            let max = e.valid_up_to();
-            if max > 0 {
-                // we know the string is valid UTF-8 so unwrap is safe
-                std::str::from_utf8(&bytes[..max]).unwrap()
+            let valid = e.valid_up_to();
+            if valid > 0 {
+                std::str::from_utf8(&bytes[..valid])
+                    .unwrap()
+                    .chars()
+                    .next()
+                    .unwrap()
             } else {
-                return None;
+                bytes[0] as char
             }
         }
     };
-    // we know the string isn't empty so unwrap is safe
-    let c = s.chars().next().unwrap();
-    if !c.is_control() || c.is_whitespace() {
-        Some(c)
-    } else {
-        None
-    }
-}
-
-fn read_printable_ascii_char(bytes: &[u8]) -> Option<char> {
-    let c = bytes[0] as char;
-    if c.is_ascii_graphic() || c.is_whitespace() {
+    if locale::isprint(c) {
         Some(c)
     } else {
         None
@@ -133,15 +101,12 @@ fn print_string(s: &str, starting_offset: usize, format: Option<OffsetFormat>) {
     }
 }
 
-fn print_strings<F>(bytes: &[u8], options: OutputOptions, read_char: F)
-where
-    F: Fn(&[u8]) -> Option<char>,
-{
+fn print_strings(bytes: &[u8], options: OutputOptions) {
     let mut offset = 0;
     let mut print_buffer = String::new();
 
     while offset < bytes.len() {
-        if let Some(c) = read_char(&bytes[offset..]) {
+        if let Some(c) = read_printable_char(&bytes[offset..]) {
             print_buffer.push(c);
             offset += c.len_utf8();
         } else {
@@ -157,14 +122,11 @@ where
     }
 }
 
-fn print_file<F>(path: OsString, output_options: OutputOptions, read_char: F) -> StringsResult
-where
-    F: Fn(&[u8]) -> Option<char> + Copy,
-{
+fn print_file(path: &OsString, output_options: OutputOptions) -> StringsResult {
     let bytes = std::fs::read(path)?;
 
     if output_options.scan_all {
-        print_strings(&bytes, output_options, read_char);
+        print_strings(&bytes, output_options);
         return Ok(());
     }
 
@@ -172,34 +134,29 @@ where
         for section in parsed_object.sections() {
             // skip empty sections
             if !section.kind().is_bss() {
-                print_strings(section.data()?, output_options, read_char);
+                print_strings(section.data()?, output_options);
             }
         }
     } else {
-        print_strings(&bytes, output_options, read_char);
+        print_strings(&bytes, output_options);
     }
 
     Ok(())
 }
 
-fn main() -> StringsResult {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
-
-    let args = Args::parse();
-
-    match CharacterSet::from_env() {
-        CharacterSet::Utf8 => {
-            for file in args.input_files {
-                print_file(file, args.output_options, read_printable_char_utf8)?;
-            }
-        }
-        CharacterSet::Ascii => {
-            for file in args.input_files {
-                print_file(file, args.output_options, read_printable_ascii_char)?;
-            }
+fn process_files(files: &[OsString], opts: OutputOptions) {
+    for file in files {
+        if let Err(err) = print_file(file, opts) {
+            // Log and continue with subsequent files; exit status will
+            // reflect the error via plib::diag::exit_status().
+            diag::error(&format!("{}: {}", file.to_string_lossy(), err));
         }
     }
-    Ok(())
+}
+
+fn main() {
+    diag::init_locale("strings");
+    let args = Args::parse();
+    process_files(&args.input_files, args.output_options);
+    std::process::exit(diag::exit_status());
 }

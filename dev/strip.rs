@@ -8,15 +8,17 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use object::{
     archive,
     build::elf::{Builder, Section, SectionData},
-    elf,
+    elf, Object, ObjectSymbol, SymbolKind,
 };
+use plib::diag;
 use std::{
     ffi::{OsStr, OsString},
-    io::Read,
+    io::{Read, Write},
+    path::Path,
 };
 
 #[derive(Parser)]
@@ -72,10 +74,40 @@ fn strip(data: &[u8]) -> StripResult {
     Ok(contents)
 }
 
+/// One member of the rewritten archive: header metadata + payload.
+struct StrippedMember {
+    identifier: Vec<u8>,
+    mtime: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    data: Vec<u8>,
+    /// Symbol names exported by the stripped payload (text/data/TLS only).
+    /// Used to regenerate the `"/"` archive symbol-table member so the
+    /// resulting archive is still usable for link editing per POSIX 84371-84376.
+    symbols: Vec<String>,
+}
+
+fn extract_member_symbols(data: &[u8]) -> Vec<String> {
+    match object::read::File::parse(data) {
+        Ok(file) => file
+            .symbols()
+            .filter(|s| {
+                matches!(
+                    s.kind(),
+                    SymbolKind::Text | SymbolKind::Data | SymbolKind::Tls
+                )
+            })
+            .filter_map(|s| s.name().ok().map(|n| n.to_string()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn strip_archive(data: &[u8], file_name: &OsStr) -> StripResult {
     let mut archive = ar::Archive::new(data);
-    let mut result = Vec::new();
-    let mut stripped_archive = ar::Builder::new(&mut result);
+    let mut members: Vec<StrippedMember> = Vec::new();
+
     while let Some(entry) = archive.next_entry() {
         let mut entry = entry?;
         let mut data = Vec::new();
@@ -84,18 +116,71 @@ fn strip_archive(data: &[u8], file_name: &OsStr) -> StripResult {
 
         if is_elf(&data) {
             let new_data = strip(&data)?;
-            let mut new_header = header.clone();
-            new_header.set_size(new_data.len() as u64);
-            stripped_archive.append(&new_header, &*new_data)?;
+            let symbols = extract_member_symbols(&new_data);
+            members.push(StrippedMember {
+                identifier: header.identifier().to_vec(),
+                mtime: header.mtime(),
+                uid: header.uid(),
+                gid: header.gid(),
+                mode: header.mode(),
+                data: new_data,
+                symbols,
+            });
         } else {
-            eprintln!(
-                "strip: ({}){}: file format not recognized",
+            diag::error(&format!(
+                "({}){}: {}",
                 file_name.to_string_lossy(),
                 String::from_utf8_lossy(header.identifier()),
-            );
+                gettext("file format not recognized"),
+            ));
         }
     }
+
+    // Emit: magic + "/" symbol-table member (regenerated per POSIX 84371-84376) +
+    // member-by-member { 60-byte header, payload, optional NUL pad to keep
+    // 2-byte alignment }.
+    let mut result = Vec::new();
+    result.write_all(plib::archive::MAGIC)?;
+
+    let infos: Vec<plib::archive::MemberInfo> = members
+        .iter()
+        .map(|m| plib::archive::MemberInfo {
+            size: m.data.len() as u64,
+            symbols: m.symbols.clone(),
+        })
+        .collect();
+    plib::archive::write_sysv_symbol_table(&mut result, &infos)?;
+
+    for m in &members {
+        write_member(&mut result, m)?;
+    }
+
     Ok(result)
+}
+
+fn write_member(w: &mut Vec<u8>, m: &StrippedMember) -> Result<(), Box<dyn std::error::Error>> {
+    let mut name_field = [b' '; 16];
+    let take = m.identifier.len().min(16);
+    name_field[..take].copy_from_slice(&m.identifier[..take]);
+    w.write_all(&name_field)?;
+    w.write_all(&plib::archive::pad_metadata_field::<12>(
+        &m.mtime.to_string(),
+    )?)?;
+    w.write_all(&plib::archive::pad_metadata_field::<6>(&m.uid.to_string())?)?;
+    w.write_all(&plib::archive::pad_metadata_field::<6>(&m.gid.to_string())?)?;
+    w.write_all(&plib::archive::pad_metadata_field::<8>(&format!(
+        "{:o}",
+        m.mode
+    ))?)?;
+    w.write_all(&plib::archive::pad_metadata_field::<10>(
+        &m.data.len().to_string(),
+    )?)?;
+    w.write_all(plib::archive::TERMINATOR)?;
+    w.write_all(&m.data)?;
+    if m.data.len() % 2 != 0 {
+        w.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn is_elf(data: &[u8]) -> bool {
@@ -110,7 +195,12 @@ fn strip_file(file: &OsStr) {
     let contents = match std::fs::read(file) {
         Ok(contents) => contents,
         Err(err) => {
-            eprintln!("strip: error reading {}: {}", file.to_string_lossy(), err);
+            diag::error(&format!(
+                "{}: {}: {}",
+                file.to_string_lossy(),
+                gettext("error reading"),
+                err
+            ));
             return;
         }
     };
@@ -119,37 +209,37 @@ fn strip_file(file: &OsStr) {
     } else if is_archive(&contents) {
         strip_archive(&contents, file)
     } else {
-        eprintln!(
-            "strip: {}: file format not recognized",
-            file.to_string_lossy()
-        );
+        diag::error(&format!(
+            "{}: {}",
+            file.to_string_lossy(),
+            gettext("file format not recognized"),
+        ));
         return;
     };
     match stripped_contents {
         Ok(stripped_contents) => {
-            if let Err(err) = std::fs::write(file, stripped_contents) {
-                eprintln!(
-                    "strip: error writing file {}: {}",
+            if let Err(err) = plib::io::write_atomic(Path::new(file), &stripped_contents) {
+                diag::error(&format!(
+                    "{}: {}: {}",
                     file.to_string_lossy(),
+                    gettext("error writing file"),
                     err
-                );
+                ));
             }
         }
         Err(err) => {
-            eprintln!("strip: {}: {}", file.to_string_lossy(), err);
+            diag::error(&format!("{}: {}", file.to_string_lossy(), err));
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() {
+    diag::init_locale("strip");
 
     let args = Args::parse();
 
     for file in args.input_files {
         strip_file(&file);
     }
-    Ok(())
+    std::process::exit(diag::exit_status());
 }

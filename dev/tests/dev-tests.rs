@@ -545,7 +545,10 @@ fn test_strings_print_multiple() {
 
 #[test]
 fn test_strings_utf8_file() {
-    std::env::set_var("LC_CTYPE", "UTF-8");
+    // POSIX-style locale name (the bare "UTF-8" used historically isn't a
+    // valid locale on glibc and silently falls back to "C"; C.UTF-8 is
+    // universally available since glibc 2.35 / FreeBSD 11).
+    std::env::set_var("LC_CTYPE", "C.UTF-8");
     strings_test(
         &["tests/strings/utf8.bin"],
         include_str!("strings/utf8.correct.txt"),

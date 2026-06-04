@@ -759,35 +759,47 @@ struct ParsedRuleInfo {
     is_eof: bool,
 }
 
+/// Build a parsed `<<EOF>>` rule (optionally start-condition scoped).
+fn build_eof_rule(
+    state: &ParseState,
+    start_conditions: Vec<String>,
+    action_ws: &str,
+) -> Result<ParsedRuleInfo, String> {
+    let action = action_ws.trim_start();
+    if action.is_empty() {
+        return Err(state.error("missing action for <<EOF>> rule"));
+    }
+    let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
+    Ok(ParsedRuleInfo {
+        ere: String::new(),
+        compiled_ere: String::new(),
+        action: action.to_string(),
+        open_braces,
+        start_conditions,
+        bol_anchor: false,
+        trailing_context: None,
+        compiled_trailing_context: None,
+        is_eof: true,
+    })
+}
+
 /// Parse a lex rule line, returning all rule components.
 fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, String> {
-    // Check for <<EOF>> pattern BEFORE extracting start conditions
-    // (since <<EOF>> looks like a start condition but isn't)
+    // Plain <<EOF>> (no start-condition prefix). Handled before extracting
+    // start conditions, since "<<EOF>>" superficially looks like a "<...>"
+    // prefix to extract_start_conditions.
     let trimmed_line = line.trim_start();
     if let Some(action_ws) = trimmed_line.strip_prefix("<<EOF>>") {
-        let action = action_ws.trim_start();
-
-        if action.is_empty() {
-            return Err(state.error("missing action for <<EOF>> rule"));
-        }
-
-        let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
-
-        return Ok(ParsedRuleInfo {
-            ere: String::new(),
-            compiled_ere: String::new(),
-            action: action.to_string(),
-            open_braces,
-            start_conditions: Vec::new(), // <<EOF>> doesn't support start conditions in this simple impl
-            bol_anchor: false,
-            trailing_context: None,
-            compiled_trailing_context: None,
-            is_eof: true,
-        });
+        return build_eof_rule(state, Vec::new(), action_ws);
     }
 
-    // First extract any start conditions
+    // Extract any <STATE,...> start-condition prefix.
     let (start_conditions, remaining) = extract_start_conditions(line);
+
+    // <STATE><<EOF>> - a start-condition-scoped end-of-file rule.
+    if let Some(action_ws) = remaining.trim_start().strip_prefix("<<EOF>>") {
+        return build_eof_rule(state, start_conditions, action_ws);
+    }
 
     let pos = find_ere_end(remaining).map_err(|e| state.error(&e))?;
     let ere_raw = String::from(&remaining[..pos]);

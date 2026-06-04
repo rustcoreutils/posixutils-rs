@@ -2102,6 +2102,43 @@ fn test_clean_program_no_pattern_warnings() {
 }
 
 #[test]
+fn test_eof_rule_with_start_condition() {
+    // #L10: a <STATE><<EOF>> rule fires only when the scanner is in that start
+    // condition; EOF in another condition falls through to yywrap().
+    let lex_input = r#"%option noinput nounput
+%x S
+%%
+a            BEGIN(S);
+<S><<EOF>>   { printf("EOF_IN_S\n"); return 0; }
+.|\n         /* ignore */
+%%
+
+int main(void) {
+    yylex();
+    return 0;
+}
+"#;
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Reading 'a' enters state S; EOF there triggers the conditioned rule.
+    let in_s = compile_and_run(&c_code, "a").expect("compile/run in S");
+    assert!(
+        in_s.contains("EOF_IN_S"),
+        "<S><<EOF>> should fire at EOF in state S: {}",
+        in_s
+    );
+
+    // Staying in INITIAL (never reading 'a'), EOF must NOT trigger it.
+    let in_initial = compile_and_run(&c_code, "b").expect("compile/run in INITIAL");
+    assert!(
+        !in_initial.contains("EOF_IN_S"),
+        "<S><<EOF>> must not fire in INITIAL: {}",
+        in_initial
+    );
+}
+
+#[test]
 fn test_echo_macro() {
     // Test explicit ECHO macro usage
     let lex_input = r#"

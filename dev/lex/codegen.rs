@@ -766,7 +766,8 @@ static int input(void)
     }}
     /* Need to refill buffer */
     if (yyin == NULL) yyin = stdin;
-    return getc(yyin);  /* Returns EOF (-1) on end of file */
+    int yy_c = getc(yyin);
+    return yy_c == EOF ? 0 : yy_c;  /* POSIX: input() returns 0 on end of file */
 }}
 "#
         )?;
@@ -781,8 +782,9 @@ static int input(void)
  * DFA sees the character immediately on the next scan.
  * Two paths: (1) if room before YYCURSOR, decrement and store there;
  *            (2) otherwise, shift buffer contents right to make room at start.
+ * POSIX prototype is `int unput(int c)`; returns the pushed-back character.
  */
-static void unput(int c)
+static int unput(int c)
 {{
     if (YYCURSOR > yy_buffer) {{
         /* Room before cursor - just back up and insert */
@@ -815,6 +817,7 @@ static void unput(int c)
         YYLIMIT++;
         /* YYCURSOR stays at yy_buffer, now pointing to inserted char */
     }}
+    return c;
 }}
 "#
         )?;

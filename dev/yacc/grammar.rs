@@ -795,8 +795,9 @@ expr : FOO
     }
 
     #[test]
-    fn test_char_literal_eof_conflict() {
-        // NUL character (value 0) conflicts with EOF token number
+    fn test_char_literal_nul_rejected() {
+        // NUL character (codepoint 0) is reserved for end-of-input and is
+        // rejected as out of the single-byte 1..=255 character-literal range.
         let result = try_make_grammar(
             r#"
 %token NUM
@@ -810,8 +811,8 @@ expr : '\0'
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("duplicate token number 0"),
-            "error should mention conflict with EOF: {}",
+            err.to_string().contains("out of range"),
+            "error should reject the NUL character literal: {}",
             err
         );
     }

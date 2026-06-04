@@ -3768,3 +3768,62 @@ fn test_multibyte_char_literal_rejected() {
         stderr
     );
 }
+
+// --- "--" end-of-options marker (XBD 12.2) ---
+
+#[test]
+fn test_double_dash_end_of_options() {
+    // "--" terminates options; the following argument is the grammar operand.
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+
+    let output = run_yacc(&["--"], grammar);
+    assert!(
+        output.status.success(),
+        "yacc -- <grammar> should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Options before "--" still apply.
+    let header = gen_and_read(&["-d", "--"], grammar, "y.tab.h");
+    assert!(
+        header.contains("#define NUM"),
+        "options before -- must still take effect: {}",
+        header
+    );
+}
+
+#[test]
+fn test_double_dash_allows_dash_prefixed_filename() {
+    // After "--", a grammar file literally named "-dash.y" must be accepted
+    // as an operand rather than parsed as options.
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("-dash.y"), grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["--", "-dash.y"])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(
+        output.status.success(),
+        "yacc -- -dash.y should treat the dash-prefixed name as the grammar: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        temp_dir.path().join("y.tab.c").exists(),
+        "y.tab.c should be generated from the dash-prefixed grammar file"
+    );
+
+    // Control: without "--", the same name is misparsed as options and fails.
+    let bad = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-dash.y"])
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(
+        !bad.status.success(),
+        "without --, a dash-prefixed name is parsed as options and must fail"
+    );
+}

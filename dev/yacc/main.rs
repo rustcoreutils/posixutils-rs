@@ -65,14 +65,37 @@ fn parse_args() -> Result<Options, YaccError> {
     let mut opts = Options::default();
 
     let mut i = 1;
+    let mut end_of_opts = false;
     while i < args.len() {
         let arg = &args[i];
+
+        // XBD Section 12.2: "--" terminates the options; every remaining
+        // argument is an operand, even if it begins with '-'.
+        if !end_of_opts && arg == "--" {
+            end_of_opts = true;
+            i += 1;
+            continue;
+        }
+
+        // Treat as an operand (the grammar file) once "--" has been seen or
+        // when the argument is not option-shaped.
+        if end_of_opts || !arg.starts_with('-') {
+            if !opts.grammar_file.is_empty() {
+                return Err(YaccError::Usage("multiple grammar files specified".into()));
+            }
+            opts.grammar_file = arg.clone();
+            i += 1;
+            continue;
+        }
+
         if arg == "--strict" {
             opts.strict_mode = true;
             i += 1;
             continue;
         }
-        if arg.starts_with('-') {
+
+        // Option cluster: arg begins with '-' (e.g. -dtv, -bprefix).
+        {
             let mut chars = arg.chars().skip(1);
             while let Some(c) = chars.next() {
                 match c {
@@ -125,12 +148,6 @@ fn parse_args() -> Result<Options, YaccError> {
                     }
                 }
             }
-        } else {
-            // Grammar file
-            if !opts.grammar_file.is_empty() {
-                return Err(YaccError::Usage("multiple grammar files specified".into()));
-            }
-            opts.grammar_file = arg.clone();
         }
         i += 1;
     }

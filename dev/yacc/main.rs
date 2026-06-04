@@ -162,8 +162,41 @@ fn run(opts: &Options) -> Result<(), YaccError> {
     let input = fs::read_to_string(&opts.grammar_file)
         .map_err(|e| YaccError::Io(format!("cannot read '{}': {}", opts.grammar_file, e)))?;
 
+    // POSIX CONSEQUENCES OF ERRORS (123202-4): "summary information in the
+    // description file shall always be produced if the -v flag is present."
+    // If a stage fails before codegen builds the full description, emit a
+    // stub so a y.output still exists.
+    match run_pipeline(opts, &input) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if opts.write_description {
+                write_description_stub(opts, &e);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Write a minimal description file when -v is set but generation aborted
+/// before the full y.output could be produced. Never overwrites an existing
+/// file: on the success path codegen writes the complete description first.
+fn write_description_stub(opts: &Options, err: &YaccError) {
+    let path = format!("{}.output", opts.file_prefix);
+    if std::path::Path::new(&path).exists() {
+        return;
+    }
+    let body = format!(
+        "Grammar description for {}\n\n\
+         (generation aborted before parser tables were built: {})\n\n\
+         Internal table limits: dynamic; no fixed limits.\n",
+        opts.grammar_file, err
+    );
+    let _ = fs::write(&path, body);
+}
+
+fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {
     // Lex the input
-    let tokens = lexer::lex(&input)?;
+    let tokens = lexer::lex(input)?;
 
     // Parse the grammar
     let parsed = parser::parse(&tokens)?;

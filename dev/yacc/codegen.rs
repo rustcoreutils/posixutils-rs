@@ -1901,6 +1901,10 @@ fn generate_description_file(
         "  Actions:       {:5}",
         lalr.action_table.iter().map(|a| a.len()).sum::<usize>()
     )?;
+    // POSIX 123740-3: internal-table limits "shall also be reported, in an
+    // implementation-defined manner." This implementation allocates tables
+    // dynamically and so has no fixed limits to report (spec-permitted).
+    writeln!(w, "  Internal table limits: dynamic; no fixed limits.")?;
 
     let (sr, rr) = lalr.count_conflicts();
     if sr > 0 || rr > 0 {

@@ -3679,3 +3679,50 @@ fn test_code_file_prototype_guards_honor_p_prefix() {
         code
     );
 }
+
+// --- -v description file: always produced + table-limits report ---
+
+#[test]
+fn test_description_file_produced_on_error() {
+    // POSIX CONSEQUENCES OF ERRORS: y.output shall always be produced when -v
+    // is set, even if generation aborts before the tables are built (here the
+    // grammar references a non-terminal that has no rules).
+    let grammar = r#"
+%token NUM
+%%
+expr : undefined_nt ;
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-v", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(
+        !output.status.success(),
+        "yacc should fail on an undefined non-terminal"
+    );
+
+    let out_path = temp_dir.path().join("y.output");
+    assert!(
+        out_path.exists(),
+        "y.output must be produced even when a -v run aborts with an error"
+    );
+}
+
+#[test]
+fn test_description_file_reports_table_limits() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let desc = gen_and_read(&["-v"], grammar, "y.output");
+
+    assert!(
+        desc.contains("Internal table limits"),
+        "description file must report internal table limits (POSIX 123740-3): {}",
+        desc
+    );
+}

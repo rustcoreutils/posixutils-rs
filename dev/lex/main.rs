@@ -28,7 +28,9 @@ use std::io::{self, BufRead, Read, Write};
 #[derive(Parser, Debug)]
 #[command(author, version, about = gettext("lex - generate programs for lexical tasks (POSIX compatible)"))]
 struct Args {
-    #[arg(short = 'n', long, help = gettext("Suppress the summary of statistics usually written with the -v option"))]
+    // POSIX SYNOPSIS is `lex [-t] [-n|-v] [file...]`: -n and -v are mutually
+    // exclusive.
+    #[arg(short = 'n', long, conflicts_with = "verbose", help = gettext("Suppress the summary of statistics usually written with the -v option"))]
     no_stats: bool,
 
     #[arg(short = 't', long, help = gettext("Write the resulting program to standard output instead of lex.yy.c"))]
@@ -37,7 +39,9 @@ struct Args {
     #[arg(short, long, help = gettext("Write a summary of lex statistics to the standard output"))]
     verbose: bool,
 
-    #[arg(short, long, default_value = "lex.yy.c", help = gettext("Write output to this filename (unless superceded by -t)"))]
+    // -o/--outfile is a non-POSIX convenience extension; hidden from --help to
+    // keep the advertised CLI surface POSIX-conformant.
+    #[arg(short, long, default_value = "lex.yy.c", hide = true, help = gettext("Write output to this filename (unless superseded by -t)"))]
     outfile: String,
 
     #[arg(help = gettext("Files to read as input"))]
@@ -65,7 +69,7 @@ fn concat_input_files(files: &[String]) -> io::Result<Vec<String>> {
                     input.push(line);
                 }
                 Err(e) => {
-                    eprintln!("Error reading file: {}", e);
+                    eprintln!("{}: {}", gettext("Error reading file"), e);
                     return Err(e);
                 }
             }
@@ -239,9 +243,15 @@ fn write_stats<W: Write + ?Sized>(
         "  {} character equivalence classes",
         dfa.char_classes.num_classes
     )?;
-    // Output declared table sizes if any were specified
+    // Output declared table sizes if any were specified. POSIX requires the
+    // implementation to document how these numbers affect lex; this
+    // implementation allocates all tables dynamically, so the declared values
+    // are accepted for compatibility but are advisory only (never a limit).
     if !lexinfo.table_sizes.is_empty() {
-        writeln!(output, "  declared table sizes:")?;
+        writeln!(
+            output,
+            "  declared table sizes (accepted; tables are allocated dynamically, values advisory only):"
+        )?;
         for (key, value) in &lexinfo.table_sizes {
             let desc = match key {
                 'p' => "positions",
@@ -359,18 +369,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     codegen::generate(&mut output, &dfa, &lexinfo, &config)?;
 
-    // Write statistics if requested
-    if args.verbose && !args.no_stats {
+    // Write statistics if requested. POSIX: statistics "may also be generated
+    // if table sizes are specified with a '%' operator ... as long as the -n
+    // option is not specified."
+    if !args.no_stats && (args.verbose || !lexinfo.table_sizes.is_empty()) {
         let stats_output: &mut dyn Write = if args.stdout {
             &mut io::stderr()
         } else {
             &mut io::stdout()
         };
         write_stats(stats_output, &dfa, &nfa, &lexinfo)?;
-    }
-
-    if !args.stdout {
-        eprintln!("Output written to {}", args.outfile);
     }
 
     Ok(())

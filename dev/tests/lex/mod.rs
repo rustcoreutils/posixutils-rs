@@ -12,6 +12,9 @@ fn run_lex(input: &str) -> (String, bool) {
     fs::write(&lex_file, input).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        // Pin the C locale so gettext-routed diagnostics render in English
+        // regardless of the host locale / installed message catalogs.
+        .env("LC_ALL", "C")
         .args([
             lex_file.to_str().unwrap(),
             "-o",
@@ -722,7 +725,7 @@ fn test_unput_code_generation() {
     assert!(success, "lex failed to generate C code");
 
     // Check for unput function - now uses direct buffer insertion with memmove
-    assert!(c_code.contains("static void unput(int c)"));
+    assert!(c_code.contains("static int unput(int c)"));
     assert!(c_code.contains("memmove"));
 }
 
@@ -758,6 +761,86 @@ int main() {
     // So next match should be "zyx"
     assert!(output.contains("ABC"));
     assert!(output.contains("ZYX"));
+}
+
+#[test]
+fn test_input_returns_zero_at_eof() {
+    // POSIX: input() returns 0 (not EOF/-1) at end of file, and unput(c)
+    // returns the character pushed back.
+    let lex_input = r#"%option nounput
+%%
+a   {
+        int c = input();          /* consumes the only remaining char (EOF) */
+        if (c == 0) printf("EOF_IS_ZERO\n");
+        else printf("EOF_IS_%d\n", c);
+    }
+%%
+
+int main(void) {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+    assert!(
+        c_code.contains("yy_c == EOF ? 0 : yy_c"),
+        "input() must normalize EOF to 0: {}",
+        c_code
+    );
+
+    // Input is just "a" with no trailing newline, so input() after matching
+    // 'a' hits EOF and must return 0.
+    let result = compile_and_run(&c_code, "a");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("EOF_IS_ZERO"),
+        "input() must return 0 at EOF, got: {}",
+        output
+    );
+}
+
+#[test]
+fn test_unput_returns_pushed_char() {
+    // POSIX prototype is `int unput(int c)`; it returns the pushed-back char.
+    let lex_input = r#"%option noinput
+%%
+a   {
+        int r = unput('b');
+        printf("UNPUT_RET_%c\n", r);
+    }
+b   printf("GOT_B\n");
+%%
+
+int main(void) {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+    assert!(
+        c_code.contains("static int unput(int c)"),
+        "unput must be declared `int unput(int c)`: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "a");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("UNPUT_RET_b"),
+        "unput(c) must return c: {}",
+        output
+    );
+    assert!(
+        output.contains("GOT_B"),
+        "pushed-back 'b' must re-match: {}",
+        output
+    );
 }
 
 // Anchoring and trailing context tests
@@ -1867,6 +1950,222 @@ fn test_statistics_output() {
     );
 }
 
+/// Run lex with the given extra args and source; return combined stdout+stderr.
+fn run_lex_capture(extra_args: &[&str], source: &str) -> (String, bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file = temp_dir.path().join("test.l");
+    let output_file = temp_dir.path().join("lex.yy.c");
+    fs::write(&lex_file, source).unwrap();
+
+    let mut args: Vec<&str> = extra_args.to_vec();
+    let lex_path = lex_file.to_str().unwrap().to_string();
+    let out_path = output_file.to_str().unwrap().to_string();
+    args.extend_from_slice(&[lex_path.as_str(), "-o", out_path.as_str()]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        // Pin the C locale so gettext-routed diagnostics render in English
+        // regardless of the host locale / installed message catalogs.
+        .env("LC_ALL", "C")
+        .args(&args)
+        .output()
+        .expect("Failed to execute lex");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (combined, output.status.success())
+}
+
+#[test]
+fn test_table_size_decl_triggers_stats() {
+    // POSIX: statistics may be generated when table sizes are declared with a
+    // '%' operator, even without -v (as long as -n is not given).
+    let source = "%n 600\n%a 1000\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        combined.contains("declared table sizes"),
+        "table-size declarations must trigger stats without -v: {}",
+        combined
+    );
+    assert!(
+        combined.contains("advisory only"),
+        "stats must document that table sizes are advisory (dynamic allocation): {}",
+        combined
+    );
+}
+
+#[test]
+fn test_table_size_stats_suppressed_by_n() {
+    // -n suppresses the statistics even when table sizes are declared.
+    let source = "%n 600\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&["-n"], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("declared table sizes"),
+        "-n must suppress table-size stats: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_n_and_v_are_mutually_exclusive() {
+    // POSIX SYNOPSIS `lex [-t] [-n|-v]`: -n and -v cannot be combined.
+    let (combined, ok) = run_lex_capture(&["-n", "-v"], "%%\n[a-z]+ ;\n%%\n");
+    assert!(!ok, "lex should reject -n together with -v");
+    assert!(
+        combined.contains("cannot be used with") || combined.to_lowercase().contains("conflict"),
+        "combining -n and -v should report a conflict: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_no_output_written_chatter() {
+    // #L13: lex must not print a non-POSIX "Output written to ..." notice.
+    let (combined, ok) = run_lex_capture(&[], "%%\n[a-z]+ ;\n%%\n");
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("Output written"),
+        "lex must be silent on success (no 'Output written' chatter): {}",
+        combined
+    );
+}
+
+#[test]
+fn test_outfile_option_hidden_from_help() {
+    // #L8: -o/--outfile is a non-POSIX extension and must not appear in --help,
+    // though it remains functional.
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .arg("--help")
+        .output()
+        .expect("Failed to execute lex");
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !help.contains("--outfile") && !help.contains("outfile"),
+        "-o/--outfile must be hidden from --help: {}",
+        help
+    );
+}
+
+#[test]
+fn test_no_stats_without_verbose_or_table_sizes() {
+    // No -v and no table-size declarations => no statistics emitted.
+    let source = "%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("NFA states") && !combined.contains("declared table sizes"),
+        "no stats should be emitted without -v or %-declared table sizes: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_nul_escape_in_pattern_warns() {
+    // POSIX 101898-900: a NUL in a pattern is undefined behavior. lex should
+    // warn (non-fatally) for \0, \x00, \000, etc.
+    for pat in ["\\0", "\\x00", "\\000"] {
+        let source = format!("%%\n{}    printf(\"X\\n\");\n%%\n", pat);
+        let (combined, _ok) = run_lex_capture(&[], &source);
+        assert!(
+            combined.contains("NUL"),
+            "pattern {:?} should warn about NUL: {}",
+            pat,
+            combined
+        );
+    }
+}
+
+#[test]
+fn test_trigraph_in_code_block_warns() {
+    // POSIX 101797: C code in the input shall not contain trigraphs.
+    let source = "%{\nint x = 1 ??! 2;\n%}\n%%\n[a-z]+ ;\n%%\n";
+    let (combined, _ok) = run_lex_capture(&[], source);
+    assert!(
+        combined.contains("trigraph"),
+        "a trigraph in a %{{ %}} block should warn: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_clean_program_no_pattern_warnings() {
+    // A clean program triggers neither the NUL nor the trigraph warning.
+    let source = "%{\nint x = 1;\n%}\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("NUL") && !combined.contains("trigraph"),
+        "clean program must not emit pattern warnings: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_eof_rule_with_start_condition() {
+    // #L10: a <STATE><<EOF>> rule fires only when the scanner is in that start
+    // condition; EOF in another condition falls through to yywrap().
+    let lex_input = r#"%option noinput nounput
+%x S
+%%
+a            BEGIN(S);
+<S><<EOF>>   { printf("EOF_IN_S\n"); return 0; }
+.|\n         /* ignore */
+%%
+
+int main(void) {
+    yylex();
+    return 0;
+}
+"#;
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Reading 'a' enters state S; EOF there triggers the conditioned rule.
+    let in_s = compile_and_run(&c_code, "a").expect("compile/run in S");
+    assert!(
+        in_s.contains("EOF_IN_S"),
+        "<S><<EOF>> should fire at EOF in state S: {}",
+        in_s
+    );
+
+    // Staying in INITIAL (never reading 'a'), EOF must NOT trigger it.
+    let in_initial = compile_and_run(&c_code, "b").expect("compile/run in INITIAL");
+    assert!(
+        !in_initial.contains("EOF_IN_S"),
+        "<S><<EOF>> must not fire in INITIAL: {}",
+        in_initial
+    );
+}
+
+#[test]
+fn test_diagnostics_render_under_gettext() {
+    // #L5: diagnostics are routed through gettext(); under the C/POSIX locale
+    // gettext is the identity function, so the English text renders verbatim.
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file = temp_dir.path().join("test.l");
+    let out = temp_dir.path().join("lex.yy.c");
+    fs::write(&lex_file, "%option frobnicate\n%%\n[a-z]+ ;\n%%\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .env("LC_ALL", "C")
+        .args([lex_file.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute lex");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown %option"),
+        "gettext-routed diagnostic must render verbatim under the C locale: {}",
+        stderr
+    );
+}
+
 #[test]
 fn test_echo_macro() {
     // Test explicit ECHO macro usage
@@ -2616,7 +2915,7 @@ fn test_option_noinput_suppresses_input_function() {
 
     // Verify that unput() function IS still generated (noinput doesn't affect it)
     assert!(
-        c_code.contains("static void unput(int c)"),
+        c_code.contains("static int unput(int c)"),
         "unput() function should still be generated"
     );
 }
@@ -2639,7 +2938,7 @@ fn test_option_nounput_suppresses_unput_function() {
 
     // Verify that unput() function is NOT generated
     assert!(
-        !c_code.contains("static void unput(int c)"),
+        !c_code.contains("static int unput(int c)"),
         "unput() function should NOT be generated with %option nounput"
     );
 
@@ -2675,7 +2974,7 @@ int main() {
         "input() function should NOT be generated"
     );
     assert!(
-        !c_code.contains("static void unput(int c)"),
+        !c_code.contains("static int unput(int c)"),
         "unput() function should NOT be generated"
     );
 
@@ -2713,7 +3012,7 @@ int main() {
         "input() function should NOT be generated"
     );
     assert!(
-        !c_code.contains("static void unput(int c)"),
+        !c_code.contains("static int unput(int c)"),
         "unput() function should NOT be generated"
     );
 
@@ -2748,7 +3047,7 @@ int main() {
         "input() function should be generated by default"
     );
     assert!(
-        c_code.contains("static void unput(int c)"),
+        c_code.contains("static int unput(int c)"),
         "unput() function should be generated by default"
     );
 }

@@ -694,8 +694,11 @@ expr : NUM
 }
 
 #[test]
-fn test_debug_not_enabled_without_t_flag() {
-    // Test that debug tables are NOT generated without -t
+fn test_debug_default_off_but_code_present() {
+    // Without -t, YYDEBUG defaults to 0, but per POSIX the debugging code
+    // (tables + yydebug + trace) must still be EMITTED, guarded by
+    // #if YYDEBUG, so a -DYYDEBUG=1 build can enable it. -t only flips the
+    // compile-time default value.
     let grammar = r#"
 %token NUM
 %%
@@ -719,16 +722,20 @@ expr : NUM
     let code_path = temp_dir.path().join("y.tab.c");
     let code = fs::read_to_string(&code_path).expect("should read generated code");
 
-    // Check that YYDEBUG is set to 0
+    // Default value is 0 without -t.
     assert!(
         code.contains("#define YYDEBUG 0") || code.contains("# define YYDEBUG 0"),
-        "generated code should define YYDEBUG to 0 without -t flag"
+        "generated code should default YYDEBUG to 0 without -t flag"
     );
 
-    // Check that debug tables are NOT present
+    // But the debug tables and trace ARE emitted, guarded by #if YYDEBUG.
     assert!(
-        !code.contains("yytname["),
-        "generated code should NOT have yytname table without -t flag"
+        code.contains("#if YYDEBUG"),
+        "debug code must be present, guarded by #if YYDEBUG"
+    );
+    assert!(
+        code.contains("yytname"),
+        "yytname debug table must be emitted even without -t (guarded by #if YYDEBUG)"
     );
 }
 
@@ -814,6 +821,90 @@ expr : NUM
     assert!(
         code.contains("Reading token"),
         "debug output should include token read messages"
+    );
+}
+
+#[test]
+fn test_yydebug_enabled_at_compile_without_t_flag() {
+    // POSIX 123150-4: "If YYDEBUG has a non-zero value, the debugging code
+    // shall be included." A parser generated WITHOUT -t must still honor a
+    // compile-time -DYYDEBUG=1 and emit a runtime trace when yydebug != 0.
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <stdlib.h>
+
+int yylex(void);
+void yyerror(const char *s);
+%}
+
+%token NUM
+%%
+input : NUM ;
+%%
+
+static int token_returned = 0;
+int yylval;
+
+int yylex(void) {
+    if (token_returned) return 0;
+    token_returned = 1;
+    return NUM;
+}
+
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+
+int main(void) {
+    yydebug = 1;
+    return yyparse();
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // Generate WITHOUT -t.
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args([grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(output.status.success(), "yacc should succeed");
+
+    // Compile with -DYYDEBUG=1 even though -t was not given; the debug code
+    // (including the yydebug variable main() references) must be present.
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("ydebug_parser");
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args([
+            "-DYYDEBUG=1",
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile.status.success(),
+        "cc -DYYDEBUG=1 should compile a non-`-t` parser: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run; with yydebug=1 the trace must appear on stderr.
+    let run = Command::new(&exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute parser");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("Entering state"),
+        "yydebug=1 must produce a runtime trace, got stderr: {}",
+        stderr
     );
 }
 

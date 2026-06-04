@@ -326,10 +326,9 @@ fn generate_tables<W: Write>(
     // ACTION and GOTO tables in compressed format
     generate_action_goto_tables(w, grammar, lalr, prefix, opts.strict_mode)?;
 
-    // Debug tables (only when debug is enabled)
-    if opts.debug_enabled {
-        generate_debug_tables(w, grammar, prefix)?;
-    }
+    // Debug tables. Always emitted; the C output self-guards with
+    // #if YYDEBUG so a -DYYDEBUG=1 build enables them regardless of -t.
+    generate_debug_tables(w, grammar, prefix)?;
 
     Ok(())
 }
@@ -954,12 +953,11 @@ fn generate_parser<W: Write>(
     writeln!(w, "int {}nerrs;", prefix)?;
     writeln!(w)?;
 
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "int {}debug = 0;", prefix)?;
-        writeln!(w, "#endif")?;
-        writeln!(w)?;
-    }
+    // yydebug is always declared (inside #if YYDEBUG) so -DYYDEBUG=1 works.
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "int {}debug = 0;", prefix)?;
+    writeln!(w, "#endif")?;
+    writeln!(w)?;
 
     // Stack size
     writeln!(
@@ -1064,16 +1062,14 @@ fn generate_parser<W: Write>(
     writeln!(w)?;
 
     writeln!(w, "{}newstate:", prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "    if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "        fprintf(stderr, \"Entering state %d\\n\", {}state);",
-            prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "    if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "        fprintf(stderr, \"Entering state %d\\n\", {}state);",
+        prefix
+    )?;
+    writeln!(w, "#endif")?;
     writeln!(
         w,
         "    {}ss[{}ssp_offset] = {}state;",
@@ -1180,27 +1176,25 @@ fn generate_parser<W: Write>(
     writeln!(w, "    if ({}char < 0) {{", prefix)?;
     writeln!(w, "        {}char = {}lex();", prefix, prefix)?;
     writeln!(w, "        if ({}char < 0) {}char = 0;", prefix, prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug) {{", prefix)?;
-        writeln!(
-            w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
-            prefix,
-            prefix,
-            get_translate_table_size(grammar),
-            prefix,
-            prefix,
-            ERROR_SYMBOL
-        )?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Reading token %s (%d)\\n\", {}tname[{}tok], {}char);",
-            prefix, prefix, prefix
-        )?;
-        writeln!(w, "        }}")?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug) {{", prefix)?;
+    writeln!(
+        w,
+        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix,
+        ERROR_SYMBOL
+    )?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Reading token %s (%d)\\n\", {}tname[{}tok], {}char);",
+        prefix, prefix, prefix
+    )?;
+    writeln!(w, "        }}")?;
+    writeln!(w, "#endif")?;
     writeln!(w, "    }}")?;
     writeln!(w)?;
 
@@ -1241,31 +1235,29 @@ fn generate_parser<W: Write>(
     writeln!(w, "        goto {}default_action;", prefix)?;
     writeln!(w, "    }} else if ({}n > 0) {{", prefix)?;
     writeln!(w, "        /* Shift */")?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug) {{", prefix)?;
-        writeln!(
-            w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
-            prefix,
-            prefix,
-            get_translate_table_size(grammar),
-            prefix,
-            prefix,
-            ERROR_SYMBOL
-        )?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Shifting token %s (%d), entering state %d\\n\",",
-        )?;
-        writeln!(
-            w,
-            "                    {}tname[{}tok], {}char, {}n);",
-            prefix, prefix, prefix, prefix
-        )?;
-        writeln!(w, "        }}")?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug) {{", prefix)?;
+    writeln!(
+        w,
+        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix,
+        ERROR_SYMBOL
+    )?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Shifting token %s (%d), entering state %d\\n\",",
+    )?;
+    writeln!(
+        w,
+        "                    {}tname[{}tok], {}char, {}n);",
+        prefix, prefix, prefix, prefix
+    )?;
+    writeln!(w, "        }}")?;
+    writeln!(w, "#endif")?;
     writeln!(w, "        {}ssp_offset++;", prefix)?;
     writeln!(w, "        {}vsp++;", prefix)?;
     writeln!(w, "        *{}vsp = {}lval;", prefix, prefix)?;
@@ -1300,16 +1292,14 @@ fn generate_parser<W: Write>(
 
     // Reduce
     writeln!(w, "{}reduce:", prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "    if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "        fprintf(stderr, \"Reducing by rule %d (%s)\\n\", {}n, {}rule[{}n]);",
-            prefix, prefix, prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "    if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "        fprintf(stderr, \"Reducing by rule %d (%s)\\n\", {}n, {}rule[{}n]);",
+        prefix, prefix, prefix
+    )?;
+    writeln!(w, "#endif")?;
 
     // Switch on rule number for semantic actions
     writeln!(w, "    switch ({}n) {{", prefix)?;
@@ -1412,27 +1402,25 @@ fn generate_parser<W: Write>(
         "        if ({}char == 0) goto {}abortlab;  /* EOF, can't recover */",
         prefix, prefix
     )?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug) {{", prefix)?;
-        writeln!(
-            w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
-            prefix,
-            prefix,
-            get_translate_table_size(grammar),
-            prefix,
-            prefix,
-            ERROR_SYMBOL
-        )?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Error recovery: discarding token %s (%d)\\n\", {}tname[{}tok], {}char);",
-            prefix, prefix, prefix
-        )?;
-        writeln!(w, "        }}")?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug) {{", prefix)?;
+    writeln!(
+        w,
+        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix,
+        ERROR_SYMBOL
+    )?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Error recovery: discarding token %s (%d)\\n\", {}tname[{}tok], {}char);",
+        prefix, prefix, prefix
+    )?;
+    writeln!(w, "        }}")?;
+    writeln!(w, "#endif")?;
     writeln!(w, "        {}char = -1;", prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
     writeln!(w, "    }}")?;
@@ -1450,16 +1438,14 @@ fn generate_parser<W: Write>(
     )?;
     // Check if action is a shift (positive value)
     writeln!(w, "        if ({}n > 0) {{", prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "            if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "                fprintf(stderr, \"Shifting error token, entering state %d\\n\", {}n);",
-            prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "            if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "                fprintf(stderr, \"Shifting error token, entering state %d\\n\", {}n);",
+        prefix
+    )?;
+    writeln!(w, "#endif")?;
     writeln!(w, "            /* Shift the error token */")?;
     writeln!(w, "            {}ssp_offset++;", prefix)?;
     writeln!(w, "            {}vsp++;", prefix)?;
@@ -1471,16 +1457,14 @@ fn generate_parser<W: Write>(
         "        if ({}ssp_offset <= 0) goto {}abortlab;",
         prefix, prefix
     )?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Error recovery: popping state %d\\n\", {}state);",
-            prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Error recovery: popping state %d\\n\", {}state);",
+        prefix
+    )?;
+    writeln!(w, "#endif")?;
     writeln!(w, "        {}ssp_offset--;", prefix)?;
     writeln!(w, "        {}vsp--;", prefix)?;
     writeln!(

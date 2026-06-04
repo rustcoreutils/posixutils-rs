@@ -483,27 +483,140 @@ fn test_strip_stripped_archive_contains_valid_elf_members() {
 }
 
 #[test]
-fn test_strip_remove_all_non_section_symbols() {
+fn test_strip_keeps_symbols_in_relocatable() {
+    // #ST4: a relocatable object (.o) must remain linkable, so stripping keeps
+    // its symbol table (only debug info is removed). Previously this test
+    // pinned the over-aggressive removal of all non-section symbols.
     let stripped = strip_file(
         "tests/strip/remove_all_non_section_symbols.o",
         include_bytes!("strip/remove_all_non_section_symbols.o"),
     );
     let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*stripped).unwrap();
-    for symbol in elf.symbols() {
-        assert_eq!(symbol.kind(), object::SymbolKind::Section);
-    }
+    let non_section = elf
+        .symbols()
+        .filter(|s| s.kind() != object::SymbolKind::Section)
+        .count();
+    assert!(
+        non_section > 0,
+        "a stripped .o must retain its (non-section) symbols to stay linkable"
+    );
 }
 
 #[test]
-fn test_strip_remove_all_relocations() {
+fn test_strip_keeps_relocations_in_relocatable() {
+    // #ST4: relocations must be preserved on a relocatable object, else it
+    // becomes unlinkable. Previously this test pinned their removal.
     let stripped = strip_file(
         "tests/strip/remove_all_relocations.o",
         include_bytes!("strip/remove_all_relocations.o"),
     );
     let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*stripped).unwrap();
-    for section in elf.sections() {
-        assert_eq!(section.relocations().count(), 0);
+    let total_relocs: usize = elf.sections().map(|s| s.relocations().count()).sum();
+    assert!(
+        total_relocs > 0,
+        "a stripped .o must retain its relocations to stay linkable"
+    );
+}
+
+#[test]
+fn test_strip_executable_removes_symtab() {
+    // The aggressive path still applies to executables (ET_EXEC): the symbol
+    // table is removed. Build a non-PIE executable so there is no .rela.dyn to
+    // confuse the check, strip it, and confirm .symtab is gone.
+    let dir = tempfile::TempDir::new().unwrap();
+    let src = dir.path().join("a.c");
+    let exe = dir.path().join("a.out");
+    fs::write(&src, "int main(void){return 0;}\n").unwrap();
+    let built = std::process::Command::new("cc")
+        .args([
+            "-no-pie",
+            "-o",
+            exe.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run cc");
+    assert!(built.success(), "cc must build the executable");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&exe)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        out.status.success(),
+        "strip failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bytes = fs::read(&exe).unwrap();
+    let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
+        .expect("stripped executable must still be a valid ELF");
+    assert!(
+        elf.section_by_name(".symtab").is_none(),
+        "an executable's .symtab must be stripped"
+    );
+}
+
+#[test]
+fn test_strip_preserves_non_elf_archive_members() {
+    // #ST1: a non-ELF archive member must survive stripping unmodified rather
+    // than being silently dropped.
+    let dir = tempfile::TempDir::new().unwrap();
+    let cpath = dir.path().join("o.c");
+    let opath = dir.path().join("o.o");
+    fs::write(&cpath, "int f(void){return 1;}\n").unwrap();
+    assert!(std::process::Command::new("cc")
+        .args(["-c", "-o", opath.to_str().unwrap(), cpath.to_str().unwrap()])
+        .status()
+        .expect("cc")
+        .success());
+    let txt = dir.path().join("readme.txt");
+    fs::write(&txt, "hello not an object\n").unwrap();
+    let arc = dir.path().join("mixed.a");
+    assert!(std::process::Command::new("ar")
+        .args([
+            "rc",
+            arc.to_str().unwrap(),
+            opath.to_str().unwrap(),
+            txt.to_str().unwrap()
+        ])
+        .status()
+        .expect("ar")
+        .success());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&arc)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        out.status.success(),
+        "strip failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
+    let mut names = Vec::new();
+    let mut text_data = None;
+    for m in archive.members() {
+        let m = m.unwrap();
+        let name = String::from_utf8_lossy(m.name()).to_string();
+        if name == "readme.txt" {
+            text_data = Some(m.data(&*bytes).unwrap().to_vec());
+        }
+        names.push(name);
     }
+    assert!(
+        names.iter().any(|n| n == "o.o"),
+        "ELF member must remain, got {:?}",
+        names
+    );
+    assert_eq!(
+        text_data.as_deref(),
+        Some(b"hello not an object\n".as_slice()),
+        "non-ELF member must be preserved unmodified, got members {:?}",
+        names
+    );
 }
 
 #[test]
@@ -527,6 +640,36 @@ fn test_strip_removes_all_debug_sections() {
             assert!(!section.name_bytes().unwrap().starts_with(debug_section));
         }
     }
+}
+
+#[test]
+fn test_strip_rejects_unsupported_format() {
+    // #ST3: a non-ELF, non-archive file is rejected with a clear non-zero exit.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("plain.txt");
+    fs::write(&f, "not an object file\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .arg(&f)
+        .output()
+        .expect("failed to run strip");
+    assert!(
+        !out.status.success(),
+        "strip must reject an unsupported format"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported file format"),
+        "diagnostic should name the limitation: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_strip_requires_operand() {
+    // #ST7: at least one file operand is required.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .output()
+        .expect("failed to run strip");
+    assert!(!out.status.success(), "strip with no operand must fail");
 }
 
 #[test]

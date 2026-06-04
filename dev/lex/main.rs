@@ -28,7 +28,9 @@ use std::io::{self, BufRead, Read, Write};
 #[derive(Parser, Debug)]
 #[command(author, version, about = gettext("lex - generate programs for lexical tasks (POSIX compatible)"))]
 struct Args {
-    #[arg(short = 'n', long, help = gettext("Suppress the summary of statistics usually written with the -v option"))]
+    // POSIX SYNOPSIS is `lex [-t] [-n|-v] [file...]`: -n and -v are mutually
+    // exclusive.
+    #[arg(short = 'n', long, conflicts_with = "verbose", help = gettext("Suppress the summary of statistics usually written with the -v option"))]
     no_stats: bool,
 
     #[arg(short = 't', long, help = gettext("Write the resulting program to standard output instead of lex.yy.c"))]
@@ -37,7 +39,9 @@ struct Args {
     #[arg(short, long, help = gettext("Write a summary of lex statistics to the standard output"))]
     verbose: bool,
 
-    #[arg(short, long, default_value = "lex.yy.c", help = gettext("Write output to this filename (unless superceded by -t)"))]
+    // -o/--outfile is a non-POSIX convenience extension; hidden from --help to
+    // keep the advertised CLI surface POSIX-conformant.
+    #[arg(short, long, default_value = "lex.yy.c", hide = true, help = gettext("Write output to this filename (unless superceded by -t)"))]
     outfile: String,
 
     #[arg(help = gettext("Files to read as input"))]
@@ -375,10 +379,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &mut io::stdout()
         };
         write_stats(stats_output, &dfa, &nfa, &lexinfo)?;
-    }
-
-    if !args.stdout {
-        eprintln!("Output written to {}", args.outfile);
     }
 
     Ok(())

@@ -2004,6 +2004,50 @@ fn test_table_size_stats_suppressed_by_n() {
 }
 
 #[test]
+fn test_n_and_v_are_mutually_exclusive() {
+    // POSIX SYNOPSIS `lex [-t] [-n|-v]`: -n and -v cannot be combined.
+    let (combined, ok) = run_lex_capture(&["-n", "-v"], "%%\n[a-z]+ ;\n%%\n");
+    assert!(!ok, "lex should reject -n together with -v");
+    assert!(
+        combined.contains("cannot be used with") || combined.to_lowercase().contains("conflict"),
+        "combining -n and -v should report a conflict: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_no_output_written_chatter() {
+    // #L13: lex must not print a non-POSIX "Output written to ..." notice.
+    let (combined, ok) = run_lex_capture(&[], "%%\n[a-z]+ ;\n%%\n");
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("Output written"),
+        "lex must be silent on success (no 'Output written' chatter): {}",
+        combined
+    );
+}
+
+#[test]
+fn test_outfile_option_hidden_from_help() {
+    // #L8: -o/--outfile is a non-POSIX extension and must not appear in --help,
+    // though it remains functional.
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .arg("--help")
+        .output()
+        .expect("Failed to execute lex");
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !help.contains("--outfile") && !help.contains("outfile"),
+        "-o/--outfile must be hidden from --help: {}",
+        help
+    );
+}
+
+#[test]
 fn test_no_stats_without_verbose_or_table_sizes() {
     // No -v and no table-size declarations => no statistics emitted.
     let source = "%%\n[a-z]+    printf(\"W\\n\");\n%%\n";

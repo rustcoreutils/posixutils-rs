@@ -41,7 +41,7 @@ struct Args {
 
     // -o/--outfile is a non-POSIX convenience extension; hidden from --help to
     // keep the advertised CLI surface POSIX-conformant.
-    #[arg(short, long, default_value = "lex.yy.c", hide = true, help = gettext("Write output to this filename (unless superceded by -t)"))]
+    #[arg(short, long, default_value = "lex.yy.c", hide = true, help = gettext("Write output to this filename (unless superseded by -t)"))]
     outfile: String,
 
     #[arg(help = gettext("Files to read as input"))]

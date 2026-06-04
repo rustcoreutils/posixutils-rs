@@ -239,9 +239,15 @@ fn write_stats<W: Write + ?Sized>(
         "  {} character equivalence classes",
         dfa.char_classes.num_classes
     )?;
-    // Output declared table sizes if any were specified
+    // Output declared table sizes if any were specified. POSIX requires the
+    // implementation to document how these numbers affect lex; this
+    // implementation allocates all tables dynamically, so the declared values
+    // are accepted for compatibility but are advisory only (never a limit).
     if !lexinfo.table_sizes.is_empty() {
-        writeln!(output, "  declared table sizes:")?;
+        writeln!(
+            output,
+            "  declared table sizes (accepted; tables are allocated dynamically, values advisory only):"
+        )?;
         for (key, value) in &lexinfo.table_sizes {
             let desc = match key {
                 'p' => "positions",
@@ -359,8 +365,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     codegen::generate(&mut output, &dfa, &lexinfo, &config)?;
 
-    // Write statistics if requested
-    if args.verbose && !args.no_stats {
+    // Write statistics if requested. POSIX: statistics "may also be generated
+    // if table sizes are specified with a '%' operator ... as long as the -n
+    // option is not specified."
+    if !args.no_stats && (args.verbose || !lexinfo.table_sizes.is_empty()) {
         let stats_output: &mut dyn Write = if args.stdout {
             &mut io::stderr()
         } else {

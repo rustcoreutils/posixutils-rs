@@ -1947,6 +1947,75 @@ fn test_statistics_output() {
     );
 }
 
+/// Run lex with the given extra args and source; return combined stdout+stderr.
+fn run_lex_capture(extra_args: &[&str], source: &str) -> (String, bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file = temp_dir.path().join("test.l");
+    let output_file = temp_dir.path().join("lex.yy.c");
+    fs::write(&lex_file, source).unwrap();
+
+    let mut args: Vec<&str> = extra_args.to_vec();
+    let lex_path = lex_file.to_str().unwrap().to_string();
+    let out_path = output_file.to_str().unwrap().to_string();
+    args.extend_from_slice(&[lex_path.as_str(), "-o", out_path.as_str()]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .args(&args)
+        .output()
+        .expect("Failed to execute lex");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (combined, output.status.success())
+}
+
+#[test]
+fn test_table_size_decl_triggers_stats() {
+    // POSIX: statistics may be generated when table sizes are declared with a
+    // '%' operator, even without -v (as long as -n is not given).
+    let source = "%n 600\n%a 1000\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        combined.contains("declared table sizes"),
+        "table-size declarations must trigger stats without -v: {}",
+        combined
+    );
+    assert!(
+        combined.contains("advisory only"),
+        "stats must document that table sizes are advisory (dynamic allocation): {}",
+        combined
+    );
+}
+
+#[test]
+fn test_table_size_stats_suppressed_by_n() {
+    // -n suppresses the statistics even when table sizes are declared.
+    let source = "%n 600\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&["-n"], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("declared table sizes"),
+        "-n must suppress table-size stats: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_no_stats_without_verbose_or_table_sizes() {
+    // No -v and no table-size declarations => no statistics emitted.
+    let source = "%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("NFA states") && !combined.contains("declared table sizes"),
+        "no stats should be emitted without -v or %-declared table sizes: {}",
+        combined
+    );
+}
+
 #[test]
 fn test_echo_macro() {
     // Test explicit ECHO macro usage

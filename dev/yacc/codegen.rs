@@ -148,7 +148,7 @@ fn generate_code_file(
     writeln!(w)?;
 
     // Token definitions
-    generate_token_defines(&mut w, grammar, opts)?;
+    generate_token_defines(&mut w, grammar)?;
     writeln!(w)?;
 
     // YYSTYPE definition
@@ -216,12 +216,13 @@ typedef int YYSTYPE;
     Ok(())
 }
 
-/// Generate token #define statements
-fn generate_token_defines<W: Write>(
-    w: &mut W,
-    grammar: &Grammar,
-    opts: &Options,
-) -> Result<(), YaccError> {
+/// Generate token #define statements.
+///
+/// Token names are emitted verbatim. POSIX scopes the -p sym_prefix to the
+/// external names yacc itself produces (yyparse, yylex, yyerror, yylval,
+/// yychar, yydebug) — NOT user-declared token names, which the separate lexer
+/// translation unit must keep referring to by their original spelling.
+fn generate_token_defines<W: Write>(w: &mut W, grammar: &Grammar) -> Result<(), YaccError> {
     writeln!(w, "/* Token definitions */")?;
 
     // Collect tokens that need #define (exclude char literals and special tokens)
@@ -245,12 +246,7 @@ fn generate_token_defines<W: Write>(
     tokens.sort_by_key(|(_, n)| *n);
 
     for (name, num) in &tokens {
-        let prefixed_name = if opts.sym_prefix != "yy" {
-            format!("{}_{}", opts.sym_prefix.to_uppercase(), name)
-        } else {
-            name.clone()
-        };
-        writeln!(w, "#define {} {}", prefixed_name, num)?;
+        writeln!(w, "#define {} {}", name, num)?;
     }
 
     Ok(())
@@ -1707,7 +1703,7 @@ fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result
     writeln!(w)?;
 
     // Token definitions
-    generate_token_defines(&mut w, grammar, opts)?;
+    generate_token_defines(&mut w, grammar)?;
     writeln!(w)?;
 
     // YYSTYPE definition

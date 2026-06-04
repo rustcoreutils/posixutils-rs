@@ -535,6 +535,18 @@ impl Grammar {
                 }
             }
             ParsedSymbol::CharLiteral(c) => {
+                // POSIX RATIONALE 124342-6: multi-byte characters should be
+                // returned as tokens by the lexer, not as multi-byte character
+                // literals. A literal codepoint must fit in a single byte
+                // (1..=255); 0 (NUL) is reserved for end-of-input.
+                let cp = *c as u32;
+                if !(1..=255).contains(&cp) {
+                    return Err(grammar_error(format!(
+                        "character literal '{}' (U+{:04X}) is out of range; \
+                         only single-byte characters 1..=255 are allowed",
+                        c, cp
+                    )));
+                }
                 let name = format!("'{}'", c);
                 if let Some(&id) = self.symbol_map.get(&name) {
                     Ok(id)

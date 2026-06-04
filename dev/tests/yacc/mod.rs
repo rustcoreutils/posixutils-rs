@@ -1585,8 +1585,9 @@ expr : FOO
 }
 
 #[test]
-fn test_nul_char_conflicts_with_eof() {
-    // Test that '\0' character literal conflicts with EOF (token number 0)
+fn test_nul_char_literal_rejected() {
+    // The '\0' character literal (codepoint 0) is reserved for end-of-input
+    // and is rejected as out of the single-byte 1..=255 range.
     let grammar = r#"
 %token NUM
 %%
@@ -1607,13 +1608,13 @@ expr : '\0'
 
     assert!(
         !output.status.success(),
-        "yacc should fail when '\\0' conflicts with EOF"
+        "yacc should fail when '\\0' is used as a character literal"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("duplicate token number 0"),
-        "error message should mention conflict with token 0 (EOF): {}",
+        stderr.contains("out of range"),
+        "error message should reject the NUL character literal: {}",
         stderr
     );
 }
@@ -3724,5 +3725,46 @@ fn test_description_file_reports_table_limits() {
         desc.contains("Internal table limits"),
         "description file must report internal table limits (POSIX 123740-3): {}",
         desc
+    );
+}
+
+// --- -p must not mangle user token names; reject multi-byte char literals ---
+
+#[test]
+fn test_p_prefix_leaves_token_names_unmangled() {
+    // POSIX 123655-60: -p renames only the external names yacc produces, not
+    // user-declared token names (the lexer in another TU still says NUM).
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&["-p", "foo"], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("#define NUM "),
+        "user token NUM must be defined unprefixed under -p: {}",
+        code
+    );
+    assert!(
+        !code.contains("#define FOO_NUM"),
+        "user token NUM must NOT be mangled to FOO_NUM under -p: {}",
+        code
+    );
+}
+
+#[test]
+fn test_multibyte_char_literal_rejected() {
+    // POSIX RATIONALE 124342-6: multi-byte characters must not be returned as
+    // character literals. A char literal's token number is its byte value, so
+    // a codepoint > 255 (here U+20AC '€') cannot be represented and is an error.
+    let grammar = "%token NUM\n%%\nexpr : '\u{20ac}' | NUM ;\n";
+
+    let output = run_yacc(&[], grammar);
+    assert!(
+        !output.status.success(),
+        "yacc should reject a multi-byte character literal"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("out of range"),
+        "diagnostic should explain the char literal is out of range: {}",
+        stderr
     );
 }

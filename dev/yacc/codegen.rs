@@ -118,10 +118,13 @@ fn generate_code_file(
 
     // Parser sentinel values (POSIX, Austin Group Defect 1269):
     // YYEMPTY shall be a negative parenthesized integer, YYEOF shall be 0.
+    // YYEMPTY is -1 to match the value the parser uses internally for the
+    // "empty lookahead" state (see the yychar = YYEMPTY assignments below);
+    // they must agree so user code can test `yychar == YYEMPTY`.
     writeln!(
         w,
         r#"#ifndef YYEMPTY
-# define YYEMPTY (-2)
+# define YYEMPTY (-1)
 #endif
 #ifndef YYEOF
 # define YYEOF 0
@@ -999,7 +1002,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "#define yyerrok ({}errflag = 0)", prefix)?;
     writeln!(w)?;
     writeln!(w, "/* yyclearin - discard lookahead token */")?;
-    writeln!(w, "#define yyclearin ({}char = -1)", prefix)?;
+    writeln!(w, "#define yyclearin ({}char = YYEMPTY)", prefix)?;
     writeln!(w)?;
     writeln!(
         w,
@@ -1054,7 +1057,7 @@ fn generate_parser<W: Write>(
 
     // Initialize
     writeln!(w, "    {}state = 0;", prefix)?;
-    writeln!(w, "    {}char = -1;", prefix)?;
+    writeln!(w, "    {}char = YYEMPTY;", prefix)?;
     writeln!(w, "    {}nerrs = 0;", prefix)?;
     writeln!(w)?;
 
@@ -1261,7 +1264,11 @@ fn generate_parser<W: Write>(
     writeln!(w, "        {}state = {}n;", prefix, prefix)?;
     // Don't clear yychar when it's EOF (0) - we need to remember we've seen EOF
     // to avoid calling yylex() again in the final state
-    writeln!(w, "        if ({}char != 0) {}char = -1;", prefix, prefix)?;
+    writeln!(
+        w,
+        "        if ({}char != 0) {}char = YYEMPTY;",
+        prefix, prefix
+    )?;
     writeln!(w, "        if ({}errflag > 0) {}errflag--;", prefix, prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
     writeln!(w, "    }} else if ({}n == INT16_MIN) {{", prefix)?;
@@ -1418,7 +1425,7 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w, "        }}")?;
     writeln!(w, "#endif")?;
-    writeln!(w, "        {}char = -1;", prefix)?;
+    writeln!(w, "        {}char = YYEMPTY;", prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
     writeln!(w, "    }}")?;
     writeln!(w)?;

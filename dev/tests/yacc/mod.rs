@@ -3636,6 +3636,52 @@ fn test_code_file_defines_yyempty_yyeof() {
 }
 
 #[test]
+fn test_yyempty_matches_parser_empty_sentinel() {
+    // YYEMPTY must equal the value the generated parser actually uses for the
+    // "empty lookahead" state (yyclearin / init set yychar to it). The parser
+    // uses -1, so YYEMPTY must be -1 and the parser must reference the macro,
+    // otherwise `yychar == YYEMPTY` after yyclearin would be false.
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("define YYEMPTY (-1)"),
+        "YYEMPTY must be -1 to match the parser's empty-lookahead sentinel: {}",
+        code
+    );
+    assert!(
+        code.contains("#define yyclearin (yychar = YYEMPTY)"),
+        "yyclearin must clear the lookahead via YYEMPTY, not a bare literal: {}",
+        code
+    );
+
+    // Compile-time proof that the macro value is the sentinel value.
+    let probe = format!(
+        "{}\n_Static_assert(YYEMPTY == -1, \"YYEMPTY must match parser sentinel\");\nint use_it(void){{return YYEMPTY;}}\n",
+        code
+    );
+    let temp_dir = TempDir::new().unwrap();
+    let c_path = temp_dir.path().join("probe.c");
+    fs::write(&c_path, probe).unwrap();
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-Werror",
+            "-c",
+            "-o",
+            temp_dir.path().join("probe.o").to_str().unwrap(),
+            c_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile.status.success(),
+        "_Static_assert(YYEMPTY == -1) must hold: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+}
+
+#[test]
 fn test_code_file_yyparse_prototype() {
     let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
     let code = gen_and_read(&[], grammar, "y.tab.c");

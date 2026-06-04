@@ -15,6 +15,7 @@
 
 use crate::error::YaccError;
 use crate::lexer::{PositionedToken, Token};
+use gettextrs::gettext;
 use plib::diag;
 
 /// Associativity of operators
@@ -168,11 +169,23 @@ impl<'a> Parser<'a> {
             }
             Some(t) => Err(self.syntax_error(
                 t.line,
-                format!("expected {:?}, found {:?}", expected, t.token),
+                format!(
+                    "{} {:?}, {} {:?}",
+                    gettext("expected"),
+                    expected,
+                    gettext("found"),
+                    t.token
+                ),
             )),
-            None => {
-                Err(self.syntax_error(0, format!("expected {:?}, found end of input", expected)))
-            }
+            None => Err(self.syntax_error(
+                0,
+                format!(
+                    "{} {:?}, {}",
+                    gettext("expected"),
+                    expected,
+                    gettext("found end of input")
+                ),
+            )),
         }
     }
 
@@ -217,7 +230,7 @@ impl<'a> Parser<'a> {
                     if grammar.union_def.is_some() {
                         return Err(self.syntax_error(
                             self.current_line(),
-                            "multiple %union declarations".into(),
+                            gettext("multiple %union declarations"),
                         ));
                     }
                     let line = self.current_line();
@@ -261,7 +274,7 @@ impl<'a> Parser<'a> {
                     } else {
                         return Err(self.syntax_error(
                             self.current_line(),
-                            "expected identifier after %start".into(),
+                            gettext("expected identifier after %start"),
                         ));
                     }
                 }
@@ -271,7 +284,7 @@ impl<'a> Parser<'a> {
                         if *n < 0 {
                             return Err(self.syntax_error(
                                 self.current_line(),
-                                "expected non-negative number after %expect".into(),
+                                gettext("expected non-negative number after %expect"),
                             ));
                         }
                         grammar.expect_sr = Some(*n as usize);
@@ -279,7 +292,7 @@ impl<'a> Parser<'a> {
                     } else {
                         return Err(self.syntax_error(
                             self.current_line(),
-                            "expected number after %expect".into(),
+                            gettext("expected number after %expect"),
                         ));
                     }
                 }
@@ -289,7 +302,7 @@ impl<'a> Parser<'a> {
                         if *n < 0 {
                             return Err(self.syntax_error(
                                 self.current_line(),
-                                "expected non-negative number after %expect-rr".into(),
+                                gettext("expected non-negative number after %expect-rr"),
                             ));
                         }
                         grammar.expect_rr = Some(*n as usize);
@@ -297,20 +310,21 @@ impl<'a> Parser<'a> {
                     } else {
                         return Err(self.syntax_error(
                             self.current_line(),
-                            "expected number after %expect-rr".into(),
+                            gettext("expected number after %expect-rr"),
                         ));
                     }
                 }
                 None => {
                     return Err(
-                        self.syntax_error(0, "unexpected end of input in declarations".into())
+                        self.syntax_error(0, gettext("unexpected end of input in declarations"))
                     )
                 }
                 _ => {
                     return Err(self.syntax_error(
                         self.current_line(),
                         format!(
-                            "unexpected token in declarations: {:?}",
+                            "{}: {:?}",
+                            gettext("unexpected token in declarations"),
                             self.current_token()
                         ),
                     ))
@@ -406,7 +420,7 @@ impl<'a> Parser<'a> {
             self.advance();
             t
         } else {
-            return Err(self.syntax_error(self.current_line(), "%type requires a <tag>".into()));
+            return Err(self.syntax_error(self.current_line(), gettext("%type requires a <tag>")));
         };
 
         let mut symbols = Vec::new();
@@ -420,7 +434,7 @@ impl<'a> Parser<'a> {
         if symbols.is_empty() {
             return Err(self.syntax_error(
                 self.current_line(),
-                "%type requires at least one symbol".into(),
+                gettext("%type requires at least one symbol"),
             ));
         }
 
@@ -458,7 +472,11 @@ impl<'a> Parser<'a> {
                         }
                         return Err(self.syntax_error(
                             self.current_line(),
-                            format!("unexpected token in rule: {:?}", self.current_token()),
+                            format!(
+                                "{}: {:?}",
+                                gettext("unexpected token in rule"),
+                                self.current_token()
+                            ),
                         ));
                     }
                 }
@@ -510,7 +528,7 @@ impl<'a> Parser<'a> {
                         _ => {
                             return Err(self.syntax_error(
                                 self.current_line(),
-                                "expected token name after %prec".into(),
+                                gettext("expected token name after %prec"),
                             ));
                         }
                     }
@@ -542,7 +560,11 @@ impl<'a> Parser<'a> {
                 _ => {
                     return Err(self.syntax_error(
                         self.current_line(),
-                        format!("unexpected token in rule body: {:?}", self.current_token()),
+                        format!(
+                            "{}: {:?}",
+                            gettext("unexpected token in rule body"),
+                            self.current_token()
+                        ),
                     ));
                 }
             }

@@ -14,6 +14,7 @@
 //! comments and escape sequences per ISO C.
 
 use crate::error::YaccError;
+use gettextrs::gettext;
 use plib::diag;
 
 /// Token types for yacc grammar files
@@ -196,7 +197,11 @@ impl<'a> Lexer<'a> {
             }
         }
         s.parse::<i32>().map_err(|_| {
-            self.lexical_error(self.line, self.column, format!("invalid number: {}", s))
+            self.lexical_error(
+                self.line,
+                self.column,
+                format!("{}: {}", gettext("invalid number"), s),
+            )
         })
     }
 
@@ -241,7 +246,7 @@ impl<'a> Lexer<'a> {
                             return Err(self.lexical_error(
                                 start_line,
                                 start_col,
-                                "\\x used with no following hex digits".into(),
+                                gettext("\\x used with no following hex digits"),
                             ));
                         }
                         let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
@@ -276,7 +281,7 @@ impl<'a> Lexer<'a> {
                         return Err(self.lexical_error(
                             start_line,
                             start_col,
-                            "unterminated character literal".into(),
+                            gettext("unterminated character literal"),
                         ))
                     }
                 }
@@ -286,7 +291,7 @@ impl<'a> Lexer<'a> {
                 return Err(self.lexical_error(
                     start_line,
                     start_col,
-                    "unterminated character literal".into(),
+                    gettext("unterminated character literal"),
                 ))
             }
         };
@@ -295,7 +300,7 @@ impl<'a> Lexer<'a> {
             return Err(self.lexical_error(
                 start_line,
                 start_col,
-                "unterminated character literal".into(),
+                gettext("unterminated character literal"),
             ));
         }
 
@@ -316,7 +321,7 @@ impl<'a> Lexer<'a> {
                     return Err(self.lexical_error(
                         start_line,
                         start_col,
-                        "unterminated tag".into(),
+                        gettext("unterminated tag"),
                     ))
                 }
             }
@@ -418,7 +423,7 @@ impl<'a> Lexer<'a> {
                     return Err(self.lexical_error(
                         start_line,
                         start_col,
-                        "unterminated action".into(),
+                        gettext("unterminated action"),
                     ))
                 }
             }
@@ -448,7 +453,7 @@ impl<'a> Lexer<'a> {
                     return Err(self.lexical_error(
                         start_line,
                         start_col,
-                        "unterminated %{ %}".into(),
+                        gettext("unterminated %{ %}"),
                     ))
                 }
             }
@@ -465,7 +470,7 @@ impl<'a> Lexer<'a> {
             return Err(self.lexical_error(
                 self.line,
                 self.column,
-                "expected '{' after %union".into(),
+                gettext("expected '{' after %union"),
             ));
         }
 
@@ -541,7 +546,7 @@ impl<'a> Lexer<'a> {
                                 return Err(self.lexical_error(
                                     line,
                                     self.column,
-                                    format!("unknown directive: %{}", word),
+                                    format!("{}: %{}", gettext("unknown directive"), word),
                                 ))
                             }
                         }
@@ -550,7 +555,7 @@ impl<'a> Lexer<'a> {
                         return Err(self.lexical_error(
                             line,
                             self.column,
-                            "invalid character after '%'".into(),
+                            gettext("invalid character after '%'"),
                         ))
                     }
                 }
@@ -606,7 +611,7 @@ impl<'a> Lexer<'a> {
                 return Err(self.lexical_error(
                     line,
                     self.column,
-                    format!("unexpected character: '{}'", c),
+                    format!("{}: '{}'", gettext("unexpected character"), c),
                 ))
             }
         };

@@ -18,6 +18,7 @@ use crate::error::YaccError;
 use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL};
 use crate::lalr::{Action, LALRAutomaton};
 use crate::Options;
+use gettextrs::gettext;
 use plib::diag;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -85,7 +86,7 @@ fn generate_code_file(
     lalr: &LALRAutomaton,
 ) -> Result<(), YaccError> {
     let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("cannot create '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
     let mut w = BufWriter::new(file);
 
     // Header comments
@@ -115,6 +116,22 @@ fn generate_code_file(
         )?;
     }
 
+    // Parser sentinel values (POSIX, Austin Group Defect 1269):
+    // YYEMPTY shall be a negative parenthesized integer, YYEOF shall be 0.
+    // YYEMPTY is -1 to match the value the parser uses internally for the
+    // "empty lookahead" state (see the yychar = YYEMPTY assignments below);
+    // they must agree so user code can test `yychar == YYEMPTY`.
+    writeln!(
+        w,
+        r#"#ifndef YYEMPTY
+# define YYEMPTY (-1)
+#endif
+#ifndef YYEOF
+# define YYEOF 0
+#endif
+"#
+    )?;
+
     // Standard includes
     writeln!(
         w,
@@ -135,7 +152,7 @@ fn generate_code_file(
     writeln!(w)?;
 
     // Token definitions
-    generate_token_defines(&mut w, grammar, opts)?;
+    generate_token_defines(&mut w, grammar)?;
     writeln!(w)?;
 
     // YYSTYPE definition
@@ -165,13 +182,22 @@ typedef int YYSTYPE;
     writeln!(w, "/* External declarations */")?;
     writeln!(w, "extern YYSTYPE {}lval;", prefix)?;
     writeln!(w, "extern int {}char;", prefix)?;
+    // yynerrs is a non-POSIX Bison-ism, kept for historical compatibility.
     writeln!(w, "extern int {}nerrs;", prefix)?;
     writeln!(w)?;
 
-    // Function declarations
+    // Function declarations. POSIX (Austin Group Defect 1388) mandates
+    // prototypes for yylex, yyerror, and yyparse in the code file; the
+    // yylex/yyerror declarations shall be #ifndef-guarded so a conforming
+    // application can override them with a macro of the same name.
     writeln!(w, "/* Function declarations */")?;
+    writeln!(w, "#ifndef {}lex", prefix)?;
     writeln!(w, "int {}lex(void);", prefix)?;
+    writeln!(w, "#endif")?;
+    writeln!(w, "#ifndef {}error", prefix)?;
     writeln!(w, "void {}error(const char *s);", prefix)?;
+    writeln!(w, "#endif")?;
+    writeln!(w, "int {}parse(void);", prefix)?;
     writeln!(w)?;
 
     // Parser tables
@@ -189,17 +215,18 @@ typedef int YYSTYPE;
     }
 
     w.flush()
-        .map_err(|e| YaccError::Io(format!("error writing '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
 
     Ok(())
 }
 
-/// Generate token #define statements
-fn generate_token_defines<W: Write>(
-    w: &mut W,
-    grammar: &Grammar,
-    opts: &Options,
-) -> Result<(), YaccError> {
+/// Generate token #define statements.
+///
+/// Token names are emitted verbatim. POSIX scopes the -p sym_prefix to the
+/// external names yacc itself produces (yyparse, yylex, yyerror, yylval,
+/// yychar, yydebug) — NOT user-declared token names, which the separate lexer
+/// translation unit must keep referring to by their original spelling.
+fn generate_token_defines<W: Write>(w: &mut W, grammar: &Grammar) -> Result<(), YaccError> {
     writeln!(w, "/* Token definitions */")?;
 
     // Collect tokens that need #define (exclude char literals and special tokens)
@@ -223,12 +250,7 @@ fn generate_token_defines<W: Write>(
     tokens.sort_by_key(|(_, n)| *n);
 
     for (name, num) in &tokens {
-        let prefixed_name = if opts.sym_prefix != "yy" {
-            format!("{}_{}", opts.sym_prefix.to_uppercase(), name)
-        } else {
-            name.clone()
-        };
-        writeln!(w, "#define {} {}", prefixed_name, num)?;
+        writeln!(w, "#define {} {}", name, num)?;
     }
 
     Ok(())
@@ -304,10 +326,9 @@ fn generate_tables<W: Write>(
     // ACTION and GOTO tables in compressed format
     generate_action_goto_tables(w, grammar, lalr, prefix, opts.strict_mode)?;
 
-    // Debug tables (only when debug is enabled)
-    if opts.debug_enabled {
-        generate_debug_tables(w, grammar, prefix)?;
-    }
+    // Debug tables. Always emitted; the C output self-guards with
+    // #if YYDEBUG so a -DYYDEBUG=1 build enables them regardless of -t.
+    generate_debug_tables(w, grammar, prefix)?;
 
     Ok(())
 }
@@ -932,12 +953,11 @@ fn generate_parser<W: Write>(
     writeln!(w, "int {}nerrs;", prefix)?;
     writeln!(w)?;
 
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "int {}debug = 0;", prefix)?;
-        writeln!(w, "#endif")?;
-        writeln!(w)?;
-    }
+    // yydebug is always declared (inside #if YYDEBUG) so -DYYDEBUG=1 works.
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "int {}debug = 0;", prefix)?;
+    writeln!(w, "#endif")?;
+    writeln!(w)?;
 
     // Stack size
     writeln!(
@@ -982,7 +1002,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "#define yyerrok ({}errflag = 0)", prefix)?;
     writeln!(w)?;
     writeln!(w, "/* yyclearin - discard lookahead token */")?;
-    writeln!(w, "#define yyclearin ({}char = -1)", prefix)?;
+    writeln!(w, "#define yyclearin ({}char = YYEMPTY)", prefix)?;
     writeln!(w)?;
     writeln!(
         w,
@@ -1037,21 +1057,19 @@ fn generate_parser<W: Write>(
 
     // Initialize
     writeln!(w, "    {}state = 0;", prefix)?;
-    writeln!(w, "    {}char = -1;", prefix)?;
+    writeln!(w, "    {}char = YYEMPTY;", prefix)?;
     writeln!(w, "    {}nerrs = 0;", prefix)?;
     writeln!(w)?;
 
     writeln!(w, "{}newstate:", prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "    if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "        fprintf(stderr, \"Entering state %d\\n\", {}state);",
-            prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "    if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "        fprintf(stderr, \"Entering state %d\\n\", {}state);",
+        prefix
+    )?;
+    writeln!(w, "#endif")?;
     writeln!(
         w,
         "    {}ss[{}ssp_offset] = {}state;",
@@ -1158,27 +1176,25 @@ fn generate_parser<W: Write>(
     writeln!(w, "    if ({}char < 0) {{", prefix)?;
     writeln!(w, "        {}char = {}lex();", prefix, prefix)?;
     writeln!(w, "        if ({}char < 0) {}char = 0;", prefix, prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug) {{", prefix)?;
-        writeln!(
-            w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
-            prefix,
-            prefix,
-            get_translate_table_size(grammar),
-            prefix,
-            prefix,
-            ERROR_SYMBOL
-        )?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Reading token %s (%d)\\n\", {}tname[{}tok], {}char);",
-            prefix, prefix, prefix
-        )?;
-        writeln!(w, "        }}")?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug) {{", prefix)?;
+    writeln!(
+        w,
+        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix,
+        ERROR_SYMBOL
+    )?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Reading token %s (%d)\\n\", {}tname[{}tok], {}char);",
+        prefix, prefix, prefix
+    )?;
+    writeln!(w, "        }}")?;
+    writeln!(w, "#endif")?;
     writeln!(w, "    }}")?;
     writeln!(w)?;
 
@@ -1219,38 +1235,40 @@ fn generate_parser<W: Write>(
     writeln!(w, "        goto {}default_action;", prefix)?;
     writeln!(w, "    }} else if ({}n > 0) {{", prefix)?;
     writeln!(w, "        /* Shift */")?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug) {{", prefix)?;
-        writeln!(
-            w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
-            prefix,
-            prefix,
-            get_translate_table_size(grammar),
-            prefix,
-            prefix,
-            ERROR_SYMBOL
-        )?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Shifting token %s (%d), entering state %d\\n\",",
-        )?;
-        writeln!(
-            w,
-            "                    {}tname[{}tok], {}char, {}n);",
-            prefix, prefix, prefix, prefix
-        )?;
-        writeln!(w, "        }}")?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug) {{", prefix)?;
+    writeln!(
+        w,
+        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix,
+        ERROR_SYMBOL
+    )?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Shifting token %s (%d), entering state %d\\n\",",
+    )?;
+    writeln!(
+        w,
+        "                    {}tname[{}tok], {}char, {}n);",
+        prefix, prefix, prefix, prefix
+    )?;
+    writeln!(w, "        }}")?;
+    writeln!(w, "#endif")?;
     writeln!(w, "        {}ssp_offset++;", prefix)?;
     writeln!(w, "        {}vsp++;", prefix)?;
     writeln!(w, "        *{}vsp = {}lval;", prefix, prefix)?;
     writeln!(w, "        {}state = {}n;", prefix, prefix)?;
     // Don't clear yychar when it's EOF (0) - we need to remember we've seen EOF
     // to avoid calling yylex() again in the final state
-    writeln!(w, "        if ({}char != 0) {}char = -1;", prefix, prefix)?;
+    writeln!(
+        w,
+        "        if ({}char != 0) {}char = YYEMPTY;",
+        prefix, prefix
+    )?;
     writeln!(w, "        if ({}errflag > 0) {}errflag--;", prefix, prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
     writeln!(w, "    }} else if ({}n == INT16_MIN) {{", prefix)?;
@@ -1278,16 +1296,14 @@ fn generate_parser<W: Write>(
 
     // Reduce
     writeln!(w, "{}reduce:", prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "    if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "        fprintf(stderr, \"Reducing by rule %d (%s)\\n\", {}n, {}rule[{}n]);",
-            prefix, prefix, prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "    if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "        fprintf(stderr, \"Reducing by rule %d (%s)\\n\", {}n, {}rule[{}n]);",
+        prefix, prefix, prefix
+    )?;
+    writeln!(w, "#endif")?;
 
     // Switch on rule number for semantic actions
     writeln!(w, "    switch ({}n) {{", prefix)?;
@@ -1390,28 +1406,26 @@ fn generate_parser<W: Write>(
         "        if ({}char == 0) goto {}abortlab;  /* EOF, can't recover */",
         prefix, prefix
     )?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug) {{", prefix)?;
-        writeln!(
-            w,
-            "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
-            prefix,
-            prefix,
-            get_translate_table_size(grammar),
-            prefix,
-            prefix,
-            ERROR_SYMBOL
-        )?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Error recovery: discarding token %s (%d)\\n\", {}tname[{}tok], {}char);",
-            prefix, prefix, prefix
-        )?;
-        writeln!(w, "        }}")?;
-        writeln!(w, "#endif")?;
-    }
-    writeln!(w, "        {}char = -1;", prefix)?;
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug) {{", prefix)?;
+    writeln!(
+        w,
+        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        prefix,
+        prefix,
+        get_translate_table_size(grammar),
+        prefix,
+        prefix,
+        ERROR_SYMBOL
+    )?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Error recovery: discarding token %s (%d)\\n\", {}tname[{}tok], {}char);",
+        prefix, prefix, prefix
+    )?;
+    writeln!(w, "        }}")?;
+    writeln!(w, "#endif")?;
+    writeln!(w, "        {}char = YYEMPTY;", prefix)?;
     writeln!(w, "        goto {}newstate;", prefix)?;
     writeln!(w, "    }}")?;
     writeln!(w)?;
@@ -1428,16 +1442,14 @@ fn generate_parser<W: Write>(
     )?;
     // Check if action is a shift (positive value)
     writeln!(w, "        if ({}n > 0) {{", prefix)?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "            if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "                fprintf(stderr, \"Shifting error token, entering state %d\\n\", {}n);",
-            prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "            if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "                fprintf(stderr, \"Shifting error token, entering state %d\\n\", {}n);",
+        prefix
+    )?;
+    writeln!(w, "#endif")?;
     writeln!(w, "            /* Shift the error token */")?;
     writeln!(w, "            {}ssp_offset++;", prefix)?;
     writeln!(w, "            {}vsp++;", prefix)?;
@@ -1449,16 +1461,14 @@ fn generate_parser<W: Write>(
         "        if ({}ssp_offset <= 0) goto {}abortlab;",
         prefix, prefix
     )?;
-    if opts.debug_enabled {
-        writeln!(w, "#if YYDEBUG")?;
-        writeln!(w, "        if ({}debug)", prefix)?;
-        writeln!(
-            w,
-            "            fprintf(stderr, \"Error recovery: popping state %d\\n\", {}state);",
-            prefix
-        )?;
-        writeln!(w, "#endif")?;
-    }
+    writeln!(w, "#if YYDEBUG")?;
+    writeln!(w, "        if ({}debug)", prefix)?;
+    writeln!(
+        w,
+        "            fprintf(stderr, \"Error recovery: popping state %d\\n\", {}state);",
+        prefix
+    )?;
+    writeln!(w, "#endif")?;
     writeln!(w, "        {}ssp_offset--;", prefix)?;
     writeln!(w, "        {}vsp--;", prefix)?;
     writeln!(
@@ -1540,8 +1550,10 @@ fn transform_action(
                             diag::warning_at(
                                 diag::Position::line_only(prod.line as u32),
                                 &format!(
-                                    "$$ has no declared type; '{}' lacks a %type declaration",
-                                    lhs_name
+                                    "$$ {}; '{}' {}",
+                                    gettext("has no declared type"),
+                                    lhs_name,
+                                    gettext("lacks a %type declaration")
                                 ),
                             );
                         }
@@ -1630,8 +1642,11 @@ fn transform_action(
                             diag::warning_at(
                                 diag::Position::line_only(prod.line as u32),
                                 &format!(
-                                    "${} has no declared type; '{}' lacks a %type declaration",
-                                    n, name
+                                    "${} {}; '{}' {}",
+                                    n,
+                                    gettext("has no declared type"),
+                                    name,
+                                    gettext("lacks a %type declaration")
                                 ),
                             );
                         }
@@ -1690,7 +1705,7 @@ fn generate_stack_reference(n: i32, rhs_len: usize, tag: Option<&str>, prefix: &
 /// Generate header file (y.tab.h)
 fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result<(), YaccError> {
     let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("cannot create '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
     let mut w = BufWriter::new(file);
 
     writeln!(
@@ -1701,7 +1716,7 @@ fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result
     writeln!(w)?;
 
     // Token definitions
-    generate_token_defines(&mut w, grammar, opts)?;
+    generate_token_defines(&mut w, grammar)?;
     writeln!(w)?;
 
     // YYSTYPE definition
@@ -1730,7 +1745,7 @@ typedef int YYSTYPE;
     writeln!(w, "extern YYSTYPE {}lval;", opts.sym_prefix)?;
 
     w.flush()
-        .map_err(|e| YaccError::Io(format!("error writing '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
 
     Ok(())
 }
@@ -1742,7 +1757,7 @@ fn generate_description_file(
     lalr: &LALRAutomaton,
 ) -> Result<(), YaccError> {
     let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("cannot create '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
     let mut w = BufWriter::new(file);
 
     writeln!(w, "Grammar")?;
@@ -1895,6 +1910,10 @@ fn generate_description_file(
         "  Actions:       {:5}",
         lalr.action_table.iter().map(|a| a.len()).sum::<usize>()
     )?;
+    // POSIX 123740-3: internal-table limits "shall also be reported, in an
+    // implementation-defined manner." This implementation allocates tables
+    // dynamically and so has no fixed limits to report (spec-permitted).
+    writeln!(w, "  Internal table limits: dynamic; no fixed limits.")?;
 
     let (sr, rr) = lalr.count_conflicts();
     if sr > 0 || rr > 0 {
@@ -1958,7 +1977,7 @@ fn generate_description_file(
     }
 
     w.flush()
-        .map_err(|e| YaccError::Io(format!("error writing '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
 
     Ok(())
 }

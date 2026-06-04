@@ -694,8 +694,11 @@ expr : NUM
 }
 
 #[test]
-fn test_debug_not_enabled_without_t_flag() {
-    // Test that debug tables are NOT generated without -t
+fn test_debug_default_off_but_code_present() {
+    // Without -t, YYDEBUG defaults to 0, but per POSIX the debugging code
+    // (tables + yydebug + trace) must still be EMITTED, guarded by
+    // #if YYDEBUG, so a -DYYDEBUG=1 build can enable it. -t only flips the
+    // compile-time default value.
     let grammar = r#"
 %token NUM
 %%
@@ -719,16 +722,20 @@ expr : NUM
     let code_path = temp_dir.path().join("y.tab.c");
     let code = fs::read_to_string(&code_path).expect("should read generated code");
 
-    // Check that YYDEBUG is set to 0
+    // Default value is 0 without -t.
     assert!(
         code.contains("#define YYDEBUG 0") || code.contains("# define YYDEBUG 0"),
-        "generated code should define YYDEBUG to 0 without -t flag"
+        "generated code should default YYDEBUG to 0 without -t flag"
     );
 
-    // Check that debug tables are NOT present
+    // But the debug tables and trace ARE emitted, guarded by #if YYDEBUG.
     assert!(
-        !code.contains("yytname["),
-        "generated code should NOT have yytname table without -t flag"
+        code.contains("#if YYDEBUG"),
+        "debug code must be present, guarded by #if YYDEBUG"
+    );
+    assert!(
+        code.contains("yytname"),
+        "yytname debug table must be emitted even without -t (guarded by #if YYDEBUG)"
     );
 }
 
@@ -814,6 +821,90 @@ expr : NUM
     assert!(
         code.contains("Reading token"),
         "debug output should include token read messages"
+    );
+}
+
+#[test]
+fn test_yydebug_enabled_at_compile_without_t_flag() {
+    // POSIX 123150-4: "If YYDEBUG has a non-zero value, the debugging code
+    // shall be included." A parser generated WITHOUT -t must still honor a
+    // compile-time -DYYDEBUG=1 and emit a runtime trace when yydebug != 0.
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <stdlib.h>
+
+int yylex(void);
+void yyerror(const char *s);
+%}
+
+%token NUM
+%%
+input : NUM ;
+%%
+
+static int token_returned = 0;
+int yylval;
+
+int yylex(void) {
+    if (token_returned) return 0;
+    token_returned = 1;
+    return NUM;
+}
+
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+
+int main(void) {
+    yydebug = 1;
+    return yyparse();
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // Generate WITHOUT -t.
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args([grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(output.status.success(), "yacc should succeed");
+
+    // Compile with -DYYDEBUG=1 even though -t was not given; the debug code
+    // (including the yydebug variable main() references) must be present.
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("ydebug_parser");
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args([
+            "-DYYDEBUG=1",
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile.status.success(),
+        "cc -DYYDEBUG=1 should compile a non-`-t` parser: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run; with yydebug=1 the trace must appear on stderr.
+    let run = Command::new(&exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute parser");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("Entering state"),
+        "yydebug=1 must produce a runtime trace, got stderr: {}",
+        stderr
     );
 }
 
@@ -1494,8 +1585,9 @@ expr : FOO
 }
 
 #[test]
-fn test_nul_char_conflicts_with_eof() {
-    // Test that '\0' character literal conflicts with EOF (token number 0)
+fn test_nul_char_literal_rejected() {
+    // The '\0' character literal (codepoint 0) is reserved for end-of-input
+    // and is rejected as out of the single-byte 1..=255 range.
     let grammar = r#"
 %token NUM
 %%
@@ -1516,13 +1608,13 @@ expr : '\0'
 
     assert!(
         !output.status.success(),
-        "yacc should fail when '\\0' conflicts with EOF"
+        "yacc should fail when '\\0' is used as a character literal"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("duplicate token number 0"),
-        "error message should mention conflict with token 0 (EOF): {}",
+        stderr.contains("out of range"),
+        "error message should reject the NUL character literal: {}",
         stderr
     );
 }
@@ -3496,6 +3588,350 @@ B : /* empty */ ;
     assert!(
         stderr.contains("reduce/reduce conflict"),
         "should report expected vs actual mismatch, got: {}",
+        stderr
+    );
+}
+
+/// Run yacc and return the text of a generated file in the working dir.
+fn gen_and_read(args: &[&str], grammar: &str, filename: &str) -> String {
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let mut cmd_args: Vec<&str> = args.to_vec();
+    cmd_args.push(grammar_path.to_str().unwrap());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&cmd_args)
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::read_to_string(temp_dir.path().join(filename))
+        .unwrap_or_else(|e| panic!("should read generated {}: {}", filename, e))
+}
+
+// --- POSIX code-file boilerplate (Austin Group Defects 1269 & 1388) ---
+
+#[test]
+fn test_code_file_defines_yyempty_yyeof() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("define YYEMPTY"),
+        "code file must #define YYEMPTY (Austin Group Defect 1269): {}",
+        code
+    );
+    assert!(
+        code.contains("define YYEOF 0"),
+        "code file must #define YYEOF as 0 (Austin Group Defect 1269): {}",
+        code
+    );
+}
+
+#[test]
+fn test_yyempty_matches_parser_empty_sentinel() {
+    // YYEMPTY must equal the value the generated parser actually uses for the
+    // "empty lookahead" state (yyclearin / init set yychar to it). The parser
+    // uses -1, so YYEMPTY must be -1 and the parser must reference the macro,
+    // otherwise `yychar == YYEMPTY` after yyclearin would be false.
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("define YYEMPTY (-1)"),
+        "YYEMPTY must be -1 to match the parser's empty-lookahead sentinel: {}",
+        code
+    );
+    assert!(
+        code.contains("#define yyclearin (yychar = YYEMPTY)"),
+        "yyclearin must clear the lookahead via YYEMPTY, not a bare literal: {}",
+        code
+    );
+
+    // Compile-time proof that the macro value is the sentinel value.
+    let probe = format!(
+        "{}\n_Static_assert(YYEMPTY == -1, \"YYEMPTY must match parser sentinel\");\nint use_it(void){{return YYEMPTY;}}\n",
+        code
+    );
+    let temp_dir = TempDir::new().unwrap();
+    let c_path = temp_dir.path().join("probe.c");
+    fs::write(&c_path, probe).unwrap();
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-Werror",
+            "-c",
+            "-o",
+            temp_dir.path().join("probe.o").to_str().unwrap(),
+            c_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile.status.success(),
+        "_Static_assert(YYEMPTY == -1) must hold: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+}
+
+#[test]
+fn test_code_file_yyparse_prototype() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("int yyparse(void);"),
+        "code file must declare yyparse prototype (Austin Group Defect 1388): {}",
+        code
+    );
+}
+
+#[test]
+fn test_code_file_yyerror_yylex_ifndef_guarded() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("#ifndef yylex"),
+        "yylex prototype must be #ifndef-guarded: {}",
+        code
+    );
+    assert!(
+        code.contains("#ifndef yyerror"),
+        "yyerror prototype must be #ifndef-guarded: {}",
+        code
+    );
+}
+
+#[test]
+fn test_code_file_prototype_guards_honor_p_prefix() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&["-p", "foo"], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("#ifndef foolex") && code.contains("#ifndef fooerror"),
+        "prototype guards must use the -p sym_prefix: {}",
+        code
+    );
+    assert!(
+        code.contains("int fooparse(void);"),
+        "yyparse prototype must honor -p sym_prefix: {}",
+        code
+    );
+}
+
+// --- -v description file: always produced + table-limits report ---
+
+#[test]
+fn test_description_file_produced_on_error() {
+    // POSIX CONSEQUENCES OF ERRORS: y.output shall always be produced when -v
+    // is set, even if generation aborts before the tables are built (here the
+    // grammar references a non-terminal that has no rules).
+    let grammar = r#"
+%token NUM
+%%
+expr : undefined_nt ;
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-v", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(
+        !output.status.success(),
+        "yacc should fail on an undefined non-terminal"
+    );
+
+    let out_path = temp_dir.path().join("y.output");
+    assert!(
+        out_path.exists(),
+        "y.output must be produced even when a -v run aborts with an error"
+    );
+}
+
+#[test]
+fn test_description_file_reports_table_limits() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let desc = gen_and_read(&["-v"], grammar, "y.output");
+
+    assert!(
+        desc.contains("Internal table limits"),
+        "description file must report internal table limits (POSIX 123740-3): {}",
+        desc
+    );
+}
+
+#[test]
+fn test_description_stub_write_failure_warns() {
+    // If the mandated -v stub cannot be written (here the -b prefix points
+    // into a non-existent directory), the user must get a diagnostic rather
+    // than a silent failure.
+    let grammar = "%token NUM\n%%\nexpr : undefined_nt ;\n";
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // <prefix>.output lands in a subdirectory that does not exist.
+    let bad_prefix = temp_dir.path().join("nope").join("y");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args([
+            "-v",
+            "-b",
+            bad_prefix.to_str().unwrap(),
+            grammar_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(
+        !output.status.success(),
+        "run should fail (undefined non-terminal)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot write"),
+        "a stub-write failure must be reported on stderr: {}",
+        stderr
+    );
+}
+
+// --- -p must not mangle user token names; reject multi-byte char literals ---
+
+#[test]
+fn test_p_prefix_leaves_token_names_unmangled() {
+    // POSIX 123655-60: -p renames only the external names yacc produces, not
+    // user-declared token names (the lexer in another TU still says NUM).
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&["-p", "foo"], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("#define NUM "),
+        "user token NUM must be defined unprefixed under -p: {}",
+        code
+    );
+    assert!(
+        !code.contains("#define FOO_NUM"),
+        "user token NUM must NOT be mangled to FOO_NUM under -p: {}",
+        code
+    );
+}
+
+#[test]
+fn test_multibyte_char_literal_rejected() {
+    // POSIX RATIONALE 124342-6: multi-byte characters must not be returned as
+    // character literals. A char literal's token number is its byte value, so
+    // a codepoint > 255 (here U+20AC '€') cannot be represented and is an error.
+    let grammar = "%token NUM\n%%\nexpr : '\u{20ac}' | NUM ;\n";
+
+    let output = run_yacc(&[], grammar);
+    assert!(
+        !output.status.success(),
+        "yacc should reject a multi-byte character literal"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("out of range"),
+        "diagnostic should explain the char literal is out of range: {}",
+        stderr
+    );
+}
+
+// --- "--" end-of-options marker (XBD 12.2) ---
+
+#[test]
+fn test_double_dash_end_of_options() {
+    // "--" terminates options; the following argument is the grammar operand.
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+
+    let output = run_yacc(&["--"], grammar);
+    assert!(
+        output.status.success(),
+        "yacc -- <grammar> should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Options before "--" still apply.
+    let header = gen_and_read(&["-d", "--"], grammar, "y.tab.h");
+    assert!(
+        header.contains("#define NUM"),
+        "options before -- must still take effect: {}",
+        header
+    );
+}
+
+#[test]
+fn test_double_dash_allows_dash_prefixed_filename() {
+    // After "--", a grammar file literally named "-dash.y" must be accepted
+    // as an operand rather than parsed as options.
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("-dash.y"), grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["--", "-dash.y"])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(
+        output.status.success(),
+        "yacc -- -dash.y should treat the dash-prefixed name as the grammar: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        temp_dir.path().join("y.tab.c").exists(),
+        "y.tab.c should be generated from the dash-prefixed grammar file"
+    );
+
+    // Control: without "--", the same name is misparsed as options and fails.
+    let bad = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-dash.y"])
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(
+        !bad.status.success(),
+        "without --, a dash-prefixed name is parsed as options and must fail"
+    );
+}
+
+// --- i18n: diagnostics routed through gettext render verbatim (C locale) ---
+
+#[test]
+fn test_diagnostics_render_under_gettext() {
+    // Diagnostic strings are wrapped in gettext(); under the C/POSIX locale
+    // gettext is the identity function, so the English text must be unchanged.
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, "%token NUM\n%%\nexpr : NUM ;\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .env("LC_ALL", "C")
+        .args(["-Z", grammar_path.to_str().unwrap()]) // -Z is not a valid option
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(!output.status.success(), "unknown option must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown option: -Z"),
+        "gettext-routed usage diagnostic must render verbatim: {}",
         stderr
     );
 }

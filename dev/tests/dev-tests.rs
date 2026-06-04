@@ -615,3 +615,45 @@ fn test_strings_print_with_octal_offset() {
         include_str!("strings/with_octal_offset.correct.txt"),
     );
 }
+
+#[test]
+fn test_strings_reads_stdin_when_no_operand() {
+    // POSIX: with no file operand, strings reads standard input.
+    let input = b"\x00\x00hello\x00\x00world\x00";
+    let output = plib::testing::run_test_base("strings", &vec![], input);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\nworld\n");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn test_strings_rejects_n_zero() {
+    // POSIX OPTIONS: -n requires a positive integer.
+    let args = vec![
+        "-n".to_string(),
+        "0".to_string(),
+        "tests/strings/one.txt".to_string(),
+    ];
+    let output = plib::testing::run_test_base("strings", &args, b"");
+    assert!(!output.status.success(), "-n 0 must be rejected");
+}
+
+#[test]
+fn test_strings_continues_after_missing_file() {
+    // A missing file is reported on stderr but the run continues to the next
+    // operand and exits non-zero.
+    let args = vec![
+        "tests/strings/does_not_exist_xyz".to_string(),
+        "tests/strings/one.txt".to_string(),
+    ];
+    let output = plib::testing::run_test_base("strings", &args, b"");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("string"),
+        "the valid file's strings must still be printed"
+    );
+    assert!(
+        !output.status.success(),
+        "a failed file must yield non-zero exit"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("strings:"));
+}

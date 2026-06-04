@@ -8,6 +8,7 @@
 //
 
 use std::ffi::OsString;
+use std::io::Read;
 
 use clap::{Parser, ValueEnum};
 use gettextrs::gettext;
@@ -32,7 +33,7 @@ struct OutputOptions {
     #[arg(short = 't', help = gettext("Byte offset format"))]
     format: Option<OffsetFormat>,
 
-    #[arg(short = 'n', default_value_t = 4, help = gettext("Minimum string length"))]
+    #[arg(short = 'n', default_value_t = 4, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), help = gettext("Minimum string length"))]
     minimum_string_length: usize,
 }
 
@@ -90,17 +91,17 @@ fn read_printable_char(bytes: &[u8]) -> Option<char> {
 }
 
 fn print_string(s: &str, starting_offset: usize, format: Option<OffsetFormat>) {
-    // the width of the byte offset was chosen to match the
-    // behavior of the GNU strings implementation.
+    // POSIX STDOUT 115906-115911 mandates exactly "%d %s" / "%o %s" / "%x %s"
+    // (no field-width padding).
     match format {
         Some(OffsetFormat::Decimal) => {
-            println!("{:7} {}", starting_offset, s);
+            println!("{} {}", starting_offset, s);
         }
         Some(OffsetFormat::Octal) => {
-            println!("{:7o} {}", starting_offset, s);
+            println!("{:o} {}", starting_offset, s);
         }
         Some(OffsetFormat::Hex) => {
-            println!("{:7x} {}", starting_offset, s);
+            println!("{:x} {}", starting_offset, s);
         }
         _ => println!("{}", s),
     }
@@ -162,7 +163,16 @@ fn process_files(files: &[OsString], opts: OutputOptions) {
 fn main() {
     diag::init_locale("strings");
     let args = Args::parse();
-    process_files(&args.input_files, args.output_options);
+    if args.input_files.is_empty() {
+        // POSIX OPERANDS 115878-115881: with no file operand, read stdin.
+        let mut bytes = Vec::new();
+        match std::io::stdin().read_to_end(&mut bytes) {
+            Ok(_) => print_strings(&bytes, args.output_options),
+            Err(err) => diag::error(&format!("{}: {}", gettext("standard input"), err)),
+        }
+    } else {
+        process_files(&args.input_files, args.output_options);
+    }
     std::process::exit(diag::exit_status());
 }
 

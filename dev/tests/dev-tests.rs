@@ -800,3 +800,86 @@ fn test_strings_continues_after_missing_file() {
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("strings:"));
 }
+
+#[test]
+fn test_ar_tv_date_uses_mtime_not_age() {
+    // #A1: the archive date field is the member's mtime (Unix epoch), so
+    // `ar -tv` shows the real year, not 1970 (the old file-age bug).
+    use std::io::Write;
+    use std::time::{Duration, SystemTime};
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("member.txt");
+    {
+        let mut file = fs::File::create(&f).unwrap();
+        file.write_all(b"hello world payload").unwrap();
+        // 1_600_000_000 = 2020-09-13 UTC.
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+            .unwrap();
+    }
+    let arc = dir.path().join("a.a");
+    let create = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("run ar -r");
+    assert!(
+        create.status.success(),
+        "ar -r failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let tv = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-t", "-v", arc.to_str().unwrap()])
+        .env("TZ", "UTC")
+        .output()
+        .expect("run ar -t -v");
+    assert!(
+        tv.status.success(),
+        "ar -t -v failed: {}",
+        String::from_utf8_lossy(&tv.stderr)
+    );
+    let out = String::from_utf8_lossy(&tv.stdout);
+    assert!(
+        out.contains("2020"),
+        "ar -tv date must reflect the member mtime (2020): {}",
+        out
+    );
+    assert!(
+        !out.contains("1970"),
+        "ar -tv date must not show the 1970 file-age bug: {}",
+        out
+    );
+}
+
+#[test]
+fn test_ar_delete_matches_basename() {
+    // #A2: a file operand is matched to a member by its last pathname
+    // component, so `ar -d arc some/dir/foo.o` deletes the member `foo.o`.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("foo.o");
+    fs::write(&f, b"member contents").unwrap();
+    let arc = dir.path().join("a.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("run ar -r")
+        .status
+        .success());
+
+    let del = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-d", arc.to_str().unwrap(), "some/dir/foo.o"])
+        .output()
+        .expect("run ar -d");
+    assert!(
+        del.status.success(),
+        "ar -d failed: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
+    assert_eq!(
+        archive.members().count(),
+        0,
+        "the basename-matched member should have been deleted"
+    );
+}

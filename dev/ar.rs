@@ -177,10 +177,14 @@ impl ArchiveMember {
         let symbols = read_member_symbols(&data);
         let symbol_bytes = symbols.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
 
+        // The archive date field is the member's mtime as Unix epoch seconds
+        // (#A1). The previous `t.elapsed()` stored the file's *age*, producing
+        // dates near 1970-01-01 on `ar -tv` and breaking `ar -ru`.
         let date = file_metadata
             .modified()
             .ok()
-            .map(|t| t.elapsed().ok().map(|d| d.as_secs()).unwrap_or_default())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
             .unwrap_or_default();
 
         Ok(ArchiveMember {
@@ -373,7 +377,13 @@ impl Archive {
     }
 
     fn member_index(&self, name: &OsStr) -> Option<usize> {
-        self.members.iter().position(|m| m.name == name)
+        // POSIX 84379-84380: the comparison of a file operand to archive
+        // member names uses the LAST pathname component of the operand (#A2),
+        // so `ar -d arc sub/foo.o` matches the member `foo.o`.
+        let basename = Path::new(name).file_name().unwrap_or(name);
+        self.members
+            .iter()
+            .position(|m| m.name.as_os_str() == basename)
     }
 
     fn get_member(&self, index: usize) -> &ArchiveMember {

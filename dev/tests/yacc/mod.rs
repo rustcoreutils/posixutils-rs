@@ -3499,3 +3499,92 @@ B : /* empty */ ;
         stderr
     );
 }
+
+/// Run yacc and return the text of a generated file in the working dir.
+fn gen_and_read(args: &[&str], grammar: &str, filename: &str) -> String {
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let mut cmd_args: Vec<&str> = args.to_vec();
+    cmd_args.push(grammar_path.to_str().unwrap());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&cmd_args)
+        .output()
+        .expect("failed to execute yacc-rs");
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::read_to_string(temp_dir.path().join(filename))
+        .unwrap_or_else(|e| panic!("should read generated {}: {}", filename, e))
+}
+
+// --- POSIX code-file boilerplate (Austin Group Defects 1269 & 1388) ---
+
+#[test]
+fn test_code_file_defines_yyempty_yyeof() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("define YYEMPTY"),
+        "code file must #define YYEMPTY (Austin Group Defect 1269): {}",
+        code
+    );
+    assert!(
+        code.contains("define YYEOF 0"),
+        "code file must #define YYEOF as 0 (Austin Group Defect 1269): {}",
+        code
+    );
+}
+
+#[test]
+fn test_code_file_yyparse_prototype() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("int yyparse(void);"),
+        "code file must declare yyparse prototype (Austin Group Defect 1388): {}",
+        code
+    );
+}
+
+#[test]
+fn test_code_file_yyerror_yylex_ifndef_guarded() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("#ifndef yylex"),
+        "yylex prototype must be #ifndef-guarded: {}",
+        code
+    );
+    assert!(
+        code.contains("#ifndef yyerror"),
+        "yyerror prototype must be #ifndef-guarded: {}",
+        code
+    );
+}
+
+#[test]
+fn test_code_file_prototype_guards_honor_p_prefix() {
+    let grammar = "%token NUM\n%%\nexpr : NUM ;\n";
+    let code = gen_and_read(&["-p", "foo"], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("#ifndef foolex") && code.contains("#ifndef fooerror"),
+        "prototype guards must use the -p sym_prefix: {}",
+        code
+    );
+    assert!(
+        code.contains("int fooparse(void);"),
+        "yyparse prototype must honor -p sym_prefix: {}",
+        code
+    );
+}

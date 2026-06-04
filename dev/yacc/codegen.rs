@@ -115,6 +115,19 @@ fn generate_code_file(
         )?;
     }
 
+    // Parser sentinel values (POSIX, Austin Group Defect 1269):
+    // YYEMPTY shall be a negative parenthesized integer, YYEOF shall be 0.
+    writeln!(
+        w,
+        r#"#ifndef YYEMPTY
+# define YYEMPTY (-2)
+#endif
+#ifndef YYEOF
+# define YYEOF 0
+#endif
+"#
+    )?;
+
     // Standard includes
     writeln!(
         w,
@@ -165,13 +178,22 @@ typedef int YYSTYPE;
     writeln!(w, "/* External declarations */")?;
     writeln!(w, "extern YYSTYPE {}lval;", prefix)?;
     writeln!(w, "extern int {}char;", prefix)?;
+    // yynerrs is a non-POSIX Bison-ism, kept for historical compatibility.
     writeln!(w, "extern int {}nerrs;", prefix)?;
     writeln!(w)?;
 
-    // Function declarations
+    // Function declarations. POSIX (Austin Group Defect 1388) mandates
+    // prototypes for yylex, yyerror, and yyparse in the code file; the
+    // yylex/yyerror declarations shall be #ifndef-guarded so a conforming
+    // application can override them with a macro of the same name.
     writeln!(w, "/* Function declarations */")?;
+    writeln!(w, "#ifndef {}lex", prefix)?;
     writeln!(w, "int {}lex(void);", prefix)?;
+    writeln!(w, "#endif")?;
+    writeln!(w, "#ifndef {}error", prefix)?;
     writeln!(w, "void {}error(const char *s);", prefix)?;
+    writeln!(w, "#endif")?;
+    writeln!(w, "int {}parse(void);", prefix)?;
     writeln!(w)?;
 
     // Parser tables

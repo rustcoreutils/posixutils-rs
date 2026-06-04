@@ -21,7 +21,7 @@
 
 /* Forward declarations for lex functions used in check_indent */
 static int input(void);
-static void unput(int c);
+static int unput(int c);
 
 /* Forward declaration for parser */
 extern int yyparse(void);

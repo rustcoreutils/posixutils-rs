@@ -69,7 +69,7 @@ fn concat_input_files(files: &[String]) -> io::Result<Vec<String>> {
                     input.push(line);
                 }
                 Err(e) => {
-                    eprintln!("Error reading file: {}", e);
+                    eprintln!("{}: {}", gettext("Error reading file"), e);
                     return Err(e);
                 }
             }

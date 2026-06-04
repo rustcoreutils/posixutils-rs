@@ -3,6 +3,8 @@
 //! This module handles validation of pattern restrictions per POSIX specification
 //! and parsing of anchoring (^, $) and trailing context (/) operators.
 
+use gettextrs::gettext;
+
 /// Parse anchoring and trailing context from a pattern.
 ///
 /// Returns (bol_anchor, main_pattern, trailing_context, eol_anchor)
@@ -183,7 +185,8 @@ pub fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
     for pos in &caret_positions {
         if *pos != 0 {
             return Err(format!(
-                "'^' operator only valid at beginning of pattern, found at position {}",
+                "{} {}",
+                gettext("'^' operator only valid at beginning of pattern, found at position"),
                 pos
             ));
         }
@@ -194,15 +197,16 @@ pub fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
         // $ must be at the very end of the pattern
         if *pos != chars.len() - 1 {
             return Err(format!(
-                "'$' operator only valid at end of pattern, found at position {}",
+                "{} {}",
+                gettext("'$' operator only valid at end of pattern, found at position"),
                 pos
             ));
         }
         // $ cannot be used with trailing context
         if has_trailing_context {
-            return Err(
-                "'$' cannot be used with trailing context '/'; $ is equivalent to /\\n".to_string(),
-            );
+            return Err(gettext(
+                "'$' cannot be used with trailing context '/'; $ is equivalent to /\\n",
+            ));
         }
     }
 
@@ -210,7 +214,8 @@ pub fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
     let tc_count = count_trailing_context_slashes(pattern);
     if tc_count > 1 {
         return Err(format!(
-            "Only one trailing context operator '/' allowed per pattern, found {}",
+            "{} {}",
+            gettext("Only one trailing context operator '/' allowed per pattern, found"),
             tc_count
         ));
     }

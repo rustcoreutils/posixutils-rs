@@ -21,6 +21,7 @@ use crate::pattern_escape::{
 use crate::pattern_validate::{
     parse_anchoring_and_trailing_context, validate_pattern_restrictions,
 };
+use gettextrs::gettext;
 use plib::diag;
 use regex::Regex;
 use std::collections::HashMap;
@@ -225,9 +226,9 @@ fn warn_on_trigraphs(state: &ParseState, line: &str) {
                 b'=' | b'(' | b'/' | b')' | b'\'' | b'<' | b'>' | b'!' | b'-'
             )
         {
-            state.warning(
+            state.warning(&gettext(
                 "C trigraph in copied code block (POSIX: input shall not contain trigraphs)",
-            );
+            ));
             return;
         }
         i += 1;
@@ -310,13 +311,17 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                         "nounput" => state.options.nounput = true,
                         // Future: add more flex options here as needed
                         _ => {
-                            state.warning(&format!("unknown %option: {}", opt));
+                            state.warning(&format!("{}: {}", gettext("unknown %option"), opt));
                         }
                     }
                 }
             }
             _ => {
-                state.warning(&format!("unknown command in definitions section: {}", cmd));
+                state.warning(&format!(
+                    "{}: {}",
+                    gettext("unknown command in definitions section"),
+                    cmd
+                ));
             }
         }
     } else if first_char.is_whitespace() && line_to_parse.len() > 1 {
@@ -329,7 +334,8 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
         state.subs.insert(String::from(name), String::from(value));
     } else if !line_to_parse.trim().is_empty() {
         return Err(state.error(&format!(
-            "unexpected line in definitions section: {}",
+            "{}: {}",
+            gettext("unexpected line in definitions section"),
             line_to_parse.trim()
         )));
     }
@@ -403,7 +409,7 @@ fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
             open_braces += 1;
         } else if c == '}' {
             if open_braces == 0 {
-                return Err("unmatched closing brace in action".to_string());
+                return Err(gettext("unmatched closing brace in action"));
             }
             open_braces -= 1;
         }
@@ -505,19 +511,19 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 if inside_brackets {
                     inside_brackets = false;
                     if stack.pop() != Some(RegexType::Square) {
-                        return Err("unmatched closing square bracket in pattern".to_string());
+                        return Err(gettext("unmatched closing square bracket in pattern"));
                     }
                 }
                 // ] outside brackets: could be part of pattern, let regex_syntax handle
             }
             ')' => {
                 if !inside_brackets && stack.pop() != Some(RegexType::Paren) {
-                    return Err("unmatched closing parenthesis in pattern".to_string());
+                    return Err(gettext("unmatched closing parenthesis in pattern"));
                 }
             }
             '}' => {
                 if !inside_brackets && stack.pop() != Some(RegexType::Curly) {
-                    return Err("unmatched closing curly brace in pattern".to_string());
+                    return Err(gettext("unmatched closing curly brace in pattern"));
                 }
             }
             _ => {
@@ -530,10 +536,10 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
     }
 
     if inside_quotes {
-        return Err("unterminated quoted string in pattern".to_string());
+        return Err(gettext("unterminated quoted string in pattern"));
     }
 
-    Err("unterminated regular expression".to_string())
+    Err(gettext("unterminated regular expression"))
 }
 
 /// Check if a string looks like an interval expression: {m}, {m,}, or {m,n}
@@ -696,9 +702,11 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
                         }
                     }
                     None => {
-                        return Err(
-                            state.error(&format!("undefined substitution: {{{}}}", brace_content))
-                        );
+                        return Err(state.error(&format!(
+                            "{}: {{{}}}",
+                            gettext("undefined substitution"),
+                            brace_content
+                        )));
                     }
                 }
             }
@@ -767,7 +775,7 @@ fn build_eof_rule(
 ) -> Result<ParsedRuleInfo, String> {
     let action = action_ws.trim_start();
     if action.is_empty() {
-        return Err(state.error("missing action for <<EOF>> rule"));
+        return Err(state.error(&gettext("missing action for <<EOF>> rule")));
     }
     let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
     Ok(ParsedRuleInfo {
@@ -806,7 +814,7 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
 
     // POSIX 101898-900: a NUL character in a pattern is undefined behavior.
     if pattern_contains_nul_escape(&ere_raw) {
-        state.warning("NUL (\\0) in pattern has undefined behavior");
+        state.warning(&gettext("NUL (\\0) in pattern has undefined behavior"));
     }
 
     // Validate pattern restrictions per POSIX before processing
@@ -837,7 +845,9 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     // POSIX: "the absence of an action shall not be valid"
     // Only exception is "|" which means fall-through to the next rule's action
     if action.is_empty() {
-        return Err(state.error("missing action for rule (use '|' for fall-through)"));
+        return Err(state.error(&gettext(
+            "missing action for rule (use '|' for fall-through)",
+        )));
     }
 
     let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
@@ -881,7 +891,11 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
                 state.section = LexSection::UserCode;
             }
             _ => {
-                state.warning(&format!("unknown command in rules section: {}", cmd));
+                state.warning(&format!(
+                    "{}: {}",
+                    gettext("unknown command in rules section"),
+                    cmd
+                ));
             }
         }
     } else if state.open_braces > 0 {

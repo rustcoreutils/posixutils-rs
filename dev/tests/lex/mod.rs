@@ -2139,6 +2139,28 @@ int main(void) {
 }
 
 #[test]
+fn test_diagnostics_render_under_gettext() {
+    // #L5: diagnostics are routed through gettext(); under the C/POSIX locale
+    // gettext is the identity function, so the English text renders verbatim.
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file = temp_dir.path().join("test.l");
+    let out = temp_dir.path().join("lex.yy.c");
+    fs::write(&lex_file, "%option frobnicate\n%%\n[a-z]+ ;\n%%\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .env("LC_ALL", "C")
+        .args([lex_file.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute lex");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown %option"),
+        "gettext-routed diagnostic must render verbatim under the C locale: {}",
+        stderr
+    );
+}
+
+#[test]
 fn test_echo_macro() {
     // Test explicit ECHO macro usage
     let lex_input = r#"

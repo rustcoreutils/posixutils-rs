@@ -12,6 +12,9 @@ fn run_lex(input: &str) -> (String, bool) {
     fs::write(&lex_file, input).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        // Pin the C locale so gettext-routed diagnostics render in English
+        // regardless of the host locale / installed message catalogs.
+        .env("LC_ALL", "C")
         .args([
             lex_file.to_str().unwrap(),
             "-o",
@@ -1960,6 +1963,9 @@ fn run_lex_capture(extra_args: &[&str], source: &str) -> (String, bool) {
     args.extend_from_slice(&[lex_path.as_str(), "-o", out_path.as_str()]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        // Pin the C locale so gettext-routed diagnostics render in English
+        // regardless of the host locale / installed message catalogs.
+        .env("LC_ALL", "C")
         .args(&args)
         .output()
         .expect("Failed to execute lex");

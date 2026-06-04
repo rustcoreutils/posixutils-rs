@@ -3774,6 +3774,42 @@ fn test_description_file_reports_table_limits() {
     );
 }
 
+#[test]
+fn test_description_stub_write_failure_warns() {
+    // If the mandated -v stub cannot be written (here the -b prefix points
+    // into a non-existent directory), the user must get a diagnostic rather
+    // than a silent failure.
+    let grammar = "%token NUM\n%%\nexpr : undefined_nt ;\n";
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // <prefix>.output lands in a subdirectory that does not exist.
+    let bad_prefix = temp_dir.path().join("nope").join("y");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args([
+            "-v",
+            "-b",
+            bad_prefix.to_str().unwrap(),
+            grammar_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(
+        !output.status.success(),
+        "run should fail (undefined non-terminal)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot write"),
+        "a stub-write failure must be reported on stderr: {}",
+        stderr
+    );
+}
+
 // --- -p must not mangle user token names; reject multi-byte char literals ---
 
 #[test]

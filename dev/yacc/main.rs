@@ -236,7 +236,11 @@ fn write_description_stub(opts: &Options, err: &YaccError) {
          Internal table limits: dynamic; no fixed limits.\n",
         opts.grammar_file, err
     );
-    let _ = fs::write(&path, body);
+    // POSIX requires the -v description to be produced; if even the stub
+    // cannot be written, warn rather than failing silently.
+    if let Err(e) = fs::write(&path, body) {
+        diag::warning(&format!("{} '{}': {}", gettext("cannot write"), path, e));
+    }
 }
 
 fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {

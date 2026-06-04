@@ -744,9 +744,44 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
     Ok(())
 }
 
+/// The seven mode letters; one of these is the "key" that selects the operation.
+const MODE_LETTERS: &[u8] = b"dmpqrtx";
+
+/// Split a bundled key token such as `-rv`/`-tv`/`-dv` into separate `-r -v`
+/// tokens before clap sees them (#A3). XBD 12.2 requires grouped single-char
+/// options to be equivalent to separate ones, but the mode flags are clap
+/// subcommands, so a literal `-rv` token would not match any subcommand. Only
+/// the first option-shaped argument (the ar key) is rewritten; `-a`/`-b`/`-i`
+/// posname operands remain separate tokens and are untouched.
+fn canonicalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() < 2 {
+        return args;
+    }
+    let bytes = args[1].as_bytes();
+    // Need "-" + at least two letters; leave "-d", "--", "--long" to clap.
+    if bytes.len() <= 2 || bytes[0] != b'-' || bytes[1] == b'-' {
+        return args;
+    }
+    let letters = &bytes[1..];
+    if !letters.iter().all(u8::is_ascii_alphabetic) {
+        return args;
+    }
+    let Some(mode_pos) = letters.iter().position(|c| MODE_LETTERS.contains(c)) else {
+        return args;
+    };
+    let mut replacement = vec![OsString::from(format!("-{}", letters[mode_pos] as char))];
+    for (i, c) in letters.iter().enumerate() {
+        if i != mode_pos {
+            replacement.push(OsString::from(format!("-{}", *c as char)));
+        }
+    }
+    args.splice(1..2, replacement);
+    args
+}
+
 fn main() {
     diag::init_locale("ar");
-    let args = Args::parse();
+    let args = Args::parse_from(canonicalize_args(std::env::args_os().collect()));
     let result = match args.command {
         Commands::Delete(args) => delete_cmd(args),
         Commands::Move(args) => move_cmd(args),

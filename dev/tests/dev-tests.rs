@@ -883,3 +883,44 @@ fn test_ar_delete_matches_basename() {
         "the basename-matched member should have been deleted"
     );
 }
+
+#[test]
+fn test_ar_bundled_mode_flags() {
+    // #A3: grouped mode+modifier flags like -rc/-tv/-dv must work (XBD 12.2).
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("m.o");
+    fs::write(&f, b"some object bytes").unwrap();
+    let arc = dir.path().join("b.a");
+
+    let create = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-rc", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("run ar -rc");
+    assert!(
+        create.status.success(),
+        "ar -rc (bundled) must work: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let tv = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-tv", arc.to_str().unwrap()])
+        .output()
+        .expect("run ar -tv");
+    assert!(
+        tv.status.success(),
+        "ar -tv (bundled) must work: {}",
+        String::from_utf8_lossy(&tv.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tv.stdout).contains("m.o"));
+
+    let dv = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-dv", arc.to_str().unwrap(), "m.o"])
+        .output()
+        .expect("run ar -dv");
+    assert!(
+        dv.status.success(),
+        "ar -dv (bundled) must work: {}",
+        String::from_utf8_lossy(&dv.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&dv.stdout), "d - m.o\n");
+}

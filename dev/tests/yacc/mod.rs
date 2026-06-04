@@ -3827,3 +3827,29 @@ fn test_double_dash_allows_dash_prefixed_filename() {
         "without --, a dash-prefixed name is parsed as options and must fail"
     );
 }
+
+// --- i18n: diagnostics routed through gettext render verbatim (C locale) ---
+
+#[test]
+fn test_diagnostics_render_under_gettext() {
+    // Diagnostic strings are wrapped in gettext(); under the C/POSIX locale
+    // gettext is the identity function, so the English text must be unchanged.
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, "%token NUM\n%%\nexpr : NUM ;\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .env("LC_ALL", "C")
+        .args(["-Z", grammar_path.to_str().unwrap()]) // -Z is not a valid option
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(!output.status.success(), "unknown option must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown option: -Z"),
+        "gettext-routed usage diagnostic must render verbatim: {}",
+        stderr
+    );
+}

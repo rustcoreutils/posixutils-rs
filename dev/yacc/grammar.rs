@@ -15,6 +15,7 @@
 
 use crate::error::YaccError;
 use crate::parser::{Associativity, CodeBlock, ParsedGrammar, RhsElement, Symbol as ParsedSymbol};
+use gettextrs::gettext;
 use plib::diag;
 use std::collections::HashMap;
 
@@ -264,15 +265,17 @@ impl Grammar {
                 id
             } else {
                 return Err(grammar_error(format!(
-                    "start symbol '{}' not defined",
-                    start
+                    "{} '{}' {}",
+                    gettext("start symbol"),
+                    start,
+                    gettext("not defined")
                 )));
             }
         } else if !parsed.rules.is_empty() {
             // Default: LHS of first rule
             *grammar.symbol_map.get(&parsed.rules[0].lhs).unwrap()
         } else {
-            return Err(grammar_error("no rules defined".into()));
+            return Err(grammar_error(gettext("no rules defined")));
         };
 
         grammar.start_symbol = user_start;
@@ -339,7 +342,7 @@ impl Grammar {
                 if sym_id >= grammar.symbols.len() {
                     return Err(grammar_error_at(
                         prod.line,
-                        format!("undefined symbol in production {}", prod.id),
+                        format!("{} {}", gettext("undefined symbol in production"), prod.id),
                     ));
                 }
             }
@@ -352,8 +355,10 @@ impl Grammar {
                 && !grammar.productions_for.contains_key(&id)
             {
                 return Err(grammar_error(format!(
-                    "non-terminal '{}' has no rules",
-                    sym.name
+                    "{} '{}' {}",
+                    gettext("non-terminal"),
+                    sym.name,
+                    gettext("has no rules")
                 )));
             }
         }
@@ -384,8 +389,13 @@ impl Grammar {
                 if let Some(existing_num) = self.symbols[id].token_number {
                     if existing_num != new_num {
                         return Err(grammar_error(format!(
-                            "token '{}' already has number {}, cannot reassign to {}",
-                            name, existing_num, new_num
+                            "{} '{}' {} {}, {} {}",
+                            gettext("token"),
+                            name,
+                            gettext("already has number"),
+                            existing_num,
+                            gettext("cannot reassign to"),
+                            new_num
                         )));
                     }
                 } else {
@@ -393,8 +403,13 @@ impl Grammar {
                     // Check for duplicate token numbers
                     if let Some(existing_name) = self.token_number_map.get(&new_num) {
                         return Err(grammar_error(format!(
-                            "duplicate token number {}: already assigned to '{}', cannot assign to '{}'",
-                            new_num, existing_name, name
+                            "{} {}: {} '{}', {} '{}'",
+                            gettext("duplicate token number"),
+                            new_num,
+                            gettext("already assigned to"),
+                            existing_name,
+                            gettext("cannot assign to"),
+                            name
                         )));
                     }
                     self.symbols[id].token_number = Some(new_num);
@@ -412,8 +427,10 @@ impl Grammar {
                 diag::warning_at(
                     diag::Position::line_only(0),
                     &format!(
-                        "symbol '{}' begins with 'yy' or 'YY' which is reserved",
-                        name
+                        "{} '{}' {}",
+                        gettext("symbol"),
+                        name,
+                        gettext("begins with 'yy' or 'YY' which is reserved")
                     ),
                 );
             }
@@ -423,8 +440,13 @@ impl Grammar {
         if let Some(num) = token_number {
             if let Some(existing_name) = self.token_number_map.get(&num) {
                 return Err(grammar_error(format!(
-                    "duplicate token number {}: already assigned to '{}', cannot assign to '{}'",
-                    num, existing_name, name
+                    "{} {}: {} '{}', {} '{}'",
+                    gettext("duplicate token number"),
+                    num,
+                    gettext("already assigned to"),
+                    existing_name,
+                    gettext("cannot assign to"),
+                    name
                 )));
             }
             self.token_number_map.insert(num, name.to_string());
@@ -445,7 +467,10 @@ impl Grammar {
 
     fn add_production(&mut self, rule: &crate::parser::Rule) -> Result<(), YaccError> {
         let lhs = *self.symbol_map.get(&rule.lhs).ok_or_else(|| {
-            grammar_error_at(rule.line, format!("undefined non-terminal: {}", rule.lhs))
+            grammar_error_at(
+                rule.line,
+                format!("{}: {}", gettext("undefined non-terminal"), rule.lhs),
+            )
         })?;
 
         let mut rhs = Vec::new();
@@ -500,7 +525,7 @@ impl Grammar {
             } else {
                 return Err(grammar_error_at(
                     rule.line,
-                    format!("undefined token in %prec: {}", prec_name),
+                    format!("{}: {}", gettext("undefined token in %prec"), prec_name),
                 ));
             }
         } else {
@@ -542,9 +567,11 @@ impl Grammar {
                 let cp = *c as u32;
                 if !(1..=255).contains(&cp) {
                     return Err(grammar_error(format!(
-                        "character literal '{}' (U+{:04X}) is out of range; \
-                         only single-byte characters 1..=255 are allowed",
-                        c, cp
+                        "{} '{}' (U+{:04X}) {}",
+                        gettext("character literal"),
+                        c,
+                        cp,
+                        gettext("is out of range; only single-byte characters 1..=255 are allowed")
                     )));
                 }
                 let name = format!("'{}'", c);

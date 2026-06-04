@@ -22,6 +22,7 @@ use std::fs;
 use std::process;
 
 use error::YaccError;
+use gettextrs::gettext;
 use plib::diag;
 
 /// Command-line options for yacc
@@ -81,7 +82,9 @@ fn parse_args() -> Result<Options, YaccError> {
         // when the argument is not option-shaped.
         if end_of_opts || !arg.starts_with('-') {
             if !opts.grammar_file.is_empty() {
-                return Err(YaccError::Usage("multiple grammar files specified".into()));
+                return Err(YaccError::Usage(gettext(
+                    "multiple grammar files specified",
+                )));
             }
             opts.grammar_file = arg.clone();
             i += 1;
@@ -111,9 +114,9 @@ fn parse_args() -> Result<Options, YaccError> {
                             // -b prefix (with space)
                             i += 1;
                             if i >= args.len() {
-                                return Err(YaccError::Usage(
-                                    "option -b requires an argument".into(),
-                                ));
+                                return Err(YaccError::Usage(gettext(
+                                    "option -b requires an argument",
+                                )));
                             }
                             args[i].clone()
                         };
@@ -132,9 +135,9 @@ fn parse_args() -> Result<Options, YaccError> {
                         } else {
                             i += 1;
                             if i >= args.len() {
-                                return Err(YaccError::Usage(
-                                    "option -p requires an argument".into(),
-                                ));
+                                return Err(YaccError::Usage(gettext(
+                                    "option -p requires an argument",
+                                )));
                             }
                             args[i].clone()
                         };
@@ -144,7 +147,11 @@ fn parse_args() -> Result<Options, YaccError> {
                     't' => opts.debug_enabled = true,
                     'v' => opts.write_description = true,
                     _ => {
-                        return Err(YaccError::Usage(format!("unknown option: -{}", c)));
+                        return Err(YaccError::Usage(format!(
+                            "{}: -{}",
+                            gettext("unknown option"),
+                            c
+                        )));
                     }
                 }
             }
@@ -153,22 +160,37 @@ fn parse_args() -> Result<Options, YaccError> {
     }
 
     if opts.grammar_file.is_empty() {
-        return Err(YaccError::Usage("no grammar file specified".into()));
+        return Err(YaccError::Usage(gettext("no grammar file specified")));
     }
 
     Ok(opts)
 }
 
 fn print_usage() {
-    eprintln!("Usage: yacc [-dltv] [-b file_prefix] [-p sym_prefix] [--strict] grammar");
-    eprintln!("Options:");
-    eprintln!("  -b file_prefix  Use file_prefix instead of 'y' for output files");
-    eprintln!("  -d              Write header file");
-    eprintln!("  -l              Omit #line directives");
-    eprintln!("  -p sym_prefix   Use sym_prefix instead of 'yy' for external names");
-    eprintln!("  -t              Enable debugging code in generated parser");
-    eprintln!("  -v              Write description file");
-    eprintln!("  --strict        Disable optimizations that may change yylex timing");
+    eprintln!(
+        "{}",
+        gettext("Usage: yacc [-dltv] [-b file_prefix] [-p sym_prefix] [--strict] grammar")
+    );
+    eprintln!("{}", gettext("Options:"));
+    eprintln!(
+        "  -b file_prefix  {}",
+        gettext("Use file_prefix instead of 'y' for output files")
+    );
+    eprintln!("  -d              {}", gettext("Write header file"));
+    eprintln!("  -l              {}", gettext("Omit #line directives"));
+    eprintln!(
+        "  -p sym_prefix   {}",
+        gettext("Use sym_prefix instead of 'yy' for external names")
+    );
+    eprintln!(
+        "  -t              {}",
+        gettext("Enable debugging code in generated parser")
+    );
+    eprintln!("  -v              {}", gettext("Write description file"));
+    eprintln!(
+        "  --strict        {}",
+        gettext("Disable optimizations that may change yylex timing")
+    );
 }
 
 fn run(opts: &Options) -> Result<(), YaccError> {
@@ -176,8 +198,14 @@ fn run(opts: &Options) -> Result<(), YaccError> {
     diag::set_source(&opts.grammar_file);
 
     // Read input grammar
-    let input = fs::read_to_string(&opts.grammar_file)
-        .map_err(|e| YaccError::Io(format!("cannot read '{}': {}", opts.grammar_file, e)))?;
+    let input = fs::read_to_string(&opts.grammar_file).map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("cannot read"),
+            opts.grammar_file,
+            e
+        ))
+    })?;
 
     // POSIX CONSEQUENCES OF ERRORS (123202-4): "summary information in the
     // description file shall always be produced if the -v flag is present."
@@ -247,10 +275,13 @@ fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {
     match expect_sr {
         Some(expected) if sr_conflicts != expected => {
             diag::error(&format!(
-                "{}: expected {} shift/reduce conflict{}, found {}",
+                "{}: {} {} {}{}, {} {}",
                 opts.grammar_file,
+                gettext("expected"),
                 expected,
+                gettext("shift/reduce conflict"),
                 if expected == 1 { "" } else { "s" },
+                gettext("found"),
                 sr_conflicts
             ));
             conflict_error = true;
@@ -260,9 +291,10 @@ fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {
         }
         None if sr_conflicts > 0 => {
             diag::warning(&format!(
-                "{}: {} shift/reduce conflict{}",
+                "{}: {} {}{}",
                 opts.grammar_file,
                 sr_conflicts,
+                gettext("shift/reduce conflict"),
                 if sr_conflicts == 1 { "" } else { "s" }
             ));
         }
@@ -273,10 +305,13 @@ fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {
     match expect_rr {
         Some(expected) if rr_conflicts != expected => {
             diag::error(&format!(
-                "{}: expected {} reduce/reduce conflict{}, found {}",
+                "{}: {} {} {}{}, {} {}",
                 opts.grammar_file,
+                gettext("expected"),
                 expected,
+                gettext("reduce/reduce conflict"),
                 if expected == 1 { "" } else { "s" },
+                gettext("found"),
                 rr_conflicts
             ));
             conflict_error = true;
@@ -286,9 +321,10 @@ fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {
         }
         None if rr_conflicts > 0 => {
             diag::warning(&format!(
-                "{}: {} reduce/reduce conflict{}",
+                "{}: {} {}{}",
                 opts.grammar_file,
                 rr_conflicts,
+                gettext("reduce/reduce conflict"),
                 if rr_conflicts == 1 { "" } else { "s" }
             ));
         }
@@ -296,9 +332,9 @@ fn run_pipeline(opts: &Options, input: &str) -> Result<(), YaccError> {
     }
 
     if conflict_error {
-        return Err(YaccError::Grammar(
-            "conflict count does not match expected".into(),
-        ));
+        return Err(YaccError::Grammar(gettext(
+            "conflict count does not match expected",
+        )));
     }
 
     Ok(())

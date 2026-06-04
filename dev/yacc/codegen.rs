@@ -18,6 +18,7 @@ use crate::error::YaccError;
 use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL};
 use crate::lalr::{Action, LALRAutomaton};
 use crate::Options;
+use gettextrs::gettext;
 use plib::diag;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -85,7 +86,7 @@ fn generate_code_file(
     lalr: &LALRAutomaton,
 ) -> Result<(), YaccError> {
     let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("cannot create '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
     let mut w = BufWriter::new(file);
 
     // Header comments
@@ -211,7 +212,7 @@ typedef int YYSTYPE;
     }
 
     w.flush()
-        .map_err(|e| YaccError::Io(format!("error writing '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
 
     Ok(())
 }
@@ -1542,8 +1543,10 @@ fn transform_action(
                             diag::warning_at(
                                 diag::Position::line_only(prod.line as u32),
                                 &format!(
-                                    "$$ has no declared type; '{}' lacks a %type declaration",
-                                    lhs_name
+                                    "$$ {}; '{}' {}",
+                                    gettext("has no declared type"),
+                                    lhs_name,
+                                    gettext("lacks a %type declaration")
                                 ),
                             );
                         }
@@ -1632,8 +1635,11 @@ fn transform_action(
                             diag::warning_at(
                                 diag::Position::line_only(prod.line as u32),
                                 &format!(
-                                    "${} has no declared type; '{}' lacks a %type declaration",
-                                    n, name
+                                    "${} {}; '{}' {}",
+                                    n,
+                                    gettext("has no declared type"),
+                                    name,
+                                    gettext("lacks a %type declaration")
                                 ),
                             );
                         }
@@ -1692,7 +1698,7 @@ fn generate_stack_reference(n: i32, rhs_len: usize, tag: Option<&str>, prefix: &
 /// Generate header file (y.tab.h)
 fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result<(), YaccError> {
     let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("cannot create '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
     let mut w = BufWriter::new(file);
 
     writeln!(
@@ -1732,7 +1738,7 @@ typedef int YYSTYPE;
     writeln!(w, "extern YYSTYPE {}lval;", opts.sym_prefix)?;
 
     w.flush()
-        .map_err(|e| YaccError::Io(format!("error writing '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
 
     Ok(())
 }
@@ -1744,7 +1750,7 @@ fn generate_description_file(
     lalr: &LALRAutomaton,
 ) -> Result<(), YaccError> {
     let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("cannot create '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
     let mut w = BufWriter::new(file);
 
     writeln!(w, "Grammar")?;
@@ -1964,7 +1970,7 @@ fn generate_description_file(
     }
 
     w.flush()
-        .map_err(|e| YaccError::Io(format!("error writing '{}': {}", path, e)))?;
+        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
 
     Ok(())
 }

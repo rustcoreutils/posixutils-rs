@@ -92,6 +92,60 @@ pub fn translate_escape_sequences(input: &str) -> String {
     result
 }
 
+/// Returns true if `input` contains an escape sequence denoting the NUL
+/// character (`\0`, `\00`, `\000`, `\x0`, `\x00`, ...). POSIX 101898-900: a
+/// NUL in a bracket expression / pattern gives undefined behavior, so callers
+/// warn about it.
+pub fn pattern_contains_nul_escape(input: &str) -> bool {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+
+            // Hex escape: \x followed by hex digits, all zero => NUL.
+            if next == 'x' {
+                let mut j = i + 2;
+                let mut any = false;
+                let mut nonzero = false;
+                while j < chars.len() && chars[j].is_ascii_hexdigit() {
+                    any = true;
+                    nonzero |= chars[j] != '0';
+                    j += 1;
+                }
+                if any && !nonzero {
+                    return true;
+                }
+                i = if any { j } else { i + 2 };
+                continue;
+            }
+
+            // Octal escape: \ followed by up to 3 octal digits, all zero => NUL.
+            if next.is_ascii_digit() && next < '8' {
+                let mut j = i + 1;
+                let mut count = 0;
+                let mut nonzero = false;
+                while j < chars.len() && count < 3 && chars[j].is_ascii_digit() && chars[j] < '8' {
+                    nonzero |= chars[j] != '0';
+                    j += 1;
+                    count += 1;
+                }
+                if !nonzero {
+                    return true;
+                }
+                i = j;
+                continue;
+            }
+
+            // Any other escape: skip the escaped character.
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Expand POSIX bracket expression constructs to standard regex form.
 ///
 /// In the POSIX locale (which we assume):
@@ -236,6 +290,24 @@ mod tests {
     #[test]
     fn test_translate_backspace() {
         assert_eq!(translate_escape_sequences(r"\b"), r"\x08");
+    }
+
+    #[test]
+    fn test_nul_escape_detection() {
+        // NUL escapes (value 0).
+        assert!(pattern_contains_nul_escape(r"\0"));
+        assert!(pattern_contains_nul_escape(r"\00"));
+        assert!(pattern_contains_nul_escape(r"\000"));
+        assert!(pattern_contains_nul_escape(r"\x0"));
+        assert!(pattern_contains_nul_escape(r"\x00"));
+        assert!(pattern_contains_nul_escape(r"a\0b"));
+        // Non-NUL escapes must not be flagged.
+        assert!(!pattern_contains_nul_escape(r"\01"));
+        assert!(!pattern_contains_nul_escape(r"\7"));
+        assert!(!pattern_contains_nul_escape(r"\x41"));
+        assert!(!pattern_contains_nul_escape(r"\n"));
+        assert!(!pattern_contains_nul_escape("abc"));
+        assert!(!pattern_contains_nul_escape(r"\x"));
     }
 
     #[test]

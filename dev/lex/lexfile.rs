@@ -15,7 +15,9 @@
 //! - `%option noinput` - suppress `input()` function generation
 //! - `%option nounput` - suppress `unput()` function generation
 
-use crate::pattern_escape::{expand_posix_bracket_constructs, translate_escape_sequences};
+use crate::pattern_escape::{
+    expand_posix_bracket_constructs, pattern_contains_nul_escape, translate_escape_sequences,
+};
 use crate::pattern_validate::{
     parse_anchoring_and_trailing_context, validate_pattern_restrictions,
 };
@@ -210,6 +212,28 @@ fn strip_comments(line: &str, in_comment: &mut bool) -> String {
     result
 }
 
+/// Warn (once per line) if a copied C-code line contains an ISO C trigraph.
+/// POSIX 101797: C-language code in the input shall not contain trigraphs.
+fn warn_on_trigraphs(state: &ParseState, line: &str) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'?'
+            && bytes[i + 1] == b'?'
+            && matches!(
+                bytes[i + 2],
+                b'=' | b'(' | b'/' | b')' | b'\'' | b'<' | b'>' | b'!' | b'-'
+            )
+        {
+            state.warning(
+                "C trigraph in copied code block (POSIX: input shall not contain trigraphs)",
+            );
+            return;
+        }
+        i += 1;
+    }
+}
+
 /// Parse line from Definitions section.
 fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     // Check for %} to end a %{ block first (before early return)
@@ -227,6 +251,7 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
 
     // Inside %{ %} blocks, preserve everything as-is (user C code)
     if state.in_def {
+        warn_on_trigraphs(state, line);
         state.external_def.push(String::from(line));
         return Ok(());
     }
@@ -296,6 +321,7 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
         }
     } else if first_char.is_whitespace() && line_to_parse.len() > 1 {
         // Lines starting with whitespace are continuation lines (user C code)
+        warn_on_trigraphs(state, line);
         state.external_def.push(String::from(line));
     } else if let Some(caps) = state.sub_re.captures(line_to_parse) {
         let name = caps.get(1).unwrap().as_str();
@@ -766,6 +792,11 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     let pos = find_ere_end(remaining).map_err(|e| state.error(&e))?;
     let ere_raw = String::from(&remaining[..pos]);
 
+    // POSIX 101898-900: a NUL character in a pattern is undefined behavior.
+    if pattern_contains_nul_escape(&ere_raw) {
+        state.warning("NUL (\\0) in pattern has undefined behavior");
+    }
+
     // Validate pattern restrictions per POSIX before processing
     validate_pattern_restrictions(&ere_raw).map_err(|e| state.error(&e))?;
 
@@ -849,6 +880,7 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
             state.push_rule(rule);
         }
     } else if state.in_def || (first_char.is_whitespace() && line.len() > 1) {
+        warn_on_trigraphs(state, line);
         state.internal_defs.push(String::from(line));
     } else if line.trim().is_empty() {
         return Ok(());
@@ -884,6 +916,7 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
 
 /// Parse line from UserCode section.
 fn parse_user_line(state: &mut ParseState, line: &str) -> Result<(), &'static str> {
+    warn_on_trigraphs(state, line);
     state.user_subs.push(String::from(line));
     Ok(())
 }

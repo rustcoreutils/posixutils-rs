@@ -2061,6 +2061,47 @@ fn test_no_stats_without_verbose_or_table_sizes() {
 }
 
 #[test]
+fn test_nul_escape_in_pattern_warns() {
+    // POSIX 101898-900: a NUL in a pattern is undefined behavior. lex should
+    // warn (non-fatally) for \0, \x00, \000, etc.
+    for pat in ["\\0", "\\x00", "\\000"] {
+        let source = format!("%%\n{}    printf(\"X\\n\");\n%%\n", pat);
+        let (combined, _ok) = run_lex_capture(&[], &source);
+        assert!(
+            combined.contains("NUL"),
+            "pattern {:?} should warn about NUL: {}",
+            pat,
+            combined
+        );
+    }
+}
+
+#[test]
+fn test_trigraph_in_code_block_warns() {
+    // POSIX 101797: C code in the input shall not contain trigraphs.
+    let source = "%{\nint x = 1 ??! 2;\n%}\n%%\n[a-z]+ ;\n%%\n";
+    let (combined, _ok) = run_lex_capture(&[], source);
+    assert!(
+        combined.contains("trigraph"),
+        "a trigraph in a %{{ %}} block should warn: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_clean_program_no_pattern_warnings() {
+    // A clean program triggers neither the NUL nor the trigraph warning.
+    let source = "%{\nint x = 1;\n%}\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(ok, "lex should succeed");
+    assert!(
+        !combined.contains("NUL") && !combined.contains("trigraph"),
+        "clean program must not emit pattern warnings: {}",
+        combined
+    );
+}
+
+#[test]
 fn test_echo_macro() {
     // Test explicit ECHO macro usage
     let lex_input = r#"

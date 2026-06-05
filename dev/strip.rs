@@ -24,6 +24,8 @@ use std::{
 #[derive(Parser)]
 #[command(version, about = gettext("strip - remove unnecessary information from strippable files"))]
 struct Args {
+    // POSIX SYNOPSIS makes the `file...` operand required (>= 1).
+    #[arg(num_args = 1.., required = true)]
     input_files: Vec<OsString>,
 }
 
@@ -36,13 +38,29 @@ fn is_debug_section(name: &[u8]) -> bool {
         || name.starts_with(b".line")
         || name.starts_with(b".stab")
         || name.starts_with(b".gdb_index")
+        // Relocation sections that target a debug section go with it; otherwise
+        // (on a relocatable object, where we keep relocations) they would be
+        // left pointing at a deleted section.
+        || name.starts_with(b".rela.debug")
+        || name.starts_with(b".rel.debug")
+        || name.starts_with(b".rela.zdebug")
+        || name.starts_with(b".rel.zdebug")
 }
 
-fn strip_section(section: &Section) -> bool {
-    is_debug_section(section.name.as_slice())
-        // by removing all the symbols in the symbol table,
-        // the below sections will all be empty
-        || section.sh_type == elf::SHT_GROUP
+fn strip_section(section: &Section, is_relocatable: bool) -> bool {
+    // Debug sections are always safe to remove.
+    if is_debug_section(section.name.as_slice()) {
+        return true;
+    }
+    // #ST4: a relocatable object (ET_REL, i.e. a `.o`) must remain linkable, so
+    // its symbol table, relocations, and group sections are preserved. Only
+    // executables / shared objects get the aggressive treatment.
+    if is_relocatable {
+        return false;
+    }
+    // by removing all the symbols in the symbol table,
+    // the below sections will all be empty
+    section.sh_type == elf::SHT_GROUP
         || section.sh_type == elf::SHT_RELA
         || section.sh_type == elf::SHT_REL
         // after we removed all symbols, the
@@ -58,13 +76,21 @@ fn strip_section(section: &Section) -> bool {
 type StripResult = Result<Vec<u8>, Box<dyn std::error::Error>>;
 
 fn strip(data: &[u8]) -> StripResult {
+    // Relocatable objects keep their symbol table and relocations (#ST4).
+    let is_relocatable = matches!(
+        object::read::File::parse(data).map(|f| f.kind()),
+        Ok(object::ObjectKind::Relocatable)
+    );
+
     let mut builder = Builder::read(data)?;
 
-    for symbol in &mut builder.symbols {
-        symbol.delete = true;
+    if !is_relocatable {
+        for symbol in &mut builder.symbols {
+            symbol.delete = true;
+        }
     }
     for section in &mut builder.sections {
-        if strip_section(section) {
+        if strip_section(section, is_relocatable) {
             section.delete = true;
         }
     }
@@ -104,7 +130,7 @@ fn extract_member_symbols(data: &[u8]) -> Vec<String> {
     }
 }
 
-fn strip_archive(data: &[u8], file_name: &OsStr) -> StripResult {
+fn strip_archive(data: &[u8]) -> StripResult {
     let mut archive = ar::Archive::new(data);
     let mut members: Vec<StrippedMember> = Vec::new();
 
@@ -114,26 +140,26 @@ fn strip_archive(data: &[u8], file_name: &OsStr) -> StripResult {
         entry.read_to_end(&mut data)?;
         let header = entry.header();
 
-        if is_elf(&data) {
+        // #ST1: only ELF members are stripped; any other member (a non-object
+        // file legitimately stored in the archive) is preserved unmodified.
+        // Dropping it would be silent data loss. The `ar` crate already hides
+        // the archive's own "/" symbol-table and "//" name-table members.
+        let (data, symbols) = if is_elf(&data) {
             let new_data = strip(&data)?;
             let symbols = extract_member_symbols(&new_data);
-            members.push(StrippedMember {
-                identifier: header.identifier().to_vec(),
-                mtime: header.mtime(),
-                uid: header.uid(),
-                gid: header.gid(),
-                mode: header.mode(),
-                data: new_data,
-                symbols,
-            });
+            (new_data, symbols)
         } else {
-            diag::error(&format!(
-                "({}){}: {}",
-                file_name.to_string_lossy(),
-                String::from_utf8_lossy(header.identifier()),
-                gettext("file format not recognized"),
-            ));
-        }
+            (data, Vec::new())
+        };
+        members.push(StrippedMember {
+            identifier: header.identifier().to_vec(),
+            mtime: header.mtime(),
+            uid: header.uid(),
+            gid: header.gid(),
+            mode: header.mode(),
+            data,
+            symbols,
+        });
     }
 
     // Emit: magic + "/" symbol-table member (regenerated per POSIX 84371-84376) +
@@ -149,7 +175,7 @@ fn strip_archive(data: &[u8], file_name: &OsStr) -> StripResult {
             symbols: m.symbols.clone(),
         })
         .collect();
-    plib::archive::write_sysv_symbol_table(&mut result, &infos)?;
+    plib::archive::write_sysv_symtab(&mut result, &infos, 0)?;
 
     for m in &members {
         write_member(&mut result, m)?;
@@ -207,12 +233,20 @@ fn strip_file(file: &OsStr) {
     let stripped_contents = if is_elf(&contents) {
         strip(&contents)
     } else if is_archive(&contents) {
-        strip_archive(&contents, file)
+        strip_archive(&contents)
     } else {
+        // #ST3: only ELF objects/executables and ar archives are supported.
+        // strip rewrites via object::build::elf::Builder, and the object crate's
+        // `build` (read-modify-write) module is ELF-only — there is no
+        // build::macho. (object reads Mach-O fine, which is why nm/strings work
+        // on it; only the in-place rewrite strip needs is missing.) A faithful
+        // Mach-O strip would need a hand-rolled __LINKEDIT/load-command rewrite,
+        // so other formats (Mach-O, COFF/PE, XCOFF) are rejected here rather
+        // than silently passed through.
         diag::error(&format!(
             "{}: {}",
             file.to_string_lossy(),
-            gettext("file format not recognized"),
+            gettext("unsupported file format (only ELF objects/executables and ar archives are supported)"),
         ));
         return;
     };

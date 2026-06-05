@@ -96,7 +96,7 @@ pub fn translate_escape_sequences(input: &str) -> String {
 /// character (`\0`, `\00`, `\000`, `\x0`, `\x00`, ...). POSIX 101898-900: a
 /// NUL in a bracket expression / pattern gives undefined behavior, so callers
 /// warn about it.
-pub fn pattern_contains_nul_escape(input: &str) -> bool {
+pub fn has_nul_escape(input: &str) -> bool {
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -295,19 +295,19 @@ mod tests {
     #[test]
     fn test_nul_escape_detection() {
         // NUL escapes (value 0).
-        assert!(pattern_contains_nul_escape(r"\0"));
-        assert!(pattern_contains_nul_escape(r"\00"));
-        assert!(pattern_contains_nul_escape(r"\000"));
-        assert!(pattern_contains_nul_escape(r"\x0"));
-        assert!(pattern_contains_nul_escape(r"\x00"));
-        assert!(pattern_contains_nul_escape(r"a\0b"));
+        assert!(has_nul_escape(r"\0"));
+        assert!(has_nul_escape(r"\00"));
+        assert!(has_nul_escape(r"\000"));
+        assert!(has_nul_escape(r"\x0"));
+        assert!(has_nul_escape(r"\x00"));
+        assert!(has_nul_escape(r"a\0b"));
         // Non-NUL escapes must not be flagged.
-        assert!(!pattern_contains_nul_escape(r"\01"));
-        assert!(!pattern_contains_nul_escape(r"\7"));
-        assert!(!pattern_contains_nul_escape(r"\x41"));
-        assert!(!pattern_contains_nul_escape(r"\n"));
-        assert!(!pattern_contains_nul_escape("abc"));
-        assert!(!pattern_contains_nul_escape(r"\x"));
+        assert!(!has_nul_escape(r"\01"));
+        assert!(!has_nul_escape(r"\7"));
+        assert!(!has_nul_escape(r"\x41"));
+        assert!(!has_nul_escape(r"\n"));
+        assert!(!has_nul_escape("abc"));
+        assert!(!has_nul_escape(r"\x"));
     }
 
     #[test]

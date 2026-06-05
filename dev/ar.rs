@@ -38,6 +38,9 @@ struct DeleteArgs {
 
 #[derive(clap::Args)]
 struct MoveArgs {
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
+    verbose: bool,
+
     #[command(flatten)]
     insert_args: InsertArgs,
 
@@ -162,11 +165,16 @@ struct ArchiveMember {
 impl ArchiveMember {
     fn read(file_path: &Path) -> ArResult<Self> {
         if !file_path.exists() {
-            return Err(format!("{}: No such file or directory", file_path.display()).into());
+            return Err(format!(
+                "{}: {}",
+                file_path.display(),
+                gettext("No such file or directory")
+            )
+            .into());
         }
 
         if !file_path.is_file() {
-            return Err(format!("{}: Is a directory", file_path.display()).into());
+            return Err(format!("{}: {}", file_path.display(), gettext("Is a directory")).into());
         }
 
         let file_metadata = file_path.metadata()?;
@@ -177,10 +185,14 @@ impl ArchiveMember {
         let symbols = read_member_symbols(&data);
         let symbol_bytes = symbols.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
 
+        // The archive date field is the member's mtime as Unix epoch seconds
+        // (#A1). The previous `t.elapsed()` stored the file's *age*, producing
+        // dates near 1970-01-01 on `ar -tv` and breaking `ar -ru`.
         let date = file_metadata
             .modified()
             .ok()
-            .map(|t| t.elapsed().ok().map(|d| d.as_secs()).unwrap_or_default())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
             .unwrap_or_default();
 
         Ok(ArchiveMember {
@@ -196,14 +208,14 @@ impl ArchiveMember {
         })
     }
 
-    fn write<W: Write>(&self, writer: &mut W) -> ArResult<()> {
+    fn write<W: Write>(&self, writer: &mut W, long_name_offset: Option<usize>) -> ArResult<()> {
         // format definition taken from: https://en.wikipedia.org/wiki/Ar_(Unix)
 
         // Since we are using the System V (or GNU) archive format, the data section
         // needs to be 2 byte aligned, if it isn't we add a newline as filler
         let size = self.size + (self.data.len() % 2) as u64;
 
-        writer.write_all(&format_name_for_header(&self.name)?)?;
+        writer.write_all(&format_name_for_header(&self.name, long_name_offset)?)?;
         writer.write_all(&pad_metadata_with_spaces::<12>(self.date.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<6>(self.uid.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<6>(self.gid.to_string())?)?;
@@ -236,11 +248,16 @@ struct Archive {
 impl Archive {
     fn read_from_file(path: &Path) -> ArResult<Self> {
         if !path.exists() {
-            return Err(format!("{}: No such file or directory", path.display()).into());
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                gettext("No such file or directory")
+            )
+            .into());
         }
 
         if !path.is_file() {
-            return Err(format!("{}: Is a directory", path.display()).into());
+            return Err(format!("{}: {}", path.display(), gettext("Is a directory")).into());
         }
 
         let file_data = std::fs::read(path)?;
@@ -251,7 +268,7 @@ impl Archive {
         let mut archive_size = 0;
 
         for member in parsed_archive.members() {
-            let member = member.map_err(|_| "invalid archive format")?;
+            let member = member.map_err(|_| gettext("invalid archive format"))?;
 
             let data = member.data(&*file_data)?;
             let name = OsString::from_vec(member.name().to_vec());
@@ -264,10 +281,10 @@ impl Archive {
 
             members.push(ArchiveMember {
                 name,
-                date: member.date().ok_or("invalid archive format")?,
-                uid: member.uid().ok_or("invalid archive format")?,
-                gid: member.gid().ok_or("invalid archive format")?,
-                mode: member.mode().ok_or("invalid archive format")?,
+                date: member.date().ok_or(gettext("invalid archive format"))?,
+                uid: member.uid().ok_or(gettext("invalid archive format"))?,
+                gid: member.gid().ok_or(gettext("invalid archive format"))?,
+                mode: member.mode().ok_or(gettext("invalid archive format"))?,
                 size: data.len() as u64,
                 data: data.to_vec(),
                 symbols,
@@ -284,14 +301,41 @@ impl Archive {
 
     fn write<W: Write>(&self, writer: &mut W) -> ArResult<()> {
         writer.write_all(&object::archive::MAGIC)?;
-        self.write_symbol_table(writer)?;
-        for member in &self.members {
-            member.write(writer)?;
+
+        // Build the System V "//" long-name string table for any member name
+        // longer than 15 bytes (#A6). Each long name is stored as "<name>/\n";
+        // its member header carries "/<offset>" into this table.
+        let mut name_table: Vec<u8> = Vec::new();
+        let mut offsets: Vec<Option<usize>> = Vec::with_capacity(self.members.len());
+        for m in &self.members {
+            if m.name.as_bytes().len() > 15 {
+                offsets.push(Some(name_table.len()));
+                name_table.extend_from_slice(m.name.as_bytes());
+                name_table.extend_from_slice(b"/\n");
+            } else {
+                offsets.push(None);
+            }
+        }
+        // Bytes the "//" member occupies between the symbol table and the first
+        // file member (0 when there are no long names). Member offsets recorded
+        // in the symbol table must account for it.
+        let long_table_bytes = if name_table.is_empty() {
+            0
+        } else {
+            MEMBER_HEADER_SIZE + name_table.len() as u64 + (name_table.len() % 2) as u64
+        };
+
+        self.write_symbol_table(writer, long_table_bytes)?;
+        if !name_table.is_empty() {
+            write_long_name_member(writer, &name_table)?;
+        }
+        for (member, offset) in self.members.iter().zip(offsets) {
+            member.write(writer, offset)?;
         }
         Ok(())
     }
 
-    fn write_symbol_table<W: Write>(&self, writer: &mut W) -> ArResult<()> {
+    fn write_symbol_table<W: Write>(&self, writer: &mut W, prefix_bytes: u64) -> ArResult<()> {
         let members: Vec<plib::archive::MemberInfo> = self
             .members
             .iter()
@@ -300,7 +344,7 @@ impl Archive {
                 symbols: m.symbols.clone(),
             })
             .collect();
-        plib::archive::write_sysv_symbol_table(writer, &members)?;
+        plib::archive::write_sysv_symtab(writer, &members, prefix_bytes)?;
         Ok(())
     }
 
@@ -373,7 +417,13 @@ impl Archive {
     }
 
     fn member_index(&self, name: &OsStr) -> Option<usize> {
-        self.members.iter().position(|m| m.name == name)
+        // POSIX 84379-84380: the comparison of a file operand to archive
+        // member names uses the LAST pathname component of the operand (#A2),
+        // so `ar -d arc sub/foo.o` matches the member `foo.o`.
+        let basename = Path::new(name).file_name().unwrap_or(name);
+        self.members
+            .iter()
+            .position(|m| m.name.as_os_str() == basename)
     }
 
     fn get_member(&self, index: usize) -> &ArchiveMember {
@@ -385,7 +435,7 @@ impl Archive {
 /// If the input string is longer than N, an error is returned.
 fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
     if s.len() > N {
-        return Err("file metadata cannot fit into archive format".into());
+        return Err(gettext("file metadata cannot fit into archive format").into());
     }
     let mut result = [b' '; N];
     for (i, byte) in s.as_bytes().iter().enumerate() {
@@ -397,16 +447,50 @@ fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
 /// Generates a byte array of length 16, from the input OsStr padding it with spaces.
 /// We use the System V (or GNU) archive format, which requires the name to be a maximum
 /// of 15 bytes, followed by a '/' character and space padding.
-fn format_name_for_header(name: &OsStr) -> ArResult<[u8; 16]> {
-    if name.len() > 15 {
-        return Err(format!("{}: file name is too long", name.to_string_lossy()).into());
-    }
+fn format_name_for_header(name: &OsStr, long_name_offset: Option<usize>) -> ArResult<[u8; 16]> {
     let mut result = [b' '; 16];
-    for (i, byte) in name.as_bytes().iter().enumerate() {
-        result[i] = *byte;
+    match long_name_offset {
+        // Long name (> 15 bytes): the header carries "/<offset>" referencing the
+        // "//" string-table member (#A6).
+        Some(offset) => {
+            let encoded = format!("/{}", offset);
+            if encoded.len() > 16 {
+                return Err(format!(
+                    "{}: {}",
+                    gettext("archive name-table offset too large"),
+                    offset
+                )
+                .into());
+            }
+            result[..encoded.len()].copy_from_slice(encoded.as_bytes());
+        }
+        // Short name (<= 15 bytes): stored inline as "<name>/".
+        None => {
+            let bytes = name.as_bytes();
+            result[..bytes.len()].copy_from_slice(bytes);
+            result[bytes.len()] = b'/';
+        }
     }
-    result[name.len()] = b'/';
     Ok(result)
+}
+
+/// Write the System V `"//"` long-name string-table member.
+fn write_long_name_member<W: Write>(writer: &mut W, table: &[u8]) -> ArResult<()> {
+    let mut name_field = [b' '; 16];
+    name_field[0] = b'/';
+    name_field[1] = b'/';
+    writer.write_all(&name_field)?;
+    writer.write_all(&pad_metadata_with_spaces::<12>(String::new())?)?; // date
+    writer.write_all(&pad_metadata_with_spaces::<6>(String::new())?)?; // uid
+    writer.write_all(&pad_metadata_with_spaces::<6>(String::new())?)?; // gid
+    writer.write_all(&pad_metadata_with_spaces::<8>(String::new())?)?; // mode
+    writer.write_all(&pad_metadata_with_spaces::<10>(table.len().to_string())?)?;
+    writer.write_all(&object::archive::TERMINATOR)?;
+    writer.write_all(table)?;
+    if table.len() % 2 != 0 {
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn member_symbol_bytes(member_symbols: &[String]) -> u64 {
@@ -452,7 +536,7 @@ fn delete_cmd(args: DeleteArgs) -> ArResult<()> {
 fn move_cmd(args: MoveArgs) -> ArResult<()> {
     if args.insert_args.insert_after || args.insert_args.insert_before {
         if args.files.len() < 2 {
-            return Err("missing archive operand".into());
+            return Err(gettext("missing archive operand").into());
         }
 
         let posname = &args.files[0];
@@ -460,19 +544,33 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
         let mut archive = Archive::read_from_file(archive_path)?;
 
         if archive.member_index(posname).is_none() {
-            return Err(format!("{}: No such file or directory", posname.to_string_lossy()).into());
+            return Err(format!(
+                "{}: {}",
+                posname.to_string_lossy(),
+                gettext("No such file or directory")
+            )
+            .into());
         }
         for file in args.files.iter().skip(2) {
             let target = archive.member_index(posname).unwrap();
             let index = archive.member_index(file);
             if let Some(index) = index {
+                if args.verbose {
+                    println!("m - {}", file.to_string_lossy());
+                }
                 if args.insert_args.insert_after {
                     archive.move_after(index, target);
                 } else if args.insert_args.insert_before {
                     archive.move_before(index, target);
                 }
             } else {
-                return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
+                return Err(format!(
+                    "{} {} {}",
+                    gettext("no entry"),
+                    file.to_string_lossy(),
+                    gettext("in archive")
+                )
+                .into());
             }
         }
 
@@ -486,9 +584,18 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
         for file in args.files.iter().skip(1) {
             let index = archive.member_index(file);
             if let Some(index) = index {
+                if args.verbose {
+                    println!("m - {}", file.to_string_lossy());
+                }
                 archive.move_to_end(index);
             } else {
-                return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
+                return Err(format!(
+                    "{} {} {}",
+                    gettext("no entry"),
+                    file.to_string_lossy(),
+                    gettext("in archive")
+                )
+                .into());
             }
         }
         let mut buf = Vec::new();
@@ -515,13 +622,16 @@ fn print_cmd(args: PrintArgs) -> ArResult<()> {
             if let Some(index) = archive.member_index(file) {
                 let member = archive.get_member(index);
                 if args.verbose {
-                    print!("\n<{}>\n\n", member.name.to_string_lossy());
+                    // POSIX STDOUT 84476-84479 (#A8): when file operands are
+                    // given, the prefix is the operand, not the member name.
+                    print!("\n<{}>\n\n", file.to_string_lossy());
                 }
                 stdout().write_all(&member.data)?;
             } else {
                 diag::error(&format!(
-                    "{}: No such file or directory",
-                    file.to_string_lossy()
+                    "{}: {}",
+                    file.to_string_lossy(),
+                    gettext("No such file or directory")
                 ));
             }
         }
@@ -567,21 +677,30 @@ fn replace_cmd(args: ReplaceArgs) -> ArResult<()> {
 
     let archive_path = if special_insert_position {
         if args.files.len() < 2 {
-            return Err("missing archive operand".into());
+            return Err(gettext("missing archive operand").into());
         }
         Path::new(&args.files[1])
     } else {
         if args.files.is_empty() {
-            return Err("missing archive operand".into());
+            return Err(gettext("missing archive operand").into());
         }
         Path::new(&args.files[0])
     };
+
+    // #A11: distinguish "no file operands" from "missing archive". POSIX leaves
+    // `-r` with no files (on an existing archive) undefined; we reject it with a
+    // clear message and non-zero exit rather than the misleading
+    // "missing archive operand" or a silent no-op.
+    let files_start = special_insert_position as usize + 1;
+    if args.files.len() <= files_start {
+        return Err(gettext("no file operands specified").into());
+    }
 
     let mut archive = if archive_path.exists() {
         Archive::read_from_file(archive_path)?
     } else {
         if !args.no_create_message {
-            eprintln!("ar: creating {}", archive_path.display());
+            eprintln!("ar: {} {}", gettext("creating"), archive_path.display());
         }
         Archive::default()
     };
@@ -634,11 +753,27 @@ fn replace_cmd(args: ReplaceArgs) -> ArResult<()> {
 fn format_mode(mode: u64) -> String {
     let types = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"];
 
-    let user = types[((mode >> 6) & 7) as usize];
-    let group = types[((mode >> 3) & 7) as usize];
-    let others = types[(mode & 7) as usize];
+    let mut s = format!(
+        "{}{}{}",
+        types[((mode >> 6) & 7) as usize],
+        types[((mode >> 3) & 7) as usize],
+        types[(mode & 7) as usize]
+    )
+    .into_bytes();
 
-    format!("{}{}{}", user, group, others)
+    // setuid / setgid / sticky bits, rendered in the exec positions like ls
+    // (#A9): lowercase when the exec bit is also set, uppercase otherwise.
+    if mode & 0o4000 != 0 {
+        s[2] = if s[2] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o2000 != 0 {
+        s[5] = if s[5] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o1000 != 0 {
+        s[8] = if s[8] == b'x' { b't' } else { b'T' };
+    }
+
+    String::from_utf8(s).unwrap()
 }
 
 fn list_member(member: &ArchiveMember, verbose: bool) {
@@ -673,9 +808,12 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
             if let Some(index) = archive.member_index(&file) {
                 list_member(archive.get_member(index), args.verbose);
             } else {
-                return Err(
-                    format!("{}: No such file or directory", archive_path.display()).into(),
-                );
+                return Err(format!(
+                    "{}: {}",
+                    archive_path.display(),
+                    gettext("No such file or directory")
+                )
+                .into());
             }
         }
     }
@@ -688,13 +826,49 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
     Ok(())
 }
 
-fn extract_member(member: &ArchiveMember, dont_replace: bool, verbose: bool) -> ArResult<()> {
-    let file_path = Path::new(&member.name);
+/// Largest filename (in bytes) the current directory's filesystem accepts.
+fn name_max_for_cwd() -> usize {
+    let dot = std::ffi::CString::new(".").unwrap();
+    let v = unsafe { libc::pathconf(dot.as_ptr(), libc::_PC_NAME_MAX) };
+    if v > 0 {
+        v as usize
+    } else {
+        255
+    }
+}
+
+fn extract_member(
+    member: &ArchiveMember,
+    dont_replace: bool,
+    verbose: bool,
+    allow_truncation: bool,
+) -> ArResult<()> {
+    // POSIX 84418-84421 (#A4): extracting a name longer than NAME_MAX is an
+    // error by default; -T allows the name to be truncated to fit.
+    let name_bytes = member.name.as_bytes();
+    let name_max = name_max_for_cwd();
+    let out_name: OsString = if name_bytes.len() > name_max {
+        if !allow_truncation {
+            return Err(format!(
+                "{}: {} {} {}",
+                member.name.to_string_lossy(),
+                gettext("file name too long (limit"),
+                name_max,
+                gettext("bytes); use -T to allow truncation")
+            )
+            .into());
+        }
+        OsString::from_vec(name_bytes[..name_max].to_vec())
+    } else {
+        member.name.clone()
+    };
+
+    let file_path = Path::new(&out_name);
     if file_path.exists() && dont_replace {
         return Ok(());
     }
     if verbose {
-        println!("x - {}", member.name.to_string_lossy());
+        println!("x - {}", out_name.to_string_lossy());
     }
     let mut out_file = std::fs::File::create(file_path)?;
     out_file.write_all(&member.data)?;
@@ -707,7 +881,12 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
 
     if args.files.is_empty() {
         for member in &archive.members {
-            extract_member(member, args.dont_replace_files, args.verbose)?;
+            extract_member(
+                member,
+                args.dont_replace_files,
+                args.verbose,
+                args.allow_truncation,
+            )?;
         }
     } else {
         for file in args.files {
@@ -716,11 +895,15 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
                     archive.get_member(index),
                     args.dont_replace_files,
                     args.verbose,
+                    args.allow_truncation,
                 )?;
             } else {
-                return Err(
-                    format!("{}: No such file or directory", file.to_string_lossy()).into(),
-                );
+                return Err(format!(
+                    "{}: {}",
+                    file.to_string_lossy(),
+                    gettext("No such file or directory")
+                )
+                .into());
             }
         }
     }
@@ -734,9 +917,44 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
     Ok(())
 }
 
+/// The seven mode letters; one of these is the "key" that selects the operation.
+const MODE_LETTERS: &[u8] = b"dmpqrtx";
+
+/// Split a bundled key token such as `-rv`/`-tv`/`-dv` into separate `-r -v`
+/// tokens before clap sees them (#A3). XBD 12.2 requires grouped single-char
+/// options to be equivalent to separate ones, but the mode flags are clap
+/// subcommands, so a literal `-rv` token would not match any subcommand. Only
+/// the first option-shaped argument (the ar key) is rewritten; `-a`/`-b`/`-i`
+/// posname operands remain separate tokens and are untouched.
+fn canonicalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() < 2 {
+        return args;
+    }
+    let bytes = args[1].as_bytes();
+    // Need "-" + at least two letters; leave "-d", "--", "--long" to clap.
+    if bytes.len() <= 2 || bytes[0] != b'-' || bytes[1] == b'-' {
+        return args;
+    }
+    let letters = &bytes[1..];
+    if !letters.iter().all(u8::is_ascii_alphabetic) {
+        return args;
+    }
+    let Some(mode_pos) = letters.iter().position(|c| MODE_LETTERS.contains(c)) else {
+        return args;
+    };
+    let mut replacement = vec![OsString::from(format!("-{}", letters[mode_pos] as char))];
+    for (i, c) in letters.iter().enumerate() {
+        if i != mode_pos {
+            replacement.push(OsString::from(format!("-{}", *c as char)));
+        }
+    }
+    args.splice(1..2, replacement);
+    args
+}
+
 fn main() {
     diag::init_locale("ar");
-    let args = Args::parse();
+    let args = Args::parse_from(canonicalize_args(std::env::args_os().collect()));
     let result = match args.command {
         Commands::Delete(args) => delete_cmd(args),
         Commands::Move(args) => move_cmd(args),

@@ -518,6 +518,9 @@ fn test_strip_keeps_relocations_in_relocatable() {
     );
 }
 
+// ELF-specific: cc produces Mach-O on macOS, which strip (intentionally) does
+// not support, so this test only runs on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_strip_executable_removes_symtab() {
     // The aggressive path still applies to executables (ET_EXEC): the symbol
@@ -557,6 +560,9 @@ fn test_strip_executable_removes_symtab() {
     );
 }
 
+// ELF/GNU-ar specific: on macOS cc emits Mach-O and `ar` writes the BSD format,
+// so this exercises behavior that only applies on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_strip_preserves_non_elf_archive_members() {
     // #ST1: a non-ELF archive member must survive stripping unmodified rather
@@ -1199,7 +1205,13 @@ fn test_nm_default_sorted_by_name() {
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "default nm output must be sorted by name");
-    assert!(names.contains(&"alpha_global") && names.contains(&"undef_sym"));
+    // Mach-O prefixes user symbols with '_', so match on a suffix.
+    assert!(
+        names.iter().any(|n| n.ends_with("alpha_global"))
+            && names.iter().any(|n| n.ends_with("undef_sym")),
+        "expected symbols not found: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -1210,12 +1222,17 @@ fn test_nm_portable_format() {
     let out = nm_run(&["-P", obj.to_str().unwrap()]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Match the symbol-name field by suffix (Mach-O prepends '_').
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("mid_func "))
+        .find(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|n| n.ends_with("mid_func"))
+        })
         .expect("mid_func line");
     let fields: Vec<&str> = line.split_whitespace().collect();
-    assert_eq!(fields[0], "mid_func");
+    assert!(fields[0].ends_with("mid_func"));
     assert_eq!(fields[1], "T", "a defined global function is type T");
     assert_eq!(fields.len(), 4, "defined -P line has 4 fields: {}", line);
 }

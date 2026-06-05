@@ -16,7 +16,7 @@
 //! - `%option nounput` - suppress `unput()` function generation
 
 use crate::pattern_escape::{
-    expand_posix_bracket_constructs, pattern_contains_nul_escape, translate_escape_sequences,
+    expand_posix_bracket_constructs, has_nul_escape, translate_escape_sequences,
 };
 use crate::pattern_validate::{
     parse_anchoring_and_trailing_context, validate_pattern_restrictions,
@@ -813,7 +813,7 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
     let ere_raw = String::from(&remaining[..pos]);
 
     // POSIX 101898-900: a NUL character in a pattern is undefined behavior.
-    if pattern_contains_nul_escape(&ere_raw) {
+    if has_nul_escape(&ere_raw) {
         state.warning(&gettext("NUL (\\0) in pattern has undefined behavior"));
     }
 

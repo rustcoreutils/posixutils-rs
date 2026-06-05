@@ -344,7 +344,7 @@ impl Archive {
                 symbols: m.symbols.clone(),
             })
             .collect();
-        plib::archive::write_sysv_symbol_table_with_prefix(writer, &members, prefix_bytes)?;
+        plib::archive::write_sysv_symtab(writer, &members, prefix_bytes)?;
         Ok(())
     }
 

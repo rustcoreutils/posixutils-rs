@@ -175,7 +175,7 @@ fn strip_archive(data: &[u8]) -> StripResult {
             symbols: m.symbols.clone(),
         })
         .collect();
-    plib::archive::write_sysv_symbol_table(&mut result, &infos)?;
+    plib::archive::write_sysv_symtab(&mut result, &infos, 0)?;
 
     for m in &members {
         write_member(&mut result, m)?;

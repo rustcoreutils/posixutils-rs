@@ -84,17 +84,12 @@ pub fn pad_metadata_field<const N: usize>(s: &str) -> io::Result<[u8; N]> {
 /// 4. For each symbol: NUL-terminated name.
 /// 5. Optional NUL pad to keep total payload 2-byte aligned.
 ///
-/// Member offsets assume the symbol-table member comes immediately after
-/// the archive magic, followed by `members` in order.
-pub fn write_sysv_symbol_table<W: Write>(w: &mut W, members: &[MemberInfo]) -> io::Result<()> {
-    write_sysv_symbol_table_with_prefix(w, members, 0)
-}
-
-/// Like [`write_sysv_symbol_table`], but `prefix_bytes` accounts for bytes that
-/// sit between the symbol-table member and the first file member — e.g. a `"//"`
-/// long-name string-table member. The computed member offsets are shifted by
-/// that amount so they remain correct.
-pub fn write_sysv_symbol_table_with_prefix<W: Write>(
+/// Member offsets assume the symbol-table member comes immediately after the
+/// archive magic, followed by `members` in order. `prefix_bytes` accounts for
+/// any bytes between this member and the first file member — e.g. a `"//"`
+/// long-name string-table member — shifting the offsets so they stay correct;
+/// pass 0 when there is no such prefix.
+pub fn write_sysv_symtab<W: Write>(
     w: &mut W,
     members: &[MemberInfo],
     prefix_bytes: u64,
@@ -171,7 +166,7 @@ mod tests {
     #[test]
     fn empty_archive_symbol_table_minimal() {
         let mut out = Vec::new();
-        write_sysv_symbol_table(&mut out, &[]).unwrap();
+        write_sysv_symtab(&mut out, &[], 0).unwrap();
         // Header is 60 bytes; payload is 4 bytes (count = 0).
         assert_eq!(out.len(), 60 + 4);
         // Count of symbols, big-endian.
@@ -189,7 +184,7 @@ mod tests {
             symbols: vec!["main".to_string()],
         }];
         let mut out = Vec::new();
-        write_sysv_symbol_table(&mut out, &members).unwrap();
+        write_sysv_symtab(&mut out, &members, 0).unwrap();
         // Payload: 4 (count) + 4 (offset) + 5 ("main\0") = 13, padded to 14.
         let payload_start = 60;
         let payload = &out[payload_start..];
@@ -227,7 +222,7 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
-        write_sysv_symbol_table(&mut out, &members).unwrap();
+        write_sysv_symtab(&mut out, &members, 0).unwrap();
         let payload = &out[60..];
         // Count = 2.
         assert_eq!(&payload[0..4], &[0, 0, 0, 2]);

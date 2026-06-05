@@ -236,8 +236,13 @@ fn strip_file(file: &OsStr) {
         strip_archive(&contents)
     } else {
         // #ST3: only ELF objects/executables and ar archives are supported.
-        // Other strippable formats (Mach-O, COFF/PE, XCOFF) are not yet handled;
-        // reject them clearly with a non-zero exit rather than silently passing.
+        // strip rewrites via object::build::elf::Builder, and the object crate's
+        // `build` (read-modify-write) module is ELF-only — there is no
+        // build::macho. (object reads Mach-O fine, which is why nm/strings work
+        // on it; only the in-place rewrite strip needs is missing.) A faithful
+        // Mach-O strip would need a hand-rolled __LINKEDIT/load-command rewrite,
+        // so other formats (Mach-O, COFF/PE, XCOFF) are rejected here rather
+        // than silently passed through.
         diag::error(&format!(
             "{}: {}",
             file.to_string_lossy(),

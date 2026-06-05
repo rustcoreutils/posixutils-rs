@@ -105,12 +105,21 @@ pub fn write_sysv_symtab<W: Write>(
 
     let mut offsets = Vec::with_capacity(symbol_count as usize * 4);
     let mut name_blob = Vec::with_capacity(symbol_bytes as usize);
+    // Offsets are computed in u64 and narrowed to the table's 32-bit field per
+    // symbol; an archive large enough to overflow u32 (>4 GiB) cannot be
+    // represented by a SysV symbol table, so error rather than truncate.
     let mut next_member_offset =
-        MAGIC.len() as u32 + MEMBER_HEADER_SIZE as u32 + table_size + prefix_bytes as u32;
+        MAGIC.len() as u64 + MEMBER_HEADER_SIZE + table_size as u64 + prefix_bytes;
 
     for member in members {
         for symbol in &member.symbols {
-            offsets.extend_from_slice(&next_member_offset.to_be_bytes());
+            let off: u32 = next_member_offset.try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "archive too large for 32-bit SysV symbol-table offsets",
+                )
+            })?;
+            offsets.extend_from_slice(&off.to_be_bytes());
             name_blob.extend(symbol.as_bytes());
             name_blob.push(0);
         }
@@ -120,7 +129,7 @@ pub fn write_sysv_symtab<W: Write>(
         // member's header advances by the unpadded payload plus the pad
         // byte (if the payload size is odd).
         let padded = member.size + (member.size % 2);
-        next_member_offset += (MEMBER_HEADER_SIZE + padded) as u32;
+        next_member_offset += MEMBER_HEADER_SIZE + padded;
     }
 
     let mut payload = Vec::with_capacity(table_size as usize);

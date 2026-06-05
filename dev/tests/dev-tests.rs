@@ -1144,3 +1144,225 @@ fn test_ar_replace_no_files_errors() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// nm tests. Fixtures are compiled at test time with cc (no committed binaries).
+// ---------------------------------------------------------------------------
+
+fn nm_compile_obj(dir: &std::path::Path, name: &str, src: &str) -> std::path::PathBuf {
+    let c = dir.join(format!("{}.c", name));
+    let o = dir.join(format!("{}.o", name));
+    fs::write(&c, src).unwrap();
+    let ok = std::process::Command::new("cc")
+        .args(["-c", "-o", o.to_str().unwrap(), c.to_str().unwrap()])
+        .status()
+        .expect("run cc")
+        .success();
+    assert!(ok, "cc must compile the nm fixture");
+    o
+}
+
+const NM_SRC: &str = r#"
+int alpha_global = 1;
+int zeta_global = 2;
+int mid_func(void) { return 0; }
+extern int undef_sym(void);
+int use_undef(void) { return undef_sym(); }
+"#;
+
+fn nm_run(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_nm"))
+        .args(args)
+        .output()
+        .expect("run nm")
+}
+
+/// The type letter of an nm default-format line ("value type name").
+fn nm_line_type(line: &str) -> &str {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    f[f.len() - 2]
+}
+
+fn nm_line_name(line: &str) -> &str {
+    line.split_whitespace().last().unwrap()
+}
+
+#[test]
+fn test_nm_default_sorted_by_name() {
+    // #N5: default output is sorted by symbol name.
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&[obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let names: Vec<&str> = stdout.lines().map(nm_line_name).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "default nm output must be sorted by name");
+    assert!(names.contains(&"alpha_global") && names.contains(&"undef_sym"));
+}
+
+#[test]
+fn test_nm_portable_format() {
+    // #N3/#N6/#N13: -P emits "name type value size".
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&["-P", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("mid_func "))
+        .expect("mid_func line");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields[0], "mid_func");
+    assert_eq!(fields[1], "T", "a defined global function is type T");
+    assert_eq!(fields.len(), 4, "defined -P line has 4 fields: {}", line);
+}
+
+#[test]
+fn test_nm_value_sort() {
+    // #N9: -v sorts by value (ascending).
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&["-v", "-P", "-t", "d", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let values: Vec<u64> = stdout
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() == 4 {
+                f[2].parse().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut sorted = values.clone();
+    sorted.sort_unstable();
+    assert_eq!(values, sorted, "-v output must be sorted by value");
+}
+
+#[test]
+fn test_nm_global_filter() {
+    // #N8: -g keeps only global symbols (uppercase type letters).
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&["-g", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let t = nm_line_type(line);
+        assert!(
+            t.chars().all(|c| c.is_ascii_uppercase()),
+            "-g must keep only globals: {}",
+            line
+        );
+    }
+    assert!(stdout.contains("mid_func"));
+}
+
+#[test]
+fn test_nm_undefined_filter() {
+    // #N8: -u keeps only undefined symbols.
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&["-u", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        assert_eq!(
+            nm_line_type(line),
+            "U",
+            "-u must keep only undefined: {}",
+            line
+        );
+    }
+    assert!(stdout.contains("undef_sym"));
+}
+
+#[test]
+fn test_nm_print_name_prefix() {
+    // #N4: -A prefixes every line with the object pathname.
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&["-A", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let prefix = format!("{}: ", obj.display());
+    for line in stdout.lines() {
+        assert!(line.starts_with(&prefix), "-A prefix missing: {}", line);
+    }
+}
+
+#[test]
+fn test_nm_multiple_files_headers() {
+    // #N11: multiple operands produce a "file:" header per file.
+    let dir = tempfile::TempDir::new().unwrap();
+    let a = nm_compile_obj(dir.path(), "first", NM_SRC);
+    let b = nm_compile_obj(dir.path(), "second", "int only_here = 9;\n");
+    let out = nm_run(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("{}:", a.display())));
+    assert!(stdout.contains(&format!("{}:", b.display())));
+}
+
+#[test]
+fn test_nm_archive_input() {
+    // #N2: nm reads .a archives and emits a "[member]:" stanza per member.
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let arc = dir.path().join("lib.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-rc", arc.to_str().unwrap(), obj.to_str().unwrap()])
+        .output()
+        .expect("ar -rc")
+        .status
+        .success());
+    let out = nm_run(&[arc.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "nm on archive failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[t.o]:"),
+        "per-member header missing: {}",
+        stdout
+    );
+    assert!(stdout.contains("mid_func"));
+}
+
+#[test]
+fn test_nm_octal_radix() {
+    // #N6/#N7: -t o formats numeric columns in octal (no digits 8/9).
+    let dir = tempfile::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&["-P", "-t", "o", obj.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() == 4 {
+            for col in [f[2], f[3]] {
+                assert!(
+                    !col.contains('8') && !col.contains('9'),
+                    "octal column has a non-octal digit: {}",
+                    line
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_nm_requires_operand() {
+    // #N1: file operand is required.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nm"))
+        .output()
+        .expect("run nm");
+    assert!(!out.status.success(), "nm with no operand must fail");
+}

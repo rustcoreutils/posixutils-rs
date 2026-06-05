@@ -1065,3 +1065,82 @@ fn test_ar_long_member_name() {
         b"payload-bytes-here"
     );
 }
+
+#[test]
+fn test_ar_print_verbose_uses_operand_prefix() {
+    // #A8: with file operands, the -pv prefix is the operand, not the member.
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("m.o");
+    fs::write(&f, b"PAYLOAD").unwrap();
+    let arc = dir.path().join("p.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-rc", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("ar -rc")
+        .status
+        .success());
+
+    // Operand with a directory prefix; matches member m.o by basename.
+    let pv = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-p", "-v", arc.to_str().unwrap(), "sub/m.o"])
+        .output()
+        .expect("ar -p -v");
+    assert!(pv.status.success());
+    let out = String::from_utf8_lossy(&pv.stdout);
+    assert!(
+        out.contains("<sub/m.o>"),
+        "the -pv prefix must be the operand, got: {}",
+        out
+    );
+    assert!(out.contains("PAYLOAD"));
+}
+
+#[test]
+fn test_ar_tv_shows_setuid_bit() {
+    // #A9: the -tv mode column renders setuid/setgid/sticky like ls.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let f = dir.path().join("s.o");
+    fs::write(&f, b"x").unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o4755)).unwrap();
+    let arc = dir.path().join("s.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-rc", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("ar -rc")
+        .status
+        .success());
+
+    let tv = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-tv", arc.to_str().unwrap()])
+        .output()
+        .expect("ar -tv");
+    assert!(tv.status.success());
+    let out = String::from_utf8_lossy(&tv.stdout);
+    assert!(
+        out.contains("rwsr-xr-x"),
+        "setuid bit must render as 's': {}",
+        out
+    );
+}
+
+#[test]
+fn test_ar_replace_no_files_errors() {
+    // #A11: -r with no file operands is a clear error, not a silent no-op or a
+    // misleading "missing archive operand".
+    let dir = tempfile::TempDir::new().unwrap();
+    let arc = dir.path().join("r.a");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", arc.to_str().unwrap()])
+        .output()
+        .expect("ar -r");
+    assert!(
+        !out.status.success(),
+        "ar -r with no file operands must error"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no file operands"),
+        "diagnostic should mention missing file operands: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

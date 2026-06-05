@@ -165,11 +165,16 @@ struct ArchiveMember {
 impl ArchiveMember {
     fn read(file_path: &Path) -> ArResult<Self> {
         if !file_path.exists() {
-            return Err(format!("{}: No such file or directory", file_path.display()).into());
+            return Err(format!(
+                "{}: {}",
+                file_path.display(),
+                gettext("No such file or directory")
+            )
+            .into());
         }
 
         if !file_path.is_file() {
-            return Err(format!("{}: Is a directory", file_path.display()).into());
+            return Err(format!("{}: {}", file_path.display(), gettext("Is a directory")).into());
         }
 
         let file_metadata = file_path.metadata()?;
@@ -243,11 +248,16 @@ struct Archive {
 impl Archive {
     fn read_from_file(path: &Path) -> ArResult<Self> {
         if !path.exists() {
-            return Err(format!("{}: No such file or directory", path.display()).into());
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                gettext("No such file or directory")
+            )
+            .into());
         }
 
         if !path.is_file() {
-            return Err(format!("{}: Is a directory", path.display()).into());
+            return Err(format!("{}: {}", path.display(), gettext("Is a directory")).into());
         }
 
         let file_data = std::fs::read(path)?;
@@ -258,7 +268,7 @@ impl Archive {
         let mut archive_size = 0;
 
         for member in parsed_archive.members() {
-            let member = member.map_err(|_| "invalid archive format")?;
+            let member = member.map_err(|_| gettext("invalid archive format"))?;
 
             let data = member.data(&*file_data)?;
             let name = OsString::from_vec(member.name().to_vec());
@@ -271,10 +281,10 @@ impl Archive {
 
             members.push(ArchiveMember {
                 name,
-                date: member.date().ok_or("invalid archive format")?,
-                uid: member.uid().ok_or("invalid archive format")?,
-                gid: member.gid().ok_or("invalid archive format")?,
-                mode: member.mode().ok_or("invalid archive format")?,
+                date: member.date().ok_or(gettext("invalid archive format"))?,
+                uid: member.uid().ok_or(gettext("invalid archive format"))?,
+                gid: member.gid().ok_or(gettext("invalid archive format"))?,
+                mode: member.mode().ok_or(gettext("invalid archive format"))?,
                 size: data.len() as u64,
                 data: data.to_vec(),
                 symbols,
@@ -425,7 +435,7 @@ impl Archive {
 /// If the input string is longer than N, an error is returned.
 fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
     if s.len() > N {
-        return Err("file metadata cannot fit into archive format".into());
+        return Err(gettext("file metadata cannot fit into archive format").into());
     }
     let mut result = [b' '; N];
     for (i, byte) in s.as_bytes().iter().enumerate() {
@@ -445,7 +455,12 @@ fn format_name_for_header(name: &OsStr, long_name_offset: Option<usize>) -> ArRe
         Some(offset) => {
             let encoded = format!("/{}", offset);
             if encoded.len() > 16 {
-                return Err(format!("archive name-table offset too large: {}", offset).into());
+                return Err(format!(
+                    "{}: {}",
+                    gettext("archive name-table offset too large"),
+                    offset
+                )
+                .into());
             }
             result[..encoded.len()].copy_from_slice(encoded.as_bytes());
         }
@@ -521,7 +536,7 @@ fn delete_cmd(args: DeleteArgs) -> ArResult<()> {
 fn move_cmd(args: MoveArgs) -> ArResult<()> {
     if args.insert_args.insert_after || args.insert_args.insert_before {
         if args.files.len() < 2 {
-            return Err("missing archive operand".into());
+            return Err(gettext("missing archive operand").into());
         }
 
         let posname = &args.files[0];
@@ -529,7 +544,12 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
         let mut archive = Archive::read_from_file(archive_path)?;
 
         if archive.member_index(posname).is_none() {
-            return Err(format!("{}: No such file or directory", posname.to_string_lossy()).into());
+            return Err(format!(
+                "{}: {}",
+                posname.to_string_lossy(),
+                gettext("No such file or directory")
+            )
+            .into());
         }
         for file in args.files.iter().skip(2) {
             let target = archive.member_index(posname).unwrap();
@@ -544,7 +564,13 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
                     archive.move_before(index, target);
                 }
             } else {
-                return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
+                return Err(format!(
+                    "{} {} {}",
+                    gettext("no entry"),
+                    file.to_string_lossy(),
+                    gettext("in archive")
+                )
+                .into());
             }
         }
 
@@ -563,7 +589,13 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
                 }
                 archive.move_to_end(index);
             } else {
-                return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
+                return Err(format!(
+                    "{} {} {}",
+                    gettext("no entry"),
+                    file.to_string_lossy(),
+                    gettext("in archive")
+                )
+                .into());
             }
         }
         let mut buf = Vec::new();
@@ -590,13 +622,16 @@ fn print_cmd(args: PrintArgs) -> ArResult<()> {
             if let Some(index) = archive.member_index(file) {
                 let member = archive.get_member(index);
                 if args.verbose {
-                    print!("\n<{}>\n\n", member.name.to_string_lossy());
+                    // POSIX STDOUT 84476-84479 (#A8): when file operands are
+                    // given, the prefix is the operand, not the member name.
+                    print!("\n<{}>\n\n", file.to_string_lossy());
                 }
                 stdout().write_all(&member.data)?;
             } else {
                 diag::error(&format!(
-                    "{}: No such file or directory",
-                    file.to_string_lossy()
+                    "{}: {}",
+                    file.to_string_lossy(),
+                    gettext("No such file or directory")
                 ));
             }
         }
@@ -642,21 +677,30 @@ fn replace_cmd(args: ReplaceArgs) -> ArResult<()> {
 
     let archive_path = if special_insert_position {
         if args.files.len() < 2 {
-            return Err("missing archive operand".into());
+            return Err(gettext("missing archive operand").into());
         }
         Path::new(&args.files[1])
     } else {
         if args.files.is_empty() {
-            return Err("missing archive operand".into());
+            return Err(gettext("missing archive operand").into());
         }
         Path::new(&args.files[0])
     };
+
+    // #A11: distinguish "no file operands" from "missing archive". POSIX leaves
+    // `-r` with no files (on an existing archive) undefined; we reject it with a
+    // clear message and non-zero exit rather than the misleading
+    // "missing archive operand" or a silent no-op.
+    let files_start = special_insert_position as usize + 1;
+    if args.files.len() <= files_start {
+        return Err(gettext("no file operands specified").into());
+    }
 
     let mut archive = if archive_path.exists() {
         Archive::read_from_file(archive_path)?
     } else {
         if !args.no_create_message {
-            eprintln!("ar: creating {}", archive_path.display());
+            eprintln!("ar: {} {}", gettext("creating"), archive_path.display());
         }
         Archive::default()
     };
@@ -709,11 +753,27 @@ fn replace_cmd(args: ReplaceArgs) -> ArResult<()> {
 fn format_mode(mode: u64) -> String {
     let types = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"];
 
-    let user = types[((mode >> 6) & 7) as usize];
-    let group = types[((mode >> 3) & 7) as usize];
-    let others = types[(mode & 7) as usize];
+    let mut s = format!(
+        "{}{}{}",
+        types[((mode >> 6) & 7) as usize],
+        types[((mode >> 3) & 7) as usize],
+        types[(mode & 7) as usize]
+    )
+    .into_bytes();
 
-    format!("{}{}{}", user, group, others)
+    // setuid / setgid / sticky bits, rendered in the exec positions like ls
+    // (#A9): lowercase when the exec bit is also set, uppercase otherwise.
+    if mode & 0o4000 != 0 {
+        s[2] = if s[2] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o2000 != 0 {
+        s[5] = if s[5] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o1000 != 0 {
+        s[8] = if s[8] == b'x' { b't' } else { b'T' };
+    }
+
+    String::from_utf8(s).unwrap()
 }
 
 fn list_member(member: &ArchiveMember, verbose: bool) {
@@ -748,9 +808,12 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
             if let Some(index) = archive.member_index(&file) {
                 list_member(archive.get_member(index), args.verbose);
             } else {
-                return Err(
-                    format!("{}: No such file or directory", archive_path.display()).into(),
-                );
+                return Err(format!(
+                    "{}: {}",
+                    archive_path.display(),
+                    gettext("No such file or directory")
+                )
+                .into());
             }
         }
     }
@@ -787,9 +850,11 @@ fn extract_member(
     let out_name: OsString = if name_bytes.len() > name_max {
         if !allow_truncation {
             return Err(format!(
-                "{}: file name too long (limit {} bytes); use -T to allow truncation",
+                "{}: {} {} {}",
                 member.name.to_string_lossy(),
-                name_max
+                gettext("file name too long (limit"),
+                name_max,
+                gettext("bytes); use -T to allow truncation")
             )
             .into());
         }
@@ -833,9 +898,12 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
                     args.allow_truncation,
                 )?;
             } else {
-                return Err(
-                    format!("{}: No such file or directory", file.to_string_lossy()).into(),
-                );
+                return Err(format!(
+                    "{}: {}",
+                    file.to_string_lossy(),
+                    gettext("No such file or directory")
+                )
+                .into());
             }
         }
     }

@@ -203,14 +203,14 @@ impl ArchiveMember {
         })
     }
 
-    fn write<W: Write>(&self, writer: &mut W) -> ArResult<()> {
+    fn write<W: Write>(&self, writer: &mut W, long_name_offset: Option<usize>) -> ArResult<()> {
         // format definition taken from: https://en.wikipedia.org/wiki/Ar_(Unix)
 
         // Since we are using the System V (or GNU) archive format, the data section
         // needs to be 2 byte aligned, if it isn't we add a newline as filler
         let size = self.size + (self.data.len() % 2) as u64;
 
-        writer.write_all(&format_name_for_header(&self.name)?)?;
+        writer.write_all(&format_name_for_header(&self.name, long_name_offset)?)?;
         writer.write_all(&pad_metadata_with_spaces::<12>(self.date.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<6>(self.uid.to_string())?)?;
         writer.write_all(&pad_metadata_with_spaces::<6>(self.gid.to_string())?)?;
@@ -291,14 +291,41 @@ impl Archive {
 
     fn write<W: Write>(&self, writer: &mut W) -> ArResult<()> {
         writer.write_all(&object::archive::MAGIC)?;
-        self.write_symbol_table(writer)?;
-        for member in &self.members {
-            member.write(writer)?;
+
+        // Build the System V "//" long-name string table for any member name
+        // longer than 15 bytes (#A6). Each long name is stored as "<name>/\n";
+        // its member header carries "/<offset>" into this table.
+        let mut name_table: Vec<u8> = Vec::new();
+        let mut offsets: Vec<Option<usize>> = Vec::with_capacity(self.members.len());
+        for m in &self.members {
+            if m.name.as_bytes().len() > 15 {
+                offsets.push(Some(name_table.len()));
+                name_table.extend_from_slice(m.name.as_bytes());
+                name_table.extend_from_slice(b"/\n");
+            } else {
+                offsets.push(None);
+            }
+        }
+        // Bytes the "//" member occupies between the symbol table and the first
+        // file member (0 when there are no long names). Member offsets recorded
+        // in the symbol table must account for it.
+        let long_table_bytes = if name_table.is_empty() {
+            0
+        } else {
+            MEMBER_HEADER_SIZE + name_table.len() as u64 + (name_table.len() % 2) as u64
+        };
+
+        self.write_symbol_table(writer, long_table_bytes)?;
+        if !name_table.is_empty() {
+            write_long_name_member(writer, &name_table)?;
+        }
+        for (member, offset) in self.members.iter().zip(offsets) {
+            member.write(writer, offset)?;
         }
         Ok(())
     }
 
-    fn write_symbol_table<W: Write>(&self, writer: &mut W) -> ArResult<()> {
+    fn write_symbol_table<W: Write>(&self, writer: &mut W, prefix_bytes: u64) -> ArResult<()> {
         let members: Vec<plib::archive::MemberInfo> = self
             .members
             .iter()
@@ -307,7 +334,7 @@ impl Archive {
                 symbols: m.symbols.clone(),
             })
             .collect();
-        plib::archive::write_sysv_symbol_table(writer, &members)?;
+        plib::archive::write_sysv_symbol_table_with_prefix(writer, &members, prefix_bytes)?;
         Ok(())
     }
 
@@ -410,16 +437,45 @@ fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
 /// Generates a byte array of length 16, from the input OsStr padding it with spaces.
 /// We use the System V (or GNU) archive format, which requires the name to be a maximum
 /// of 15 bytes, followed by a '/' character and space padding.
-fn format_name_for_header(name: &OsStr) -> ArResult<[u8; 16]> {
-    if name.len() > 15 {
-        return Err(format!("{}: file name is too long", name.to_string_lossy()).into());
-    }
+fn format_name_for_header(name: &OsStr, long_name_offset: Option<usize>) -> ArResult<[u8; 16]> {
     let mut result = [b' '; 16];
-    for (i, byte) in name.as_bytes().iter().enumerate() {
-        result[i] = *byte;
+    match long_name_offset {
+        // Long name (> 15 bytes): the header carries "/<offset>" referencing the
+        // "//" string-table member (#A6).
+        Some(offset) => {
+            let encoded = format!("/{}", offset);
+            if encoded.len() > 16 {
+                return Err(format!("archive name-table offset too large: {}", offset).into());
+            }
+            result[..encoded.len()].copy_from_slice(encoded.as_bytes());
+        }
+        // Short name (<= 15 bytes): stored inline as "<name>/".
+        None => {
+            let bytes = name.as_bytes();
+            result[..bytes.len()].copy_from_slice(bytes);
+            result[bytes.len()] = b'/';
+        }
     }
-    result[name.len()] = b'/';
     Ok(result)
+}
+
+/// Write the System V `"//"` long-name string-table member.
+fn write_long_name_member<W: Write>(writer: &mut W, table: &[u8]) -> ArResult<()> {
+    let mut name_field = [b' '; 16];
+    name_field[0] = b'/';
+    name_field[1] = b'/';
+    writer.write_all(&name_field)?;
+    writer.write_all(&pad_metadata_with_spaces::<12>(String::new())?)?; // date
+    writer.write_all(&pad_metadata_with_spaces::<6>(String::new())?)?; // uid
+    writer.write_all(&pad_metadata_with_spaces::<6>(String::new())?)?; // gid
+    writer.write_all(&pad_metadata_with_spaces::<8>(String::new())?)?; // mode
+    writer.write_all(&pad_metadata_with_spaces::<10>(table.len().to_string())?)?;
+    writer.write_all(&object::archive::TERMINATOR)?;
+    writer.write_all(table)?;
+    if table.len() % 2 != 0 {
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn member_symbol_bytes(member_symbols: &[String]) -> u64 {

@@ -1008,3 +1008,60 @@ fn test_ar_extract_long_name_truncation() {
         "the truncated-name file should have been created"
     );
 }
+
+#[test]
+fn test_ar_long_member_name() {
+    // #A6: a member name longer than 15 bytes is stored via a "//" long-name
+    // table (POSIX: valid filenames must not be rejected), and round-trips
+    // through list/parse/extract.
+    let dir = tempfile::TempDir::new().unwrap();
+    let longname = "this_is_a_long_member_name.o"; // 28 bytes > 15
+    let f = dir.path().join(longname);
+    fs::write(&f, b"payload-bytes-here").unwrap();
+    let arc = dir.path().join("l.a");
+    let create = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-rc", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("ar -rc");
+    assert!(
+        create.status.success(),
+        "ar -rc failed for a long name: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // ar -t lists the full name.
+    let t = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-t", arc.to_str().unwrap()])
+        .output()
+        .expect("ar -t");
+    assert!(t.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&t.stdout),
+        format!("{}\n", longname)
+    );
+
+    // The archive parses and the member name/data are preserved.
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
+    let m = archive.members().next().unwrap().unwrap();
+    assert_eq!(m.name(), longname.as_bytes());
+    assert_eq!(m.data(&*bytes).unwrap(), b"payload-bytes-here");
+
+    // Extract recreates the file under its full name.
+    let exdir = dir.path().join("ex");
+    fs::create_dir(&exdir).unwrap();
+    let x = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", arc.to_str().unwrap()])
+        .current_dir(&exdir)
+        .output()
+        .expect("ar -x");
+    assert!(
+        x.status.success(),
+        "ar -x failed: {}",
+        String::from_utf8_lossy(&x.stderr)
+    );
+    assert_eq!(
+        fs::read(exdir.join(longname)).unwrap(),
+        b"payload-bytes-here"
+    );
+}

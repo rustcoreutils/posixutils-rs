@@ -87,6 +87,18 @@ pub fn pad_metadata_field<const N: usize>(s: &str) -> io::Result<[u8; N]> {
 /// Member offsets assume the symbol-table member comes immediately after
 /// the archive magic, followed by `members` in order.
 pub fn write_sysv_symbol_table<W: Write>(w: &mut W, members: &[MemberInfo]) -> io::Result<()> {
+    write_sysv_symbol_table_with_prefix(w, members, 0)
+}
+
+/// Like [`write_sysv_symbol_table`], but `prefix_bytes` accounts for bytes that
+/// sit between the symbol-table member and the first file member — e.g. a `"//"`
+/// long-name string-table member. The computed member offsets are shifted by
+/// that amount so they remain correct.
+pub fn write_sysv_symbol_table_with_prefix<W: Write>(
+    w: &mut W,
+    members: &[MemberInfo],
+    prefix_bytes: u64,
+) -> io::Result<()> {
     let symbol_count: u64 = members.iter().map(|m| m.symbols.len() as u64).sum();
     let symbol_bytes: u64 = members.iter().map(|m| m.symbol_bytes()).sum();
 
@@ -98,7 +110,8 @@ pub fn write_sysv_symbol_table<W: Write>(w: &mut W, members: &[MemberInfo]) -> i
 
     let mut offsets = Vec::with_capacity(symbol_count as usize * 4);
     let mut name_blob = Vec::with_capacity(symbol_bytes as usize);
-    let mut next_member_offset = MAGIC.len() as u32 + MEMBER_HEADER_SIZE as u32 + table_size;
+    let mut next_member_offset =
+        MAGIC.len() as u32 + MEMBER_HEADER_SIZE as u32 + table_size + prefix_bytes as u32;
 
     for member in members {
         for symbol in &member.symbols {

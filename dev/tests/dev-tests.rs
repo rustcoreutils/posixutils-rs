@@ -924,3 +924,87 @@ fn test_ar_bundled_mode_flags() {
     );
     assert_eq!(String::from_utf8_lossy(&dv.stdout), "d - m.o\n");
 }
+
+#[test]
+fn test_ar_move_verbose() {
+    // #A5: ar -m -v reports each moved member as "m - <name>".
+    let dir = tempfile::TempDir::new().unwrap();
+    let a = dir.path().join("a.o");
+    let b = dir.path().join("b.o");
+    fs::write(&a, b"aaaa").unwrap();
+    fs::write(&b, b"bbbb").unwrap();
+    let arc = dir.path().join("mv.a");
+    assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args([
+            "-rc",
+            arc.to_str().unwrap(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap()
+        ])
+        .output()
+        .expect("ar -rc")
+        .status
+        .success());
+
+    let mv = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-m", "-v", arc.to_str().unwrap(), "a.o"])
+        .output()
+        .expect("ar -m -v");
+    assert!(
+        mv.status.success(),
+        "ar -m -v failed: {}",
+        String::from_utf8_lossy(&mv.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&mv.stdout), "m - a.o\n");
+}
+
+#[test]
+fn test_ar_extract_long_name_truncation() {
+    // #A4: extracting a member whose name exceeds NAME_MAX errors by default
+    // and is truncated with -T. Build the long-name archive with the ar crate
+    // (a real file with a 300-byte name can't exist on disk).
+    let dir = tempfile::TempDir::new().unwrap();
+    let longname = format!("{}.o", "x".repeat(300));
+    let data = b"member-data";
+    let arc = dir.path().join("long.a");
+    {
+        let f = fs::File::create(&arc).unwrap();
+        let mut builder = ar::GnuBuilder::new(f, vec![longname.clone().into_bytes()]);
+        let header = ar::Header::new(longname.clone().into_bytes(), data.len() as u64);
+        builder.append(&header, &data[..]).unwrap();
+    }
+
+    // Without -T: error, no file created.
+    let no_t = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", arc.to_str().unwrap()])
+        .current_dir(dir.path())
+        .output()
+        .expect("ar -x");
+    assert!(
+        !no_t.status.success(),
+        "extract of an over-long name must fail without -T"
+    );
+    assert!(
+        String::from_utf8_lossy(&no_t.stderr).contains("too long"),
+        "diagnostic should mention the name is too long: {}",
+        String::from_utf8_lossy(&no_t.stderr)
+    );
+
+    // With -T: name is truncated to NAME_MAX and the file is created.
+    let with_t = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-x", "-T", arc.to_str().unwrap()])
+        .current_dir(dir.path())
+        .output()
+        .expect("ar -x -T");
+    assert!(
+        with_t.status.success(),
+        "extract with -T must succeed: {}",
+        String::from_utf8_lossy(&with_t.stderr)
+    );
+    // The first 255 bytes of the name are all 'x'.
+    let truncated = dir.path().join("x".repeat(255));
+    assert!(
+        truncated.exists(),
+        "the truncated-name file should have been created"
+    );
+}

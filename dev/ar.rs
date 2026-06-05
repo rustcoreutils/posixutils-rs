@@ -38,6 +38,9 @@ struct DeleteArgs {
 
 #[derive(clap::Args)]
 struct MoveArgs {
+    #[arg(short = 'v', help = gettext("Give verbose output"))]
+    verbose: bool,
+
     #[command(flatten)]
     insert_args: InsertArgs,
 
@@ -476,6 +479,9 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
             let target = archive.member_index(posname).unwrap();
             let index = archive.member_index(file);
             if let Some(index) = index {
+                if args.verbose {
+                    println!("m - {}", file.to_string_lossy());
+                }
                 if args.insert_args.insert_after {
                     archive.move_after(index, target);
                 } else if args.insert_args.insert_before {
@@ -496,6 +502,9 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
         for file in args.files.iter().skip(1) {
             let index = archive.member_index(file);
             if let Some(index) = index {
+                if args.verbose {
+                    println!("m - {}", file.to_string_lossy());
+                }
                 archive.move_to_end(index);
             } else {
                 return Err(format!("no entry {} in archive", file.to_string_lossy()).into());
@@ -698,13 +707,47 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
     Ok(())
 }
 
-fn extract_member(member: &ArchiveMember, dont_replace: bool, verbose: bool) -> ArResult<()> {
-    let file_path = Path::new(&member.name);
+/// Largest filename (in bytes) the current directory's filesystem accepts.
+fn name_max_for_cwd() -> usize {
+    let dot = std::ffi::CString::new(".").unwrap();
+    let v = unsafe { libc::pathconf(dot.as_ptr(), libc::_PC_NAME_MAX) };
+    if v > 0 {
+        v as usize
+    } else {
+        255
+    }
+}
+
+fn extract_member(
+    member: &ArchiveMember,
+    dont_replace: bool,
+    verbose: bool,
+    allow_truncation: bool,
+) -> ArResult<()> {
+    // POSIX 84418-84421 (#A4): extracting a name longer than NAME_MAX is an
+    // error by default; -T allows the name to be truncated to fit.
+    let name_bytes = member.name.as_bytes();
+    let name_max = name_max_for_cwd();
+    let out_name: OsString = if name_bytes.len() > name_max {
+        if !allow_truncation {
+            return Err(format!(
+                "{}: file name too long (limit {} bytes); use -T to allow truncation",
+                member.name.to_string_lossy(),
+                name_max
+            )
+            .into());
+        }
+        OsString::from_vec(name_bytes[..name_max].to_vec())
+    } else {
+        member.name.clone()
+    };
+
+    let file_path = Path::new(&out_name);
     if file_path.exists() && dont_replace {
         return Ok(());
     }
     if verbose {
-        println!("x - {}", member.name.to_string_lossy());
+        println!("x - {}", out_name.to_string_lossy());
     }
     let mut out_file = std::fs::File::create(file_path)?;
     out_file.write_all(&member.data)?;
@@ -717,7 +760,12 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
 
     if args.files.is_empty() {
         for member in &archive.members {
-            extract_member(member, args.dont_replace_files, args.verbose)?;
+            extract_member(
+                member,
+                args.dont_replace_files,
+                args.verbose,
+                args.allow_truncation,
+            )?;
         }
     } else {
         for file in args.files {
@@ -726,6 +774,7 @@ fn extract_cmd(args: ExtractArgs) -> ArResult<()> {
                     archive.get_member(index),
                     args.dont_replace_files,
                     args.verbose,
+                    args.allow_truncation,
                 )?;
             } else {
                 return Err(

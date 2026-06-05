@@ -272,6 +272,12 @@ fn process_input(args: &Args, path: &str, radix: OutputType, multiple: bool) -> 
             let member_data = match member.data(&*data) {
                 Ok(d) => d,
                 Err(_) => {
+                    diag::error(&format!(
+                        "{}[{}]: {}",
+                        path,
+                        member_name,
+                        gettext("cannot read archive member")
+                    ));
                     ok = false;
                     continue;
                 }

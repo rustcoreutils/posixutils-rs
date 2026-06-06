@@ -54,6 +54,34 @@ fn test_bc_add() {
     test_bc!(add)
 }
 
+// Diagnostics go to stderr, not stdout (audit #B2). A runtime error in the
+// REPL is recovered from, so the session still exits 0 after quit.
+#[test]
+fn test_bc_error_to_stderr() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1/0\nquit\n"),
+        expected_out: String::new(),
+        expected_err: String::from("runtime error (line 1): division by zero\n"),
+        expected_exit_code: 0,
+    });
+}
+
+// A file operand that cannot be read: diagnostic to stderr, terminate with a
+// non-zero exit status (audit #B11).
+#[test]
+fn test_bc_missing_file() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec!["/nonexistent-bc-file.bc".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::from("bc: cannot read file: /nonexistent-bc-file.bc\n"),
+        expected_exit_code: 1,
+    });
+}
+
 // Regression: `quit` inside a `for` body within a function definition must not
 // panic. Per bc semantics quit takes effect when the definition is read, so
 // the statements after the definition are never executed (matches GNU bc).

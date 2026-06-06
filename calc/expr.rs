@@ -28,7 +28,7 @@ enum Token {
     OpAnd,
     OpOr,
     OpMatch,
-    Integer(i64),
+    Integer(i128),
     Str(String),
 }
 
@@ -78,6 +78,18 @@ fn token_is_zero(t: &Token) -> bool {
     }
 }
 
+// Does the result value count as "null or zero" for exit-status purposes?
+// Per POSIX EXIT STATUS: 0 if the result is neither null nor zero, else 1.
+// GNU expr treats the empty string, the literal integer 0, and the string
+// "0" as zero (but not "0.0", "00", etc.).
+fn token_is_null_or_zero(t: &Token) -> bool {
+    match t {
+        Token::Integer(val) => *val == 0,
+        Token::Str(s) => s.is_empty() || s == "0",
+        _ => false,
+    }
+}
+
 // convert token to string
 fn token_to_string(t: &Token) -> Result<String, &'static str> {
     match t {
@@ -88,7 +100,7 @@ fn token_to_string(t: &Token) -> Result<String, &'static str> {
 }
 
 // convert token to integer
-fn token_to_int(t: &Token) -> Option<i64> {
+fn token_to_int(t: &Token) -> Option<i128> {
     match t {
         Token::Integer(val) => Some(*val),
         _ => None,
@@ -96,10 +108,10 @@ fn token_to_int(t: &Token) -> Option<i64> {
 }
 
 // convert token to integer, returning an error if not an integer
-fn token_to_int_req(t: &Token) -> Result<i64, &'static str> {
+fn token_to_int_req(t: &Token) -> Result<i128, &'static str> {
     match token_to_int(t) {
         Some(val) => Ok(val),
-        None => Err("syntax error: not an integer"),
+        None => Err("non-integer argument"),
     }
 }
 
@@ -122,7 +134,7 @@ fn parse_token(s: &str) -> Token {
         "&" => Token::OpAnd,
         "|" => Token::OpOr,
         ":" => Token::OpMatch,
-        _ => match s.parse::<i64>() {
+        _ => match s.parse::<i128>() {
             Ok(n) => Token::Integer(n),
             Err(_) => Token::Str(String::from(s)),
         },
@@ -135,6 +147,13 @@ fn tokenize() -> Vec<Token> {
     let mut args: Vec<String> = std::env::args().collect();
     args.remove(0); // remove 1st value, the unnecessary program name
 
+    // POSIX / XBD 12.2 Guideline 10: a leading "--" delimits the end of
+    // options. expr has no options, so a single leading "--" is consumed to
+    // protect operands that begin with '-'.
+    if args.first().map(String::as_str) == Some("--") {
+        args.remove(0);
+    }
+
     // parse each arg into a Token
     let mut tokens = Vec::new();
     for arg in &args {
@@ -145,7 +164,7 @@ fn tokenize() -> Vec<Token> {
 }
 
 // compare two integers
-fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Token {
+fn cmpint(lhs: i128, rhs: i128, op: CmpOp) -> Token {
     let result: bool = match op {
         CmpOp::EQ => lhs == rhs,
         CmpOp::NE => lhs != rhs,
@@ -155,7 +174,7 @@ fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Token {
         CmpOp::LE => lhs <= rhs,
     };
 
-    Token::Integer(result as i64)
+    Token::Integer(result as i128)
 }
 
 // compare two strings
@@ -172,7 +191,7 @@ fn cmpstr(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
         CmpOp::LE => lhs <= rhs,
     };
 
-    Ok(Token::Integer(result as i64))
+    Ok(Token::Integer(result as i128))
 }
 
 // perform a comparison operation
@@ -203,13 +222,25 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
     let i1 = token_to_int_req(lhs)?;
     let i2 = token_to_int_req(rhs)?;
 
-    match op {
-        IntOp::Add => Ok(Token::Integer(i1 + i2)),
-        IntOp::Sub => Ok(Token::Integer(i1 - i2)),
-        IntOp::Mul => Ok(Token::Integer(i1 * i2)),
-        IntOp::Div => Ok(Token::Integer(i1 / i2)),
-        IntOp::Rem => Ok(Token::Integer(i1 % i2)),
-    }
+    let result = match op {
+        IntOp::Add => i1.checked_add(i2),
+        IntOp::Sub => i1.checked_sub(i2),
+        IntOp::Mul => i1.checked_mul(i2),
+        IntOp::Div => {
+            if i2 == 0 {
+                return Err("division by zero");
+            }
+            i1.checked_div(i2)
+        }
+        IntOp::Rem => {
+            if i2 == 0 {
+                return Err("division by zero");
+            }
+            i1.checked_rem(i2)
+        }
+    };
+
+    result.map(Token::Integer).ok_or("integer overflow")
 }
 
 // logical and/or operation
@@ -218,17 +249,18 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
     let rhs_zero = token_is_zero(rhs);
 
     if is_and {
+        // expr1 & expr2: return expr1 if neither is null or zero, else 0.
         if !lhs_zero && !rhs_zero {
             lhs.clone()
         } else {
             Token::Integer(0)
         }
     } else if !lhs_zero {
+        // expr1 | expr2: return expr1 if it is neither null nor zero,
+        // otherwise return expr2 (regardless of expr2's value).
         lhs.clone()
-    } else if !rhs_zero {
-        rhs.clone()
     } else {
-        Token::Integer(0)
+        rhs.clone()
     }
 }
 
@@ -258,121 +290,173 @@ fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
 
             // otherwise, return length of overall match as int
             } else {
-                Ok(Token::Integer(caps.get(0).unwrap().len() as i64))
+                Ok(Token::Integer(caps.get(0).unwrap().len() as i128))
             }
         }
     }
 }
 
-// find closing right paren
-fn find_matching_paren(tokens: &[Token]) -> Option<usize> {
-    let mut depth = 0;
-    for (i, token) in tokens.iter().enumerate() {
-        match token {
-            Token::LParen => depth += 1,
-            Token::RParen => {
-                if depth == 0 {
-                    return None;
+// Recursive-descent, precedence-climbing evaluator. Operator precedence and
+// associativity follow the POSIX expr EXTENDED DESCRIPTION table (in order of
+// decreasing precedence): grouping, ':', '* / %', '+ -', comparisons, '&',
+// '|'. All binary operators are left-associative.
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Self {
+        Parser { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn advance(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    // top level: '|', lowest precedence
+    fn parse_or(&mut self) -> Result<Token, &'static str> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek(), Some(Token::OpOr)) {
+            self.advance();
+            let rhs = self.parse_and()?;
+            lhs = logop(&lhs, &rhs, false);
+        }
+        Ok(lhs)
+    }
+
+    // '&'
+    fn parse_and(&mut self) -> Result<Token, &'static str> {
+        let mut lhs = self.parse_cmp()?;
+        while matches!(self.peek(), Some(Token::OpAnd)) {
+            self.advance();
+            let rhs = self.parse_cmp()?;
+            lhs = logop(&lhs, &rhs, true);
+        }
+        Ok(lhs)
+    }
+
+    // comparison operators: = > >= < <= !=
+    fn parse_cmp(&mut self) -> Result<Token, &'static str> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::OpEq) => CmpOp::EQ,
+                Some(Token::OpNE) => CmpOp::NE,
+                Some(Token::OpGT) => CmpOp::GT,
+                Some(Token::OpLT) => CmpOp::LT,
+                Some(Token::OpGE) => CmpOp::GE,
+                Some(Token::OpLE) => CmpOp::LE,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_add()?;
+            lhs = cmpop(&lhs, &rhs, op)?;
+        }
+        Ok(lhs)
+    }
+
+    // additive operators: + -
+    fn parse_add(&mut self) -> Result<Token, &'static str> {
+        let mut lhs = self.parse_mul()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::OpAdd) => IntOp::Add,
+                Some(Token::OpSub) => IntOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_mul()?;
+            lhs = intop(&lhs, &rhs, op)?;
+        }
+        Ok(lhs)
+    }
+
+    // multiplicative operators: * / %
+    fn parse_mul(&mut self) -> Result<Token, &'static str> {
+        let mut lhs = self.parse_match()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::OpMul) => IntOp::Mul,
+                Some(Token::OpDiv) => IntOp::Div,
+                Some(Token::OpRem) => IntOp::Rem,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_match()?;
+            lhs = intop(&lhs, &rhs, op)?;
+        }
+        Ok(lhs)
+    }
+
+    // matching operator ':', highest-precedence binary operator
+    fn parse_match(&mut self) -> Result<Token, &'static str> {
+        let mut lhs = self.parse_primary()?;
+        while matches!(self.peek(), Some(Token::OpMatch)) {
+            self.advance();
+            let rhs = self.parse_primary()?;
+            lhs = matchop(&lhs, &rhs)?;
+        }
+        Ok(lhs)
+    }
+
+    // primary: ( expr ) | integer | string
+    fn parse_primary(&mut self) -> Result<Token, &'static str> {
+        match self.advance() {
+            Some(Token::LParen) => {
+                let val = self.parse_or()?;
+                match self.advance() {
+                    Some(Token::RParen) => Ok(val),
+                    _ => Err("syntax error: expected ')'"),
                 }
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
             }
-            _ => {}
+            Some(t) if token_is_lval(&t) => Ok(t),
+            Some(_) => Err("syntax error: unexpected operator"),
+            None => Err("syntax error: missing argument"),
         }
-    }
-
-    None
-}
-
-// evaluate an expression
-fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
-    let mut tokens = tokens.to_vec();
-
-    // continually consume tokens until only one remains
-    while tokens.len() >= 3 {
-        // handle nested expressions: left hand side
-        if tokens[0] == Token::LParen {
-            if let Some(i) = find_matching_paren(&tokens) {
-                let subexpr = &tokens[1..i];
-                let result = eval_expression(subexpr)?;
-                tokens.splice(0..=i, vec![result]);
-                continue;
-            } else {
-                return Err("syntax error EP0: unmatched left paren");
-            }
-        }
-        // handle nested expressions: right hand side
-        if tokens[2] == Token::LParen {
-            if let Some(i) = find_matching_paren(&tokens[2..]) {
-                let subexpr = &tokens[3..i + 2];
-                let result = eval_expression(subexpr)?;
-                tokens.splice(2..=i + 2, vec![result]);
-                continue;
-            } else {
-                return Err("syntax error EP1: unmatched left paren");
-            }
-        }
-
-        // extract our left hand side, operator, and right hand side
-        let lhs = &tokens[0];
-        let operator = &tokens[1];
-        let rhs = &tokens[2];
-
-        // dispatch to the appropriate operation
-        let result = match operator {
-            Token::OpAdd => intop(lhs, rhs, IntOp::Add)?,
-            Token::OpSub => intop(lhs, rhs, IntOp::Sub)?,
-            Token::OpMul => intop(lhs, rhs, IntOp::Mul)?,
-            Token::OpDiv => intop(lhs, rhs, IntOp::Div)?,
-            Token::OpRem => intop(lhs, rhs, IntOp::Rem)?,
-
-            Token::OpEq => cmpop(lhs, rhs, CmpOp::EQ)?,
-            Token::OpNE => cmpop(lhs, rhs, CmpOp::NE)?,
-            Token::OpGT => cmpop(lhs, rhs, CmpOp::GT)?,
-            Token::OpLT => cmpop(lhs, rhs, CmpOp::LT)?,
-            Token::OpGE => cmpop(lhs, rhs, CmpOp::GE)?,
-            Token::OpLE => cmpop(lhs, rhs, CmpOp::LE)?,
-
-            Token::OpAnd => logop(lhs, rhs, true),
-            Token::OpOr => logop(lhs, rhs, false),
-
-            Token::OpMatch => matchop(lhs, rhs)?,
-
-            Token::LParen | Token::RParen | Token::Integer(_) | Token::Str(_) => {
-                return Err("syntax error: wanted operator");
-            }
-        };
-
-        // replace the lhs, operator, and rhs with the result
-        tokens.splice(0..=2, vec![result]);
-    }
-
-    // final result should be a single token
-    if tokens.len() == 1 {
-        let lhs = &tokens[0];
-        if token_is_lval(lhs) {
-            Ok(lhs.clone())
-        } else {
-            Err("syntax error: E1")
-        }
-    } else {
-        Err("syntax error: E2")
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+// evaluate the whole token stream as a single expression
+fn eval_expression(tokens: Vec<Token>) -> Result<Token, &'static str> {
+    let mut parser = Parser::new(tokens);
+    let result = parser.parse_or()?;
+    if parser.pos != parser.tokens.len() {
+        return Err("syntax error: unexpected trailing argument");
+    }
+    Ok(result)
+}
+
+fn main() {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
 
     // tokenize and evaluate the expression
     let arg_tokens = tokenize();
-    let final_val = eval_expression(&arg_tokens)?;
-
-    // display the result
-    println!("{}", token_display(&final_val));
-
-    Ok(())
+    match eval_expression(arg_tokens) {
+        Ok(final_val) => {
+            // display the result, then return exit status per POSIX:
+            // 0 if the result is neither null nor zero, otherwise 1.
+            println!("{}", token_display(&final_val));
+            std::process::exit(if token_is_null_or_zero(&final_val) {
+                1
+            } else {
+                0
+            });
+        }
+        Err(msg) => {
+            // invalid expression: diagnostic to stderr, exit status 2.
+            eprintln!("expr: {}", msg);
+            std::process::exit(2);
+        }
+    }
 }

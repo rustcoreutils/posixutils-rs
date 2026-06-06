@@ -119,6 +119,12 @@ fn test_bc_array_index_out_of_bounds() {
     );
 }
 
+// x^0 is 1 with scale 0, regardless of the scale register (audit #B8).
+#[test]
+fn test_bc_pow_zero_scale() {
+    test_bc("scale=5\n2.5^0\nquit\n", "1\n");
+}
+
 // Regression: `quit` inside a `for` body within a function definition must not
 // panic. Per bc semantics quit takes effect when the definition is read, so
 // the statements after the definition are never executed (matches GNU bc).

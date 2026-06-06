@@ -8,7 +8,7 @@
 //
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use regex::Regex;
+use plib::regex::Regex;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
@@ -264,35 +264,60 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
     }
 }
 
-// regex match operation
+// Does the BRE pattern contain at least one subexpression "\(...\)"?
+// A backslash that is itself escaped ("\\") does not begin one.
+fn has_subexpr(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                return true;
+            }
+            i += 2; // skip the escaped character
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+// matching operator (':')
+//
+// Per POSIX: the pattern is a Basic Regular Expression (XBD 9.3) anchored to
+// the beginning of the string. If the pattern contains a subexpression
+// "\(...\)", the string matched by "\1" is returned (the null string if it
+// did not match); otherwise the number of characters matched is returned (0
+// on failure).
 fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
     let lhs = token_to_string(lhs)?;
     let rhs = token_to_string(rhs)?;
 
-    let re = match Regex::new(&rhs) {
-        Ok(re_res) => re_res,
-        Err(_) => {
-            return Err("invalid regex");
+    let re = Regex::bre(&rhs).map_err(|_| "invalid regex")?;
+    let captures = re.captures(&lhs);
+
+    // The match must be anchored at the start of the string.
+    let anchored = captures
+        .as_ref()
+        .map(|caps| caps[0].start == 0)
+        .unwrap_or(false);
+
+    if has_subexpr(&rhs) {
+        // Return the substring captured by "\1", or the null string.
+        if anchored {
+            let caps = captures.unwrap();
+            let group1 = caps.get(1).copied().unwrap_or_default();
+            Ok(Token::Str(String::from(group1.as_str(&lhs))))
+        } else {
+            Ok(Token::Str(String::new()))
         }
-    };
-
-    match re.captures(&lhs) {
-        // no regex match: zero
-        None => Ok(Token::Integer(0)),
-
-        // regex matched
-        Some(caps) => {
-            let cap1 = caps.get(1);
-
-            // if regex subexpression #1 matched, return as string
-            if let Some(mtch) = cap1 {
-                Ok(Token::Str(String::from(mtch.as_str())))
-
-            // otherwise, return length of overall match as int
-            } else {
-                Ok(Token::Integer(caps.get(0).unwrap().len() as i128))
-            }
-        }
+    } else if anchored {
+        // Return the number of characters (not bytes) matched.
+        let caps = captures.unwrap();
+        let matched = &lhs[..caps[0].end];
+        Ok(Token::Integer(matched.chars().count() as i128))
+    } else {
+        Ok(Token::Integer(0))
     }
 }
 

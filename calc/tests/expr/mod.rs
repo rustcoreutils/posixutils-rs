@@ -104,3 +104,24 @@ fn expr_invalid() {
 fn expr_dashdash() {
     expr_test(&["--", "-3", "+", "1"], "-2\n");
 }
+
+// ':' matching operator — POSIX BRE, anchored at start, character-count
+// length, and "\1" back-reference. Values verified against GNU expr.
+#[test]
+fn expr_match() {
+    // anchored char-count length
+    expr_test(&["abcd", ":", "ab"], "2\n");
+    // no anchored match -> 0 (exit 1)
+    expr_test_status(&["abcd", ":", "bc"], "0\n", "", 1);
+    // multibyte: length is in characters, not bytes
+    expr_test(&["éé", ":", ".*"], "2\n");
+    // back-reference capture
+    expr_test(&["abc", ":", "a\\(b\\)c"], "b\n");
+    expr_test(&["hello", ":", "h\\(.*\\)o"], "ell\n");
+    // canonical pathname example from the spec
+    expr_test(&["//abc/file", ":", ".*/\\(.*\\)"], "file\n");
+    // subexpression present but matches the null string -> null (exit 1)
+    expr_test_status(&["abc", ":", "a\\(x*\\)"], "\n", "", 1);
+    // subexpression present but no match at all -> null (exit 1)
+    expr_test_status(&["abc", ":", "x\\(y\\)"], "\n", "", 1);
+}

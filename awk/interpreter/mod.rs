@@ -421,8 +421,7 @@ impl Interpreter {
                 OpCode::GetField => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
                     is_valid_record_index(index)?;
-                    // fields are never arrays, so this is always safe
-                    unsafe { stack.push_value((*record.fields[index].get()).clone())? };
+                    stack.push_value(record.read_field(index))?;
                 }
                 OpCode::IndexArrayGetValue => {
                     let key = stack
@@ -447,8 +446,9 @@ impl Interpreter {
                 OpCode::FieldRef => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
                     is_valid_record_index(index)?;
-                    // fields live longer than the stack, so this is safe
-                    unsafe { stack.push_ref(record.fields[index].get())? };
+                    // The boxed cell keeps this pointer valid across later field
+                    // growth, and fields outlive the stack, so this is safe.
+                    unsafe { stack.push_ref(record.field_ref_ptr(index))? };
                 }
                 OpCode::IndexArrayGetRef => {
                     let key = stack
@@ -555,10 +555,29 @@ impl Interpreter {
                         let filename = stack
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
-                        self.write_files.close_file(&filename);
-                        self.read_files.close_file(&filename);
-                        self.write_pipes.close_pipe(&filename);
-                        self.read_pipes.close_pipe(&filename);
+                        // A name may have been opened for both reading and
+                        // writing, so close it in every table.
+                        let results = [
+                            self.write_files.close_file(&filename),
+                            self.read_files.close_file(&filename),
+                            self.write_pipes.close_pipe(&filename),
+                            self.read_pipes.close_pipe(&filename),
+                        ];
+                        // POSIX: close shall return 0 if the close was
+                        // successful and non-zero otherwise (e.g. the name was
+                        // not open). Surface any error status, else 0, else -1
+                        // when nothing matched.
+                        let status = if results.iter().all(Option::is_none) {
+                            -1
+                        } else {
+                            results
+                                .iter()
+                                .flatten()
+                                .copied()
+                                .find(|&s| s != 0)
+                                .unwrap_or(0)
+                        };
+                        stack.push_value(status as f64)?;
                     }
                     BuiltinFunction::FFlush => {
                         let expr_str = if argc == 1 {
@@ -609,6 +628,13 @@ impl Interpreter {
                             Ok(Some(next_record)) => {
                                 fields_state =
                                     var.assign(maybe_numeric_string(next_record), global_env)?;
+                                // `cmd | getline` advances NR (but not FNR), like
+                                // historical awk; `getline < file` touches neither.
+                                if function == BuiltinFunction::GetLineFromPipe {
+                                    let nr_ptr = self.globals[SpecialVar::Nr as usize].get();
+                                    let next_nr = unsafe { (*nr_ptr).scalar_as_f64() } + 1.0;
+                                    unsafe { &mut *nr_ptr }.assign(next_nr, global_env)?;
+                                }
                                 stack.push_value(1.0)?;
                             }
                             Ok(None) => {
@@ -841,6 +867,10 @@ pub fn interpret(
     )?;
 
     if let Some(separator) = separator {
+        // POSIX: `-F sepstring` is equivalent to `-v FS=sepstring`, so the
+        // separator undergoes the same escape processing (e.g. `-F '\t'` is a
+        // tab), matching the -v path above.
+        let separator = escape_string_contents(&separator)?;
         interpreter.globals[SpecialVar::Fs as usize]
             .get_mut()
             .assign(AwkString::from(separator), &mut global_env)?;

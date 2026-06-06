@@ -35,11 +35,32 @@ pub(crate) fn sprintf(
     while let Some(c) = next {
         match c {
             '%' => {
-                let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
+                let (specifier, mut args) = parse_conversion_specifier_args(&mut iter)?;
                 if specifier == '%' {
                     result.push('%');
                     next = iter.next();
                     continue;
+                }
+
+                // A '*' field width or precision consumes the next argument(s),
+                // in order: width, then precision, then the conversion's value.
+                if args.needs_width_arg() {
+                    if current_arg == 0 {
+                        return Err("not enough arguments for format string".to_string());
+                    }
+                    current_arg -= 1;
+                    args.set_width(
+                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
+                    );
+                }
+                if args.needs_precision_arg() {
+                    if current_arg == 0 {
+                        return Err("not enough arguments for format string".to_string());
+                    }
+                    current_arg -= 1;
+                    args.set_precision(
+                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
+                    );
                 }
 
                 if current_arg == 0 {
@@ -129,6 +150,13 @@ pub(crate) fn builtin_sprintf(
     sprintf(&format_string, &mut values, &global_env.convfmt)
 }
 
+/// Convert a byte offset within `s` to a character offset (the number of whole
+/// characters that begin before `byte`). POSIX awk string functions operate on
+/// characters, while the regex engine and `str` searches report byte offsets.
+pub(crate) fn byte_offset_to_char_count(s: &str, byte: usize) -> usize {
+    s.char_indices().take_while(|&(i, _)| i < byte).count()
+}
+
 pub(crate) fn builtin_match(
     stack: &mut Stack,
     global_env: &mut GlobalEnv,
@@ -137,12 +165,16 @@ pub(crate) fn builtin_match(
     let string = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
+    let text = string.as_str().to_owned();
     let mut locations = ere.match_locations(string.try_into()?);
     let start;
     let len;
     if let Some(first_match) = locations.next() {
-        start = first_match.start as i64 + 1;
-        len = first_match.end as i64 - start + 1;
+        // RSTART/RLENGTH are measured in characters, not bytes.
+        let cstart = byte_offset_to_char_count(&text, first_match.start);
+        let cend = byte_offset_to_char_count(&text, first_match.end);
+        start = cstart as i64 + 1;
+        len = (cend - cstart) as i64;
     } else {
         start = 0;
         len = -1;
@@ -270,10 +302,12 @@ pub(crate) fn call_simple_builtin(
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
+            // index() returns a character position, numbering from 1; str::find
+            // reports a byte offset, so convert it to a character count.
             let index = s
                 .as_str()
                 .find(t.as_str())
-                .map(|i| i as f64 + 1.0)
+                .map(|i| byte_offset_to_char_count(s.as_str(), i) as f64 + 1.0)
                 .unwrap_or(0.0);
             stack.push_value(index)?;
         }
@@ -284,8 +318,9 @@ pub(crate) fn call_simple_builtin(
                     stack.push_value(array.len() as f64)?;
                 }
                 _ => {
+                    // length() counts characters, not bytes.
                     let value_str = value.scalar_to_string(&global_env.convfmt)?;
-                    stack.push_value(value_str.len() as f64)?;
+                    stack.push_value(value_str.chars().count() as f64)?;
                 }
             }
         }
@@ -322,31 +357,43 @@ pub(crate) fn call_simple_builtin(
             stack.push_value(str)?;
         }
         BuiltinFunction::Substr => {
+            // substr(s, m[, n]): the at most n-character substring of s that
+            // begins at character position m (numbering from 1). Positions below
+            // 1 still consume part of n, matching nawk/gawk, so e.g.
+            // substr("hello", -1, 3) == "h". m and n truncate toward zero.
             let n = if argc == 2 {
-                usize::MAX
+                None
             } else {
-                stack.pop_scalar_value()?.scalar_as_f64() as usize
+                Some(stack.pop_scalar_value()?.scalar_as_f64().trunc() as i64)
             };
-            // the behaviour for values < 1 is not specified. Here we follow what other
-            // implementations do
-            let m = stack.pop_scalar_value()?.scalar_as_f64().max(1.0) as usize;
+            let m = stack.pop_scalar_value()?.scalar_as_f64().trunc() as i64;
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            let substr = s.chars().skip(m - 1).take(n).collect::<String>();
+            // Character window is [max(m, 1), m + n); `take` naturally stops at
+            // the end of the string, so no length pre-scan or Vec is needed.
+            let start = m.max(1);
+            let count = match n {
+                None => usize::MAX,
+                Some(n) => m.saturating_add(n).saturating_sub(start).max(0) as usize,
+            };
+            let substr: String = s.chars().skip((start - 1) as usize).take(count).collect();
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
+            // POSIX: case mapping follows the LC_CTYPE category of the locale.
             let value = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            stack.push_value(value.to_lowercase())?;
+            let lowered: String = value.chars().map(plib::locale::to_lower).collect();
+            stack.push_value(lowered)?;
         }
         BuiltinFunction::ToUpper => {
             let value = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            stack.push_value(value.to_uppercase())?;
+            let uppered: String = value.chars().map(plib::locale::to_upper).collect();
+            stack.push_value(uppered)?;
         }
         BuiltinFunction::Gsub | BuiltinFunction::Sub => {
             return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)

@@ -103,6 +103,91 @@ fn test_awk_in_operator() {
 }
 
 #[test]
+fn test_awk_close_returns_status() {
+    test_awk!(close_returns_status);
+}
+
+#[test]
+fn test_awk_dash_f_escape_processing() {
+    // POSIX: `-F sepstring` == `-v FS=sepstring`, so `\t` is a tab (a single
+    // character), not the two-character string backslash-t.
+    test_awk(
+        vec![
+            "-F".to_string(),
+            "\\t".to_string(),
+            "{ print length(FS), $2 }".to_string(),
+            "tests/awk/tab_separated.txt".to_string(),
+        ],
+        "1 b\n",
+    );
+}
+
+#[test]
+fn test_awk_multibyte_char_counts() {
+    test_awk!(multibyte_char_counts);
+}
+
+#[test]
+fn test_awk_printf_star_width() {
+    test_awk!(printf_star_width);
+}
+
+#[test]
+fn test_awk_substr_edges() {
+    test_awk!(substr_edges);
+}
+
+#[test]
+fn test_awk_case_mapping() {
+    test_awk!(case_mapping);
+}
+
+#[test]
+fn test_awk_getline_pipe_advances_nr() {
+    test_awk!(getline_pipe_nr);
+}
+
+#[test]
+fn test_awk_record_with_many_fields() {
+    // A record with more than the old 1024-field cap must keep every field.
+    test_awk!(many_fields, "tests/awk/many_fields.txt");
+}
+
+#[test]
+fn test_awk_high_field_assignment() {
+    test_awk!(high_field_assignment);
+}
+
+#[test]
+fn test_awk_uninitialized_field_comparison() {
+    // POSIX: nonexistent fields (85506) and empty fields from $0/FS (85511) have
+    // the uninitialized value, so they compare numerically equal to 0 while
+    // still being string-equal to "". Populated fields are unaffected.
+    test_awk(
+        vec![
+            "-F".to_string(),
+            ":".to_string(),
+            "{ print ($5==0); print ($2==0); print ($2==\"\"); print ($1==\"a\") }".to_string(),
+            "tests/awk/empty_fields.txt".to_string(),
+        ],
+        "1\n1\n1\n1\n",
+    );
+}
+
+#[test]
+fn test_awk_program_file_from_stdin() {
+    // POSIX: a `-f` progfile of `-` denotes the standard input.
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["-f".to_string(), "-".to_string()],
+        stdin_data: String::from("BEGIN { print \"okprog\" }\n"),
+        expected_out: String::from("okprog\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
 fn test_awk_multidimensional_index() {
     test_awk!(multidimensional_index);
 }

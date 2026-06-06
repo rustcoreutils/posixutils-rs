@@ -360,14 +360,12 @@ macro_rules! compare_op {
             (AwkValueVariant::UninitializedScalar, AwkValueVariant::UninitializedScalar) => {
                 $stack.push_value(bool_to_f64(0.0 $op 0.0))?;
             }
-            (AwkValueVariant::Number(n), AwkValueVariant::UninitializedScalar)
-                if !lhs.ref_type.is_field() && !rhs.ref_type.is_field() =>
-            {
+            // POSIX 85481: an uninitialized value (including a nonexistent or
+            // empty field) compared with a number is compared numerically.
+            (AwkValueVariant::Number(n), AwkValueVariant::UninitializedScalar) => {
                 $stack.push_value(bool_to_f64(*n $op 0.0))?;
             }
-            (AwkValueVariant::UninitializedScalar, AwkValueVariant::Number(n))
-                if !lhs.ref_type.is_field() && !rhs.ref_type.is_field() =>
-            {
+            (AwkValueVariant::UninitializedScalar, AwkValueVariant::Number(n)) => {
                 $stack.push_value(bool_to_f64(0.0 $op *n))?;
             }
             (AwkValueVariant::String(s), AwkValueVariant::Number(x)) if s.is_numeric => {

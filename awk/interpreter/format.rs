@@ -273,7 +273,48 @@ pub struct FormatArgs {
     alternative_form: bool,
     zero_padded: bool,
     width: usize,
+    /// The width was given as `*`; its value must be fetched from the argument
+    /// list (see `set_width`).
+    width_star: bool,
     precision: Option<usize>,
+    /// The precision was given as `.*`; its value must be fetched from the
+    /// argument list (see `set_precision`).
+    precision_star: bool,
+}
+
+impl FormatArgs {
+    /// True if the field width was specified as `*` and must be supplied by the
+    /// next argument.
+    pub fn needs_width_arg(&self) -> bool {
+        self.width_star
+    }
+
+    /// True if the precision was specified as `.*` and must be supplied by the
+    /// next argument.
+    pub fn needs_precision_arg(&self) -> bool {
+        self.precision_star
+    }
+
+    /// Apply a `*` field width fetched from the argument list. Per C/POSIX a
+    /// negative width means left-justified with the absolute value.
+    pub fn set_width(&mut self, width: i64) {
+        if width < 0 {
+            self.left_justified = true;
+            self.width = width.unsigned_abs() as usize;
+        } else {
+            self.width = width as usize;
+        }
+    }
+
+    /// Apply a `.*` precision fetched from the argument list. A negative
+    /// precision is treated as if the precision were omitted.
+    pub fn set_precision(&mut self, precision: i64) {
+        self.precision = if precision < 0 {
+            None
+        } else {
+            Some(precision as usize)
+        };
+    }
 }
 
 /// Parse the conversion specifier arguments from the format string.
@@ -313,11 +354,24 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
         next = iter_next(iter)?;
     }
 
-    result.width = parse_number(&mut next, iter)?;
+    if next == '*' {
+        // Width supplied by the next argument; resolved by the caller.
+        result.width_star = true;
+        next = iter_next(iter)?;
+    } else {
+        result.width = parse_number(&mut next, iter)?;
+    }
 
     result.precision = if next == '.' {
         next = iter_next(iter)?;
-        Some(parse_number(&mut next, iter)?)
+        if next == '*' {
+            // Precision supplied by the next argument; resolved by the caller.
+            result.precision_star = true;
+            next = iter_next(iter)?;
+            None
+        } else {
+            Some(parse_number(&mut next, iter)?)
+        }
     } else {
         None
     };

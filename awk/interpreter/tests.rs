@@ -1135,17 +1135,14 @@ fn test_builtin_sub_on_record() {
         Constant::Regex(Rc::from(regex_from_str("ab+"))),
         Constant::from("x"),
     ];
-    let mut record = Test::new(instructions, constants)
+    let record = Test::new(instructions, constants)
         .add_record("aaabbb ab aabb")
         .run_correct()
         .record;
-    assert_eq!(
-        *record.fields[0].get_mut(),
-        AwkValue::field_ref("aax ab aabb", 0)
-    );
-    assert_eq!(*record.fields[1].get_mut(), AwkValue::field_ref("aax", 1));
-    assert_eq!(*record.fields[2].get_mut(), AwkValue::field_ref("ab", 2));
-    assert_eq!(*record.fields[3].get_mut(), AwkValue::field_ref("aabb", 3));
+    assert_eq!(record.field(0), AwkValue::field_ref("aax ab aabb", 0));
+    assert_eq!(record.field(1), AwkValue::field_ref("aax", 1));
+    assert_eq!(record.field(2), AwkValue::field_ref("ab", 2));
+    assert_eq!(record.field(3), AwkValue::field_ref("aabb", 3));
 }
 
 #[test]
@@ -1190,17 +1187,14 @@ fn test_builtin_gsub_on_record() {
         Constant::Regex(Rc::from(regex_from_str("ab+"))),
         Constant::from("x"),
     ];
-    let mut record = Test::new(instructions, constants)
+    let record = Test::new(instructions, constants)
         .add_record("aaabbb ab aabb")
         .run_correct()
         .record;
-    assert_eq!(
-        *record.fields[0].get_mut(),
-        AwkValue::field_ref("aax x ax", 0)
-    );
-    assert_eq!(*record.fields[1].get_mut(), AwkValue::field_ref("aax", 1));
-    assert_eq!(*record.fields[2].get_mut(), AwkValue::field_ref("x", 2));
-    assert_eq!(*record.fields[3].get_mut(), AwkValue::field_ref("ax", 3));
+    assert_eq!(record.field(0), AwkValue::field_ref("aax x ax", 0));
+    assert_eq!(record.field(1), AwkValue::field_ref("aax", 1));
+    assert_eq!(record.field(2), AwkValue::field_ref("x", 2));
+    assert_eq!(record.field(3), AwkValue::field_ref("ax", 3));
 }
 
 #[test]
@@ -1462,16 +1456,13 @@ fn test_changing_a_field_recomputes_the_record() {
     ];
     let constants = vec![Constant::from("test")];
 
-    let mut record = Test::new(instructions, constants)
+    let record = Test::new(instructions, constants)
         .add_record("a b")
         .run_correct()
         .record;
-    assert_eq!(
-        *record.fields[0].get_mut(),
-        AwkValue::field_ref("test b", 0)
-    );
-    assert_eq!(*record.fields[1].get_mut(), AwkValue::field_ref("test", 1));
-    assert_eq!(*record.fields[2].get_mut(), AwkValue::field_ref("b", 2));
+    assert_eq!(record.field(0), AwkValue::field_ref("test b", 0));
+    assert_eq!(record.field(1), AwkValue::field_ref("test", 1));
+    assert_eq!(record.field(2), AwkValue::field_ref("b", 2));
 }
 
 #[test]
@@ -1488,14 +1479,8 @@ fn test_changing_the_record_recomputes_fields() {
         .add_record("a b")
         .run_correct();
     assert_eq!(*result.record.last_field.get_mut(), 1);
-    assert_eq!(
-        *result.record.fields[0].get_mut(),
-        AwkValue::field_ref("test", 0)
-    );
-    assert_eq!(
-        *result.record.fields[1].get_mut(),
-        AwkValue::field_ref("test", 1)
-    );
+    assert_eq!(result.record.field(0), AwkValue::field_ref("test", 0));
+    assert_eq!(result.record.field(1), AwkValue::field_ref("test", 1));
     assert_eq!(
         result.globals[SpecialVar::Nf as usize],
         AwkValue::from(1.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
@@ -1593,11 +1578,8 @@ fn test_push_multiple_references_to_the_same_record_field() {
         Constant::from("test3"),
         Constant::from("test4"),
     ];
-    let mut result = Test::new(instructions, constants).run_correct();
-    assert_eq!(
-        *result.record.fields[1].get_mut(),
-        AwkValue::field_ref("test4", 1)
-    );
+    let result = Test::new(instructions, constants).run_correct();
+    assert_eq!(result.record.field(1), AwkValue::field_ref("test4", 1));
 }
 
 #[test]
@@ -1654,15 +1636,15 @@ fn test_modifying_nf_recomputes_record() {
         .run_correct();
     assert_eq!(*result.record.last_field.get_mut(), 1);
     assert_eq!(
-        *result.record.fields[0].get_mut(),
+        result.record.field(0),
         AwkValue::field_ref(maybe_numeric_string("1"), 0)
     );
     assert_eq!(
-        *result.record.fields[1].get_mut(),
+        result.record.field(1),
         AwkValue::field_ref(maybe_numeric_string("1"), 1)
     );
     assert_eq!(
-        *result.record.fields[2].get_mut(),
+        result.record.field(2),
         AwkValue::field_ref(AwkValue::uninitialized_scalar(), 2)
     );
 
@@ -1677,7 +1659,7 @@ fn test_modifying_nf_recomputes_record() {
         .run_correct();
     assert_eq!(*result.record.last_field.get_mut(), 10);
     assert_eq!(
-        *result.record.fields[0].get_mut(),
+        result.record.field(0),
         AwkValue::field_ref(maybe_numeric_string("1 2 3 4      "), 0)
     );
 }

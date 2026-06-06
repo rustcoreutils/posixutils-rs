@@ -265,5 +265,7 @@ Not covered:
 ## 9. Reference audits
 
 - [`display/audit.md`](display/audit.md) — `more` (the first full pass; covers 15 priority items, 28 interactive commands, signal handling, i18n).
+- [`dev/audit.md`](dev/audit.md) — `yacc`, `lex`, `ar`, `nm`, `strings`, `strip` (development utilities; shared `plib::diag`/`io`/`archive`/`locale` infrastructure).
+- [`awk/audit.md`](awk/audit.md) — `awk` (full language audit, behaviorally verified; 1 Critical `close()` crash, 6 Major: `-F` escapes, byte-vs-char, printf `*`, `-f -`, field uninitialized comparison, 1024-field cap).
 
 When you finish a new audit, add the link here.

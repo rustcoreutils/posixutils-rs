@@ -367,8 +367,13 @@ impl WriteFiles {
         success
     }
 
-    pub fn close_file(&mut self, filename: &str) {
-        self.files.remove(filename);
+    /// Close a previously-opened output file. Returns `Some(0)` on a
+    /// successful flush+close, `Some(-1)` if flushing failed, or `None` if no
+    /// file was open under this name.
+    pub fn close_file(&mut self, filename: &str) -> Option<i32> {
+        self.files
+            .remove(filename)
+            .map(|mut file| if file.flush().is_ok() { 0 } else { -1 })
     }
 }
 
@@ -395,8 +400,10 @@ impl ReadFiles {
         }
     }
 
-    pub fn close_file(&mut self, filename: &str) {
-        self.files.remove(filename);
+    /// Close a previously-opened input file. Returns `Some(0)` if a file was
+    /// open under this name, or `None` otherwise.
+    pub fn close_file(&mut self, filename: &str) -> Option<i32> {
+        self.files.remove(filename).map(|_| 0)
     }
 }
 
@@ -447,12 +454,18 @@ impl WritePipes {
         success
     }
 
-    pub fn close_pipe(&mut self, filename: &str) {
-        if let Some(file) = self.pipes.remove(filename) {
-            unsafe {
-                libc::pclose(file);
+    /// Close a previously-opened output pipe. Returns `Some(0)` on a
+    /// successful `pclose`, `Some(-1)` if `pclose` failed, or `None` if no pipe
+    /// was open under this name.
+    pub fn close_pipe(&mut self, filename: &str) -> Option<i32> {
+        self.pipes.remove(filename).map(|file| {
+            let status = unsafe { libc::pclose(file) };
+            if status == -1 {
+                -1
+            } else {
+                0
             }
-        }
+        })
     }
 }
 
@@ -471,6 +484,9 @@ impl Drop for WritePipes {
 pub struct PipeRecordReader {
     pipe: *mut libc::FILE,
     is_done: bool,
+    /// Set once the pipe has been `pclose`d by an explicit `close()`, so the
+    /// `Drop` impl does not close it a second time.
+    closed: bool,
     ere_byte_buffer: Vec<u8>,
 }
 
@@ -487,8 +503,21 @@ impl PipeRecordReader {
         Ok(Self {
             pipe: file,
             is_done: false,
+            closed: false,
             ere_byte_buffer: Vec::new(),
         })
+    }
+
+    /// `pclose` the pipe and return the resulting status (0 on success, -1 on
+    /// failure). Marks the reader closed so `Drop` will not close it again.
+    fn pclose(&mut self) -> i32 {
+        self.closed = true;
+        let status = unsafe { libc::pclose(self.pipe) };
+        if status == -1 {
+            -1
+        } else {
+            0
+        }
     }
 }
 
@@ -518,6 +547,9 @@ impl RecordReader for PipeRecordReader {
 
 impl Drop for PipeRecordReader {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
         unsafe {
             if libc::pclose(self.pipe) == -1 {
                 eprintln!("awk: warning: failed to close read pipe");
@@ -549,8 +581,11 @@ impl ReadPipes {
         }
     }
 
-    pub fn close_pipe(&mut self, command: &str) {
-        self.pipes.remove(command);
+    /// Close a previously-opened input pipe. Returns `Some(0)` on a successful
+    /// `pclose`, `Some(-1)` if `pclose` failed, or `None` if no pipe was open
+    /// under this name.
+    pub fn close_pipe(&mut self, command: &str) -> Option<i32> {
+        self.pipes.remove(command).map(|mut reader| reader.pclose())
     }
 }
 

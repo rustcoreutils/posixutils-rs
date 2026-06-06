@@ -103,6 +103,11 @@ fn test_awk_in_operator() {
 }
 
 #[test]
+fn test_awk_close_returns_status() {
+    test_awk!(close_returns_status);
+}
+
+#[test]
 fn test_awk_multidimensional_index() {
     test_awk!(multidimensional_index);
 }

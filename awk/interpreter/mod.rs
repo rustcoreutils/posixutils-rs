@@ -555,10 +555,29 @@ impl Interpreter {
                         let filename = stack
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
-                        self.write_files.close_file(&filename);
-                        self.read_files.close_file(&filename);
-                        self.write_pipes.close_pipe(&filename);
-                        self.read_pipes.close_pipe(&filename);
+                        // A name may have been opened for both reading and
+                        // writing, so close it in every table.
+                        let results = [
+                            self.write_files.close_file(&filename),
+                            self.read_files.close_file(&filename),
+                            self.write_pipes.close_pipe(&filename),
+                            self.read_pipes.close_pipe(&filename),
+                        ];
+                        // POSIX: close shall return 0 if the close was
+                        // successful and non-zero otherwise (e.g. the name was
+                        // not open). Surface any error status, else 0, else -1
+                        // when nothing matched.
+                        let status = if results.iter().all(Option::is_none) {
+                            -1
+                        } else {
+                            results
+                                .iter()
+                                .flatten()
+                                .copied()
+                                .find(|&s| s != 0)
+                                .unwrap_or(0)
+                        };
+                        stack.push_value(status as f64)?;
                     }
                     BuiltinFunction::FFlush => {
                         let expr_str = if argc == 1 {

@@ -35,7 +35,7 @@ drops fields** (Major).
 
 ### Critical
 
-- [ ] **#1 — `close()` panics ("empty stack") when used as an expression and never returns a status.** `awk/interpreter/mod.rs:554-562` pops the filename but pushes **no** return value; `BuiltinFunction::Close` is otherwise treated as a value-producing call, so any expression use underflows the operand stack. Verified: `awk 'BEGIN{print "x">"/tmp/f"; print close("/tmp/f")}'` → `panicked at awk/interpreter/stack.rs:205:36: empty stack`; `r=close("/tmp/f")` → panic at `stack.rs:237`. Bare-statement use (`close(f)` alone) works. POSIX 85911-85915: close "If the close was successful, the function shall return …" a status (0/non-zero). Fix: push the close result (0 on success, non-zero on error) like `fflush` does at `mod.rs:580`.
+- [x] **#1 — `close()` panics ("empty stack") when used as an expression and never returns a status.** `awk/interpreter/mod.rs:554-562` pops the filename but pushes **no** return value; `BuiltinFunction::Close` is otherwise treated as a value-producing call, so any expression use underflows the operand stack. Verified: `awk 'BEGIN{print "x">"/tmp/f"; print close("/tmp/f")}'` → `panicked at awk/interpreter/stack.rs:205:36: empty stack`; `r=close("/tmp/f")` → panic at `stack.rs:237`. Bare-statement use (`close(f)` alone) works. POSIX 85911-85915: close "If the close was successful, the function shall return …" a status (0/non-zero). Fix: push the close result (0 on success, non-zero on error) like `fflush` does at `mod.rs:580`. **✓ Fixed:** the four `close_*` I/O helpers now return `Option<i32>` and the `Close` opcode pushes 0 (success) / non-zero (e.g. not open); regression test `awk/tests/awk/close_returns_status.{awk,out}` + `test_awk_close_returns_status`.
 
 ### Major
 
@@ -191,7 +191,7 @@ drops fields** (Major).
 #### Input/Output & general functions
 | Func | Status | Notes |
 |---|---|---|
-| `close` | **CRITICAL** | (#1) panics as expression; no return value. `mod.rs:554-562`. |
+| `close` | CONFORMS | (#1 ✓ fixed) returns 0/non-zero; `mod.rs:554-579`, `io.rs` close helpers. |
 | `fflush` | CONFORMS | returns 0/-1; no-arg flushes all (`mod.rs:563-581`). |
 | `system` | CONFORMS | libc `system(3)`; returns exit status / 128+sig (`builtins.rs:354-369`). |
 | `getline` | CONFORMS | sets `$0`,NF,NR,FNR (verified NF=3/NR=2/FNR=2). |
@@ -223,7 +223,7 @@ drops fields** (Major).
 Existing tests (`interpreter/tests.rs` 1711, `tests/integration.rs` 832) cover the
 golden language paths well (operators, builtins, getline, printf, arrays, regex,
 srand-prior-seed). Gaps that map to findings — add tests that:
-- [ ] assert `print close(f)` / `r=close(f)` return a status without panicking (#1).
+- [x] assert `print close(f)` / `r=close(f)` return a status without panicking (#1). ✓ `test_awk_close_returns_status`
 - [ ] assert `-F '\t'` yields a single-char tab FS (`length(FS)==1`) (#2).
 - [ ] assert `length`/`index`/`match`/RSTART/RLENGTH on a multibyte record return character counts (#3).
 - [ ] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4).

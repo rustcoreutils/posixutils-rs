@@ -49,7 +49,7 @@ drops fields** (Major).
 
 - [x] **#6 — Uninitialized / empty / nonexistent fields do not compare numerically equal to 0.** Two causes: (a) the compare macro at `awk/interpreter/stack.rs:362-371` explicitly excludes field refs (`!lhs.ref_type.is_field() && !rhs.ref_type.is_field()`) from the "Number vs UninitializedScalar → numeric" rule, dropping uninitialized fields to the string-compare fallback (`stack.rs:378-380`); (b) empty fields are stored as empty *strings* (`record.rs:119,198`, via `maybe_numeric_string("")`) rather than the uninitialized value. POSIX 85481 (numeric comparison "if one is numeric and the other has the uninitialized value"), 85506 (nonexistent fields "shall evaluate to the uninitialized value"), 85511 (empty fields from `$0`/FS "shall have the uninitialized value … considered a numeric string"). Verified: `echo 'a b' | awk '{print ($5==0)}'` → `0` (want 1); `echo 'a::b' | awk -F: '{print ($2==0)}'` → `0` (want 1); scalar/array uninitialized compares (`x==0`, `a["k"]==0`) correctly give 1, confirming the divergence is field-specific. Fix: treat field-ref uninitialized values like scalar uninitialized values in comparison, and create empty fields as the uninitialized value. **✓ Fixed:** removed the `is_field()` guard in `compare_op!` (and the now-unused `AwkRefType::is_field`); `record.rs` `make_field` stores empty fields as the uninitialized value; test `test_awk_uninitialized_field_comparison`.
 
-- [ ] **#7 — Hard 1024-field cap silently truncates records and errors on high field assignment.** `awk/interpreter/record.rs:103` (`MAX_FIELDS = 1024`); split silently drops fields past 1024 (`record.rs:115-117,194-196`) and `is_valid_record_index` (`record.rs:229-235`) rejects any `$n` with `n>1024`. POSIX places no such low fixed limit and the spec model is dynamic. Verified: a 1100-field record → `NF` reports `1024` (76 fields lost with no diagnostic); `echo x | awk '{$2000="z"}'` → `runtime error: invalid field index`. Fix: grow the fields vector dynamically (or raise the cap well beyond {LINE_MAX}-implied field counts and never silently drop).
+- [x] **#7 — Hard 1024-field cap silently truncates records and errors on high field assignment.** `awk/interpreter/record.rs:103` (`MAX_FIELDS = 1024`); split silently drops fields past 1024 (`record.rs:115-117,194-196`) and `is_valid_record_index` (`record.rs:229-235`) rejects any `$n` with `n>1024`. POSIX places no such low fixed limit and the spec model is dynamic. Verified: a 1100-field record → `NF` reports `1024` (76 fields lost with no diagnostic); `echo x | awk '{$2000="z"}'` → `runtime error: invalid field index`. Fix: grow the fields vector dynamically (or raise the cap well beyond {LINE_MAX}-implied field counts and never silently drop). **✓ Fixed:** field storage is now `RefCell<Vec<Box<…>>>` grown on demand to a `u16::MAX` ceiling (boxed cells keep stack-held field pointers valid across growth; surplus fields are cleared, not dropped, for soundness). Tests `test_awk_record_with_many_fields`, `test_awk_high_field_assignment`.
 
 ### Minor
 
@@ -148,7 +148,7 @@ drops fields** (Major).
 - [x] RS modes incl. paragraph (`RS=""`, newline always a field sep) — `io.rs` + `mod.rs` effective-FS. Verified.
 - [x] Assigning `$n` rebuilds `$0` with OFS; assigning `$0` re-splits; `$(NF+k)` grows NF with intervening uninitialized fields — `record.rs:135-205`. Verified.
 - [x] **Empty fields carry the uninitialized value** (#6 ✓ fixed) — `record.rs` `make_field`.
-- [ ] **1024-field cap** (#7) — `record.rs:103,115-117,229-235`.
+- [x] **Dynamic field count** (#7 ✓ fixed) — `record.rs` grow-on-demand boxed cells.
 
 #### Regular expressions (ERE)
 - [x] ERE via `plib::regex` `RegexFlags::ere()` — libc-backed POSIX ERE (`regex.rs:84`). Verified anchors `^…$`, alternation, intervals `{2}`, bracket class `[[:alpha:]]`, `~`/`!~`, dynamic regex from a string variable.
@@ -229,7 +229,7 @@ srand-prior-seed). Gaps that map to findings — add tests that:
 - [x] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4). ✓ `test_awk_printf_star_width`
 - [x] exercise `awk -f -` reading the program from stdin (#5). ✓ `test_awk_program_file_from_stdin`
 - [x] assert `$5==0` and empty `$2==0` are true (#6). ✓ `test_awk_uninitialized_field_comparison`
-- [ ] assert records with >1024 fields keep all fields and `$2000=…` works (#7).
+- [x] assert records with >1024 fields keep all fields and `$2000=…` works (#7). ✓ `test_awk_record_with_many_fields`, `test_awk_high_field_assignment`
 - [ ] pin `substr("hello",-1,3)` behavior (#8).
 
 ## Suggested PR groupings

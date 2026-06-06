@@ -133,6 +133,17 @@ fn test_awk_printf_star_width() {
 }
 
 #[test]
+fn test_awk_record_with_many_fields() {
+    // A record with more than the old 1024-field cap must keep every field.
+    test_awk!(many_fields, "tests/awk/many_fields.txt");
+}
+
+#[test]
+fn test_awk_high_field_assignment() {
+    test_awk!(high_field_assignment);
+}
+
+#[test]
 fn test_awk_uninitialized_field_comparison() {
     // POSIX: nonexistent fields (85506) and empty fields from $0/FS (85511) have
     // the uninitialized value, so they compare numerically equal to 0 while

@@ -421,8 +421,7 @@ impl Interpreter {
                 OpCode::GetField => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
                     is_valid_record_index(index)?;
-                    // fields are never arrays, so this is always safe
-                    unsafe { stack.push_value((*record.fields[index].get()).clone())? };
+                    stack.push_value(record.read_field(index))?;
                 }
                 OpCode::IndexArrayGetValue => {
                     let key = stack
@@ -447,8 +446,9 @@ impl Interpreter {
                 OpCode::FieldRef => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
                     is_valid_record_index(index)?;
-                    // fields live longer than the stack, so this is safe
-                    unsafe { stack.push_ref(record.fields[index].get())? };
+                    // The boxed cell keeps this pointer valid across later field
+                    // growth, and fields outlive the stack, so this is safe.
+                    unsafe { stack.push_ref(record.field_ref_ptr(index))? };
                 }
                 OpCode::IndexArrayGetRef => {
                     let key = stack

@@ -49,6 +49,9 @@ fn expr_logops() {
     // '|' returns expr2 when expr1 is null or zero, regardless of expr2.
     expr_test_status(&["0", "|", "0"], "0\n", "", 1);
     expr_test(&["", "|", "abc"], "abc\n");
+    // A string-valued "0" (here produced by a ':' capture) is zero for '|'/'&'.
+    expr_test(&["0abc", ":", "\\(0\\)", "|", "5"], "5\n");
+    expr_test_status(&["0abc", ":", "\\(0\\)", "&", "5"], "0\n", "", 1);
 }
 
 #[test]

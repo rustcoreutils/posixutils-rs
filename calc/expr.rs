@@ -69,23 +69,17 @@ fn token_is_lval(t: &Token) -> bool {
     matches!(t, Token::Integer(_) | Token::Str(_))
 }
 
-// is token zero?
-fn token_is_zero(t: &Token) -> bool {
-    match t {
-        Token::Integer(val) => *val == 0,
-        Token::Str(s) => s.is_empty(),
-        _ => false,
-    }
-}
-
-// Does the result value count as "null or zero" for exit-status purposes?
-// Per POSIX EXIT STATUS: 0 if the result is neither null nor zero, else 1.
-// GNU expr treats the empty string, the literal integer 0, and the string
-// "0" as zero (but not "0.0", "00", etc.).
+// Does the token count as "null or zero"?
+//
+// Used both for the POSIX EXIT STATUS rule (exit 1 when the result is null or
+// zero) and for the `&`/`|` operators, whose operands are treated as integers
+// when they consist of an optional sign followed by digits. The empty string
+// is null; a string naming the integer zero (e.g. "0", "00", "-0") is zero;
+// a non-integer string such as "0.0" or "abc" is neither.
 fn token_is_null_or_zero(t: &Token) -> bool {
     match t {
         Token::Integer(val) => *val == 0,
-        Token::Str(s) => s.is_empty() || s == "0",
+        Token::Str(s) => s.is_empty() || matches!(s.parse::<i128>(), Ok(0)),
         _ => false,
     }
 }
@@ -245,8 +239,8 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
 
 // logical and/or operation
 fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
-    let lhs_zero = token_is_zero(lhs);
-    let rhs_zero = token_is_zero(rhs);
+    let lhs_zero = token_is_null_or_zero(lhs);
+    let rhs_zero = token_is_null_or_zero(rhs);
 
     if is_and {
         // expr1 & expr2: return expr1 if neither is null or zero, else 0.

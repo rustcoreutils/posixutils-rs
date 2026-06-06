@@ -129,8 +129,7 @@ and the print-vs-assignment rule and relational-operator gating are correct.
 The headline defects are a **crash** (`quit`/`break` inside a `for` body within
 a function `panic!`s the process), **all diagnostics going to stdout** (breaks
 `x=$(… | bc)`), missing **upper-bound limit checks** (`scale`, obase,
-array index → unbounded allocation), missing **70-column line wrapping**, and
-unary-minus binding tighter than `^`.
+array index → unbounded allocation), and missing **70-column line wrapping**.
 
 ### Priority issues
 

@@ -54,6 +54,17 @@ fn test_bc_add() {
     test_bc!(add)
 }
 
+// Regression: `quit` inside a `for` body within a function definition must not
+// panic. Per bc semantics quit takes effect when the definition is read, so
+// the statements after the definition are never executed (matches GNU bc).
+#[test]
+fn test_bc_quit_in_for_in_function() {
+    test_bc(
+        "1\ndefine f(x){\nfor(i=0;i<5;i++){\nif(i==3)quit\n}\n}\n2\nf(0)\n3\n",
+        "1\n",
+    );
+}
+
 #[test]
 fn test_bc_arrays_are_passed_to_function_by_value() {
     test_bc!(arrays_are_passed_to_function_by_value)

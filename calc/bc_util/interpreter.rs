@@ -113,6 +113,7 @@ fn contains_quit(stmt: &StmtInstruction) -> bool {
         StmtInstruction::Quit => true,
         StmtInstruction::If { body, .. } => body.iter().any(contains_quit),
         StmtInstruction::While { body, .. } => body.iter().any(contains_quit),
+        StmtInstruction::For { body, .. } => body.iter().any(contains_quit),
         _ => false,
     }
 }
@@ -271,13 +272,21 @@ impl Interpreter {
                     self.instruction_counter = saved_instruction_counter;
                     return Ok(value);
                 }
-                Ok(ControlFlow::Break) | Ok(ControlFlow::Quit) => {
-                    // both of these should never happen.
-                    // A quit inside of a function definition
-                    // should stop execution, and we can only call
-                    // a function after its definition has been processed
-                    // A break outside of a loop is a parser bug.
-                    panic!("reached quit or break in function call")
+                Ok(ControlFlow::Quit) => {
+                    // A quit reached at runtime inside a function body. The
+                    // static contains_quit check normally stops execution when
+                    // the definition is read, so this is defensive: stop
+                    // gracefully rather than crashing.
+                    self.has_quit = true;
+                    self.call_frames.pop();
+                    self.instruction_counter = saved_instruction_counter;
+                    return Ok(Number::zero());
+                }
+                Ok(ControlFlow::Break) => {
+                    // A break not bound to a loop ends the function harmlessly.
+                    self.call_frames.pop();
+                    self.instruction_counter = saved_instruction_counter;
+                    return Ok(Number::zero());
                 }
                 _ => {}
             }
@@ -559,7 +568,7 @@ impl Interpreter {
                 // we can't trust the return value of eval_stmt because
                 // unexecuted branches will not return ControlFlow::Quit,
                 // but we need still need to stop execution
-                if contains_quit(&stmt) {
+                if contains_quit(&stmt) || self.has_quit {
                     self.has_quit = true;
                     return Ok(self.take_and_clear_output());
                 }

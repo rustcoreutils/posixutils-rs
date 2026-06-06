@@ -86,6 +86,8 @@ impl TryFrom<AwkString> for FieldSeparator {
 
     fn try_from(value: AwkString) -> Result<Self, Self::Error> {
         if value.is_empty() {
+            // POSIX leaves a null FS "unspecified"; like gawk we split the
+            // record into individual characters (one field per character).
             Ok(FieldSeparator::Null)
         } else if value.as_str() == " " {
             Ok(FieldSeparator::Default)

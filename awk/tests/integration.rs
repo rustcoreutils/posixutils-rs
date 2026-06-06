@@ -133,6 +133,21 @@ fn test_awk_printf_star_width() {
 }
 
 #[test]
+fn test_awk_substr_edges() {
+    test_awk!(substr_edges);
+}
+
+#[test]
+fn test_awk_case_mapping() {
+    test_awk!(case_mapping);
+}
+
+#[test]
+fn test_awk_getline_pipe_advances_nr() {
+    test_awk!(getline_pipe_nr);
+}
+
+#[test]
 fn test_awk_record_with_many_fields() {
     // A record with more than the old 1024-field cap must keep every field.
     test_awk!(many_fields, "tests/awk/many_fields.txt");

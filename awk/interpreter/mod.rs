@@ -628,6 +628,13 @@ impl Interpreter {
                             Ok(Some(next_record)) => {
                                 fields_state =
                                     var.assign(maybe_numeric_string(next_record), global_env)?;
+                                // `cmd | getline` advances NR (but not FNR), like
+                                // historical awk; `getline < file` touches neither.
+                                if function == BuiltinFunction::GetLineFromPipe {
+                                    let nr_ptr = self.globals[SpecialVar::Nr as usize].get();
+                                    let next_nr = unsafe { (*nr_ptr).scalar_as_f64() } + 1.0;
+                                    unsafe { &mut *nr_ptr }.assign(next_nr, global_env)?;
+                                }
                                 stack.push_value(1.0)?;
                             }
                             Ok(None) => {

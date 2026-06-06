@@ -357,31 +357,50 @@ pub(crate) fn call_simple_builtin(
             stack.push_value(str)?;
         }
         BuiltinFunction::Substr => {
+            // substr(s, m[, n]): the at most n-character substring of s that
+            // begins at character position m (numbering from 1). Positions below
+            // 1 still consume part of n, matching nawk/gawk, so e.g.
+            // substr("hello", -1, 3) == "h". m and n truncate toward zero.
             let n = if argc == 2 {
-                usize::MAX
+                None
             } else {
-                stack.pop_scalar_value()?.scalar_as_f64() as usize
+                Some(stack.pop_scalar_value()?.scalar_as_f64().trunc() as i64)
             };
-            // the behaviour for values < 1 is not specified. Here we follow what other
-            // implementations do
-            let m = stack.pop_scalar_value()?.scalar_as_f64().max(1.0) as usize;
+            let m = stack.pop_scalar_value()?.scalar_as_f64().trunc() as i64;
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            let substr = s.chars().skip(m - 1).take(n).collect::<String>();
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            let start = m.max(1);
+            let end = match n {
+                None => len + 1,
+                Some(n) => m.saturating_add(n),
+            }
+            .min(len + 1);
+            let substr: String = if start < end {
+                chars[(start - 1) as usize..(end - 1) as usize]
+                    .iter()
+                    .collect()
+            } else {
+                String::new()
+            };
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
+            // POSIX: case mapping follows the LC_CTYPE category of the locale.
             let value = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            stack.push_value(value.to_lowercase())?;
+            let lowered: String = value.chars().map(plib::locale::to_lower).collect();
+            stack.push_value(lowered)?;
         }
         BuiltinFunction::ToUpper => {
             let value = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            stack.push_value(value.to_uppercase())?;
+            let uppered: String = value.chars().map(plib::locale::to_upper).collect();
+            stack.push_value(uppered)?;
         }
         BuiltinFunction::Gsub | BuiltinFunction::Sub => {
             return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)

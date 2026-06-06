@@ -37,6 +37,38 @@ type WintT = libc::c_uint;
 
 extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
+    fn towlower(c: WintT) -> WintT;
+    fn towupper(c: WintT) -> WintT;
+}
+
+/// Map `c` to lowercase under the current `LC_CTYPE`.
+///
+/// Single-byte values (`c <= 0xFF`) go through libc `tolower(3)`; multi-byte
+/// Unicode characters go through `towlower(3)`. Characters with no mapping are
+/// returned unchanged.
+pub fn to_lower(c: char) -> char {
+    let code = c as u32;
+    let mapped = if code <= 0xFF {
+        // SAFETY: tolower is thread-safe; the argument is in [0, 255].
+        unsafe { libc::tolower(code as libc::c_int) as u32 }
+    } else {
+        // SAFETY: towlower is thread-safe; every Unicode codepoint fits in WintT.
+        unsafe { towlower(code as WintT) as u32 }
+    };
+    char::from_u32(mapped).unwrap_or(c)
+}
+
+/// Map `c` to uppercase under the current `LC_CTYPE`. See [`to_lower`].
+pub fn to_upper(c: char) -> char {
+    let code = c as u32;
+    let mapped = if code <= 0xFF {
+        // SAFETY: toupper is thread-safe; the argument is in [0, 255].
+        unsafe { libc::toupper(code as libc::c_int) as u32 }
+    } else {
+        // SAFETY: towupper is thread-safe; every Unicode codepoint fits in WintT.
+        unsafe { towupper(code as WintT) as u32 }
+    };
+    char::from_u32(mapped).unwrap_or(c)
 }
 
 /// True if `c` is printable under the current `LC_CTYPE`.
@@ -157,6 +189,18 @@ mod tests {
         assert!(!isprint('\t'));
         assert!(!isprint('\0'));
         assert!(!isprint('\x7f')); // DEL
+    }
+
+    #[test]
+    fn to_lower_upper_ascii() {
+        assert_eq!(to_lower('A'), 'a');
+        assert_eq!(to_lower('Z'), 'z');
+        assert_eq!(to_upper('a'), 'A');
+        assert_eq!(to_upper('z'), 'Z');
+        // Non-alphabetic characters are unchanged.
+        assert_eq!(to_lower('5'), '5');
+        assert_eq!(to_upper('!'), '!');
+        assert_eq!(to_lower('a'), 'a');
     }
 
     #[test]

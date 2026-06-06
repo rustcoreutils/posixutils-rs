@@ -53,15 +53,15 @@ drops fields** (Major).
 
 ### Minor
 
-- [ ] **#8 — `substr(s,m,n)` with `m<1` keeps `n` characters from position 1 instead of from `m`.** `builtins.rs:332` clamps `m` to `1.0` then `builtins.rs:336` takes `n` chars, so leading positions below 1 are not counted against `n`. POSIX 85895-85898 defines the result as "the at most n-character substring … that begins at position m". Verified: `substr("hello",-1,3)`→`hel` and `substr("hello",0,2)`→`he`; nawk/gawk give `h` and `h`. The code comment acknowledges the `<1` case is "not specified", so this is a divergence-from-common-behavior rather than a hard `shall`; remaining substr edges (`m`/`n` fractional truncation, negative `n`→empty, over-long `n` clamp) are correct.
+- [x] **#8 — `substr(s,m,n)` with `m<1` keeps `n` characters from position 1 instead of from `m`.** `builtins.rs:332` clamps `m` to `1.0` then `builtins.rs:336` takes `n` chars, so leading positions below 1 are not counted against `n`. POSIX 85895-85898 defines the result as "the at most n-character substring … that begins at position m". Verified: `substr("hello",-1,3)`→`hel` and `substr("hello",0,2)`→`he`; nawk/gawk give `h` and `h`. The code comment acknowledges the `<1` case is "not specified", so this is a divergence-from-common-behavior rather than a hard `shall`; remaining substr edges (`m`/`n` fractional truncation, negative `n`→empty, over-long `n` clamp) are correct. **✓ Fixed:** substr now computes the character window `[max(m,1), m+n)` clamped to the string, so out-of-range leading positions consume `n`; test `test_awk_substr_edges`.
 
-- [ ] **#9 — Division / modulo by zero yields `inf`/`-nan` with no diagnostic and exit 0.** `awk 'BEGIN{print 1/0}'` → `inf` (exit 0); `1%0` → `-nan`. POSIX 85426-85428 makes the result undefined (ISO C error case), so this is conforming-but-surprising; most awks emit a fatal "division by zero" diagnostic. Consider emitting a diagnostic and non-zero exit.
+- [ ] **#9 — Division / modulo by zero yields `inf`/`-nan` with no diagnostic and exit 0.** `awk 'BEGIN{print 1/0}'` → `inf` (exit 0); `1%0` → `-nan`. POSIX 85426-85428 makes the result undefined (ISO C error case), so this is conforming-but-surprising; most awks emit a fatal "division by zero" diagnostic. Consider emitting a diagnostic and non-zero exit. **Left as-is (intentional):** current behavior is POSIX-conforming (undefined → `inf`/`-nan`); not changed to avoid breaking programs that rely on the IEEE result.
 
-- [ ] **#10 — `tolower`/`toupper` use Unicode default case mapping, not the `LC_CTYPE` mapping.** `builtins.rs:339-349` call Rust `to_lowercase()`/`to_uppercase()`. POSIX 85899-85906 ties the mapping to "the LC_CTYPE category of the current locale". Practical impact is small (ASCII identical); flagged for strict-conformance completeness, consistent with the `plib::locale` direction taken in `dev/audit.md`.
+- [x] **#10 — `tolower`/`toupper` use Unicode default case mapping, not the `LC_CTYPE` mapping.** `builtins.rs:339-349` call Rust `to_lowercase()`/`to_uppercase()`. POSIX 85899-85906 ties the mapping to "the LC_CTYPE category of the current locale". Practical impact is small (ASCII identical); flagged for strict-conformance completeness, consistent with the `plib::locale` direction taken in `dev/audit.md`. **✓ Fixed:** added `plib::locale::to_lower`/`to_upper` (libc `tolower`/`towlower`); awk maps each character through them. Tests `plib locale::tests::to_lower_upper_ascii`, `test_awk_case_mapping`.
 
-- [ ] **#11 — `cmd | getline` does not set NR.** `awk/interpreter/mod.rs:598-622` sets neither NR nor FNR for the file and pipe getline forms. The POSIX 2024 text for `expression | getline [var]` (85922-85933) is silent on NR, so this conforms to the letter, but historical awk and gawk increment NR for the pipe form. Verified: `awk 'BEGIN{"echo hi"|getline x; print NR}'` → `0`. Document or align with historical behavior.
+- [x] **#11 — `cmd | getline` does not set NR.** `awk/interpreter/mod.rs:598-622` sets neither NR nor FNR for the file and pipe getline forms. The POSIX 2024 text for `expression | getline [var]` (85922-85933) is silent on NR, so this conforms to the letter, but historical awk and gawk increment NR for the pipe form. Verified: `awk 'BEGIN{"echo hi"|getline x; print NR}'` → `0`. Document or align with historical behavior. **✓ Fixed:** the `GetLineFromPipe` branch now advances NR (not FNR) on a successful read, matching gawk; `getline < file` still touches neither. Test `test_awk_getline_pipe_advances_nr`.
 
-- [ ] **#12 — `split(s,a,"")` performs a per-character split.** `record.rs:76-77` maps an empty FS to `Null` → one element per character. POSIX 85876 calls a null `fs` "unspecified", so this is conforming; worth a one-line doc note since it is an observable choice (`split("abc",a,"")` → 3 elements). Likewise FS="" for record field splitting is the same unspecified-but-defined char split.
+- [x] **#12 — `split(s,a,"")` performs a per-character split.** `record.rs:76-77` maps an empty FS to `Null` → one element per character. POSIX 85876 calls a null `fs` "unspecified", so this is conforming; worth a one-line doc note since it is an observable choice (`split("abc",a,"")` → 3 elements). Likewise FS="" for record field splitting is the same unspecified-but-defined char split. **✓ Documented:** comment added at the `FieldSeparator::Null` construction noting the gawk-compatible per-character behavior.
 
 - [ ] **#13 — clap exposes `--help`/`-h`/`--version`/`-V`.** `awk/main.rs:24-45`. These are non-POSIX but standard and harmless. `--` end-of-options and unknown-option rejection are handled by clap (both verified working). No action required beyond noting the extension surface.
 
@@ -185,8 +185,8 @@ drops fields** (Major).
 | `match` | CONFORMS | (#3 ✓ fixed) RSTART/RLENGTH character-based. No-match 0/-1 correct. |
 | `split` | CONFORMS | clears array; default FS / regex / single-char; numeric-string tagging (verified `10>9`→1); empty-fs char split (#12). |
 | `sprintf` | CONFORMS | (#4 ✓ fixed) `*` width/precision supported. |
-| `substr` | PARTIAL | (#8) `m<1` divergence; char-based, fractional truncation, negative-`n`→empty, over-long-`n` clamp all correct (verified). |
-| `tolower`/`toupper` | PARTIAL | (#10) Unicode mapping, not LC_CTYPE. |
+| `substr` | CONFORMS | (#8 ✓ fixed) `m<1` window math; char-based, fractional truncation, negative-`n`→empty, over-long-`n` clamp. |
+| `tolower`/`toupper` | CONFORMS | (#10 ✓ fixed) `plib::locale` LC_CTYPE mapping. |
 
 #### Input/Output & general functions
 | Func | Status | Notes |
@@ -197,7 +197,7 @@ drops fields** (Major).
 | `getline` | CONFORMS | sets `$0`,NF,NR,FNR (verified NF=3/NR=2/FNR=2). |
 | `getline var` | CONFORMS | sets var,NR,FNR; not `$0`/NF (verified). |
 | `getline < file` | CONFORMS | sets `$0`/NF (or var); not NR/FNR (verified NR=0). |
-| `cmd \| getline [var]` | PARTIAL | (#11) does not set NR (spec-silent; historical sets it). |
+| `cmd \| getline [var]` | CONFORMS | (#11 ✓ fixed) advances NR (not FNR), like historical awk. |
 | getline returns 1/0/-1 | CONFORMS | verified missing-file→-1, EOF→0, success→1 (`mod.rs:608-621`). |
 
 #### Grammar / lexical conventions
@@ -213,7 +213,7 @@ drops fields** (Major).
 - [x] Inaccessible file operand → diagnostic + terminate — file readers in `io.rs`/`mod.rs`.
 
 ### Cross-cutting
-- [x] i18n: `setlocale(LC_ALL,"")` + gettext domain wired (`main.rs:58-60`); diagnostics gettext-wrapped. Residual: `tolower`/`toupper` LC_CTYPE (#10).
+- [x] i18n: `setlocale(LC_ALL,"")` + gettext domain wired (`main.rs:58-60`); diagnostics gettext-wrapped; `tolower`/`toupper` honor LC_CTYPE (#10 ✓ fixed).
 - [x] Regex flavor: ERE (correct for awk) via libc-backed `plib::regex`.
 - [x] Signals: Default (non-interactive) — no handlers required.
 - [x] Character vs byte: `length`/`index`/`match` now character-based, consistent with `substr`/`split` (#3 ✓ fixed).
@@ -230,7 +230,7 @@ srand-prior-seed). Gaps that map to findings — add tests that:
 - [x] exercise `awk -f -` reading the program from stdin (#5). ✓ `test_awk_program_file_from_stdin`
 - [x] assert `$5==0` and empty `$2==0` are true (#6). ✓ `test_awk_uninitialized_field_comparison`
 - [x] assert records with >1024 fields keep all fields and `$2000=…` works (#7). ✓ `test_awk_record_with_many_fields`, `test_awk_high_field_assignment`
-- [ ] pin `substr("hello",-1,3)` behavior (#8).
+- [x] pin `substr("hello",-1,3)` behavior (#8). ✓ `test_awk_substr_edges`
 
 ## Suggested PR groupings
 

@@ -33,6 +33,18 @@ pub(crate) fn ere_escape_char(c: char) -> String {
     }
 }
 
+/// Build the stored value for field `index` from its text. POSIX 85511: a field
+/// created from `$0`/FS that "does not contain any characters" has the
+/// uninitialized value (so e.g. an empty field compares numerically equal to 0),
+/// while a non-empty field is a (possibly numeric) string.
+fn make_field(value: AwkString, index: u16) -> AwkValue {
+    if value.is_empty() {
+        AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index))
+    } else {
+        AwkValue::field_ref(value, index)
+    }
+}
+
 /// Splits a record into fields and calls the provided closure for each field.
 /// If the record is a numeric string, fields will be numeric strings if appropriate.
 pub(crate) fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
@@ -116,7 +128,7 @@ impl Record {
                 return Ok(());
             }
             last_field += 1;
-            *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
+            *self.fields[field_index].get_mut() = make_field(s, field_index as u16);
             Ok(())
         })?;
         if last_field < previous_last_field {
@@ -195,7 +207,7 @@ impl Record {
                 return Ok(());
             }
             last_field += 1;
-            *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
+            *self.fields[field_index].get() = make_field(s, field_index as u16);
             Ok(())
         })?;
         *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);

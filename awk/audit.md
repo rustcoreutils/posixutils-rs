@@ -47,7 +47,7 @@ drops fields** (Major).
 
 - [x] **#5 — `-f -` does not read the program from standard input.** `awk/main.rs:64-77` opens every `-f` argument with `std::fs::File::open`, which fails on `-`. POSIX 85188-85192: "A pathname of `-` shall denote the standard input." Verified: `echo 'BEGIN{print 1}' | awk -f -` → `Error: "could not open file '-'"`. Fix: special-case `-` to read `stdin` (and concatenate in order with other `-f` files). **✓ Fixed:** the `-f` loop reads `stdin` when the arg is `-`; test `test_awk_program_file_from_stdin`.
 
-- [ ] **#6 — Uninitialized / empty / nonexistent fields do not compare numerically equal to 0.** Two causes: (a) the compare macro at `awk/interpreter/stack.rs:362-371` explicitly excludes field refs (`!lhs.ref_type.is_field() && !rhs.ref_type.is_field()`) from the "Number vs UninitializedScalar → numeric" rule, dropping uninitialized fields to the string-compare fallback (`stack.rs:378-380`); (b) empty fields are stored as empty *strings* (`record.rs:119,198`, via `maybe_numeric_string("")`) rather than the uninitialized value. POSIX 85481 (numeric comparison "if one is numeric and the other has the uninitialized value"), 85506 (nonexistent fields "shall evaluate to the uninitialized value"), 85511 (empty fields from `$0`/FS "shall have the uninitialized value … considered a numeric string"). Verified: `echo 'a b' | awk '{print ($5==0)}'` → `0` (want 1); `echo 'a::b' | awk -F: '{print ($2==0)}'` → `0` (want 1); scalar/array uninitialized compares (`x==0`, `a["k"]==0`) correctly give 1, confirming the divergence is field-specific. Fix: treat field-ref uninitialized values like scalar uninitialized values in comparison, and create empty fields as the uninitialized value.
+- [x] **#6 — Uninitialized / empty / nonexistent fields do not compare numerically equal to 0.** Two causes: (a) the compare macro at `awk/interpreter/stack.rs:362-371` explicitly excludes field refs (`!lhs.ref_type.is_field() && !rhs.ref_type.is_field()`) from the "Number vs UninitializedScalar → numeric" rule, dropping uninitialized fields to the string-compare fallback (`stack.rs:378-380`); (b) empty fields are stored as empty *strings* (`record.rs:119,198`, via `maybe_numeric_string("")`) rather than the uninitialized value. POSIX 85481 (numeric comparison "if one is numeric and the other has the uninitialized value"), 85506 (nonexistent fields "shall evaluate to the uninitialized value"), 85511 (empty fields from `$0`/FS "shall have the uninitialized value … considered a numeric string"). Verified: `echo 'a b' | awk '{print ($5==0)}'` → `0` (want 1); `echo 'a::b' | awk -F: '{print ($2==0)}'` → `0` (want 1); scalar/array uninitialized compares (`x==0`, `a["k"]==0`) correctly give 1, confirming the divergence is field-specific. Fix: treat field-ref uninitialized values like scalar uninitialized values in comparison, and create empty fields as the uninitialized value. **✓ Fixed:** removed the `is_field()` guard in `compare_op!` (and the now-unused `AwkRefType::is_field`); `record.rs` `make_field` stores empty fields as the uninitialized value; test `test_awk_uninitialized_field_comparison`.
 
 - [ ] **#7 — Hard 1024-field cap silently truncates records and errors on high field assignment.** `awk/interpreter/record.rs:103` (`MAX_FIELDS = 1024`); split silently drops fields past 1024 (`record.rs:115-117,194-196`) and `is_valid_record_index` (`record.rs:229-235`) rejects any `$n` with `n>1024`. POSIX places no such low fixed limit and the spec model is dynamic. Verified: a 1100-field record → `NF` reports `1024` (76 fields lost with no diagnostic); `echo x | awk '{$2000="z"}'` → `runtime error: invalid field index`. Fix: grow the fields vector dynamically (or raise the cap well beyond {LINE_MAX}-implied field counts and never silently drop).
 
@@ -117,7 +117,7 @@ drops fields** (Major).
 - [x] Number→string: integers via `%d`, others via CONVFMT (85375-85381) — `value.rs:88-106`. Verified integer bypass and CONVFMT concat.
 - [x] Numeric-string sources (fields, getline, FILENAME, ARGV, ENVIRON, split, cmdline assign) tagged — `mod.rs:78-82,814-825`, `record.rs:43`.
 - [x] Comparison rule (numeric if both numeric / numeric+numeric-string / both numeric-strings / numeric+uninitialized) — `stack.rs:345-381`. Verified `"10"==10`→y, `" 10 "==10`→n, field `10>9`→1.
-- [ ] **Field uninitialized comparison broken** (#6) — `stack.rs:362-371`.
+- [x] **Field uninitialized comparison** (#6 ✓ fixed) — `stack.rs` `compare_op!`, `record.rs` `make_field`.
 - [x] Boolean context (zero/`""` false) — verified via `if`, `?:`, patterns.
 
 #### Arrays
@@ -147,7 +147,7 @@ drops fields** (Major).
 - [x] FS modes: space-default (strip leading/trailing blanks+newlines, split on runs), single-char, regex/multi-char — `record.rs:44-86`. Verified all, incl. `FS="\t"`, `FS="[0-9]"`.
 - [x] RS modes incl. paragraph (`RS=""`, newline always a field sep) — `io.rs` + `mod.rs` effective-FS. Verified.
 - [x] Assigning `$n` rebuilds `$0` with OFS; assigning `$0` re-splits; `$(NF+k)` grows NF with intervening uninitialized fields — `record.rs:135-205`. Verified.
-- [ ] **Empty fields stored as strings, not the uninitialized value** (#6) — `record.rs:119,198`.
+- [x] **Empty fields carry the uninitialized value** (#6 ✓ fixed) — `record.rs` `make_field`.
 - [ ] **1024-field cap** (#7) — `record.rs:103,115-117,229-235`.
 
 #### Regular expressions (ERE)
@@ -228,7 +228,7 @@ srand-prior-seed). Gaps that map to findings — add tests that:
 - [x] assert `length`/`index`/`match`/RSTART/RLENGTH on a multibyte record return character counts (#3). ✓ `test_awk_multibyte_char_counts`
 - [x] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4). ✓ `test_awk_printf_star_width`
 - [x] exercise `awk -f -` reading the program from stdin (#5). ✓ `test_awk_program_file_from_stdin`
-- [ ] assert `$5==0` and empty `$2==0` are true (#6).
+- [x] assert `$5==0` and empty `$2==0` are true (#6). ✓ `test_awk_uninitialized_field_comparison`
 - [ ] assert records with >1024 fields keep all fields and `$2000=…` works (#7).
 - [ ] pin `substr("hello",-1,3)` behavior (#8).
 

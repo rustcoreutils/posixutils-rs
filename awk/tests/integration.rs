@@ -133,6 +133,22 @@ fn test_awk_printf_star_width() {
 }
 
 #[test]
+fn test_awk_uninitialized_field_comparison() {
+    // POSIX: nonexistent fields (85506) and empty fields from $0/FS (85511) have
+    // the uninitialized value, so they compare numerically equal to 0 while
+    // still being string-equal to "". Populated fields are unaffected.
+    test_awk(
+        vec![
+            "-F".to_string(),
+            ":".to_string(),
+            "{ print ($5==0); print ($2==0); print ($2==\"\"); print ($1==\"a\") }".to_string(),
+            "tests/awk/empty_fields.txt".to_string(),
+        ],
+        "1\n1\n1\n1\n",
+    );
+}
+
+#[test]
 fn test_awk_program_file_from_stdin() {
     // POSIX: a `-f` progfile of `-` denotes the standard input.
     run_test(TestPlan {

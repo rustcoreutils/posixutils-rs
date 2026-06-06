@@ -39,12 +39,6 @@ pub(crate) enum AwkRefType {
     SpecialGlobalVar(SpecialVar),
 }
 
-impl AwkRefType {
-    pub(crate) fn is_field(&self) -> bool {
-        matches!(self, AwkRefType::Field(_))
-    }
-}
-
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, PartialEq)]
 pub(crate) struct AwkValue {

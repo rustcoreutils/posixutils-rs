@@ -35,11 +35,32 @@ pub(crate) fn sprintf(
     while let Some(c) = next {
         match c {
             '%' => {
-                let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
+                let (specifier, mut args) = parse_conversion_specifier_args(&mut iter)?;
                 if specifier == '%' {
                     result.push('%');
                     next = iter.next();
                     continue;
+                }
+
+                // A '*' field width or precision consumes the next argument(s),
+                // in order: width, then precision, then the conversion's value.
+                if args.needs_width_arg() {
+                    if current_arg == 0 {
+                        return Err("not enough arguments for format string".to_string());
+                    }
+                    current_arg -= 1;
+                    args.set_width(
+                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
+                    );
+                }
+                if args.needs_precision_arg() {
+                    if current_arg == 0 {
+                        return Err("not enough arguments for format string".to_string());
+                    }
+                    current_arg -= 1;
+                    args.set_precision(
+                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
+                    );
                 }
 
                 if current_arg == 0 {

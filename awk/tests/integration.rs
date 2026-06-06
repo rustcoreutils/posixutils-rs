@@ -128,6 +128,11 @@ fn test_awk_multibyte_char_counts() {
 }
 
 #[test]
+fn test_awk_printf_star_width() {
+    test_awk!(printf_star_width);
+}
+
+#[test]
 fn test_awk_program_file_from_stdin() {
     // POSIX: a `-f` progfile of `-` denotes the standard input.
     run_test(TestPlan {

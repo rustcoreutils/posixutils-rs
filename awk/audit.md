@@ -43,7 +43,7 @@ drops fields** (Major).
 
 - [x] **#3 — `length`, `index`, `match` (and RSTART/RLENGTH) count bytes, not characters.** `length` uses `value_str.len()` (`builtins.rs:288`), `index` uses `str::find` byte offset (`builtins.rs:273-278`), and `match` derives RSTART/RLENGTH from `plib::regex` byte offsets (`builtins.rs:140-152`). `substr` and `split("")` correctly use `chars()` (`builtins.rs:336`, `record.rs:64`), so the implementation is internally inconsistent. POSIX 85859-85868 and APPLICATION USAGE 86394-86396: "the awk versions deal with characters, while the ISO C standard deals with bytes." Verified on a 3-character / 4-byte record `AÉB`: `length`→`4` (want 3), `index($0,"B")`→`4` (want 3), `match($0,/B/)` RSTART→`4` (want 3). Fix: count characters (`chars().count()`, char indices) in these functions and translate regex byte offsets to char offsets. **✓ Fixed:** `length` uses `chars().count()`; `index`/`match` convert byte offsets via `byte_offset_to_char_count`; test `test_awk_multibyte_char_counts`.
 
-- [ ] **#4 — printf/sprintf `*` dynamic field width/precision is unimplemented.** `parse_conversion_specifier_args` (`awk/interpreter/format.rs`) only consumes from the format-string iterator; `sprintf` (`builtins.rs:38`) has no path to fetch a width/precision argument from the value list. POSIX EXTENDED DESCRIPTION item 4 (85798-85800): "A field width or precision can be specified as the `*` character … the next argument … shall be fetched and its numeric value taken as the field width or precision." Verified: `awk 'BEGIN{printf "%*d\n",5,42}'` → `runtime error: unsupported format specifier '*'` (same for `%.*f`, `%-*d`). Fix: when `*` is seen in the width/precision position, pull the next expression argument as an integer.
+- [x] **#4 — printf/sprintf `*` dynamic field width/precision is unimplemented.** `parse_conversion_specifier_args` (`awk/interpreter/format.rs`) only consumes from the format-string iterator; `sprintf` (`builtins.rs:38`) has no path to fetch a width/precision argument from the value list. POSIX EXTENDED DESCRIPTION item 4 (85798-85800): "A field width or precision can be specified as the `*` character … the next argument … shall be fetched and its numeric value taken as the field width or precision." Verified: `awk 'BEGIN{printf "%*d\n",5,42}'` → `runtime error: unsupported format specifier '*'` (same for `%.*f`, `%-*d`). Fix: when `*` is seen in the width/precision position, pull the next expression argument as an integer. **✓ Fixed:** `FormatArgs` records `width_star`/`precision_star`; `sprintf` fetches width then precision then value (negative width → left-justify, negative precision → omitted); test `test_awk_printf_star_width`.
 
 - [x] **#5 — `-f -` does not read the program from standard input.** `awk/main.rs:64-77` opens every `-f` argument with `std::fs::File::open`, which fails on `-`. POSIX 85188-85192: "A pathname of `-` shall denote the standard input." Verified: `echo 'BEGIN{print 1}' | awk -f -` → `Error: "could not open file '-'"`. Fix: special-case `-` to read `stdin` (and concatenate in order with other `-f` files). **✓ Fixed:** the `-f` loop reads `stdin` when the arg is `-`; test `test_awk_program_file_from_stdin`.
 
@@ -170,7 +170,7 @@ drops fields** (Major).
 - [x] `printf`/`sprintf`: `%d %i %o %x %X %u %e %E %f %F %g %G %a %A %c %s %%`; flags/width/precision — `builtins.rs:26-118`, `format.rs`. Verified `%i`,`%x`,`%o`,`%e`,`%8.2f`,`%d` large.
 - [x] `%c`: numeric→char-by-value, string→first char (`builtins.rs:85-101`). Verified `65`→`A`, `"hello"`→`h`.
 - [x] Redirection `>` (truncate-once-then-append), `>>` (append), `| cmd` (popen `w`) — `mod.rs:520-552`, `io.rs`. Verified truncate-then-append, cross-run `>>`, `print|"sort"`.
-- [ ] **`*` dynamic width/precision unimplemented** (#4) — `builtins.rs:38`, `format.rs`.
+- [x] **`*` dynamic width/precision** (#4 ✓ fixed) — `format.rs` `FormatArgs`, `builtins.rs` `sprintf`.
 - [x] Insufficient args → error (spec "undefined"; erroring is acceptable) — `builtins.rs:45-46`. Extra args ignored (awk printf does not cycle) — verified.
 
 #### Built-in arithmetic functions
@@ -184,7 +184,7 @@ drops fields** (Major).
 | `length` | CONFORMS | (#3 ✓ fixed) `chars().count()`. Bare `length` = `length($0)`; `length(array)` works. |
 | `match` | CONFORMS | (#3 ✓ fixed) RSTART/RLENGTH character-based. No-match 0/-1 correct. |
 | `split` | CONFORMS | clears array; default FS / regex / single-char; numeric-string tagging (verified `10>9`→1); empty-fs char split (#12). |
-| `sprintf` | PARTIAL | (#4) `*` unsupported; else conforms. |
+| `sprintf` | CONFORMS | (#4 ✓ fixed) `*` width/precision supported. |
 | `substr` | PARTIAL | (#8) `m<1` divergence; char-based, fractional truncation, negative-`n`→empty, over-long-`n` clamp all correct (verified). |
 | `tolower`/`toupper` | PARTIAL | (#10) Unicode mapping, not LC_CTYPE. |
 
@@ -226,7 +226,7 @@ srand-prior-seed). Gaps that map to findings — add tests that:
 - [x] assert `print close(f)` / `r=close(f)` return a status without panicking (#1). ✓ `test_awk_close_returns_status`
 - [x] assert `-F '\t'` yields a single-char tab FS (`length(FS)==1`) (#2). ✓ `test_awk_dash_f_escape_processing`
 - [x] assert `length`/`index`/`match`/RSTART/RLENGTH on a multibyte record return character counts (#3). ✓ `test_awk_multibyte_char_counts`
-- [ ] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4).
+- [x] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4). ✓ `test_awk_printf_star_width`
 - [x] exercise `awk -f -` reading the program from stdin (#5). ✓ `test_awk_program_file_from_stdin`
 - [ ] assert `$5==0` and empty `$2==0` are true (#6).
 - [ ] assert records with >1024 fields keep all fields and `$2000=…` works (#7).

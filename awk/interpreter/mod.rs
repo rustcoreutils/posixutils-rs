@@ -860,6 +860,10 @@ pub fn interpret(
     )?;
 
     if let Some(separator) = separator {
+        // POSIX: `-F sepstring` is equivalent to `-v FS=sepstring`, so the
+        // separator undergoes the same escape processing (e.g. `-F '\t'` is a
+        // tab), matching the -v path above.
+        let separator = escape_string_contents(&separator)?;
         interpreter.globals[SpecialVar::Fs as usize]
             .get_mut()
             .assign(AwkString::from(separator), &mut global_env)?;

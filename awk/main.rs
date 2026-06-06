@@ -64,11 +64,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let return_status = if !args.program_files.is_empty() {
         let mut sources = Vec::new();
         for source_file in &args.program_files {
-            let mut file = std::fs::File::open(source_file)
-                .map_err(|_| gettext!("could not open file '{}'", source_file))?;
             let mut contents = String::new();
-            file.read_to_string(&mut contents)
-                .map_err(|_| gettext!("could not read file '{}'", source_file))?;
+            if source_file == "-" {
+                // POSIX: a progfile of '-' denotes the standard input.
+                std::io::stdin()
+                    .read_to_string(&mut contents)
+                    .map_err(|_| gettext!("could not read standard input"))?;
+            } else {
+                let mut file = std::fs::File::open(source_file)
+                    .map_err(|_| gettext!("could not open file '{}'", source_file))?;
+                file.read_to_string(&mut contents)
+                    .map_err(|_| gettext!("could not read file '{}'", source_file))?;
+            }
             sources.push(SourceFile {
                 contents,
                 filename: source_file.clone(),

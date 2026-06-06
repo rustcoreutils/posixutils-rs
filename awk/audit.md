@@ -39,13 +39,13 @@ drops fields** (Major).
 
 ### Major
 
-- [ ] **#2 — `-F sepstring` does not apply escape-sequence processing.** `awk/interpreter/mod.rs:843-847` assigns the `-F` argument to FS verbatim (`AwkString::from(separator)`), bypassing the `escape_string_contents()` used for `-v` assignments (`mod.rs:799`) and assignment operands (`mod.rs:903`). POSIX 85182-85187: `-F sepstring` "shall be equivalent to `-v FS=sepstring`". Verified: `awk -F '\t' 'BEGIN{print length(FS)}'` → `2` (literal `\t`), but `awk -v 'FS=\t' 'BEGIN{print length(FS)}'` → `1` (a real tab); `printf 'a\tb\n' | awk -F '\t' '{print $2}'` prints nothing. The ubiquitous `-F'\t'` idiom is broken. Fix: run `separator` through `escape_string_contents` before assigning FS.
+- [x] **#2 — `-F sepstring` does not apply escape-sequence processing.** `awk/interpreter/mod.rs:843-847` assigns the `-F` argument to FS verbatim (`AwkString::from(separator)`), bypassing the `escape_string_contents()` used for `-v` assignments (`mod.rs:799`) and assignment operands (`mod.rs:903`). POSIX 85182-85187: `-F sepstring` "shall be equivalent to `-v FS=sepstring`". Verified: `awk -F '\t' 'BEGIN{print length(FS)}'` → `2` (literal `\t`), but `awk -v 'FS=\t' 'BEGIN{print length(FS)}'` → `1` (a real tab); `printf 'a\tb\n' | awk -F '\t' '{print $2}'` prints nothing. The ubiquitous `-F'\t'` idiom is broken. Fix: run `separator` through `escape_string_contents` before assigning FS. **✓ Fixed:** `interpret()` now wraps `-F` in `escape_string_contents`; test `test_awk_dash_f_escape_processing`.
 
 - [ ] **#3 — `length`, `index`, `match` (and RSTART/RLENGTH) count bytes, not characters.** `length` uses `value_str.len()` (`builtins.rs:288`), `index` uses `str::find` byte offset (`builtins.rs:273-278`), and `match` derives RSTART/RLENGTH from `plib::regex` byte offsets (`builtins.rs:140-152`). `substr` and `split("")` correctly use `chars()` (`builtins.rs:336`, `record.rs:64`), so the implementation is internally inconsistent. POSIX 85859-85868 and APPLICATION USAGE 86394-86396: "the awk versions deal with characters, while the ISO C standard deals with bytes." Verified on a 3-character / 4-byte record `AÉB`: `length`→`4` (want 3), `index($0,"B")`→`4` (want 3), `match($0,/B/)` RSTART→`4` (want 3). Fix: count characters (`chars().count()`, char indices) in these functions and translate regex byte offsets to char offsets.
 
 - [ ] **#4 — printf/sprintf `*` dynamic field width/precision is unimplemented.** `parse_conversion_specifier_args` (`awk/interpreter/format.rs`) only consumes from the format-string iterator; `sprintf` (`builtins.rs:38`) has no path to fetch a width/precision argument from the value list. POSIX EXTENDED DESCRIPTION item 4 (85798-85800): "A field width or precision can be specified as the `*` character … the next argument … shall be fetched and its numeric value taken as the field width or precision." Verified: `awk 'BEGIN{printf "%*d\n",5,42}'` → `runtime error: unsupported format specifier '*'` (same for `%.*f`, `%-*d`). Fix: when `*` is seen in the width/precision position, pull the next expression argument as an integer.
 
-- [ ] **#5 — `-f -` does not read the program from standard input.** `awk/main.rs:64-77` opens every `-f` argument with `std::fs::File::open`, which fails on `-`. POSIX 85188-85192: "A pathname of `-` shall denote the standard input." Verified: `echo 'BEGIN{print 1}' | awk -f -` → `Error: "could not open file '-'"`. Fix: special-case `-` to read `stdin` (and concatenate in order with other `-f` files).
+- [x] **#5 — `-f -` does not read the program from standard input.** `awk/main.rs:64-77` opens every `-f` argument with `std::fs::File::open`, which fails on `-`. POSIX 85188-85192: "A pathname of `-` shall denote the standard input." Verified: `echo 'BEGIN{print 1}' | awk -f -` → `Error: "could not open file '-'"`. Fix: special-case `-` to read `stdin` (and concatenate in order with other `-f` files). **✓ Fixed:** the `-f` loop reads `stdin` when the arg is `-`; test `test_awk_program_file_from_stdin`.
 
 - [ ] **#6 — Uninitialized / empty / nonexistent fields do not compare numerically equal to 0.** Two causes: (a) the compare macro at `awk/interpreter/stack.rs:362-371` explicitly excludes field refs (`!lhs.ref_type.is_field() && !rhs.ref_type.is_field()`) from the "Number vs UninitializedScalar → numeric" rule, dropping uninitialized fields to the string-compare fallback (`stack.rs:378-380`); (b) empty fields are stored as empty *strings* (`record.rs:119,198`, via `maybe_numeric_string("")`) rather than the uninitialized value. POSIX 85481 (numeric comparison "if one is numeric and the other has the uninitialized value"), 85506 (nonexistent fields "shall evaluate to the uninitialized value"), 85511 (empty fields from `$0`/FS "shall have the uninitialized value … considered a numeric string"). Verified: `echo 'a b' | awk '{print ($5==0)}'` → `0` (want 1); `echo 'a::b' | awk -F: '{print ($2==0)}'` → `0` (want 1); scalar/array uninitialized compares (`x==0`, `a["k"]==0`) correctly give 1, confirming the divergence is field-specific. Fix: treat field-ref uninitialized values like scalar uninitialized values in comparison, and create empty fields as the uninitialized value.
 
@@ -72,13 +72,13 @@ drops fields** (Major).
 - [x] `-F`, `-f` (repeatable, `ArgAction::Append`), `-v` (repeatable) parsed — `main.rs:27-42`.
 - [x] `-f` concatenation in order forms one program — `main.rs:65-77`.
 - [x] `--` end-of-options handled (clap) — verified `awk -- 'BEGIN{print 1}'` → `1`.
-- [ ] **`-f -` not routed to stdin** (#5) — `main.rs:67`.
+- [x] **`-f -` routed to stdin** (#5 ✓ fixed) — `main.rs:64-77`.
 
 ### OPTIONS
 | Opt | Status | Notes (file:line) |
 |---|---|---|
-| `-F sepstring` | **DIVERGES** | (#2) No escape processing; `mod.rs:843-847` vs `-v` path `mod.rs:799`. Single-char/regex/literal separators work; `\t`/`\057` do not. |
-| `-f progfile` | **PARTIAL** | (#5) Multiple/concatenation OK (`main.rs:65-77`); `-` not stdin. |
+| `-F sepstring` | CONFORMS | (#2 ✓ fixed) escapes processed via `escape_string_contents`; `-F '\t'` is a tab. |
+| `-f progfile` | CONFORMS | (#5 ✓ fixed) Multiple/concatenation OK; `-` reads stdin. |
 | `-v assignment` | CONFORMS | `main.rs:37-42`; applied before BEGIN (`mod.rs:836-841`), escapes processed (`mod.rs:799`), numeric-string tagged. Verified `-v x=5` and `-v 'x=a\tb'`. |
 
 ### OPERANDS / STDIN / INPUT FILES
@@ -224,10 +224,10 @@ Existing tests (`interpreter/tests.rs` 1711, `tests/integration.rs` 832) cover t
 golden language paths well (operators, builtins, getline, printf, arrays, regex,
 srand-prior-seed). Gaps that map to findings — add tests that:
 - [x] assert `print close(f)` / `r=close(f)` return a status without panicking (#1). ✓ `test_awk_close_returns_status`
-- [ ] assert `-F '\t'` yields a single-char tab FS (`length(FS)==1`) (#2).
+- [x] assert `-F '\t'` yields a single-char tab FS (`length(FS)==1`) (#2). ✓ `test_awk_dash_f_escape_processing`
 - [ ] assert `length`/`index`/`match`/RSTART/RLENGTH on a multibyte record return character counts (#3).
 - [ ] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4).
-- [ ] exercise `awk -f -` reading the program from stdin (#5).
+- [x] exercise `awk -f -` reading the program from stdin (#5). ✓ `test_awk_program_file_from_stdin`
 - [ ] assert `$5==0` and empty `$2==0` are true (#6).
 - [ ] assert records with >1024 fields keep all fields and `$2000=…` works (#7).
 - [ ] pin `substr("hello",-1,3)` behavior (#8).

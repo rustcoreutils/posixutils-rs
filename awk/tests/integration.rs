@@ -108,6 +108,34 @@ fn test_awk_close_returns_status() {
 }
 
 #[test]
+fn test_awk_dash_f_escape_processing() {
+    // POSIX: `-F sepstring` == `-v FS=sepstring`, so `\t` is a tab (a single
+    // character), not the two-character string backslash-t.
+    test_awk(
+        vec![
+            "-F".to_string(),
+            "\\t".to_string(),
+            "{ print length(FS), $2 }".to_string(),
+            "tests/awk/tab_separated.txt".to_string(),
+        ],
+        "1 b\n",
+    );
+}
+
+#[test]
+fn test_awk_program_file_from_stdin() {
+    // POSIX: a `-f` progfile of `-` denotes the standard input.
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["-f".to_string(), "-".to_string()],
+        stdin_data: String::from("BEGIN { print \"okprog\" }\n"),
+        expected_out: String::from("okprog\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
 fn test_awk_multidimensional_index() {
     test_awk!(multidimensional_index);
 }

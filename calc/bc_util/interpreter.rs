@@ -102,6 +102,13 @@ impl std::fmt::Display for ExecutionError {
 
 pub type ExecutionResult<T> = Result<T, ExecutionError>;
 
+// POSIX limit maxima. POSIX defines these as minimum-maxima; we use GNU bc's
+// generous values so real programs are not rejected while pathological inputs
+// can no longer drive unbounded allocation.
+const BC_SCALE_MAX: u64 = i32::MAX as u64; // matches GNU bc (2147483647)
+const BC_BASE_MAX: u64 = i32::MAX as u64; // obase upper bound, matches GNU bc
+const BC_DIM_MAX: u64 = 16_777_215; // array elements, matches GNU bc (2^24 - 1)
+
 type NameMap<T> = [T; 26];
 
 fn name_index(name: char) -> usize {
@@ -199,7 +206,11 @@ impl Interpreter {
                 let index = self
                     .eval_expr(index)?
                     .as_u64()
-                    .ok_or("array index is too large")? as usize;
+                    .ok_or("array index is too large")?;
+                if index >= BC_DIM_MAX {
+                    return Err("array index out of bounds".into());
+                }
+                let index = index as usize;
                 if let Some(call_frame) = self.call_frames.last_mut() {
                     if let Some(array) = &mut call_frame.array_variables[name_index(*name)] {
                         return Ok(get_or_extend(array, index));
@@ -366,9 +377,13 @@ impl Interpreter {
 
                 match register {
                     Register::Scale => {
-                        self.scale = value
+                        let new_scale = value
                             .as_u64()
-                            .ok_or("the value assigned to scale is too large")?
+                            .ok_or("the value assigned to scale is too large")?;
+                        if new_scale > BC_SCALE_MAX {
+                            return Err("scale is too large".into());
+                        }
+                        self.scale = new_scale;
                     }
                     Register::IBase => {
                         if let Some(new_ibase) = value.as_u64() {
@@ -381,11 +396,13 @@ impl Interpreter {
                     }
                     Register::OBase => {
                         if let Some(new_obase) = value.as_u64() {
-                            if new_obase >= 2 {
-                                self.obase = new_obase;
-                            } else {
+                            if new_obase < 2 {
                                 return Err("obase must be greater than 1".into());
                             }
+                            if new_obase > BC_BASE_MAX {
+                                return Err("obase is too large".into());
+                            }
+                            self.obase = new_obase;
                         } else {
                             return Err("value assigned to obase is too large".into());
                         }

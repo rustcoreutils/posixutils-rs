@@ -82,6 +82,43 @@ fn test_bc_missing_file() {
     });
 }
 
+// POSIX limit maxima are enforced so pathological inputs cannot drive
+// unbounded allocation (audit #B3 scale, #B4 obase, #B5 array index).
+fn bc_runtime_error(program: &str, expected_err: &str) {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: format!("{program}\nquit\n"),
+        expected_out: String::new(),
+        expected_err: format!("{expected_err}\n"),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_bc_scale_too_large() {
+    bc_runtime_error(
+        "scale=2147483648",
+        "runtime error (line 1): scale is too large",
+    );
+}
+
+#[test]
+fn test_bc_obase_too_large() {
+    bc_runtime_error(
+        "obase=2147483648",
+        "runtime error (line 1): obase is too large",
+    );
+}
+
+#[test]
+fn test_bc_array_index_out_of_bounds() {
+    bc_runtime_error(
+        "a[16777215]=1",
+        "runtime error (line 1): array index out of bounds",
+    );
+}
+
 // Regression: `quit` inside a `for` body within a function definition must not
 // panic. Per bc semantics quit takes effect when the definition is read, so
 // the statements after the definition are never executed (matches GNU bc).

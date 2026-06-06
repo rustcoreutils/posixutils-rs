@@ -14,6 +14,14 @@ binaries and running real inputs. Several agent-proposed findings were
 **refuted** by that step and are recorded as CONFORMS (see notes); they are
 kept so a future auditor does not re-raise them.
 
+> **Status (2026-06-06):** All actionable findings have been addressed across
+> six phases on branch `calc-audit`. expr #E1–#E10 (Phases 1–2); bc #B1/#B9
+> (Phase 3), #B2/#B10/#B11/#B12 (Phase 4), #B3/#B4/#B5 (Phase 5), #B6/#B8
+> (Phase 6). #B7 (`-1^2`) was re-examined and is **not** a bug — GNU bc agrees
+> with the current output (see note below). Three number.rs "rounds not
+> truncates" findings raised during the audit were already refuted before
+> publication. fixes verified against GNU `expr`/`bc`.
+
 ---
 
 ## Cross-cutting observations
@@ -53,34 +61,34 @@ real expression parser before it can be called conformant.
 ### Priority issues
 
 #### Critical
-- [ ] **#E1 — Operator precedence ignored; strictly left-to-right.** `expr.rs:290-350`. `eval_expression` repeatedly folds `tokens[0..3]` left to right with no precedence/associativity. Verified: `expr 2 + 3 \* 4` → `20` (POSIX requires `14`). Fix: replace the fold with a precedence-climbing/Pratt parser honoring the spec table (`:` > `* / %` > `+ -` > `= > >= < <= !=` > `&` > `|`, all left-associative).
-- [ ] **#E2 — `:` matching uses Rust regex, not anchored POSIX BRE.** `expr.rs:236-265`. `Regex::new(&rhs)` then `re.captures` (unanchored, ERE-ish). Verified: `expr "//abc/file" : '.*/\(.*\)'` → `0` (POSIX `file` — `\(...\)` is a literal paren to Rust regex); `expr abcd : bc` → `2` (POSIX `0`, patterns are anchored to start). Fix: compile as BRE, anchor at string start, capture `\1`.
-- [ ] **#E3 — Divide / remainder by zero panics (exit 101), no diagnostic.** `expr.rs:210-211` (`i1 / i2`, `i1 % i2`). Verified: `expr 6 / 0` panics. Fix: check `i2 == 0` and return an error → exit 2.
-- [ ] **#E4 — Exit status never reflects the result value.** `expr.rs:365-378`. `main` returns `Ok(())` whenever evaluation succeeds, so exit is always `0`. Verified: `expr 0` → exit `0`, `expr 1 = 2` → exit `0` (POSIX requires exit `1` when the result is null or zero). Fix: after printing, `exit(1)` if the result is the empty string or numeric zero, else `exit(0)`.
+- [x] **#E1 — Operator precedence ignored; strictly left-to-right.** ✓ Phase 1. Replaced the `tokens[0..3]` fold with a precedence-climbing evaluator honoring the spec table (`:` > `* / %` > `+ -` > comparisons > `&` > `|`, left-associative). `expr 2 + 3 \* 4` → `14`.
+- [x] **#E2 — `:` matching uses Rust regex, not anchored POSIX BRE.** ✓ Phase 2. Switched to `plib::regex` BRE, anchored at start (`caps[0].start == 0`), with `\1` capture. `expr "//abc/file" : '.*/\(.*\)'` → `file`.
+- [x] **#E3 — Divide / remainder by zero panics (exit 101), no diagnostic.** ✓ Phase 1. `checked_div`/`checked_rem` + explicit zero check → error, exit 2.
+- [x] **#E4 — Exit status never reflects the result value.** ✓ Phase 1. `main` now exits 1 when the result is null/zero (empty, `0`, or integer 0), else 0.
 
 #### Major
-- [ ] **#E5 — Error exit code is 1, not 2/>2.** `expr.rs:372` (Err bubbles out of `main` → Rust `ExitCode::FAILURE` = 1). POSIX: `2` = invalid expression, `>2` = other error. Verified: `expr 1 +` → exit `1`. Fix: map invalid-expression errors to `exit(2)`.
-- [ ] **#E6 — `:` match length counts bytes, not characters.** `expr.rs:261` (`caps.get(0).unwrap().len()`). Verified: `expr éé : '.*'` → `4` (POSIX `2`). Fix: count `chars()` of the matched slice (LC_CTYPE-aware).
+- [x] **#E5 — Error exit code is 1, not 2/>2.** ✓ Phase 1. Invalid expressions print `expr: <msg>` to stderr and exit 2.
+- [x] **#E6 — `:` match length counts bytes, not characters.** ✓ Phase 2. Length is `chars().count()` of the anchored match. `expr éé : '.*'` → `2`.
 
 #### Minor
-- [ ] **#E7 — `|` does not return expr2's value when expr1 is null/zero.** `expr.rs:216-233` (`logop`): the `|` arm returns `Token::Integer(0)` when both sides are zero/null instead of the (string) value of expr2. e.g. `expr 0 \| ""` yields `0`, POSIX yields the empty string. Fix: return `rhs` (the evaluated expr2), not a synthesized `0`.
-- [ ] **#E8 — Integer range limited to `i64`; silent wrap / literal demotion.** `expr.rs:31,125,207-211`. Out-of-`i64` literals fall through to `Str` (then arithmetic errors); in-range arithmetic wraps in release (`overflow-checks` off). Verified: `expr 99999999999999999999 + 1` → "not an integer". POSIX expr arithmetic is conventionally arbitrary/wide. Fix: use a wide/bignum integer and detect overflow.
-- [ ] **#E9 — `--` end-of-options not honored.** `expr.rs:133-145` tokenizes every arg literally. Verified: `expr -- -3 + 1` → "wanted operator" (`--` became a string operand). POSIX (XBD 12.2 Guideline 10, cited in APPLICATION USAGE) expects `--` to protect leading-minus operands. Fix: strip a single leading `--` before tokenizing.
-- [ ] **#E10 — Runtime diagnostics not localized / odd prefix.** `expr.rs:365` + the `&'static str` error strings. Errors surface as `Error: "syntax error: ..."` via the `Box<dyn Error>` return, on stderr. LC_MESSAGES has no effect on them. Fix: print `expr: <message>` to stderr via a localized surface.
+- [x] **#E7 — `|` does not return expr2's value when expr1 is null/zero.** ✓ Phase 1. `logop` `|` arm now returns the evaluated expr2.
+- [x] **#E8 — Integer range limited to `i64`; silent wrap / literal demotion.** ✓ Phase 1. Widened to `i128` with checked arithmetic (overflow → error, no wrap). (Per design decision: i128 + overflow errors, not bignum.)
+- [x] **#E9 — `--` end-of-options not honored.** ✓ Phase 1. A single leading `--` is consumed before tokenizing. `expr -- -3 + 1` → `-2`.
+- [x] **#E10 — Runtime diagnostics not localized / odd prefix.** ✓ Phase 1 (partial). Diagnostics now print as `expr: <message>` on stderr; string-level `gettext()` wrapping still deferred (consistent with the dev/ audit's "partial" status).
 
 ### Detailed conformance matrix
 
 #### SYNOPSIS / argv parsing
 - [x] No options defined; operands collected from argv — CONFORMS. `expr.rs:133-145`.
-- [ ] **`--` end-of-options MISSING** — #E9.
+- [x] **`--` end-of-options** — #E9 ✓ Phase 1.
 
 #### Operators / EXTENDED DESCRIPTION
-- [ ] **Precedence/associativity DIVERGES** — #E1.
+- [x] **Precedence/associativity** — #E1 ✓ Phase 1.
 - [x] Operator token set complete (`( ) | & = > >= < <= != + - * / % :`) — CONFORMS. `expr.rs:107-130`.
 - [x] Integer-vs-string identification for arithmetic/comparison operands — CONFORMS. `expr.rs:179-199` (`cmpop` falls back to string compare; `intop` requires ints).
 - [x] Unary-minus integer literals (`-5`) — CONFORMS. `expr.rs:125-128`.
-- [ ] **`|` null/zero return value DIVERGES** — #E7. `&` arm CONFORMS.
-- [ ] **`:` matching DIVERGES (regex flavor, anchor, byte length)** — #E2, #E6.
+- [x] **`|` null/zero return value** — #E7 ✓ Phase 1. `&` arm CONFORMS.
+- [x] **`:` matching (BRE flavor, anchor, char length)** — #E2, #E6 ✓ Phase 2.
 - [x] `length`/`substr`/`index`/`match` keywords — N/A (spec: unspecified results); current behavior is to treat them as strings → syntax error, which is acceptable.
 
 #### STDIN / INPUT FILES / ENVIRONMENT
@@ -90,21 +98,20 @@ real expression parser before it can be called conformant.
 
 #### STDOUT / STDERR
 - [x] Result + `<newline>` to stdout — CONFORMS. `expr.rs:375`.
-- [ ] **Diagnostics prefix/localization** — #E10 (channel is stderr — OK).
+- [x] **Diagnostics prefix + stderr channel** — #E10 ✓ Phase 1 (gettext deferred).
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
-- [ ] **Result-driven 0/1 status MISSING** — #E4.
-- [ ] **Invalid-expression status (2) wrong** — #E5.
-- [ ] **Divide-by-zero panic** — #E3.
+- [x] **Result-driven 0/1 status** — #E4 ✓ Phase 1.
+- [x] **Invalid-expression status (2)** — #E5 ✓ Phase 1.
+- [x] **Divide-by-zero → error, not panic** — #E3 ✓ Phase 1.
 
 ### Test coverage signal (`tests/expr/mod.rs`)
 Covered: logical ops, integer ops, integer compare, string compare (4 cases each).
-Not covered:
-- [ ] Operator precedence (`a + b * c`, mixed compare/arith).
-- [ ] `:` matching operator at all (anchoring, `\(...\)` capture, byte vs char length).
-- [ ] Divide/remainder by zero.
-- [ ] Exit-status assertions (0 vs 1 vs 2).
-- [ ] `--` handling; multibyte operands.
+Now covered (added in Phases 1–2): operator precedence; `:` matching
+(anchoring, `\(...\)` capture, char-vs-byte length); divide/remainder by zero;
+exit-status assertions (0/1/2); `--` handling; multibyte operands.
+Still not covered:
+- [ ] LC_COLLATE-sensitive `=`/`!=` string comparison.
 
 ---
 
@@ -128,22 +135,22 @@ unary-minus binding tighter than `^`.
 ### Priority issues
 
 #### Critical
-- [ ] **#B1 — `quit`/`break` inside a `for` body within a function panics.** `interpreter.rs:280` (`panic!("reached quit or break in function call")`); root cause `interpreter.rs:111-118` (`contains_quit` recurses into `If`/`While` but **not** `For`). Verified: `define f(x){<nl>for(i=0;i<1;i++){<nl>quit<nl>}<nl>}<nl>f(0)` aborts with a Rust panic. POSIX: `quit` must stop execution; interactive `bc` must recover from errors, never crash. Fix: extend `contains_quit` (and break-detection) to `StmtInstruction::For { body, .. }`, or propagate the control-flow result instead of panicking.
-- [ ] **#B2 — All diagnostics written to stdout, not stderr.** `bc.rs:39-40` (runtime errors + partial output), `bc.rs:66` (file parse errors), `bc.rs:96-97` (interactive parse errors) all use `print!`/`println!`. Spec line 87120: "standard error shall be used only for diagnostic messages." Verified: `echo '1/0' | bc` prints `runtime error … division by zero` on **stdout** (stderr empty). Fix: route every diagnostic through `eprintln!`. (Only `bc.rs:69` file-not-found is correct.)
+- [x] **#B1 — `quit`/`break` inside a `for` body within a function panics.** ✓ Phase 3. `contains_quit` now recurses into `For` bodies (so quit is detected at definition-read time, matching GNU bc); `call_function` no longer panics on `ControlFlow::Quit`/`Break` (defensive). Added a regression test.
+- [x] **#B2 — All diagnostics written to stdout, not stderr.** ✓ Phase 4. All error paths use `eprintln!`; program/partial output stays on stdout.
 
 #### Major
-- [ ] **#B3 — `scale` upper bound (`BC_SCALE_MAX`) not enforced.** `interpreter.rs:~360` (`SetRegister(Scale)` accepts any `as_u64()`). Verified: `scale=100000000000; scale` → accepted; a subsequent `/`/`sqrt`/`pow` would allocate unboundedly. Fix: clamp/reject `scale > BC_SCALE_MAX`.
-- [ ] **#B4 — `obase` upper bound (`BC_BASE_MAX`) not enforced.** `interpreter.rs:~374` (only `>= 2` checked). Verified: `obase=100000` accepted. Fix: reject `obase > BC_BASE_MAX`.
-- [ ] **#B5 — Array index unbounded (`BC_DIM_MAX` not enforced).** `interpreter.rs:129-133` (`get_or_extend` resizes Vec to `index+1`), `:200-201` (only rejects values exceeding `u64`). `a[99999999]=1` would attempt a 100M-element allocation. Fix: reject `index >= BC_DIM_MAX`.
-- [ ] **#B6 — 70-column line wrapping with `\`-continuation MISSING.** `number.rs` `to_string` emits one line. Spec lines 87368-87370. Verified: `obase=2; 2^200` → a single 201-char line. Fix: wrap output at 70 cols in the POSIX locale, ending continued lines with `\`.
-- [ ] **#B7 — Unary minus binds tighter than `^`.** `parser.rs:27` (Pratt: `neg` registered as prefix above `pow`). Verified: `-1^2` → `1` (i.e. `(-1)^2`); standard/GNU `bc` and mathematical convention give `-(1^2) = -1`. Fix: rank unary minus below `^` in the Pratt table.
+- [x] **#B3 — `scale` upper bound (`BC_SCALE_MAX`) not enforced.** ✓ Phase 5. Rejects `scale > BC_SCALE_MAX` (`i32::MAX`, GNU-compatible).
+- [x] **#B4 — `obase` upper bound (`BC_BASE_MAX`) not enforced.** ✓ Phase 5. Rejects `obase > BC_BASE_MAX` (`i32::MAX`).
+- [x] **#B5 — Array index unbounded (`BC_DIM_MAX` not enforced).** ✓ Phase 5. Rejects `index >= BC_DIM_MAX` (16777215) before allocation.
+- [x] **#B6 — 70-column line wrapping with `\`-continuation MISSING.** ✓ Phase 6. `to_string` output wraps (68 chars + `\` per continued line); verified byte-for-byte against GNU bc.
+- [x] ~~**#B7 — Unary minus binds tighter than `^`.**~~ ✓ Phase 6 — **re-examined; actually CONFORMS.** GNU bc evaluates `-1^2` as `(-1)^2 == 1` (unary minus is *higher* precedence than `^` in the POSIX table), which the current implementation already matches. No change made.
 
 #### Minor
-- [ ] **#B8 — `x^0` result scale is the `scale` register, not 0.** `number.rs:220` (`if other.0.is_positive()` is `false` for exponent `0`, so the `else` branch uses the `scale` register). Spec: `b>=0` → `min(a*b, max(scale,a))` = `0` when `b=0`. Verified: `scale=5; 2.5^0` → `1.00000` (should be `1`). Fix: use `!other.0.is_negative()` for the `b>=0` branch.
-- [ ] **#B9 — Additional `panic!`/`unwrap` reachable on adversarial input.** `number.rs:10` (`to_digit` panics on out-of-range digit), `number.rs:22` (`to_char` for `val>15`), `interpreter.rs:~552-556` (`return`/`break` outside context). Mostly pre-screened by the parser, but spec requires interactive recovery; prefer `Result` returns. Minor (defense in depth).
-- [ ] **#B10 — REPL prints `CTRL-D`/`CTRL-C` to stdout on EOF/interrupt.** `bc.rs:104,108`. Pollutes the output stream. Fix: drop or send to stderr.
-- [ ] **#B11 — Exit status is 0 even after a file-not-found / error.** `bc.rs:68-72` returns `Ok(())`; `main`'s `rustyline::Result` exits 0. Spec leaves error status "unspecified," so this is *allowed*, but a non-zero status is friendlier. Minor.
-- [ ] **#B12 — `math_functions.bc` loaded with `.expect()`.** `bc.rs:57-59` panics at startup if the embedded `-l` library fails to parse/exec. Developer gate, not user input. Minor.
+- [x] **#B8 — `x^0` result scale is the `scale` register, not 0.** ✓ Phase 6. `pow` uses `!is_negative()` for the `b>=0` branch, so `x^0` has scale 0 (`scale=5; 2.5^0` → `1`).
+- [x] **#B9 — Additional `panic!`/`unwrap` reachable on adversarial input.** ✓ Phase 3 (partial). The `call_function` quit/break panic is gone. The remaining sites (`number.rs` `to_digit`/`to_char`; top-level `return`/`break`) were verified **not user-reachable** — the grammar rejects top-level `return`/`break`, and `to_digit`/`to_char` are guarded by the parser/enforced bases. Left as internal invariants.
+- [x] **#B10 — REPL prints `CTRL-D`/`CTRL-C` to stdout on EOF/interrupt.** ✓ Phase 4. EOF/interrupt now exit silently.
+- [x] **#B11 — Exit status is 0 even after a file-not-found / error.** ✓ Phase 4. File-not-found and file-processing errors exit non-zero.
+- [x] **#B12 — `math_functions.bc` loaded with `.expect()`.** ✓ Phase 4. The `-l` library load failure now prints a diagnostic and exits non-zero instead of panicking.
 
 ### Detailed conformance matrix
 
@@ -173,40 +180,39 @@ unary-minus binding tighter than `^`.
 - [x] Power: integer-exponent required, negative exponent supported, right-assoc — CONFORMS. `number.rs:209-233`. (scale of `x^0`: #B8.)
 - [x] `length()` (significant digits, incl. trailing-zero integers) — CONFORMS. Verified: `length(1000)`→`4`, `length(0.001)`→`1`. `number.rs:177-179`.
 - [x] Numeric-constant scale = fractional digit count — CONFORMS. `number.rs:94-99`.
-- [ ] **Power `x^0` scale DIVERGES** — #B8.
+- [x] **Power `x^0` scale** — #B8 ✓ Phase 6.
 
 #### EXTENDED DESCRIPTION — registers / variables (interpreter.rs)
 - [x] `ibase` enforced `2..16`; single-digit `A-F` → hex (`ibase=A`→base 10) — CONFORMS. Verified: `ibase=20` errors; `ibase=A;10`→`10`.
 - [x] `obase` lower bound `>=2` — CONFORMS. Verified: `obase=1` errors.
-- [ ] **`obase` upper bound MISSING** — #B4.
-- [ ] **`scale` upper bound MISSING** — #B3.
-- [ ] **Array `BC_DIM_MAX` MISSING** — #B5.
+- [x] **`obase` upper bound (`BC_BASE_MAX`)** — #B4 ✓ Phase 5.
+- [x] **`scale` upper bound (`BC_SCALE_MAX`)** — #B3 ✓ Phase 5.
+- [x] **Array `BC_DIM_MAX`** — #B5 ✓ Phase 5.
 - [x] Defaults `ibase=obase=10`, `scale=0`; registers truncate to int — CONFORMS.
 
 #### Output formatting (number.rs)
 - [x] obase 2–16 digits `0-9A-F`; negative sign; zero → `0` — CONFORMS.
 - [x] obase>16 multi-digit space-separated format — CONFORMS. Verified: `obase=25;1024`→` 01 15 24` (matches spec example `Δ01Δ15Δ24`).
-- [ ] **70-column wrap MISSING** — #B6.
+- [x] **70-column wrap** — #B6 ✓ Phase 6.
 
 #### Statements / control flow (interpreter.rs)
 - [x] Expression statement prints value; assignment / `SetRegister` suppresses print — CONFORMS. `interpreter.rs:120-127`.
 - [x] String statement prints the string — CONFORMS.
 - [x] `if`/`while`/`for` (all three `for` exprs required), `break`, `return`/`return(e)`/bare, `define` replaces prior, recursion, `auto` first + pass-by-value — CONFORMS (per read; spot-checked `define`/recursion).
-- [ ] **`quit`/`break` in `for`-in-function panics** — #B1.
+- [x] **`quit`/`break` in `for`-in-function** — #B1 ✓ Phase 3.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
-- [ ] **Diagnostics on stdout** — #B2.
+- [x] **Diagnostics on stderr** — #B2 ✓ Phase 4.
 - [x] Interactive parse errors recover (REPL continues) — CONFORMS. `bc.rs:91-99`.
-- [ ] **`quit`-in-`for` crash defeats recovery** — #B1.
-- [ ] Error exit status (#B11), startup `.expect` (#B12) — Minor.
+- [x] **`quit`-in-`for` no longer crashes recovery** — #B1 ✓ Phase 3.
+- [x] Error exit status (#B11), startup `-l` load (#B12) — ✓ Phase 4.
 
-### Test coverage signal (`tests/bc/mod.rs`, 49 tests)
-Good breadth on arithmetic, scale, functions, control flow. Not covered:
-- [ ] `quit`/`break` inside a `for` body within a function (the #B1 panic).
-- [ ] Diagnostics-channel assertion (stdout vs stderr) (#B2).
-- [ ] 70-column line wrapping (#B6).
-- [ ] `obase`/`scale` upper-bound and array-index bound rejection (#B3/#B4/#B5).
-- [ ] `-1^2` precedence (#B7); `x^0` scale (#B8).
+### Test coverage signal (`tests/bc/mod.rs`)
+Good breadth on arithmetic, scale, functions, control flow. Tests added in
+Phases 3–6 now cover: `quit`/`break` inside a `for` in a function (#B1);
+diagnostics channel + missing-file exit code (#B2/#B11); 70-column wrapping
+(#B6, unit test); `obase`/`scale`/array-index limit rejection (#B3/#B4/#B5);
+`x^0` scale (#B8). `-1^2` (#B7) conforms and matches GNU bc.
 
 ---
 

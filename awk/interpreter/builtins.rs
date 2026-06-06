@@ -129,6 +129,13 @@ pub(crate) fn builtin_sprintf(
     sprintf(&format_string, &mut values, &global_env.convfmt)
 }
 
+/// Convert a byte offset within `s` to a character offset (the number of whole
+/// characters that begin before `byte`). POSIX awk string functions operate on
+/// characters, while the regex engine and `str` searches report byte offsets.
+pub(crate) fn byte_offset_to_char_count(s: &str, byte: usize) -> usize {
+    s.char_indices().take_while(|&(i, _)| i < byte).count()
+}
+
 pub(crate) fn builtin_match(
     stack: &mut Stack,
     global_env: &mut GlobalEnv,
@@ -137,12 +144,16 @@ pub(crate) fn builtin_match(
     let string = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
+    let text = string.as_str().to_owned();
     let mut locations = ere.match_locations(string.try_into()?);
     let start;
     let len;
     if let Some(first_match) = locations.next() {
-        start = first_match.start as i64 + 1;
-        len = first_match.end as i64 - start + 1;
+        // RSTART/RLENGTH are measured in characters, not bytes.
+        let cstart = byte_offset_to_char_count(&text, first_match.start);
+        let cend = byte_offset_to_char_count(&text, first_match.end);
+        start = cstart as i64 + 1;
+        len = (cend - cstart) as i64;
     } else {
         start = 0;
         len = -1;
@@ -270,10 +281,12 @@ pub(crate) fn call_simple_builtin(
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
+            // index() returns a character position, numbering from 1; str::find
+            // reports a byte offset, so convert it to a character count.
             let index = s
                 .as_str()
                 .find(t.as_str())
-                .map(|i| i as f64 + 1.0)
+                .map(|i| byte_offset_to_char_count(s.as_str(), i) as f64 + 1.0)
                 .unwrap_or(0.0);
             stack.push_value(index)?;
         }
@@ -284,8 +297,9 @@ pub(crate) fn call_simple_builtin(
                     stack.push_value(array.len() as f64)?;
                 }
                 _ => {
+                    // length() counts characters, not bytes.
                     let value_str = value.scalar_to_string(&global_env.convfmt)?;
-                    stack.push_value(value_str.len() as f64)?;
+                    stack.push_value(value_str.chars().count() as f64)?;
                 }
             }
         }

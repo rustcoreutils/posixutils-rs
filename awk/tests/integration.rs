@@ -123,6 +123,11 @@ fn test_awk_dash_f_escape_processing() {
 }
 
 #[test]
+fn test_awk_multibyte_char_counts() {
+    test_awk!(multibyte_char_counts);
+}
+
+#[test]
 fn test_awk_program_file_from_stdin() {
     // POSIX: a `-f` progfile of `-` denotes the standard input.
     run_test(TestPlan {

@@ -41,7 +41,7 @@ drops fields** (Major).
 
 - [x] **#2 — `-F sepstring` does not apply escape-sequence processing.** `awk/interpreter/mod.rs:843-847` assigns the `-F` argument to FS verbatim (`AwkString::from(separator)`), bypassing the `escape_string_contents()` used for `-v` assignments (`mod.rs:799`) and assignment operands (`mod.rs:903`). POSIX 85182-85187: `-F sepstring` "shall be equivalent to `-v FS=sepstring`". Verified: `awk -F '\t' 'BEGIN{print length(FS)}'` → `2` (literal `\t`), but `awk -v 'FS=\t' 'BEGIN{print length(FS)}'` → `1` (a real tab); `printf 'a\tb\n' | awk -F '\t' '{print $2}'` prints nothing. The ubiquitous `-F'\t'` idiom is broken. Fix: run `separator` through `escape_string_contents` before assigning FS. **✓ Fixed:** `interpret()` now wraps `-F` in `escape_string_contents`; test `test_awk_dash_f_escape_processing`.
 
-- [ ] **#3 — `length`, `index`, `match` (and RSTART/RLENGTH) count bytes, not characters.** `length` uses `value_str.len()` (`builtins.rs:288`), `index` uses `str::find` byte offset (`builtins.rs:273-278`), and `match` derives RSTART/RLENGTH from `plib::regex` byte offsets (`builtins.rs:140-152`). `substr` and `split("")` correctly use `chars()` (`builtins.rs:336`, `record.rs:64`), so the implementation is internally inconsistent. POSIX 85859-85868 and APPLICATION USAGE 86394-86396: "the awk versions deal with characters, while the ISO C standard deals with bytes." Verified on a 3-character / 4-byte record `AÉB`: `length`→`4` (want 3), `index($0,"B")`→`4` (want 3), `match($0,/B/)` RSTART→`4` (want 3). Fix: count characters (`chars().count()`, char indices) in these functions and translate regex byte offsets to char offsets.
+- [x] **#3 — `length`, `index`, `match` (and RSTART/RLENGTH) count bytes, not characters.** `length` uses `value_str.len()` (`builtins.rs:288`), `index` uses `str::find` byte offset (`builtins.rs:273-278`), and `match` derives RSTART/RLENGTH from `plib::regex` byte offsets (`builtins.rs:140-152`). `substr` and `split("")` correctly use `chars()` (`builtins.rs:336`, `record.rs:64`), so the implementation is internally inconsistent. POSIX 85859-85868 and APPLICATION USAGE 86394-86396: "the awk versions deal with characters, while the ISO C standard deals with bytes." Verified on a 3-character / 4-byte record `AÉB`: `length`→`4` (want 3), `index($0,"B")`→`4` (want 3), `match($0,/B/)` RSTART→`4` (want 3). Fix: count characters (`chars().count()`, char indices) in these functions and translate regex byte offsets to char offsets. **✓ Fixed:** `length` uses `chars().count()`; `index`/`match` convert byte offsets via `byte_offset_to_char_count`; test `test_awk_multibyte_char_counts`.
 
 - [ ] **#4 — printf/sprintf `*` dynamic field width/precision is unimplemented.** `parse_conversion_specifier_args` (`awk/interpreter/format.rs`) only consumes from the format-string iterator; `sprintf` (`builtins.rs:38`) has no path to fetch a width/precision argument from the value list. POSIX EXTENDED DESCRIPTION item 4 (85798-85800): "A field width or precision can be specified as the `*` character … the next argument … shall be fetched and its numeric value taken as the field width or precision." Verified: `awk 'BEGIN{printf "%*d\n",5,42}'` → `runtime error: unsupported format specifier '*'` (same for `%.*f`, `%-*d`). Fix: when `*` is seen in the width/precision position, pull the next expression argument as an integer.
 
@@ -139,7 +139,7 @@ drops fields** (Major).
 | `NF` | CONFORMS | recomputed on split; assignment truncates/extends (`mod.rs`/`record.rs:135-183`). Verified `NF=2` truncate, `$4=` grow. Capped at 1024 (#7). |
 | `OFMT` | CONFORMS | print of non-integers; integers bypass. Verified `OFMT="%.2f"`→`3.14`, `print 100`→`100`. |
 | `OFS`/`ORS` | CONFORMS | print separators; OFS on `$0` rebuild. Verified `OFS="-"; $1=$1`. |
-| `RLENGTH`/`RSTART` | PARTIAL | set by `match`; **byte-based** (#3). No-match → 0/-1 (verified). |
+| `RLENGTH`/`RSTART` | CONFORMS | set by `match`; character-based (#3 ✓ fixed). No-match → 0/-1. |
 | `RS` | CONFORMS+ext | first-char separator; `""` paragraph mode; multi-char/regex accepted (spec leaves multi-char unspecified — conforming extension). Verified all three. |
 | `SUBSEP` | CONFORMS | multi-dim subscript join. |
 
@@ -180,9 +180,9 @@ drops fields** (Major).
 | Func | Status | Notes |
 |---|---|---|
 | `gsub`/`sub` | CONFORMS | count returned; `&`/`\&`/`\\` replacement handled (`builtins.rs:154-228`). Verified `gsub(/b/,"[&]")`→`a[b]c`, `\\&`→`a[&]c`, count `gsub(/a/,…)`→3. |
-| `index` | **DIVERGES** | (#3) byte offset. 1-based / 0-on-miss otherwise correct. |
-| `length` | **DIVERGES** | (#3) byte length. Bare `length` = `length($0)` works (verified →5). `length(array)` works. |
-| `match` | **DIVERGES** | (#3) RSTART/RLENGTH byte-based. No-match 0/-1 correct. |
+| `index` | CONFORMS | (#3 ✓ fixed) character position via `byte_offset_to_char_count`. |
+| `length` | CONFORMS | (#3 ✓ fixed) `chars().count()`. Bare `length` = `length($0)`; `length(array)` works. |
+| `match` | CONFORMS | (#3 ✓ fixed) RSTART/RLENGTH character-based. No-match 0/-1 correct. |
 | `split` | CONFORMS | clears array; default FS / regex / single-char; numeric-string tagging (verified `10>9`→1); empty-fs char split (#12). |
 | `sprintf` | PARTIAL | (#4) `*` unsupported; else conforms. |
 | `substr` | PARTIAL | (#8) `m<1` divergence; char-based, fractional truncation, negative-`n`→empty, over-long-`n` clamp all correct (verified). |
@@ -216,7 +216,7 @@ drops fields** (Major).
 - [x] i18n: `setlocale(LC_ALL,"")` + gettext domain wired (`main.rs:58-60`); diagnostics gettext-wrapped. Residual: `tolower`/`toupper` LC_CTYPE (#10).
 - [x] Regex flavor: ERE (correct for awk) via libc-backed `plib::regex`.
 - [x] Signals: Default (non-interactive) — no handlers required.
-- [ ] Character vs byte: pervasive byte/char inconsistency in `length`/`index`/`match` (#3).
+- [x] Character vs byte: `length`/`index`/`match` now character-based, consistent with `substr`/`split` (#3 ✓ fixed).
 
 ## Test coverage signal
 
@@ -225,7 +225,7 @@ golden language paths well (operators, builtins, getline, printf, arrays, regex,
 srand-prior-seed). Gaps that map to findings — add tests that:
 - [x] assert `print close(f)` / `r=close(f)` return a status without panicking (#1). ✓ `test_awk_close_returns_status`
 - [x] assert `-F '\t'` yields a single-char tab FS (`length(FS)==1`) (#2). ✓ `test_awk_dash_f_escape_processing`
-- [ ] assert `length`/`index`/`match`/RSTART/RLENGTH on a multibyte record return character counts (#3).
+- [x] assert `length`/`index`/`match`/RSTART/RLENGTH on a multibyte record return character counts (#3). ✓ `test_awk_multibyte_char_counts`
 - [ ] exercise `printf "%*d"`, `"%.*f"`, `"%-*d"` (#4).
 - [x] exercise `awk -f -` reading the program from stdin (#5). ✓ `test_awk_program_file_from_stdin`
 - [ ] assert `$5==0` and empty `$2==0` are true (#6).

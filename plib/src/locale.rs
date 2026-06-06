@@ -43,30 +43,29 @@ extern "C" {
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
 ///
-/// Single-byte values (`c <= 0xFF`) go through libc `tolower(3)`; multi-byte
-/// Unicode characters go through `towlower(3)`. Characters with no mapping are
-/// returned unchanged.
+/// ASCII characters go through libc `tolower(3)`; all other characters go
+/// through `towlower(3)`. (A non-ASCII codepoint such as `É` is multi-byte in a
+/// UTF-8 locale, so the byte-oriented `tolower(3)` could not map it.) Characters
+/// with no mapping are returned unchanged.
 pub fn to_lower(c: char) -> char {
-    let code = c as u32;
-    let mapped = if code <= 0xFF {
-        // SAFETY: tolower is thread-safe; the argument is in [0, 255].
-        unsafe { libc::tolower(code as libc::c_int) as u32 }
+    let mapped = if c.is_ascii() {
+        // SAFETY: tolower is thread-safe; the argument is in [0, 127].
+        unsafe { libc::tolower(c as libc::c_int) as u32 }
     } else {
         // SAFETY: towlower is thread-safe; every Unicode codepoint fits in WintT.
-        unsafe { towlower(code as WintT) as u32 }
+        unsafe { towlower(c as u32 as WintT) as u32 }
     };
     char::from_u32(mapped).unwrap_or(c)
 }
 
 /// Map `c` to uppercase under the current `LC_CTYPE`. See [`to_lower`].
 pub fn to_upper(c: char) -> char {
-    let code = c as u32;
-    let mapped = if code <= 0xFF {
-        // SAFETY: toupper is thread-safe; the argument is in [0, 255].
-        unsafe { libc::toupper(code as libc::c_int) as u32 }
+    let mapped = if c.is_ascii() {
+        // SAFETY: toupper is thread-safe; the argument is in [0, 127].
+        unsafe { libc::toupper(c as libc::c_int) as u32 }
     } else {
         // SAFETY: towupper is thread-safe; every Unicode codepoint fits in WintT.
-        unsafe { towupper(code as WintT) as u32 }
+        unsafe { towupper(c as u32 as WintT) as u32 }
     };
     char::from_u32(mapped).unwrap_or(c)
 }

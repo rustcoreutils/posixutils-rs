@@ -370,21 +370,14 @@ pub(crate) fn call_simple_builtin(
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            let chars: Vec<char> = s.chars().collect();
-            let len = chars.len() as i64;
+            // Character window is [max(m, 1), m + n); `take` naturally stops at
+            // the end of the string, so no length pre-scan or Vec is needed.
             let start = m.max(1);
-            let end = match n {
-                None => len + 1,
-                Some(n) => m.saturating_add(n),
-            }
-            .min(len + 1);
-            let substr: String = if start < end {
-                chars[(start - 1) as usize..(end - 1) as usize]
-                    .iter()
-                    .collect()
-            } else {
-                String::new()
+            let count = match n {
+                None => usize::MAX,
+                Some(n) => m.saturating_add(n).saturating_sub(start).max(0) as usize,
             };
+            let substr: String = s.chars().skip((start - 1) as usize).take(count).collect();
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {

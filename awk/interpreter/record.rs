@@ -129,10 +129,12 @@ impl Record {
         ))
     }
 
-    /// Grow `fields` (in place, reusing existing boxes) so that exactly
-    /// `field_index` numbered fields plus `$0` are present, assigning each from
-    /// the split values; surplus fields from a previous longer record are
-    /// dropped.
+    /// Split `record` into `fields` (in place, reusing existing boxes), so the
+    /// record has its numbered fields plus `$0`, assigning each from the split
+    /// values. Surplus fields from a previous longer record are cleared to the
+    /// uninitialized value via [`Self::clear_fields_above`]; the boxed storage
+    /// is retained (high-water mark), not dropped, so any stack-held raw field
+    /// pointers remain valid. Returns the new last field index (NF).
     #[allow(clippy::vec_box)] // boxed for pointer stability; see `fields`
     fn fill_fields(
         fields: &mut Vec<Box<AwkValueRef>>,

@@ -324,7 +324,7 @@ where
 }
 
 mod time {
-    use chrono::{offset::LocalResult, DateTime, Datelike, TimeZone, Utc};
+    use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 
     // Copy from `touch`
     pub fn parse_time_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
@@ -397,15 +397,17 @@ mod time {
         let minute = minute_str.parse::<u32>()?;
         let secs = seconds.parse::<u32>()?;
 
-        // convert to DateTime and validate input
-        let res = Utc.with_ymd_and_hms(year, month, day, hour, minute, secs);
-        if res == LocalResult::None {
-            return Err("Invalid time".into());
-        }
-
-        // return parsed date
-        let dt = res.unwrap();
-        Ok(dt)
+        // The -t time_arg names a wall-clock time in the user's timezone
+        // (honoring TZ via the local timezone); convert it to an absolute
+        // instant for storage (audit #A5).
+        let naive = NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(hour, minute, secs))
+            .ok_or("Invalid time")?;
+        let dt = Local
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or("Invalid or ambiguous local time")?;
+        Ok(dt.with_timezone(&Utc))
     }
 }
 
@@ -697,141 +699,72 @@ mod timespec {
     }
 
     impl Time {
-        pub fn to_naive_time(&self) -> Option<chrono::NaiveTime> {
+        /// The wall-clock time the user typed, with no timezone conversion. Any
+        /// timezone suffix is applied later by [`Timespec::to_date_time`] once
+        /// the date is known (audit #A5/#A6).
+        fn base_naive_time(&self) -> Option<NaiveTime> {
+            fn to_24(hour: u8, am: &AmPm) -> u32 {
+                match am {
+                    AmPm::Am => u32::from(hour),
+                    AmPm::Pm => u32::from(hour) + 12,
+                }
+            }
+
             match self {
                 Time::Midnight => NaiveTime::from_hms_opt(0, 0, 0),
                 Time::Noon => NaiveTime::from_hms_opt(12, 0, 0),
-                Time::Hr24clockHour(hr24_clock) => {
-                    let Hr24Clock([hour, minute]) = *hr24_clock;
-
-                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
+                Time::Hr24clockHour(c) | Time::Hr24clockHourTimezone { hr24_clock: c, .. } => {
+                    let Hr24Clock([hour, minute]) = c;
+                    NaiveTime::from_hms_opt(u32::from(*hour), u32::from(*minute), 0)
                 }
-                Time::Hr24clockHourTimezone {
-                    hr24_clock,
-                    timezone,
+                Time::Hr24clockHourMinute { hour, minute }
+                | Time::Hr24clockHourMinuteTimezone { hour, minute, .. } => {
+                    let Hr24ClockHour(hour) = hour;
+                    let Minute(minute) = minute;
+                    NaiveTime::from_hms_opt(u32::from(*hour), u32::from(*minute), 0)
+                }
+                Time::WallclockHour { clock, am }
+                | Time::WallclockHourTimezone { clock, am, .. } => {
+                    let WallClock { hour, minutes } = clock;
+                    NaiveTime::from_hms_opt(to_24(hour.get(), am), u32::from(*minutes), 0)
+                }
+                Time::WallclockHourMinute { clock, minute, am }
+                | Time::WallclockHourMinuteTimezone {
+                    clock, minute, am, ..
                 } => {
-                    let Hr24Clock([hour, minute]) = *hr24_clock;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour.into(), minute.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
-                }
-                Time::Hr24clockHourMinute { hour, minute } => {
-                    let Hr24ClockHour(hour) = *hour;
-                    let Minute(minute) = *minute;
-
-                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
-                }
-                Time::Hr24clockHourMinuteTimezone {
-                    hour,
-                    minute,
-                    timezone,
-                } => {
-                    let Hr24ClockHour(hour) = *hour;
-                    let Minute(minute) = *minute;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour.into(), minute.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
-                }
-                Time::WallclockHour { clock, am } => {
-                    let WallClock { hour, minutes } = *clock;
-
-                    chrono::NaiveTime::from_hms_opt(
-                        u32::from(match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        }),
-                        u32::from(minutes),
-                        0,
-                    )
-                }
-                Time::WallclockHourTimezone {
-                    clock,
-                    am,
-                    timezone,
-                } => {
-                    let WallClock { hour, minutes } = *clock;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let hour_24 = match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        };
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour_24.into(), minutes.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
-                }
-                Time::WallclockHourMinute { clock, minute, am } => {
-                    let WallClockHour(hour) = *clock;
-                    let Minute(minutes) = *minute;
-
-                    chrono::NaiveTime::from_hms_opt(
-                        u32::from(match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        }),
-                        u32::from(minutes),
-                        0,
-                    )
-                }
-                Time::WallclockHourMinuteTimezone {
-                    clock,
-                    minute,
-                    am,
-                    timezone,
-                } => {
-                    let WallClockHour(hour) = *clock;
-                    let Minute(minutes) = *minute;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let hour_24 = match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        };
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour_24.into(), minutes.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
+                    let WallClockHour(hour) = clock;
+                    let Minute(minute) = minute;
+                    NaiveTime::from_hms_opt(to_24(hour.get(), am), u32::from(*minute), 0)
                 }
             }
+        }
+
+        /// The timezone suffix the user attached to the time, if any.
+        fn timezone(&self) -> Option<&TimezoneName> {
+            match self {
+                Time::Hr24clockHourTimezone { timezone, .. }
+                | Time::Hr24clockHourMinuteTimezone { timezone, .. }
+                | Time::WallclockHourTimezone { timezone, .. }
+                | Time::WallclockHourMinuteTimezone { timezone, .. } => Some(timezone),
+                _ => None,
+            }
+        }
+    }
+
+    /// Interpret a naive wall-clock datetime in `tz` — or, when no timezone
+    /// suffix was given, in the user's local timezone (honoring TZ) — and return
+    /// the absolute instant (audit #A5/#A6).
+    fn zone_resolve(naive: NaiveDateTime, tz: Option<&TimezoneName>) -> Option<DateTime<Utc>> {
+        match tz {
+            Some(name) => name
+                .to_timezone()?
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc)),
+            None => Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc)),
         }
     }
 
@@ -1052,26 +985,27 @@ mod timespec {
         pub fn to_date_time(&self) -> Option<DateTime<Utc>> {
             let date_time = match self {
                 Timespec::Time(time) => {
-                    let time = time.to_naive_time()?;
-                    let now = Utc::now();
-
-                    match time < now.time() {
-                        true => now
-                            .checked_add_days(Days::new(1))?
-                            .with_time(time)
-                            .single()?
-                            .to_utc(),
-                        false => now.with_time(time).single()?.to_utc(),
+                    // A bare time is today if still in the future, else tomorrow,
+                    // interpreted in the user's timezone (audit #A5).
+                    let nt = time.base_naive_time()?;
+                    let tz = time.timezone();
+                    let today = Local::now().date_naive();
+                    let candidate = zone_resolve(NaiveDateTime::new(today, nt), tz)?;
+                    if candidate <= Utc::now() {
+                        let tomorrow = today.checked_add_days(Days::new(1))?;
+                        zone_resolve(NaiveDateTime::new(tomorrow, nt), tz)?
+                    } else {
+                        candidate
                     }
                 }
                 Timespec::TimeDate { time, date } => {
-                    let time = time.to_naive_time()?;
-                    let date = date.to_naive_date()?;
-
-                    let date_time = NaiveDateTime::new(date, time).and_utc();
-                    match date_time < Utc::now() {
-                        true => date_time.checked_add_months(chrono::Months::new(12))?,
-                        false => date_time,
+                    let nt = time.base_naive_time()?;
+                    let nd = date.to_naive_date()?;
+                    let date_time = zone_resolve(NaiveDateTime::new(nd, nt), time.timezone())?;
+                    if date_time < Utc::now() {
+                        date_time.checked_add_months(chrono::Months::new(12))?
+                    } else {
+                        date_time
                     }
                 }
                 Timespec::TimeDateIncrement {
@@ -1079,36 +1013,24 @@ mod timespec {
                     date,
                     increment,
                 } => {
-                    let time = time.to_naive_time()?;
-                    let date = date.to_naive_date()?;
-
-                    let date_time = NaiveDateTime::new(date, time)
-                        .and_utc()
+                    let nt = time.base_naive_time()?;
+                    let nd = date.to_naive_date()?;
+                    let date_time = zone_resolve(NaiveDateTime::new(nd, nt), time.timezone())?
                         .checked_add_signed(
                             chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
                         )?;
-
-                    match date_time < Utc::now() {
-                        true => date_time.checked_add_months(chrono::Months::new(12))?,
-                        false => date_time,
+                    if date_time < Utc::now() {
+                        date_time.checked_add_months(chrono::Months::new(12))?
+                    } else {
+                        date_time
                     }
                 }
                 Timespec::Nowspec(nowspec) => match nowspec {
-                    Nowspec::Now => {
-                        let datetime_utc = Utc::now();
-                        let datetime_local = datetime_utc.with_timezone(&Local);
-                        Utc.from_local_datetime(&datetime_local.naive_local())
-                            .unwrap()
-                    }
-                    Nowspec::NowIncrement(increment) => {
-                        let datetime_utc = Utc::now();
-                        let datetime_local = datetime_utc.with_timezone(&Local);
-                        Utc.from_local_datetime(&datetime_local.naive_local())
-                            .unwrap()
-                            .checked_add_signed(
-                                chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
-                            )?
-                    }
+                    // "now" is the current absolute instant.
+                    Nowspec::Now => Utc::now(),
+                    Nowspec::NowIncrement(increment) => Utc::now().checked_add_signed(
+                        chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
+                    )?,
                 },
             };
 
@@ -1551,9 +1473,16 @@ mod timespec {
                 },
             };
 
-            let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
-                .expect("expected is valid")
-                .to_utc();
+            // No timezone suffix ⇒ interpreted in the local timezone.
+            let naive = NaiveDateTime::new(
+                NaiveDate::from_ymd_opt(3000, 11, 4).unwrap(),
+                NaiveTime::from_hms_opt(5, 53, 0).unwrap(),
+            );
+            let expected = Local
+                .from_local_datetime(&naive)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc);
 
             assert_eq!(Some(expected), timespec.to_date_time())
         }
@@ -1577,9 +1506,17 @@ mod timespec {
                 },
             };
 
-            let expected = DateTime::parse_from_rfc3339("3000-11-05T05:53:00Z")
-                .expect("expected is valid")
-                .to_utc();
+            // No timezone suffix ⇒ local interpretation, plus a 1-day increment.
+            let naive = NaiveDateTime::new(
+                NaiveDate::from_ymd_opt(3000, 11, 4).unwrap(),
+                NaiveTime::from_hms_opt(5, 53, 0).unwrap(),
+            );
+            let expected = Local
+                .from_local_datetime(&naive)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::TimeDelta::days(1);
 
             assert_eq!(Some(expected), timespec.to_date_time())
         }
@@ -1600,19 +1537,12 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
-            assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+            assert_eq!(Some(expected), timespec.to_date_time())
         }
 
         #[test]
@@ -1633,19 +1563,12 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
-            assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+            assert_eq!(Some(expected), timespec.to_date_time())
         }
 
         #[test]
@@ -1664,19 +1587,12 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
-            assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+            assert_eq!(Some(expected), timespec.to_date_time())
         }
 
         #[test]
@@ -1693,19 +1609,36 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
+            assert_eq!(Some(expected), timespec.to_date_time())
+        }
+
+        #[test]
+        fn timezone_name_accepts_utc_case_insensitively() {
             assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+                TimezoneName::from_str("utc"),
+                Ok(TimezoneName("UTC".to_owned()))
+            );
+            assert_eq!(
+                TimezoneName::from_str("UtC"),
+                Ok(TimezoneName("UTC".to_owned()))
+            );
+            assert!(TimezoneName::from_str("Not/AZone").is_err());
+        }
+
+        #[test]
+        fn timespec_lowercase_utc_suffix_is_absolute() {
+            // A lowercase `utc` suffix is honored, and the instant is exactly the
+            // wall clock in UTC regardless of the host timezone (audit #A6).
+            let ts = Timespec::from_str("1800utcNOV4,3000").unwrap();
+            let expected = DateTime::parse_from_rfc3339("3000-11-04T18:00:00Z")
+                .unwrap()
+                .to_utc();
+            assert_eq!(Some(expected), ts.to_date_time());
         }
     }
 }
@@ -2072,22 +2005,29 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let tz = std::env::var("TZ").ok().unwrap_or("UTC".to_owned());
-
-            match s == tz {
-                true => Ok(Self(tz)), // TODO: Seems like implementation only reads UTC, but it should be influenced by TZ variable
-                false => Err(TokenParsingError::TimezonePatternNotFound(tz)),
+            // POSIX mandates that `utc` be recognized case-insensitively; any
+            // other IANA timezone name chrono-tz knows is also accepted (audit
+            // #A6). Anything else is not a timezone suffix.
+            if s.is_empty() {
+                return Err(TokenParsingError::TimezonePatternNotFound(s.to_owned()));
+            }
+            if s.eq_ignore_ascii_case("utc") {
+                return Ok(Self("UTC".to_owned()));
+            }
+            match s.parse::<Tz>() {
+                Ok(_) => Ok(Self(s.to_owned())),
+                Err(_) => Err(TokenParsingError::TimezonePatternNotFound(s.to_owned())),
             }
         }
     }
 
     impl TimezoneName {
-        /// Returns the time zone based on the string (so far only UTC)
+        /// Resolve the suffix to a concrete timezone (audit #A6).
         pub fn to_timezone(&self) -> Option<Tz> {
-            match self.0.as_str() {
-                "UTC" => Some(chrono_tz::UTC), // Only UTC is currently supported
-                _ => None, // For other time zones, the implementation has not yet been added
+            if self.0.eq_ignore_ascii_case("utc") {
+                return Some(chrono_tz::UTC);
             }
+            self.0.parse::<Tz>().ok()
         }
     }
 

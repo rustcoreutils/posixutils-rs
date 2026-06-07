@@ -262,14 +262,14 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   `%d` (zero-padded) not `%e` (space-padded), and the time computed in UTC
   (`format_execution_time`, `at.rs:390-397`) rather than the user TZ. Fix:
   match the spec format exactly.
-- [ ] **#A5 — `-t time` and timespec are interpreted in UTC, ignoring `TZ`.**
+- [x] **#A5 — `-t time` and timespec are interpreted in UTC, ignoring `TZ`.**
   `time::parse_time_posix` builds the instant with `Utc.with_ymd_and_hms`
   (`at.rs:763`); the submission/`-l` formats also use UTC. ENVIRONMENT (84998-
   85002): "The job shall be submitted for execution at the time specified … 
   relative to the timezone specified by the `TZ` variable." Fix: interpret
   wall-clock input in the user's `TZ` (default local) and convert to the stored
   epoch minute.
-- [ ] **#A6 — Timezone support is effectively just the literal string `UTC`.**
+- [x] **#A6 — Timezone support is effectively just the literal string `UTC`.**
   `TimezoneName::from_str` only accepts a suffix exactly equal to `$TZ` (or
   `"UTC"` default) (`at.rs:2436-2444`), and `to_timezone` maps only `"UTC"`
   (`at.rs:2448-2453`). The spec requires timezone names be *case-insensitive*
@@ -394,7 +394,7 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
 - [x] **#B3 — Prompts written unconditionally to stdout.** `at <date>` / `at> `
   / `<EOT>` always emitted (`batch.rs:54-71`); spec 87004-87005 allows prompts
   only when stdin is a terminal.
-- [ ] **#B4 — Submission instant computed in local→UTC, ignoring `TZ`/format.**
+- [x] **#B4 — Submission instant computed in local→UTC, ignoring `TZ`/format.**
   `batch.rs:43-48` builds `now`; the printed date uses `%d` not `%e` and is not
   `TZ`-adjusted (87010-87012). Same root cause as `at` #A5/#A14.
 - [ ] **#B5 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{Local, TimeZone, Utc};
+use chrono::Utc;
 use cron::spool::{at, print_err_and_exit};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
@@ -18,12 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let time = {
-        let datetime_utc = Utc::now();
-        let datetime_local = datetime_utc.with_timezone(&Local);
-        Utc.from_local_datetime(&datetime_local.naive_local())
-            .unwrap()
-    };
+    // batch is `at now`: schedule for the current absolute instant (audit #B4).
+    let time = Utc::now();
 
     let cmd = {
         let stdout = std::io::stdout();

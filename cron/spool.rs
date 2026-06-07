@@ -125,11 +125,14 @@ pub fn at(
     file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
 
     // POSIX: the submission notice "job %s at %s\n" is written to standard error,
-    // with the date as `date +"%a %b %e %T %Y"` (audit #A3/#A14/#B2).
+    // with the date as `date +"%a %b %e %T %Y"` adjusted to the user's timezone
+    // (audit #A3/#A14/#B2; timezone per #A5/#B4).
     eprintln!(
         "job {} at {}",
         jobno,
-        execution_time.format("%a %b %e %H:%M:%S %Y")
+        execution_time
+            .with_timezone(&chrono::Local)
+            .format("%a %b %e %H:%M:%S %Y")
     );
 
     Ok(())

@@ -101,9 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => {
-                if !args.silent {
-                    eprintln!("{}: {}", path, e);
-                }
+                eprintln!("{}: {}", path, e);
+                editor.error_occurred = true;
             }
         }
     }
@@ -111,6 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run the editor loop
     if let Err(e) = editor.run() {
         eprintln!("ed: {}", e);
+        std::process::exit(1);
+    }
+
+    // POSIX EXIT STATUS: greater than 0 if any file or command error occurred.
+    if editor.error_occurred {
         std::process::exit(1);
     }
 

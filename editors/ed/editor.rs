@@ -139,6 +139,8 @@ pub struct Editor<R: BufRead, W: Write> {
     quit_warning_given: bool,
     /// Previous command for & in interactive global (G/V)
     last_interactive_cmd: Option<String>,
+    /// Whether any command/file error occurred (POSIX: exit status > 0).
+    pub error_occurred: bool,
 }
 
 impl<R: BufRead, W: Write> Editor<R, W> {
@@ -164,6 +166,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             should_quit: false,
             quit_warning_given: false,
             last_interactive_cmd: None,
+            error_occurred: false,
         }
     }
 
@@ -189,6 +192,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             writeln!(self.writer, "{}", err)?;
         }
         self.last_error = Some(err.to_string());
+        // POSIX EXIT STATUS: any file or command error makes ed exit > 0.
+        self.error_occurred = true;
         Ok(())
     }
 
@@ -256,19 +261,22 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// This is needed for semicolon separator semantics where the second address
     /// should be resolved relative to the first address.
     fn resolve_address_with_base(&mut self, addr: &Address, base_line: usize) -> EdResult<usize> {
-        let mut line = match &addr.info {
-            AddressInfo::Null => base_line,
-            AddressInfo::Current => base_line,
-            AddressInfo::Last => self.buf.last_line(),
-            AddressInfo::Line(n) => *n,
-            AddressInfo::Mark(c) => self.buf.get_mark(*c).ok_or(EdError::InvalidAddress)?,
+        // Resolve the base address in signed arithmetic. Per POSIX,
+        // intermediate values produced while chaining +/- offsets may legally
+        // be out of range; only the final resolved address is validated.
+        let base: isize = match &addr.info {
+            AddressInfo::Null => base_line as isize,
+            AddressInfo::Current => base_line as isize,
+            AddressInfo::Last => self.buf.last_line() as isize,
+            AddressInfo::Line(n) => *n as isize,
+            AddressInfo::Mark(c) => self.buf.get_mark(*c).ok_or(EdError::InvalidAddress)? as isize,
             AddressInfo::RegexForward(pat) => {
                 let result = self.search_forward_from(pat, base_line)?;
                 // POSIX: Save pattern for subsequent null RE references
                 if !pat.is_empty() {
                     self.last_pattern = Some(pat.clone());
                 }
-                result
+                result as isize
             }
             AddressInfo::RegexBack(pat) => {
                 let result = self.search_backward_from(pat, base_line)?;
@@ -276,27 +284,19 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 if !pat.is_empty() {
                     self.last_pattern = Some(pat.clone());
                 }
-                result
+                result as isize
             }
-            AddressInfo::Offset(off) => {
-                let new_line = base_line as isize + off;
-                if new_line < 0 {
-                    return Err(EdError::AddressOutOfRange);
-                }
-                new_line as usize
-            }
+            AddressInfo::Offset(off) => base_line as isize + off,
         };
 
-        // Apply offsets
-        for off in &addr.offsets {
-            let new_line = line as isize + off;
-            if new_line < 0 {
-                return Err(EdError::AddressOutOfRange);
-            }
-            line = new_line as usize;
-        }
+        // Apply chained offsets; intermediate values may be out of range.
+        let acc = addr.offsets.iter().fold(base, |a, off| a + off);
 
-        // Validate range
+        // Validate only the final resolved address.
+        if acc < 0 {
+            return Err(EdError::AddressOutOfRange);
+        }
+        let line = acc as usize;
         if line > self.buf.last_line() {
             return Err(EdError::AddressOutOfRange);
         }
@@ -1504,17 +1504,19 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
             match parse(&cmd_str) {
                 Ok(cmd) => {
-                    // Check for forbidden commands
+                    // POSIX: in the interactive G/V prompt, any one command
+                    // other than a, c, i, g, G, v, V may be executed.
                     if matches!(
                         cmd,
-                        Command::Global(..)
+                        Command::Append(..)
+                            | Command::Change(..)
+                            | Command::Insert(..)
+                            | Command::Global(..)
                             | Command::GlobalNot(..)
                             | Command::GlobalInteractive(..)
                             | Command::GlobalNotInteractive(..)
-                            | Command::Shell(..)
                     ) {
-                        writeln!(self.writer, "?")?;
-                        self.last_error = Some("invalid command".to_string());
+                        self.print_error(&EdError::Generic("invalid command".to_string()))?;
                     } else if let Err(e) = self.execute_command(cmd) {
                         self.print_error(&e)?;
                     }
@@ -1595,6 +1597,31 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // If we couldn't save anywhere, nothing more we can do
     }
 
+    /// Handle end-of-file on the command stream.
+    ///
+    /// POSIX: in input mode, EOF terminates input mode and finalizes the
+    /// pending `a`/`i`/`c` command with the lines collected so far; then EOF
+    /// in command mode is equivalent to a `q` command — so if the buffer has
+    /// unsaved changes and the user has not yet been warned, emit the warning
+    /// (which also sets a non-zero exit status). There is no further input, so
+    /// the caller terminates the session regardless.
+    fn handle_eof(&mut self) -> io::Result<()> {
+        if self.in_input_mode {
+            self.in_input_mode = false;
+            if let Some(cmd) = self.pending_command.take() {
+                let lines = std::mem::take(&mut self.input_lines);
+                if let Err(e) = self.finish_input_command(cmd, lines) {
+                    self.print_error(&e)?;
+                }
+            }
+        }
+        if self.buf.modified && !self.quit_warning_given {
+            self.quit_warning_given = true;
+            self.print_error(&EdError::BufferModified)?;
+        }
+        Ok(())
+    }
+
     /// Run the main editor loop.
     pub fn run(&mut self) -> io::Result<()> {
         loop {
@@ -1610,7 +1637,11 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
             let line = match self.read_line()? {
                 Some(l) => l,
-                None => break,
+                None => {
+                    // POSIX: end-of-file is equivalent to a `q` command.
+                    self.handle_eof()?;
+                    break;
+                }
             };
 
             // Check signals again after potentially blocking on input
@@ -1626,6 +1657,10 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
         }
 
+        // Flush buffered output before returning: the caller may terminate via
+        // process::exit (for a non-zero status), which skips Drop and would
+        // otherwise lose any output still sitting in a BufWriter.
+        self.writer.flush()?;
         Ok(())
     }
 

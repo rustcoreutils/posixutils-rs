@@ -52,10 +52,9 @@ an interactive utility; SIGHUP preservation is mandated by both specs.
 
 ### 3. Exit-status propagation
 
-`ed` prints `?` on every command error but **never sets a non-zero exit status**
-for command-level errors — invalid command, bad address, and no-match scripts all
-exit 0 *(verified: tests 3 & 4)*. POSIX requires `>0` when an error occurred,
-especially for non-terminal input. `vi`/`ex` propagate a 0/1 exit code correctly.
+~~`ed` prints `?` on every command error but never sets a non-zero exit status~~
+✓ fixed (phase 2): `ed` now exits `>0` on any command/file error, matching GNU
+ed. `vi`/`ex` already propagate a 0/1 exit code correctly.
 
 ### 4. Locale / i18n
 
@@ -89,19 +88,19 @@ diverge.
 
 #### Critical
 - [x] **#E1 — Search/substitute use ERE, not BRE.** ✓ fixed (phase 1): migrated `ed/editor.rs` off the `regex` crate to `plib::regex` (`RegexFlags::bre()`, libc `regcomp`/`regexec`). BRE `\(\)` grouping, `\{n,m\}` intervals, and in-pattern back-references `\1`–`\9` now work; matching is done on the newline-stripped line body for correct `^`/`$` anchoring. Tests: `test_ed_bre_*`, `test_ed_sub_*`.
-- [ ] **#E2 — Command errors never set exit status > 0.** `ed_main.rs:113-115`; loop prints `?` and continues. *(verified: invalid command `Z` and no-match search both exit 0)*. Fix: add `error_occurred: bool` to `Editor`, set it in the `?`-printing path, exit `1` from `main`.
+- [x] **#E2 — Command errors never set exit status > 0.** ✓ fixed (phase 2): `Editor.error_occurred` is set in `print_error`; `main` exits 1 when set; file-load errors set it too. Also fixed a latent bug where `process::exit(1)` skipped the `BufWriter` flush (lost the trailing `?`) — `run()` now flushes before returning. Matches GNU ed exit codes. Tests: `test_ed_exit_status_*`.
 
 #### Major
-- [ ] **#E3 — Identical-result substitution reported as no-match.** `editor.rs:1021,1061`. The `if new_line != line_content` guard leaves `any_match=false` when the replacement equals the match, so `s` returns `EdError::NoMatch` → spurious `?`. *(verified: `s/x/x/` and `s/o/o/` on lines containing the char both print `?`)*. Fix: set `any_match=true` whenever the regex matched, independent of whether the text changed; also mark the buffer modified (POSIX: same-contents result still counts as modified).
-- [ ] **#E4 — EOF in command mode does not act as `q`.** `editor.rs:1588-1591` bare `break`. *(verified: append + `.` + EOF on a modified buffer exits 0 with no `?` warning)*. Fix: on `read_line()→None`, run the `q` path so the modified-buffer warning fires.
-- [ ] **#E5 — EOF in input mode does not return to command mode.** `editor.rs:1588-1591` (and the `G` loop). Collected `input_lines` are dropped and ed exits. Fix: terminate input mode, resume the command loop without the pending command.
-- [ ] **#E6 — `G`/`V` interactive prompt allows `a`/`c`/`i`.** `editor.rs:1484-1492` blocks the global/shell commands but not `Append`/`Change`/`Insert`, which the spec forbids in the interactive sub-prompt. Fix: add those three to the forbidden match arm.
-- [ ] **#E7 — Intermediate address offsets reject out-of-range values.** `editor.rs:283-297` errors when a mid-chain offset goes `< 0`. Spec: "It shall not be an error for an intermediate address value to be less than zero or greater than the last line." Fix: only validate the final resolved address.
+- [x] **#E3 — Identical-result substitution reported as no-match.** ✓ fixed (phase 2): the new `substitute_line` returns `Some` whenever the pattern matched (even when the text is unchanged), so the line is rewritten and the buffer marked modified; only a complete absence of matches is an error. Test: `test_ed_identity_substitute_marks_modified`.
+- [x] **#E4 — EOF in command mode does not act as `q`.** ✓ fixed (phase 2): `run()` calls `handle_eof()` on `read_line()→None`, which fires the modified-buffer warning (and non-zero exit). Test: `test_ed_eof_acts_as_quit_warns_when_modified`.
+- [x] **#E5 — EOF in input mode does not return to command mode.** ✓ fixed (phase 2): `handle_eof()` terminates input mode and finalizes the pending `a`/`i`/`c` with the lines collected so far, then acts as `q`. Tests: `test_ed_eof_in_input_mode_*`.
+- [x] **#E6 — `G`/`V` interactive prompt allows `a`/`c`/`i`.** ✓ fixed (phase 2): the interactive prompt now forbids exactly `a c i g G v V` (spec ed.md §93609) and — per spec — *allows* `!` (which was wrongly forbidden). Test: `test_ed_global_interactive_forbids_append`.
+- [x] **#E7 — Intermediate address offsets reject out-of-range values.** ✓ fixed (phase 2): `resolve_address_with_base` accumulates offsets in signed arithmetic and validates only the final address. Test: `test_ed_intermediate_address_out_of_range_ok`.
 
 #### Minor
 - [ ] **#E8 — Diagnostics hardcoded English; regex not locale-aware.** `error.rs`, `editor.rs`. `setlocale`/`textdomain` are called (`ed_main.rs:72-74`) but message strings aren't `gettext()`-wrapped. LC_COLLATE/LC_CTYPE bracket ranges are now honored via libc BRE (phase 1); the remaining `gettext()` string-wrapping is deferred to phase 3.
 - [x] **#E9 — `s` count-flag (nth occurrence) is fragile.** ✓ fixed (phase 1): the substitute loop (`substitute_line`) now enumerates matches via `captures_at` and splices the chosen occurrence without re-matching a substring. Test: `test_ed_sub_count_flag`.
-- [ ] **#E10 — Compound omitted-address separators not expanded.** `parser.rs:323-366`. `,,`/`;;` chains (`1,$,$`) not handled. Fix: propagate the resolved second address as the first input to the next separator.
+- [x] **#E10 — Compound omitted-address separators.** ✓ examined (phase 2): the spec-relevant requirement — discarding excess *leading* addresses — already conforms (`1,2,3p` → `2,3`, matching GNU ed), and `;;p` matches GNU (`$`). The only divergence is bare `,,p`, which we resolve to `1,$` (vs GNU's `$,$`); POSIX leaves this degenerate all-omitted case unspecified, so the current behavior is defensible. No code change.
 - [ ] **#E11 — SIGHUP/SIGINT handled by polling atomic flags, not async-safe path.** `ed_main.rs:41-67`, `editor.rs:1577-1598`. Works in practice; `save_hup_file` is not strictly async-signal-safe. Fix: self-pipe or restrict the handler to async-signal-safe writes.
 
 ### Detailed conformance matrix
@@ -113,8 +112,8 @@ diverge.
 
 #### OPERANDS / STDIN / INPUT FILES
 - [x] `file` operand loaded before commands — `ed_main.rs:96-109`.
-- [ ] **EOF-as-`q` (cmd mode) DIVERGES** — #E4.
-- [ ] **EOF terminate-input-mode DIVERGES** — #E5.
+- [x] **EOF-as-`q` (cmd mode)** — ✓ fixed (phase 2), #E4.
+- [x] **EOF terminate-input-mode** — ✓ fixed (phase 2), #E5.
 
 #### ENVIRONMENT VARIABLES
 - [x] `HOME` CONFORMS — `ed.hup` fallback path, `editor.rs:1559`.
@@ -148,8 +147,8 @@ diverge.
 - [ ] **Compound `,,`/`;;` MISSING** — #E10.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
-- [ ] **Command errors exit 0 DIVERGES** — #E2.
-- [ ] **Non-terminal stdin error policy PARTIAL** — folded into #E2 (no `isatty()` distinction).
+- [x] **Command errors exit 0** — ✓ fixed (phase 2), #E2.
+- [x] **Non-terminal stdin error policy** — ✓ fixed (phase 2): any error sets a non-zero exit status (folded into #E2).
 
 ### Test coverage signal
 Not covered:

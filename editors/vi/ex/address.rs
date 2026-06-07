@@ -4,7 +4,7 @@
 
 use crate::buffer::Buffer;
 use crate::error::{Result, ViError};
-use regex::Regex;
+use plib::regex::{Regex, RegexFlags};
 
 /// An ex command address.
 #[derive(Debug, Clone)]
@@ -211,14 +211,14 @@ pub fn parse_address(input: &str) -> Option<(Address, &str)> {
             // Forward search
             let end = input[1..].find('/')?;
             let pattern = input[1..end + 1].to_string();
-            let regex = Regex::new(&pattern).ok()?;
+            let regex = Regex::new(&pattern, RegexFlags::bre()).ok()?;
             Some((Address::SearchForward { pattern, regex }, &input[end + 2..]))
         }
         '?' => {
             // Backward search
             let end = input[1..].find('?')?;
             let pattern = input[1..end + 1].to_string();
-            let regex = Regex::new(&pattern).ok()?;
+            let regex = Regex::new(&pattern, RegexFlags::bre()).ok()?;
             Some((
                 Address::SearchBackward { pattern, regex },
                 &input[end + 2..],

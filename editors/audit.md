@@ -32,9 +32,9 @@ crate implements ERE and does **not** support in-pattern back-references.
 | Utility | Pattern path | State |
 |---|---|---|
 | `ed` | ~~`Regex::new(&pat)` direct~~ → `plib::regex` BRE | ✓ fixed (phase 1) — true libc BRE, back-refs + locale brackets |
-| `vi` | `Searcher::convert_pattern` (`search.rs:106-194`) | BRE→ERE translation present for `/`…`?` search; imperfect (no back-refs, nomagic quirks) |
-| `ex` | search via `convert_pattern`; **addresses** via raw `Regex::new` at `address.rs:214,221` | search OK-ish; **address `/re/` is pure ERE** |
-| all | — | LC_COLLATE bracket-expression ranges / equivalence classes never honored |
+| `vi` | ~~`convert_pattern` BRE→ERE~~ → `plib::regex` BRE | ✓ fixed (phase 4) — magic mode passes through to libc BRE (incl. `\<`/`\>`); nomagic escapes metacharacters |
+| `ex` | ~~search via `convert_pattern`; addresses raw ERE~~ → `plib::regex` BRE | ✓ fixed (phase 4) — search, `:s` substitute, `:g` global, and address `/re/` all compile as BRE |
+| all | — | ✓ fixed: LC_COLLATE/LC_CTYPE bracket ranges honored via libc regex (ed phase 1, vi/ex phase 4) |
 
 ### 2. Signal handling
 
@@ -58,12 +58,11 @@ ed. `vi`/`ex` already propagate a 0/1 exit code correctly.
 
 ### 4. Locale / i18n
 
-`ed` calls `setlocale(LC_ALL, "")` + `textdomain` (`ed_main.rs:72-74`) but its
-diagnostics are hardcoded English and the regex engine is not locale-aware.
-`vi`/`ex` make **no `setlocale()` call at all** — `LANG`/`LC_*` do nothing, and
-word/case classification uses Rust built-ins (`is_alphanumeric`). The shared
-`plib::locale` / `plib::diag` infrastructure built for the `dev/` audit is the
-natural home for the fix.
+~~`vi`/`ex` make no `setlocale()` call at all~~ ✓ fixed (phase 4): `run_editor`
+now calls `setlocale(LC_ALL, "")`, so `LC_CTYPE`/`LC_COLLATE` drive the libc
+regex engine and `LC_MESSAGES` is honored. `ed` already called `setlocale` and
+its diagnostics are now `gettext()`-wrapped (phase 3). Word/case classification
+in vi still uses Rust built-ins (minor; not a spec `shall`).
 
 ---
 
@@ -199,7 +198,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [ ] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** `command/parser.rs:272`; no executor arm. Fix: add arm → `current + count − 1`, first non-blank.
 - [ ] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** `ui/terminal.rs:74`. `^C` arrives as byte 0x03 and is silently discarded; spec wants the terminal alerted and partial command discarded. Fix: keep `ISIG` or install a SIGINT handler; bell + cancel pending command.
 - [ ] **#V9 — `EXINIT=""` does not suppress `$HOME/.exrc`.** `editor/mod.rs:2023` checks `!exinit.is_empty()` before processing, so an empty-but-set `EXINIT` falls through and sources `.exrc`. Spec: presence (even empty) suppresses `.exrc`. Fix: branch on *is-set*, not *non-empty*.
-- [ ] **#V10 — No `setlocale`; LC_* ignored.** No call anywhere in `vi/`. Word/case ops use Rust built-ins. Fix: `setlocale(LC_ALL,"")` at startup (shared with #X/#E i18n work).
+- [x] **#V10 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): `run_editor` calls `setlocale(LC_ALL, "")` (`vi/lib.rs`), enabling locale-aware libc regex and `LC_MESSAGES`. (Word/case ops still use Rust built-ins — minor, no spec `shall`.)
 
 #### Minor
 - [ ] **#V11 — `-w size` consumed but discarded.** `lib.rs:193-196`; never assigned to `options.window`/`scroll`. Fix: parse + assign.
@@ -207,7 +206,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [ ] **#V13 — Missing `set` options.** `beautify`, `directory`, `edcompatible`, `mesg`, `prompt`, `redraw`, `remap`, `slowopen`, `warn` absent from `Options` (`options.rs`). Fix: add (stub where behavior is a no-op).
 - [ ] **#V14 — `^L` and `^R` share one handler.** `editor/mod.rs:622-625`; both just mark for redraw. `^L` should clear the physical screen first; `^R` should refresh only `@`-flagged lines. Fix: split handlers.
 - [ ] **#V15 — NUL-in-insert (re-insert last input) not implemented.** `mode/insert.rs`. Fix: on `Char('\0')` at insert start, replay last inserted text.
-- [ ] **#V16 — Search is imperfect BRE over ERE.** `search.rs:106-194` converts magic-mode patterns but the underlying engine is ERE (no in-pattern back-refs) and nomagic handling has BRE edge-case quirks. Fix: shared BRE engine (cross-cutting #1).
+- [x] **#V16 — Search is imperfect BRE over ERE.** ✓ fixed (phase 4): `search.rs` now uses `plib::regex` (libc BRE). `convert_pattern` magic mode is a passthrough (libc handles `\(\) \{\} \<\>` and treats `+?|(){}` as literal); nomagic escapes metacharacters. `Substitutor` rewritten with `captures_at` + a back-reference-aware `build_replacement`. Tests: `test_substitute_bre_*`, `test_search_bre_grouping`.
 
 ### Detailed conformance matrix
 
@@ -225,7 +224,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] `COLUMNS`/`LINES` CONFORMS — `ui/terminal.rs:141-152`.
 - [x] `EXINIT`/`HOME` (basic) CONFORMS — `editor/mod.rs:2021-2035` (but #V9).
 - [x] `SHELL` CONFORMS — `options.rs:142`.
-- [ ] **`LANG`/`LC_ALL`/`LC_COLLATE`/`LC_CTYPE`/`LC_MESSAGES` MISSING** — #V10.
+- [x] **`LANG`/`LC_ALL`/`LC_COLLATE`/`LC_CTYPE`/`LC_MESSAGES`** — ✓ fixed (phase 4), #V10.
 - [ ] **`TERM` PARTIAL** — read but no terminfo lookup.
 
 #### ASYNCHRONOUS EVENTS
@@ -289,7 +288,7 @@ mandated mark-then-execute.
 - [ ] **#X1 — No signal handlers (SIGHUP/SIGINT/SIGTERM).** None in the tree. Spec mandates SIGHUP ⇒ preserve. Fix: install handlers (shared with vi-#V1-#V3).
 - [ ] **#X2 — `preserve` command + EOF/SIGHUP file preservation missing.** No `Preserve` variant in `ExCommand`. *(EOF in `run_ex_mode` at `editor/mod.rs:505-508` just sets `should_quit`)*. Fix: add `preserve`, save buffer to recovery dir; call it on EOF/SIGHUP when modified.
 - [ ] **#X3 — `-s` does not suppress EXINIT / `.exrc`.** `lib.rs:109-110` calls `load_startup_config()` unconditionally; only the *error message* is gated on `silent_mode`. *(verified by code path)*. Fix: skip startup config entirely when `silent_mode`.
-- [ ] **#X4 — Address `/re/`,`?re?` use raw ERE.** `address.rs:214,221` call `Regex::new` directly, bypassing `convert_pattern`. Fix: route address searches through the BRE converter (and the shared BRE engine, cross-cutting #1).
+- [x] **#X4 — Address `/re/`,`?re?` use raw ERE.** ✓ fixed (phase 4): `address.rs` compiles address patterns with `plib::regex` BRE. (Note: a *separate* pre-existing parser bug captures the trailing delimiter into the pattern — e.g. `/cherry/` stores `cherry/` — so `/re/` addresses don't match; this is address-parser fidelity, tracked under #X-addressing for phase 10, not a regex-engine issue.)
 - [ ] **#X5 — `-r` exits with error instead of listing recoverable files.** `lib.rs:177-178`. *(verified: exit 1)*. Fix: list-or-no-op.
 - [ ] **#X6 — EOF on stdin not treated as SIGHUP.** `editor/mod.rs:505-508`; data loss when the buffer is modified. Fix: preserve before quitting (ties to #X2).
 
@@ -301,7 +300,7 @@ mandated mark-then-execute.
 - [ ] **#X11 — stdin-not-a-tty does not auto-enable `-s`.** Spec: non-terminal stdin ⇒ behave as `-s`. Only the explicit flag sets `silent_mode` (`lib.rs:197`). Fix: `stdin().is_terminal()` check at startup.
 - [ ] **#X12 — `substitute` gaps.** `parser.rs:506-508` errors on empty pattern instead of reusing the last RE; missing flags `l`, `#`, count; `~`, `%`, `\l\u\L\U` in replacement unimplemented; `c` (confirm) parsed but no interactive loop; `\n`-split doesn't split the buffer line. Fix: extend `SubstituteFlags` + `expand_replacement`.
 - [ ] **#X13 — `shell` command does not pass `-i`.** `shell.rs` interactive path. Spec §`sh -i`. Fix: add `.arg("-i")`.
-- [ ] **#X14 — No `setlocale`; LC_* ignored.** Shared with vi-#V10.
+- [x] **#X14 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): shared `setlocale(LC_ALL, "")` in `run_editor` (vi-#V10).
 
 #### Minor
 - [ ] **#X15 — Line-0 address rejected for `a`/`i`/`r`/`=`/`put`.** `address.rs:56-60`. Fix: allow 0 for the commands the spec lists.
@@ -338,7 +337,7 @@ mandated mark-then-execute.
 
 #### Addressing
 - [x] `. $ n +n -n % ,` CONFORM (`address.rs`).
-- [ ] **`/re/`,`?re?` raw ERE** (#X4); **offset dropped** (#X9); **`;`==`,`** (#X10); **line-0 rejected** (#X15); **`'`/`` ` `` marks** (#X16); **excess not discarded** (#X17).
+- [x] **`/re/`,`?re?` now BRE** (#X4, phase 4). Still open: **trailing-delimiter capture in `/re/`** (phase 10), **offset dropped** (#X9); **`;`==`,`** (#X10); **line-0 rejected** (#X15); **`'`/`` ` `` marks** (#X16); **excess not discarded** (#X17).
 
 #### Commands
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.

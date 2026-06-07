@@ -40,6 +40,7 @@ pub use ui::{
 };
 pub use undo::{Change, ChangeKind, UndoManager};
 
+use gettextrs::{setlocale, LocaleCategory};
 use std::process;
 
 /// Invocation mode for the editor.
@@ -71,6 +72,10 @@ impl InvokedAs {
 /// This is the main entry point for both vi and ex binaries.
 /// Returns the exit code.
 pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
+    // Honor the user's locale: LC_CTYPE/LC_COLLATE drive the libc regex engine
+    // and LC_MESSAGES localizes diagnostics.
+    setlocale(LocaleCategory::LcAll, "");
+
     let opts = match parse_args(invoked_as, args) {
         Ok(o) => o,
         Err(e) => {

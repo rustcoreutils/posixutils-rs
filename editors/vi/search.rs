@@ -10,7 +10,7 @@
 use crate::buffer::{Buffer, Position};
 use crate::error::{Result, ViError};
 use crate::options::Options;
-use regex::{Regex, RegexBuilder};
+use plib::regex::{Match, Regex, RegexFlags};
 
 /// Direction of search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,12 +87,14 @@ impl SearchState {
             )));
         }
 
-        // Convert vi pattern to regex
+        // Convert the vi pattern to a POSIX BRE for the libc engine.
         let regex_pattern = self.convert_pattern(pattern)?;
 
-        let regex = RegexBuilder::new(&regex_pattern)
-            .case_insensitive(self.ignorecase)
-            .build()
+        let mut flags = RegexFlags::bre();
+        if self.ignorecase {
+            flags = flags.ignore_case();
+        }
+        let regex = Regex::new(&regex_pattern, flags)
             .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         self.pattern = Some(pattern.to_string());
@@ -102,87 +104,34 @@ impl SearchState {
         Ok(())
     }
 
-    /// Convert vi pattern to regex pattern.
+    /// Convert a vi search pattern to a POSIX Basic Regular Expression for the
+    /// libc engine (`plib::regex`).
     fn convert_pattern(&self, pattern: &str) -> Result<String> {
-        if !self.magic {
-            // In nomagic mode, only ^ and $ are special
-            // All other special chars need to be escaped
+        if self.magic {
+            // vi "magic" mode is exactly POSIX BRE — `. * ^ $ [ ] \` are
+            // special, `\( \) \{ \}` group/repeat, and `+ ? | ( ) { }` are
+            // literal — plus the `\<`/`\>` word-boundary escapes, which glibc
+            // BRE supports natively. So the pattern passes through unchanged.
+            Ok(pattern.to_string())
+        } else {
+            // "nomagic": only `^` and `$` keep their special meaning; every
+            // other BRE metacharacter must be escaped so libc treats it
+            // literally. Backslash escapes are preserved as-is (so `\(`, `\{`,
+            // `\<`, etc. remain special).
             let mut result = String::new();
-            let mut chars = pattern.chars().peekable();
+            let mut chars = pattern.chars();
 
             while let Some(c) = chars.next() {
                 match c {
                     '\\' => {
-                        // In nomagic, \. means literal period, but \( is special
-                        if let Some(&next) = chars.peek() {
-                            match next {
-                                '(' | ')' | '{' | '}' | '+' | '?' | '|' | '.' | '*' => {
-                                    // These become special when escaped in nomagic
-                                    result.push(chars.next().unwrap());
-                                }
-                                _ => {
-                                    result.push('\\');
-                                    result.push(chars.next().unwrap());
-                                }
-                            }
-                        } else {
-                            result.push('\\');
+                        result.push('\\');
+                        if let Some(next) = chars.next() {
+                            result.push(next);
                         }
                     }
                     '^' | '$' => result.push(c),
-                    '.' | '*' | '+' | '?' | '(' | ')' | '{' | '}' | '[' | ']' | '|' => {
-                        result.push('\\');
-                        result.push(c);
-                    }
-                    _ => result.push(c),
-                }
-            }
-            Ok(result)
-        } else {
-            // Magic mode - some vi patterns differ from regex
-            // POSIX BRE: * . ^ $ [ \ are special
-            // \( \) \{ \} are for grouping/repetition
-            let mut result = String::new();
-            let mut chars = pattern.chars().peekable();
-
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => {
-                        if let Some(&next) = chars.peek() {
-                            match next {
-                                '<' => {
-                                    // Word boundary start
-                                    chars.next();
-                                    result.push_str(r"\b");
-                                }
-                                '>' => {
-                                    // Word boundary end
-                                    chars.next();
-                                    result.push_str(r"\b");
-                                }
-                                '(' | ')' => {
-                                    // Grouping in BRE
-                                    result.push(chars.next().unwrap());
-                                }
-                                '{' | '}' => {
-                                    // Repetition in BRE
-                                    result.push(chars.next().unwrap());
-                                }
-                                _ => {
-                                    result.push('\\');
-                                    result.push(chars.next().unwrap());
-                                }
-                            }
-                        } else {
-                            result.push('\\');
-                        }
-                    }
-                    // These are special in BRE magic mode
-                    '.' | '*' | '^' | '$' | '[' | ']' => {
-                        result.push(c);
-                    }
-                    // These need escaping in regex but not BRE
-                    '+' | '?' | '|' | '(' | ')' | '{' | '}' => {
+                    // Make the BRE metacharacters literal.
+                    '.' | '*' | '[' | ']' => {
                         result.push('\\');
                         result.push(c);
                     }
@@ -229,7 +178,7 @@ impl SearchState {
 
                 if search_start < content.len() {
                     if let Some(mat) = regex.find(&content[search_start..]) {
-                        let byte_pos = search_start + mat.start();
+                        let byte_pos = search_start + mat.start;
                         let char_pos = byte_to_char_offset(content, byte_pos);
                         return Ok(Position::new(line_num, char_pos));
                     }
@@ -243,7 +192,7 @@ impl SearchState {
                 if let Some(line) = buffer.line(line_num) {
                     let content = line.content();
                     if let Some(mat) = regex.find(content) {
-                        let char_pos = byte_to_char_offset(content, mat.start());
+                        let char_pos = byte_to_char_offset(content, mat.start);
                         return Ok(Position::new(line_num, char_pos));
                     }
                 }
@@ -255,7 +204,7 @@ impl SearchState {
                 let search_end = char_to_byte_offset(content, start_col);
                 if search_end > 0 {
                     if let Some(mat) = regex.find(&content[..search_end]) {
-                        let char_pos = byte_to_char_offset(content, mat.start());
+                        let char_pos = byte_to_char_offset(content, mat.start);
                         return Ok(Position::new(start_line, char_pos));
                     }
                 }
@@ -347,7 +296,7 @@ impl SearchState {
         let mut matches = Vec::new();
         if let Some(regex) = &self.regex {
             for mat in regex.find_iter(line) {
-                matches.push((mat.start(), mat.end()));
+                matches.push((mat.start, mat.end));
             }
         }
         matches
@@ -358,9 +307,45 @@ impl SearchState {
 fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
     let mut last_pos = None;
     for mat in regex.find_iter(text) {
-        last_pos = Some(mat.start());
+        last_pos = Some(mat.start);
     }
     last_pos
+}
+
+/// Build a `:s` replacement string for one match from its capture groups.
+/// Supports `&` (whole match), `\1`-`\9` (back-references), `\&` (literal `&`),
+/// `\\` (literal backslash), and the `\n`/`\t` vi conveniences.
+fn build_replacement(template: &str, input: &str, matches: &[Match]) -> String {
+    let mut result = String::with_capacity(template.len() + 16);
+    let mut chars = template.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '&' => {
+                let m = matches[0];
+                result.push_str(&input[m.start..m.end]);
+            }
+            '\\' => match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('&') => result.push('&'),
+                Some('\\') => result.push('\\'),
+                Some(d @ '1'..='9') => {
+                    let idx = d as usize - '0' as usize;
+                    if let Some(m) = matches.get(idx) {
+                        if m.end > m.start {
+                            result.push_str(&input[m.start..m.end]);
+                        }
+                    }
+                }
+                Some(other) => result.push(other),
+                None => result.push('\\'),
+            },
+            _ => result.push(c),
+        }
+    }
+
+    result
 }
 
 /// Convert character offset to byte offset.
@@ -404,10 +389,13 @@ impl Substitutor {
         count_only: bool,
         ignorecase: bool,
     ) -> Result<Self> {
-        let regex = RegexBuilder::new(pattern)
-            .case_insensitive(ignorecase)
-            .build()
-            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        // The :s pattern is a POSIX BRE (vi magic mode); compile via libc.
+        let mut flags = RegexFlags::bre();
+        if ignorecase {
+            flags = flags.ignore_case();
+        }
+        let regex =
+            Regex::new(pattern, flags).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         Ok(Self {
             regex,
@@ -427,72 +415,44 @@ impl Substitutor {
             return (line.to_string(), count);
         }
 
-        if self.global {
-            // Replace all occurrences
-            let replacement = self.expand_replacement(&self.replacement);
-            let new_line = self.regex.replace_all(line, replacement.as_str());
-            let count = self.regex.find_iter(line).count();
-            (new_line.into_owned(), count)
-        } else {
-            // Replace first occurrence only
-            let replacement = self.expand_replacement(&self.replacement);
-            if self.regex.is_match(line) {
-                let new_line = self.regex.replace(line, replacement.as_str());
-                (new_line.into_owned(), 1)
-            } else {
-                (line.to_string(), 0)
-            }
-        }
-    }
-
-    /// Expand special sequences in replacement string.
-    fn expand_replacement(&self, replacement: &str) -> String {
         let mut result = String::new();
-        let mut chars = replacement.chars().peekable();
+        let mut last_end = 0usize;
+        let mut pos = 0usize;
+        let mut count = 0usize;
 
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    if let Some(&next) = chars.peek() {
-                        match next {
-                            'n' => {
-                                chars.next();
-                                result.push('\n');
-                            }
-                            't' => {
-                                chars.next();
-                                result.push('\t');
-                            }
-                            '&' => {
-                                chars.next();
-                                result.push('&');
-                            }
-                            '\\' => {
-                                chars.next();
-                                result.push('\\');
-                            }
-                            '1'..='9' => {
-                                // Group reference - pass through for regex
-                                result.push('$');
-                                result.push(chars.next().unwrap());
-                            }
-                            _ => {
-                                result.push(chars.next().unwrap());
-                            }
-                        }
-                    } else {
-                        result.push('\\');
-                    }
-                }
-                '&' => {
-                    // Entire match - convert to $0
-                    result.push_str("$0");
-                }
-                _ => result.push(c),
+        while let Some(caps) = self.regex.captures_at(line, pos) {
+            let m = caps[0];
+            let (ms, me) = (m.start, m.end);
+            result.push_str(&line[last_end..ms]);
+            result.push_str(&build_replacement(&self.replacement, line, &caps));
+            last_end = me;
+            count += 1;
+
+            // Advance past this match, keeping `pos` on a char boundary.
+            let next = if me > ms {
+                me
+            } else {
+                line[me..]
+                    .chars()
+                    .next()
+                    .map(|c| me + c.len_utf8())
+                    .unwrap_or(me + 1)
+            };
+            if next > line.len() {
+                break;
+            }
+            pos = next;
+
+            if !self.global {
+                break;
             }
         }
 
-        result
+        if count == 0 {
+            return (line.to_string(), 0);
+        }
+        result.push_str(&line[last_end..]);
+        (result, count)
     }
 
     /// Check if confirm mode is on.
@@ -650,6 +610,47 @@ mod tests {
         let (result, count) = sub.substitute_line("foo bar");
         assert_eq!(result, "foo bar");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_substitute_bre_grouping_backref() {
+        // POSIX BRE \(...\) grouping with \1/\2 back-references in pattern and
+        // replacement. The old ERE engine could not do in-pattern back-refs.
+        let sub =
+            Substitutor::new(r"\(a\)\(b\)", r"\2\1", true, false, false, false, false).unwrap();
+        let (result, count) = sub.substitute_line("ab ab");
+        assert_eq!(result, "ba ba");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_substitute_bre_interval() {
+        // BRE \{n\} interval.
+        let sub = Substitutor::new(r"a\{2\}", "X", false, false, false, false, false).unwrap();
+        let (result, count) = sub.substitute_line("caab");
+        assert_eq!(result, "cXb");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_substitute_bre_plus_is_literal() {
+        // In BRE, '+' is an ordinary character (not "one or more").
+        let sub = Substitutor::new("a+", "X", false, false, false, false, false).unwrap();
+        let (result, count) = sub.substitute_line("a+b");
+        assert_eq!(result, "Xb");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_search_bre_grouping() {
+        let buffer = make_buffer("apple\nbanana\ncherry");
+        let mut search = SearchState::new();
+        // \(rr\) — BRE grouping; matches "cherry".
+        search
+            .set_pattern(r"\(rr\)", SearchDirection::Forward)
+            .unwrap();
+        let pos = search.search_forward(&buffer, Position::new(1, 0)).unwrap();
+        assert_eq!(pos.line, 3);
     }
 
     #[test]

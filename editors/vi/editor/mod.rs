@@ -2352,9 +2352,9 @@ impl Editor {
             (1, self.buffer.line_count())
         };
 
-        // Compile the pattern
-        let regex =
-            regex::Regex::new(pattern).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        // Compile the pattern as a POSIX BRE.
+        let regex = plib::regex::Regex::new(pattern, plib::regex::RegexFlags::bre())
+            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         // Collect matching line numbers first (to avoid mutation during iteration)
         let mut matching_lines = Vec::new();

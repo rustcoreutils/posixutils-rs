@@ -123,12 +123,6 @@ impl From<io::Error> for ViError {
     }
 }
 
-impl From<regex::Error> for ViError {
-    fn from(e: regex::Error) -> Self {
-        ViError::InvalidRegex(e.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

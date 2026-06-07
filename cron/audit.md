@@ -469,7 +469,7 @@ convention, and (e) discards job output instead of mailing it.
   the crontab spool (`crond.rs:76`).
 
 #### Major
-- [ ] **#D4 — Jobs inherit `crond`'s environment; no sanitized default env.**
+- [x] **#D4 — Jobs inherit `crond`'s environment; no sanitized default env.**
   `run_job` execs `sh -c command` (`job.rs:638`) with whatever environment the
   daemon was started with; it sets none of `HOME`, `LOGNAME`, `USER`, `PATH`,
   `SHELL`. crontab 90918-90926 *mandates* a default environment (`HOME`,
@@ -478,7 +478,7 @@ convention, and (e) discards job output instead of mailing it.
   hijack vector. Fix: build a clean environment per Vixie (`HOME=pw_dir`,
   `LOGNAME=USER=pw_name`, a fixed safe `PATH`, `SHELL`), overlaid by any
   `NAME=value` assignments in the crontab.
-- [ ] **#D5 — crontab command-field `%`/stdin convention unimplemented.** crontab
+- [x] **#D5 — crontab command-field `%`/stdin convention unimplemented.** crontab
   90970-90974: `%` → `<newline>`; only the first line (up to `%`/EOL) is
   executed; remaining lines become the command's **standard input**; `\` quotes
   the next char (incl. `%`). The parser just joins the trailing fields with
@@ -492,12 +492,12 @@ convention, and (e) discards job output instead of mailing it.
   ≥60 s away is never special-cased — the loop just re-sleeps 60 s. Fix: each
   tick, run *all* jobs whose next execution falls in the elapsed minute (vixie's
   per-minute wheel), not the single nearest.
-- [ ] **#D7 — Job runs in `crond`'s session with no `setsid`/new process group.**
+- [x] **#D7 — Job runs in `crond`'s session with no `setsid`/new process group.**
   `run_job` forks and `exec`s without `setsid()` (`job.rs:587-642`). `at`
   semantics (84765-84768) require "a separate process group with no controlling
   terminal". The child should start a new session. Fix: `setsid()` in the child
   before `exec`.
-- [ ] **#D8 — Job output is discarded, never mailed.** `setup` closes
+- [x] **#D8 — Job output is discarded, never mailed.** `setup` closes
   STDIN/STDOUT/STDERR (`crond.rs:155-157`); the forked job inherits those closed
   fds, so its output goes nowhere (writes fail). crontab 90927-90929: output and
   errors "shall be mailed … to the user". `grep -nE 'MAILTO|sendmail|mail'
@@ -523,7 +523,7 @@ convention, and (e) discards job output instead of mailing it.
   if a second instance starts, it has already zeroed the file before its
   `flock` fails, briefly clobbering the running daemon's recorded PID. Fix:
   lock first, then truncate+write.
-- [ ] **#D13 — No post-drop verification / chdir-failure tolerance.** `run_job`
+- [x] **#D13 — No post-drop verification / chdir-failure tolerance.** `run_job`
   checks `setgid`/`setuid` return values (good) but does not re-verify the uid
   actually changed, and ignores `chdir($HOME)` failure with `let _` rather than
   falling back to `/` explicitly (`job.rs:631-634`). Minor hardening.

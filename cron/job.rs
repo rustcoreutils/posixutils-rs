@@ -11,8 +11,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::iter::Peekable;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Copy, Clone, Debug)]
@@ -145,6 +144,9 @@ pub struct CronJob {
     pub owner_gid: Option<u32>,
     pub owner_name: Option<String>,
     pub owner_home: Option<String>,
+    /// `NAME=value` assignments in effect for this job, in crontab order. The
+    /// daemon overlays these on the default environment (audit #D4).
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -229,6 +231,7 @@ impl Database {
     /// Parse a system crontab (6-field format with username)
     pub fn parse_system_crontab(content: &str) -> Self {
         let mut result = vec![];
+        let mut env_vars: Vec<(String, String)> = Vec::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -238,13 +241,12 @@ impl Database {
                 continue;
             }
 
-            // Skip environment variable assignments (NAME=value)
-            if line.contains('=') && !line.starts_with('@') && !line.starts_with('*') {
-                if let Some(first_char) = line.chars().next() {
-                    if first_char.is_alphabetic() {
-                        continue;
-                    }
-                }
+            // Collect environment-variable assignments; they apply to all jobs
+            // that follow in the file (audit #D4).
+            if let Some((key, value)) = parse_env_assignment(line) {
+                env_vars.retain(|(k, _)| k != &key);
+                env_vars.push((key, value));
+                continue;
             }
 
             let mut fields = line.split_ascii_whitespace();
@@ -330,11 +332,39 @@ impl Database {
                 owner_gid: user_info.as_ref().map(|u| u.gid),
                 owner_name: user_info.as_ref().map(|u| u.name.clone()),
                 owner_home: user_info.map(|u| u.home),
+                env: env_vars.clone(),
             });
         }
 
         Database(result)
     }
+}
+
+/// Recognize a crontab `NAME=value` environment assignment, returning the name
+/// and its (single-quote/double-quote stripped) value.
+fn parse_env_assignment(line: &str) -> Option<(String, String)> {
+    let (name, value) = line.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+    {
+        return None;
+    }
+
+    let value = value.trim();
+    let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+
+    Some((name.to_string(), value.to_string()))
 }
 
 /// Represents time specification parsed from @-prefix or 5-field format
@@ -412,12 +442,21 @@ impl FromStr for Database {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut result = vec![];
+        let mut env_vars: Vec<(String, String)> = Vec::new();
 
         for line in s.lines() {
             let line = line.trim();
 
             // Skip empty lines and comments
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Collect environment-variable assignments; they apply to all jobs
+            // that follow in the file (audit #D4).
+            if let Some((key, value)) = parse_env_assignment(line) {
+                env_vars.retain(|(k, _)| k != &key);
+                env_vars.push((key, value));
                 continue;
             }
 
@@ -494,6 +533,7 @@ impl FromStr for Database {
                 owner_gid: None,
                 owner_name: None,
                 owner_home: None,
+                env: env_vars.clone(),
             })
         }
 
@@ -567,6 +607,7 @@ impl CronJob {
             owner_gid: _,
             owner_name: _,
             owner_home: _,
+            env: _,
         } = self;
 
         let months_vec = months.to_vec();
@@ -626,71 +667,253 @@ impl CronJob {
     }
 
     pub fn run_job(&self) -> std::io::Result<()> {
-        // SAFETY: fork() is safe to call here because:
-        // 1. We immediately check the return value for errors (pid < 0)
-        // 2. The child process (pid == 0) immediately exec()s a new process
-        // 3. The parent process returns immediately without shared state issues
-        // 4. We use Command::exec() which replaces the child process entirely
+        // SAFETY: fork() is checked; the parent returns immediately, and the
+        // child performs only operations safe in this single-threaded daemon.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid != 0 {
+            // Parent (daemon) returns immediately; the child is reaped by SIGCHLD.
+            return Ok(());
+        }
+
+        // Child: start a new session so the job has no controlling terminal and
+        // runs in its own process group (audit #D7).
+        // SAFETY: setsid() in a fresh child is always safe.
         unsafe {
-            let pid = libc::fork();
-            if pid < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if pid == 0 {
-                // Child process - drop privileges and execute the command
+            libc::setsid();
+        }
 
-                // Drop privileges if owner info is available
-                if let (Some(uid), Some(gid), Some(ref name), Some(ref home)) = (
-                    self.owner_uid,
-                    self.owner_gid,
-                    &self.owner_name,
-                    &self.owner_home,
-                ) {
-                    use std::ffi::CString;
-
-                    // Set GID first (must be done before dropping root)
-                    if libc::setgid(gid) != 0 {
-                        eprintln!("Failed to setgid({})", gid);
-                        std::process::exit(1);
-                    }
-
-                    // Set supplementary groups
-                    // Note: initgroups takes c_int on macOS, gid_t on Linux
-                    if let Ok(c_name) = CString::new(name.as_str()) {
-                        #[cfg(target_os = "macos")]
-                        let initgroups_gid = gid as libc::c_int;
-                        #[cfg(not(target_os = "macos"))]
-                        let initgroups_gid = gid;
-
-                        if libc::initgroups(c_name.as_ptr(), initgroups_gid) != 0 {
-                            eprintln!("Failed to initgroups for {}", name);
-                            std::process::exit(1);
-                        }
-                    }
-
-                    // Set UID (drops root privileges)
-                    if libc::setuid(uid) != 0 {
-                        eprintln!("Failed to setuid({})", uid);
-                        std::process::exit(1);
-                    }
-
-                    // Change to user's home directory
-                    if let Ok(c_home) = CString::new(home.as_str()) {
-                        // Ignore chdir errors - job may still run from /
-                        let _ = libc::chdir(c_home.as_ptr());
-                    }
-                }
-
-                // Execute the command via sh -c
-                let err = Command::new("sh").args(["-c", &self.command]).exec();
-                // exec() only returns on error
-                eprintln!("Failed to exec job: {}", err);
+        // Drop privileges to the job owner, if known.
+        if let (Some(uid), Some(gid), Some(name)) =
+            (self.owner_uid, self.owner_gid, self.owner_name.as_deref())
+        {
+            // SAFETY: called in the forked child before exec.
+            if let Err(e) = unsafe { drop_privileges(uid, gid, name) } {
+                eprintln!("crond: cannot drop privileges for {name}: {e}");
                 std::process::exit(1);
             }
-            // Parent returns immediately
-            Ok(())
+        }
+
+        // Working directory: the owner's home, falling back to / (audit #D13).
+        let home = self.owner_home.as_deref().unwrap_or("/");
+        if std::env::set_current_dir(home).is_err() {
+            let _ = std::env::set_current_dir("/");
+        }
+
+        // Build the clean default environment overlaid by the crontab's own
+        // assignments (audit #D4).
+        let owner_name = self.owner_name.as_deref().unwrap_or("");
+        let env = build_job_env(owner_name, home, &self.env);
+        let shell = env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+
+        // Apply the crontab `%`/standard-input command-field convention (#D5).
+        let parsed = parse_command_field(&self.command);
+
+        let mut command = Command::new(&shell);
+        command
+            .arg("-c")
+            .arg(&parsed.exec_line)
+            .env_clear()
+            .envs(env.iter().cloned())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("crond: cannot run job: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        // Feed the standard-input text (everything after the first `%`).
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            if let Some(data) = &parsed.stdin {
+                let _ = stdin.write_all(data.as_bytes());
+            }
+            // Dropping `stdin` closes it, signalling EOF.
+        }
+
+        let output = match child.wait_with_output() {
+            Ok(o) => o,
+            Err(_) => std::process::exit(1),
+        };
+
+        // Mail the combined output to the user (or MAILTO), unless it is empty or
+        // MAILTO is set to the empty string (audit #D8).
+        let recipient = match self.env.iter().find(|(k, _)| k == "MAILTO") {
+            Some((_, addr)) if addr.is_empty() => None,
+            Some((_, addr)) => Some(addr.clone()),
+            None => self.owner_name.clone(),
+        };
+        let mut combined = output.stdout;
+        combined.extend_from_slice(&output.stderr);
+        if !combined.is_empty() {
+            if let Some(rcpt) = recipient {
+                let subject = format!("Cron <{owner_name}> {}", parsed.exec_line);
+                mail_output(&rcpt, &subject, &combined);
+            }
+        }
+
+        std::process::exit(output.status.code().unwrap_or(0));
+    }
+}
+
+/// The first executable line of a crontab command field, plus any standard input
+/// text that followed an unescaped `%`.
+pub struct ParsedCommand {
+    pub exec_line: String,
+    pub stdin: Option<String>,
+}
+
+/// Apply the crontab command-field conventions (audit #D5): an unescaped `%`
+/// ends the command and begins standard-input text; each subsequent unescaped
+/// `%` becomes a newline; `\` quotes the following character (including `%`).
+pub fn parse_command_field(raw: &str) -> ParsedCommand {
+    let mut exec_line = String::new();
+    let mut chars = raw.chars();
+    let mut stdin = None;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => exec_line.push(chars.next().unwrap_or('\\')),
+            '%' => {
+                let mut data = String::new();
+                let mut escaped = false;
+                for d in chars.by_ref() {
+                    if escaped {
+                        data.push(d);
+                        escaped = false;
+                    } else if d == '\\' {
+                        escaped = true;
+                    } else if d == '%' {
+                        data.push('\n');
+                    } else {
+                        data.push(d);
+                    }
+                }
+                stdin = Some(data);
+                break;
+            }
+            _ => exec_line.push(c),
         }
     }
+
+    ParsedCommand { exec_line, stdin }
+}
+
+/// Build the clean default environment for an executed crontab job, overlaid by
+/// the crontab's own `NAME=value` assignments (audit #D4). The authoritative
+/// `LOGNAME`/`USER` and the routing-only `MAILTO` cannot be overridden.
+pub fn build_job_env(
+    name: &str,
+    home: &str,
+    overrides: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        ("HOME".to_string(), home.to_string()),
+        ("LOGNAME".to_string(), name.to_string()),
+        ("USER".to_string(), name.to_string()),
+        ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ("SHELL".to_string(), "/bin/sh".to_string()),
+    ];
+
+    for (key, value) in overrides {
+        if key == "MAILTO" || key == "LOGNAME" || key == "USER" {
+            continue;
+        }
+        env.retain(|(k, _)| k != key);
+        env.push((key.clone(), value.clone()));
+    }
+
+    env
+}
+
+/// Drop to `uid`/`gid` and the user's supplementary groups, in the order
+/// setgid → initgroups → setuid so privileges cannot be regained.
+///
+/// # Safety
+/// Must be called in a freshly forked child, before exec.
+pub unsafe fn drop_privileges(uid: u32, gid: u32, name: &str) -> std::io::Result<()> {
+    use std::ffi::CString;
+
+    if libc::setgid(gid) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if let Ok(c_name) = CString::new(name) {
+        // initgroups takes c_int on macOS, gid_t on Linux.
+        #[cfg(target_os = "macos")]
+        let g = gid as libc::c_int;
+        #[cfg(not(target_os = "macos"))]
+        let g = gid;
+        if libc::initgroups(c_name.as_ptr(), g) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    if libc::setuid(uid) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Whether `recipient` is safe to pass to the MTA (no header-injection or
+/// whitespace characters).
+fn recipient_is_safe(recipient: &str) -> bool {
+    !recipient.is_empty()
+        && recipient
+            .chars()
+            .all(|c| !c.is_control() && c != ' ' && !matches!(c, '<' | '>'))
+}
+
+/// Pipe `body` to the local MTA addressed to `recipient`, best-effort. Skips
+/// silently when no sendmail binary is found or the recipient looks unsafe
+/// (audit #D8).
+fn mail_output(recipient: &str, subject: &str, body: &[u8]) {
+    if !recipient_is_safe(recipient) {
+        return;
+    }
+
+    let sendmail = [
+        "/usr/sbin/sendmail",
+        "/usr/lib/sendmail",
+        "/usr/bin/sendmail",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists());
+    let Some(sendmail) = sendmail else {
+        return;
+    };
+
+    let mut child = match Command::new(sendmail)
+        .arg("-t")
+        .arg("-oi")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let header = format!("To: {recipient}\nSubject: {subject}\n\n");
+        let _ = stdin.write_all(header.as_bytes());
+        let _ = stdin.write_all(body);
+    }
+    let _ = child.wait();
 }
 
 fn get_number(src: &mut Peekable<impl Iterator<Item = char>>) -> Option<i32> {

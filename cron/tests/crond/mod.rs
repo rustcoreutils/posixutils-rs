@@ -463,3 +463,57 @@ fn test_system_crontab_at_prefix() {
     assert!(!job.is_reboot);
     assert_eq!(job.command, "echo hourly");
 }
+
+// Secure-execution helpers (audit #D4/#D5).
+
+#[test]
+fn command_field_without_percent() {
+    let p = cron::job::parse_command_field("echo hello");
+    assert_eq!(p.exec_line, "echo hello");
+    assert!(p.stdin.is_none());
+}
+
+#[test]
+fn command_field_percent_is_stdin_with_newlines() {
+    // POSIX crontab example: only the first line runs; the rest is stdin, and
+    // each `%` becomes a newline.
+    let p = cron::job::parse_command_field("mailx john%Happy Birthday!%Time for lunch.");
+    assert_eq!(p.exec_line, "mailx john");
+    assert_eq!(p.stdin.as_deref(), Some("Happy Birthday!\nTime for lunch."));
+}
+
+#[test]
+fn command_field_backslash_escapes_percent() {
+    let p = cron::job::parse_command_field(r"echo 100\% done");
+    assert_eq!(p.exec_line, "echo 100% done");
+    assert!(p.stdin.is_none());
+}
+
+#[test]
+fn job_env_defaults_and_safe_overrides() {
+    let overrides = vec![
+        ("PATH".to_string(), "/custom/bin".to_string()),
+        ("LOGNAME".to_string(), "evil".to_string()),
+        ("MAILTO".to_string(), "someone".to_string()),
+    ];
+    let env = cron::job::build_job_env("alice", "/home/alice", &overrides);
+    let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
+    assert_eq!(get("HOME").as_deref(), Some("/home/alice"));
+    assert_eq!(get("USER").as_deref(), Some("alice"));
+    assert_eq!(get("SHELL").as_deref(), Some("/bin/sh"));
+    // A crontab PATH override is honored...
+    assert_eq!(get("PATH").as_deref(), Some("/custom/bin"));
+    // ...but LOGNAME stays authoritative and MAILTO is not exported.
+    assert_eq!(get("LOGNAME").as_deref(), Some("alice"));
+    assert!(get("MAILTO").is_none());
+}
+
+#[test]
+fn user_crontab_collects_env_assignments() {
+    let db = "MAILTO=ops\nPATH=/sbin\n* * * * * echo hi"
+        .parse::<Database>()
+        .unwrap();
+    assert_eq!(db.0.len(), 1);
+    assert!(db.0[0].env.iter().any(|(k, v)| k == "MAILTO" && v == "ops"));
+    assert!(db.0[0].env.iter().any(|(k, v)| k == "PATH" && v == "/sbin"));
+}

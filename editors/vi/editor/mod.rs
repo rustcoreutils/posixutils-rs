@@ -2091,6 +2091,10 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Nop => Ok(ExResult::Continue),
+            ExCommand::Tag { tag } => {
+                self.goto_tag(&tag)?;
+                Ok(ExResult::Continue)
+            }
             _ => {
                 // Other commands not yet implemented
                 Ok(ExResult::Continue)
@@ -3196,10 +3200,59 @@ impl Editor {
 
     /// Go to tag.
     fn goto_tag(&mut self, tag: &str) -> Result<()> {
-        // TODO: Full tag support requires reading tags file
-        // For now, just set an error message
-        self.set_error(&format!("tag not found: {}", tag));
+        // The `tags` option is a space-separated list of tags files.
+        let tags_opt = self.options.tags.clone();
+        let files: Vec<&str> = tags_opt.split_whitespace().collect();
+        let taglength = self.options.taglength;
+
+        let Some(m) = crate::tags::lookup(&files, tag, taglength) else {
+            self.set_error(&format!("tag not found: {}", tag));
+            return Ok(());
+        };
+
+        // Switch to the tag's file unless it is already the current file.
+        let already_open = self
+            .files
+            .current_file()
+            .map(|p| p.to_string_lossy() == m.file.as_str())
+            .unwrap_or(false);
+        if !already_open {
+            self.open(&m.file)?;
+        }
+
+        // Move to the definition.
+        match m.address {
+            crate::tags::TagAddress::Line(n) => {
+                let target = n.clamp(1, self.buffer.line_count().max(1));
+                self.buffer.set_line(target);
+                self.buffer.move_to_first_non_blank();
+            }
+            crate::tags::TagAddress::Pattern(pat) => {
+                if let Ok(re) = plib::regex::Regex::new(&pat, plib::regex::RegexFlags::bre()) {
+                    let mut found = None;
+                    for n in 1..=self.buffer.line_count() {
+                        if let Some(line) = self.buffer.line(n) {
+                            if re.is_match(line.content()) {
+                                found = Some(n);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(n) = found {
+                        self.buffer.set_line(n);
+                        self.buffer.move_to_first_non_blank();
+                    } else {
+                        self.set_error(&format!("tag pattern not found: {}", pat));
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Public entry for the `-t` startup option and the `:tag` command.
+    pub fn tag(&mut self, tag: &str) -> Result<()> {
+        self.goto_tag(tag)
     }
 }
 

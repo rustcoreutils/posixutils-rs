@@ -598,3 +598,60 @@ fn test_ex_preserve_and_recover_roundtrip() {
         stdout
     );
 }
+
+/// Tag lookup: `ex -t tag` opens the file and jumps to the definition; `:tag`
+/// does the same from the command line. Regression test for #X8/#V5.
+#[test]
+fn test_ex_tag_lookup() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("src.c"),
+        "int helper() { }\nint main() { }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("tags"),
+        "main\tsrc.c\t/^int main/\nhelper\tsrc.c\t1\n",
+    )
+    .unwrap();
+
+    let bin = get_binary_path("ex");
+
+    // -t main: jump to the pattern address and print the current line.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg("-t")
+        .arg("main")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"p\nq!\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "int main() { }"
+    );
+
+    // :tag helper: line-number address.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(dir.path().join("src.c"))
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"tag helper\np\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "int helper() { }"
+    );
+}

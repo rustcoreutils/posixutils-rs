@@ -18,6 +18,7 @@ pub mod register;
 pub mod search;
 pub mod shell;
 pub mod signals;
+pub mod tags;
 pub mod ui;
 pub mod undo;
 
@@ -143,6 +144,12 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
             eprintln!("{}: {}", prog_name, e);
             return 1;
         }
+    } else if let Some(tag) = &opts.tag {
+        // -t: open the file containing the tag and jump to it.
+        if let Err(e) = editor.tag(tag) {
+            eprintln!("{}: {}", prog_name, e);
+            return 1;
+        }
     } else if !opts.files.is_empty() {
         if let Err(e) = editor.open_files(opts.files) {
             eprintln!("{}: {}", prog_name, e);
@@ -180,6 +187,8 @@ struct EditorOptions {
     command: Option<String>,
     /// Recover a previously-preserved buffer (-r).
     recover: bool,
+    /// Tag to jump to at startup (-t).
+    tag: Option<String>,
     /// Files to edit.
     files: Vec<String>,
 }
@@ -195,6 +204,7 @@ fn parse_args(
         readonly: false,
         command: None,
         recover: false,
+        tag: None,
         files: Vec::new(),
     };
 
@@ -217,7 +227,12 @@ fn parse_args(
                 }
             }
             "-t" => {
-                return Err("tag mode not supported".to_string());
+                i += 1;
+                if i < args.len() {
+                    opts.tag = Some(args[i].clone());
+                } else {
+                    return Err("-t requires a tagstring".to_string());
+                }
             }
             "-w" => {
                 // Window size (handled by options)

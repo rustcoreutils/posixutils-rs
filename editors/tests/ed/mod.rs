@@ -1392,3 +1392,57 @@ fn test_ed_global_mixed_commands_with_append() {
         "baz\nappended\nbar\n",
     );
 }
+
+// ============================================================================
+// POSIX BRE engine tests (audit #E1, #E9) — plib::regex / libc BRE
+// ============================================================================
+
+#[test]
+fn test_ed_bre_grouping_address() {
+    // BRE \(...\) grouping in a search address. ERE would treat \( as a
+    // literal '(' and fail to match.
+    ed_test("a\napple\nbanana\n.\n/\\(pp\\)/\nQ\n", "apple\n");
+}
+
+#[test]
+fn test_ed_bre_interval_address() {
+    // BRE \{n\} interval. ERE would treat \{ as a literal brace.
+    ed_test("a\ncat\naardvark\n.\n/a\\{2\\}/\nQ\n", "aardvark\n");
+}
+
+#[test]
+fn test_ed_bre_backreference_pattern() {
+    // In-pattern back-reference \1 (unsupported by the old regex crate).
+    ed_test("a\naabb\n.\ns/\\(.\\)\\1/X/\n1p\nQ\n", "Xbb\n");
+}
+
+#[test]
+fn test_ed_sub_backreference_replacement() {
+    // \1 / \2 back-references in the replacement, swapping two groups.
+    ed_test("a\nab\n.\ns/\\(a\\)\\(b\\)/\\2\\1/\n1p\nQ\n", "ba\n");
+}
+
+#[test]
+fn test_ed_sub_ampersand_whole_match() {
+    // & expands to the whole match.
+    ed_test("a\nfoo\n.\ns/oo/[&]/\n1p\nQ\n", "f[oo]\n");
+}
+
+#[test]
+fn test_ed_sub_count_flag() {
+    // Count flag replaces only the nth occurrence (#E9).
+    ed_test("a\nbanana\n.\ns/a/X/2\n1p\nQ\n", "banXna\n");
+}
+
+#[test]
+fn test_ed_sub_anchors() {
+    // ^ and $ anchor to the line body (trailing newline stripped).
+    ed_test("a\nhi\n.\ns/^/> /\ns/$/!/\n1p\nQ\n", "> hi!\n");
+}
+
+#[test]
+fn test_ed_sub_identity_is_not_error() {
+    // #E3 precursor: a match whose replacement equals the match still counts
+    // as a substitution (no spurious '?'); the line prints unchanged.
+    ed_test("a\nxword\n.\ns/x/x/\n1p\nQ\n", "xword\n");
+}

@@ -31,7 +31,7 @@ crate implements ERE and does **not** support in-pattern back-references.
 
 | Utility | Pattern path | State |
 |---|---|---|
-| `ed` | `Regex::new(&pat)` direct at `editor.rs:332,365,977,1211,1400` | **No BRE translation at all** — `\(\)`, `\{n,m\}`, in-pattern `\1` all wrong *(verified)* |
+| `ed` | ~~`Regex::new(&pat)` direct~~ → `plib::regex` BRE | ✓ fixed (phase 1) — true libc BRE, back-refs + locale brackets |
 | `vi` | `Searcher::convert_pattern` (`search.rs:106-194`) | BRE→ERE translation present for `/`…`?` search; imperfect (no back-refs, nomagic quirks) |
 | `ex` | search via `convert_pattern`; **addresses** via raw `Regex::new` at `address.rs:214,221` | search OK-ish; **address `/re/` is pure ERE** |
 | all | — | LC_COLLATE bracket-expression ranges / equivalence classes never honored |
@@ -88,7 +88,7 @@ diverge.
 ### Priority issues
 
 #### Critical
-- [ ] **#E1 — Search/substitute use ERE, not BRE.** `editor.rs:15,332,365,977,1211,1400`. BRE `\(\)` grouping, `\{n,m\}` intervals, and in-pattern back-references `\1`–`\9` are all wrong; `regex` crate can't do in-pattern back-refs at all. *(verified: `/\(a\)/` and `/a\{2\}/` both return `?` instead of matching)*. Fix: add a BRE→ERE translation layer (mirror `vi/search.rs:convert_pattern`) or adopt a POSIX BRE engine; back-references need an engine that supports them.
+- [x] **#E1 — Search/substitute use ERE, not BRE.** ✓ fixed (phase 1): migrated `ed/editor.rs` off the `regex` crate to `plib::regex` (`RegexFlags::bre()`, libc `regcomp`/`regexec`). BRE `\(\)` grouping, `\{n,m\}` intervals, and in-pattern back-references `\1`–`\9` now work; matching is done on the newline-stripped line body for correct `^`/`$` anchoring. Tests: `test_ed_bre_*`, `test_ed_sub_*`.
 - [ ] **#E2 — Command errors never set exit status > 0.** `ed_main.rs:113-115`; loop prints `?` and continues. *(verified: invalid command `Z` and no-match search both exit 0)*. Fix: add `error_occurred: bool` to `Editor`, set it in the `?`-printing path, exit `1` from `main`.
 
 #### Major
@@ -99,8 +99,8 @@ diverge.
 - [ ] **#E7 — Intermediate address offsets reject out-of-range values.** `editor.rs:283-297` errors when a mid-chain offset goes `< 0`. Spec: "It shall not be an error for an intermediate address value to be less than zero or greater than the last line." Fix: only validate the final resolved address.
 
 #### Minor
-- [ ] **#E8 — Diagnostics hardcoded English; regex not locale-aware.** `error.rs`, `editor.rs`. `setlocale`/`textdomain` are called (`ed_main.rs:72-74`) but message strings aren't `gettext()`-wrapped and LC_COLLATE ranges aren't honored. Fix: route through `plib::diag` + wrap strings (shared with dev/ audit).
-- [ ] **#E9 — `s` count-flag (nth occurrence) is fragile.** `editor.rs:1009-1014` re-runs the regex on the matched substring; breaks anchored/back-ref patterns. Fix: select the nth match position from `find_iter`, splice without re-matching.
+- [ ] **#E8 — Diagnostics hardcoded English; regex not locale-aware.** `error.rs`, `editor.rs`. `setlocale`/`textdomain` are called (`ed_main.rs:72-74`) but message strings aren't `gettext()`-wrapped. LC_COLLATE/LC_CTYPE bracket ranges are now honored via libc BRE (phase 1); the remaining `gettext()` string-wrapping is deferred to phase 3.
+- [x] **#E9 — `s` count-flag (nth occurrence) is fragile.** ✓ fixed (phase 1): the substitute loop (`substitute_line`) now enumerates matches via `captures_at` and splices the chosen occurrence without re-matching a substring. Test: `test_ed_sub_count_flag`.
 - [ ] **#E10 — Compound omitted-address separators not expanded.** `parser.rs:323-366`. `,,`/`;;` chains (`1,$,$`) not handled. Fix: propagate the resolved second address as the first input to the next separator.
 - [ ] **#E11 — SIGHUP/SIGINT handled by polling atomic flags, not async-safe path.** `ed_main.rs:41-67`, `editor.rs:1577-1598`. Works in practice; `save_hup_file` is not strictly async-signal-safe. Fix: self-pipe or restrict the handler to async-signal-safe writes.
 
@@ -138,7 +138,7 @@ diverge.
 - [x] `g v` CONFORMS — mark-then-iterate (`editor.rs:1186-1375`).
 - [ ] **`G V` PARTIAL** — #E6.
 - [x] `h H P q Q u` CONFORMS.
-- [ ] **`s` DIVERGES/PARTIAL** — #E1 (BRE), #E3 (no-op), #E9 (count). Flags `g p l n % & \&` and `\<newline>` split CONFORM (`editor.rs:959-1044`).
+- [x] **`s` — BRE engine + count fixed (phase 1)**; #E3 (no-op marks modified) lands in phase 2. Flags `g p l n % & \&` and `\<newline>` split CONFORM.
 - [x] `!cmd` CONFORMS — `%`/`!` expansion, completion marker (`editor.rs:710-775`).
 - [ ] `x z #` are non-POSIX extensions (treated as wq / scroll / null) — N/A, harmless.
 

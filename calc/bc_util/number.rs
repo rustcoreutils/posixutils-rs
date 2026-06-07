@@ -28,6 +28,29 @@ fn pad_digit(d: u64, base_ilog10: u32) -> String {
     format!("{:0width$}", d, width = width as usize)
 }
 
+/// Split very long numeric output across lines, matching bc's convention (and
+/// GNU bc): continued lines hold up to 68 characters followed by a `<backslash>`
+/// continuation, and the final line holds the remainder. Output is ASCII, so
+/// character and column counts coincide.
+fn wrap_long_output(s: String) -> String {
+    const CHUNK: usize = 68;
+    if s.len() <= CHUNK {
+        return s;
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / CHUNK * 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let end = usize::min(i + CHUNK, bytes.len());
+        out.push_str(&s[i..end]);
+        if end < bytes.len() {
+            out.push_str("\\\n");
+        }
+        i = end;
+    }
+    out
+}
+
 pub type NumericResult = Result<Number, &'static str>;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,7 +162,7 @@ impl Number {
         }
 
         if fractional_part.fractional_digit_count() == 0 {
-            return result;
+            return wrap_long_output(result);
         }
 
         result.push('.');
@@ -166,7 +189,7 @@ impl Number {
         if base > 16 {
             result.pop();
         }
-        result
+        wrap_long_output(result)
     }
 
     /// The number of decimal digits in the number.
@@ -217,7 +240,10 @@ impl Number {
             .to_i64()
             .ok_or("exponent is too large")?
             .unsigned_abs();
-        let scale = if other.0.is_positive() {
+        // Per POSIX: if b >= 0 the scale is min(a*b, max(scale, a)); if b < 0
+        // it is the scale register. b == 0 takes the first branch, giving a
+        // scale of 0 (so e.g. `scale=5; 2.5^0` is "1", not "1.00000").
+        let scale = if !other.0.is_negative() {
             u64::min(a * b, u64::max(scale, a))
         } else {
             scale
@@ -405,6 +431,26 @@ mod tests {
     #[test]
     fn test_trailing_zeros_increase_scale() {
         assert_eq!(Number::parse("10.000", 10).unwrap().scale(), 3);
+    }
+
+    #[test]
+    fn test_pow_to_zero_has_zero_scale() {
+        // x^0 is 1 with scale 0, regardless of the scale register (audit #B8).
+        let r = Number::from(2).pow(&Number::from(0), 5).unwrap();
+        assert_eq!(r.scale(), 0);
+        assert_eq!(r.to_string(10), "1");
+    }
+
+    #[test]
+    fn test_long_output_is_wrapped() {
+        // 2^240 has 73 decimal digits: a 68-char line ending in a backslash
+        // continuation, then the 5-character remainder (audit #B6).
+        let n = Number::from(2).pow(&Number::from(240), 0).unwrap();
+        let s = n.to_string(10);
+        let first_line = s.split('\n').next().unwrap();
+        assert_eq!(first_line.len(), 69);
+        assert!(first_line.ends_with('\\'));
+        assert_eq!(s.replace("\\\n", "").len(), 73);
     }
 
     #[test]

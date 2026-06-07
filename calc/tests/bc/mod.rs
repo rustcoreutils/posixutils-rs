@@ -54,6 +54,88 @@ fn test_bc_add() {
     test_bc!(add)
 }
 
+// Diagnostics go to stderr, not stdout (audit #B2). A runtime error in the
+// REPL is recovered from, so the session still exits 0 after quit.
+#[test]
+fn test_bc_error_to_stderr() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1/0\nquit\n"),
+        expected_out: String::new(),
+        expected_err: String::from("runtime error (line 1): division by zero\n"),
+        expected_exit_code: 0,
+    });
+}
+
+// A file operand that cannot be read: diagnostic to stderr, terminate with a
+// non-zero exit status (audit #B11).
+#[test]
+fn test_bc_missing_file() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec!["/nonexistent-bc-file.bc".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::from("bc: cannot read file: /nonexistent-bc-file.bc\n"),
+        expected_exit_code: 1,
+    });
+}
+
+// POSIX limit maxima are enforced so pathological inputs cannot drive
+// unbounded allocation (audit #B3 scale, #B4 obase, #B5 array index).
+fn bc_runtime_error(program: &str, expected_err: &str) {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: format!("{program}\nquit\n"),
+        expected_out: String::new(),
+        expected_err: format!("{expected_err}\n"),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_bc_scale_too_large() {
+    bc_runtime_error(
+        "scale=2147483648",
+        "runtime error (line 1): scale is too large",
+    );
+}
+
+#[test]
+fn test_bc_obase_too_large() {
+    bc_runtime_error(
+        "obase=2147483648",
+        "runtime error (line 1): obase is too large",
+    );
+}
+
+#[test]
+fn test_bc_array_index_out_of_bounds() {
+    bc_runtime_error(
+        "a[16777215]=1",
+        "runtime error (line 1): array index out of bounds",
+    );
+}
+
+// x^0 is 1 with scale 0, regardless of the scale register (audit #B8).
+#[test]
+fn test_bc_pow_zero_scale() {
+    test_bc("scale=5\n2.5^0\nquit\n", "1\n");
+}
+
+// Regression: `quit` inside a `for` body within a function definition must not
+// panic. Per bc semantics quit takes effect when the definition is read, so
+// the statements after the definition are never executed (matches GNU bc).
+#[test]
+fn test_bc_quit_in_for_in_function() {
+    test_bc(
+        "1\ndefine f(x){\nfor(i=0;i<5;i++){\nif(i==3)quit\n}\n}\n2\nf(0)\n3\n",
+        "1\n",
+    );
+}
+
 #[test]
 fn test_bc_arrays_are_passed_to_function_by_value() {
     test_bc!(arrays_are_passed_to_function_by_value)

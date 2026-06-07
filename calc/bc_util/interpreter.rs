@@ -102,6 +102,13 @@ impl std::fmt::Display for ExecutionError {
 
 pub type ExecutionResult<T> = Result<T, ExecutionError>;
 
+// POSIX limit maxima. POSIX defines these as minimum-maxima; we use GNU bc's
+// generous values so real programs are not rejected while pathological inputs
+// can no longer drive unbounded allocation.
+const BC_SCALE_MAX: u64 = i32::MAX as u64; // matches GNU bc (2147483647)
+const BC_BASE_MAX: u64 = i32::MAX as u64; // obase upper bound, matches GNU bc
+const BC_DIM_MAX: u64 = 16_777_215; // array elements, matches GNU bc (2^24 - 1)
+
 type NameMap<T> = [T; 26];
 
 fn name_index(name: char) -> usize {
@@ -113,6 +120,7 @@ fn contains_quit(stmt: &StmtInstruction) -> bool {
         StmtInstruction::Quit => true,
         StmtInstruction::If { body, .. } => body.iter().any(contains_quit),
         StmtInstruction::While { body, .. } => body.iter().any(contains_quit),
+        StmtInstruction::For { body, .. } => body.iter().any(contains_quit),
         _ => false,
     }
 }
@@ -198,7 +206,11 @@ impl Interpreter {
                 let index = self
                     .eval_expr(index)?
                     .as_u64()
-                    .ok_or("array index is too large")? as usize;
+                    .ok_or("array index is too large")?;
+                if index >= BC_DIM_MAX {
+                    return Err("array index out of bounds".into());
+                }
+                let index = index as usize;
                 if let Some(call_frame) = self.call_frames.last_mut() {
                     if let Some(array) = &mut call_frame.array_variables[name_index(*name)] {
                         return Ok(get_or_extend(array, index));
@@ -271,13 +283,21 @@ impl Interpreter {
                     self.instruction_counter = saved_instruction_counter;
                     return Ok(value);
                 }
-                Ok(ControlFlow::Break) | Ok(ControlFlow::Quit) => {
-                    // both of these should never happen.
-                    // A quit inside of a function definition
-                    // should stop execution, and we can only call
-                    // a function after its definition has been processed
-                    // A break outside of a loop is a parser bug.
-                    panic!("reached quit or break in function call")
+                Ok(ControlFlow::Quit) => {
+                    // A quit reached at runtime inside a function body. The
+                    // static contains_quit check normally stops execution when
+                    // the definition is read, so this is defensive: stop
+                    // gracefully rather than crashing.
+                    self.has_quit = true;
+                    self.call_frames.pop();
+                    self.instruction_counter = saved_instruction_counter;
+                    return Ok(Number::zero());
+                }
+                Ok(ControlFlow::Break) => {
+                    // A break not bound to a loop ends the function harmlessly.
+                    self.call_frames.pop();
+                    self.instruction_counter = saved_instruction_counter;
+                    return Ok(Number::zero());
                 }
                 _ => {}
             }
@@ -357,9 +377,13 @@ impl Interpreter {
 
                 match register {
                     Register::Scale => {
-                        self.scale = value
+                        let new_scale = value
                             .as_u64()
-                            .ok_or("the value assigned to scale is too large")?
+                            .ok_or("the value assigned to scale is too large")?;
+                        if new_scale > BC_SCALE_MAX {
+                            return Err("scale is too large".into());
+                        }
+                        self.scale = new_scale;
                     }
                     Register::IBase => {
                         if let Some(new_ibase) = value.as_u64() {
@@ -372,11 +396,13 @@ impl Interpreter {
                     }
                     Register::OBase => {
                         if let Some(new_obase) = value.as_u64() {
-                            if new_obase >= 2 {
-                                self.obase = new_obase;
-                            } else {
+                            if new_obase < 2 {
                                 return Err("obase must be greater than 1".into());
                             }
+                            if new_obase > BC_BASE_MAX {
+                                return Err("obase is too large".into());
+                            }
+                            self.obase = new_obase;
                         } else {
                             return Err("value assigned to obase is too large".into());
                         }
@@ -559,7 +585,7 @@ impl Interpreter {
                 // we can't trust the return value of eval_stmt because
                 // unexecuted branches will not return ControlFlow::Quit,
                 // but we need still need to stop execution
-                if contains_quit(&stmt) {
+                if contains_quit(&stmt) || self.has_quit {
                     self.has_quit = true;
                     return Ok(self.take_and_clear_output());
                 }

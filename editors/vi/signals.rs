@@ -14,6 +14,8 @@ pub static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static SIGCONT_RECEIVED: AtomicBool = AtomicBool::new(false);
 /// Set when an interrupt was requested (SIGINT).
 pub static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+/// Set on hangup or termination (SIGHUP/SIGTERM): preserve the buffer and exit.
+pub static HANGUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
@@ -25,6 +27,25 @@ extern "C" fn handle_sigcont(_: libc::c_int) {
 
 extern "C" fn handle_sigint(_: libc::c_int) {
     SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn handle_hangup(_: libc::c_int) {
+    HANGUP_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+/// Install handlers for SIGHUP and SIGTERM (buffer preservation). Idempotent;
+/// installed for both visual and ex modes.
+pub fn install_hangup_handlers() {
+    unsafe {
+        libc::signal(
+            libc::SIGHUP,
+            handle_hangup as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_hangup as *const () as libc::sighandler_t,
+        );
+    }
 }
 
 /// Install the visual-mode signal handlers. Idempotent.

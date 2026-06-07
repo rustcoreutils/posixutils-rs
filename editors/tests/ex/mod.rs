@@ -545,3 +545,56 @@ fn test_ex_exrc_same_file() {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "tabstop=4");
 }
+
+/// Recovery round-trip: `:preserve` saves the buffer; `ex -r file` restores it.
+/// Regression test for audit #X2 (preserve) and #V4/#X5 (-r recovery).
+#[test]
+fn test_ex_preserve_and_recover_roundtrip() {
+    let rec = TempDir::new().unwrap();
+    let recdir = rec.path().to_str().unwrap();
+    let work = TempDir::new().unwrap();
+    let file = work.path().join("doc.txt");
+    fs::write(&file, "base\n").unwrap();
+
+    let bin = get_binary_path("ex");
+
+    // 1) Append a line and :preserve the buffer.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(&file)
+        .env("TMPDIR", recdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"a\nADDED\n.\npreserve\nq!\n")
+        .unwrap();
+    child.wait().unwrap();
+
+    let recsub = rec.path().join("vi.recover");
+    let count = fs::read_dir(&recsub).map(|d| d.count()).unwrap_or(0);
+    assert!(count >= 1, "preserve should create a recovery file");
+
+    // 2) Recover the buffer and print it.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg("-r")
+        .arg(&file)
+        .env("TMPDIR", recdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"%p\nq!\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ADDED"),
+        "recovered buffer should contain ADDED, got: {:?}",
+        stdout
+    );
+}

@@ -459,8 +459,9 @@ impl Editor {
                 let mut line = String::new();
                 match stdin.lock().read_line(&mut line) {
                     Ok(0) => {
-                        // EOF - finalize and quit
+                        // EOF - finalize pending input, preserve, and quit.
                         let _ = self.finalize_ex_insert();
+                        self.preserve_buffer();
                         self.should_quit = true;
                         break;
                     }
@@ -505,13 +506,17 @@ impl Editor {
             let mut line = String::new();
             match stdin.lock().read_line(&mut line) {
                 Ok(0) => {
-                    // EOF - treat as quit
+                    // EOF on the command stream: preserve unsaved work, then quit.
+                    self.preserve_buffer();
                     self.should_quit = true;
                     break;
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    if !self.silent_mode {
+                    // A hangup/termination signal interrupts the read; preserve.
+                    if crate::signals::take(&crate::signals::HANGUP_RECEIVED) {
+                        self.preserve_buffer();
+                    } else if !self.silent_mode {
                         eprintln!("Read error: {}", e);
                     }
                     self.should_quit = true;
@@ -564,8 +569,10 @@ impl Editor {
                 Ok(key) => self.handle_key(key)?,
                 Err(ViError::Interrupted) => {
                     // The read was interrupted: service any pending signal and
-                    // redraw. If nothing is pending, it was a genuine EOF.
+                    // redraw. If nothing is pending, it was a genuine EOF —
+                    // treat it like a hangup and preserve any unsaved work.
                     if !self.handle_pending_signals()? {
+                        self.preserve_buffer();
                         self.should_quit = true;
                     }
                 }
@@ -579,7 +586,18 @@ impl Editor {
     /// Service any pending asynchronous signals. Returns `true` if at least one
     /// was handled (the loop should redraw and keep running).
     fn handle_pending_signals(&mut self) -> Result<bool> {
-        use crate::signals::{take, SIGCONT_RECEIVED, SIGINT_RECEIVED, SIGWINCH_RECEIVED};
+        use crate::signals::{
+            take, HANGUP_RECEIVED, SIGCONT_RECEIVED, SIGINT_RECEIVED, SIGWINCH_RECEIVED,
+        };
+
+        if take(&HANGUP_RECEIVED) {
+            // Hangup/termination: preserve the buffer and exit.
+            self.preserve_buffer();
+            self.should_quit = true;
+            self.exit_code = 1;
+            return Ok(true);
+        }
+
         let mut handled = false;
 
         if take(&SIGCONT_RECEIVED) {
@@ -606,6 +624,51 @@ impl Editor {
     fn interrupt_command(&mut self) {
         self.parser.reset();
         let _ = self.terminal.bell();
+    }
+
+    /// Write the buffer to a recovery file if it has unsaved changes, mailing
+    /// a notification. Returns the recovery path when a copy was saved.
+    pub fn preserve_buffer(&mut self) -> Option<std::path::PathBuf> {
+        if !self.buffer.is_modified() {
+            return None;
+        }
+        let orig = self.files.current_file().map(|p| p.to_path_buf());
+        match crate::recover::preserve(orig.as_deref(), &self.buffer.as_text()) {
+            Ok(path) => {
+                crate::recover::notify(orig.as_deref());
+                Some(path)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Recover a buffer saved by a previous session. With `file`, recover the
+    /// newest recovery for that path; without, the newest recovery of any.
+    pub fn recover(&mut self, file: Option<&str>) -> Result<()> {
+        match crate::recover::find_for(file) {
+            Some(info) => {
+                let body = crate::recover::load_body(&info.recovery_path).map_err(ViError::Io)?;
+                self.buffer = Buffer::from_text(&body);
+                // Recovered content is not yet written back to the file.
+                self.buffer.mark_modified();
+                if let Some(p) = &info.orig_path {
+                    self.files.set_current_file(Some(PathBuf::from(p)));
+                }
+                self.buffer.set_line(1);
+                self.undo.clear();
+                crate::recover::remove(&info.recovery_path);
+                let msg = match &info.orig_path {
+                    Some(p) => format!("Recovered {}", p),
+                    None => "Recovered buffer".to_string(),
+                };
+                self.set_message(&msg);
+                Ok(())
+            }
+            None => Err(ViError::FileNotFound(
+                file.map(|f| f.to_string())
+                    .unwrap_or_else(|| "recovery file".to_string()),
+            )),
+        }
     }
 
     /// Handle a key press.
@@ -1864,6 +1927,21 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Args => Ok(ExResult::StatusMessage(self.files.format_args())),
+            ExCommand::Preserve => {
+                // :preserve always saves the buffer (independent of modified).
+                let orig = self.files.current_file().map(|p| p.to_path_buf());
+                match crate::recover::preserve(orig.as_deref(), &self.buffer.as_text()) {
+                    Ok(_) => {
+                        crate::recover::notify(orig.as_deref());
+                        Ok(ExResult::StatusMessage("File preserved".to_string()))
+                    }
+                    Err(e) => Ok(ExResult::Error(format!("preserve failed: {}", e))),
+                }
+            }
+            ExCommand::Recover { file } => {
+                self.recover(file.as_deref())?;
+                Ok(ExResult::Continue)
+            }
             ExCommand::Version => Ok(ExResult::StatusMessage(format!(
                 "{} {}",
                 env!("CARGO_PKG_NAME"),

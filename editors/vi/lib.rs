@@ -13,6 +13,7 @@ pub mod file;
 pub mod input;
 pub mod mode;
 pub mod options;
+pub mod recover;
 pub mod register;
 pub mod search;
 pub mod shell;
@@ -77,6 +78,10 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     // and LC_MESSAGES localizes diagnostics.
     setlocale(LocaleCategory::LcAll, "");
 
+    // Preserve the buffer on hangup/termination, and prune old recovery files.
+    signals::install_hangup_handlers();
+    recover::cleanup_stale(14 * 24 * 60 * 60);
+
     let opts = match parse_args(invoked_as, args) {
         Ok(o) => o,
         Err(e) => {
@@ -119,8 +124,26 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         // Continue anyway - don't fail on config errors
     }
 
-    // Open files
-    if !opts.files.is_empty() {
+    // Recovery mode (-r): list recoverable buffers (no operand) or recover
+    // the named file; otherwise open the operands normally.
+    if opts.recover {
+        if opts.files.is_empty() {
+            let recs = recover::list();
+            if recs.is_empty() {
+                println!("No files to recover");
+            } else {
+                println!("Recoverable files:");
+                for r in &recs {
+                    println!("  {}", r.orig_path.as_deref().unwrap_or("(unnamed)"));
+                }
+            }
+            return 0;
+        }
+        if let Err(e) = editor.recover(opts.files.first().map(|s| s.as_str())) {
+            eprintln!("{}: {}", prog_name, e);
+            return 1;
+        }
+    } else if !opts.files.is_empty() {
         if let Err(e) = editor.open_files(opts.files) {
             eprintln!("{}: {}", prog_name, e);
             return 1;
@@ -155,6 +178,8 @@ struct EditorOptions {
     readonly: bool,
     /// Initial command to execute (-c or +command).
     command: Option<String>,
+    /// Recover a previously-preserved buffer (-r).
+    recover: bool,
     /// Files to edit.
     files: Vec<String>,
 }
@@ -169,6 +194,7 @@ fn parse_args(
         silent_mode: false,
         readonly: false,
         command: None,
+        recover: false,
         files: Vec::new(),
     };
 
@@ -180,7 +206,7 @@ fn parse_args(
                 opts.readonly = true;
             }
             "-r" => {
-                return Err("recovery mode not supported".to_string());
+                opts.recover = true;
             }
             "-c" => {
                 i += 1;

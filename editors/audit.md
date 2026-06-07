@@ -40,7 +40,7 @@ crate implements ERE and does **not** support in-pattern back-references.
 
 | Signal | `ed` | `vi` / `ex` |
 |---|---|---|
-| SIGHUP | handler → writes buffer to `ed.hup` (`ed_main.rs:46-67`, `editor.rs:1541-1572`) | **none** — no buffer preservation |
+| SIGHUP | handler → writes buffer to `ed.hup` (`ed_main.rs:46-67`, `editor.rs:1541-1572`) | ✓ fixed (phase 6) — preserves buffer to `$TMPDIR/vi.recover` (`recover.rs`) |
 | SIGINT | flag + `?` (`ed_main.rs:41-43`, `editor.rs:1523-1538`) | ✓ fixed (phase 5) — `^C`/SIGINT rings bell + cancels command (`signals.rs`) |
 | SIGQUIT | `SIG_IGN` (`ed_main.rs:54-55`) | **none** |
 | SIGWINCH | N/A (non-visual) | ✓ fixed (phase 5) — resize → refresh size + redraw |
@@ -189,10 +189,10 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 #### Critical
 - [x] **#V1 — SIGWINCH not handled.** ✓ fixed (phase 5): new `vi/signals.rs` installs a SIGWINCH handler (atomic flag); the input loop catches the `EINTR` (`reader.rs` now surfaces it as `ViError::Interrupted`), calls `terminal.refresh_size()`, and `refresh_screen()` redraws at the new size. PTY test: `test_pty_vi_resize_survives_and_saves`.
 - [x] **#V2 — SIGCONT not handled.** ✓ fixed (phase 5): SIGCONT handler set; on resume the loop re-enables raw mode, re-enters the alternate screen, refreshes size, and redraws (`handle_pending_signals`).
-- [ ] **#V3 — SIGHUP not handled; no buffer preservation.** Spec: hangup/EOF-on-input ⇒ preserve buffer. Currently the buffer is lost. Fix: SIGHUP handler writes a recovery/`dead.letter`-style file then exits.
+- [x] **#V3 — SIGHUP not handled; no buffer preservation.** ✓ fixed (phase 6): new `vi/recover.rs` + SIGHUP/SIGTERM handlers (`signals.rs`). On hangup/termination, or EOF-on-input, a modified buffer is written to a recovery file under `$TMPDIR/vi.recover` (0600) and the user is mailed (best effort). *(behaviorally verified: `kill -HUP` on a modified ex session writes the recovery file.)*
 
 #### Major
-- [ ] **#V4 — `-r` recovery hard-errors and exits.** `lib.rs:177`. *(verified: `vi -r` → "vi: recovery mode not supported", exit 1)*. Fix: at minimum list recoverable files / no-op instead of fatal.
+- [x] **#V4 — `-r` recovery hard-errors and exits.** ✓ fixed (phase 6): `vi -r` lists recoverable buffers; `vi -r file` recovers the newest saved buffer for that file (`Editor::recover`). Stale recovery files (>14 days) are pruned at startup.
 - [ ] **#V5 — `-t tagstring` hard-errors; `^]` is a stub.** `lib.rs:188`, `editor/mod.rs:3071-3074`. *(verified: `vi -t main` → "vi: tag mode not supported", exit 1)*. Fix: parse `tags` (ctags format), literal-string lookup, jump.
 - [ ] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** In the parser's simple-command list but no arm in `execute_command`; they silently do nothing. Fix: implement `move_sentence_{forward,backward}` and wire them.
 - [ ] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** `command/parser.rs:272`; no executor arm. Fix: add arm → `current + count − 1`, first non-blank.
@@ -218,7 +218,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### OPERANDS / STDIN / INPUT FILES
 - [x] Multiple-file list + first-file open CONFORMS — `FileManager`.
-- [ ] **STDIN EOF not treated as SIGHUP PARTIAL** — folded into #V3.
+- [x] **STDIN EOF treated as SIGHUP** — ✓ fixed (phase 6), #V3.
 
 #### ENVIRONMENT VARIABLES
 - [x] `COLUMNS`/`LINES` CONFORMS — `ui/terminal.rs:141-152`.
@@ -228,7 +228,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [ ] **`TERM` PARTIAL** — read but no terminfo lookup.
 
 #### ASYNCHRONOUS EVENTS
-- [x] **SIGWINCH / SIGCONT** — ✓ fixed (phase 5), #V1/#V2. **SIGHUP** still open — #V3 (phase 6).
+- [x] **SIGWINCH / SIGCONT / SIGHUP** — ✓ fixed (phases 5–6), #V1/#V2/#V3.
 - [x] **SIGINT** — ✓ fixed (phase 5), #V8; `:suspend`/resume now redraws via the SIGCONT path (#V2).
 
 #### Command set
@@ -246,7 +246,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] 0/1 exit code propagated — `lib.rs:73-140`, `vi_main.rs:15`.
-- [ ] **Unrecoverable-error ⇒ preserve PARTIAL** — folded into #V3.
+- [x] **Unrecoverable-error ⇒ preserve** — ✓ fixed (phase 6), #V3.
 
 ### Test coverage signal
 Not covered:
@@ -285,12 +285,12 @@ mandated mark-then-execute.
 ### Priority issues
 
 #### Critical
-- [ ] **#X1 — No signal handlers (SIGHUP/SIGINT/SIGTERM).** None in the tree. Spec mandates SIGHUP ⇒ preserve. Fix: install handlers (shared with vi-#V1-#V3).
-- [ ] **#X2 — `preserve` command + EOF/SIGHUP file preservation missing.** No `Preserve` variant in `ExCommand`. *(EOF in `run_ex_mode` at `editor/mod.rs:505-508` just sets `should_quit`)*. Fix: add `preserve`, save buffer to recovery dir; call it on EOF/SIGHUP when modified.
+- [x] **#X1 — No signal handlers (SIGHUP/SIGINT/SIGTERM).** ✓ fixed (phases 5–6): SIGINT (phase 5); SIGHUP/SIGTERM install in `run_editor` for both modes and trigger buffer preservation (phase 6).
+- [x] **#X2 — `preserve` command + EOF/SIGHUP file preservation missing.** ✓ fixed (phase 6): added `ExCommand::Preserve` (`:pre[serve]`) and `:rec[over]`; the ex command loop preserves a modified buffer on EOF and on hangup. Integration test: `test_ex_preserve_and_recover_roundtrip`.
 - [ ] **#X3 — `-s` does not suppress EXINIT / `.exrc`.** `lib.rs:109-110` calls `load_startup_config()` unconditionally; only the *error message* is gated on `silent_mode`. *(verified by code path)*. Fix: skip startup config entirely when `silent_mode`.
 - [x] **#X4 — Address `/re/`,`?re?` use raw ERE.** ✓ fixed (phase 4): `address.rs` compiles address patterns with `plib::regex` BRE. (Note: a *separate* pre-existing parser bug captures the trailing delimiter into the pattern — e.g. `/cherry/` stores `cherry/` — so `/re/` addresses don't match; this is address-parser fidelity, tracked under #X-addressing for phase 10, not a regex-engine issue.)
-- [ ] **#X5 — `-r` exits with error instead of listing recoverable files.** `lib.rs:177-178`. *(verified: exit 1)*. Fix: list-or-no-op.
-- [ ] **#X6 — EOF on stdin not treated as SIGHUP.** `editor/mod.rs:505-508`; data loss when the buffer is modified. Fix: preserve before quitting (ties to #X2).
+- [x] **#X5 — `-r` exits with error instead of listing recoverable files.** ✓ fixed (phase 6): shared with #V4.
+- [x] **#X6 — EOF on stdin not treated as SIGHUP.** ✓ fixed (phase 6): EOF in ex command/insert mode now preserves a modified buffer before quitting.
 
 #### Major
 - [ ] **#X7 — `global`/`v` appears single-pass.** `parser.rs:519-544` stores the command string and dispatches per match without a mark-first pass; line-inserting/deleting commands corrupt iteration. Fix: collect matching line numbers first, then execute against stable marks.
@@ -306,7 +306,7 @@ mandated mark-then-execute.
 - [ ] **#X15 — Line-0 address rejected for `a`/`i`/`r`/`=`/`put`.** `address.rs:56-60`. Fix: allow 0 for the commands the spec lists.
 - [ ] **#X16 — `'`/`` ` `` marks not resolvable; only a–z named marks.** `address.rs:228`. Fix: support the previous-context marks.
 - [ ] **#X17 — Excess leading addresses not discarded.** `address.rs`. Fix: keep only the last two.
-- [ ] **#X18 — Missing `~`, `recover` commands; `preserve` (see #X2).** `ex/command.rs` enum. Fix: add variants.
+- [x] **#X18 — Missing `~`, `recover` commands; `preserve`.** ✓ partial: `:preserve` and `:recover` added (phase 6); the `~` substitute-repeat command remains for phase 10.
 - [ ] **#X19 — `showmode` defaults `true`; spec default unset.** `options.rs:101`. Fix: default `false`.
 - [ ] **#X20 — Missing `set` options & `warn` message before `!`.** Same list as vi-#V13; `warn`/`beautify`/`mesg`/`redraw`/`remap`/`slowopen`/`directory`/`edcompatible` absent. Fix: add.
 - [ ] **#X21 — Unreadable `.exrc` silently ignored.** `config.rs:40` returns `None`; spec says it "shall be an error." Fix: surface the error.
@@ -321,7 +321,7 @@ mandated mark-then-execute.
 - [ ] **`-s` PARTIAL** (#X3); **`-r` MISSING** (#X5); **`-t` MISSING** (#X8); **`-w` PARTIAL** (parsed, not applied).
 
 #### OPERANDS / STDIN
-- [ ] **EOF-as-SIGHUP MISSING** — #X6.  **`{LINE_MAX}` limit MISSING** — minor.
+- [x] **EOF-as-SIGHUP** — ✓ fixed (phase 6), #X6.  **`{LINE_MAX}` limit MISSING** — minor.
 - [ ] **stdin-not-tty ⇒ `-s` MISSING** — #X11.
 
 #### ENVIRONMENT VARIABLES
@@ -330,7 +330,7 @@ mandated mark-then-execute.
 - [ ] **`LANG`/`LC_*` MISSING** (#X14); **`COLUMNS`/`LINES` MISSING** (ioctl only); **`TERM` PARTIAL** (read before mode applied).
 
 #### ASYNCHRONOUS EVENTS
-- [ ] **All signals MISSING** — #X1.
+- [x] **Signals (SIGINT/SIGHUP/SIGTERM)** — ✓ fixed (phases 5–6), #X1.
 
 #### STDOUT / STDERR
 - [x] Line output to stdout, diagnostics to stderr CONFORM.

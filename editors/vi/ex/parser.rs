@@ -280,6 +280,16 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         "ve" | "version" => Ok(ExCommand::Version),
         "h" | "help" => Ok(ExCommand::Help),
 
+        // Recovery
+        "pre" | "preserve" => Ok(ExCommand::Preserve),
+        "rec" | "recover" => Ok(ExCommand::Recover {
+            file: if args.is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            },
+        }),
+
         // Source file
         "so" | "source" => {
             if args.is_empty() {

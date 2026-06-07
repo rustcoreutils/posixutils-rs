@@ -267,5 +267,6 @@ Not covered:
 - [`display/audit.md`](display/audit.md) — `more` (the first full pass; covers 15 priority items, 28 interactive commands, signal handling, i18n).
 - [`dev/audit.md`](dev/audit.md) — `yacc`, `lex`, `ar`, `nm`, `strings`, `strip` (development utilities; shared `plib::diag`/`io`/`archive`/`locale` infrastructure).
 - [`awk/audit.md`](awk/audit.md) — `awk` (full language audit, behaviorally verified; 1 Critical `close()` crash, 6 Major: `-F` escapes, byte-vs-char, printf `*`, `-f -`, field uninitialized comparison, 1024-field cap).
+- [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond` (the cron family; `crond` audited vs. Vixie cron + implicit `crontab`/`at`/`batch` requirements + secure-daemon practice). Headline risks: `crond` executes spool files with no ownership/permission/symlink checks; `crontab -e` truncates the existing entry; `at`/`batch` jobs are filed but never run; multi-operand `at` timespecs and the `crontab` stdin form are unsupported.
 
 When you finish a new audit, add the link here.

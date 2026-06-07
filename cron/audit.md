@@ -447,7 +447,7 @@ convention, and (e) discards job output instead of mailing it.
 ### Priority issues
 
 #### Critical (security)
-- [ ] **#D1 — Spool files are executed with no ownership/permission/symlink
+- [x] **#D1 — Spool files are executed with no ownership/permission/symlink
   validation.** `sync_cronfile` reads *every* entry in `CRON_SPOOL_DIR`, takes
   the **filename** as the username, `getpwnam`s it, and runs the contained
   commands as that uid (`crond.rs:82-96` → `job.rs:212-227, 581-646`). There is
@@ -459,7 +459,7 @@ convention, and (e) discards job output instead of mailing it.
   command execution as that user (root). Fix: port Vixie's `load_user` checks
   (regular file, exact mode `0600`, owner ∈ {root, named user}, `nlink == 1`,
   `O_RDONLY|O_NONBLOCK|O_NOFOLLOW`, `fstat` after open).
-- [ ] **#D2 — `/etc/crontab` is loaded without trust checks.** `sync_cronfile`
+- [x] **#D2 — `/etc/crontab` is loaded without trust checks.** `sync_cronfile`
   reads `SYSTEM_CRONTAB` and runs its jobs (incl. as root) with no check that it
   is owned by root and not group/other-writable (`crond.rs:99-101`). A
   world-writable `/etc/crontab` (or one on a user-controlled path) becomes
@@ -506,12 +506,12 @@ convention, and (e) discards job output instead of mailing it.
   recipient), honoring `MAILTO` if set.
 
 #### Minor
-- [ ] **#D9 — `is_file_changed` returns "changed" almost always.** The branch
+- [x] **#D9 — `is_file_changed` returns "changed" almost always.** The branch
   `last_checked <= last_modified ⇒ Ok(true)` (`crond.rs:65-67`) is true whenever
   the mtime is unchanged *or* newer, so the daemon reloads the entire database
   every iteration. Fix: compare for strict inequality and reload only on a newer
   mtime; better, stat each crontab and reload per-file like Vixie.
-- [ ] **#D10 — Reload only keys on the spool *directory* mtime.** `sync_cronfile`
+- [x] **#D10 — Reload only keys on the spool *directory* mtime.** `sync_cronfile`
   gates on `is_file_changed(CRON_SPOOL_DIR)` (`crond.rs:76`); an in-place edit
   that doesn't change the directory mtime is missed. Vixie stats each file.
 - [ ] **#D11 — `signal()` instead of `sigaction()`.** Handlers are installed with

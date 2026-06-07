@@ -9,20 +9,25 @@
 
 use chrono::Local;
 use cron::job::{Database, UserInfo};
+use cron::trust::{open_trusted, TrustPolicy};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::cmp::Ordering::{Greater, Less};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::SystemTime;
 
 static CRONTAB: Mutex<Option<Database>> = Mutex::new(None);
-static LAST_MODIFIED: Mutex<Option<u64>> = Mutex::new(None);
+/// Per-file modification times of every loaded crontab, so a reload happens
+/// only when a file is actually added, removed, or changed (audit #D9/#D10).
+static MTIMES: Mutex<Option<HashMap<PathBuf, SystemTime>>> = Mutex::new(None);
 
 /// Atomic flag set by SIGHUP handler to signal reload needed
 static RELOAD_FLAG: AtomicBool = AtomicBool::new(false);
@@ -51,55 +56,106 @@ impl fmt::Display for CronError {
     }
 }
 
-/// Check if logname file is changed
-fn is_file_changed(filepath: &str) -> Result<bool, Box<dyn Error>> {
-    let last_modified = fs::metadata(filepath)?
-        .modified()?
-        .duration_since(UNIX_EPOCH)?
-        .as_secs();
+/// Collect the modification time of every crontab file the daemon loads (each
+/// spool entry plus the system crontab). Missing files are simply absent from
+/// the map.
+fn collect_mtimes() -> HashMap<PathBuf, SystemTime> {
+    let mut mtimes = HashMap::new();
 
-    let Some(last_checked) = *LAST_MODIFIED.lock().unwrap() else {
-        *LAST_MODIFIED.lock().unwrap() = Some(last_modified);
-        return Ok(true);
+    if let Ok(entries) = fs::read_dir(CRON_SPOOL_DIR) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    mtimes.insert(entry.path(), modified);
+                }
+            }
+        }
+    }
+
+    if let Ok(meta) = fs::metadata(SYSTEM_CRONTAB) {
+        if let Ok(modified) = meta.modified() {
+            mtimes.insert(PathBuf::from(SYSTEM_CRONTAB), modified);
+        }
+    }
+
+    mtimes
+}
+
+/// Return true if any crontab file was added, removed, or modified since the
+/// last load, updating the stored snapshot (audit #D9/#D10).
+fn needs_reload() -> bool {
+    let current = collect_mtimes();
+    let mut guard = MTIMES.lock().unwrap();
+    let changed = match &*guard {
+        None => true,
+        Some(previous) => *previous != current,
     };
-    if last_checked <= last_modified {
-        *LAST_MODIFIED.lock().unwrap() = Some(last_modified);
-        Ok(true)
-    } else {
-        Ok(false)
+    if changed {
+        *guard = Some(current);
+    }
+    changed
+}
+
+/// Load a crontab file after a trust check, appending its jobs to `db`. A file
+/// that fails the trust check is skipped with a diagnostic (audit #D1/#D2).
+fn load_trusted<F>(path: &Path, policy: &TrustPolicy, label: &str, parse: F, db: &mut Database)
+where
+    F: FnOnce(&str) -> Database,
+{
+    match open_trusted(path, policy) {
+        Ok((mut file, _meta)) => {
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() {
+                let parsed = parse(&content);
+                let merged = std::mem::replace(db, Database(vec![])).merge(parsed);
+                *db = merged;
+            }
+        }
+        Err(reason) => {
+            // Only warn when a file is actually present (a missing optional file
+            // such as /etc/crontab is not an error).
+            if path.exists() {
+                eprintln!("crond: ignoring {label}: {reason}");
+            }
+        }
     }
 }
 
-/// Update [`CRONTAB`] by loading all user crontabs from spool directory
+/// Update [`CRONTAB`] by loading all trusted user crontabs from the spool
+/// directory plus the system crontab.
 fn sync_cronfile() -> Result<(), Box<dyn Error>> {
-    // Check if directory has changed (use directory mtime)
-    let dir_changed = is_file_changed(CRON_SPOOL_DIR).unwrap_or(true);
-
-    if (*CRONTAB.lock().unwrap()).is_none() || dir_changed {
+    if (*CRONTAB.lock().unwrap()).is_none() || needs_reload() {
         let mut combined_db = Database(vec![]);
 
-        // Load all user crontabs from spool directory
+        // Load all user crontabs from the spool directory.
         if let Ok(entries) = fs::read_dir(CRON_SPOOL_DIR) {
             for entry in entries.flatten() {
-                // The filename is the username
+                // The filename is the username.
                 let username = entry.file_name().to_string_lossy().into_owned();
 
-                // Look up user info for privilege dropping
+                // Look up user info for privilege dropping; skip unknown users.
                 if let Some(user_info) = UserInfo::from_username(&username) {
-                    if let Ok(content) = fs::read_to_string(entry.path()) {
-                        let user_db = Database::parse_user_crontab(&content, &user_info);
-                        combined_db = combined_db.merge(user_db);
-                    }
+                    let policy = TrustPolicy::crontab_spool(user_info.uid);
+                    let label = format!("crontab for {username}");
+                    load_trusted(
+                        &entry.path(),
+                        &policy,
+                        &label,
+                        |content| Database::parse_user_crontab(content, &user_info),
+                        &mut combined_db,
+                    );
                 }
-                // If user doesn't exist in passwd, skip their crontab
             }
         }
 
-        // Also load system crontab if exists (6-field format with username)
-        if let Ok(content) = fs::read_to_string(SYSTEM_CRONTAB) {
-            let sys_db = Database::parse_system_crontab(&content);
-            combined_db = combined_db.merge(sys_db);
-        }
+        // Load the system crontab (6-field format with username).
+        load_trusted(
+            Path::new(SYSTEM_CRONTAB),
+            &TrustPolicy::system_crontab(),
+            SYSTEM_CRONTAB,
+            Database::parse_system_crontab,
+            &mut combined_db,
+        );
 
         *CRONTAB.lock().unwrap() = Some(combined_db);
     }
@@ -191,8 +247,8 @@ fn daemon_loop() -> Result<(), Box<dyn Error>> {
 
         // Check for reload signal (from SIGHUP)
         if RELOAD_FLAG.swap(false, Ordering::SeqCst) {
-            // Force reload by clearing last modified time
-            *LAST_MODIFIED.lock().unwrap() = None;
+            // Force a full reload by discarding the stored mtimes.
+            *MTIMES.lock().unwrap() = None;
         }
 
         sync_cronfile()?;

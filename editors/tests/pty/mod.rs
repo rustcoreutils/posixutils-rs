@@ -329,3 +329,40 @@ fn test_pty_vi_interrupt_cancels_count() {
     let contents = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(contents, "L2\nL3\n", "interrupt should cancel the count");
 }
+
+/// Test: sentence motion `)` works as a delete target (#V6).
+#[test]
+fn test_pty_vi_sentence_motion_delete() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("sent.txt");
+    // POSIX sentences are separated by two spaces.
+    std::fs::write(&file_path, "One.  Two.  Three.\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("d)"); // delete the first sentence
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "Two.  Three.\n");
+}
+
+/// Test: `_` moves to the first non-blank of the line (#V7).
+#[test]
+fn test_pty_vi_underscore_first_nonblank() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("us.txt");
+    std::fs::write(&file_path, "    indented\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("_rX"); // first non-blank, replace char with X
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "    Xndented\n");
+}

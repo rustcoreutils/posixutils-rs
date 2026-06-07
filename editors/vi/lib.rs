@@ -116,6 +116,11 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         editor.set_readonly(true);
     }
 
+    // Apply the initial window size (-w).
+    if let Some(n) = opts.window {
+        editor.set_window(n);
+    }
+
     // Load startup configuration (EXINIT or $HOME/.exrc)
     // Per POSIX, this happens before editing the first file
     if let Err(e) = editor.load_startup_config() {
@@ -189,6 +194,8 @@ struct EditorOptions {
     recover: bool,
     /// Tag to jump to at startup (-t).
     tag: Option<String>,
+    /// Initial window size (-w).
+    window: Option<usize>,
     /// Files to edit.
     files: Vec<String>,
 }
@@ -205,6 +212,7 @@ fn parse_args(
         command: None,
         recover: false,
         tag: None,
+        window: None,
         files: Vec::new(),
     };
 
@@ -235,9 +243,15 @@ fn parse_args(
                 }
             }
             "-w" => {
-                // Window size (handled by options)
                 i += 1;
-                // Skip the size argument
+                if i < args.len() {
+                    // Apply the window size if it parses; ignore otherwise.
+                    if let Ok(n) = args[i].parse::<usize>() {
+                        opts.window = Some(n);
+                    }
+                } else {
+                    return Err("-w requires a size".to_string());
+                }
             }
             "-s" => {
                 // Silent/batch mode (ex only, but accept for both)

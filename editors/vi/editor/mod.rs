@@ -294,6 +294,13 @@ impl Editor {
         self.files.set_readonly(readonly);
     }
 
+    /// Set the initial window size (the `-w size` option).
+    pub fn set_window(&mut self, n: usize) {
+        if n > 0 {
+            self.options.window = n;
+        }
+    }
+
     /// Execute an initial command (from -c or +command).
     pub fn execute_initial_command(&mut self, cmd: &str) -> Result<()> {
         self.execute_ex_input(cmd)
@@ -731,8 +738,13 @@ impl Editor {
                 self.interrupt_command();
                 return Ok(());
             }
-            Key::Ctrl('r') | Key::Ctrl('l') => {
-                // Redraw screen - just return, will redraw on next refresh
+            Key::Ctrl('l') => {
+                // ^L: clear the physical screen, then redraw on next refresh.
+                let _ = self.terminal.clear_screen();
+                return Ok(());
+            }
+            Key::Ctrl('r') => {
+                // ^R: redraw (refresh happens at the top of the loop).
                 return Ok(());
             }
             Key::Ctrl(']') => {
@@ -1308,6 +1320,24 @@ impl Editor {
                     self.buffer.set_cursor(res.position);
                 }
             }
+            // Sentence motions
+            '(' => {
+                if let Ok(res) = motion::move_sentence_backward(&self.buffer, count) {
+                    self.buffer.set_cursor(res.position);
+                }
+            }
+            ')' => {
+                if let Ok(res) = motion::move_sentence_forward(&self.buffer, count) {
+                    self.buffer.set_cursor(res.position);
+                }
+            }
+            // Go to first non-blank, count-1 lines down (_ command)
+            '_' => {
+                let target =
+                    (self.buffer.cursor().line + count.max(1) - 1).min(self.buffer.line_count());
+                self.buffer.set_line(target.max(1));
+                self.buffer.move_to_first_non_blank();
+            }
             // Go to column
             '|' => {
                 if let Ok(res) = motion::move_to_column(&self.buffer, count) {
@@ -1687,6 +1717,8 @@ impl Editor {
                 .and_then(|c| motion::till_char_backward(&self.buffer, c, mot.count).ok()),
             '{' => motion::move_paragraph_backward(&self.buffer, mot.count).ok(),
             '}' => motion::move_paragraph_forward(&self.buffer, mot.count).ok(),
+            '(' => motion::move_sentence_backward(&self.buffer, mot.count).ok(),
+            ')' => motion::move_sentence_forward(&self.buffer, mot.count).ok(),
             '|' => motion::move_to_column(&self.buffer, mot.count).ok(),
             '%' => motion::find_matching_bracket(&self.buffer).ok(),
             _ => None,

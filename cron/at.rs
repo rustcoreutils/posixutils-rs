@@ -105,6 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'".into());
         }
         let ids = parse_job_ids(&args.operands)?;
+        if ids.is_empty() {
+            // POSIX: `at -r at_job_id...` requires at least one operand.
+            return Err("at -r requires at least one at_job_id operand".into());
+        }
         remove_jobs(&ids)?;
         return Ok(());
     }

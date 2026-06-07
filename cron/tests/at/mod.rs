@@ -314,6 +314,19 @@ fn test12() {
     run_test_at(&args3, expected_output3, "", 0);
 }
 
+// `at -r` requires at least one at_job_id operand; with none it is a usage
+// error (POSIX synopsis `at -r at_job_id...`).
+#[test]
+fn remove_requires_operand() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let (_temp_dir, dir_path) = setup_test_env();
+    fs::create_dir(&dir_path).expect("Unable to create test directory");
+    std::env::set_var("AT_JOB_DIR", &dir_path);
+
+    let out = plib::testing::run_test_base("at", &vec!["-r".to_string()], b"");
+    assert_eq!(out.status.code(), Some(1));
+}
+
 // A timespec spread across multiple operands is concatenated and parsed as one,
 // per the grammar where white space merely delimits tokens (audit #A1). This is
 // equivalent to test1's single-operand "05:53amNOV4,2100".

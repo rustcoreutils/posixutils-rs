@@ -571,13 +571,14 @@ impl FromStr for Database {
     }
 }
 
-/// Validate a user crontab (5-field format) the way the daemon parses it.
+/// Validate a user crontab (5-field format) before installation (#C4).
 ///
-/// Returns the 1-based line number of the first entry the daemon would reject
-/// (a time field that fails to parse, or an unknown `@`-spec). Lines the daemon
-/// silently ignores — blank, comment, or structurally short — are not flagged,
-/// so "valid" here means exactly "the daemon will load this crontab". Used by
-/// `crontab` to refuse installing a crontab the daemon would choke on (#C4).
+/// Returns the 1-based line number of the first entry that would not run as the
+/// user intends: a time field that fails to parse (which the daemon rejects), or
+/// an unknown `@`-spec (which the daemon would silently *skip*, so the job would
+/// never run). Blank, comment, and structurally short lines — which the daemon
+/// also silently ignores — are not flagged. The check is therefore at least as
+/// strict as the daemon: a crontab that passes here loads and runs every entry.
 pub fn validate_user_crontab(content: &str) -> Result<(), usize> {
     for (idx, raw) in content.lines().enumerate() {
         let line = raw.trim();

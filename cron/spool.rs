@@ -21,7 +21,7 @@ use std::{
     ffi::CStr,
     fs,
     io::{self, ErrorKind, Read, Seek, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::OpenOptionsExt,
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process,
@@ -112,8 +112,11 @@ pub fn at(
 
     let job = Job::new(&user, std::env::current_dir()?, std::env::vars(), cmd, mail).into_script();
 
+    // Create the job file restricted to the owner from the start, so there is no
+    // window in which it is readable by others (the script embeds the user's
+    // environment).
     let mut file_opt = std::fs::OpenOptions::new();
-    file_opt.read(true).write(true).create_new(true);
+    file_opt.read(true).write(true).create_new(true).mode(0o600);
 
     let file_path = PathBuf::from(format!("{}/{job_filename}", get_job_dir()?));
 
@@ -121,9 +124,17 @@ pub fn at(
         .open(&file_path)
         .map_err(|e| format!("Failed to create file with job. Reason: {e}"))?;
 
-    file.write_all(job.as_bytes())?;
+    // Own the job file to the submitting (real) user. crond resolves an at-job's
+    // run-as identity from the file's owner, so a set-uid-root `at` must not
+    // leave root-owned jobs that would then be executed as root.
+    // SAFETY: fchown on our just-created fd; getuid/getgid never fail.
+    unsafe {
+        if libc::fchown(file.as_raw_fd(), libc::getuid(), libc::getgid()) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
 
-    file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    file.write_all(job.as_bytes())?;
 
     // POSIX: the submission notice "job %s at %s\n" is written to standard error,
     // with the date as `date +"%a %b %e %T %Y"` adjusted to the user's timezone

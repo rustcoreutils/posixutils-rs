@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::iter::Peekable;
@@ -48,6 +48,15 @@ macro_rules! time_unit {
                     v
                 } else {
                     Vec::from_iter(Self::range())
+                }
+            }
+
+            /// True if `value` falls in this field's set (a wildcard matches
+            /// everything). Used by the daemon's per-minute wheel (audit #D6).
+            fn matches(&self, value: i32) -> bool {
+                match &self.0 {
+                    None => true,
+                    Some(_) => self.to_vec().contains(&value),
                 }
             }
 
@@ -589,6 +598,30 @@ pub fn validate_user_crontab(content: &str) -> Result<(), usize> {
 }
 
 impl CronJob {
+    /// True if this recurring job is scheduled to fire during the minute `t`
+    /// (truncated to minute resolution by the caller). Mirrors the POSIX
+    /// month / day-of-month / day-of-week union rule (audit #D6).
+    pub fn matches_minute(&self, t: &NaiveDateTime) -> bool {
+        if self.is_reboot {
+            return false;
+        }
+        if !self.minute.matches(t.minute() as i32)
+            || !self.hour.matches(t.hour() as i32)
+            || !self.month.matches(t.month() as i32)
+        {
+            return false;
+        }
+
+        let dom = t.day() as i32;
+        let dow = t.weekday().num_days_from_sunday() as i32;
+        match (self.monthday.0.is_some(), self.weekday.0.is_some()) {
+            (true, true) => self.monthday.matches(dom) || self.weekday.matches(dow),
+            (false, true) => self.weekday.matches(dow),
+            (true, false) => self.monthday.matches(dom),
+            (false, false) => true,
+        }
+    }
+
     pub fn next_execution(&self, now: &NaiveDateTime) -> Option<NaiveDateTime> {
         // @reboot jobs don't have scheduled executions
         if self.is_reboot {

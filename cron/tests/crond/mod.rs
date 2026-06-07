@@ -509,6 +509,38 @@ fn job_env_defaults_and_safe_overrides() {
 }
 
 #[test]
+fn matches_minute_exact_field() {
+    let db = "30 4 * * * echo".parse::<Database>().unwrap();
+    let job = &db.0[0];
+    let yes = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(4, 30, 0).unwrap(),
+    );
+    let no = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(4, 31, 0).unwrap(),
+    );
+    assert!(job.matches_minute(&yes));
+    assert!(!job.matches_minute(&no));
+}
+
+#[test]
+fn matches_minute_dom_dow_union() {
+    // "0 0 1,15 * 1" fires on the 1st, the 15th, OR any Monday (POSIX union).
+    let db = "0 0 1,15 * 1 echo".parse::<Database>().unwrap();
+    let job = &db.0[0];
+    let midnight = |y, m, d| {
+        NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(y, m, d).unwrap(),
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        )
+    };
+    assert!(job.matches_minute(&midnight(2000, 1, 3))); // Monday
+    assert!(job.matches_minute(&midnight(2000, 1, 1))); // 1st (a Saturday)
+    assert!(!job.matches_minute(&midnight(2000, 1, 4))); // Tue, not 1/15
+}
+
+#[test]
 fn user_crontab_collects_env_assignments() {
     let db = "MAILTO=ops\nPATH=/sbin\n* * * * * echo hi"
         .parse::<Database>()

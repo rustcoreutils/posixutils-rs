@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::Local;
+use chrono::{DateTime, Local, NaiveDateTime};
 use cron::job::{Database, UserInfo};
 use cron::trust::{open_trusted, TrustPolicy};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
@@ -38,7 +38,6 @@ static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 #[derive(Debug)]
 enum CronError {
     Fork,
-    NoCrontab,
     AlreadyRunning,
     PidFile(std::io::Error),
 }
@@ -48,7 +47,6 @@ impl Error for CronError {}
 impl fmt::Display for CronError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoCrontab => write!(f, "Could not format database"),
             Self::Fork => write!(f, "Could not create child process"),
             Self::AlreadyRunning => write!(f, "Another crond instance is already running"),
             Self::PidFile(e) => write!(f, "Could not create PID file: {}", e),
@@ -165,24 +163,25 @@ fn sync_cronfile() -> Result<(), Box<dyn Error>> {
 /// Acquire PID file lock to prevent multiple daemon instances
 /// Returns the file handle which must be kept open for the lock to persist
 fn acquire_lock() -> Result<File, CronError> {
+    // Open WITHOUT O_TRUNC so a second instance's failed lock attempt does not
+    // clobber the running daemon's recorded PID (audit #D12).
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .open(PID_FILE)
         .map_err(CronError::PidFile)?;
 
-    // SAFETY: flock() is safe to call here because:
-    // 1. file.as_raw_fd() returns a valid file descriptor from an open File
-    // 2. LOCK_EX | LOCK_NB are valid flags for exclusive non-blocking lock
-    // 3. We check the return value and handle errors appropriately
+    // SAFETY: file.as_raw_fd() is valid for the lifetime of `file`; LOCK_EX|
+    // LOCK_NB is an exclusive non-blocking lock and we check the return value.
     unsafe {
         if libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
             return Err(CronError::AlreadyRunning);
         }
     }
 
-    // Write our PID to the file
+    // Only after the lock is held, replace the file contents with our PID.
+    file.set_len(0).map_err(CronError::PidFile)?;
     writeln!(file, "{}", std::process::id()).map_err(CronError::PidFile)?;
     file.flush().map_err(CronError::PidFile)?;
 
@@ -237,42 +236,107 @@ extern "C" fn handle_sigchld(_: libc::c_int) {
     unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
 }
 
-/// Daemon loop
-fn daemon_loop() -> Result<(), Box<dyn Error>> {
+/// Install `handler` for `signum` via `sigaction` (audit #D11). `SA_RESTART` is
+/// intentionally omitted so a delivered signal interrupts the daemon's
+/// `nanosleep` and is acted on promptly.
+fn install_signal(signum: libc::c_int, handler: extern "C" fn(libc::c_int), flags: libc::c_int) {
+    // SAFETY: a zeroed sigaction with a valid extern "C" handler and an emptied
+    // mask is a well-formed disposition.
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = handler as libc::sighandler_t;
+        act.sa_flags = flags;
+        libc::sigemptyset(&mut act.sa_mask);
+        libc::sigaction(signum, &act, std::ptr::null_mut());
+    }
+}
+
+/// How many missed minutes to replay after a busy tick or forward clock jump.
+const CATCHUP_LIMIT: i64 = 3;
+
+fn current_minute() -> i64 {
+    Local::now().timestamp() / 60
+}
+
+/// Convert an epoch-minute back to the local wall-clock datetime the schedule
+/// predicate compares against.
+fn minute_to_naive(minute: i64) -> NaiveDateTime {
+    DateTime::from_timestamp(minute * 60, 0)
+        .map(|dt| dt.with_timezone(&Local).naive_local())
+        .unwrap_or_default()
+}
+
+/// The inclusive epoch-minute range to process this tick. Catch-up is bounded to
+/// `cap` minutes; a backward clock jump (or no new minute) yields an empty range
+/// so nothing is re-run (audit #D6/#D14).
+fn due_window(last: i64, now: i64, cap: i64) -> std::ops::RangeInclusive<i64> {
+    if now <= last {
+        // A computed empty range (start > end yields no values).
+        return (now + 1)..=now;
+    }
+    std::cmp::max(last + 1, now - cap + 1)..=now
+}
+
+/// Suspend for `seconds`, returning early if interrupted by a signal so SIGTERM
+/// and SIGHUP are handled promptly.
+fn interruptible_sleep(seconds: i64) {
+    if seconds <= 0 {
+        return;
+    }
+    let req = libc::timespec {
+        tv_sec: seconds as libc::time_t,
+        tv_nsec: 0,
+    };
+    // SAFETY: `req` is a valid timespec; EINTR simply returns early.
+    unsafe {
+        libc::nanosleep(&req, std::ptr::null_mut());
+    }
+}
+
+/// Sleep until just after the next minute boundary.
+fn sleep_to_next_minute() {
+    let secs_into = Local::now().timestamp().rem_euclid(60);
+    interruptible_sleep(60 - secs_into);
+}
+
+/// Daemon loop: at each minute boundary, run every job scheduled for the minutes
+/// that have elapsed since the last tick (audit #D6).
+fn tick_loop() -> Result<(), Box<dyn Error>> {
+    // Start at the current minute so the first tick does not replay history.
+    let mut last_run_minute = current_minute();
+
     loop {
-        // Check for shutdown signal
         if SHUTDOWN_FLAG.load(Ordering::SeqCst) {
             return Ok(());
         }
-
-        // Check for reload signal (from SIGHUP)
         if RELOAD_FLAG.swap(false, Ordering::SeqCst) {
-            // Force a full reload by discarding the stored mtimes.
+            *MTIMES.lock().unwrap() = None;
+        }
+
+        sleep_to_next_minute();
+
+        if SHUTDOWN_FLAG.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if RELOAD_FLAG.swap(false, Ordering::SeqCst) {
             *MTIMES.lock().unwrap() = None;
         }
 
         sync_cronfile()?;
         let Some(db) = CRONTAB.lock().unwrap().clone() else {
-            return Err(Box::new(CronError::NoCrontab));
-        };
-        let Some(x) = db.nearest_job() else {
-            sleep(60);
             continue;
         };
-        let Some(next_exec) = x.next_execution(&Local::now().naive_local()) else {
-            sleep(60);
-            continue;
-        };
-        let now = Local::now();
-        let diff = next_exec - now.naive_local();
-        let sleep_time = diff.num_seconds().max(0) as u64;
 
-        if sleep_time < 60 {
-            sleep(sleep_time as u32);
-            let _ = x.run_job(); // Errors logged in child process
-        } else {
-            sleep(60);
+        let now = current_minute();
+        for minute in due_window(last_run_minute, now, CATCHUP_LIMIT) {
+            let when = minute_to_naive(minute);
+            for job in &db.0 {
+                if job.matches_minute(&when) {
+                    let _ = job.run_job(); // errors are reported in the child
+                }
+            }
         }
+        last_run_minute = now;
     }
 }
 
@@ -292,20 +356,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Acquire PID file lock (keep handle alive for the daemon's lifetime)
     let _pid_lock = acquire_lock()?;
 
-    // SAFETY: signal() is safe to call with valid signal numbers and
-    // extern "C" function handlers. All handlers are async-signal-safe
-    // (they only perform atomic stores or call async-signal-safe functions).
-    unsafe {
-        libc::signal(libc::SIGHUP, handle_sighup as *const () as usize);
-        libc::signal(libc::SIGCHLD, handle_sigchld as *const () as usize);
-        libc::signal(libc::SIGTERM, handle_shutdown as *const () as usize);
-        libc::signal(libc::SIGINT, handle_shutdown as *const () as usize);
-    }
+    // Install handlers via sigaction (audit #D11). Handlers are async-signal-safe
+    // (atomic stores or waitpid). SIGCHLD uses SA_NOCLDSTOP to avoid stop/cont
+    // notifications.
+    install_signal(libc::SIGHUP, handle_sighup, 0);
+    install_signal(libc::SIGCHLD, handle_sigchld, libc::SA_NOCLDSTOP);
+    install_signal(libc::SIGTERM, handle_shutdown, 0);
+    install_signal(libc::SIGINT, handle_shutdown, 0);
 
     // Run @reboot jobs at startup
     run_reboot_jobs()?;
 
-    daemon_loop()
+    tick_loop()
 }
 
 /// Execute all @reboot jobs once at daemon startup
@@ -323,8 +385,27 @@ fn run_reboot_jobs() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn sleep(target: u32) {
-    // SAFETY: libc::sleep() is safe with any u32 value; it simply
-    // suspends execution for the specified number of seconds.
-    unsafe { libc::sleep(target) };
+#[cfg(test)]
+mod tests {
+    use super::due_window;
+
+    #[test]
+    fn window_single_new_minute() {
+        assert_eq!(due_window(100, 101, 3).collect::<Vec<_>>(), vec![101]);
+    }
+
+    #[test]
+    fn window_bounded_catchup() {
+        // A 10-minute gap is clamped to the last CATCHUP_LIMIT minutes.
+        assert_eq!(
+            due_window(100, 110, 3).collect::<Vec<_>>(),
+            vec![108, 109, 110]
+        );
+    }
+
+    #[test]
+    fn window_same_or_backward_is_empty() {
+        assert!(due_window(100, 100, 3).collect::<Vec<_>>().is_empty());
+        assert!(due_window(100, 95, 3).collect::<Vec<_>>().is_empty());
+    }
 }

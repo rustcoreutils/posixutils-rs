@@ -485,7 +485,7 @@ convention, and (e) discards job output instead of mailing it.
   spaces (`job.rs:265, 310, 477`) and runs the whole thing via `sh -c`
   (`job.rs:638`) with no stdin. Fix: split on unescaped `%`, run the head, feed
   the tail to the child's stdin.
-- [ ] **#D6 — Only one job runs per minute.** `daemon_loop` picks a single
+- [x] **#D6 — Only one job runs per minute.** `daemon_loop` picks a single
   `nearest_job()` (`crond.rs:202`, `job.rs:197-204` = `min_by_key`), sleeps to
   it, and runs just that one if `sleep_time < 60` (`crond.rs:206-219`). Other
   jobs scheduled for the same minute are skipped, and any job whose next run is
@@ -514,11 +514,11 @@ convention, and (e) discards job output instead of mailing it.
 - [x] **#D10 — Reload only keys on the spool *directory* mtime.** `sync_cronfile`
   gates on `is_file_changed(CRON_SPOOL_DIR)` (`crond.rs:76`); an in-place edit
   that doesn't change the directory mtime is missed. Vixie stats each file.
-- [ ] **#D11 — `signal()` instead of `sigaction()`.** Handlers are installed with
+- [x] **#D11 — `signal()` instead of `sigaction()`.** Handlers are installed with
   `libc::signal` (`crond.rs:242-247`); semantics (restart, one-shot reset)
   vary by platform. Prefer `sigaction` with explicit flags. Handlers themselves
   are correctly async-signal-safe (atomic store / `waitpid`).
-- [ ] **#D12 — PID file truncated before the lock is tested.** `acquire_lock`
+- [x] **#D12 — PID file truncated before the lock is tested.** `acquire_lock`
   opens `PID_FILE` with `.truncate(true)` *then* `flock`s (`crond.rs:111-124`);
   if a second instance starts, it has already zeroed the file before its
   `flock` fails, briefly clobbering the running daemon's recorded PID. Fix:
@@ -527,7 +527,7 @@ convention, and (e) discards job output instead of mailing it.
   checks `setgid`/`setuid` return values (good) but does not re-verify the uid
   actually changed, and ignores `chdir($HOME)` failure with `let _` rather than
   falling back to `/` explicitly (`job.rs:631-634`). Minor hardening.
-- [ ] **#D14 — Missed-minute jobs are not made up.** If the daemon is busy >60 s
+- [x] **#D14 — Missed-minute jobs are not made up.** If the daemon is busy >60 s
   or the clock jumps, jobs in the skipped interval never run (no catch-up
   window). Vixie clamps and runs the wheel for elapsed minutes. Document or
   implement a bounded catch-up.

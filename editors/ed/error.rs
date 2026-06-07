@@ -9,6 +9,7 @@
 
 //! Error types for the ed editor.
 
+use gettextrs::gettext;
 use std::fmt;
 use std::io;
 
@@ -39,15 +40,17 @@ pub enum EdError {
 
 impl fmt::Display for EdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Diagnostic text is wrapped in gettext() so LC_MESSAGES can localize
+        // the explanatory messages shown by the `h` and `H` commands.
         match self {
             EdError::Generic(msg) => write!(f, "{}", msg),
-            EdError::AddressOutOfRange => write!(f, "Invalid address"),
-            EdError::InvalidAddress => write!(f, "Invalid address"),
-            EdError::InvalidCommand(cmd) => write!(f, "Invalid command: {}", cmd),
-            EdError::NoFilename => write!(f, "No current filename"),
-            EdError::NoPreviousPattern => write!(f, "No previous pattern"),
-            EdError::NoMatch => write!(f, "No match"),
-            EdError::BufferModified => write!(f, "Warning: buffer modified"),
+            EdError::AddressOutOfRange => write!(f, "{}", gettext("Invalid address")),
+            EdError::InvalidAddress => write!(f, "{}", gettext("Invalid address")),
+            EdError::InvalidCommand(cmd) => write!(f, "{}: {}", gettext("Invalid command"), cmd),
+            EdError::NoFilename => write!(f, "{}", gettext("No current filename")),
+            EdError::NoPreviousPattern => write!(f, "{}", gettext("No previous pattern")),
+            EdError::NoMatch => write!(f, "{}", gettext("No match")),
+            EdError::BufferModified => write!(f, "{}", gettext("Warning: buffer modified")),
             EdError::Io(e) => write!(f, "{}", e),
             EdError::Syntax(msg) => write!(f, "{}", msg),
         }

@@ -98,10 +98,10 @@ diverge.
 - [x] **#E7 — Intermediate address offsets reject out-of-range values.** ✓ fixed (phase 2): `resolve_address_with_base` accumulates offsets in signed arithmetic and validates only the final address. Test: `test_ed_intermediate_address_out_of_range_ok`.
 
 #### Minor
-- [ ] **#E8 — Diagnostics hardcoded English; regex not locale-aware.** `error.rs`, `editor.rs`. `setlocale`/`textdomain` are called (`ed_main.rs:72-74`) but message strings aren't `gettext()`-wrapped. LC_COLLATE/LC_CTYPE bracket ranges are now honored via libc BRE (phase 1); the remaining `gettext()` string-wrapping is deferred to phase 3.
+- [x] **#E8 — Diagnostics hardcoded English; regex not locale-aware.** ✓ fixed: LC_COLLATE/LC_CTYPE bracket ranges honored via libc BRE (phase 1); the `EdError` Display strings (shown by `h`/`H`) are now `gettext()`-wrapped (phase 3), so `LC_MESSAGES` can localize them. `setlocale`/`textdomain` were already wired in `ed_main.rs`.
 - [x] **#E9 — `s` count-flag (nth occurrence) is fragile.** ✓ fixed (phase 1): the substitute loop (`substitute_line`) now enumerates matches via `captures_at` and splices the chosen occurrence without re-matching a substring. Test: `test_ed_sub_count_flag`.
 - [x] **#E10 — Compound omitted-address separators.** ✓ examined (phase 2): the spec-relevant requirement — discarding excess *leading* addresses — already conforms (`1,2,3p` → `2,3`, matching GNU ed), and `;;p` matches GNU (`$`). The only divergence is bare `,,p`, which we resolve to `1,$` (vs GNU's `$,$`); POSIX leaves this degenerate all-omitted case unspecified, so the current behavior is defensible. No code change.
-- [ ] **#E11 — SIGHUP/SIGINT handled by polling atomic flags, not async-safe path.** `ed_main.rs:41-67`, `editor.rs:1577-1598`. Works in practice; `save_hup_file` is not strictly async-signal-safe. Fix: self-pipe or restrict the handler to async-signal-safe writes.
+- [x] **#E11 — SIGHUP/SIGINT handler async-safety.** ✓ examined (phase 3): the handlers (`ed_main.rs:42-49`) only do an `AtomicBool::store`, which *is* async-signal-safe; `save_hup_file` runs later from `check_sighup()` in the main loop (normal context), not from the signal handler. No change needed.
 
 ### Detailed conformance matrix
 
@@ -117,13 +117,13 @@ diverge.
 
 #### ENVIRONMENT VARIABLES
 - [x] `HOME` CONFORMS — `ed.hup` fallback path, `editor.rs:1559`.
-- [ ] **`LC_COLLATE` MISSING** — regex not locale-aware (#E8).
-- [ ] **`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` PARTIAL** — setlocale called, strings/engine not wired (#E8).
+- [x] **`LC_COLLATE` / `LC_CTYPE`** — ✓ fixed (phase 1): bracket ranges/classes honored via libc BRE (#E8).
+- [x] **`LC_MESSAGES`** — ✓ fixed (phase 3): diagnostic strings `gettext()`-wrapped (#E8). `NLSPATH` N/A (no catalog shipped).
 
 #### ASYNCHRONOUS EVENTS
 - [x] `SIGQUIT` CONFORMS (`SIG_IGN`).
 - [x] `SIGINT` CONFORMS — prints `?`, returns to command mode.
-- [x] `SIGHUP` CONFORMS (common path) — writes `ed.hup` then `$HOME/ed.hup`; #E11 is the only nit.
+- [x] `SIGHUP` CONFORMS — writes `ed.hup` then `$HOME/ed.hup`; handler is async-signal-safe (#E11 examined).
 
 #### STDOUT / STDERR
 - [x] `?` error reporting on stdout CONFORMS — `editor.rs:187`.

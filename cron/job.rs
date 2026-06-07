@@ -501,6 +501,53 @@ impl FromStr for Database {
     }
 }
 
+/// Validate a user crontab (5-field format) the way the daemon parses it.
+///
+/// Returns the 1-based line number of the first entry the daemon would reject
+/// (a time field that fails to parse, or an unknown `@`-spec). Lines the daemon
+/// silently ignores — blank, comment, or structurally short — are not flagged,
+/// so "valid" here means exactly "the daemon will load this crontab". Used by
+/// `crontab` to refuse installing a crontab the daemon would choke on (#C4).
+pub fn validate_user_crontab(content: &str) -> Result<(), usize> {
+    for (idx, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let mut fields = line.split_ascii_whitespace();
+        let Some(first_field) = fields.next() else {
+            continue;
+        };
+
+        if first_field.starts_with('@') {
+            if parse_at_spec(first_field).is_none() {
+                return Err(idx + 1);
+            }
+            continue;
+        }
+
+        // Standard 5-field format. Too few fields ⇒ the daemon skips the line,
+        // so we do not flag it; only a malformed time field is a hard error.
+        let (Some(hours), Some(mdays), Some(months), Some(wdays)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+
+        if Minute::parse(first_field).is_err()
+            || Hour::parse(hours).is_err()
+            || MonthDay::parse(mdays).is_err()
+            || Month::parse(months).is_err()
+            || WeekDay::parse(wdays).is_err()
+        {
+            return Err(idx + 1);
+        }
+    }
+
+    Ok(())
+}
+
 impl CronJob {
     pub fn next_execution(&self, now: &NaiveDateTime) -> Option<NaiveDateTime> {
         // @reboot jobs don't have scheduled executions

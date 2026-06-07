@@ -109,7 +109,7 @@ do no syntax validation.
 ### Priority issues
 
 #### Critical
-- [ ] **#C1 — `-e` truncates the existing crontab before editing.**
+- [x] **#C1 — `-e` truncates the existing crontab before editing.**
   `edit_crontab` calls `File::create(path)` (`crontab.rs:67`) — which truncates
   — every time, then launches the editor on that now-empty file. Existing
   entries are destroyed before the user sees them; "edit a copy … or create an
@@ -119,7 +119,7 @@ do no syntax validation.
   (vixie pattern), never truncating the live file.
 
 #### Major
-- [ ] **#C2 — `crontab [file]` with no operand does not read standard input.**
+- [x] **#C2 — `crontab [file]` with no operand does not read standard input.**
   SYNOPSIS line 90911 is `crontab [file]`; DESCRIPTION 90914-90917: "The new
   crontab entry can be input by specifying file or input from standard input if
   no file operand is specified." `main` instead counts `-e/-l/-r/file`, and
@@ -127,13 +127,13 @@ do no syntax validation.
   So the primary "pipe a crontab in" form is missing. Fix: when no option and
   no file operand are given, replace the crontab from stdin (the APPLICATION
   USAGE note 91021-91024 even documents the EOF-on-tty behavior this implies).
-- [ ] **#C3 — Diagnostics and status messages go to stdout, not stderr.**
+- [x] **#C3 — Diagnostics and status messages go to stdout, not stderr.**
   Every error arm uses `println!` (`crontab.rs:123-188`), and successes print
   to stdout ("Removed crontab file", "Replaced crontab file with …"). STDERR
   (90999-91000): "standard error shall be used only for diagnostic messages";
   STDOUT (90997-90998) is reserved for the `-l` listing. Fix: route all
   diagnostics to stderr; drop the success chatter (or send to stderr).
-- [ ] **#C4 — No crontab validation on replace/edit.** `replace_crontab`
+- [x] **#C4 — No crontab validation on replace/edit.** `replace_crontab`
   (`crontab.rs:74-83`) and `-e` write the bytes verbatim; malformed lines are
   silently dropped later by `crond` (`job.rs:453-467` returns `Err(())` →
   empty DB for that user). CONSEQUENCES OF ERRORS (91009-91010): on error "the
@@ -143,24 +143,24 @@ do no syntax validation.
 - [x] **#C5 — Identity from `$LOGNAME` only (#X2).** `crontab.rs:91`. ✓ fixed (Phase 1).
 
 #### Minor
-- [ ] **#C6 — Replace is non-atomic.** `replace_crontab` does
+- [x] **#C6 — Replace is non-atomic.** `replace_crontab` does
   `File::create(to)` then streams bytes (`crontab.rs:74-82`); a crash or short
   write leaves a truncated crontab that `crond` will load. Fix: write to a temp
   file in the spool dir + fsync + atomic rename (cf. `plib::io::write_atomic`).
-- [ ] **#C7 — `cron.allow`/`cron.deny` "neither exists" rule inverted vs. XSI.**
+- [x] **#C7 — `cron.allow`/`cron.deny` "neither exists" rule inverted vs. XSI.**
   `is_user_allowed` returns `true` for everyone when neither file exists
   (`crontab.rs:43-56`). XSI text 90933-90934: "If neither file exists, only a
   process with appropriate privileges shall be allowed." Current behavior is
   open-by-default. (XSI is optional, hence Minor, but it is a security-relevant
   divergence.) Also the empty-`cron.deny` ⇒ global-allow special case is not
   distinguished.
-- [ ] **#C8 — `-e` ignores `VISUAL`; unquoted editor command.** `edit_crontab`
+- [x] **#C8 — `-e` ignores `VISUAL`; unquoted editor command.** `edit_crontab`
   reads only `$EDITOR` (`crontab.rs:68`) and builds `sh -c "{editor} {path}"`
   with no quoting (`crontab.rs:70`). POSIX names only `EDITOR` here, but the
   unquoted `{path}` breaks on spool paths containing shell metacharacters and
   the `EDITOR` value is not path-normalized. Fix: pass the path as a separate
   argv element rather than interpolating into a shell string.
-- [ ] **#C9 — Runtime diagnostics are hardcoded English.** `setlocale` +
+- [x] **#C9 — Runtime diagnostics are hardcoded English.** `setlocale` +
   `textdomain` are called (`crontab.rs:86-88`) and clap help is `gettext`'d,
   but the `println!`/`eprintln!` strings are literals. LC_MESSAGES (90991-90993)
   governs diagnostic text. (Same partial state as the `dev/` audit.)

@@ -231,6 +231,61 @@ fn current_umask() -> libc::mode_t {
     }
 }
 
+/// Locate the at spool directory without creating it (used by the daemon, which
+/// must not fabricate the spool). Mirrors [`get_job_dir`]'s search order.
+pub fn at_spool_dir_readonly() -> Option<PathBuf> {
+    if let Ok(env_dir) = env::var("AT_JOB_DIR") {
+        let p = PathBuf::from(env_dir);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for dir in SPOOL_DIRECTORIES {
+            let p = PathBuf::from(dir);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        let p = PathBuf::from(DEFAULT_DIRECTORY);
+        p.exists().then_some(p)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let p = PathBuf::from(MACOS_DIRECTORY);
+        p.exists().then_some(p)
+    }
+}
+
+/// A parsed at-spool job filename, the inverse of [`job_file_name`].
+pub struct AtJobName {
+    pub queue: char,
+    pub job_id: u32,
+    /// Scheduled execution time in epoch-minutes.
+    pub exec_minute: u64,
+}
+
+/// Parse an at-spool filename (`<queue><jobid:05x><minutes:08x>`), rejecting the
+/// `.SEQ` sequence file, temporary files, and anything malformed.
+pub fn parse_at_job_name(name: &str) -> Option<AtJobName> {
+    if name.len() != 14 {
+        return None;
+    }
+    let queue = name.chars().next()?;
+    if !queue.is_ascii_alphabetic() {
+        return None;
+    }
+    let job_id = u32::from_str_radix(&name[1..6], 16).ok()?;
+    let exec_minute = u64::from_str_radix(&name[6..14], 16).ok()?;
+    Some(AtJobName {
+        queue,
+        job_id,
+        exec_minute,
+    })
+}
+
 /// Return name for job number
 ///
 /// None if DateTime < [DateTime::UNIX_EPOCH]
@@ -431,5 +486,26 @@ mod tests {
     #[test]
     fn sh_quote_escapes_embedded_single_quote() {
         assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn at_job_name_roundtrips() {
+        use super::{job_file_name, parse_at_job_name};
+        use chrono::{DateTime, Utc};
+
+        let t = DateTime::<Utc>::from_timestamp(1_700_000_040, 0).unwrap();
+        let name = job_file_name(0x1a, Some('b'), &t).unwrap();
+        let parsed = parse_at_job_name(&name).expect("valid name");
+        assert_eq!(parsed.queue, 'b');
+        assert_eq!(parsed.job_id, 0x1a);
+        assert_eq!(parsed.exec_minute, 1_700_000_040 / 60);
+    }
+
+    #[test]
+    fn at_job_name_rejects_seq_and_garbage() {
+        use super::parse_at_job_name;
+        assert!(parse_at_job_name("a00001.SEQ").is_none());
+        assert!(parse_at_job_name("too-short").is_none());
+        assert!(parse_at_job_name("100001041a0e81").is_none()); // non-alpha queue
     }
 }

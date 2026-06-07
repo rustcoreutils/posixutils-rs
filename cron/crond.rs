@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Local, NaiveDateTime};
 use cron::job::{Database, UserInfo};
+use cron::spool::{at_spool_dir_readonly, parse_at_job_name};
 use cron::trust::{open_trusted, TrustPolicy};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
@@ -18,8 +19,10 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -299,6 +302,128 @@ fn sleep_to_next_minute() {
     interruptible_sleep(60 - secs_into);
 }
 
+/// Maximum 1-minute load average at which batch (queue `b`) jobs are started.
+const BATCH_MAX_LOAD: f64 = 1.5;
+
+fn loadavg_1min() -> Option<f64> {
+    let mut loads = [0f64; 1];
+    // SAFETY: getloadavg writes up to `nelem` (1) doubles into the array.
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    (n == 1).then_some(loads[0])
+}
+
+/// Run one at-spool job (its script provided as `content`) as `owner`. Returns
+/// true once the worker has been forked; the caller then unlinks the file so it
+/// cannot run twice (audit #X1).
+fn run_at_job(content: &str, owner: &UserInfo) -> bool {
+    // SAFETY: fork() is checked; the child performs only fork-safe work.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid != 0 {
+        return true; // parent: caller unlinks the now-claimed job
+    }
+
+    // Child: new session, drop privileges, run the script with output mailed.
+    // SAFETY: setsid() in a fresh child is always safe.
+    unsafe {
+        libc::setsid();
+    }
+    // SAFETY: called in the forked child before exec.
+    if let Err(e) = unsafe { cron::job::drop_privileges(owner.uid, owner.gid, &owner.name) } {
+        eprintln!("crond: cannot drop privileges for at job: {e}");
+        std::process::exit(1);
+    }
+    if std::env::set_current_dir(&owner.home).is_err() {
+        let _ = std::env::set_current_dir("/");
+    }
+
+    // The at script restores the submitter's environment itself, so start from a
+    // clean base and feed the script on stdin (avoiding any unlink/path race).
+    let mut child = match Command::new("/bin/sh")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => std::process::exit(1),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(content.as_bytes());
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(_) => std::process::exit(1),
+    };
+
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    if !combined.is_empty() {
+        cron::job::mail_output(&owner.name, "at job output", &combined);
+    }
+    std::process::exit(output.status.code().unwrap_or(0));
+}
+
+/// Scan the at spool and run every job whose execution minute has arrived,
+/// dropping to the file owner's identity. Queue `b` (batch) jobs additionally
+/// wait for the load average to fall and only one is started per tick (audit
+/// #X1, closing #A2/#A9/#B1/#D3).
+fn run_due_at_jobs() {
+    let Some(dir) = at_spool_dir_readonly() else {
+        return;
+    };
+    let now_min = current_minute().max(0) as u64;
+    let mut batch_started = false;
+
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Some(job) = parse_at_job_name(&name) else {
+            continue;
+        };
+        if job.exec_minute > now_min {
+            continue; // not due yet
+        }
+
+        if job.queue == 'b' {
+            if batch_started {
+                continue; // at most one batch job per tick
+            }
+            if loadavg_1min().map(|l| l > BATCH_MAX_LOAD).unwrap_or(false) {
+                continue; // defer until the load falls
+            }
+        }
+
+        let path = entry.path();
+        // Trust the file (regular, single link, not group/other-writable,
+        // O_NOFOLLOW) and take the run-as identity from its owner uid.
+        let Ok((mut file, meta)) = open_trusted(&path, &TrustPolicy::at_spool()) else {
+            continue; // untrusted; leave it in place
+        };
+        let Some(owner) = UserInfo::from_uid(meta.uid()) else {
+            continue; // owner has no passwd entry
+        };
+        let mut content = String::new();
+        if file.read_to_string(&mut content).is_err() {
+            continue;
+        }
+
+        if run_at_job(&content, &owner) {
+            let _ = fs::remove_file(&path);
+            if job.queue == 'b' {
+                batch_started = true;
+            }
+        }
+    }
+}
+
 /// Daemon loop: at each minute boundary, run every job scheduled for the minutes
 /// that have elapsed since the last tick (audit #D6).
 fn tick_loop() -> Result<(), Box<dyn Error>> {
@@ -337,6 +462,9 @@ fn tick_loop() -> Result<(), Box<dyn Error>> {
             }
         }
         last_run_minute = now;
+
+        // Also run any due one-shot at/batch jobs (audit #X1).
+        run_due_at_jobs();
     }
 }
 
@@ -364,8 +492,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     install_signal(libc::SIGTERM, handle_shutdown, 0);
     install_signal(libc::SIGINT, handle_shutdown, 0);
 
-    // Run @reboot jobs at startup
+    // Run @reboot jobs at startup, and flush any already-due at/batch jobs.
     run_reboot_jobs()?;
+    run_due_at_jobs();
 
     tick_loop()
 }

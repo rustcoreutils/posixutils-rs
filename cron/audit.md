@@ -58,7 +58,7 @@ Research sources:
 
 Two issues span multiple binaries; they are referenced by per-utility items.
 
-- [ ] **#X1 — `at`/`batch` jobs are never executed (Critical).** `at` and
+- [x] **#X1 — `at`/`batch` jobs are never executed (Critical).** `at` and
   `batch` write job files into the *at* spool (`AT_JOB_DIR` →
   `/var/spool/atjobs/` etc., `at.rs:29-40`, `batch.rs:25-36`), but `crond` only
   ever scans `CRON_SPOOL_DIR` (`/var/spool/cron`, the *crontab* spool —
@@ -246,7 +246,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   now tomorrow`, 85076) and 5 (`at 8 :15amjan24`, `at now "+ 1day"`, `at 5 pm
   FRIday`, 85079-85085) all fail. Fix: collect all trailing operands, join with
   spaces, strip interior whitespace per the grammar, and parse the whole string.
-- [ ] **#A2 — Submitted `at` jobs are never executed (#X1).** `at.rs` files the
+- [x] **#A2 — Submitted `at` jobs are never executed (#X1).** `at.rs` files the
   job into the at spool but no daemon consumes it. Submission therefore cannot
   satisfy the contract "to be executed at a later time" (84763-84764).
 
@@ -288,7 +288,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   than retaining the invoking mask (84767: "file creation mask … shall be
   retained"). Fix: single-quote values (escaping embedded quotes) and emit the
   actual `umask`.
-- [ ] **#A9 — `-m` mail / default output-mail unimplemented.** `-m` only sets a
+- [x] **#A9 — `-m` mail / default output-mail unimplemented.** `-m` only sets a
   `# mail user 1` header line (`at.rs:520-522`); nothing mails output, and the
   default (no `-m`) "provide output via mail unless redirected" (84793-84796) is
   absent. Depends on #A2/#X1. Fix: when the job runs, capture stdout+stderr and
@@ -383,7 +383,7 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
 ### Priority issues
 
 #### Major
-- [ ] **#B1 — Batch jobs are never executed (#X1).** Filed into queue `b` of the
+- [x] **#B1 — Batch jobs are never executed (#X1).** Filed into queue `b` of the
   at spool, which `crond` never scans. The "run by the system using algorithms
   based on unspecified factors" contract (86955-86957) cannot be met.
 - [x] **#B2 — Submission notice printed to stdout, not stderr.** `println!("job
@@ -465,7 +465,7 @@ convention, and (e) discards job output instead of mailing it.
   world-writable `/etc/crontab` (or one on a user-controlled path) becomes
   instant root. Fix: `fstat` and require `uid==0 && (mode & 022)==0` before
   parsing; same for any `cron.d`-style directory if added.
-- [ ] **#D3 — `at`/`batch` jobs are never executed (#X1).** `crond` scans only
+- [x] **#D3 — `at`/`batch` jobs are never executed (#X1).** `crond` scans only
   the crontab spool (`crond.rs:76`).
 
 #### Major

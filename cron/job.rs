@@ -197,6 +197,27 @@ impl UserInfo {
             })
         }
     }
+
+    /// Look up user info from a uid using getpwuid. Used to resolve the run-as
+    /// identity of an at-spool job from the file's owner (audit #X1).
+    pub fn from_uid(uid: u32) -> Option<Self> {
+        // SAFETY: getpwuid() is read-only; all fields are copied before return.
+        unsafe {
+            let pwd = libc::getpwuid(uid);
+            if pwd.is_null() {
+                return None;
+            }
+            let pw = &*pwd;
+            let name = CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned();
+            let home = CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned();
+            Some(UserInfo {
+                uid: pw.pw_uid,
+                gid: pw.pw_gid,
+                name,
+                home,
+            })
+        }
+    }
 }
 
 impl Database {
@@ -911,8 +932,8 @@ fn recipient_is_safe(recipient: &str) -> bool {
 
 /// Pipe `body` to the local MTA addressed to `recipient`, best-effort. Skips
 /// silently when no sendmail binary is found or the recipient looks unsafe
-/// (audit #D8).
-fn mail_output(recipient: &str, subject: &str, body: &[u8]) {
+/// (audit #D8/#A9).
+pub fn mail_output(recipient: &str, subject: &str, body: &[u8]) {
     if !recipient_is_safe(recipient) {
         return;
     }

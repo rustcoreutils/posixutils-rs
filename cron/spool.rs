@@ -124,10 +124,12 @@ pub fn at(
 
     file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
 
-    println!(
+    // POSIX: the submission notice "job %s at %s\n" is written to standard error,
+    // with the date as `date +"%a %b %e %T %Y"` (audit #A3/#A14/#B2).
+    eprintln!(
         "job {} at {}",
         jobno,
-        execution_time.format("%a %b %d %H:%M:%S %Y")
+        execution_time.format("%a %b %e %H:%M:%S %Y")
     );
 
     Ok(())

@@ -236,7 +236,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 ### Priority issues
 
 #### Critical
-- [ ] **#A1 — Multi-operand `timespec` is unsupported; canonical examples fail.**
+- [x] **#A1 — Multi-operand `timespec` is unsupported; canonical examples fail.**
   The grammar (84859-84966) defines `timespec...` as multiple operands
   "interpreted as if they were separated by `<space>` characters and
   concatenated". Here `timespec` is one `Option<String>` (`at.rs:58-59`) and any
@@ -251,11 +251,11 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   satisfy the contract "to be executed at a later time" (84763-84764).
 
 #### Major
-- [ ] **#A3 — Submission notice printed to stdout, not stderr.** `at` prints
+- [x] **#A3 — Submission notice printed to stdout, not stderr.** `at` prints
   `job {n} at {date}` via `println!` (`at.rs:456-460`). STDERR (85015-85019):
   the `"job %s at %s\n"` line "shall be written to standard error". Fix: write
   to stderr.
-- [ ] **#A4 — `-l` output format diverges.** STDOUT (85008-85012) mandates
+- [x] **#A4 — `-l` output format diverges.** STDOUT (85008-85012) mandates
   `"%s\t%s\n", at_job_id, <date>` with the date as `date +"%a %b %e %T %Y"` in
   the user's TZ. `Display for JobInfo` emits `"{id}      {time}    {queue}"`
   (`at.rs:327-334`) — spaces not a tab, an extra queue column, day formatted
@@ -295,7 +295,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   mail per `-m`/default rules.
 
 #### Minor
-- [ ] **#A10 — Prompts written unconditionally to stdout.** `at <date>`, `at> `,
+- [x] **#A10 — Prompts written unconditionally to stdout.** `at <date>`, `at> `,
   `<EOT>` are written even when stdin is not a terminal (`at.rs:230-248`).
   STDOUT (85006): prompts "may be written" *when standard input is a terminal*.
   Writing always pollutes non-interactive pipelines. Fix: gate on `isatty(0)`.
@@ -303,7 +303,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   (`at.rs:558-593`); concurrent `at` invocations can compute the same id, and
   the subsequent `create_new` job file then errors out. Fix: `flock` the SEQ
   file across the increment (vixie uses a lock).
-- [ ] **#A12 — `setlocale` runs after clap parsing.** `Args::try_parse()` and
+- [x] **#A12 — `setlocale` runs after clap parsing.** `Args::try_parse()` and
   `validate_args` run (`at.rs:155-160`) before `setlocale` (`at.rs:162`), so the
   `gettext()` calls embedded in the clap attributes are evaluated in the C
   locale — localization is a no-op (same defect noted in `dev/lex`). Fix: call
@@ -311,10 +311,13 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
 - [ ] **#A13 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
   returns `true` for all when neither `/etc/at.allow` nor `/etc/at.deny` exists
   (`at.rs:603-619`); spec 84778-84779 restricts to appropriate-privilege.
-- [ ] **#A14 — Submission-notice date uses `%d` not `%e`.** `at.rs:459`; spec
+- [x] **#A14 — Submission-notice date uses `%d` not `%e`.** `at.rs:459`; spec
   date is `date +"%a %b %e %T %Y"` (space-padded day) (85011-85012).
 - [ ] **#A15 — Diagnostics hardcoded English.** No `gettext()` on runtime error
-  strings (LC_MESSAGES, 84986-84989).
+  strings (LC_MESSAGES, 84986-84989). Partial (Phase 3): `plib::diag` +
+  `init_locale` plumbing is in place and the locale is initialized before
+  parsing; string-level `gettext()` wrapping of the remaining error strings is
+  deferred.
 
 ### Detailed conformance matrix
 
@@ -383,12 +386,12 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
 - [ ] **#B1 — Batch jobs are never executed (#X1).** Filed into queue `b` of the
   at spool, which `crond` never scans. The "run by the system using algorithms
   based on unspecified factors" contract (86955-86957) cannot be met.
-- [ ] **#B2 — Submission notice printed to stdout, not stderr.** `println!("job
+- [x] **#B2 — Submission notice printed to stdout, not stderr.** `println!("job
   {} at {}", …)` (`batch.rs:166`). STDERR (87007-87008): `"job %s at %s\n"`
   goes to standard error. Fix: stderr.
 
 #### Minor
-- [ ] **#B3 — Prompts written unconditionally to stdout.** `at <date>` / `at> `
+- [x] **#B3 — Prompts written unconditionally to stdout.** `at <date>` / `at> `
   / `<EOT>` always emitted (`batch.rs:54-71`); spec 87004-87005 allows prompts
   only when stdin is a terminal.
 - [ ] **#B4 — Submission instant computed in local→UTC, ignoring `TZ`/format.**

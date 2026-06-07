@@ -49,7 +49,6 @@ fn test1() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
     let args = ["05:53amNOV4,2100", "-f", &file];
@@ -73,7 +72,6 @@ fn test2() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -96,7 +94,6 @@ fn test3() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -119,7 +116,6 @@ fn test4() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -142,7 +138,6 @@ fn test5() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -165,7 +160,6 @@ fn test6() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -188,7 +182,6 @@ fn test7() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -211,7 +204,6 @@ fn test8() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -234,7 +226,6 @@ fn test9() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -256,7 +247,6 @@ fn test10() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -285,7 +275,6 @@ fn test11() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
@@ -315,7 +304,6 @@ fn test12() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 

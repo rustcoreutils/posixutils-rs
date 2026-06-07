@@ -8,6 +8,7 @@
 //
 
 pub mod job;
+pub mod spool;
 
 // Path constants for cron system files
 #[cfg(target_os = "linux")]

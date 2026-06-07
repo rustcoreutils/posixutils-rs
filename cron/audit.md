@@ -71,8 +71,10 @@ Two issues span multiple binaries; they are referenced by per-utility items.
   execution minute, run the job at/after that time as its owning user, then
   unlink it; honor queue `b` (batch) "run when load permits" semantics.
 
-- [ ] **#X2 — Invoking identity is taken from spoofable `LOGNAME`/`getlogin`,
-  never `getuid()` (Major, security).** `crontab` trusts `$LOGNAME`
+- [x] **#X2 — Invoking identity is taken from spoofable `LOGNAME`/`getlogin`,
+  never `getuid()` (Major, security).** ✓ fixed (Phase 1): identity now resolves
+  via `getpwuid(getuid())` in `cron/spool.rs::User::current` and
+  `crontab.rs`; `$LOGNAME`/`getlogin()` are no longer consulted. `crontab` trusts `$LOGNAME`
   (`crontab.rs:91`); `at`/`batch` use `getlogin()` then fall back to `$LOGNAME`
   (`at.rs:621-634`, `batch.rs:331-344`). `grep -nE 'getuid|geteuid|getpwuid'
   cron/*.rs` → zero matches. `getlogin()` reflects the controlling terminal's
@@ -138,7 +140,7 @@ do no syntax validation.
   user's crontab entry is not submitted". The user gets no feedback and loses
   the whole crontab. Fix: parse before install; reject with a line-numbered
   diagnostic and non-zero exit, leaving the old entry intact.
-- [ ] **#C5 — Identity from `$LOGNAME` only (#X2).** `crontab.rs:91`.
+- [x] **#C5 — Identity from `$LOGNAME` only (#X2).** `crontab.rs:91`. ✓ fixed (Phase 1).
 
 #### Minor
 - [ ] **#C6 — Replace is non-atomic.** `replace_crontab` does
@@ -396,11 +398,12 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
   open-by-default (`batch.rs:313-329`); spec 86961-86962.
 - [ ] **#B6 — `SHELL`/`TZ` env semantics (86991-87000) not honored** — uses the
   passwd shell; no `TZ`-relative scheduling.
-- [ ] **#B7 — Massive duplication of `at.rs`.** `User`, `Job`, `next_job_id`,
+- [x] **#B7 — Massive duplication of `at.rs`.** `User`, `Job`, `next_job_id`,
   `get_job_dir`, `is_user_allowed`, `job_file_name` are copy-pasted
   (`batch.rs:82-397` ≈ `at.rs:259-686`). Not a conformance issue, but it
   guarantees the two binaries drift; the shared code belongs in `cron/job.rs` or
-  a new module. Quality follow-up.
+  a new module. Quality follow-up. ✓ fixed (Phase 1): hoisted into `cron/spool.rs`;
+  `batch.rs` is now a thin `at -q b -m now` wrapper.
 
 ### Detailed conformance matrix
 - [x] No options, no operands — clap-free `main` (87 lines).

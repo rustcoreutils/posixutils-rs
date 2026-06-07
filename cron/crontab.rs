@@ -88,8 +88,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = CronArgs::parse();
-    let Ok(logname) = env::var("LOGNAME") else {
-        eprintln!("Could not obtain the user's logname.");
+    // Identity comes from the real uid, never the spoofable $LOGNAME (audit #X2).
+    let Some(logname) = cron::spool::User::current().map(|u| u.name) else {
+        eprintln!("Could not determine the invoking user.");
         exit(1);
     };
 

@@ -16,6 +16,7 @@ pub mod options;
 pub mod register;
 pub mod search;
 pub mod shell;
+pub mod signals;
 pub mod ui;
 pub mod undo;
 

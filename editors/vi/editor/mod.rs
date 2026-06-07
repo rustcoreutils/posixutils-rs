@@ -422,6 +422,8 @@ impl Editor {
     fn run_visual_mode(&mut self) -> Result<i32> {
         self.terminal.enable_raw_mode()?;
         self.terminal.enter_alternate_screen()?;
+        // React to resize / job-control resume / interrupt while editing.
+        crate::signals::install_visual_handlers();
 
         let result = self.visual_main_loop();
 
@@ -558,11 +560,52 @@ impl Editor {
         while !self.should_quit && !self.ex_standalone_mode {
             self.refresh_screen()?;
 
-            let key = reader.read_key()?;
-            self.handle_key(key)?;
+            match reader.read_key() {
+                Ok(key) => self.handle_key(key)?,
+                Err(ViError::Interrupted) => {
+                    // The read was interrupted: service any pending signal and
+                    // redraw. If nothing is pending, it was a genuine EOF.
+                    if !self.handle_pending_signals()? {
+                        self.should_quit = true;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(())
+    }
+
+    /// Service any pending asynchronous signals. Returns `true` if at least one
+    /// was handled (the loop should redraw and keep running).
+    fn handle_pending_signals(&mut self) -> Result<bool> {
+        use crate::signals::{take, SIGCONT_RECEIVED, SIGINT_RECEIVED, SIGWINCH_RECEIVED};
+        let mut handled = false;
+
+        if take(&SIGCONT_RECEIVED) {
+            // Resumed from job-control stop: re-establish terminal state.
+            self.terminal.enable_raw_mode()?;
+            self.terminal.enter_alternate_screen()?;
+            self.terminal.refresh_size()?;
+            handled = true;
+        }
+        if take(&SIGWINCH_RECEIVED) {
+            // Window resized: refresh_screen() will redraw at the new size.
+            self.terminal.refresh_size()?;
+            handled = true;
+        }
+        if take(&SIGINT_RECEIVED) {
+            self.interrupt_command();
+            handled = true;
+        }
+        Ok(handled)
+    }
+
+    /// Handle an interrupt in command mode: discard any partial command and
+    /// alert the terminal (POSIX vi command-mode interrupt behavior).
+    fn interrupt_command(&mut self) {
+        self.parser.reset();
+        let _ = self.terminal.bell();
     }
 
     /// Handle a key press.
@@ -617,6 +660,12 @@ impl Editor {
                 // Display file info
                 let info = self.file_info();
                 self.set_message(&info);
+                return Ok(());
+            }
+            Key::Ctrl('c') => {
+                // Interrupt (raw mode delivers ^C as a byte): discard the
+                // partial command and ring the bell.
+                self.interrupt_command();
                 return Ok(());
             }
             Key::Ctrl('r') | Key::Ctrl('l') => {

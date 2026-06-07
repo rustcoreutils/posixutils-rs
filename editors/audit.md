@@ -41,10 +41,10 @@ crate implements ERE and does **not** support in-pattern back-references.
 | Signal | `ed` | `vi` / `ex` |
 |---|---|---|
 | SIGHUP | handler → writes buffer to `ed.hup` (`ed_main.rs:46-67`, `editor.rs:1541-1572`) | **none** — no buffer preservation |
-| SIGINT | flag + `?` (`ed_main.rs:41-43`, `editor.rs:1523-1538`) | **none** (raw mode clears `ISIG`, so `^C` arrives as byte 0x03 and is dropped) |
+| SIGINT | flag + `?` (`ed_main.rs:41-43`, `editor.rs:1523-1538`) | ✓ fixed (phase 5) — `^C`/SIGINT rings bell + cancels command (`signals.rs`) |
 | SIGQUIT | `SIG_IGN` (`ed_main.rs:54-55`) | **none** |
-| SIGWINCH | N/A (non-visual) | **none** — terminal resize silently corrupts the display |
-| SIGCONT | N/A | **none** — after `^Z`/resume the terminal is left in cooked mode |
+| SIGWINCH | N/A (non-visual) | ✓ fixed (phase 5) — resize → refresh size + redraw |
+| SIGCONT | N/A | ✓ fixed (phase 5) — resume → re-enter raw mode + redraw |
 | SIGTSTP | N/A | only `raise(SIGTSTP)` for `:suspend` (`editor/mod.rs:2415-2418`) |
 
 `vi`/`ex` install **zero** signal handlers. SIGWINCH + SIGCONT are mandatory for
@@ -187,8 +187,8 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 ### Priority issues
 
 #### Critical
-- [ ] **#V1 — SIGWINCH not handled.** No handler anywhere in `vi/`. Terminal resize mid-edit corrupts the display with no recovery. Fix: `sigaction` handler → atomic flag → main loop refreshes size + full redraw.
-- [ ] **#V2 — SIGCONT not handled.** After `^Z` (or `:suspend`) + resume, the terminal stays in cooked mode. Fix: SIGCONT handler re-enables raw mode and redraws.
+- [x] **#V1 — SIGWINCH not handled.** ✓ fixed (phase 5): new `vi/signals.rs` installs a SIGWINCH handler (atomic flag); the input loop catches the `EINTR` (`reader.rs` now surfaces it as `ViError::Interrupted`), calls `terminal.refresh_size()`, and `refresh_screen()` redraws at the new size. PTY test: `test_pty_vi_resize_survives_and_saves`.
+- [x] **#V2 — SIGCONT not handled.** ✓ fixed (phase 5): SIGCONT handler set; on resume the loop re-enables raw mode, re-enters the alternate screen, refreshes size, and redraws (`handle_pending_signals`).
 - [ ] **#V3 — SIGHUP not handled; no buffer preservation.** Spec: hangup/EOF-on-input ⇒ preserve buffer. Currently the buffer is lost. Fix: SIGHUP handler writes a recovery/`dead.letter`-style file then exits.
 
 #### Major
@@ -196,7 +196,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [ ] **#V5 — `-t tagstring` hard-errors; `^]` is a stub.** `lib.rs:188`, `editor/mod.rs:3071-3074`. *(verified: `vi -t main` → "vi: tag mode not supported", exit 1)*. Fix: parse `tags` (ctags format), literal-string lookup, jump.
 - [ ] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** In the parser's simple-command list but no arm in `execute_command`; they silently do nothing. Fix: implement `move_sentence_{forward,backward}` and wire them.
 - [ ] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** `command/parser.rs:272`; no executor arm. Fix: add arm → `current + count − 1`, first non-blank.
-- [ ] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** `ui/terminal.rs:74`. `^C` arrives as byte 0x03 and is silently discarded; spec wants the terminal alerted and partial command discarded. Fix: keep `ISIG` or install a SIGINT handler; bell + cancel pending command.
+- [x] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** ✓ fixed (phase 5): `^C` (byte 0x03 → `Key::Ctrl('c')`) now rings the bell and resets the command parser (`interrupt_command`); a SIGINT *signal* (e.g. `kill -INT`) is also caught via the handler and routed to the same path. PTY test: `test_pty_vi_interrupt_cancels_count`.
 - [ ] **#V9 — `EXINIT=""` does not suppress `$HOME/.exrc`.** `editor/mod.rs:2023` checks `!exinit.is_empty()` before processing, so an empty-but-set `EXINIT` falls through and sources `.exrc`. Spec: presence (even empty) suppresses `.exrc`. Fix: branch on *is-set*, not *non-empty*.
 - [x] **#V10 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): `run_editor` calls `setlocale(LC_ALL, "")` (`vi/lib.rs`), enabling locale-aware libc regex and `LC_MESSAGES`. (Word/case ops still use Rust built-ins — minor, no spec `shall`.)
 
@@ -228,8 +228,8 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [ ] **`TERM` PARTIAL** — read but no terminfo lookup.
 
 #### ASYNCHRONOUS EVENTS
-- [ ] **SIGWINCH / SIGCONT / SIGHUP MISSING** — #V1/#V2/#V3.
-- [ ] **SIGINT PARTIAL** — #V8.  `:suspend` raises SIGTSTP but no SIGCONT re-entry (#V2).
+- [x] **SIGWINCH / SIGCONT** — ✓ fixed (phase 5), #V1/#V2. **SIGHUP** still open — #V3 (phase 6).
+- [x] **SIGINT** — ✓ fixed (phase 5), #V8; `:suspend`/resume now redraws via the SIGCONT path (#V2).
 
 #### Command set
 - [x] Motions `h j k l w W b B e E 0 $ ^ f F t T ; , G H M L { } [[ ]] |` CONFORM — `command/motion.rs`, `editor/mod.rs`.

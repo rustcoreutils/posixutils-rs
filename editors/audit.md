@@ -193,7 +193,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### Major
 - [x] **#V4 — `-r` recovery hard-errors and exits.** ✓ fixed (phase 6): `vi -r` lists recoverable buffers; `vi -r file` recovers the newest saved buffer for that file (`Editor::recover`). Stale recovery files (>14 days) are pruned at startup.
-- [ ] **#V5 — `-t tagstring` hard-errors; `^]` is a stub.** `lib.rs:188`, `editor/mod.rs:3071-3074`. *(verified: `vi -t main` → "vi: tag mode not supported", exit 1)*. Fix: parse `tags` (ctags format), literal-string lookup, jump.
+- [x] **#V5 — `-t tagstring` hard-errors; `^]` is a stub.** ✓ fixed (phase 7): new `vi/tags.rs` parses ctags `tags` files (honoring `tags`/`taglength`), does a literal tagstring lookup, opens the target file, and jumps to the line-number or `/pattern/` address. Wired to `-t`, `:tag`, and `^]`.
 - [ ] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** In the parser's simple-command list but no arm in `execute_command`; they silently do nothing. Fix: implement `move_sentence_{forward,backward}` and wire them.
 - [ ] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** `command/parser.rs:272`; no executor arm. Fix: add arm → `current + count − 1`, first non-blank.
 - [x] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** ✓ fixed (phase 5): `^C` (byte 0x03 → `Key::Ctrl('c')`) now rings the bell and resets the command parser (`interrupt_command`); a SIGINT *signal* (e.g. `kill -INT`) is also caught via the handler and routed to the same path. PTY test: `test_pty_vi_interrupt_cancels_count`.
@@ -213,7 +213,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 #### OPTIONS
 - [x] `-R` CONFORMS — `lib.rs:173`.
 - [x] `-c command` / `+command` CONFORMS — `lib.rs:179-185,212-213`.
-- [ ] **`-r` MISSING** — #V4.  **`-t` MISSING** — #V5.  **`-w` PARTIAL** — #V11.
+- [x] **`-r`** ✓ (phase 6, #V4); **`-t`** ✓ (phase 7, #V5).  **`-w` PARTIAL** — #V11.
 - [ ] `-s`/`-h`/`--version` accepted (extensions / ex-only on vi) — DIVERGES, harmless.
 
 #### OPERANDS / STDIN / INPUT FILES
@@ -235,7 +235,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] Motions `h j k l w W b B e E 0 $ ^ f F t T ; , G H M L { } [[ ]] |` CONFORM — `command/motion.rs`, `editor/mod.rs`.
 - [ ] **`(` `)` MISSING** (#V6); **`_` MISSING** (#V7).
 - [x] Scrolling `^F ^B ^D ^U ^E ^Y z` CONFORM.
-- [ ] **`^L`/`^R` PARTIAL** (#V14); **`^]` MISSING** (#V5).
+- [x] **`^]`** ✓ tag jump (phase 7, #V5).  **`^L`/`^R` PARTIAL** — #V14.
 - [x] Editing `i I a A o O c C cc d D dd x X r R y Y p P J ~ < > .` CONFORM.
 - [ ] **`s`/`S` PARTIAL** — do not save deleted text to the named buffer (`editor/mod.rs:698,705`).
 - [x] `u U`, marks `m ' \``, `: / ? n N % & @ " Q ZZ ! ^^` CONFORM (search is #V16).
@@ -294,7 +294,7 @@ mandated mark-then-execute.
 
 #### Major
 - [ ] **#X7 — `global`/`v` appears single-pass.** `parser.rs:519-544` stores the command string and dispatches per match without a mark-first pass; line-inserting/deleting commands corrupt iteration. Fix: collect matching line numbers first, then execute against stable marks.
-- [ ] **#X8 — `-t tagstring` hard-errors.** `lib.rs:187-189`. *(verified: exit 1)*. Fix: ctags lookup + jump (shared with vi-#V5).
+- [x] **#X8 — `-t tagstring` hard-errors.** ✓ fixed (phase 7): shared `vi/tags.rs`; `ex -t` and `:tag` resolve via the ctags file. Tests: `tags::tests::*`, `test_ex_tag_lookup`.
 - [ ] **#X9 — Address offset after an address is parsed then discarded.** `address.rs:296-310` computes the offset but never applies it to the base address. Fix: add the offset to the resolved address.
 - [ ] **#X10 — `;` separator treated like `,`.** `address.rs:315`; does not set current line to the first address before parsing the second. Fix: resolve first address, set `.`, then parse second.
 - [ ] **#X11 — stdin-not-a-tty does not auto-enable `-s`.** Spec: non-terminal stdin ⇒ behave as `-s`. Only the explicit flag sets `silent_mode` (`lib.rs:197`). Fix: `stdin().is_terminal()` check at startup.
@@ -318,7 +318,7 @@ mandated mark-then-execute.
 #### OPTIONS
 - [x] `-R` CONFORMS; `-v` CONFORMS (`lib.rs`).
 - [ ] **`-c`/`+command` PARTIAL** — run unconditionally, not only on first existing-file load.
-- [ ] **`-s` PARTIAL** (#X3); **`-r` MISSING** (#X5); **`-t` MISSING** (#X8); **`-w` PARTIAL** (parsed, not applied).
+- [x] **`-r`** ✓ (phase 6, #X5); **`-t`** ✓ (phase 7, #X8).  **`-s` PARTIAL** — #X3; **`-w` PARTIAL** — parsed, not applied.
 
 #### OPERANDS / STDIN
 - [x] **EOF-as-SIGHUP** — ✓ fixed (phase 6), #X6.  **`{LINE_MAX}` limit MISSING** — minor.

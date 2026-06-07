@@ -7,37 +7,20 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{DateTime, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{getlogin, getpwnam, passwd};
+use cron::spool::{at, get_job_dir, print_err_and_exit};
+use gettextrs::gettext;
 use timespec::Timespec;
 
 use std::{
-    collections::{BTreeMap, HashSet},
-    env,
-    ffi::{CStr, CString},
+    collections::BTreeMap,
     fmt::Display,
     fs::{self, File},
-    io::{BufRead, Read, Seek, Write},
-    os::unix::fs::PermissionsExt,
+    io::{BufRead, IsTerminal, Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process,
     str::FromStr,
 };
-
-#[cfg(target_os = "linux")]
-const SPOOL_DIRECTORIES: &[&str] = &[
-    "/var/spool/cron/atjobs/",
-    "/var/spool/at/",
-    "/var/spool/atjobs/",
-];
-
-#[cfg(target_os = "macos")]
-const MACOS_DIRECTORY: &str = "/var/at/jobs/";
-
-#[cfg(target_os = "linux")]
-const DEFAULT_DIRECTORY: &str = "/var/spool/atjobs/";
 
 /// at - execute commands at a later time
 #[derive(Parser, Debug)]
@@ -54,9 +37,6 @@ const DEFAULT_DIRECTORY: &str = "/var/spool/atjobs/";
                   at -l [at_job_id...]"
 ))]
 struct Args {
-    /// Submit the job to be run at the date and time specified.
-    #[arg(value_name = "TIMESPEC", required = false, help = gettext("Submit the job to be run at the date and time specified."))]
-    timespec: Option<String>,
     /// Displays a list of all scheduled jobs
     #[arg(short = 'l', long = "list", help = gettext("Displays a list of all scheduled jobs"))]
     list: bool,
@@ -81,109 +61,81 @@ struct Args {
     #[arg(short = 't', long = "time", value_name = "TIME_ARG", help = gettext("Submit the job to be run at the time specified by the time option-argument."))]
     time: Option<String>,
 
-    /// Job IDs for reporting jobs scheduled for the invoking user.
-    #[arg(value_name = "AT_JOB_ID", required = false, help = gettext("Job IDs for reporting jobs scheduled"))]
-    at_job_ids: Vec<u32>,
+    /// timespec words (when submitting), or at_job_id operands with -l / -r.
+    #[arg(value_name = "ARG", help = gettext("timespec words, or at_job_id operands with -l/-r"))]
+    operands: Vec<String>,
 }
 
-impl Args {
-    pub fn validate_args(&mut self) -> Result<(), String> {
-        // Check for incompatibility of the `-l` (list jobs) option with other options
-        if self.list {
-            if let Some(timespec) = self.timespec.take() {
-                let id = timespec
-                    .parse()
-                    .map_err(|e| format!("Failed to parse job ID. Reason: {e}"))?;
-                self.at_job_ids.push(id);
-            }
-            if self.remove || self.time.is_some() || self.file.is_some() || self.mail {
-                return Err("Option '-l' cannot be used with '-r', '-t', '-m' or -f".to_string());
-            }
-
-            if self.queue.is_some() && !self.at_job_ids.is_empty() {
-                return Err("at -l -q queueename cannot be used with AT_JOB_IDs".to_string());
-            }
-        }
-
-        // Check for incompatibility of the `-r` (remove jobs) option with other options
-        if self.remove {
-            if let Some(timespec) = self.timespec.take() {
-                let id = timespec
-                    .parse()
-                    .map_err(|e| format!("Failed to parse job ID. Reason: {e}"))?;
-                self.at_job_ids.push(id);
-            }
-
-            if self.list
-                || self.time.is_some()
-                || self.file.is_some()
-                || self.mail
-                || self.queue.is_some()
-            {
-                return Err(
-                    "Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'".to_string(),
-                );
-            }
-        }
-
-        // Checking if `TIMESPEC` and `-t` are specified at the same time
-        if self.timespec.is_some() && self.time.is_some() {
-            return Err("Options TIMESPEC and '-t' cannot be used together".to_string());
-        }
-
-        // Check if `TIMESPEC` or `-t` is specified with `AT_JOB_ID`
-        if (!self.at_job_ids.is_empty()) && (self.timespec.is_some() || self.time.is_some()) {
-            return Err("AT_JOB_ID cannot be used with TIMESPEC or '-t'".to_string());
-        }
-
-        // Checking the queue for correctness
-        if let Some(queue) = self.queue {
-            if !queue.is_ascii_lowercase() {
-                return Err(
-                    "Invalid queue name. Queue must be a single lowercase ASCII letter."
-                        .to_string(),
-                );
-            }
-        }
-
-        // If all checks are successful
-        Ok(())
-    }
+/// Parse the operand list as numeric at_job_id values (used with -l / -r).
+fn parse_job_ids(operands: &[String]) -> Result<Vec<u32>, String> {
+    operands
+        .iter()
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|e| format!("invalid at_job_id '{s}': {e}"))
+        })
+        .collect()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = Args::try_parse().unwrap_or_else(|err| {
+    // Initialize the locale before clap parses, so the gettext-decorated help and
+    // diagnostics are localized (audit #A12).
+    plib::diag::init_locale("at");
+
+    let args = Args::try_parse().unwrap_or_else(|err| {
         eprintln!("{}", err);
         std::process::exit(1);
     });
 
-    args.validate_args()?;
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    if let Some(queue) = args.queue {
+        if !queue.is_ascii_lowercase() {
+            return Err(
+                "Invalid queue name. Queue must be a single lowercase ASCII letter.".into(),
+            );
+        }
+    }
 
     if args.remove {
-        remove_jobs(&args.at_job_ids)?;
+        if args.list
+            || args.time.is_some()
+            || args.file.is_some()
+            || args.mail
+            || args.queue.is_some()
+        {
+            return Err("Option '-r' cannot be used with '-l', '-t', '-m', '-q' or '-f'".into());
+        }
+        let ids = parse_job_ids(&args.operands)?;
+        if ids.is_empty() {
+            // POSIX: `at -r at_job_id...` requires at least one operand.
+            return Err("at -r requires at least one at_job_id operand".into());
+        }
+        remove_jobs(&ids)?;
         return Ok(());
     }
 
     if args.list {
+        if args.time.is_some() || args.file.is_some() || args.mail {
+            return Err("Option '-l' cannot be used with '-t', '-m' or -f".into());
+        }
+        let ids = parse_job_ids(&args.operands)?;
+        if args.queue.is_some() && !ids.is_empty() {
+            return Err("at -l -q queuename cannot be used with at_job_id operands".into());
+        }
+
         let list = list_jobs(get_job_dir()?);
         if list.is_empty() {
             return Ok(());
         }
         if let Some(queue) = args.queue {
-            let queue_jobs = jobs_in_queue(queue, &list);
-            for job in queue_jobs {
+            for job in jobs_in_queue(queue, &list) {
                 println!("{}", job);
             }
-        } else if !args.at_job_ids.is_empty() {
-            for id in args.at_job_ids {
+        } else if !ids.is_empty() {
+            for id in ids {
                 if let Some(job) = list.get(&id) {
                     println!("{}", job);
                 } else {
-                    eprintln!("Job with ID {} not found", id);
+                    plib::diag::error(&format!("no such job: {id}"));
                 }
             }
         } else {
@@ -194,61 +146,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let time = match (args.time, args.timespec) {
-        (None, None) => print_err_and_exit(1, "You need `timespec` arg or `-t` flag"),
-        (None, Some(timespec)) => Timespec::from_str(&timespec)?
-            .to_date_time()
-            .ok_or("Failed to parse `timespec` did you set too big date?")?,
-        (Some(time), None) => time::parse_time_posix(&time)?,
-        (Some(_), Some(_)) => print_err_and_exit(
-            1,
-            "You can't specify time twice. Use only `timespec` arg or `-t` flag",
-        ),
+    // Submission path: a -t time_arg, or a timespec built from the operands.
+    let time = match (&args.time, args.operands.is_empty()) {
+        (Some(_), false) => {
+            return Err("a timespec and the -t option cannot be used together".into())
+        }
+        (None, true) => print_err_and_exit(1, "you need a timespec or the -t option"),
+        (Some(time_arg), true) => time::parse_time_posix(time_arg)?,
+        (None, false) => {
+            // Operands are concatenated and all white space stripped, per the
+            // timespec grammar where white space merely delimits tokens (#A1).
+            let timespec: String = args
+                .operands
+                .iter()
+                .flat_map(|s| s.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            Timespec::from_str(&timespec)?
+                .to_date_time()
+                .ok_or("Failed to parse `timespec`: date out of range?")?
+        }
     };
 
     let cmd = match args.file {
         Some(path) => {
-            let path = match path.is_absolute() {
-                true => path,
-                false => std::env::current_dir().ok().unwrap_or_default().join(path),
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().ok().unwrap_or_default().join(path)
             };
 
             let mut file = File::open(path)
                 .map_err(|e| format!("Failed to open command file. Reason: {e}"))?;
 
             let mut buf = String::new();
-
             file.read_to_string(&mut buf)
                 .map_err(|e| format!("Failed to read command file. Reason: {e}"))?;
 
             buf
         }
-        None => {
-            let stdout = std::io::stdout();
-            let mut stdout_lock = stdout.lock();
-
-            writeln!(&mut stdout_lock, "at {}", time.to_rfc2822())?;
-            write!(&mut stdout_lock, "at> ")?;
-            stdout_lock.flush()?;
-
-            let stdin = std::io::stdin();
-            let mut stdin_lock = stdin.lock();
-
-            let mut result = Vec::new();
-            let mut buf = String::new();
-
-            while stdin_lock.read_line(&mut buf)? != 0 {
-                write!(&mut stdout_lock, "at> ")?;
-                stdout_lock.flush()?;
-
-                result.push(buf.to_owned());
-            }
-
-            writeln!(&mut stdout_lock, "<EOT>")?;
-            stdout_lock.flush()?;
-
-            result.join("\n")
-        }
+        None => read_commands_from_stdin(&time)?,
     };
 
     let _ = at(args.queue, &time, cmd, args.mail).inspect_err(|err| print_err_and_exit(1, err));
@@ -256,53 +193,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Returns the path to the jobs directory, adjusted for the operating system.
-/// On Linux: checks the `AT_JOB_DIR` environment variable, then predefined directories.
-/// On macOS: checks or creates the `/var/at/jobs` directory.
-fn get_job_dir() -> Result<String, String> {
-    // Check `AT_JOB_DIR` environment variable
-    if let Ok(env_dir) = env::var("AT_JOB_DIR") {
-        if Path::new(&env_dir).exists() {
-            return Ok(env_dir);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // Check the predefined spool directories
-        for dir in SPOOL_DIRECTORIES {
-            if Path::new(dir).exists() {
-                return Ok(dir.to_string());
+/// Read the at-job commands from standard input. Prompts are written only when
+/// standard input is a terminal (audit #A10).
+fn read_commands_from_stdin(time: &chrono::DateTime<chrono::Utc>) -> std::io::Result<String> {
+    let stdin = std::io::stdin();
+    let mut cmd = String::new();
+
+    if stdin.is_terminal() {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "at {}", time.to_rfc2822())?;
+        let mut line = String::new();
+        loop {
+            write!(out, "at> ")?;
+            out.flush()?;
+            line.clear();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break;
             }
+            cmd.push_str(&line);
         }
-
-        // Create the default directory if none exist
-        let default_path = Path::new(DEFAULT_DIRECTORY);
-        if !default_path.exists() {
-            if let Err(err) = fs::create_dir_all(default_path) {
-                return Err(format!(
-                    "Failed to create directory {}: {}",
-                    DEFAULT_DIRECTORY, err
-                ));
-            }
-        }
-
-        Ok(DEFAULT_DIRECTORY.to_string())
+        writeln!(out, "<EOT>")?;
+        out.flush()?;
+    } else {
+        stdin.lock().read_to_string(&mut cmd)?;
     }
-    #[cfg(target_os = "macos")]
-    {
-        let macos_path = Path::new(MACOS_DIRECTORY);
 
-        if !macos_path.exists() {
-            if let Err(err) = fs::create_dir_all(macos_path) {
-                return Err(format!(
-                    "Failed to create directory {}: {}",
-                    MACOS_DIRECTORY, err
-                ));
-            }
-        }
-
-        Ok(MACOS_DIRECTORY.to_string())
-    }
+    Ok(cmd)
 }
 
 /// Checks if the file name matches the job format
@@ -326,11 +242,8 @@ struct JobInfo {
 
 impl Display for JobInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}      {}    {}",
-            self.id, self.formatted_time, self.queue
-        )
+        // POSIX -l format: "%s\t%s\n", at_job_id, <date> (audit #A4).
+        write!(f, "{}\t{}", self.id, self.formatted_time)
     }
 }
 
@@ -368,10 +281,21 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
     // get a list of all jobs
     let jobs = list_jobs(path);
 
+    // SAFETY: getuid() never fails.
+    let uid = unsafe { libc::getuid() };
+
     // Go through all the job identifiers
     for job_id in job_ids {
         if let Some(job_info) = jobs.get(job_id) {
             let file_path = path.join(&job_info.file_name);
+
+            // Only the job's owner (or root) may remove it (audit #A7).
+            let meta = fs::symlink_metadata(&file_path)
+                .map_err(|e| format!("Could not stat job {}: {}", job_id, e))?;
+            if uid != 0 && meta.uid() != uid {
+                return Err(format!("you do not own job {}", job_id));
+            }
+
             // Delete the file
             if let Err(e) = fs::remove_file(&file_path) {
                 return Err(format!(
@@ -386,14 +310,11 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
-/// Formats the execution time as `Thu Dec 12 10:44:00 2024`
-fn format_execution_time(duration_seconds: u32) -> String {
-    let datetime = DateTime::from_timestamp(duration_seconds as i64, 0);
-    if let Some(dt) = datetime {
-        dt.format("%a %b %d %H:%M:%S %Y").to_string()
-    } else {
-        "Invalid time".to_string()
-    }
+/// Format the execution time in the user's timezone as `date +"%a %b %e %T %Y"`
+/// (audit #A4/#A14), e.g. `Thu Dec 12 10:44:00 2024`.
+fn format_execution_time(epoch_seconds: u32) -> String {
+    plib::locale::strftime("%a %b %e %H:%M:%S %Y", epoch_seconds as i64)
+        .unwrap_or_else(|_| "Invalid time".to_string())
 }
 
 /// Scans the directory, collects the jobs
@@ -418,275 +339,8 @@ where
     queues
 }
 
-fn print_err_and_exit(exit_code: i32, err: impl std::fmt::Display) -> ! {
-    eprintln!("{}", err);
-    process::exit(exit_code)
-}
-
-fn at(
-    queue: Option<char>,
-    execution_time: &DateTime<Utc>,
-    cmd: impl Into<String>,
-    mail: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let jobno = next_job_id()?;
-    let job_filename = job_file_name(jobno, queue, execution_time)
-        .ok_or("Failed to generate file name for job")?;
-
-    let user = User::new().ok_or("Failed to get current user")?;
-    if !is_user_allowed(&user.name) {
-        return Err(format!("Access denied for user: {}", &user.name).into());
-    }
-
-    let job = Job::new(&user, std::env::current_dir()?, std::env::vars(), cmd, mail).into_script();
-
-    let mut file_opt = std::fs::OpenOptions::new();
-    file_opt.read(true).write(true).create_new(true);
-
-    let file_path = PathBuf::from(format!("{}/{job_filename}", get_job_dir()?));
-
-    let mut file = file_opt
-        .open(&file_path)
-        .map_err(|e| format!("Failed to create file with job. Reason: {e}"))?;
-
-    file.write_all(job.as_bytes())?;
-
-    file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-
-    println!(
-        "job {} at {}",
-        jobno,
-        execution_time.format("%a %b %d %H:%M:%S %Y")
-    );
-
-    Ok(())
-}
-
-/// Structure to represent future job or script to be saved
-pub struct Job {
-    shell: String,
-    user_uid: u32,
-    user_gid: u32,
-    user_name: String,
-    env: std::env::Vars,
-    call_place: PathBuf,
-    cmd: String,
-    mail: bool,
-}
-
-impl Job {
-    pub fn new(
-        User {
-            shell,
-            uid,
-            gid,
-            name,
-        }: &User,
-        call_place: PathBuf,
-        env: std::env::Vars,
-        cmd: impl Into<String>,
-        mail: bool,
-    ) -> Self {
-        Self {
-            shell: shell.to_owned(),
-            user_uid: *uid,
-            user_gid: *gid,
-            user_name: name.to_owned(),
-            env,
-            call_place,
-            cmd: cmd.into(),
-            mail,
-        }
-    }
-
-    pub fn into_script(self) -> String {
-        let Self {
-            shell,
-            user_uid,
-            user_gid,
-            user_name,
-            env,
-            call_place,
-            cmd,
-            mail,
-        } = self;
-
-        let env = env
-            .into_iter()
-            .map(|(key, value)| format!("{}={}; export {}", key, value, key))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask 22\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
-            if mail {1} else {0},
-            call_place.to_string_lossy()
-        )
-    }
-}
-
-/// Return name for job number
-///
-/// None if DateTime < [DateTime::UNIX_EPOCH]
-fn job_file_name(next_job: u32, queue: Option<char>, time: &DateTime<Utc>) -> Option<String> {
-    let duration = time.signed_duration_since(DateTime::UNIX_EPOCH);
-    let duration_seconds = u32::try_from(duration.num_seconds()).ok()? / 60;
-    let queue = queue.unwrap_or('a');
-    let result = format!("{queue}{next_job:05x}{duration_seconds:08x}");
-
-    Some(result)
-}
-
-#[derive(Debug)]
-pub enum NextJobError {
-    Io(std::io::Error),
-    FromStr(std::num::ParseIntError),
-}
-
-impl std::fmt::Display for NextJobError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Error reading id of next job. Reason: ")?;
-        match self {
-            NextJobError::Io(err) => writeln!(f, "{err}"),
-            NextJobError::FromStr(err) => writeln!(f, "invalid number - {err}"),
-        }
-    }
-}
-
-impl std::error::Error for NextJobError {}
-
-fn next_job_id() -> Result<u32, Box<dyn std::error::Error>> {
-    let mut file_opt = std::fs::OpenOptions::new();
-    file_opt.read(true).write(true);
-
-    let mut buf = String::new();
-    let job_file_number = format!("{}.SEQ", get_job_dir()?);
-
-    let (next_job_id, mut file) = match file_opt.open(&job_file_number) {
-        Ok(mut file) => {
-            file.read_to_string(&mut buf).map_err(NextJobError::Io)?;
-            file.rewind().map_err(NextJobError::Io)?;
-
-            (
-                u32::from_str_radix(buf.trim_end_matches("\n"), 16)
-                    .map_err(NextJobError::FromStr)?,
-                file,
-            )
-        }
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => (
-                0,
-                std::fs::File::create_new(job_file_number).map_err(NextJobError::Io)?,
-            ),
-
-            _ => Err(NextJobError::Io(err))?,
-        },
-    };
-
-    // Limit range of jobs to 2^20 jobs
-    let next_job_id = (1 + next_job_id) % 0xfffff;
-
-    file.write_all(format!("{next_job_id:05x}").as_bytes())
-        .map_err(NextJobError::Io)?;
-
-    Ok(next_job_id)
-}
-
-fn read_user_file(file_path: &str) -> std::io::Result<HashSet<String>> {
-    let content = std::fs::read_to_string(file_path)?;
-    Ok(content
-        .lines()
-        .map(|line| line.trim().to_string())
-        .collect())
-}
-
-fn is_user_allowed(user: &str) -> bool {
-    let allow_file = "/etc/at.allow";
-    let deny_file = "/etc/at.deny";
-
-    if let Ok(allowed_users) = read_user_file(allow_file) {
-        // If at.allow exists, only users from this file have access
-        return allowed_users.contains(user);
-    }
-
-    if let Ok(denied_users) = read_user_file(deny_file) {
-        // If there is no at.allow, but there is at.deny, check if the user is blacklisted
-        return !denied_users.contains(user);
-    }
-
-    // If there are no files, access is allowed to all
-    true
-}
-
-fn login_name() -> Option<String> {
-    // Try to get the login name using getlogin
-    unsafe {
-        let login_ptr = getlogin();
-        if !login_ptr.is_null() {
-            if let Ok(c_str) = CStr::from_ptr(login_ptr).to_str() {
-                return Some(c_str.to_string());
-            }
-        }
-    }
-
-    // Fall back to checking the LOGNAME environment variable
-    env::var("LOGNAME").ok()
-}
-
-pub struct User {
-    pub name: String,
-    pub shell: String,
-    pub uid: u32,
-    pub gid: u32,
-}
-
-impl User {
-    pub fn new() -> Option<Self> {
-        const DEFAULT_SHELL: &str = "/bin/sh";
-
-        let login_name = login_name()?;
-
-        let passwd {
-            pw_uid,
-            pw_gid,
-            pw_shell,
-            ..
-        } = user_info_by_name(&login_name)?;
-
-        let pw_shell = match pw_shell.is_null() {
-            true => std::env::var("SHELL")
-                .ok()
-                .unwrap_or(DEFAULT_SHELL.to_owned()),
-            false => unsafe {
-                CStr::from_ptr(pw_shell)
-                    .to_str()
-                    .ok()
-                    .unwrap_or(DEFAULT_SHELL)
-                    .to_owned()
-            },
-        };
-
-        Some(Self {
-            shell: pw_shell,
-            uid: pw_uid,
-            gid: pw_gid,
-            name: login_name,
-        })
-    }
-}
-
-fn user_info_by_name(name: &str) -> Option<passwd> {
-    let c_name = CString::new(name).unwrap();
-    let pw_ptr = unsafe { getpwnam(c_name.as_ptr()) };
-    if pw_ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { *pw_ptr })
-    }
-}
-
 mod time {
-    use chrono::{offset::LocalResult, DateTime, Datelike, TimeZone, Utc};
+    use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 
     // Copy from `touch`
     pub fn parse_time_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
@@ -759,15 +413,17 @@ mod time {
         let minute = minute_str.parse::<u32>()?;
         let secs = seconds.parse::<u32>()?;
 
-        // convert to DateTime and validate input
-        let res = Utc.with_ymd_and_hms(year, month, day, hour, minute, secs);
-        if res == LocalResult::None {
-            return Err("Invalid time".into());
-        }
-
-        // return parsed date
-        let dt = res.unwrap();
-        Ok(dt)
+        // The -t time_arg names a wall-clock time in the user's timezone
+        // (honoring TZ via the local timezone); convert it to an absolute
+        // instant for storage (audit #A5).
+        let naive = NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(hour, minute, secs))
+            .ok_or("Invalid time")?;
+        let dt = Local
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or("Invalid or ambiguous local time")?;
+        Ok(dt.with_timezone(&Utc))
     }
 }
 
@@ -1059,141 +715,72 @@ mod timespec {
     }
 
     impl Time {
-        pub fn to_naive_time(&self) -> Option<chrono::NaiveTime> {
+        /// The wall-clock time the user typed, with no timezone conversion. Any
+        /// timezone suffix is applied later by [`Timespec::to_date_time`] once
+        /// the date is known (audit #A5/#A6).
+        fn base_naive_time(&self) -> Option<NaiveTime> {
+            fn to_24(hour: u8, am: &AmPm) -> u32 {
+                match am {
+                    AmPm::Am => u32::from(hour),
+                    AmPm::Pm => u32::from(hour) + 12,
+                }
+            }
+
             match self {
                 Time::Midnight => NaiveTime::from_hms_opt(0, 0, 0),
                 Time::Noon => NaiveTime::from_hms_opt(12, 0, 0),
-                Time::Hr24clockHour(hr24_clock) => {
-                    let Hr24Clock([hour, minute]) = *hr24_clock;
-
-                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
+                Time::Hr24clockHour(c) | Time::Hr24clockHourTimezone { hr24_clock: c, .. } => {
+                    let Hr24Clock([hour, minute]) = c;
+                    NaiveTime::from_hms_opt(u32::from(*hour), u32::from(*minute), 0)
                 }
-                Time::Hr24clockHourTimezone {
-                    hr24_clock,
-                    timezone,
+                Time::Hr24clockHourMinute { hour, minute }
+                | Time::Hr24clockHourMinuteTimezone { hour, minute, .. } => {
+                    let Hr24ClockHour(hour) = hour;
+                    let Minute(minute) = minute;
+                    NaiveTime::from_hms_opt(u32::from(*hour), u32::from(*minute), 0)
+                }
+                Time::WallclockHour { clock, am }
+                | Time::WallclockHourTimezone { clock, am, .. } => {
+                    let WallClock { hour, minutes } = clock;
+                    NaiveTime::from_hms_opt(to_24(hour.get(), am), u32::from(*minutes), 0)
+                }
+                Time::WallclockHourMinute { clock, minute, am }
+                | Time::WallclockHourMinuteTimezone {
+                    clock, minute, am, ..
                 } => {
-                    let Hr24Clock([hour, minute]) = *hr24_clock;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour.into(), minute.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
-                }
-                Time::Hr24clockHourMinute { hour, minute } => {
-                    let Hr24ClockHour(hour) = *hour;
-                    let Minute(minute) = *minute;
-
-                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
-                }
-                Time::Hr24clockHourMinuteTimezone {
-                    hour,
-                    minute,
-                    timezone,
-                } => {
-                    let Hr24ClockHour(hour) = *hour;
-                    let Minute(minute) = *minute;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour.into(), minute.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
-                }
-                Time::WallclockHour { clock, am } => {
-                    let WallClock { hour, minutes } = *clock;
-
-                    chrono::NaiveTime::from_hms_opt(
-                        u32::from(match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        }),
-                        u32::from(minutes),
-                        0,
-                    )
-                }
-                Time::WallclockHourTimezone {
-                    clock,
-                    am,
-                    timezone,
-                } => {
-                    let WallClock { hour, minutes } = *clock;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let hour_24 = match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        };
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour_24.into(), minutes.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
-                }
-                Time::WallclockHourMinute { clock, minute, am } => {
-                    let WallClockHour(hour) = *clock;
-                    let Minute(minutes) = *minute;
-
-                    chrono::NaiveTime::from_hms_opt(
-                        u32::from(match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        }),
-                        u32::from(minutes),
-                        0,
-                    )
-                }
-                Time::WallclockHourMinuteTimezone {
-                    clock,
-                    minute,
-                    am,
-                    timezone,
-                } => {
-                    let WallClockHour(hour) = *clock;
-                    let Minute(minutes) = *minute;
-
-                    if let Some(tz) = timezone.to_timezone() {
-                        let hour_24 = match am {
-                            AmPm::Am => hour.get(),
-                            AmPm::Pm => hour.get() + 12,
-                        };
-                        let today = Utc::now().date_naive();
-                        let custom_time =
-                            NaiveTime::from_hms_opt(hour_24.into(), minutes.into(), 0).unwrap();
-                        let utc_time = Utc
-                            .from_local_datetime(&today.and_time(custom_time))
-                            .unwrap();
-                        let tz_time = utc_time.with_timezone(&tz);
-                        let local_time = tz_time.with_timezone(&Local);
-                        Some(local_time.time())
-                    } else {
-                        None
-                    }
+                    let WallClockHour(hour) = clock;
+                    let Minute(minute) = minute;
+                    NaiveTime::from_hms_opt(to_24(hour.get(), am), u32::from(*minute), 0)
                 }
             }
+        }
+
+        /// The timezone suffix the user attached to the time, if any.
+        fn timezone(&self) -> Option<&TimezoneName> {
+            match self {
+                Time::Hr24clockHourTimezone { timezone, .. }
+                | Time::Hr24clockHourMinuteTimezone { timezone, .. }
+                | Time::WallclockHourTimezone { timezone, .. }
+                | Time::WallclockHourMinuteTimezone { timezone, .. } => Some(timezone),
+                _ => None,
+            }
+        }
+    }
+
+    /// Interpret a naive wall-clock datetime in `tz` — or, when no timezone
+    /// suffix was given, in the user's local timezone (honoring TZ) — and return
+    /// the absolute instant (audit #A5/#A6).
+    fn zone_resolve(naive: NaiveDateTime, tz: Option<&TimezoneName>) -> Option<DateTime<Utc>> {
+        match tz {
+            Some(name) => name
+                .to_timezone()?
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc)),
+            None => Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc)),
         }
     }
 
@@ -1414,26 +1001,27 @@ mod timespec {
         pub fn to_date_time(&self) -> Option<DateTime<Utc>> {
             let date_time = match self {
                 Timespec::Time(time) => {
-                    let time = time.to_naive_time()?;
-                    let now = Utc::now();
-
-                    match time < now.time() {
-                        true => now
-                            .checked_add_days(Days::new(1))?
-                            .with_time(time)
-                            .single()?
-                            .to_utc(),
-                        false => now.with_time(time).single()?.to_utc(),
+                    // A bare time is today if still in the future, else tomorrow,
+                    // interpreted in the user's timezone (audit #A5).
+                    let nt = time.base_naive_time()?;
+                    let tz = time.timezone();
+                    let today = Local::now().date_naive();
+                    let candidate = zone_resolve(NaiveDateTime::new(today, nt), tz)?;
+                    if candidate <= Utc::now() {
+                        let tomorrow = today.checked_add_days(Days::new(1))?;
+                        zone_resolve(NaiveDateTime::new(tomorrow, nt), tz)?
+                    } else {
+                        candidate
                     }
                 }
                 Timespec::TimeDate { time, date } => {
-                    let time = time.to_naive_time()?;
-                    let date = date.to_naive_date()?;
-
-                    let date_time = NaiveDateTime::new(date, time).and_utc();
-                    match date_time < Utc::now() {
-                        true => date_time.checked_add_months(chrono::Months::new(12))?,
-                        false => date_time,
+                    let nt = time.base_naive_time()?;
+                    let nd = date.to_naive_date()?;
+                    let date_time = zone_resolve(NaiveDateTime::new(nd, nt), time.timezone())?;
+                    if date_time < Utc::now() {
+                        date_time.checked_add_months(chrono::Months::new(12))?
+                    } else {
+                        date_time
                     }
                 }
                 Timespec::TimeDateIncrement {
@@ -1441,36 +1029,24 @@ mod timespec {
                     date,
                     increment,
                 } => {
-                    let time = time.to_naive_time()?;
-                    let date = date.to_naive_date()?;
-
-                    let date_time = NaiveDateTime::new(date, time)
-                        .and_utc()
+                    let nt = time.base_naive_time()?;
+                    let nd = date.to_naive_date()?;
+                    let date_time = zone_resolve(NaiveDateTime::new(nd, nt), time.timezone())?
                         .checked_add_signed(
                             chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
                         )?;
-
-                    match date_time < Utc::now() {
-                        true => date_time.checked_add_months(chrono::Months::new(12))?,
-                        false => date_time,
+                    if date_time < Utc::now() {
+                        date_time.checked_add_months(chrono::Months::new(12))?
+                    } else {
+                        date_time
                     }
                 }
                 Timespec::Nowspec(nowspec) => match nowspec {
-                    Nowspec::Now => {
-                        let datetime_utc = Utc::now();
-                        let datetime_local = datetime_utc.with_timezone(&Local);
-                        Utc.from_local_datetime(&datetime_local.naive_local())
-                            .unwrap()
-                    }
-                    Nowspec::NowIncrement(increment) => {
-                        let datetime_utc = Utc::now();
-                        let datetime_local = datetime_utc.with_timezone(&Local);
-                        Utc.from_local_datetime(&datetime_local.naive_local())
-                            .unwrap()
-                            .checked_add_signed(
-                                chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
-                            )?
-                    }
+                    // "now" is the current absolute instant.
+                    Nowspec::Now => Utc::now(),
+                    Nowspec::NowIncrement(increment) => Utc::now().checked_add_signed(
+                        chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
+                    )?,
                 },
             };
 
@@ -1913,9 +1489,16 @@ mod timespec {
                 },
             };
 
-            let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
-                .expect("expected is valid")
-                .to_utc();
+            // No timezone suffix ⇒ interpreted in the local timezone.
+            let naive = NaiveDateTime::new(
+                NaiveDate::from_ymd_opt(3000, 11, 4).unwrap(),
+                NaiveTime::from_hms_opt(5, 53, 0).unwrap(),
+            );
+            let expected = Local
+                .from_local_datetime(&naive)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc);
 
             assert_eq!(Some(expected), timespec.to_date_time())
         }
@@ -1939,9 +1522,17 @@ mod timespec {
                 },
             };
 
-            let expected = DateTime::parse_from_rfc3339("3000-11-05T05:53:00Z")
-                .expect("expected is valid")
-                .to_utc();
+            // No timezone suffix ⇒ local interpretation, plus a 1-day increment.
+            let naive = NaiveDateTime::new(
+                NaiveDate::from_ymd_opt(3000, 11, 4).unwrap(),
+                NaiveTime::from_hms_opt(5, 53, 0).unwrap(),
+            );
+            let expected = Local
+                .from_local_datetime(&naive)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::TimeDelta::days(1);
 
             assert_eq!(Some(expected), timespec.to_date_time())
         }
@@ -1962,19 +1553,12 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
-            assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+            assert_eq!(Some(expected), timespec.to_date_time())
         }
 
         #[test]
@@ -1995,19 +1579,12 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
-            assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+            assert_eq!(Some(expected), timespec.to_date_time())
         }
 
         #[test]
@@ -2026,19 +1603,12 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
-            assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+            assert_eq!(Some(expected), timespec.to_date_time())
         }
 
         #[test]
@@ -2055,19 +1625,36 @@ mod timespec {
                 },
             };
 
+            // UTC suffix ⇒ the absolute instant is exactly the wall clock in UTC.
             let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
                 .expect("expected is valid")
-                .to_utc()
-                .with_timezone(&Local);
+                .to_utc();
 
+            assert_eq!(Some(expected), timespec.to_date_time())
+        }
+
+        #[test]
+        fn timezone_name_accepts_utc_case_insensitively() {
             assert_eq!(
-                expected.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                timespec
-                    .to_date_time()
-                    .unwrap()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            )
+                TimezoneName::from_str("utc"),
+                Ok(TimezoneName("UTC".to_owned()))
+            );
+            assert_eq!(
+                TimezoneName::from_str("UtC"),
+                Ok(TimezoneName("UTC".to_owned()))
+            );
+            assert!(TimezoneName::from_str("Not/AZone").is_err());
+        }
+
+        #[test]
+        fn timespec_lowercase_utc_suffix_is_absolute() {
+            // A lowercase `utc` suffix is honored, and the instant is exactly the
+            // wall clock in UTC regardless of the host timezone (audit #A6).
+            let ts = Timespec::from_str("1800utcNOV4,3000").unwrap();
+            let expected = DateTime::parse_from_rfc3339("3000-11-04T18:00:00Z")
+                .unwrap()
+                .to_utc();
+            assert_eq!(Some(expected), ts.to_date_time());
         }
     }
 }
@@ -2434,22 +2021,29 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let tz = std::env::var("TZ").ok().unwrap_or("UTC".to_owned());
-
-            match s == tz {
-                true => Ok(Self(tz)), // TODO: Seems like implementation only reads UTC, but it should be influenced by TZ variable
-                false => Err(TokenParsingError::TimezonePatternNotFound(tz)),
+            // POSIX mandates that `utc` be recognized case-insensitively; any
+            // other IANA timezone name chrono-tz knows is also accepted (audit
+            // #A6). Anything else is not a timezone suffix.
+            if s.is_empty() {
+                return Err(TokenParsingError::TimezonePatternNotFound(s.to_owned()));
+            }
+            if s.eq_ignore_ascii_case("utc") {
+                return Ok(Self("UTC".to_owned()));
+            }
+            match s.parse::<Tz>() {
+                Ok(_) => Ok(Self(s.to_owned())),
+                Err(_) => Err(TokenParsingError::TimezonePatternNotFound(s.to_owned())),
             }
         }
     }
 
     impl TimezoneName {
-        /// Returns the time zone based on the string (so far only UTC)
+        /// Resolve the suffix to a concrete timezone (audit #A6).
         pub fn to_timezone(&self) -> Option<Tz> {
-            match self.0.as_str() {
-                "UTC" => Some(chrono_tz::UTC), // Only UTC is currently supported
-                _ => None, // For other time zones, the implementation has not yet been added
+            if self.0.eq_ignore_ascii_case("utc") {
+                return Some(chrono_tz::UTC);
             }
+            self.0.parse::<Tz>().ok()
         }
     }
 

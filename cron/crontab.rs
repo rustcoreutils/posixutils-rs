@@ -9,14 +9,15 @@
 
 use clap::Parser;
 use cron::{CRON_ALLOW, CRON_DENY, CRON_SPOOL_DIR};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::env;
 use std::fs;
-use std::fs::File;
-use std::io::{ErrorKind, Read, Result, Write};
-use std::process::{exit, ExitStatus};
+use std::io::{self, ErrorKind, Read, Write};
+use std::path::Path;
+use std::process::{exit, Command};
 
 #[derive(Parser)]
+#[command(version, about = gettext("crontab - schedule periodic background work"))]
 struct CronArgs {
     #[arg(short, long, help = gettext("edit user's crontab"))]
     edit: bool,
@@ -24,170 +25,224 @@ struct CronArgs {
     list: bool,
     #[arg(short, long, help = gettext("delete user's crontab"))]
     remove: bool,
-    #[arg(name = "FILE", help = gettext("file to replace user's current crontab with"))]
+    #[arg(
+        name = "FILE",
+        help = gettext("replace crontab with FILE (or standard input if '-' or omitted)")
+    )]
     file: Option<String>,
 }
 
-fn print_usage(err: &str) {
-    let name = env::args().next().unwrap();
-    eprintln!("{name}: usage error: {err}");
-    eprintln!("usage:\t{name} [ FILE ]");
-    eprintln!("\t{name} [ -e | -l | -r ]");
-    eprintln!("\t-e\t- edit user's crontab");
-    eprintln!("\t-l\t- list user's crontab");
-    eprintln!("\t-r\t- delete user's crontab");
-}
-
-/// Check if a user is allowed to use crontab based on cron.allow/cron.deny files
-/// Returns true if allowed, false if denied
+/// Check whether a user is allowed to use crontab per the cron.allow/cron.deny
+/// rules (audit #C7).
 fn is_user_allowed(username: &str) -> bool {
-    // If cron.allow exists, only listed users are allowed
-    if let Ok(content) = fs::read_to_string(CRON_ALLOW) {
-        return content.lines().any(|line| line.trim() == username);
+    // If cron.allow exists, only the users listed in it are permitted.
+    match fs::read_to_string(CRON_ALLOW) {
+        Ok(content) => return content.lines().any(|line| line.trim() == username),
+        // An existing-but-unreadable allow file fails closed.
+        Err(e) if e.kind() != ErrorKind::NotFound => return false,
+        Err(_) => {}
     }
 
-    // If cron.deny exists, listed users are denied
-    if let Ok(content) = fs::read_to_string(CRON_DENY) {
-        return !content.lines().any(|line| line.trim() == username);
+    // Otherwise, if cron.deny exists, everyone not listed is permitted (an empty
+    // cron.deny therefore permits all users).
+    match fs::read_to_string(CRON_DENY) {
+        Ok(content) => return !content.lines().any(|line| line.trim() == username),
+        Err(e) if e.kind() != ErrorKind::NotFound => return false,
+        Err(_) => {}
     }
 
-    // Default: allow all users
-    true
+    // Neither file exists: only a privileged process may submit (POSIX XSI).
+    is_privileged()
 }
 
-fn list_crontab(path: &str) -> Result<String> {
-    fs::read_to_string(path)
+fn is_privileged() -> bool {
+    // SAFETY: getuid() is always safe and never fails.
+    unsafe { libc::getuid() == 0 }
 }
 
-fn remove_crontab(path: &str) -> Result<()> {
-    fs::remove_file(path)
+/// Validate `content` against the daemon's parser, then atomically install it
+/// over `target`. On any error the existing crontab is left untouched (#C4/#C6).
+fn install_crontab(target: &str, content: &str) -> ! {
+    if let Err(line) = cron::job::validate_user_crontab(content) {
+        diag_error(&format!(
+            "{} {}",
+            gettext("errors in crontab file, can't install; problem at line"),
+            line
+        ));
+        exit(1);
+    }
+
+    if let Err(e) = plib::io::write_atomic(Path::new(target), content.as_bytes()) {
+        diag_error(&format!("{}: {}", gettext("cannot install crontab"), e));
+        exit(1);
+    }
+
+    exit(0);
 }
 
-fn edit_crontab(path: &str) -> Result<ExitStatus> {
-    File::create(path)?;
-    let editor = env::var("EDITOR").unwrap_or("vi".to_string());
-    let shell = env::var("SHELL").unwrap_or("sh".to_string());
-    let args = ["-c".to_string(), format!("{editor} {path}")];
-    std::process::Command::new(shell).args(args).status()
+/// Read the replacement crontab from `file`, or from standard input when the
+/// operand is absent or `-` (audit #C2).
+fn read_source(file: &Option<String>) -> io::Result<String> {
+    match file.as_deref() {
+        None | Some("-") => {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+        Some(path) => fs::read_to_string(path),
+    }
 }
 
-fn replace_crontab(from: &str, to: &str) -> Result<()> {
-    let mut source = File::open(from)?;
-    let mut target = File::create(to)?;
-    let mut buffer = Vec::new();
-
-    source.read_to_end(&mut buffer)?;
-    target.write_all(&buffer)?;
-
-    Ok(())
+fn do_replace(target: &str, file: &Option<String>) -> ! {
+    match read_source(file) {
+        Ok(content) => install_crontab(target, &content),
+        Err(e) => {
+            diag_error(&format!("{}: {}", gettext("cannot read input"), e));
+            exit(1);
+        }
+    }
 }
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn do_list(target: &str) -> ! {
+    match fs::read_to_string(target) {
+        Ok(content) => {
+            // The listing is the one thing that goes to standard output.
+            print!("{content}");
+            io::stdout().flush().ok();
+            exit(0);
+        }
+        Err(e) => {
+            diag_error(&format!("{}: {}", gettext("no crontab to list"), e));
+            exit(1);
+        }
+    }
+}
+
+fn do_remove(target: &str) -> ! {
+    match fs::remove_file(target) {
+        Ok(()) => exit(0),
+        Err(e) => {
+            diag_error(&format!("{}: {}", gettext("cannot remove crontab"), e));
+            exit(1);
+        }
+    }
+}
+
+/// Edit a copy of the current crontab and install it only on a clean editor
+/// exit. The live crontab is never truncated up front (audit #C1).
+fn do_edit(target: &str) -> ! {
+    // Pre-flight: confirm we can create the install tempfile in the spool dir.
+    // This fails fast — before launching the editor — when the result could not
+    // be installed, and guarantees the live entry is never touched on failure.
+    let spool_dir = Path::new(target).parent().unwrap_or(Path::new("."));
+    if let Err(e) = tempfile::NamedTempFile::new_in(spool_dir) {
+        diag_error(&format!(
+            "{}: {}",
+            gettext("cannot access crontab spool"),
+            e
+        ));
+        exit(1);
+    }
+
+    // Seed the edit buffer from the current crontab (empty if none exists).
+    let current = fs::read_to_string(target).unwrap_or_default();
+    let mut tmp = match tempfile::NamedTempFile::new() {
+        Ok(t) => t,
+        Err(e) => {
+            diag_error(&format!(
+                "{}: {}",
+                gettext("cannot create temporary file"),
+                e
+            ));
+            exit(1);
+        }
+    };
+    if let Err(e) = tmp.write_all(current.as_bytes()).and_then(|()| tmp.flush()) {
+        diag_error(&format!(
+            "{}: {}",
+            gettext("cannot write temporary file"),
+            e
+        ));
+        exit(1);
+    }
+    let tmp_path = tmp.path().to_path_buf();
+
+    // Launch the editor with the path as a separate argv element — never
+    // interpolated into a shell command line (audit #C8).
+    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("vi");
+    let mut cmd = Command::new(prog);
+    cmd.args(parts).arg(&tmp_path);
+
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(_) => {
+            diag_error(&gettext("editor exited with an error; crontab unchanged"));
+            exit(1);
+        }
+        Err(e) => {
+            diag_error(&format!("{}: {}", gettext("cannot launch editor"), e));
+            exit(1);
+        }
+    }
+
+    match fs::read_to_string(&tmp_path) {
+        Ok(edited) => install_crontab(target, &edited),
+        Err(e) => {
+            diag_error(&format!("{}: {}", gettext("cannot read edited crontab"), e));
+            exit(1);
+        }
+    }
+}
+
+/// Emit a diagnostic to standard error with the `crontab:` prefix (audit #C3).
+fn diag_error(msg: &str) {
+    plib::diag::error(msg);
+}
+
+fn main() {
+    plib::diag::init_locale("crontab");
 
     let args = CronArgs::parse();
-    let Ok(logname) = env::var("LOGNAME") else {
-        eprintln!("Could not obtain the user's logname.");
+
+    // Identity comes from the real uid, never the spoofable $LOGNAME (audit #X2).
+    let Some(logname) = cron::spool::User::current().map(|u| u.name) else {
+        diag_error(&gettext("could not determine the invoking user"));
         exit(1);
     };
 
-    // Check if user is allowed to use crontab
     if !is_user_allowed(&logname) {
-        eprintln!("You ({logname}) are not allowed to use this program.");
+        diag_error(&format!(
+            "{} ({})",
+            gettext("you are not allowed to use crontab"),
+            logname
+        ));
         exit(1);
     }
 
-    let path = format!("{}/{}", CRON_SPOOL_DIR, logname);
+    let target = format!("{}/{}", CRON_SPOOL_DIR, logname);
 
-    let opt_count = [args.edit, args.list, args.remove, args.file.is_some()]
-        .into_iter()
-        .map(|x| x as i32)
-        .sum::<i32>();
-    if opt_count > 1 {
-        print_usage("Too many options specified.");
+    // -e, -l, -r, and a file operand are mutually exclusive.
+    let mode_count = [args.edit, args.list, args.remove]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if mode_count > 1 || (mode_count == 1 && args.file.is_some()) {
+        diag_error(&gettext(
+            "only one of -e, -l, -r, or a file operand may be given",
+        ));
         exit(1);
-    }
-
-    if opt_count < 1 {
-        print_usage("Not enough options specified.");
-        exit(1);
-    }
-
-    if args.edit {
-        match edit_crontab(&path) {
-            Ok(status) => exit(status.code().unwrap_or(0)),
-            Err(err) => {
-                match err.kind() {
-                    ErrorKind::NotFound => println!("No crontab file has been found."),
-                    ErrorKind::PermissionDenied => {
-                        println!("Permission to access user's crontab file denied.")
-                    }
-                    ErrorKind::Interrupted => println!("crontab was interrupted."),
-                    ErrorKind::OutOfMemory => println!("crontab exceeded available memory."),
-                    _ => println!("Unknown error: {}", err),
-                }
-                exit(1);
-            }
-        }
     }
 
     if args.list {
-        match list_crontab(&path) {
-            Ok(content) => println!("{}", content),
-            Err(err) => {
-                match err.kind() {
-                    ErrorKind::NotFound => println!("No crontab file has been found."),
-                    ErrorKind::PermissionDenied => {
-                        println!("Permission to access user's crontab file denied.")
-                    }
-                    ErrorKind::Interrupted => println!("crontab was interrupted."),
-                    ErrorKind::OutOfMemory => println!("crontab exceeded available memory."),
-                    _ => println!("Unknown error: {}", err),
-                }
-                exit(1);
-            }
-        }
+        do_list(&target);
+    } else if args.remove {
+        do_remove(&target);
+    } else if args.edit {
+        do_edit(&target);
+    } else {
+        // No mode option: replace from the file operand, or from stdin (#C2).
+        do_replace(&target, &args.file);
     }
-
-    if args.remove {
-        match remove_crontab(&path) {
-            Ok(()) => println!("Removed crontab file"),
-            Err(err) => {
-                match err.kind() {
-                    ErrorKind::NotFound => println!("No crontab file has been found."),
-                    ErrorKind::PermissionDenied => {
-                        println!("Permission to access user's crontab file denied.")
-                    }
-                    ErrorKind::Interrupted => println!("crontab was interrupted."),
-                    ErrorKind::OutOfMemory => println!("crontab exceeded available memory."),
-                    _ => println!("Unknown error: {}", err),
-                }
-                exit(1);
-            }
-        }
-    }
-
-    if let Some(file) = args.file {
-        match replace_crontab(&file, &path) {
-            Ok(()) => println!("Replaced crontab file with {file}"),
-            Err(err) => {
-                match err.kind() {
-                    ErrorKind::NotFound => {
-                        println!("Crontab file or user-specified file has not been found.")
-                    }
-                    ErrorKind::PermissionDenied => println!(
-                        "Permission to access user's crontab file or user-specified file denied."
-                    ),
-                    ErrorKind::Interrupted => println!("crontab was interrupted."),
-                    ErrorKind::OutOfMemory => println!("crontab exceeded available memory."),
-                    _ => println!("Unknown error: {}", err),
-                }
-                exit(1);
-            }
-        }
-    }
-
-    Ok(())
 }

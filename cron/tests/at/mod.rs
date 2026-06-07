@@ -28,6 +28,15 @@ fn run_test_at(
     expected_error: &str,
     expected_exit_code: i32,
 ) {
+    // Pin the timezone and locale so the `-l` listing (formatted via libc
+    // strftime in the user's timezone) is deterministic regardless of the host.
+    std::env::set_var("TZ", "UTC");
+    std::env::set_var("LC_ALL", "C");
+    // Make the allow/deny gate permit the test user regardless of the host's
+    // /etc/at.{allow,deny}: no allow file, an empty deny file (/dev/null).
+    std::env::set_var("AT_ALLOW", "/nonexistent/posixutils/at.allow");
+    std::env::set_var("AT_DENY", "/dev/null");
+
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
     run_test(TestPlan {
@@ -49,14 +58,14 @@ fn test1() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
     let args = ["05:53amNOV4,2100", "-f", &file];
 
-    let expected_output = "job 1 at Thu Nov 04 05:53:00 2100\n";
+    // The submission notice goes to standard error (audit #A3).
+    let expected_error = "job 1 at Thu Nov  4 05:53:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041a0e81");
     assert!(res_file.exists());
@@ -73,15 +82,14 @@ fn test2() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["05:53amNOV4,2100+30minutes", "-f", &file];
 
-    let expected_output = "job 1 at Thu Nov 04 06:23:00 2100\n";
+    let expected_error = "job 1 at Thu Nov  4 06:23:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041a0e9f");
     assert!(res_file.exists());
@@ -96,15 +104,14 @@ fn test3() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["05:53amNOV4,2100+1day", "-f", &file];
 
-    let expected_output = "job 1 at Fri Nov 05 05:53:00 2100\n";
+    let expected_error = "job 1 at Fri Nov  5 05:53:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041a1421");
     assert!(res_file.exists());
@@ -119,15 +126,14 @@ fn test4() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["midnightNOV4,2100", "-f", &file];
 
-    let expected_output = "job 1 at Thu Nov 04 00:00:00 2100\n";
+    let expected_error = "job 1 at Thu Nov  4 00:00:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041a0d20");
     assert!(res_file.exists());
@@ -142,15 +148,14 @@ fn test5() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["05:53pmNOV4,2100+1day", "-f", &file];
 
-    let expected_output = "job 1 at Fri Nov 05 17:53:00 2100\n";
+    let expected_error = "job 1 at Fri Nov  5 17:53:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041a16f1");
     assert!(res_file.exists());
@@ -165,15 +170,14 @@ fn test6() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["15:53NOV4,2100+1day", "-f", &file];
 
-    let expected_output = "job 1 at Fri Nov 05 15:53:00 2100\n";
+    let expected_error = "job 1 at Fri Nov  5 15:53:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041a1679");
     assert!(res_file.exists());
@@ -188,15 +192,14 @@ fn test7() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["midnightNOV4,2100", "-f", &file, "-q", "b"];
 
-    let expected_output = "job 1 at Thu Nov 04 00:00:00 2100\n";
+    let expected_error = "job 1 at Thu Nov  4 00:00:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("b00001041a0d20");
     assert!(res_file.exists());
@@ -211,15 +214,14 @@ fn test8() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["-t", "210012131200", "-f", &file];
 
-    let expected_output = "job 1 at Mon Dec 13 12:00:00 2100\n";
+    let expected_error = "job 1 at Mon Dec 13 12:00:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
     let res_file = Path::new(&dir_path).join("a00001041aeb50");
     assert!(res_file.exists());
@@ -234,19 +236,18 @@ fn test9() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["midnightNOV4,2100", "-f", &file, "-q", "b"];
 
-    let expected_output = "job 1 at Thu Nov 04 00:00:00 2100\n";
+    let expected_error = "job 1 at Thu Nov  4 00:00:00 2100\n";
 
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", expected_error, 0);
 
+    // Remove the job by id; nothing on stdout/stderr.
     let args2 = ["-r", "1"];
-    let expected_output2 = "";
-    run_test_at(&args2, expected_output2, "", 0);
+    run_test_at(&args2, "", "", 0);
 }
 
 #[test]
@@ -256,25 +257,18 @@ fn test10() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["midnightNOV4,2100", "-f", &file, "-q", "b"];
-
-    let expected_output = "job 1 at Thu Nov 04 00:00:00 2100\n";
-
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", "job 1 at Thu Nov  4 00:00:00 2100\n", 0);
 
     let args2 = ["midnightNOV4,2099", "-f", &file];
+    run_test_at(&args2, "", "job 2 at Wed Nov  4 00:00:00 2099\n", 0);
 
-    let expected_output2 = "job 2 at Wed Nov 04 00:00:00 2099\n";
-
-    run_test_at(&args2, expected_output2, "", 0);
-
+    // POSIX -l format: "%s\t%s\n", at_job_id, <date> (audit #A4).
     let args3 = ["-l", "-q", "b"];
-
-    let expected_output3 = "1      Thu Nov 04 00:00:00 2100    b\n";
+    let expected_output3 = "1\tThu Nov  4 00:00:00 2100\n";
     run_test_at(&args3, expected_output3, "", 0);
 }
 
@@ -285,26 +279,17 @@ fn test11() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["midnightNOV4,2100", "-f", &file, "-q", "b"];
-
-    let expected_output = "job 1 at Thu Nov 04 00:00:00 2100\n";
-
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", "job 1 at Thu Nov  4 00:00:00 2100\n", 0);
 
     let args2 = ["midnightNOV4,2099", "-f", &file];
-
-    let expected_output2 = "job 2 at Wed Nov 04 00:00:00 2099\n";
-
-    run_test_at(&args2, expected_output2, "", 0);
+    run_test_at(&args2, "", "job 2 at Wed Nov  4 00:00:00 2099\n", 0);
 
     let args3 = ["-l"];
-
-    let expected_output3 =
-        "1      Thu Nov 04 00:00:00 2100    b\n2      Wed Nov 04 00:00:00 2099    a\n";
+    let expected_output3 = "1\tThu Nov  4 00:00:00 2100\n2\tWed Nov  4 00:00:00 2099\n";
     run_test_at(&args3, expected_output3, "", 0);
 }
 
@@ -315,24 +300,51 @@ fn test12() {
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
     std::env::set_var("AT_JOB_DIR", &dir_path);
-    std::env::set_var("LOGNAME", "root");
 
     let file = "test_files/at/cmd_for_job.txt".to_string();
 
     let args = ["midnightNOV4,2100", "-f", &file, "-q", "b"];
-
-    let expected_output = "job 1 at Thu Nov 04 00:00:00 2100\n";
-
-    run_test_at(&args, expected_output, "", 0);
+    run_test_at(&args, "", "job 1 at Thu Nov  4 00:00:00 2100\n", 0);
 
     let args2 = ["midnightNOV4,2099", "-f", &file];
-
-    let expected_output2 = "job 2 at Wed Nov 04 00:00:00 2099\n";
-
-    run_test_at(&args2, expected_output2, "", 0);
+    run_test_at(&args2, "", "job 2 at Wed Nov  4 00:00:00 2099\n", 0);
 
     let args3 = ["-l", "2"];
-
-    let expected_output3 = "2      Wed Nov 04 00:00:00 2099    a\n";
+    let expected_output3 = "2\tWed Nov  4 00:00:00 2099\n";
     run_test_at(&args3, expected_output3, "", 0);
+}
+
+// `at -r` requires at least one at_job_id operand; with none it is a usage
+// error (POSIX synopsis `at -r at_job_id...`).
+#[test]
+fn remove_requires_operand() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let (_temp_dir, dir_path) = setup_test_env();
+    fs::create_dir(&dir_path).expect("Unable to create test directory");
+    std::env::set_var("AT_JOB_DIR", &dir_path);
+
+    let out = plib::testing::run_test_base("at", &vec!["-r".to_string()], b"");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+// A timespec spread across multiple operands is concatenated and parsed as one,
+// per the grammar where white space merely delimits tokens (audit #A1). This is
+// equivalent to test1's single-operand "05:53amNOV4,2100".
+#[test]
+fn test_multi_operand_timespec() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let (_temp_dir, dir_path) = setup_test_env();
+    fs::create_dir(&dir_path).expect("Unable to create test directory");
+
+    std::env::set_var("AT_JOB_DIR", &dir_path);
+
+    let file = "test_files/at/cmd_for_job.txt".to_string();
+
+    let args = ["05:53am", "NOV4,2100", "-f", &file];
+    run_test_at(&args, "", "job 1 at Thu Nov  4 05:53:00 2100\n", 0);
+
+    let res_file = Path::new(&dir_path).join("a00001041a0e81");
+    assert!(res_file.exists());
+
+    fs::remove_file(res_file).expect("Unable to remove test file");
 }

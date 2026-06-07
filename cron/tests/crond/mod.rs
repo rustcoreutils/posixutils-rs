@@ -463,3 +463,89 @@ fn test_system_crontab_at_prefix() {
     assert!(!job.is_reboot);
     assert_eq!(job.command, "echo hourly");
 }
+
+// Secure-execution helpers (audit #D4/#D5).
+
+#[test]
+fn command_field_without_percent() {
+    let p = cron::job::parse_command_field("echo hello");
+    assert_eq!(p.exec_line, "echo hello");
+    assert!(p.stdin.is_none());
+}
+
+#[test]
+fn command_field_percent_is_stdin_with_newlines() {
+    // POSIX crontab example: only the first line runs; the rest is stdin, and
+    // each `%` becomes a newline.
+    let p = cron::job::parse_command_field("mailx john%Happy Birthday!%Time for lunch.");
+    assert_eq!(p.exec_line, "mailx john");
+    assert_eq!(p.stdin.as_deref(), Some("Happy Birthday!\nTime for lunch."));
+}
+
+#[test]
+fn command_field_backslash_escapes_percent() {
+    let p = cron::job::parse_command_field(r"echo 100\% done");
+    assert_eq!(p.exec_line, "echo 100% done");
+    assert!(p.stdin.is_none());
+}
+
+#[test]
+fn job_env_defaults_and_safe_overrides() {
+    let overrides = vec![
+        ("PATH".to_string(), "/custom/bin".to_string()),
+        ("LOGNAME".to_string(), "evil".to_string()),
+        ("MAILTO".to_string(), "someone".to_string()),
+    ];
+    let env = cron::job::build_job_env("alice", "/home/alice", &overrides);
+    let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
+    assert_eq!(get("HOME").as_deref(), Some("/home/alice"));
+    assert_eq!(get("USER").as_deref(), Some("alice"));
+    assert_eq!(get("SHELL").as_deref(), Some("/bin/sh"));
+    // A crontab PATH override is honored...
+    assert_eq!(get("PATH").as_deref(), Some("/custom/bin"));
+    // ...but LOGNAME stays authoritative and MAILTO is not exported.
+    assert_eq!(get("LOGNAME").as_deref(), Some("alice"));
+    assert!(get("MAILTO").is_none());
+}
+
+#[test]
+fn matches_minute_exact_field() {
+    let db = "30 4 * * * echo".parse::<Database>().unwrap();
+    let job = &db.0[0];
+    let yes = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(4, 30, 0).unwrap(),
+    );
+    let no = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(4, 31, 0).unwrap(),
+    );
+    assert!(job.matches_minute(&yes));
+    assert!(!job.matches_minute(&no));
+}
+
+#[test]
+fn matches_minute_dom_dow_union() {
+    // "0 0 1,15 * 1" fires on the 1st, the 15th, OR any Monday (POSIX union).
+    let db = "0 0 1,15 * 1 echo".parse::<Database>().unwrap();
+    let job = &db.0[0];
+    let midnight = |y, m, d| {
+        NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(y, m, d).unwrap(),
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        )
+    };
+    assert!(job.matches_minute(&midnight(2000, 1, 3))); // Monday
+    assert!(job.matches_minute(&midnight(2000, 1, 1))); // 1st (a Saturday)
+    assert!(!job.matches_minute(&midnight(2000, 1, 4))); // Tue, not 1/15
+}
+
+#[test]
+fn user_crontab_collects_env_assignments() {
+    let db = "MAILTO=ops\nPATH=/sbin\n* * * * * echo hi"
+        .parse::<Database>()
+        .unwrap();
+    assert_eq!(db.0.len(), 1);
+    assert!(db.0[0].env.iter().any(|(k, v)| k == "MAILTO" && v == "ops"));
+    assert!(db.0[0].env.iter().any(|(k, v)| k == "PATH" && v == "/sbin"));
+}

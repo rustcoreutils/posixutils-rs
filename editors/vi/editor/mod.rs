@@ -21,6 +21,39 @@ use crate::ui::{Screen, Terminal, TerminalSize};
 use crate::undo::UndoManager;
 use std::path::PathBuf;
 
+/// Split a `/`- or `?`-style search body into `(pattern, offset)`.
+///
+/// The pattern runs up to the first unescaped `delim`; `\<delim>` becomes a
+/// literal delimiter in the pattern. Any `+n`/`-n` after the closing delimiter
+/// is returned as a signed line offset (0 if absent).
+fn split_search(body: &str, delim: char) -> (String, i64) {
+    let mut pattern = String::new();
+    let mut chars = body.chars().peekable();
+    let mut rest: Option<String> = None;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&delim) {
+                pattern.push(delim);
+                chars.next();
+                continue;
+            }
+            pattern.push('\\');
+        } else if c == delim {
+            rest = Some(chars.collect());
+            break;
+        } else {
+            pattern.push(c);
+        }
+    }
+    let offset = rest
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(|r| r.parse::<i64>().ok())
+        .unwrap_or(0);
+    (pattern, offset)
+}
+
 /// Stores the last substitution for & and :& commands.
 #[derive(Debug, Clone)]
 pub struct LastSubstitution {
@@ -1778,26 +1811,36 @@ impl Editor {
         Ok(())
     }
 
+    /// Run a `/`- or `?`-style search from an ex command line: set the pattern
+    /// (up to the first unescaped delimiter), search, then apply any trailing
+    /// `+n`/`-n` line offset.
+    fn ex_search(&mut self, body: &str, delim: char, dir: SearchDirection) -> Result<()> {
+        self.search.update_options(&self.options);
+        let (pattern, offset) = split_search(body, delim);
+        if !pattern.is_empty() {
+            self.search.set_pattern(&pattern, dir)?;
+            self.registers.set_search(&pattern);
+        }
+        self.search_next(dir)?;
+        if offset != 0 {
+            let target = (self.buffer.cursor().line as i64 + offset)
+                .clamp(1, self.buffer.line_count().max(1) as i64) as usize;
+            self.buffer.set_line(target);
+            self.buffer.move_to_first_non_blank();
+        }
+        Ok(())
+    }
+
     /// Execute an ex command input string.
     fn execute_ex_input(&mut self, input: &str) -> Result<()> {
-        // Handle search patterns
-        if let Some(pattern) = input.strip_prefix('/') {
-            self.search.update_options(&self.options);
-            if !pattern.is_empty() {
-                self.search.set_pattern(pattern, SearchDirection::Forward)?;
-                self.registers.set_search(pattern);
-            }
-            return self.search_next(SearchDirection::Forward);
+        // Handle search patterns. The pattern runs up to the first unescaped
+        // delimiter (POSIX: a trailing delimiter is optional and may be
+        // followed by a +n/-n line offset).
+        if let Some(body) = input.strip_prefix('/') {
+            return self.ex_search(body, '/', SearchDirection::Forward);
         }
-
-        if let Some(pattern) = input.strip_prefix('?') {
-            self.search.update_options(&self.options);
-            if !pattern.is_empty() {
-                self.search
-                    .set_pattern(pattern, SearchDirection::Backward)?;
-                self.registers.set_search(pattern);
-            }
-            return self.search_next(SearchDirection::Backward);
+        if let Some(body) = input.strip_prefix('?') {
+            return self.ex_search(body, '?', SearchDirection::Backward);
         }
 
         // Check if this is a filter command from vi ! operator

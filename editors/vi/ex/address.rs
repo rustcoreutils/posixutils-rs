@@ -23,6 +23,8 @@ pub enum Address {
     Mark(char),
     /// Relative offset from current address (+n or -n).
     Relative(i32),
+    /// A base address with a trailing +n/-n offset (e.g. `.+2`, `/re/-1`).
+    Offset(Box<Address>, i32),
 }
 
 // Custom PartialEq that ignores regex (compares only pattern strings)
@@ -42,6 +44,7 @@ impl PartialEq for Address {
             ) => a == b,
             (Address::Mark(a), Address::Mark(b)) => a == b,
             (Address::Relative(a), Address::Relative(b)) => a == b,
+            (Address::Offset(a, ao), Address::Offset(b, bo)) => a == b && ao == bo,
             _ => false,
         }
     }
@@ -109,6 +112,15 @@ impl Address {
                     Err(ViError::InvalidAddress(
                         "relative address out of range".to_string(),
                     ))
+                } else {
+                    Ok(result as usize)
+                }
+            }
+            Address::Offset(base, offset) => {
+                let b = base.resolve(buffer, current)? as i32;
+                let result = b + offset;
+                if result < 1 || result > buffer.line_count() as i32 {
+                    Err(ViError::InvalidAddress("address out of range".to_string()))
                 } else {
                     Ok(result as usize)
                 }
@@ -292,16 +304,15 @@ pub fn parse_address_range(input: &str) -> (AddressRange, &str) {
         None => (None, input),
     };
 
-    // Check for any offsets after first address
+    // Check for any offsets after first address (e.g. `.+2`, `/re/-1`).
     let (first_addr, rest) = if let Some(addr) = first_addr {
-        let (offset, rest) = if rest.starts_with('+') || rest.starts_with('-') {
-            parse_offset(rest)
-        } else {
-            (0, rest)
-        };
-        if offset != 0 {
-            // Combine address with offset (simplified - just use offset)
-            (Some(addr), rest)
+        if rest.starts_with('+') || rest.starts_with('-') {
+            let (offset, rest) = parse_offset(rest);
+            if offset != 0 {
+                (Some(Address::Offset(Box::new(addr), offset)), rest)
+            } else {
+                (Some(addr), rest)
+            }
         } else {
             (Some(addr), rest)
         }
@@ -315,9 +326,20 @@ pub fn parse_address_range(input: &str) -> (AddressRange, &str) {
     if rest.starts_with(',') || rest.starts_with(';') {
         let rest = &rest[1..];
 
-        // Try to parse second address
+        // Try to parse second address (with an optional trailing offset).
         let (second_addr, rest) = match parse_address(rest) {
-            Some((addr, rest)) => (Some(addr), rest),
+            Some((addr, rest)) => {
+                if rest.starts_with('+') || rest.starts_with('-') {
+                    let (offset, rest) = parse_offset(rest);
+                    if offset != 0 {
+                        (Some(Address::Offset(Box::new(addr), offset)), rest)
+                    } else {
+                        (Some(addr), rest)
+                    }
+                } else {
+                    (Some(addr), rest)
+                }
+            }
             None => (None, rest),
         };
 

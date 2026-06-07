@@ -293,25 +293,25 @@ mandated mark-then-execute.
 - [x] **#X6 — EOF on stdin not treated as SIGHUP.** ✓ fixed (phase 6): EOF in ex command/insert mode now preserves a modified buffer before quitting.
 
 #### Major
-- [ ] **#X7 — `global`/`v` appears single-pass.** `parser.rs:519-544` stores the command string and dispatches per match without a mark-first pass; line-inserting/deleting commands corrupt iteration. Fix: collect matching line numbers first, then execute against stable marks.
+- [x] **#X7 — `global`/`v` two-pass.** ✓ examined (phase 10): `execute_ex_global` already collects all matching line numbers first, then executes (reversing for deletes). Conforms.
 - [x] **#X8 — `-t tagstring` hard-errors.** ✓ fixed (phase 7): shared `vi/tags.rs`; `ex -t` and `:tag` resolve via the ctags file. Tests: `tags::tests::*`, `test_ex_tag_lookup`.
-- [ ] **#X9 — Address offset after an address is parsed then discarded.** `address.rs:296-310` computes the offset but never applies it to the base address. Fix: add the offset to the resolved address.
-- [ ] **#X10 — `;` separator treated like `,`.** `address.rs:315`; does not set current line to the first address before parsing the second. Fix: resolve first address, set `.`, then parse second.
+- [x] **#X9 — Address offset after an address is parsed then discarded.** ✓ fixed (phase 10): added `Address::Offset(base, n)`; `parse_address_range` now wraps both addresses with their trailing `+n`/`-n`. Tests: `test_ex_address_offset_*`. Also fixed the trailing-delimiter bug in `/re/` ex search (`split_search` in `editor/mod.rs`): the pattern no longer includes the closing delimiter, and a trailing `+n`/`-n` offset is honored (`test_ex_address_search_strips_delimiter`).
+- [ ] **#X10 — `;` separator treated like `,`** (remaining, minor). `AddressRange::resolve` already resolves the second address relative to the first (the `;` rule); distinguishing `,` (relative to the original current line) requires threading the separator through `AddressRange`. Deferred.
 - [x] **#X11 — stdin-not-a-tty does not auto-enable `-s`.** ✓ fixed (phase 9): `run_editor` sets `silent_mode` when `stdin().is_terminal()` is false (spec ex.md §94234).
-- [ ] **#X12 — `substitute` gaps.** `parser.rs:506-508` errors on empty pattern instead of reusing the last RE; missing flags `l`, `#`, count; `~`, `%`, `\l\u\L\U` in replacement unimplemented; `c` (confirm) parsed but no interactive loop; `\n`-split doesn't split the buffer line. Fix: extend `SubstituteFlags` + `expand_replacement`.
-- [ ] **#X13 — `shell` command does not pass `-i`.** `shell.rs` interactive path. Spec §`sh -i`. Fix: add `.arg("-i")`.
+- [ ] **#X12 — `substitute` gaps** (remaining, partial). The BRE engine, `g`, `&`, `\1`-`\9`, and `c`/`p`/count-only flags work (phase 4); empty-pattern reuse, `l`/`#` flags, numeric count, `~`/`%`/`\l\u\L\U` replacement escapes, and `\n` buffer-splitting remain. Deferred (large).
+- [x] **#X13 — `shell` command does not pass `-i`.** ✓ fixed (phase 10): `ShellExecutor::interactive` invokes the shell with `-i`.
 - [x] **#X14 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): shared `setlocale(LC_ALL, "")` in `run_editor` (vi-#V10).
 
 #### Minor
-- [ ] **#X15 — Line-0 address rejected for `a`/`i`/`r`/`=`/`put`.** `address.rs:56-60`. Fix: allow 0 for the commands the spec lists.
-- [ ] **#X16 — `'`/`` ` `` marks not resolvable; only a–z named marks.** `address.rs:228`. Fix: support the previous-context marks.
-- [ ] **#X17 — Excess leading addresses not discarded.** `address.rs`. Fix: keep only the last two.
+- [ ] **#X15 — Line-0 address rejected for `a`/`i`/`r`/`=`/`put`** (remaining, minor). `Address::resolve` rejects line 0 unconditionally; allowing it for the insert-class commands needs command context threaded into resolution. Deferred.
+- [ ] **#X16 — `'`/`` ` `` marks not resolvable in ex addresses** (remaining, minor). `Address::Mark::resolve` is a stub because the ex address resolver has no access to the editor's mark table; resolving marks there needs that state threaded in. (Visual-mode marks work.) Deferred.
+- [ ] **#X17 — Excess leading addresses not discarded** (remaining, minor). The ex address parser handles a single separator; chained `1,2,3` discarding is unimplemented. Deferred.
 - [x] **#X18 — Missing `~`, `recover` commands; `preserve`.** ✓ partial: `:preserve` and `:recover` added (phase 6); the `~` substitute-repeat command remains for phase 10.
 - [x] **#X19 — `showmode` defaults `true`; spec default unset.** ✓ fixed (phase 9): default is now `false`.
 - [x] **#X20 — Missing `set` options.** ✓ fixed (phase 9): shared with #V13. (The `warn`-message-before-`!` behavior is stored as the `warn` option; emitting the warning text is a minor follow-up.)
 - [ ] **#X21 — Unreadable `.exrc` silently ignored** (remaining, minor). `read_safe_exrc` returns `None` for both missing and unreadable; distinguishing them (to error on exists-but-unreadable) needs a `Result` return. Deferred.
-- [ ] **#X22 — `write` ignores readonly / pathname-changed / partial-write rules.** Write path doesn't consult `FileManager.readonly` or enforce spec write rules 5/6. Fix: add the guards.
-- [ ] **#X23 — `r !cmd` uses `Stdio::null()` for the command's stdin.** Spec: the editor's stdin. Fix: inherit stdin.
+- [ ] **#X22 — `write` ignores readonly / pathname-changed / partial-write rules** (remaining, moderate). Deferred.
+- [ ] **#X23 — `r !cmd` uses `Stdio::null()` for the command's stdin** (remaining, minor). Deferred.
 
 ### Detailed conformance matrix
 
@@ -337,7 +337,7 @@ mandated mark-then-execute.
 
 #### Addressing
 - [x] `. $ n +n -n % ,` CONFORM (`address.rs`).
-- [x] **`/re/`,`?re?` now BRE** (#X4, phase 4). Still open: **trailing-delimiter capture in `/re/`** (phase 10), **offset dropped** (#X9); **`;`==`,`** (#X10); **line-0 rejected** (#X15); **`'`/`` ` `` marks** (#X16); **excess not discarded** (#X17).
+- [x] **`/re/`,`?re?` BRE + delimiter + offset** ✓ (phases 4/10, #X4/#X9). Remaining minor: **`;`==`,`** (#X10); **line-0** (#X15); **`'`/`` ` `` marks** (#X16); **excess addresses** (#X17).
 
 #### Commands
 - [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
@@ -358,14 +358,14 @@ mandated mark-then-execute.
 Not covered:
 - [ ] Signal handling / `preserve` / EOF preservation — #X1/#X2/#X6.
 - [x] `-s` suppressing EXINIT/`.exrc` — ✓ fixed (phase 9), #X3.
-- [ ] Address offset + `;` semantics — #X9/#X10.
+- [x] Address offset — ✓ fixed (phase 10), #X9. `;` semantics — minor, #X10.
 - [ ] `global`/`v` with line-count-changing commands — #X7.
 - [ ] substitute empty-pattern reuse, count, `l`/`#`, case escapes — #X12.
 
 ### Suggested PR groupings
 - **PR ex-A — "signals & preserve"**: #X1, #X2, #X6 (+ vi-#V1-#V3 shared infra).
 - **PR ex-B — "batch/startup"**: #X3, #X5, #X8, #X11, #X21.
-- **PR ex-C — "addressing"**: #X4, #X9, #X10, #X15, #X16, #X17.
+- **PR ex-C — "addressing"**: #X4 ✓, #X9 ✓; remaining #X10, #X15, #X16, #X17.
 - **PR ex-D — "global & substitute"**: #X7, #X12, #X13, #X22, #X23.
 - **PR ex-E — "options & misc"**: #X18, #X19, #X20, #X14 (locale, cross-cutting).
 

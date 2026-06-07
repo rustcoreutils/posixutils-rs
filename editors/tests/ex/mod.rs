@@ -501,3 +501,28 @@ fn test_ex_tag_lookup() {
         "int helper() { }"
     );
 }
+
+// ============================================================================
+// Address fidelity (audit #X4 trailing delimiter, #X9 offsets)
+// ============================================================================
+
+#[test]
+fn test_ex_address_search_strips_delimiter() {
+    // /re/ must not include the trailing delimiter in the pattern.
+    ex_test("a\napple\nbanana\ncherry\n.\n/cherry/\np\nq!\n", "cherry\n");
+}
+
+#[test]
+fn test_ex_address_offset_absolute() {
+    ex_test("a\nL1\nL2\nL3\nL4\n.\n2+1p\nq!\n", "L3\n");
+}
+
+#[test]
+fn test_ex_address_offset_last() {
+    ex_test("a\nL1\nL2\nL3\nL4\n.\n$-1p\nq!\n", "L3\n");
+}
+
+#[test]
+fn test_ex_address_offset_range() {
+    ex_test("a\nL1\nL2\nL3\nL4\n.\n1,2+1p\nq!\n", "L1\nL2\nL3\n");
+}

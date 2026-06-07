@@ -32,6 +32,10 @@ fn run_test_at(
     // strftime in the user's timezone) is deterministic regardless of the host.
     std::env::set_var("TZ", "UTC");
     std::env::set_var("LC_ALL", "C");
+    // Make the allow/deny gate permit the test user regardless of the host's
+    // /etc/at.{allow,deny}: no allow file, an empty deny file (/dev/null).
+    std::env::set_var("AT_ALLOW", "/nonexistent/posixutils/at.allow");
+    std::env::set_var("AT_DENY", "/dev/null");
 
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 

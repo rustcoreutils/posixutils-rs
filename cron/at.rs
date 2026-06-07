@@ -17,6 +17,7 @@ use std::{
     fmt::Display,
     fs::{self, File},
     io::{BufRead, IsTerminal, Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -276,10 +277,21 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
     // get a list of all jobs
     let jobs = list_jobs(path);
 
+    // SAFETY: getuid() never fails.
+    let uid = unsafe { libc::getuid() };
+
     // Go through all the job identifiers
     for job_id in job_ids {
         if let Some(job_info) = jobs.get(job_id) {
             let file_path = path.join(&job_info.file_name);
+
+            // Only the job's owner (or root) may remove it (audit #A7).
+            let meta = fs::symlink_metadata(&file_path)
+                .map_err(|e| format!("Could not stat job {}: {}", job_id, e))?;
+            if uid != 0 && meta.uid() != uid {
+                return Err(format!("you do not own job {}", job_id));
+            }
+
             // Delete the file
             if let Err(e) = fs::remove_file(&file_path) {
                 return Err(format!(

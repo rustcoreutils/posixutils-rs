@@ -20,8 +20,9 @@ use std::{
     env,
     ffi::CStr,
     fs,
-    io::{Read, Seek, Write},
+    io::{self, ErrorKind, Read, Seek, Write},
     os::unix::fs::PermissionsExt,
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process,
 };
@@ -187,17 +188,46 @@ impl Job {
             mail,
         } = self;
 
+        // Environment values and the working directory are single-quoted so
+        // spaces and shell metacharacters survive intact (audit #A8).
         let env = env
             .into_iter()
-            .map(|(key, value)| format!("{}={}; export {}", key, value, key))
+            .map(|(key, value)| format!("{}={}; export {}", key, sh_single_quote(&value), key))
             .collect::<Vec<_>>()
             .join("\n");
 
         format!(
-            "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask 22\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
-            if mail {1} else {0},
-            call_place.to_string_lossy()
+            "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask {:03o}\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
+            if mail { 1 } else { 0 },
+            current_umask(),
+            sh_single_quote(&call_place.to_string_lossy())
         )
+    }
+}
+
+/// Single-quote a string for safe inclusion in a POSIX shell script.
+fn sh_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Read the invoking process's file-creation mask without changing it. The
+/// at-job retains this umask per spec (audit #A8).
+fn current_umask() -> libc::mode_t {
+    // SAFETY: umask() never fails; we set it to read the old value, then restore.
+    unsafe {
+        let m = libc::umask(0);
+        libc::umask(m);
+        m & 0o777
     }
 }
 
@@ -232,36 +262,38 @@ impl std::fmt::Display for NextJobError {
 impl std::error::Error for NextJobError {}
 
 pub fn next_job_id() -> Result<u32, Box<dyn std::error::Error>> {
-    let mut file_opt = std::fs::OpenOptions::new();
-    file_opt.read(true).write(true);
-
-    let mut buf = String::new();
     let job_file_number = format!("{}.SEQ", get_job_dir()?);
 
-    let (next_job_id, mut file) = match file_opt.open(&job_file_number) {
-        Ok(mut file) => {
-            file.read_to_string(&mut buf).map_err(NextJobError::Io)?;
-            file.rewind().map_err(NextJobError::Io)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&job_file_number)
+        .map_err(NextJobError::Io)?;
 
-            (
-                u32::from_str_radix(buf.trim_end_matches("\n"), 16)
-                    .map_err(NextJobError::FromStr)?,
-                file,
-            )
-        }
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => (
-                0,
-                std::fs::File::create_new(job_file_number).map_err(NextJobError::Io)?,
-            ),
+    // Hold an exclusive lock across the read-modify-write so concurrent `at`
+    // invocations cannot hand out the same job id (audit #A11). The lock is
+    // released when `file` is dropped.
+    // SAFETY: the fd is valid for the lifetime of `file`; flock with LOCK_EX is
+    // a blocking exclusive lock and we check the return value.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(NextJobError::Io(io::Error::last_os_error()).into());
+    }
 
-            _ => Err(NextJobError::Io(err))?,
-        },
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).map_err(NextJobError::Io)?;
+
+    let prev = match buf.trim() {
+        "" => 0,
+        s => u32::from_str_radix(s, 16).map_err(NextJobError::FromStr)?,
     };
 
     // Limit range of jobs to 2^20 jobs
-    let next_job_id = (1 + next_job_id) % 0xfffff;
+    let next_job_id = (1 + prev) % 0xfffff;
 
+    file.rewind().map_err(NextJobError::Io)?;
+    file.set_len(0).map_err(NextJobError::Io)?;
     file.write_all(format!("{next_job_id:05x}").as_bytes())
         .map_err(NextJobError::Io)?;
 
@@ -276,22 +308,46 @@ fn read_user_file(file_path: &str) -> std::io::Result<HashSet<String>> {
         .collect())
 }
 
+/// Locations of the at.allow / at.deny files. The implementation-defined
+/// location is `/etc`; the `AT_ALLOW` / `AT_DENY` overrides are honored only
+/// when not running set-uid (real uid == effective uid), so a set-uid `at`
+/// cannot be tricked into reading attacker-chosen allow/deny files.
+fn allow_deny_paths() -> (String, String) {
+    // SAFETY: getuid()/geteuid() never fail.
+    let overridable = unsafe { libc::getuid() == libc::geteuid() };
+    let pick = |var: &str, default: &str| {
+        if overridable {
+            env::var(var).unwrap_or_else(|_| default.to_string())
+        } else {
+            default.to_string()
+        }
+    };
+    (
+        pick("AT_ALLOW", "/etc/at.allow"),
+        pick("AT_DENY", "/etc/at.deny"),
+    )
+}
+
 pub fn is_user_allowed(user: &str) -> bool {
-    let allow_file = "/etc/at.allow";
-    let deny_file = "/etc/at.deny";
+    let (allow_file, deny_file) = allow_deny_paths();
 
-    if let Ok(allowed_users) = read_user_file(allow_file) {
-        // If at.allow exists, only users from this file have access
-        return allowed_users.contains(user);
+    // If at.allow exists, only the users listed in it have access.
+    match read_user_file(&allow_file) {
+        Ok(allowed) => return allowed.contains(user),
+        Err(e) if e.kind() != ErrorKind::NotFound => return false,
+        Err(_) => {}
     }
 
-    if let Ok(denied_users) = read_user_file(deny_file) {
-        // If there is no at.allow, but there is at.deny, check if the user is blacklisted
-        return !denied_users.contains(user);
+    // Otherwise, if at.deny exists, everyone not listed has access (an empty
+    // at.deny therefore permits all users).
+    match read_user_file(&deny_file) {
+        Ok(denied) => return !denied.contains(user),
+        Err(e) if e.kind() != ErrorKind::NotFound => return false,
+        Err(_) => {}
     }
 
-    // If there are no files, access is allowed to all
-    true
+    // Neither file exists: only a privileged process may submit (POSIX XSI).
+    unsafe { getuid() == 0 }
 }
 
 /// The invoking user, resolved from the real uid via `getpwuid(getuid())`.
@@ -352,5 +408,28 @@ unsafe fn resolve_passwd() -> Option<*const passwd> {
         None
     } else {
         Some(pw_ptr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sh_single_quote;
+
+    #[test]
+    fn sh_quote_wraps_plain_and_spaces() {
+        assert_eq!(sh_single_quote("abc"), "'abc'");
+        assert_eq!(sh_single_quote("a b c"), "'a b c'");
+    }
+
+    #[test]
+    fn sh_quote_neutralizes_metacharacters() {
+        // Shell metacharacters are inert inside single quotes.
+        assert_eq!(sh_single_quote("rm -rf /; echo x"), "'rm -rf /; echo x'");
+        assert_eq!(sh_single_quote("$(id)`id`"), "'$(id)`id`'");
+    }
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quote() {
+        assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
     }
 }

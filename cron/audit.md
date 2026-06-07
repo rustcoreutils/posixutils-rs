@@ -276,12 +276,12 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   and at least `utc` supported (84829-84831); a real `TZ=America/New_York`
   cannot be used. Fix: resolve names case-insensitively via `chrono-tz`; accept
   `utc` in any case.
-- [ ] **#A7 — `-r` removes any job by id with no ownership check.** `remove_jobs`
+- [x] **#A7 — `-r` removes any job by id with no ownership check.** `remove_jobs`
   unlinks by numeric id from the shared spool (`at.rs:365-387`), so any user can
   delete another user's queued job. The at spool is multi-user; the only
   per-user scoping in the spec is via the allow/deny gate and job ownership.
   Fix: verify the job file's owner == invoking user before unlinking.
-- [ ] **#A8 — Job script quoting and umask diverge.** `into_script`
+- [x] **#A8 — Job script quoting and umask diverge.** `into_script`
   (`at.rs:502-525`) emits each env var as `KEY=value; export KEY` with the value
   **unquoted**, and `cd {call_place}` unquoted; any space/metachar in a value or
   the cwd breaks the script (or injects). It also hardcodes `umask 22` rather
@@ -299,7 +299,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   `<EOT>` are written even when stdin is not a terminal (`at.rs:230-248`).
   STDOUT (85006): prompts "may be written" *when standard input is a terminal*.
   Writing always pollutes non-interactive pipelines. Fix: gate on `isatty(0)`.
-- [ ] **#A11 — `next_job_id` is racy.** Read-modify-write of `.SEQ` with no lock
+- [x] **#A11 — `next_job_id` is racy.** Read-modify-write of `.SEQ` with no lock
   (`at.rs:558-593`); concurrent `at` invocations can compute the same id, and
   the subsequent `create_new` job file then errors out. Fix: `flock` the SEQ
   file across the increment (vixie uses a lock).
@@ -308,7 +308,7 @@ supported at all), and — fatally — **submitted jobs are never executed** (#X
   `gettext()` calls embedded in the clap attributes are evaluated in the C
   locale — localization is a no-op (same defect noted in `dev/lex`). Fix: call
   `setlocale` first.
-- [ ] **#A13 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
+- [x] **#A13 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
   returns `true` for all when neither `/etc/at.allow` nor `/etc/at.deny` exists
   (`at.rs:603-619`); spec 84778-84779 restricts to appropriate-privilege.
 - [x] **#A14 — Submission-notice date uses `%d` not `%e`.** `at.rs:459`; spec
@@ -397,7 +397,7 @@ duplicates ~300 lines of `at.rs` verbatim instead of sharing them.
 - [x] **#B4 — Submission instant computed in local→UTC, ignoring `TZ`/format.**
   `batch.rs:43-48` builds `now`; the printed date uses `%d` not `%e` and is not
   `TZ`-adjusted (87010-87012). Same root cause as `at` #A5/#A14.
-- [ ] **#B5 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
+- [x] **#B5 — allow/deny "neither exists" rule inverted (XSI).** `is_user_allowed`
   open-by-default (`batch.rs:313-329`); spec 86961-86962.
 - [ ] **#B6 — `SHELL`/`TZ` env semantics (86991-87000) not honored** — uses the
   passwd shell; no `TZ`-relative scheduling.

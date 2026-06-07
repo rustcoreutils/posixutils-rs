@@ -1,0 +1,379 @@
+# POSIX.1-2024 Conformance Audits — `editors/` utilities
+
+This file collects per-utility POSIX conformance audits for the editors crate
+(`ed`, `ex`, `vi`). Each audit follows the playbook in `../audits.md`.
+
+**Date:** 2026-06-07
+**Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3.
+**Reference slices:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/{ed,ex,vi}.md`
+
+The crate builds two binaries: `ed` (`ed_main.rs` + `ed/`) and `vi` (`vi_main.rs`
++ `vi/`). `ex` is the line-editor mode of the `vi` binary, selected when `argv[0]`
+ends in `ex` (`vi/lib.rs:50-90`); it shares the buffer/file/search/options
+machinery with `vi` and adds the `vi/ex/` command parser + executor.
+
+Critical and Major findings below were **behaviorally verified** by building the
+release binaries and driving them (`ed` via piped stdin scripts; `vi`/`ex` flags
+via the CLI). Lines marked *(verified)* were confirmed by running the binary;
+"absent" claims (signals, locale) were confirmed by `grep` over the source tree.
+
+---
+
+## Cross-cutting themes
+
+Four patterns recur across all three editors. Fixing them at the shared layer
+(`vi/search.rs`, `plib`) closes many per-utility items at once.
+
+### 1. Regex flavor — `regex` crate is ERE, spec requires BRE
+
+All three editors must use **Basic Regular Expressions** (XBD §9.3); the `regex`
+crate implements ERE and does **not** support in-pattern back-references.
+
+| Utility | Pattern path | State |
+|---|---|---|
+| `ed` | `Regex::new(&pat)` direct at `editor.rs:332,365,977,1211,1400` | **No BRE translation at all** — `\(\)`, `\{n,m\}`, in-pattern `\1` all wrong *(verified)* |
+| `vi` | `Searcher::convert_pattern` (`search.rs:106-194`) | BRE→ERE translation present for `/`…`?` search; imperfect (no back-refs, nomagic quirks) |
+| `ex` | search via `convert_pattern`; **addresses** via raw `Regex::new` at `address.rs:214,221` | search OK-ish; **address `/re/` is pure ERE** |
+| all | — | LC_COLLATE bracket-expression ranges / equivalence classes never honored |
+
+### 2. Signal handling
+
+| Signal | `ed` | `vi` / `ex` |
+|---|---|---|
+| SIGHUP | handler → writes buffer to `ed.hup` (`ed_main.rs:46-67`, `editor.rs:1541-1572`) | **none** — no buffer preservation |
+| SIGINT | flag + `?` (`ed_main.rs:41-43`, `editor.rs:1523-1538`) | **none** (raw mode clears `ISIG`, so `^C` arrives as byte 0x03 and is dropped) |
+| SIGQUIT | `SIG_IGN` (`ed_main.rs:54-55`) | **none** |
+| SIGWINCH | N/A (non-visual) | **none** — terminal resize silently corrupts the display |
+| SIGCONT | N/A | **none** — after `^Z`/resume the terminal is left in cooked mode |
+| SIGTSTP | N/A | only `raise(SIGTSTP)` for `:suspend` (`editor/mod.rs:2415-2418`) |
+
+`vi`/`ex` install **zero** signal handlers. SIGWINCH + SIGCONT are mandatory for
+an interactive utility; SIGHUP preservation is mandated by both specs.
+
+### 3. Exit-status propagation
+
+`ed` prints `?` on every command error but **never sets a non-zero exit status**
+for command-level errors — invalid command, bad address, and no-match scripts all
+exit 0 *(verified: tests 3 & 4)*. POSIX requires `>0` when an error occurred,
+especially for non-terminal input. `vi`/`ex` propagate a 0/1 exit code correctly.
+
+### 4. Locale / i18n
+
+`ed` calls `setlocale(LC_ALL, "")` + `textdomain` (`ed_main.rs:72-74`) but its
+diagnostics are hardcoded English and the regex engine is not locale-aware.
+`vi`/`ex` make **no `setlocale()` call at all** — `LANG`/`LC_*` do nothing, and
+word/case classification uses Rust built-ins (`is_alphanumeric`). The shared
+`plib::locale` / `plib::diag` infrastructure built for the `dev/` audit is the
+natural home for the fix.
+
+---
+
+## `ed`
+
+**Implementation:** `ed_main.rs` (118) + `ed/editor.rs` (1674) + `ed/parser.rs`
+(883) + `ed/buffer.rs` (550) + `ed/error.rs` (66)
+**Tests:** `tests/ed/mod.rs` (1394)
+**Spec slice:** `…/3-utilities/ed.md`
+
+### TL;DR
+Core command set (`a c d e E f g G H h i j k l m n p P q Q r s t u v V w W x y z = ! #`),
+addressing, marks, global commands, and the `ed.hup`/SIGINT machinery are
+implemented and largely correct. Three headline gaps: the search/substitute
+engine is **ERE, not BRE** (so any real BRE pattern — grouping, intervals,
+back-references — fails or matches the wrong thing); **command errors never set a
+non-zero exit status**; and an **identical-result substitution is wrongly
+reported as "no match"** (`?`). EOF handling and a few error-policy details also
+diverge.
+
+### Priority issues
+
+#### Critical
+- [ ] **#E1 — Search/substitute use ERE, not BRE.** `editor.rs:15,332,365,977,1211,1400`. BRE `\(\)` grouping, `\{n,m\}` intervals, and in-pattern back-references `\1`–`\9` are all wrong; `regex` crate can't do in-pattern back-refs at all. *(verified: `/\(a\)/` and `/a\{2\}/` both return `?` instead of matching)*. Fix: add a BRE→ERE translation layer (mirror `vi/search.rs:convert_pattern`) or adopt a POSIX BRE engine; back-references need an engine that supports them.
+- [ ] **#E2 — Command errors never set exit status > 0.** `ed_main.rs:113-115`; loop prints `?` and continues. *(verified: invalid command `Z` and no-match search both exit 0)*. Fix: add `error_occurred: bool` to `Editor`, set it in the `?`-printing path, exit `1` from `main`.
+
+#### Major
+- [ ] **#E3 — Identical-result substitution reported as no-match.** `editor.rs:1021,1061`. The `if new_line != line_content` guard leaves `any_match=false` when the replacement equals the match, so `s` returns `EdError::NoMatch` → spurious `?`. *(verified: `s/x/x/` and `s/o/o/` on lines containing the char both print `?`)*. Fix: set `any_match=true` whenever the regex matched, independent of whether the text changed; also mark the buffer modified (POSIX: same-contents result still counts as modified).
+- [ ] **#E4 — EOF in command mode does not act as `q`.** `editor.rs:1588-1591` bare `break`. *(verified: append + `.` + EOF on a modified buffer exits 0 with no `?` warning)*. Fix: on `read_line()→None`, run the `q` path so the modified-buffer warning fires.
+- [ ] **#E5 — EOF in input mode does not return to command mode.** `editor.rs:1588-1591` (and the `G` loop). Collected `input_lines` are dropped and ed exits. Fix: terminate input mode, resume the command loop without the pending command.
+- [ ] **#E6 — `G`/`V` interactive prompt allows `a`/`c`/`i`.** `editor.rs:1484-1492` blocks the global/shell commands but not `Append`/`Change`/`Insert`, which the spec forbids in the interactive sub-prompt. Fix: add those three to the forbidden match arm.
+- [ ] **#E7 — Intermediate address offsets reject out-of-range values.** `editor.rs:283-297` errors when a mid-chain offset goes `< 0`. Spec: "It shall not be an error for an intermediate address value to be less than zero or greater than the last line." Fix: only validate the final resolved address.
+
+#### Minor
+- [ ] **#E8 — Diagnostics hardcoded English; regex not locale-aware.** `error.rs`, `editor.rs`. `setlocale`/`textdomain` are called (`ed_main.rs:72-74`) but message strings aren't `gettext()`-wrapped and LC_COLLATE ranges aren't honored. Fix: route through `plib::diag` + wrap strings (shared with dev/ audit).
+- [ ] **#E9 — `s` count-flag (nth occurrence) is fragile.** `editor.rs:1009-1014` re-runs the regex on the matched substring; breaks anchored/back-ref patterns. Fix: select the nth match position from `find_iter`, splice without re-matching.
+- [ ] **#E10 — Compound omitted-address separators not expanded.** `parser.rs:323-366`. `,,`/`;;` chains (`1,$,$`) not handled. Fix: propagate the resolved second address as the first input to the next separator.
+- [ ] **#E11 — SIGHUP/SIGINT handled by polling atomic flags, not async-safe path.** `ed_main.rs:41-67`, `editor.rs:1577-1598`. Works in practice; `save_hup_file` is not strictly async-signal-safe. Fix: self-pipe or restrict the handler to async-signal-safe writes.
+
+### Detailed conformance matrix
+
+#### SYNOPSIS / OPTIONS
+- [x] `-p string` CONFORMS — `ed_main.rs:31-32`, enables prompt.
+- [x] `-s` CONFORMS — suppresses byte counts and `!` completion marker; `ed_main.rs:34`, `editor.rs:771-773`.
+- [x] `--`/option ordering CONFORMS — clap.
+
+#### OPERANDS / STDIN / INPUT FILES
+- [x] `file` operand loaded before commands — `ed_main.rs:96-109`.
+- [ ] **EOF-as-`q` (cmd mode) DIVERGES** — #E4.
+- [ ] **EOF terminate-input-mode DIVERGES** — #E5.
+
+#### ENVIRONMENT VARIABLES
+- [x] `HOME` CONFORMS — `ed.hup` fallback path, `editor.rs:1559`.
+- [ ] **`LC_COLLATE` MISSING** — regex not locale-aware (#E8).
+- [ ] **`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` PARTIAL** — setlocale called, strings/engine not wired (#E8).
+
+#### ASYNCHRONOUS EVENTS
+- [x] `SIGQUIT` CONFORMS (`SIG_IGN`).
+- [x] `SIGINT` CONFORMS — prints `?`, returns to command mode.
+- [x] `SIGHUP` CONFORMS (common path) — writes `ed.hup` then `$HOME/ed.hup`; #E11 is the only nit.
+
+#### STDOUT / STDERR
+- [x] `?` error reporting on stdout CONFORMS — `editor.rs:187`.
+- [x] `H`/`h` verbose help CONFORMS — `editor.rs:575-589`.
+- [x] Byte counts (`e`/`E`/`r`/`w`) CONFORMS, `-s`-suppressed — `editor.rs:196-200`.
+- [x] Prompt to stdout, fatal diagnostics to stderr CONFORMS — `editor.rs:178-180`, `ed_main.rs` fatal path.
+
+#### Commands
+- [x] `a c d i j k l m n p P t = ` CONFORMS — see `buffer.rs`/`editor.rs` per command.
+- [x] `e E f r w W` CONFORMS — incl. `r !cmd`/`w !cmd` shell forms (`editor.rs:622-691`).
+- [x] `g v` CONFORMS — mark-then-iterate (`editor.rs:1186-1375`).
+- [ ] **`G V` PARTIAL** — #E6.
+- [x] `h H P q Q u` CONFORMS.
+- [ ] **`s` DIVERGES/PARTIAL** — #E1 (BRE), #E3 (no-op), #E9 (count). Flags `g p l n % & \&` and `\<newline>` split CONFORM (`editor.rs:959-1044`).
+- [x] `!cmd` CONFORMS — `%`/`!` expansion, completion marker (`editor.rs:710-775`).
+- [ ] `x z #` are non-POSIX extensions (treated as wq / scroll / null) — N/A, harmless.
+
+#### Addressing
+- [x] `. $ n 'x +n -n + - , ;` and `/re/`,`?re?` wrap CONFORM — `parser.rs`, `editor.rs:265-391`.
+- [ ] **Intermediate out-of-range DIVERGES** — #E7.
+- [ ] **Compound `,,`/`;;` MISSING** — #E10.
+
+#### EXIT STATUS / CONSEQUENCES OF ERRORS
+- [ ] **Command errors exit 0 DIVERGES** — #E2.
+- [ ] **Non-terminal stdin error policy PARTIAL** — folded into #E2 (no `isatty()` distinction).
+
+### Test coverage signal
+Not covered:
+- [ ] BRE-specific patterns (`\(\)`, `\{n,m\}`, back-refs) — would catch #E1.
+- [ ] Exit status after a command error — would catch #E2.
+- [ ] Identical-result substitute (`s/x/x/`) — would catch #E3.
+- [ ] EOF behavior in command/input mode — #E4/#E5.
+- [ ] `G`/`V` forbidden sub-commands — #E6.
+
+### Suggested PR groupings
+- **PR ed-A — "BRE engine"**: #E1 (+ #E9 count rework, #E8 collation).
+- **PR ed-B — "exit status & error policy"**: #E2, #E3.
+- **PR ed-C — "EOF / input-mode"**: #E4, #E5.
+- **PR ed-D — "global & addressing"**: #E6, #E7, #E10.
+
+---
+
+## `vi`
+
+**Implementation:** `vi_main.rs` (16) + `vi/` ≈ 14.3k lines (entry/dispatch
+`lib.rs`, `editor/`, `command/`, `mode/`, `buffer/`, `ui/`, `input/`, `search.rs`,
+`options.rs`, `file.rs`, `register.rs`, `undo.rs`, `shell.rs`, `config.rs`).
+**Tests:** `tests/integration/mod.rs` (2043), `tests/pty/mod.rs` (254),
+`tests/headless/mod.rs` (797)
+**Spec slice:** `…/3-utilities/vi.md`
+
+### TL;DR
+The visual command set is broad and mostly correct — motions, operators, insert
+modes, registers, marks, undo, search, `:`-escape, `%`, counts, `ZZ` all work.
+The dominant gaps are **systemic, not per-command**: **no signal handling**
+(SIGWINCH/SIGCONT/SIGHUP all absent — resize corrupts the screen, `^Z`/resume
+breaks the terminal, hangup loses the buffer); **`-r` and `-t` are hard errors**
+that exit immediately *(verified)*; **no `setlocale`**; and search is an imperfect
+BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
+(`(` `)` `_`) silently do nothing.
+
+### Priority issues
+
+#### Critical
+- [ ] **#V1 — SIGWINCH not handled.** No handler anywhere in `vi/`. Terminal resize mid-edit corrupts the display with no recovery. Fix: `sigaction` handler → atomic flag → main loop refreshes size + full redraw.
+- [ ] **#V2 — SIGCONT not handled.** After `^Z` (or `:suspend`) + resume, the terminal stays in cooked mode. Fix: SIGCONT handler re-enables raw mode and redraws.
+- [ ] **#V3 — SIGHUP not handled; no buffer preservation.** Spec: hangup/EOF-on-input ⇒ preserve buffer. Currently the buffer is lost. Fix: SIGHUP handler writes a recovery/`dead.letter`-style file then exits.
+
+#### Major
+- [ ] **#V4 — `-r` recovery hard-errors and exits.** `lib.rs:177`. *(verified: `vi -r` → "vi: recovery mode not supported", exit 1)*. Fix: at minimum list recoverable files / no-op instead of fatal.
+- [ ] **#V5 — `-t tagstring` hard-errors; `^]` is a stub.** `lib.rs:188`, `editor/mod.rs:3071-3074`. *(verified: `vi -t main` → "vi: tag mode not supported", exit 1)*. Fix: parse `tags` (ctags format), literal-string lookup, jump.
+- [ ] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** In the parser's simple-command list but no arm in `execute_command`; they silently do nothing. Fix: implement `move_sentence_{forward,backward}` and wire them.
+- [ ] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** `command/parser.rs:272`; no executor arm. Fix: add arm → `current + count − 1`, first non-blank.
+- [ ] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** `ui/terminal.rs:74`. `^C` arrives as byte 0x03 and is silently discarded; spec wants the terminal alerted and partial command discarded. Fix: keep `ISIG` or install a SIGINT handler; bell + cancel pending command.
+- [ ] **#V9 — `EXINIT=""` does not suppress `$HOME/.exrc`.** `editor/mod.rs:2023` checks `!exinit.is_empty()` before processing, so an empty-but-set `EXINIT` falls through and sources `.exrc`. Spec: presence (even empty) suppresses `.exrc`. Fix: branch on *is-set*, not *non-empty*.
+- [ ] **#V10 — No `setlocale`; LC_* ignored.** No call anywhere in `vi/`. Word/case ops use Rust built-ins. Fix: `setlocale(LC_ALL,"")` at startup (shared with #X/#E i18n work).
+
+#### Minor
+- [ ] **#V11 — `-w size` consumed but discarded.** `lib.rs:193-196`; never assigned to `options.window`/`scroll`. Fix: parse + assign.
+- [ ] **#V12 — `stty` erase/kill chars not honored.** `mode/insert.rs:122,133` hardcode `^H`/`^U`. Fix: read `c_cc[VERASE]`/`c_cc[VKILL]` via `tcgetattr`.
+- [ ] **#V13 — Missing `set` options.** `beautify`, `directory`, `edcompatible`, `mesg`, `prompt`, `redraw`, `remap`, `slowopen`, `warn` absent from `Options` (`options.rs`). Fix: add (stub where behavior is a no-op).
+- [ ] **#V14 — `^L` and `^R` share one handler.** `editor/mod.rs:622-625`; both just mark for redraw. `^L` should clear the physical screen first; `^R` should refresh only `@`-flagged lines. Fix: split handlers.
+- [ ] **#V15 — NUL-in-insert (re-insert last input) not implemented.** `mode/insert.rs`. Fix: on `Char('\0')` at insert start, replay last inserted text.
+- [ ] **#V16 — Search is imperfect BRE over ERE.** `search.rs:106-194` converts magic-mode patterns but the underlying engine is ERE (no in-pattern back-refs) and nomagic handling has BRE edge-case quirks. Fix: shared BRE engine (cross-cutting #1).
+
+### Detailed conformance matrix
+
+#### OPTIONS
+- [x] `-R` CONFORMS — `lib.rs:173`.
+- [x] `-c command` / `+command` CONFORMS — `lib.rs:179-185,212-213`.
+- [ ] **`-r` MISSING** — #V4.  **`-t` MISSING** — #V5.  **`-w` PARTIAL** — #V11.
+- [ ] `-s`/`-h`/`--version` accepted (extensions / ex-only on vi) — DIVERGES, harmless.
+
+#### OPERANDS / STDIN / INPUT FILES
+- [x] Multiple-file list + first-file open CONFORMS — `FileManager`.
+- [ ] **STDIN EOF not treated as SIGHUP PARTIAL** — folded into #V3.
+
+#### ENVIRONMENT VARIABLES
+- [x] `COLUMNS`/`LINES` CONFORMS — `ui/terminal.rs:141-152`.
+- [x] `EXINIT`/`HOME` (basic) CONFORMS — `editor/mod.rs:2021-2035` (but #V9).
+- [x] `SHELL` CONFORMS — `options.rs:142`.
+- [ ] **`LANG`/`LC_ALL`/`LC_COLLATE`/`LC_CTYPE`/`LC_MESSAGES` MISSING** — #V10.
+- [ ] **`TERM` PARTIAL** — read but no terminfo lookup.
+
+#### ASYNCHRONOUS EVENTS
+- [ ] **SIGWINCH / SIGCONT / SIGHUP MISSING** — #V1/#V2/#V3.
+- [ ] **SIGINT PARTIAL** — #V8.  `:suspend` raises SIGTSTP but no SIGCONT re-entry (#V2).
+
+#### Command set
+- [x] Motions `h j k l w W b B e E 0 $ ^ f F t T ; , G H M L { } [[ ]] |` CONFORM — `command/motion.rs`, `editor/mod.rs`.
+- [ ] **`(` `)` MISSING** (#V6); **`_` MISSING** (#V7).
+- [x] Scrolling `^F ^B ^D ^U ^E ^Y z` CONFORM.
+- [ ] **`^L`/`^R` PARTIAL** (#V14); **`^]` MISSING** (#V5).
+- [x] Editing `i I a A o O c C cc d D dd x X r R y Y p P J ~ < > .` CONFORM.
+- [ ] **`s`/`S` PARTIAL** — do not save deleted text to the named buffer (`editor/mod.rs:698,705`).
+- [x] `u U`, marks `m ' \``, `: / ? n N % & @ " Q ZZ ! ^^` CONFORM (search is #V16).
+
+#### Insert mode
+- [x] ESC, `^H`, `^W`, `^U`, `^T` CONFORM — `mode/insert.rs`.
+- [ ] **`^V` PARTIAL** (no visual feedback); **`^D` PARTIAL** (`0^D`/`^^D` edge cases); autoindent-on-blank PARTIAL; **stty erase/kill MISSING** (#V12); **NUL re-input MISSING** (#V15).
+
+#### EXIT STATUS / CONSEQUENCES OF ERRORS
+- [x] 0/1 exit code propagated — `lib.rs:73-140`, `vi_main.rs:15`.
+- [ ] **Unrecoverable-error ⇒ preserve PARTIAL** — folded into #V3.
+
+### Test coverage signal
+Not covered:
+- [ ] Signal handling (resize / suspend / hangup) — #V1-#V3.
+- [ ] `-r` / `-t` behavior — #V4/#V5.
+- [ ] Sentence motions `(` `)`, `_` — #V6/#V7.
+- [ ] `EXINIT=""` vs `.exrc` ordering — #V9.
+
+### Suggested PR groupings
+- **PR vi-A — "signals"**: #V1, #V2, #V3, #V8 (shared `dead.letter`/recovery infra with ex-#X1/#X2).
+- **PR vi-B — "missing motions"**: #V6, #V7, plus `s`/`S` register save.
+- **PR vi-C — "startup/options"**: #V4, #V5, #V9, #V11, #V13.
+- **PR vi-D — "locale & regex"**: #V10, #V16 (cross-cutting #1/#4).
+- **PR vi-E — "insert-mode fidelity"**: #V12, #V14, #V15.
+
+---
+
+## `ex`
+
+**Implementation (shared vi binary, ex mode):** `vi/lib.rs` (dispatch/argv),
+`vi/ex/{mod,command,address,parser}.rs`, plus `vi/{file,search,options,shell}.rs`.
+**Tests:** `tests/ex/mod.rs` (547)
+**Spec slice:** `…/3-utilities/ex.md`
+
+### TL;DR
+The ex command vocabulary is large and the parser covers most of it
+(`a c d g v m t co p nu s w wq x q e r set ! & < > = @ ya pu j`, addressing, the
+`set` options). But ex inherits every cross-cutting gap from vi and adds several
+of its own: **no signal handling / no `preserve`** so a modified buffer is lost on
+hangup or unexpected EOF; **`-s` batch mode still sources EXINIT/`.exrc`**
+*(verified by code path)*; **`-r`/`-t` hard-error and exit** *(verified)*; the
+**address parser uses raw ERE** and **drops the offset after an address**; `;`
+behaves like `,`; and `global`/`v` appears to run **single-pass** rather than the
+mandated mark-then-execute.
+
+### Priority issues
+
+#### Critical
+- [ ] **#X1 — No signal handlers (SIGHUP/SIGINT/SIGTERM).** None in the tree. Spec mandates SIGHUP ⇒ preserve. Fix: install handlers (shared with vi-#V1-#V3).
+- [ ] **#X2 — `preserve` command + EOF/SIGHUP file preservation missing.** No `Preserve` variant in `ExCommand`. *(EOF in `run_ex_mode` at `editor/mod.rs:505-508` just sets `should_quit`)*. Fix: add `preserve`, save buffer to recovery dir; call it on EOF/SIGHUP when modified.
+- [ ] **#X3 — `-s` does not suppress EXINIT / `.exrc`.** `lib.rs:109-110` calls `load_startup_config()` unconditionally; only the *error message* is gated on `silent_mode`. *(verified by code path)*. Fix: skip startup config entirely when `silent_mode`.
+- [ ] **#X4 — Address `/re/`,`?re?` use raw ERE.** `address.rs:214,221` call `Regex::new` directly, bypassing `convert_pattern`. Fix: route address searches through the BRE converter (and the shared BRE engine, cross-cutting #1).
+- [ ] **#X5 — `-r` exits with error instead of listing recoverable files.** `lib.rs:177-178`. *(verified: exit 1)*. Fix: list-or-no-op.
+- [ ] **#X6 — EOF on stdin not treated as SIGHUP.** `editor/mod.rs:505-508`; data loss when the buffer is modified. Fix: preserve before quitting (ties to #X2).
+
+#### Major
+- [ ] **#X7 — `global`/`v` appears single-pass.** `parser.rs:519-544` stores the command string and dispatches per match without a mark-first pass; line-inserting/deleting commands corrupt iteration. Fix: collect matching line numbers first, then execute against stable marks.
+- [ ] **#X8 — `-t tagstring` hard-errors.** `lib.rs:187-189`. *(verified: exit 1)*. Fix: ctags lookup + jump (shared with vi-#V5).
+- [ ] **#X9 — Address offset after an address is parsed then discarded.** `address.rs:296-310` computes the offset but never applies it to the base address. Fix: add the offset to the resolved address.
+- [ ] **#X10 — `;` separator treated like `,`.** `address.rs:315`; does not set current line to the first address before parsing the second. Fix: resolve first address, set `.`, then parse second.
+- [ ] **#X11 — stdin-not-a-tty does not auto-enable `-s`.** Spec: non-terminal stdin ⇒ behave as `-s`. Only the explicit flag sets `silent_mode` (`lib.rs:197`). Fix: `stdin().is_terminal()` check at startup.
+- [ ] **#X12 — `substitute` gaps.** `parser.rs:506-508` errors on empty pattern instead of reusing the last RE; missing flags `l`, `#`, count; `~`, `%`, `\l\u\L\U` in replacement unimplemented; `c` (confirm) parsed but no interactive loop; `\n`-split doesn't split the buffer line. Fix: extend `SubstituteFlags` + `expand_replacement`.
+- [ ] **#X13 — `shell` command does not pass `-i`.** `shell.rs` interactive path. Spec §`sh -i`. Fix: add `.arg("-i")`.
+- [ ] **#X14 — No `setlocale`; LC_* ignored.** Shared with vi-#V10.
+
+#### Minor
+- [ ] **#X15 — Line-0 address rejected for `a`/`i`/`r`/`=`/`put`.** `address.rs:56-60`. Fix: allow 0 for the commands the spec lists.
+- [ ] **#X16 — `'`/`` ` `` marks not resolvable; only a–z named marks.** `address.rs:228`. Fix: support the previous-context marks.
+- [ ] **#X17 — Excess leading addresses not discarded.** `address.rs`. Fix: keep only the last two.
+- [ ] **#X18 — Missing `~`, `recover` commands; `preserve` (see #X2).** `ex/command.rs` enum. Fix: add variants.
+- [ ] **#X19 — `showmode` defaults `true`; spec default unset.** `options.rs:101`. Fix: default `false`.
+- [ ] **#X20 — Missing `set` options & `warn` message before `!`.** Same list as vi-#V13; `warn`/`beautify`/`mesg`/`redraw`/`remap`/`slowopen`/`directory`/`edcompatible` absent. Fix: add.
+- [ ] **#X21 — Unreadable `.exrc` silently ignored.** `config.rs:40` returns `None`; spec says it "shall be an error." Fix: surface the error.
+- [ ] **#X22 — `write` ignores readonly / pathname-changed / partial-write rules.** Write path doesn't consult `FileManager.readonly` or enforce spec write rules 5/6. Fix: add the guards.
+- [ ] **#X23 — `r !cmd` uses `Stdio::null()` for the command's stdin.** Spec: the editor's stdin. Fix: inherit stdin.
+
+### Detailed conformance matrix
+
+#### OPTIONS
+- [x] `-R` CONFORMS; `-v` CONFORMS (`lib.rs`).
+- [ ] **`-c`/`+command` PARTIAL** — run unconditionally, not only on first existing-file load.
+- [ ] **`-s` PARTIAL** (#X3); **`-r` MISSING** (#X5); **`-t` MISSING** (#X8); **`-w` PARTIAL** (parsed, not applied).
+
+#### OPERANDS / STDIN
+- [ ] **EOF-as-SIGHUP MISSING** — #X6.  **`{LINE_MAX}` limit MISSING** — minor.
+- [ ] **stdin-not-tty ⇒ `-s` MISSING** — #X11.
+
+#### ENVIRONMENT VARIABLES
+- [x] `HOME`, `SHELL` CONFORM (`options.rs:142`).
+- [x] `EXINIT` works (but not suppressed under `-s` — #X3).
+- [ ] **`LANG`/`LC_*` MISSING** (#X14); **`COLUMNS`/`LINES` MISSING** (ioctl only); **`TERM` PARTIAL** (read before mode applied).
+
+#### ASYNCHRONOUS EVENTS
+- [ ] **All signals MISSING** — #X1.
+
+#### STDOUT / STDERR
+- [x] Line output to stdout, diagnostics to stderr CONFORM.
+
+#### Addressing
+- [x] `. $ n +n -n % ,` CONFORM (`address.rs`).
+- [ ] **`/re/`,`?re?` raw ERE** (#X4); **offset dropped** (#X9); **`;`==`,`** (#X10); **line-0 rejected** (#X15); **`'`/`` ` `` marks** (#X16); **excess not discarded** (#X17).
+
+#### Commands
+- [x] `ar co/t d m nu p pu q(!) rew se(t) u ya = # & ya` CONFORM.
+- [ ] **`g`/`v` single-pass** (#X7); **`s` gaps** (#X12); **`sh[ell]` no `-i`** (#X13).
+- [ ] **PARTIAL (modifier/arg gaps):** `a`/`i`/`c` (no `!` autoindent toggle), `cd`, `e`/`n` (`+command` & file args), `f`, `j` (`!`, two-space rule), `l` (escape table), `o`, `q` (remaining-files check), `r` (#X23), `so`, `ta`, `vi[sual]`, `w`/`wq`/`x` (#X22), `z` (`!`/multi-type), `!` (warn), `@`/`@@`.
+- [ ] **MISSING:** `pre[serve]`, `rec[over]`, `~` (#X18).
+
+#### `set` options
+- [x] Implemented: `ai ap aw eb exrc ic list magic nu para ro report scroll sections sh sw sm showmode ts tl tags term terse timeout window wm ws wa`.
+- [ ] **MISSING:** `beautify directory edcompatible mesg prompt redraw remap slowopen warn` (#X20).
+- [ ] **`showmode` default DIVERGES** (#X19).
+
+#### EXIT STATUS / CONSEQUENCES OF ERRORS
+- [x] 0/1 propagated; silent-mode error ⇒ exit 1.
+- [ ] **stdin-tty distinction PARTIAL** — uses `silent_mode`, not actual tty test (#X11).
+
+### Test coverage signal
+Not covered:
+- [ ] Signal handling / `preserve` / EOF preservation — #X1/#X2/#X6.
+- [ ] `-s` suppressing EXINIT/`.exrc` — #X3.
+- [ ] Address offset + `;` semantics — #X9/#X10.
+- [ ] `global`/`v` with line-count-changing commands — #X7.
+- [ ] substitute empty-pattern reuse, count, `l`/`#`, case escapes — #X12.
+
+### Suggested PR groupings
+- **PR ex-A — "signals & preserve"**: #X1, #X2, #X6 (+ vi-#V1-#V3 shared infra).
+- **PR ex-B — "batch/startup"**: #X3, #X5, #X8, #X11, #X21.
+- **PR ex-C — "addressing"**: #X4, #X9, #X10, #X15, #X16, #X17.
+- **PR ex-D — "global & substitute"**: #X7, #X12, #X13, #X22, #X23.
+- **PR ex-E — "options & misc"**: #X18, #X19, #X20, #X14 (locale, cross-cutting).
+
+---
+
+## Reference
+
+When fixes land, tick the box and append `✓ fixed in PR #NNN` inline (do not
+rewrite findings). Add an entry to the table in `../audits.md §9`.

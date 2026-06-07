@@ -1631,7 +1631,6 @@ dependencies = [
  "pest",
  "pest_derive",
  "plib",
- "regex",
  "rustyline",
 ]
 

@@ -197,13 +197,13 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 - [x] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** ✓ fixed (phase 8): `move_sentence_{forward,backward}` in `motion.rs` (POSIX boundaries: `.!?` + two spaces/EOL, or a blank line) wired into command and operator-motion dispatch. Tests: `motion::tests::test_sentence_*`, `test_pty_vi_sentence_motion_delete`.
 - [x] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** ✓ fixed (phase 8): `_` moves to the first non-blank of the line `count-1` lines down. Test: `test_pty_vi_underscore_first_nonblank`.
 - [x] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** ✓ fixed (phase 5): `^C` (byte 0x03 → `Key::Ctrl('c')`) now rings the bell and resets the command parser (`interrupt_command`); a SIGINT *signal* (e.g. `kill -INT`) is also caught via the handler and routed to the same path. PTY test: `test_pty_vi_interrupt_cancels_count`.
-- [ ] **#V9 — `EXINIT=""` does not suppress `$HOME/.exrc`.** `editor/mod.rs:2023` checks `!exinit.is_empty()` before processing, so an empty-but-set `EXINIT` falls through and sources `.exrc`. Spec: presence (even empty) suppresses `.exrc`. Fix: branch on *is-set*, not *non-empty*.
+- [x] **#V9 — `EXINIT=""` does not suppress `$HOME/.exrc`.** ✓ examined (phase 9): the current code already branches on `var_os("EXINIT").is_some()` (not non-empty), so a set-but-empty `EXINIT` correctly suppresses `.exrc` (the audit's line ref was stale). Verified behaviorally.
 - [x] **#V10 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): `run_editor` calls `setlocale(LC_ALL, "")` (`vi/lib.rs`), enabling locale-aware libc regex and `LC_MESSAGES`. (Word/case ops still use Rust built-ins — minor, no spec `shall`.)
 
 #### Minor
 - [x] **#V11 — `-w size` consumed but discarded.** ✓ fixed (phase 8): `-w` parses its size into `EditorOptions.window`; `Editor::set_window` applies it.
 - [ ] **#V12 — `stty` erase/kill chars not honored** (remaining, minor). Hardcoded `^H`/`^U` work for the common case; honoring `c_cc[VERASE]`/`VKILL` needs termios plumbing into insert mode. Deferred.
-- [ ] **#V13 — Missing `set` options.** `beautify`, `directory`, `edcompatible`, `mesg`, `prompt`, `redraw`, `remap`, `slowopen`, `warn` absent from `Options` (`options.rs`). Fix: add (stub where behavior is a no-op).
+- [x] **#V13 — Missing `set` options.** ✓ fixed (phase 9): `beautify`, `directory`, `edcompatible`, `mesg`, `prompt`, `redraw`, `remap`, `slowopen`, `warn` added to `Options` with set/no/query support (`prompt` is wired to the ex prompt; the rest are accepted/stored).
 - [x] **#V14 — `^L` and `^R` share one handler.** ✓ fixed (phase 8): `^L` clears the physical screen before redraw; `^R` does a plain redraw. (Per-`@`-line refresh remains a cosmetic nicety.)
 - [ ] **#V15 — NUL-in-insert (re-insert last input) not implemented** (remaining, minor). Needs cross-insert-session storage of the previous insertion. Deferred.
 - [x] **#V16 — Search is imperfect BRE over ERE.** ✓ fixed (phase 4): `search.rs` now uses `plib::regex` (libc BRE). `convert_pattern` magic mode is a passthrough (libc handles `\(\) \{\} \<\>` and treats `+?|(){}` as literal); nomagic escapes metacharacters. `Substitutor` rewritten with `captures_at` + a back-reference-aware `build_replacement`. Tests: `test_substitute_bre_*`, `test_search_bre_grouping`.
@@ -222,7 +222,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### ENVIRONMENT VARIABLES
 - [x] `COLUMNS`/`LINES` CONFORMS — `ui/terminal.rs:141-152`.
-- [x] `EXINIT`/`HOME` (basic) CONFORMS — `editor/mod.rs:2021-2035` (but #V9).
+- [x] `EXINIT`/`HOME` CONFORMS — `editor/mod.rs` (#V9 examined: set-but-empty suppresses `.exrc`).
 - [x] `SHELL` CONFORMS — `options.rs:142`.
 - [x] **`LANG`/`LC_ALL`/`LC_COLLATE`/`LC_CTYPE`/`LC_MESSAGES`** — ✓ fixed (phase 4), #V10.
 - [ ] **`TERM` PARTIAL** — read but no terminfo lookup.
@@ -253,7 +253,7 @@ Not covered:
 - [ ] Signal handling (resize / suspend / hangup) — #V1-#V3.
 - [ ] `-r` / `-t` behavior — #V4/#V5.
 - [x] Sentence motions `(` `)`, `_` — ✓ fixed (phase 8), #V6/#V7.
-- [ ] `EXINIT=""` vs `.exrc` ordering — #V9.
+- [x] `EXINIT=""` vs `.exrc` ordering — ✓ examined (phase 9), #V9; `.exrc` security unit-tested in `config.rs`.
 
 ### Suggested PR groupings
 - **PR vi-A — "signals"**: #V1, #V2, #V3, #V8 (shared `dead.letter`/recovery infra with ex-#X1/#X2).
@@ -287,7 +287,7 @@ mandated mark-then-execute.
 #### Critical
 - [x] **#X1 — No signal handlers (SIGHUP/SIGINT/SIGTERM).** ✓ fixed (phases 5–6): SIGINT (phase 5); SIGHUP/SIGTERM install in `run_editor` for both modes and trigger buffer preservation (phase 6).
 - [x] **#X2 — `preserve` command + EOF/SIGHUP file preservation missing.** ✓ fixed (phase 6): added `ExCommand::Preserve` (`:pre[serve]`) and `:rec[over]`; the ex command loop preserves a modified buffer on EOF and on hangup. Integration test: `test_ex_preserve_and_recover_roundtrip`.
-- [ ] **#X3 — `-s` does not suppress EXINIT / `.exrc`.** `lib.rs:109-110` calls `load_startup_config()` unconditionally; only the *error message* is gated on `silent_mode`. *(verified by code path)*. Fix: skip startup config entirely when `silent_mode`.
+- [x] **#X3 — `-s` does not suppress EXINIT / `.exrc`.** ✓ fixed (phase 9): `load_startup_config()` is skipped entirely in silent mode (spec ex.md §94217). Test: `test_ex_silent_suppresses_exinit`.
 - [x] **#X4 — Address `/re/`,`?re?` use raw ERE.** ✓ fixed (phase 4): `address.rs` compiles address patterns with `plib::regex` BRE. (Note: a *separate* pre-existing parser bug captures the trailing delimiter into the pattern — e.g. `/cherry/` stores `cherry/` — so `/re/` addresses don't match; this is address-parser fidelity, tracked under #X-addressing for phase 10, not a regex-engine issue.)
 - [x] **#X5 — `-r` exits with error instead of listing recoverable files.** ✓ fixed (phase 6): shared with #V4.
 - [x] **#X6 — EOF on stdin not treated as SIGHUP.** ✓ fixed (phase 6): EOF in ex command/insert mode now preserves a modified buffer before quitting.
@@ -297,7 +297,7 @@ mandated mark-then-execute.
 - [x] **#X8 — `-t tagstring` hard-errors.** ✓ fixed (phase 7): shared `vi/tags.rs`; `ex -t` and `:tag` resolve via the ctags file. Tests: `tags::tests::*`, `test_ex_tag_lookup`.
 - [ ] **#X9 — Address offset after an address is parsed then discarded.** `address.rs:296-310` computes the offset but never applies it to the base address. Fix: add the offset to the resolved address.
 - [ ] **#X10 — `;` separator treated like `,`.** `address.rs:315`; does not set current line to the first address before parsing the second. Fix: resolve first address, set `.`, then parse second.
-- [ ] **#X11 — stdin-not-a-tty does not auto-enable `-s`.** Spec: non-terminal stdin ⇒ behave as `-s`. Only the explicit flag sets `silent_mode` (`lib.rs:197`). Fix: `stdin().is_terminal()` check at startup.
+- [x] **#X11 — stdin-not-a-tty does not auto-enable `-s`.** ✓ fixed (phase 9): `run_editor` sets `silent_mode` when `stdin().is_terminal()` is false (spec ex.md §94234).
 - [ ] **#X12 — `substitute` gaps.** `parser.rs:506-508` errors on empty pattern instead of reusing the last RE; missing flags `l`, `#`, count; `~`, `%`, `\l\u\L\U` in replacement unimplemented; `c` (confirm) parsed but no interactive loop; `\n`-split doesn't split the buffer line. Fix: extend `SubstituteFlags` + `expand_replacement`.
 - [ ] **#X13 — `shell` command does not pass `-i`.** `shell.rs` interactive path. Spec §`sh -i`. Fix: add `.arg("-i")`.
 - [x] **#X14 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): shared `setlocale(LC_ALL, "")` in `run_editor` (vi-#V10).
@@ -307,9 +307,9 @@ mandated mark-then-execute.
 - [ ] **#X16 — `'`/`` ` `` marks not resolvable; only a–z named marks.** `address.rs:228`. Fix: support the previous-context marks.
 - [ ] **#X17 — Excess leading addresses not discarded.** `address.rs`. Fix: keep only the last two.
 - [x] **#X18 — Missing `~`, `recover` commands; `preserve`.** ✓ partial: `:preserve` and `:recover` added (phase 6); the `~` substitute-repeat command remains for phase 10.
-- [ ] **#X19 — `showmode` defaults `true`; spec default unset.** `options.rs:101`. Fix: default `false`.
-- [ ] **#X20 — Missing `set` options & `warn` message before `!`.** Same list as vi-#V13; `warn`/`beautify`/`mesg`/`redraw`/`remap`/`slowopen`/`directory`/`edcompatible` absent. Fix: add.
-- [ ] **#X21 — Unreadable `.exrc` silently ignored.** `config.rs:40` returns `None`; spec says it "shall be an error." Fix: surface the error.
+- [x] **#X19 — `showmode` defaults `true`; spec default unset.** ✓ fixed (phase 9): default is now `false`.
+- [x] **#X20 — Missing `set` options.** ✓ fixed (phase 9): shared with #V13. (The `warn`-message-before-`!` behavior is stored as the `warn` option; emitting the warning text is a minor follow-up.)
+- [ ] **#X21 — Unreadable `.exrc` silently ignored** (remaining, minor). `read_safe_exrc` returns `None` for both missing and unreadable; distinguishing them (to error on exists-but-unreadable) needs a `Result` return. Deferred.
 - [ ] **#X22 — `write` ignores readonly / pathname-changed / partial-write rules.** Write path doesn't consult `FileManager.readonly` or enforce spec write rules 5/6. Fix: add the guards.
 - [ ] **#X23 — `r !cmd` uses `Stdio::null()` for the command's stdin.** Spec: the editor's stdin. Fix: inherit stdin.
 
@@ -322,11 +322,11 @@ mandated mark-then-execute.
 
 #### OPERANDS / STDIN
 - [x] **EOF-as-SIGHUP** — ✓ fixed (phase 6), #X6.  **`{LINE_MAX}` limit MISSING** — minor.
-- [ ] **stdin-not-tty ⇒ `-s` MISSING** — #X11.
+- [x] **stdin-not-tty ⇒ `-s`** — ✓ fixed (phase 9), #X11.
 
 #### ENVIRONMENT VARIABLES
 - [x] `HOME`, `SHELL` CONFORM (`options.rs:142`).
-- [x] `EXINIT` works (but not suppressed under `-s` — #X3).
+- [x] `EXINIT` works interactively; suppressed under `-s`/non-tty — ✓ (phase 9), #X3.
 - [ ] **`LANG`/`LC_*` MISSING** (#X14); **`COLUMNS`/`LINES` MISSING** (ioctl only); **`TERM` PARTIAL** (read before mode applied).
 
 #### ASYNCHRONOUS EVENTS
@@ -347,17 +347,17 @@ mandated mark-then-execute.
 
 #### `set` options
 - [x] Implemented: `ai ap aw eb exrc ic list magic nu para ro report scroll sections sh sw sm showmode ts tl tags term terse timeout window wm ws wa`.
-- [ ] **MISSING:** `beautify directory edcompatible mesg prompt redraw remap slowopen warn` (#X20).
-- [ ] **`showmode` default DIVERGES** (#X19).
+- [x] **Added (phase 9):** `beautify directory edcompatible mesg prompt redraw remap slowopen warn` (#X20).
+- [x] **`showmode` default** ✓ fixed (phase 9), #X19.
 
 #### EXIT STATUS / CONSEQUENCES OF ERRORS
 - [x] 0/1 propagated; silent-mode error ⇒ exit 1.
-- [ ] **stdin-tty distinction PARTIAL** — uses `silent_mode`, not actual tty test (#X11).
+- [x] **stdin-tty distinction** ✓ fixed (phase 9): non-tty ⇒ silent (#X11).
 
 ### Test coverage signal
 Not covered:
 - [ ] Signal handling / `preserve` / EOF preservation — #X1/#X2/#X6.
-- [ ] `-s` suppressing EXINIT/`.exrc` — #X3.
+- [x] `-s` suppressing EXINIT/`.exrc` — ✓ fixed (phase 9), #X3.
 - [ ] Address offset + `;` semantics — #X9/#X10.
 - [ ] `global`/`v` with line-count-changing commands — #X7.
 - [ ] substitute empty-pattern reuse, count, `l`/`#`, case escapes — #X12.

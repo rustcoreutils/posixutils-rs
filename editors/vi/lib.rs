@@ -44,6 +44,7 @@ pub use ui::{
 pub use undo::{Change, ChangeKind, UndoManager};
 
 use gettextrs::{setlocale, LocaleCategory};
+use std::io::IsTerminal;
 use std::process;
 
 /// Invocation mode for the editor.
@@ -83,7 +84,7 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     signals::install_hangup_handlers();
     recover::cleanup_stale(14 * 24 * 60 * 60);
 
-    let opts = match parse_args(invoked_as, args) {
+    let mut opts = match parse_args(invoked_as, args) {
         Ok(o) => o,
         Err(e) => {
             let name = if invoked_as == InvokedAs::Ex {
@@ -101,6 +102,11 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     } else {
         "vi"
     };
+
+    // POSIX: if standard input is not a terminal, behave as if -s was given.
+    if !std::io::stdin().is_terminal() {
+        opts.silent_mode = true;
+    }
 
     // Create editor with appropriate mode
     let mut editor = match Editor::new(opts.start_in_ex_mode, opts.silent_mode) {
@@ -121,10 +127,11 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         editor.set_window(n);
     }
 
-    // Load startup configuration (EXINIT or $HOME/.exrc)
-    // Per POSIX, this happens before editing the first file
-    if let Err(e) = editor.load_startup_config() {
-        if !opts.silent_mode {
+    // Load startup configuration (EXINIT or $HOME/.exrc) before editing the
+    // first file. POSIX: in silent/batch mode (-s, or non-terminal stdin),
+    // EXINIT and .exrc are not consulted.
+    if !opts.silent_mode {
+        if let Err(e) = editor.load_startup_config() {
             eprintln!("{}: startup config: {}", prog_name, e);
         }
         // Continue anyway - don't fail on config errors

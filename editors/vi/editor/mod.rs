@@ -301,6 +301,11 @@ impl Editor {
         }
     }
 
+    /// Read-only access to the editor options (for tests and inspection).
+    pub fn options(&self) -> &Options {
+        &self.options
+    }
+
     /// Execute an initial command (from -c or +command).
     pub fn execute_initial_command(&mut self, cmd: &str) -> Result<()> {
         self.execute_ex_input(cmd)
@@ -503,8 +508,8 @@ impl Editor {
                 continue;
             }
 
-            // Print prompt unless in silent mode or stdin is not a tty
-            if !self.silent_mode && stdin_is_tty {
+            // Print prompt unless silent, stdin is not a tty, or `prompt` unset.
+            if !self.silent_mode && stdin_is_tty && self.options.prompt {
                 print!(":");
                 stdout.flush()?;
             }

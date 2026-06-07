@@ -6,7 +6,6 @@
 use plib::testing::{get_binary_path, run_test, TestPlan};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use tempfile::{NamedTempFile, TempDir};
 
@@ -367,15 +366,19 @@ fn run_ex_with_env(
     )
 }
 
-/// Create a file with given content and permissions mode.
-fn create_file_with_mode(path: &std::path::Path, content: &str, mode: u32) {
-    fs::write(path, content).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-}
+// ============================================================================
+// EXINIT / .exrc startup configuration (audit #X3, #V9)
+//
+// Per POSIX, EXINIT and .exrc are consulted only in interactive mode; with -s
+// (or a non-terminal stdin) they are suppressed. The piped-stdin harness runs
+// ex with -s, so it can only verify the suppression below; the .exrc security
+// checks are unit-tested in `config.rs` (no env/cwd mutation), and EXINIT-being-
+// honored interactively is verified behaviorally.
+// ============================================================================
 
 #[test]
-fn test_ex_exinit_basic() {
-    // EXINIT="set number" → query confirms number is set
+fn test_ex_silent_suppresses_exinit() {
+    // #X3: with -s (the piped harness), EXINIT is ignored.
     let home = TempDir::new().unwrap();
     let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
@@ -386,164 +389,7 @@ fn test_ex_exinit_basic() {
         None,
     );
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "number");
-}
-
-#[test]
-fn test_ex_exinit_pipe() {
-    // EXINIT="set number|set tabstop=4" → both options set
-    let home = TempDir::new().unwrap();
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nset tabstop?\nq!\n",
-        &[
-            ("EXINIT", "set number|set tabstop=4"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        None,
-    );
-    assert_eq!(code, 0);
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines[0], "number");
-    assert_eq!(lines[1], "tabstop=4");
-}
-
-#[test]
-fn test_ex_home_exrc() {
-    // $HOME/.exrc with "set number", EXINIT unset → number set
-    let home = TempDir::new().unwrap();
-    let exrc_path = home.path().join(".exrc");
-    create_file_with_mode(&exrc_path, "set number\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        None,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "number");
-}
-
-#[test]
-fn test_ex_exinit_overrides_home_exrc() {
-    // Both EXINIT and $HOME/.exrc exist → EXINIT wins, .exrc not sourced
-    let home = TempDir::new().unwrap();
-    let exrc_path = home.path().join(".exrc");
-    create_file_with_mode(&exrc_path, "set list\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nset list?\nq!\n",
-        &[
-            ("EXINIT", "set number"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        None,
-    );
-    assert_eq!(code, 0);
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines[0], "number");
-    assert_eq!(lines[1], "nolist"); // .exrc was NOT sourced
-}
-
-#[test]
-fn test_ex_local_exrc() {
-    // HOME/.exrc sets `exrc`, CWD/.exrc sets `number` → number set
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    let home_exrc = home.path().join(".exrc");
-    create_file_with_mode(&home_exrc, "set exrc\n", 0o600);
-
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "number");
-}
-
-#[test]
-fn test_ex_local_exrc_disabled() {
-    // HOME/.exrc does NOT set `exrc` → local .exrc ignored
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    let home_exrc = home.path().join(".exrc");
-    create_file_with_mode(&home_exrc, "set list\n", 0o600);
-
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "nonumber"); // local .exrc was NOT sourced
-}
-
-#[test]
-fn test_ex_exrc_security() {
-    // Group-writable .exrc (0o620) → skipped
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    // Use EXINIT to enable exrc option
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o620);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[
-            ("EXINIT", "set exrc"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "nonumber"); // unsafe .exrc was skipped
-}
-
-#[test]
-fn test_ex_exrc_security_other_writable() {
-    // Other-writable .exrc (0o602) → skipped
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o602);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[
-            ("EXINIT", "set exrc"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "nonumber"); // unsafe .exrc was skipped
-}
-
-#[test]
-fn test_ex_exrc_same_file() {
-    // CWD==HOME with exrc set → no double-source
-    // If .exrc sets tabstop=4, querying should show 4, not error from double-source
-    let home = TempDir::new().unwrap();
-    let exrc_path = home.path().join(".exrc");
-    create_file_with_mode(&exrc_path, "set exrc\nset tabstop=4\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set tabstop?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        Some(home.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "tabstop=4");
+    assert_eq!(stdout.trim(), "nonumber"); // EXINIT suppressed under -s
 }
 
 /// Recovery round-trip: `:preserve` saves the buffer; `ex -r file` restores it.

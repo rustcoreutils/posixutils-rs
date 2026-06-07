@@ -194,18 +194,18 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 #### Major
 - [x] **#V4 — `-r` recovery hard-errors and exits.** ✓ fixed (phase 6): `vi -r` lists recoverable buffers; `vi -r file` recovers the newest saved buffer for that file (`Editor::recover`). Stale recovery files (>14 days) are pruned at startup.
 - [x] **#V5 — `-t tagstring` hard-errors; `^]` is a stub.** ✓ fixed (phase 7): new `vi/tags.rs` parses ctags `tags` files (honoring `tags`/`taglength`), does a literal tagstring lookup, opens the target file, and jumps to the line-number or `/pattern/` address. Wired to `-t`, `:tag`, and `^]`.
-- [ ] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** In the parser's simple-command list but no arm in `execute_command`; they silently do nothing. Fix: implement `move_sentence_{forward,backward}` and wire them.
-- [ ] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** `command/parser.rs:272`; no executor arm. Fix: add arm → `current + count − 1`, first non-blank.
+- [x] **#V6 — Sentence motions `(` / `)` parsed but unhandled.** ✓ fixed (phase 8): `move_sentence_{forward,backward}` in `motion.rs` (POSIX boundaries: `.!?` + two spaces/EOL, or a blank line) wired into command and operator-motion dispatch. Tests: `motion::tests::test_sentence_*`, `test_pty_vi_sentence_motion_delete`.
+- [x] **#V7 — `_` (line/first-non-blank) parsed but unhandled.** ✓ fixed (phase 8): `_` moves to the first non-blank of the line `count-1` lines down. Test: `test_pty_vi_underscore_first_nonblank`.
 - [x] **#V8 — `ISIG` cleared in raw mode → SIGINT dropped.** ✓ fixed (phase 5): `^C` (byte 0x03 → `Key::Ctrl('c')`) now rings the bell and resets the command parser (`interrupt_command`); a SIGINT *signal* (e.g. `kill -INT`) is also caught via the handler and routed to the same path. PTY test: `test_pty_vi_interrupt_cancels_count`.
 - [ ] **#V9 — `EXINIT=""` does not suppress `$HOME/.exrc`.** `editor/mod.rs:2023` checks `!exinit.is_empty()` before processing, so an empty-but-set `EXINIT` falls through and sources `.exrc`. Spec: presence (even empty) suppresses `.exrc`. Fix: branch on *is-set*, not *non-empty*.
 - [x] **#V10 — No `setlocale`; LC_* ignored.** ✓ fixed (phase 4): `run_editor` calls `setlocale(LC_ALL, "")` (`vi/lib.rs`), enabling locale-aware libc regex and `LC_MESSAGES`. (Word/case ops still use Rust built-ins — minor, no spec `shall`.)
 
 #### Minor
-- [ ] **#V11 — `-w size` consumed but discarded.** `lib.rs:193-196`; never assigned to `options.window`/`scroll`. Fix: parse + assign.
-- [ ] **#V12 — `stty` erase/kill chars not honored.** `mode/insert.rs:122,133` hardcode `^H`/`^U`. Fix: read `c_cc[VERASE]`/`c_cc[VKILL]` via `tcgetattr`.
+- [x] **#V11 — `-w size` consumed but discarded.** ✓ fixed (phase 8): `-w` parses its size into `EditorOptions.window`; `Editor::set_window` applies it.
+- [ ] **#V12 — `stty` erase/kill chars not honored** (remaining, minor). Hardcoded `^H`/`^U` work for the common case; honoring `c_cc[VERASE]`/`VKILL` needs termios plumbing into insert mode. Deferred.
 - [ ] **#V13 — Missing `set` options.** `beautify`, `directory`, `edcompatible`, `mesg`, `prompt`, `redraw`, `remap`, `slowopen`, `warn` absent from `Options` (`options.rs`). Fix: add (stub where behavior is a no-op).
-- [ ] **#V14 — `^L` and `^R` share one handler.** `editor/mod.rs:622-625`; both just mark for redraw. `^L` should clear the physical screen first; `^R` should refresh only `@`-flagged lines. Fix: split handlers.
-- [ ] **#V15 — NUL-in-insert (re-insert last input) not implemented.** `mode/insert.rs`. Fix: on `Char('\0')` at insert start, replay last inserted text.
+- [x] **#V14 — `^L` and `^R` share one handler.** ✓ fixed (phase 8): `^L` clears the physical screen before redraw; `^R` does a plain redraw. (Per-`@`-line refresh remains a cosmetic nicety.)
+- [ ] **#V15 — NUL-in-insert (re-insert last input) not implemented** (remaining, minor). Needs cross-insert-session storage of the previous insertion. Deferred.
 - [x] **#V16 — Search is imperfect BRE over ERE.** ✓ fixed (phase 4): `search.rs` now uses `plib::regex` (libc BRE). `convert_pattern` magic mode is a passthrough (libc handles `\(\) \{\} \<\>` and treats `+?|(){}` as literal); nomagic escapes metacharacters. `Substitutor` rewritten with `captures_at` + a back-reference-aware `build_replacement`. Tests: `test_substitute_bre_*`, `test_search_bre_grouping`.
 
 ### Detailed conformance matrix
@@ -233,9 +233,9 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 
 #### Command set
 - [x] Motions `h j k l w W b B e E 0 $ ^ f F t T ; , G H M L { } [[ ]] |` CONFORM — `command/motion.rs`, `editor/mod.rs`.
-- [ ] **`(` `)` MISSING** (#V6); **`_` MISSING** (#V7).
+- [x] **`(` `)`** ✓ (phase 8, #V6); **`_`** ✓ (phase 8, #V7).
 - [x] Scrolling `^F ^B ^D ^U ^E ^Y z` CONFORM.
-- [x] **`^]`** ✓ tag jump (phase 7, #V5).  **`^L`/`^R` PARTIAL** — #V14.
+- [x] **`^]`** ✓ tag jump (phase 7, #V5); **`^L`/`^R`** ✓ split (phase 8, #V14).
 - [x] Editing `i I a A o O c C cc d D dd x X r R y Y p P J ~ < > .` CONFORM.
 - [ ] **`s`/`S` PARTIAL** — do not save deleted text to the named buffer (`editor/mod.rs:698,705`).
 - [x] `u U`, marks `m ' \``, `: / ? n N % & @ " Q ZZ ! ^^` CONFORM (search is #V16).
@@ -252,7 +252,7 @@ BRE veneer over an ERE engine. A handful of parsed-but-unhandled commands
 Not covered:
 - [ ] Signal handling (resize / suspend / hangup) — #V1-#V3.
 - [ ] `-r` / `-t` behavior — #V4/#V5.
-- [ ] Sentence motions `(` `)`, `_` — #V6/#V7.
+- [x] Sentence motions `(` `)`, `_` — ✓ fixed (phase 8), #V6/#V7.
 - [ ] `EXINIT=""` vs `.exrc` ordering — #V9.
 
 ### Suggested PR groupings

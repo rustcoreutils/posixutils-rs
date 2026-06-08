@@ -750,7 +750,7 @@ fn test_ed_substitute_split_in_global_error() {
         stdin_data: "a\nhello world\n.\ng/hello/s/world/one\\\ntwo/\nQ\n".to_string(),
         expected_out: "?\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        expected_exit_code: 1,
     });
 }
 
@@ -1001,7 +1001,8 @@ fn test_ed_help_command() {
         stdin_data: "99p\nh\nQ\n".to_string(),
         expected_out: "?\nInvalid address\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        // The 99p invalid-address error sets a non-zero exit status.
+        expected_exit_code: 1,
     });
 }
 
@@ -1015,7 +1016,7 @@ fn test_ed_help_mode_toggle() {
         stdin_data: "H\n99p\nQ\n".to_string(),
         expected_out: "?\nInvalid address\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        expected_exit_code: 1,
     });
 }
 
@@ -1028,7 +1029,7 @@ fn test_ed_help_mode_shows_last_error() {
         stdin_data: "99p\nH\nQ\n".to_string(),
         expected_out: "?\nInvalid address\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        expected_exit_code: 1,
     });
 }
 
@@ -1196,7 +1197,8 @@ fn test_ed_global_nested_g_error() {
         stdin_data: "a\nfoo\nbar\n.\ng/foo/g/bar/p\nQ\n".to_string(),
         expected_out: "?\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        // POSIX: a command error makes ed exit with status > 0.
+        expected_exit_code: 1,
     });
 }
 
@@ -1209,7 +1211,7 @@ fn test_ed_global_nested_v_error() {
         stdin_data: "a\nfoo\nbar\n.\ng/foo/v/bar/p\nQ\n".to_string(),
         expected_out: "?\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        expected_exit_code: 1,
     });
 }
 
@@ -1222,7 +1224,7 @@ fn test_ed_global_shell_error() {
         stdin_data: "a\nfoo\n.\ng/foo/!echo test\nQ\n".to_string(),
         expected_out: "?\n".to_string(),
         expected_err: String::new(),
-        expected_exit_code: 0,
+        expected_exit_code: 1,
     });
 }
 
@@ -1391,4 +1393,126 @@ fn test_ed_global_mixed_commands_with_append() {
         "a\nfoo\nbar\n.\ng/foo/s/foo/baz/\\\na\\\nappended\\\n.\n1,$p\nQ\n",
         "baz\nappended\nbar\n",
     );
+}
+
+// ============================================================================
+// POSIX BRE engine tests (audit #E1, #E9) — plib::regex / libc BRE
+// ============================================================================
+
+#[test]
+fn test_ed_bre_grouping_address() {
+    // BRE \(...\) grouping in a search address. ERE would treat \( as a
+    // literal '(' and fail to match.
+    ed_test("a\napple\nbanana\n.\n/\\(pp\\)/\nQ\n", "apple\n");
+}
+
+#[test]
+fn test_ed_bre_interval_address() {
+    // BRE \{n\} interval. ERE would treat \{ as a literal brace.
+    ed_test("a\ncat\naardvark\n.\n/a\\{2\\}/\nQ\n", "aardvark\n");
+}
+
+#[test]
+fn test_ed_bre_backreference_pattern() {
+    // In-pattern back-reference \1 (unsupported by the old regex crate).
+    ed_test("a\naabb\n.\ns/\\(.\\)\\1/X/\n1p\nQ\n", "Xbb\n");
+}
+
+#[test]
+fn test_ed_sub_backreference_replacement() {
+    // \1 / \2 back-references in the replacement, swapping two groups.
+    ed_test("a\nab\n.\ns/\\(a\\)\\(b\\)/\\2\\1/\n1p\nQ\n", "ba\n");
+}
+
+#[test]
+fn test_ed_sub_ampersand_whole_match() {
+    // & expands to the whole match.
+    ed_test("a\nfoo\n.\ns/oo/[&]/\n1p\nQ\n", "f[oo]\n");
+}
+
+#[test]
+fn test_ed_sub_count_flag() {
+    // Count flag replaces only the nth occurrence (#E9).
+    ed_test("a\nbanana\n.\ns/a/X/2\n1p\nQ\n", "banXna\n");
+}
+
+#[test]
+fn test_ed_sub_anchors() {
+    // ^ and $ anchor to the line body (trailing newline stripped).
+    ed_test("a\nhi\n.\ns/^/> /\ns/$/!/\n1p\nQ\n", "> hi!\n");
+}
+
+#[test]
+fn test_ed_sub_identity_is_not_error() {
+    // #E3 precursor: a match whose replacement equals the match still counts
+    // as a substitution (no spurious '?'); the line prints unchanged.
+    ed_test("a\nxword\n.\ns/x/x/\n1p\nQ\n", "xword\n");
+}
+
+// ============================================================================
+// POSIX correctness tests (audit #E2-#E7) — exit status, EOF, G/V, addressing
+// ============================================================================
+
+// Helper: ed in silent mode asserting a specific exit code.
+fn ed_test_code(stdin: &str, expected_out: &str, code: i32) {
+    run_test(TestPlan {
+        cmd: "ed".to_string(),
+        args: vec!["-s".to_string()],
+        stdin_data: stdin.to_string(),
+        expected_out: expected_out.to_string(),
+        expected_err: String::new(),
+        expected_exit_code: code,
+    });
+}
+
+#[test]
+fn test_ed_exit_status_on_command_error() {
+    // #E2: an invalid command prints '?' and ed exits non-zero.
+    ed_test_code("Z\nq\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_exit_status_clean_is_zero() {
+    // #E2: a clean session exits 0.
+    ed_test_code("a\nhi\n.\nw /dev/null\nq\n", "", 0);
+}
+
+#[test]
+fn test_ed_identity_substitute_marks_modified() {
+    // #E3: an identity substitution still modifies the buffer, so a plain `q`
+    // emits the unsaved-changes warning (and a non-zero exit status).
+    ed_test_code("a\nx\n.\ns/x/x/\nq\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_eof_acts_as_quit_warns_when_modified() {
+    // #E4: EOF in command mode acts as `q`; a modified buffer warns with '?'.
+    ed_test_code("a\nx\n.\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_eof_in_input_mode_terminates_then_quits() {
+    // #E5: EOF in input mode finalizes the pending append (buffer becomes
+    // modified), then EOF acts as `q` and warns.
+    ed_test_code("a\nAA\nBB\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_eof_in_input_mode_finalizes_append() {
+    // #E5: the lines collected in input mode are appended to the buffer.
+    ed_test("a\nl1\n.\n1a\nAA\n.\n1,$p\nQ\n", "l1\nAA\n");
+}
+
+#[test]
+fn test_ed_global_interactive_forbids_append() {
+    // #E6: in the interactive G prompt, `a`/`c`/`i` are not allowed (first
+    // '?'); EOF then acts as `q` on the modified buffer (second '?').
+    ed_test_code("a\nfoo\n.\nG/foo/\na\n", "foo\n?\n?\n", 1);
+}
+
+#[test]
+fn test_ed_intermediate_address_out_of_range_ok() {
+    // #E7: an intermediate offset value may be out of range; only the final
+    // resolved address is validated. 1-5+6 == line 2.
+    ed_test("a\nl1\nl2\nl3\nl4\nl5\n.\n1-5+6p\nQ\n", "l2\n");
 }

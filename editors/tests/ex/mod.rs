@@ -6,7 +6,6 @@
 use plib::testing::{get_binary_path, run_test, TestPlan};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use tempfile::{NamedTempFile, TempDir};
 
@@ -367,15 +366,19 @@ fn run_ex_with_env(
     )
 }
 
-/// Create a file with given content and permissions mode.
-fn create_file_with_mode(path: &std::path::Path, content: &str, mode: u32) {
-    fs::write(path, content).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-}
+// ============================================================================
+// EXINIT / .exrc startup configuration (audit #X3, #V9)
+//
+// Per POSIX, EXINIT and .exrc are consulted only in interactive mode; with -s
+// (or a non-terminal stdin) they are suppressed. The piped-stdin harness runs
+// ex with -s, so it can only verify the suppression below; the .exrc security
+// checks are unit-tested in `config.rs` (no env/cwd mutation), and EXINIT-being-
+// honored interactively is verified behaviorally.
+// ============================================================================
 
 #[test]
-fn test_ex_exinit_basic() {
-    // EXINIT="set number" → query confirms number is set
+fn test_ex_silent_suppresses_exinit() {
+    // #X3: with -s (the piped harness), EXINIT is ignored.
     let home = TempDir::new().unwrap();
     let (stdout, _stderr, code) = run_ex_with_env(
         "set number?\nq!\n",
@@ -386,162 +389,146 @@ fn test_ex_exinit_basic() {
         None,
     );
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "number");
+    assert_eq!(stdout.trim(), "nonumber"); // EXINIT suppressed under -s
+}
+
+/// Recovery round-trip: `:preserve` saves the buffer; `ex -r file` restores it.
+/// Regression test for audit #X2 (preserve) and #V4/#X5 (-r recovery).
+#[test]
+fn test_ex_preserve_and_recover_roundtrip() {
+    let rec = TempDir::new().unwrap();
+    let recdir = rec.path().to_str().unwrap();
+    let work = TempDir::new().unwrap();
+    let file = work.path().join("doc.txt");
+    fs::write(&file, "base\n").unwrap();
+
+    let bin = get_binary_path("ex");
+
+    // 1) Append a line and :preserve the buffer.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(&file)
+        .env("TMPDIR", recdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"a\nADDED\n.\npreserve\nq!\n")
+        .unwrap();
+    child.wait().unwrap();
+
+    // Recovery files live in a per-user subdir vi.recover.<uid>.
+    let count: usize = fs::read_dir(rec.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("vi.recover."))
+        .filter_map(|e| fs::read_dir(e.path()).ok())
+        .map(|d| d.count())
+        .sum();
+    assert!(count >= 1, "preserve should create a recovery file");
+
+    // 2) Recover the buffer and print it.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg("-r")
+        .arg(&file)
+        .env("TMPDIR", recdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"%p\nq!\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ADDED"),
+        "recovered buffer should contain ADDED, got: {:?}",
+        stdout
+    );
+}
+
+/// Tag lookup: `ex -t tag` opens the file and jumps to the definition; `:tag`
+/// does the same from the command line. Regression test for #X8/#V5.
+#[test]
+fn test_ex_tag_lookup() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("src.c"),
+        "int helper() { }\nint main() { }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("tags"),
+        "main\tsrc.c\t/^int main/\nhelper\tsrc.c\t1\n",
+    )
+    .unwrap();
+
+    let bin = get_binary_path("ex");
+
+    // -t main: jump to the pattern address and print the current line.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg("-t")
+        .arg("main")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"p\nq!\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "int main() { }"
+    );
+
+    // :tag helper: line-number address.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(dir.path().join("src.c"))
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"tag helper\np\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "int helper() { }"
+    );
+}
+
+// ============================================================================
+// Address fidelity (audit #X4 trailing delimiter, #X9 offsets)
+// ============================================================================
+
+#[test]
+fn test_ex_address_search_strips_delimiter() {
+    // /re/ must not include the trailing delimiter in the pattern.
+    ex_test("a\napple\nbanana\ncherry\n.\n/cherry/\np\nq!\n", "cherry\n");
 }
 
 #[test]
-fn test_ex_exinit_pipe() {
-    // EXINIT="set number|set tabstop=4" → both options set
-    let home = TempDir::new().unwrap();
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nset tabstop?\nq!\n",
-        &[
-            ("EXINIT", "set number|set tabstop=4"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        None,
-    );
-    assert_eq!(code, 0);
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines[0], "number");
-    assert_eq!(lines[1], "tabstop=4");
+fn test_ex_address_offset_absolute() {
+    ex_test("a\nL1\nL2\nL3\nL4\n.\n2+1p\nq!\n", "L3\n");
 }
 
 #[test]
-fn test_ex_home_exrc() {
-    // $HOME/.exrc with "set number", EXINIT unset → number set
-    let home = TempDir::new().unwrap();
-    let exrc_path = home.path().join(".exrc");
-    create_file_with_mode(&exrc_path, "set number\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        None,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "number");
+fn test_ex_address_offset_last() {
+    ex_test("a\nL1\nL2\nL3\nL4\n.\n$-1p\nq!\n", "L3\n");
 }
 
 #[test]
-fn test_ex_exinit_overrides_home_exrc() {
-    // Both EXINIT and $HOME/.exrc exist → EXINIT wins, .exrc not sourced
-    let home = TempDir::new().unwrap();
-    let exrc_path = home.path().join(".exrc");
-    create_file_with_mode(&exrc_path, "set list\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nset list?\nq!\n",
-        &[
-            ("EXINIT", "set number"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        None,
-    );
-    assert_eq!(code, 0);
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines[0], "number");
-    assert_eq!(lines[1], "nolist"); // .exrc was NOT sourced
-}
-
-#[test]
-fn test_ex_local_exrc() {
-    // HOME/.exrc sets `exrc`, CWD/.exrc sets `number` → number set
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    let home_exrc = home.path().join(".exrc");
-    create_file_with_mode(&home_exrc, "set exrc\n", 0o600);
-
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "number");
-}
-
-#[test]
-fn test_ex_local_exrc_disabled() {
-    // HOME/.exrc does NOT set `exrc` → local .exrc ignored
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    let home_exrc = home.path().join(".exrc");
-    create_file_with_mode(&home_exrc, "set list\n", 0o600);
-
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "nonumber"); // local .exrc was NOT sourced
-}
-
-#[test]
-fn test_ex_exrc_security() {
-    // Group-writable .exrc (0o620) → skipped
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    // Use EXINIT to enable exrc option
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o620);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[
-            ("EXINIT", "set exrc"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "nonumber"); // unsafe .exrc was skipped
-}
-
-#[test]
-fn test_ex_exrc_security_other_writable() {
-    // Other-writable .exrc (0o602) → skipped
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-
-    let local_exrc = cwd.path().join(".exrc");
-    create_file_with_mode(&local_exrc, "set number\n", 0o602);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set number?\nq!\n",
-        &[
-            ("EXINIT", "set exrc"),
-            ("HOME", home.path().to_str().unwrap()),
-        ],
-        Some(cwd.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "nonumber"); // unsafe .exrc was skipped
-}
-
-#[test]
-fn test_ex_exrc_same_file() {
-    // CWD==HOME with exrc set → no double-source
-    // If .exrc sets tabstop=4, querying should show 4, not error from double-source
-    let home = TempDir::new().unwrap();
-    let exrc_path = home.path().join(".exrc");
-    create_file_with_mode(&exrc_path, "set exrc\nset tabstop=4\n", 0o600);
-
-    let (stdout, _stderr, code) = run_ex_with_env(
-        "set tabstop?\nq!\n",
-        &[("EXINIT", ""), ("HOME", home.path().to_str().unwrap())],
-        Some(home.path()),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "tabstop=4");
+fn test_ex_address_offset_range() {
+    ex_test("a\nL1\nL2\nL3\nL4\n.\n1,2+1p\nq!\n", "L1\nL2\nL3\n");
 }

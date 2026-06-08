@@ -67,3 +67,48 @@ pub fn read_safe_exrc(path: &str) -> Option<String> {
     file.read_to_string(&mut content).ok()?;
     Some(content)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_mode(path: &std::path::Path, content: &str, mode: u32) {
+        fs::write(path, content).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn test_read_safe_exrc_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".exrc");
+        write_mode(&p, "set number\n", 0o600);
+        assert_eq!(
+            read_safe_exrc(p.to_str().unwrap()),
+            Some("set number\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_safe_exrc_group_writable_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".exrc");
+        write_mode(&p, "set number\n", 0o620);
+        assert_eq!(read_safe_exrc(p.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn test_read_safe_exrc_other_writable_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".exrc");
+        write_mode(&p, "set number\n", 0o602);
+        assert_eq!(read_safe_exrc(p.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn test_read_safe_exrc_missing_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("does-not-exist");
+        assert_eq!(read_safe_exrc(p.to_str().unwrap()), None);
+    }
+}

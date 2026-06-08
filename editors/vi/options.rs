@@ -87,6 +87,26 @@ pub struct Options {
     // Shell
     /// Shell program (shell/sh).
     pub shell: String,
+
+    // Additional POSIX options
+    /// Discard control characters from input (beautify/bf).
+    pub beautify: bool,
+    /// Directory for temporary/recovery files (directory/dir).
+    pub directory: String,
+    /// `&`/`~` reuse the previous substitute options (edcompatible/ed).
+    pub edcompatible: bool,
+    /// Permit messages from other users to the terminal (mesg).
+    pub mesg: bool,
+    /// Show the ex `:` prompt in command mode (prompt).
+    pub prompt: bool,
+    /// Simulate an intelligent terminal for redraws (redraw).
+    pub redraw: bool,
+    /// Apply `:map` expansions recursively / in input mode (remap).
+    pub remap: bool,
+    /// Use slow-terminal open mode (slowopen/slow).
+    pub slowopen: bool,
+    /// Warn before `!` (and on quit) when there are unsaved changes (warn).
+    pub warn: bool,
 }
 
 impl Default for Options {
@@ -98,7 +118,8 @@ impl Default for Options {
             shiftwidth: 8,
             list: false,
             showmatch: false,
-            showmode: true,
+            // POSIX leaves showmode unset by default.
+            showmode: false,
             window: 24,
             scroll: 12,
 
@@ -140,6 +161,17 @@ impl Default for Options {
 
             // Shell
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+
+            // Additional POSIX options (defaults per the spec)
+            beautify: false,
+            directory: std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+            edcompatible: false,
+            mesg: true,
+            prompt: true,
+            redraw: false,
+            remap: true,
+            slowopen: false,
+            warn: true,
         }
     }
 }
@@ -211,6 +243,14 @@ impl Options {
             "exrc" => self.exrc = value,
             "writeany" | "wa" => self.writeany = value,
             "timeout" => self.timeout = value,
+            "beautify" | "bf" => self.beautify = value,
+            "edcompatible" | "ed" => self.edcompatible = value,
+            "mesg" => self.mesg = value,
+            "prompt" => self.prompt = value,
+            "redraw" => self.redraw = value,
+            "remap" => self.remap = value,
+            "slowopen" | "slow" => self.slowopen = value,
+            "warn" => self.warn = value,
             _ => return Err(ViError::InvalidOption(name.to_string())),
         }
         Ok(None)
@@ -259,6 +299,7 @@ impl Options {
             }
             "term" => self.term = value.to_string(),
             "shell" | "sh" => self.shell = value.to_string(),
+            "directory" | "dir" => self.directory = value.to_string(),
             _ => return Err(ViError::InvalidOption(name.to_string())),
         }
         Ok(None)
@@ -298,6 +339,17 @@ impl Options {
             "timeout" => format!("{}timeout", if self.timeout { "" } else { "no" }),
             "term" => format!("term={}", self.term),
             "shell" | "sh" => format!("shell={}", self.shell),
+            "beautify" | "bf" => format!("{}beautify", if self.beautify { "" } else { "no" }),
+            "directory" | "dir" => format!("directory={}", self.directory),
+            "edcompatible" | "ed" => {
+                format!("{}edcompatible", if self.edcompatible { "" } else { "no" })
+            }
+            "mesg" => format!("{}mesg", if self.mesg { "" } else { "no" }),
+            "prompt" => format!("{}prompt", if self.prompt { "" } else { "no" }),
+            "redraw" => format!("{}redraw", if self.redraw { "" } else { "no" }),
+            "remap" => format!("{}remap", if self.remap { "" } else { "no" }),
+            "slowopen" | "slow" => format!("{}slowopen", if self.slowopen { "" } else { "no" }),
+            "warn" => format!("{}warn", if self.warn { "" } else { "no" }),
             _ => return Err(ViError::InvalidOption(name.to_string())),
         };
         Ok(Some(result))

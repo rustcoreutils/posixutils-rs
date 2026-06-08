@@ -255,7 +255,9 @@ impl ShellExecutor {
     ///
     /// This is used for `:shell` - spawn interactive shell.
     pub fn interactive(&mut self) -> Result<ShellOutput> {
+        // POSIX: `:shell` invokes the shell as an interactive shell (-i).
         let status = Command::new(&self.shell)
+            .arg("-i")
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())

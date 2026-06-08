@@ -252,3 +252,117 @@ fn test_pty_vi_long_line_wrapping() {
     let contents = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(contents, format!("{}\n", long_line));
 }
+
+/// Test: vi survives a terminal resize (SIGWINCH) and remains responsive.
+/// Regression test for audit #V1 (SIGWINCH not handled).
+#[test]
+fn test_pty_vi_resize_survives_and_saves() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("resize.txt");
+    std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    // Resize the PTY: the kernel delivers SIGWINCH to vi.
+    pair.master
+        .resize(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    // vi must still be alive and responsive after the resize.
+    write_keys(&mut writer, "oGAMMA\x1b");
+    thread::sleep(Duration::from_millis(100));
+    write_keys(&mut writer, ":wq\r");
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert!(
+        contents.contains("GAMMA"),
+        "vi should survive resize and save; got {:?}",
+        contents
+    );
+}
+
+/// Test: ^C in command mode discards the partial command (count).
+/// Regression test for audit #V8 (interrupt silently ignored).
+#[test]
+fn test_pty_vi_interrupt_cancels_count() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("interrupt.txt");
+    std::fs::write(&file_path, "L1\nL2\nL3\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    // Begin a count of 99, then interrupt: the count must be discarded so the
+    // following `dd` deletes exactly one line rather than the whole buffer.
+    vi.keys("99\x03");
+    vi.sleep_ms(100);
+    vi.keys("dd");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "L2\nL3\n", "interrupt should cancel the count");
+}
+
+/// Test: sentence motion `)` works as a delete target (#V6).
+#[test]
+fn test_pty_vi_sentence_motion_delete() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("sent.txt");
+    // POSIX sentences are separated by two spaces.
+    std::fs::write(&file_path, "One.  Two.  Three.\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("d)"); // delete the first sentence
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "Two.  Three.\n");
+}
+
+/// Test: `_` moves to the first non-blank of the line (#V7).
+#[test]
+fn test_pty_vi_underscore_first_nonblank() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("us.txt");
+    std::fs::write(&file_path, "    indented\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys("_rX"); // first non-blank, replace char with X
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(contents, "    Xndented\n");
+}

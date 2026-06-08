@@ -145,6 +145,10 @@ pub enum ExCommand {
     Version,
     /// Help (custom, not in POSIX).
     Help,
+    /// Preserve the edit buffer for later recovery (:pre, :preserve).
+    Preserve,
+    /// Recover a buffer saved by a previous session (:rec, :recover).
+    Recover { file: Option<String> },
     /// Source file (execute ex commands from file) (:so, :source).
     Source { file: String },
     /// Append text after line (:a, :append).

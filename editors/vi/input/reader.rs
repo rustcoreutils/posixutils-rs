@@ -55,9 +55,18 @@ impl InputReader {
 
         // Read more bytes
         self.pos = 0;
-        self.len = io::stdin().read(&mut self.buffer).map_err(ViError::Io)?;
+        self.len = match io::stdin().read(&mut self.buffer) {
+            Ok(n) => n,
+            // A signal (SIGWINCH/SIGCONT/SIGINT) interrupted the read; surface
+            // it so the caller can service the pending signal and redraw.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                return Err(ViError::Interrupted);
+            }
+            Err(e) => return Err(ViError::Io(e)),
+        };
 
         if self.len == 0 {
+            // End of input.
             return Err(ViError::Interrupted);
         }
 

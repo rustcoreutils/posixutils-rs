@@ -21,6 +21,39 @@ use crate::ui::{Screen, Terminal, TerminalSize};
 use crate::undo::UndoManager;
 use std::path::PathBuf;
 
+/// Split a `/`- or `?`-style search body into `(pattern, offset)`.
+///
+/// The pattern runs up to the first unescaped `delim`; `\<delim>` becomes a
+/// literal delimiter in the pattern. Any `+n`/`-n` after the closing delimiter
+/// is returned as a signed line offset (0 if absent).
+fn split_search(body: &str, delim: char) -> (String, i64) {
+    let mut pattern = String::new();
+    let mut chars = body.chars().peekable();
+    let mut rest: Option<String> = None;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&delim) {
+                pattern.push(delim);
+                chars.next();
+                continue;
+            }
+            pattern.push('\\');
+        } else if c == delim {
+            rest = Some(chars.collect());
+            break;
+        } else {
+            pattern.push(c);
+        }
+    }
+    let offset = rest
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(|r| r.parse::<i64>().ok())
+        .unwrap_or(0);
+    (pattern, offset)
+}
+
 /// Stores the last substitution for & and :& commands.
 #[derive(Debug, Clone)]
 pub struct LastSubstitution {
@@ -294,6 +327,18 @@ impl Editor {
         self.files.set_readonly(readonly);
     }
 
+    /// Set the initial window size (the `-w size` option).
+    pub fn set_window(&mut self, n: usize) {
+        if n > 0 {
+            self.options.window = n;
+        }
+    }
+
+    /// Read-only access to the editor options (for tests and inspection).
+    pub fn options(&self) -> &Options {
+        &self.options
+    }
+
     /// Execute an initial command (from -c or +command).
     pub fn execute_initial_command(&mut self, cmd: &str) -> Result<()> {
         self.execute_ex_input(cmd)
@@ -422,6 +467,8 @@ impl Editor {
     fn run_visual_mode(&mut self) -> Result<i32> {
         self.terminal.enable_raw_mode()?;
         self.terminal.enter_alternate_screen()?;
+        // React to resize / job-control resume / interrupt while editing.
+        crate::signals::install_visual_handlers();
 
         let result = self.visual_main_loop();
 
@@ -457,8 +504,9 @@ impl Editor {
                 let mut line = String::new();
                 match stdin.lock().read_line(&mut line) {
                     Ok(0) => {
-                        // EOF - finalize and quit
+                        // EOF - finalize pending input, preserve, and quit.
                         let _ = self.finalize_ex_insert();
+                        self.preserve_buffer();
                         self.should_quit = true;
                         break;
                     }
@@ -493,8 +541,8 @@ impl Editor {
                 continue;
             }
 
-            // Print prompt unless in silent mode or stdin is not a tty
-            if !self.silent_mode && stdin_is_tty {
+            // Print prompt unless silent, stdin is not a tty, or `prompt` unset.
+            if !self.silent_mode && stdin_is_tty && self.options.prompt {
                 print!(":");
                 stdout.flush()?;
             }
@@ -503,13 +551,17 @@ impl Editor {
             let mut line = String::new();
             match stdin.lock().read_line(&mut line) {
                 Ok(0) => {
-                    // EOF - treat as quit
+                    // EOF on the command stream: preserve unsaved work, then quit.
+                    self.preserve_buffer();
                     self.should_quit = true;
                     break;
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    if !self.silent_mode {
+                    // A hangup/termination signal interrupts the read; preserve.
+                    if crate::signals::take(&crate::signals::HANGUP_RECEIVED) {
+                        self.preserve_buffer();
+                    } else if !self.silent_mode {
                         eprintln!("Read error: {}", e);
                     }
                     self.should_quit = true;
@@ -558,11 +610,114 @@ impl Editor {
         while !self.should_quit && !self.ex_standalone_mode {
             self.refresh_screen()?;
 
-            let key = reader.read_key()?;
-            self.handle_key(key)?;
+            match reader.read_key() {
+                Ok(key) => self.handle_key(key)?,
+                Err(ViError::Interrupted) => {
+                    // The read was interrupted: service any pending signal and
+                    // redraw. If nothing is pending, it was a genuine EOF —
+                    // treat it like a hangup and preserve any unsaved work.
+                    if !self.handle_pending_signals()? {
+                        self.preserve_buffer();
+                        self.should_quit = true;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(())
+    }
+
+    /// Service any pending asynchronous signals. Returns `true` if at least one
+    /// was handled (the loop should redraw and keep running).
+    fn handle_pending_signals(&mut self) -> Result<bool> {
+        use crate::signals::{
+            take, HANGUP_RECEIVED, SIGCONT_RECEIVED, SIGINT_RECEIVED, SIGWINCH_RECEIVED,
+        };
+
+        if take(&HANGUP_RECEIVED) {
+            // Hangup/termination: preserve the buffer and exit.
+            self.preserve_buffer();
+            self.should_quit = true;
+            self.exit_code = 1;
+            return Ok(true);
+        }
+
+        let mut handled = false;
+
+        if take(&SIGCONT_RECEIVED) {
+            // Resumed from job-control stop: re-establish terminal state.
+            self.terminal.enable_raw_mode()?;
+            self.terminal.enter_alternate_screen()?;
+            self.terminal.refresh_size()?;
+            handled = true;
+        }
+        if take(&SIGWINCH_RECEIVED) {
+            // Window resized: refresh_screen() will redraw at the new size.
+            self.terminal.refresh_size()?;
+            handled = true;
+        }
+        if take(&SIGINT_RECEIVED) {
+            self.interrupt_command();
+            handled = true;
+        }
+        Ok(handled)
+    }
+
+    /// Handle an interrupt in command mode: discard any partial command and
+    /// alert the terminal (POSIX vi command-mode interrupt behavior).
+    fn interrupt_command(&mut self) {
+        self.parser.reset();
+        let _ = self.terminal.bell();
+    }
+
+    /// Write the buffer to a recovery file if it has unsaved changes, mailing
+    /// a notification. Returns the recovery path when a copy was saved.
+    pub fn preserve_buffer(&mut self) -> Option<std::path::PathBuf> {
+        if !self.buffer.is_modified() {
+            return None;
+        }
+        let orig = self.files.current_file().map(|p| p.to_path_buf());
+        match crate::recover::preserve(
+            orig.as_deref(),
+            &self.buffer.as_text(),
+            &self.options.directory,
+        ) {
+            Ok(path) => {
+                crate::recover::notify(orig.as_deref());
+                Some(path)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Recover a buffer saved by a previous session. With `file`, recover the
+    /// newest recovery for that path; without, the newest recovery of any.
+    pub fn recover(&mut self, file: Option<&str>) -> Result<()> {
+        match crate::recover::find_for(&self.options.directory, file) {
+            Some(info) => {
+                let body = crate::recover::load_body(&info.recovery_path).map_err(ViError::Io)?;
+                self.buffer = Buffer::from_text(&body);
+                // Recovered content is not yet written back to the file.
+                self.buffer.mark_modified();
+                if let Some(p) = &info.orig_path {
+                    self.files.set_current_file(Some(PathBuf::from(p)));
+                }
+                self.buffer.set_line(1);
+                self.undo.clear();
+                crate::recover::remove(&info.recovery_path);
+                let msg = match &info.orig_path {
+                    Some(p) => format!("Recovered {}", p),
+                    None => "Recovered buffer".to_string(),
+                };
+                self.set_message(&msg);
+                Ok(())
+            }
+            None => Err(ViError::FileNotFound(
+                file.map(|f| f.to_string())
+                    .unwrap_or_else(|| "recovery file".to_string()),
+            )),
+        }
     }
 
     /// Handle a key press.
@@ -619,8 +774,19 @@ impl Editor {
                 self.set_message(&info);
                 return Ok(());
             }
-            Key::Ctrl('r') | Key::Ctrl('l') => {
-                // Redraw screen - just return, will redraw on next refresh
+            Key::Ctrl('c') => {
+                // Interrupt (raw mode delivers ^C as a byte): discard the
+                // partial command and ring the bell.
+                self.interrupt_command();
+                return Ok(());
+            }
+            Key::Ctrl('l') => {
+                // ^L: clear the physical screen, then redraw on next refresh.
+                let _ = self.terminal.clear_screen();
+                return Ok(());
+            }
+            Key::Ctrl('r') => {
+                // ^R: redraw (refresh happens at the top of the loop).
                 return Ok(());
             }
             Key::Ctrl(']') => {
@@ -1196,6 +1362,24 @@ impl Editor {
                     self.buffer.set_cursor(res.position);
                 }
             }
+            // Sentence motions
+            '(' => {
+                if let Ok(res) = motion::move_sentence_backward(&self.buffer, count) {
+                    self.buffer.set_cursor(res.position);
+                }
+            }
+            ')' => {
+                if let Ok(res) = motion::move_sentence_forward(&self.buffer, count) {
+                    self.buffer.set_cursor(res.position);
+                }
+            }
+            // Go to first non-blank, count-1 lines down (_ command)
+            '_' => {
+                let target =
+                    (self.buffer.cursor().line + count.max(1) - 1).min(self.buffer.line_count());
+                self.buffer.set_line(target.max(1));
+                self.buffer.move_to_first_non_blank();
+            }
             // Go to column
             '|' => {
                 if let Ok(res) = motion::move_to_column(&self.buffer, count) {
@@ -1575,6 +1759,8 @@ impl Editor {
                 .and_then(|c| motion::till_char_backward(&self.buffer, c, mot.count).ok()),
             '{' => motion::move_paragraph_backward(&self.buffer, mot.count).ok(),
             '}' => motion::move_paragraph_forward(&self.buffer, mot.count).ok(),
+            '(' => motion::move_sentence_backward(&self.buffer, mot.count).ok(),
+            ')' => motion::move_sentence_forward(&self.buffer, mot.count).ok(),
             '|' => motion::move_to_column(&self.buffer, mot.count).ok(),
             '%' => motion::find_matching_bracket(&self.buffer).ok(),
             _ => None,
@@ -1629,26 +1815,36 @@ impl Editor {
         Ok(())
     }
 
+    /// Run a `/`- or `?`-style search from an ex command line: set the pattern
+    /// (up to the first unescaped delimiter), search, then apply any trailing
+    /// `+n`/`-n` line offset.
+    fn ex_search(&mut self, body: &str, delim: char, dir: SearchDirection) -> Result<()> {
+        self.search.update_options(&self.options);
+        let (pattern, offset) = split_search(body, delim);
+        if !pattern.is_empty() {
+            self.search.set_pattern(&pattern, dir)?;
+            self.registers.set_search(&pattern);
+        }
+        self.search_next(dir)?;
+        if offset != 0 {
+            let target = (self.buffer.cursor().line as i64 + offset)
+                .clamp(1, self.buffer.line_count().max(1) as i64) as usize;
+            self.buffer.set_line(target);
+            self.buffer.move_to_first_non_blank();
+        }
+        Ok(())
+    }
+
     /// Execute an ex command input string.
     fn execute_ex_input(&mut self, input: &str) -> Result<()> {
-        // Handle search patterns
-        if let Some(pattern) = input.strip_prefix('/') {
-            self.search.update_options(&self.options);
-            if !pattern.is_empty() {
-                self.search.set_pattern(pattern, SearchDirection::Forward)?;
-                self.registers.set_search(pattern);
-            }
-            return self.search_next(SearchDirection::Forward);
+        // Handle search patterns. The pattern runs up to the first unescaped
+        // delimiter (POSIX: a trailing delimiter is optional and may be
+        // followed by a +n/-n line offset).
+        if let Some(body) = input.strip_prefix('/') {
+            return self.ex_search(body, '/', SearchDirection::Forward);
         }
-
-        if let Some(pattern) = input.strip_prefix('?') {
-            self.search.update_options(&self.options);
-            if !pattern.is_empty() {
-                self.search
-                    .set_pattern(pattern, SearchDirection::Backward)?;
-                self.registers.set_search(pattern);
-            }
-            return self.search_next(SearchDirection::Backward);
+        if let Some(body) = input.strip_prefix('?') {
+            return self.ex_search(body, '?', SearchDirection::Backward);
         }
 
         // Check if this is a filter command from vi ! operator
@@ -1815,6 +2011,25 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Args => Ok(ExResult::StatusMessage(self.files.format_args())),
+            ExCommand::Preserve => {
+                // :preserve always saves the buffer (independent of modified).
+                let orig = self.files.current_file().map(|p| p.to_path_buf());
+                match crate::recover::preserve(
+                    orig.as_deref(),
+                    &self.buffer.as_text(),
+                    &self.options.directory,
+                ) {
+                    Ok(_) => {
+                        crate::recover::notify(orig.as_deref());
+                        Ok(ExResult::StatusMessage("File preserved".to_string()))
+                    }
+                    Err(e) => Ok(ExResult::Error(format!("preserve failed: {}", e))),
+                }
+            }
+            ExCommand::Recover { file } => {
+                self.recover(file.as_deref())?;
+                Ok(ExResult::Continue)
+            }
             ExCommand::Version => Ok(ExResult::StatusMessage(format!(
                 "{} {}",
                 env!("CARGO_PKG_NAME"),
@@ -1964,6 +2179,10 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Nop => Ok(ExResult::Continue),
+            ExCommand::Tag { tag } => {
+                self.goto_tag(&tag)?;
+                Ok(ExResult::Continue)
+            }
             _ => {
                 // Other commands not yet implemented
                 Ok(ExResult::Continue)
@@ -2352,9 +2571,9 @@ impl Editor {
             (1, self.buffer.line_count())
         };
 
-        // Compile the pattern
-        let regex =
-            regex::Regex::new(pattern).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        // Compile the pattern as a POSIX BRE.
+        let regex = plib::regex::Regex::new(pattern, plib::regex::RegexFlags::bre())
+            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         // Collect matching line numbers first (to avoid mutation during iteration)
         let mut matching_lines = Vec::new();
@@ -3069,10 +3288,64 @@ impl Editor {
 
     /// Go to tag.
     fn goto_tag(&mut self, tag: &str) -> Result<()> {
-        // TODO: Full tag support requires reading tags file
-        // For now, just set an error message
-        self.set_error(&format!("tag not found: {}", tag));
+        // The `tags` option is a space-separated list of tags files.
+        let tags_opt = self.options.tags.clone();
+        let files: Vec<&str> = tags_opt.split_whitespace().collect();
+        let taglength = self.options.taglength;
+
+        let Some(m) = crate::tags::lookup(&files, tag, taglength) else {
+            self.set_error(&format!("tag not found: {}", tag));
+            return Ok(());
+        };
+
+        // Switch to the tag's file unless it is already the current file.
+        let already_open = self
+            .files
+            .current_file()
+            .map(|p| p.to_string_lossy() == m.file.as_str())
+            .unwrap_or(false);
+        if !already_open {
+            // Match :edit/:next: refuse to abandon a modified buffer (open()
+            // would otherwise silently discard the changes).
+            if self.buffer.is_modified() {
+                return Err(ViError::FileModified);
+            }
+            self.open(&m.file)?;
+        }
+
+        // Move to the definition.
+        match m.address {
+            crate::tags::TagAddress::Line(n) => {
+                let target = n.clamp(1, self.buffer.line_count().max(1));
+                self.buffer.set_line(target);
+                self.buffer.move_to_first_non_blank();
+            }
+            crate::tags::TagAddress::Pattern(pat) => {
+                if let Ok(re) = plib::regex::Regex::new(&pat, plib::regex::RegexFlags::bre()) {
+                    let mut found = None;
+                    for n in 1..=self.buffer.line_count() {
+                        if let Some(line) = self.buffer.line(n) {
+                            if re.is_match(line.content()) {
+                                found = Some(n);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(n) = found {
+                        self.buffer.set_line(n);
+                        self.buffer.move_to_first_non_blank();
+                    } else {
+                        self.set_error(&format!("tag pattern not found: {}", pat));
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Public entry for the `-t` startup option and the `:tag` command.
+    pub fn tag(&mut self, tag: &str) -> Result<()> {
+        self.goto_tag(tag)
     }
 }
 

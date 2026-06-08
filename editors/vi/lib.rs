@@ -13,9 +13,12 @@ pub mod file;
 pub mod input;
 pub mod mode;
 pub mod options;
+pub mod recover;
 pub mod register;
 pub mod search;
 pub mod shell;
+pub mod signals;
+pub mod tags;
 pub mod ui;
 pub mod undo;
 
@@ -40,6 +43,8 @@ pub use ui::{
 };
 pub use undo::{Change, ChangeKind, UndoManager};
 
+use gettextrs::{setlocale, LocaleCategory};
+use std::io::IsTerminal;
 use std::process;
 
 /// Invocation mode for the editor.
@@ -71,7 +76,15 @@ impl InvokedAs {
 /// This is the main entry point for both vi and ex binaries.
 /// Returns the exit code.
 pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
-    let opts = match parse_args(invoked_as, args) {
+    // Honor the user's locale: LC_CTYPE/LC_COLLATE drive the libc regex engine
+    // and LC_MESSAGES localizes diagnostics.
+    setlocale(LocaleCategory::LcAll, "");
+
+    // Preserve the buffer on hangup/termination, and prune old recovery files.
+    signals::install_hangup_handlers();
+    recover::cleanup_stale(&recover::default_base(), 14 * 24 * 60 * 60);
+
+    let mut opts = match parse_args(invoked_as, args) {
         Ok(o) => o,
         Err(e) => {
             let name = if invoked_as == InvokedAs::Ex {
@@ -90,6 +103,15 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         "vi"
     };
 
+    // POSIX: if standard input is not a terminal, behave as if -s was given.
+    // That also means assuming a terminal that cannot support visual mode, so
+    // fall back to ex (line) mode rather than trying to enable raw mode on a
+    // non-terminal stdin (which would fail).
+    if !std::io::stdin().is_terminal() {
+        opts.silent_mode = true;
+        opts.start_in_ex_mode = true;
+    }
+
     // Create editor with appropriate mode
     let mut editor = match Editor::new(opts.start_in_ex_mode, opts.silent_mode) {
         Ok(e) => e,
@@ -104,17 +126,47 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         editor.set_readonly(true);
     }
 
-    // Load startup configuration (EXINIT or $HOME/.exrc)
-    // Per POSIX, this happens before editing the first file
-    if let Err(e) = editor.load_startup_config() {
-        if !opts.silent_mode {
+    // Apply the initial window size (-w).
+    if let Some(n) = opts.window {
+        editor.set_window(n);
+    }
+
+    // Load startup configuration (EXINIT or $HOME/.exrc) before editing the
+    // first file. POSIX: in silent/batch mode (-s, or non-terminal stdin),
+    // EXINIT and .exrc are not consulted.
+    if !opts.silent_mode {
+        if let Err(e) = editor.load_startup_config() {
             eprintln!("{}: startup config: {}", prog_name, e);
         }
         // Continue anyway - don't fail on config errors
     }
 
-    // Open files
-    if !opts.files.is_empty() {
+    // Recovery mode (-r): list recoverable buffers (no operand) or recover
+    // the named file; otherwise open the operands normally.
+    if opts.recover {
+        if opts.files.is_empty() {
+            let recs = recover::list(&recover::default_base());
+            if recs.is_empty() {
+                println!("No files to recover");
+            } else {
+                println!("Recoverable files:");
+                for r in &recs {
+                    println!("  {}", r.orig_path.as_deref().unwrap_or("(unnamed)"));
+                }
+            }
+            return 0;
+        }
+        if let Err(e) = editor.recover(opts.files.first().map(|s| s.as_str())) {
+            eprintln!("{}: {}", prog_name, e);
+            return 1;
+        }
+    } else if let Some(tag) = &opts.tag {
+        // -t: open the file containing the tag and jump to it.
+        if let Err(e) = editor.tag(tag) {
+            eprintln!("{}: {}", prog_name, e);
+            return 1;
+        }
+    } else if !opts.files.is_empty() {
         if let Err(e) = editor.open_files(opts.files) {
             eprintln!("{}: {}", prog_name, e);
             return 1;
@@ -149,6 +201,12 @@ struct EditorOptions {
     readonly: bool,
     /// Initial command to execute (-c or +command).
     command: Option<String>,
+    /// Recover a previously-preserved buffer (-r).
+    recover: bool,
+    /// Tag to jump to at startup (-t).
+    tag: Option<String>,
+    /// Initial window size (-w).
+    window: Option<usize>,
     /// Files to edit.
     files: Vec<String>,
 }
@@ -163,6 +221,9 @@ fn parse_args(
         silent_mode: false,
         readonly: false,
         command: None,
+        recover: false,
+        tag: None,
+        window: None,
         files: Vec::new(),
     };
 
@@ -174,7 +235,7 @@ fn parse_args(
                 opts.readonly = true;
             }
             "-r" => {
-                return Err("recovery mode not supported".to_string());
+                opts.recover = true;
             }
             "-c" => {
                 i += 1;
@@ -185,12 +246,23 @@ fn parse_args(
                 }
             }
             "-t" => {
-                return Err("tag mode not supported".to_string());
+                i += 1;
+                if i < args.len() {
+                    opts.tag = Some(args[i].clone());
+                } else {
+                    return Err("-t requires a tagstring".to_string());
+                }
             }
             "-w" => {
-                // Window size (handled by options)
                 i += 1;
-                // Skip the size argument
+                if i < args.len() {
+                    // Apply the window size if it parses; ignore otherwise.
+                    if let Ok(n) = args[i].parse::<usize>() {
+                        opts.window = Some(n);
+                    }
+                } else {
+                    return Err("-w requires a size".to_string());
+                }
             }
             "-s" => {
                 // Silent/batch mode (ex only, but accept for both)

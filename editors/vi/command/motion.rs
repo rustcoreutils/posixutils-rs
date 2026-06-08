@@ -327,6 +327,103 @@ pub fn move_paragraph_backward(buffer: &Buffer, count: usize) -> Result<MotionRe
     Ok(MotionResult::with_range(pos, range).linewise())
 }
 
+/// Compute the start position of every sentence in the buffer, in order.
+///
+/// A sentence ends at `.`, `!`, or `?`, optionally followed by any number of
+/// `)`, `]`, `"`, or `'`, and then end-of-line, a tab, or two spaces; a blank
+/// line (paragraph boundary) also ends a sentence. Line 1 always starts one.
+fn sentence_starts(buffer: &Buffer) -> Vec<Position> {
+    let mut starts = vec![Position::new(1, 0)];
+    let mut want_start = false;
+    for line_num in 1..=buffer.line_count() {
+        let content = buffer.line(line_num).map(|l| l.content()).unwrap_or("");
+        let chars: Vec<char> = content.chars().collect();
+        if chars.is_empty() {
+            want_start = true;
+            continue;
+        }
+        if want_start {
+            starts.push(Position::new(line_num, 0));
+            want_start = false;
+        }
+        let mut i = 0;
+        while i < chars.len() {
+            if matches!(chars[i], '.' | '!' | '?') {
+                let mut j = i + 1;
+                while j < chars.len() && matches!(chars[j], ')' | ']' | '"' | '\'') {
+                    j += 1;
+                }
+                let ends = j >= chars.len()
+                    || chars[j] == '\t'
+                    || (chars[j] == ' ' && (j + 1 >= chars.len() || chars[j + 1] == ' '));
+                if ends {
+                    let mut k = j;
+                    while k < chars.len() && (chars[k] == ' ' || chars[k] == '\t') {
+                        k += 1;
+                    }
+                    if k < chars.len() {
+                        starts.push(Position::new(line_num, k));
+                    } else {
+                        want_start = true;
+                    }
+                    i = k.max(i + 1);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    starts.sort();
+    starts.dedup();
+    starts
+}
+
+/// Position of the last character in the buffer (for end-of-buffer clamping).
+fn buffer_end(buffer: &Buffer) -> Position {
+    let last = buffer.line_count().max(1);
+    let col = buffer
+        .line(last)
+        .map(|l| l.content().chars().count().saturating_sub(1))
+        .unwrap_or(0);
+    Position::new(last, col)
+}
+
+/// Move to the start of the next sentence (`)` command).
+pub fn move_sentence_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
+    let cur = buffer.cursor();
+    let starts = sentence_starts(buffer);
+    let mut pos = cur;
+    for _ in 0..count.max(1) {
+        match starts.iter().copied().find(|p| *p > pos) {
+            Some(p) => pos = p,
+            None => {
+                pos = buffer_end(buffer);
+                break;
+            }
+        }
+    }
+    let range = Range::chars(cur, pos);
+    Ok(MotionResult::with_range(pos, range))
+}
+
+/// Move to the start of the current or previous sentence (`(` command).
+pub fn move_sentence_backward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
+    let cur = buffer.cursor();
+    let starts = sentence_starts(buffer);
+    let mut pos = cur;
+    for _ in 0..count.max(1) {
+        match starts.iter().copied().rev().find(|p| *p < pos) {
+            Some(p) => pos = p,
+            None => {
+                pos = Position::new(1, 0);
+                break;
+            }
+        }
+    }
+    let range = Range::chars(pos, cur);
+    Ok(MotionResult::with_range(pos, range))
+}
+
 /// Move to next section boundary (]] command).
 pub fn move_section_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
     use super::text_object::is_section_boundary;
@@ -673,6 +770,42 @@ mod tests {
         buf.set_line(2);
         let result = move_up(&buf, 1).unwrap();
         assert_eq!(result.position.line, 1);
+    }
+
+    #[test]
+    fn test_sentence_forward_two_spaces() {
+        // POSIX: a sentence ends at .!? followed by two spaces (or EOL).
+        let buf = Buffer::from_text("One.  Two.  Three.\n");
+        let r = move_sentence_forward(&buf, 1).unwrap();
+        assert_eq!(r.position, Position::new(1, 6)); // start of "Two."
+        let r = move_sentence_forward(&buf, 2).unwrap();
+        assert_eq!(r.position, Position::new(1, 12)); // start of "Three."
+    }
+
+    #[test]
+    fn test_sentence_single_space_is_not_boundary() {
+        // A single space after the period is not a sentence boundary.
+        let buf = Buffer::from_text("One. Two.\n");
+        let r = move_sentence_forward(&buf, 1).unwrap();
+        // No further sentence start: clamp to end of buffer.
+        assert_eq!(r.position.line, 1);
+        assert!(r.position.column >= 7);
+    }
+
+    #[test]
+    fn test_sentence_backward() {
+        let mut buf = Buffer::from_text("One.  Two.  Three.\n");
+        buf.set_cursor(Position::new(1, 13));
+        let r = move_sentence_backward(&buf, 1).unwrap();
+        assert_eq!(r.position, Position::new(1, 12)); // back to "Three."
+    }
+
+    #[test]
+    fn test_sentence_paragraph_boundary() {
+        // A blank line is a sentence boundary.
+        let buf = Buffer::from_text("first\n\nsecond\n");
+        let r = move_sentence_forward(&buf, 1).unwrap();
+        assert_eq!(r.position, Position::new(3, 0));
     }
 
     #[test]

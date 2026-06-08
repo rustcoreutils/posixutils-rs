@@ -421,8 +421,14 @@ fn test_ex_preserve_and_recover_roundtrip() {
         .unwrap();
     child.wait().unwrap();
 
-    let recsub = rec.path().join("vi.recover");
-    let count = fs::read_dir(&recsub).map(|d| d.count()).unwrap_or(0);
+    // Recovery files live in a per-user subdir vi.recover.<uid>.
+    let count: usize = fs::read_dir(rec.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("vi.recover."))
+        .filter_map(|e| fs::read_dir(e.path()).ok())
+        .map(|d| d.count())
+        .sum();
     assert!(count >= 1, "preserve should create a recovery file");
 
     // 2) Recover the buffer and print it.

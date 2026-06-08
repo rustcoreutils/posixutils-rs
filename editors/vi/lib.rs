@@ -82,7 +82,7 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
 
     // Preserve the buffer on hangup/termination, and prune old recovery files.
     signals::install_hangup_handlers();
-    recover::cleanup_stale(14 * 24 * 60 * 60);
+    recover::cleanup_stale(&recover::default_base(), 14 * 24 * 60 * 60);
 
     let mut opts = match parse_args(invoked_as, args) {
         Ok(o) => o,
@@ -104,8 +104,12 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     };
 
     // POSIX: if standard input is not a terminal, behave as if -s was given.
+    // That also means assuming a terminal that cannot support visual mode, so
+    // fall back to ex (line) mode rather than trying to enable raw mode on a
+    // non-terminal stdin (which would fail).
     if !std::io::stdin().is_terminal() {
         opts.silent_mode = true;
+        opts.start_in_ex_mode = true;
     }
 
     // Create editor with appropriate mode
@@ -141,7 +145,7 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     // the named file; otherwise open the operands normally.
     if opts.recover {
         if opts.files.is_empty() {
-            let recs = recover::list();
+            let recs = recover::list(&recover::default_base());
             if recs.is_empty() {
                 println!("No files to recover");
             } else {

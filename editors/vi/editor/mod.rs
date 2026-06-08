@@ -678,7 +678,11 @@ impl Editor {
             return None;
         }
         let orig = self.files.current_file().map(|p| p.to_path_buf());
-        match crate::recover::preserve(orig.as_deref(), &self.buffer.as_text()) {
+        match crate::recover::preserve(
+            orig.as_deref(),
+            &self.buffer.as_text(),
+            &self.options.directory,
+        ) {
             Ok(path) => {
                 crate::recover::notify(orig.as_deref());
                 Some(path)
@@ -690,7 +694,7 @@ impl Editor {
     /// Recover a buffer saved by a previous session. With `file`, recover the
     /// newest recovery for that path; without, the newest recovery of any.
     pub fn recover(&mut self, file: Option<&str>) -> Result<()> {
-        match crate::recover::find_for(file) {
+        match crate::recover::find_for(&self.options.directory, file) {
             Some(info) => {
                 let body = crate::recover::load_body(&info.recovery_path).map_err(ViError::Io)?;
                 self.buffer = Buffer::from_text(&body);
@@ -2010,7 +2014,11 @@ impl Editor {
             ExCommand::Preserve => {
                 // :preserve always saves the buffer (independent of modified).
                 let orig = self.files.current_file().map(|p| p.to_path_buf());
-                match crate::recover::preserve(orig.as_deref(), &self.buffer.as_text()) {
+                match crate::recover::preserve(
+                    orig.as_deref(),
+                    &self.buffer.as_text(),
+                    &self.options.directory,
+                ) {
                     Ok(_) => {
                         crate::recover::notify(orig.as_deref());
                         Ok(ExResult::StatusMessage("File preserved".to_string()))
@@ -3297,6 +3305,11 @@ impl Editor {
             .map(|p| p.to_string_lossy() == m.file.as_str())
             .unwrap_or(false);
         if !already_open {
+            // Match :edit/:next: refuse to abandon a modified buffer (open()
+            // would otherwise silently discard the changes).
+            if self.buffer.is_modified() {
+                return Err(ViError::FileModified);
+            }
             self.open(&m.file)?;
         }
 

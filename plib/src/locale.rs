@@ -39,6 +39,13 @@ extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
     fn towlower(c: WintT) -> WintT;
     fn towupper(c: WintT) -> WintT;
+    // Not surfaced by the `libc` crate on all targets, so declared directly.
+    fn mbrtowc(
+        pwc: *mut libc::wchar_t,
+        s: *const libc::c_char,
+        n: libc::size_t,
+        ps: *mut libc::mbstate_t,
+    ) -> libc::size_t;
 }
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
@@ -168,6 +175,51 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
     }
 }
 
+/// Split `bytes` into multibyte characters under the current `LC_CTYPE`, each
+/// returned as the sub-slice of bytes comprising one character.
+///
+/// `setlocale(LC_ALL, "")` must have been called for non-ASCII multibyte
+/// encodings (e.g. UTF-8) to be recognized; in the default `C` locale every
+/// byte is its own character. Invalid or incomplete byte sequences fall back to
+/// a single byte so the function is total and never loses data.
+///
+/// Used by `m4` for character- (not byte-) oriented `len`, `index`, `substr`,
+/// and `translit`, per POSIX `LC_CTYPE`.
+pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut result = Vec::new();
+    // SAFETY: an all-zero mbstate_t is the documented initial conversion state.
+    let mut state: libc::mbstate_t = unsafe { std::mem::zeroed() };
+    let mut i = 0;
+    while i < bytes.len() {
+        let remaining = &bytes[i..];
+        // SAFETY: the pointer/length describe a valid slice, and `state` is a
+        // live mbstate_t owned by this call. A null first argument means "do
+        // not store the wide character", only report the byte count.
+        let n = unsafe {
+            mbrtowc(
+                std::ptr::null_mut(),
+                remaining.as_ptr() as *const libc::c_char,
+                remaining.len() as libc::size_t,
+                &mut state,
+            )
+        };
+        let consumed = if n == 0 {
+            // A NUL wide character occupies one byte.
+            1
+        } else if n == usize::MAX || n == usize::MAX - 1 {
+            // (size_t)-1 (invalid sequence) or (size_t)-2 (incomplete at end of
+            // input): consume one byte and reset the conversion state.
+            state = unsafe { std::mem::zeroed() };
+            1
+        } else {
+            n
+        };
+        result.push(&bytes[i..i + consumed]);
+        i += consumed;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +291,29 @@ mod tests {
     #[test]
     fn strftime_nul_in_format_errors() {
         assert!(strftime("%Y\0%m", 0).is_err());
+    }
+
+    #[test]
+    fn mb_char_slices_ascii_is_one_byte_each() {
+        // ASCII is single-byte in every locale.
+        let slices = mb_char_slices(b"abc");
+        assert_eq!(slices, vec![b"a".as_slice(), b"b", b"c"]);
+        assert_eq!(mb_char_slices(b"").len(), 0);
+    }
+
+    #[test]
+    fn mb_char_slices_utf8_after_setlocale() {
+        // Exercise the multibyte path; only assert when a UTF-8 locale is
+        // actually available (mirrors isprint_non_ascii_requires_setlocale).
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8.
+        let slices = mb_char_slices("é".as_bytes());
+        if !ok.is_null() {
+            assert_eq!(slices, vec![&[0xC3u8, 0xA9u8][..]]);
+        }
+        // Restore the environment locale so other tests are unaffected.
+        unsafe { libc::setlocale(libc::LC_ALL, c"".as_ptr()) };
     }
 
     #[test]

@@ -17,6 +17,24 @@ use crate::macros::MacroDefinition;
 use crate::output::{DivertBufferNumber, BUILTIN_DEFN_PREFIX, BUILTIN_DEFN_SUFFIX};
 use crate::state::{StackFrame, State};
 use crate::EOF;
+use plib::locale::mb_char_slices;
+
+/// Convert a byte offset within `bytes` to the index of the character that
+/// begins at (or after) that offset, counting multibyte characters under the
+/// current `LC_CTYPE`. Used by `index` to report a character (not byte)
+/// position.
+fn byte_offset_to_char_index(bytes: &[u8], byte_offset: usize) -> usize {
+    let mut consumed = 0;
+    let mut index = 0;
+    for ch in mb_char_slices(bytes) {
+        if consumed >= byte_offset {
+            break;
+        }
+        consumed += ch.len();
+        index += 1;
+    }
+    index
+}
 
 const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
     "There should always be at least one macro definition";
@@ -644,9 +662,9 @@ impl MacroImplementation for LenMacro {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        state
-            .input
-            .pushback_string(first_arg.len().to_string().as_bytes());
+        // POSIX: the length is in characters, not bytes (LC_CTYPE).
+        let len = mb_char_slices(&first_arg).len();
+        state.input.pushback_string(len.to_string().as_bytes());
         Ok(state)
     }
 }
@@ -679,12 +697,17 @@ impl MacroImplementation for IndexMacro {
             return Ok(state);
         }
 
-        let index = first_arg
+        let byte_offset = first_arg
             .windows(second_arg.len())
             .position(|window| window == second_arg);
-        match index {
-            Some(index) => {
-                state.input.pushback_string(index.to_string().as_bytes());
+        match byte_offset {
+            // POSIX: the position is a character index (zero origin), not a byte
+            // offset (LC_CTYPE).
+            Some(byte_offset) => {
+                let char_index = byte_offset_to_char_index(&first_arg, byte_offset);
+                state
+                    .input
+                    .pushback_string(char_index.to_string().as_bytes());
             }
             None => {
                 state.input.pushback_string(b"-1");
@@ -704,18 +727,12 @@ impl MacroImplementation for IndexMacro {
 /// unspecified if translit is not immediately followed by a `<left-parenthesis>`.
 pub struct TranslitMacro;
 
-// TODO(utf8): support utf8 multibyte characters properly
 impl MacroImplementation for TranslitMacro {
     fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args = frame.args.into_iter();
-        let mut output_buffer = args
+        let first_arg = args
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-
-        log::debug!(
-            "TranslitMacro::evaluate() transliterating {:?}",
-            String::from_utf8_lossy(&output_buffer)
-        );
 
         let second_arg = match args.next() {
             Some(second_arg) => second_arg,
@@ -728,15 +745,20 @@ impl MacroImplementation for TranslitMacro {
 
         let third_arg = args.next().unwrap_or_default();
 
-        for (i, source_char) in second_arg.into_iter().enumerate() {
-            if let Some(replacement_char) = third_arg.get(i) {
-                for current_char in output_buffer.iter_mut() {
-                    if *current_char == source_char {
-                        *current_char = *replacement_char;
+        // Transliterate by character, not byte (LC_CTYPE): each source character
+        // maps to the target character at the same position, or is deleted when
+        // the target list is shorter.
+        let from = mb_char_slices(&second_arg);
+        let to = mb_char_slices(&third_arg);
+        let mut output_buffer: Vec<u8> = Vec::with_capacity(first_arg.len());
+        for ch in mb_char_slices(&first_arg) {
+            match from.iter().position(|source| *source == ch) {
+                Some(pos) => {
+                    if let Some(replacement) = to.get(pos) {
+                        output_buffer.extend_from_slice(replacement);
                     }
                 }
-            } else {
-                output_buffer.retain(|current_char| *current_char != source_char);
+                None => output_buffer.extend_from_slice(ch),
             }
         }
 
@@ -767,7 +789,9 @@ impl MacroImplementation for SubstrMacro {
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
-        if first_arg.is_empty() {
+        // Indices and lengths are in characters, not bytes (LC_CTYPE).
+        let chars = mb_char_slices(&first_arg);
+        if chars.is_empty() {
             return Ok(state);
         }
 
@@ -785,16 +809,17 @@ impl MacroImplementation for SubstrMacro {
             None => 0,
         };
 
-        if start_index > (first_arg.len() - 1) {
+        // A starting point beyond the end is not an error; the result is null.
+        if start_index >= chars.len() {
             return Ok(state);
         }
 
-        let out = match args.next() {
+        let selected: &[&[u8]] = match args.next() {
             Some(third_arg) => match nom::combinator::all_consuming(parse_index)(&third_arg) {
                 Ok((_, number_of_chars)) => {
                     if number_of_chars > 0 {
-                        let end_index = usize::min(start_index + number_of_chars, first_arg.len());
-                        &first_arg[start_index..end_index]
+                        let end_index = usize::min(start_index + number_of_chars, chars.len());
+                        &chars[start_index..end_index]
                     } else {
                         return Ok(state);
                     }
@@ -807,10 +832,10 @@ impl MacroImplementation for SubstrMacro {
                     return Ok(state);
                 }
             },
-            None => &first_arg[start_index..],
+            None => &chars[start_index..],
         };
 
-        state.input.pushback_string(out);
+        state.input.pushback_string(&selected.concat());
         Ok(state)
     }
 }

@@ -404,12 +404,18 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
         let skip_bytes = config.skip * config.ibs;
         // Try to seek first
         if !ifile.try_seek(SeekFrom::Start(skip_bytes as u64))? {
-            // Non-seekable: read and discard
+            // Non-seekable: read and discard a full ibs-sized block at a time,
+            // accumulating short reads so each skipped block is exactly ibs
+            // bytes (not one read() call, which may return fewer bytes).
             let mut remaining = config.skip;
-            while remaining > 0 {
-                let n = ifile.read(&mut ibuf)?;
-                if n == 0 {
-                    break;
+            'skip: while remaining > 0 {
+                let mut got = 0;
+                while got < config.ibs {
+                    let n = ifile.read(&mut ibuf[got..])?;
+                    if n == 0 {
+                        break 'skip;
+                    }
+                    got += n;
                 }
                 remaining -= 1;
             }
@@ -464,11 +470,15 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
                         ibuf.fill(0);
                         config.ibs
                     } else {
-                        // Skip this block
+                        // Skip this block, but still count it as a (partial)
+                        // input block that was read.
                         blocks_read += 1;
+                        stats.in_partial += 1;
                         continue;
                     }
                 } else {
+                    // Report the statistics gathered so far before aborting.
+                    stats.print();
                     return Err(e.into());
                 }
             }
@@ -672,9 +682,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats = copy_convert_file(&config)?;
     stats.print();
 
-    // If we were interrupted, exit with signal status
+    // On SIGINT, terminate "as if by the default action" so the parent sees
+    // the process as signal-killed (WIFSIGNALED): restore the default handler
+    // and re-raise, after the statistics have been written.
     if INTERRUPTED.load(Ordering::SeqCst) {
-        std::process::exit(128 + libc::SIGINT);
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::raise(libc::SIGINT);
+        }
     }
 
     Ok(())

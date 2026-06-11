@@ -270,8 +270,8 @@ absent.
 ### Priority issues
 
 #### Critical
-- [ ] **FIND-1 — `-name`/`-path` use the `regex` crate, not fnmatch; bracket ranges are broken.** `find.rs:631-672` (esp. `-` escaped at 655). Spec §98198/§98205 require XBD shell filename matching. Verified: `find dir -name '[a-z]'` matches nothing where it must match `m`. DIVERGES. Fix: use `libc::fnmatch` (or a faithful glob matcher) for both primaries.
-- [ ] **FIND-2 — `-iname` primary missing.** Not in `find.rs`. POSIX.1-2024 §98201 (Defect 1031) requires it. MISSING. Fix: add case-folded fnmatch.
+- [x] **FIND-1 — `-name`/`-path` use the `regex` crate, not fnmatch; bracket ranges are broken.** `find.rs:631-672` (esp. `-` escaped at 655). Spec §98198/§98205 require XBD shell filename matching. Verified: `find dir -name '[a-z]'` matches nothing where it must match `m`. DIVERGES. Fix: use `libc::fnmatch` (or a faithful glob matcher) for both primaries. ✓ fixed in find-A — `pattern_to_regex` replaced with a `libc::fnmatch` wrapper; the `regex` crate dependency dropped from the crate. Verified `[a-z]`, `[!a-z]`, `?`, and `*` globs.
+- [x] **FIND-2 — `-iname` primary missing.** Not in `find.rs`. POSIX.1-2024 §98201 (Defect 1031) requires it. MISSING. Fix: add case-folded fnmatch. ✓ fixed in find-A — `-iname` (and `-ipath`) added via `FNM_CASEFOLD`.
 
 #### Major
 - [ ] **FIND-3 — `-mount` primary missing.** Not in `find.rs`. POSIX.1-2024 §98215 (Defect 1133) requires it; semantically distinct from `-xdev` (excludes the crossing point itself). MISSING.

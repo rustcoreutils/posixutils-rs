@@ -19,7 +19,22 @@ use std::time::SystemTime;
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::modestr;
-use regex::Regex;
+
+/// Match `string` against a shell filename pattern using POSIX `fnmatch(3)`,
+/// the matching notation mandated for `-name`/`-iname`/`-path` (XBD filename
+/// pattern matching), rather than a regular expression. `fold` requests a
+/// case-insensitive match (`FNM_CASEFOLD`, for `-iname`).
+///
+/// Neither `-name` nor `-path` sets `FNM_PATHNAME`: POSIX `-path` explicitly
+/// does not treat a `<slash>` specially, and `-name` only ever sees a basename.
+fn fnmatch(pattern: &str, string: &str, fold: bool) -> bool {
+    use std::ffi::CString;
+    let (Ok(p), Ok(s)) = (CString::new(pattern), CString::new(string)) else {
+        return false;
+    };
+    let flags = if fold { libc::FNM_CASEFOLD } else { 0 };
+    unsafe { libc::fnmatch(p.as_ptr(), s.as_ptr(), flags) == 0 }
+}
 
 /// Symlink following mode
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -137,8 +152,14 @@ enum ExecMode {
 #[derive(Clone, Debug)]
 enum Primary {
     // Tests
-    Name(Regex),
-    Path(Regex),
+    Name {
+        pattern: String,
+        fold: bool,
+    },
+    Path {
+        pattern: String,
+        fold: bool,
+    },
     Type(FileTypeMatch),
     Perm(PermMode),
     Links(NumericComparison),
@@ -369,13 +390,31 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
     match tok {
         "-name" => {
             let pattern = get_arg(tokens, idx, "-name")?;
-            let regex = pattern_to_regex(pattern)?;
-            Ok(Expr::Primary(Primary::Name(regex)))
+            Ok(Expr::Primary(Primary::Name {
+                pattern: pattern.to_string(),
+                fold: false,
+            }))
+        }
+        "-iname" => {
+            let pattern = get_arg(tokens, idx, "-iname")?;
+            Ok(Expr::Primary(Primary::Name {
+                pattern: pattern.to_string(),
+                fold: true,
+            }))
         }
         "-path" => {
             let pattern = get_arg(tokens, idx, "-path")?;
-            let regex = pattern_to_regex(pattern)?;
-            Ok(Expr::Primary(Primary::Path(regex)))
+            Ok(Expr::Primary(Primary::Path {
+                pattern: pattern.to_string(),
+                fold: false,
+            }))
+        }
+        "-ipath" => {
+            let pattern = get_arg(tokens, idx, "-ipath")?;
+            Ok(Expr::Primary(Primary::Path {
+                pattern: pattern.to_string(),
+                fold: true,
+            }))
         }
         "-type" => {
             let type_char = get_arg(tokens, idx, "-type")?;
@@ -627,50 +666,6 @@ fn has_xdev(expr: &Expr) -> bool {
     }
 }
 
-/// Convert shell glob pattern to regex
-fn pattern_to_regex(pattern: &str) -> Result<Regex, String> {
-    let mut regex_str = String::from("^");
-
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => regex_str.push_str(".*"),
-            '?' => regex_str.push('.'),
-            '[' => {
-                regex_str.push('[');
-                // Handle character class
-                if chars.peek() == Some(&'!') {
-                    chars.next();
-                    regex_str.push('^');
-                }
-                // Copy until ]
-                let mut first = true;
-                while let Some(&cc) = chars.peek() {
-                    chars.next();
-                    if cc == ']' && !first {
-                        regex_str.push(']');
-                        break;
-                    }
-                    // Escape regex special chars inside class
-                    if cc == '\\' || cc == '^' || cc == '-' {
-                        regex_str.push('\\');
-                    }
-                    regex_str.push(cc);
-                    first = false;
-                }
-            }
-            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '\\' => {
-                regex_str.push('\\');
-                regex_str.push(c);
-            }
-            _ => regex_str.push(c),
-        }
-    }
-
-    regex_str.push('$');
-    Regex::new(&regex_str).map_err(|e| format!("invalid pattern: {}", e))
-}
-
 /// Evaluate expression against a file
 fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match expr {
@@ -712,14 +707,14 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
 /// Evaluate a single primary
 fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match primary {
-        Primary::Name(regex) => {
+        Primary::Name { pattern, fold } => {
             let name = ctx.path.file_name().unwrap_or(OsStr::new(""));
             let name_str = name.to_string_lossy();
-            EvalResult::new(regex.is_match(&name_str))
+            EvalResult::new(fnmatch(pattern, &name_str, *fold))
         }
-        Primary::Path(regex) => {
+        Primary::Path { pattern, fold } => {
             let path_str = ctx.path.to_string_lossy();
-            EvalResult::new(regex.is_match(&path_str))
+            EvalResult::new(fnmatch(pattern, &path_str, *fold))
         }
         Primary::Type(ft) => {
             // When -L is used and checking for symlink, use link_metadata

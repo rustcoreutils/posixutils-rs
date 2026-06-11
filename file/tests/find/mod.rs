@@ -319,3 +319,54 @@ fn find_print0_with_name_filter() {
 
     run_test_find_print0_sorted(&args, &[&file1, &file2, &file3], 0)
 }
+
+// --- fnmatch / -iname (find-A) ---
+
+/// Create a fresh temp dir with the given files; returns its path.
+fn make_fnmatch_dir(tag: &str, files: &[&str]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in files {
+        File::create(dir.join(f)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn find_name_bracket_range() {
+    // POSIX bracket expression [a-z] must match a single lowercase letter.
+    let dir = make_fnmatch_dir("bracket", &["m", "Q", "9", "abc"]);
+    let ds = dir.to_str().unwrap();
+    let expect = format!("{ds}/m");
+    run_test_find_sorted(&[ds, "-name", "[a-z]"], &[&expect], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_name_bracket_negation() {
+    let dir = make_fnmatch_dir("negation", &["m", "Q", "9"]);
+    let ds = dir.to_str().unwrap();
+    let e1 = format!("{ds}/Q");
+    let e2 = format!("{ds}/9");
+    run_test_find_sorted(&[ds, "-name", "[!a-z]"], &[&e1, &e2], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_iname_case_insensitive() {
+    let dir = make_fnmatch_dir("iname", &["README.md", "other.txt"]);
+    let ds = dir.to_str().unwrap();
+    let expect = format!("{ds}/README.md");
+    run_test_find_sorted(&[ds, "-iname", "readme.md"], &[&expect], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_name_question_mark() {
+    let dir = make_fnmatch_dir("qmark", &["ab", "abc", "a"]);
+    let ds = dir.to_str().unwrap();
+    let expect = format!("{ds}/ab");
+    run_test_find_sorted(&[ds, "-name", "a?"], &[&expect], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -145,15 +145,15 @@ stdin/stdout defaults all conform. The gaps are in conversion *ordering*, SIGINT
 ### Priority issues
 
 #### Major
-- [ ] **DD-1 — conversions applied in command-line order, not spec order.** `dd.rs:271-285`. `apply_conversions` iterates `config.conversions` in parse order. Spec §91906-91927 mandates a fixed pipeline (sync pad → swab → block/unblock → lcase/ucase). `conv=block,sync` vs `conv=sync,block` therefore differ. DIVERGES. Fix: apply in a fixed sequence regardless of how the user ordered the `conv=` list.
+- [x] **DD-1 — conversions applied in command-line order, not spec order.** `dd.rs:271-285`. `apply_conversions` iterates `config.conversions` in parse order. Spec §91906-91927 mandates a fixed pipeline (sync pad → swab → block/unblock → lcase/ucase). `conv=block,sync` vs `conv=sync,block` therefore differ. DIVERGES. Fix: apply in a fixed sequence regardless of how the user ordered the `conv=` list. ✓ fixed in dd-A — `apply_conversions` applies sync→swab→charset/case→block/unblock in fixed order regardless of `conv=` order.
 - [ ] **DD-2 — SIGINT exits via `process::exit(130)` instead of re-raising.** `dd.rs:624-640`. Stats *are* printed to stderr (conforms), but the process then `_exit`s; the parent's `waitpid` sees a normal exit, not `WIFSIGNALED`. Spec §92056: "terminate abnormally as if by the default action for SIGINT." DIVERGES. Fix: after printing stats, `signal(SIGINT, SIG_DFL)` then `raise(SIGINT)`.
-- [ ] **DD-3 — `lcase`/`ucase` ignore `LC_CTYPE`.** `dd.rs:202-216`. Raw ASCII-range arithmetic; multibyte/locale case folding unsupported. Spec ties these to the `LC_CTYPE` `tolower`/`toupper` mappings. DIVERGES. Fix: case-fold per locale.
+- [x] **DD-3 — `lcase`/`ucase` ignore `LC_CTYPE`.** `dd.rs:202-216`. Raw ASCII-range arithmetic; multibyte/locale case folding unsupported. Spec ties these to the `LC_CTYPE` `tolower`/`toupper` mappings. DIVERGES. Fix: case-fold per locale. ✓ fixed in dd-A — `convert_lcase`/`convert_ucase` use `libc::tolower`/`toupper` (LC_CTYPE-aware).
 - [ ] **DD-4 — `skip=` on non-seekable input counts read-calls, not blocks.** `dd.rs:375-389`. The fallback discard loop decrements `remaining` once per `read()` regardless of bytes returned, so a short read under-skips. Latent (a pipe delivering full blocks works; verified `ibs=2 skip=1` on a fast pipe yields `cdef`). Fix: accumulate `ibs` bytes per skipped block.
 - [ ] **DD-5 — `iflags=fullblock` operand missing.** Not implemented. POSIX.1-2024 §92011 (Austin Group Defect 406) defines it; without it `count=` semantics differ on short reads. MISSING. Fix: add `iflags=` parsing + a read-until-full inner loop.
 
 #### Minor
-- [ ] **DD-6 — `w` multiplier accepted as ×2.** `dd.rs:538`. Spec §92132 explicitly drops `w` as non-portable. DIVERGES (silent wrong size). Fix: reject `w`.
-- [ ] **DD-7 — `cbs=` not required-checked for `ascii`/`ebcdic`/`ibm`/`block`/`unblock`.** `dd.rs:494-521`. Spec requires `cbs` for these; impl accepts `cbs=0`. PARTIAL.
+- [x] **DD-6 — `w` multiplier accepted as ×2.** `dd.rs:538`. Spec §92132 explicitly drops `w` as non-portable. DIVERGES (silent wrong size). Fix: reject `w`. ✓ fixed in dd-A — the `w` suffix is rejected.
+- [x] **DD-7 — `cbs=` not required-checked for `ascii`/`ebcdic`/`ibm`/`block`/`unblock`.** `dd.rs:494-521`. Spec requires `cbs` for these; impl accepts `cbs=0`. PARTIAL. ✓ fixed in dd-A — `conv=block`/`unblock` with `cbs=0` is rejected.
 - [ ] **DD-8 — non-`noerror` read error exits without printing stats.** `dd.rs:634`. Spec is ambiguous, but historical `dd` prints stats on every termination. Minor.
 - [ ] **DD-9 — `noerror` skip path does not count the failed block.** `dd.rs:440-441`. May undercount `records in`. Minor.
 - [ ] **DD-10 — `m`/`g`/`c` multiplier suffixes are extensions** beyond POSIX `b`/`k`/`x`. `dd.rs:537,541-542`. N/A (harmless extension; note only).

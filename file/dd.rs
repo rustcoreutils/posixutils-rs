@@ -171,6 +171,19 @@ impl Config {
             .iter()
             .any(|c| !matches!(c, Conversion::Sync))
     }
+
+    fn has(&self, want: Conversion) -> bool {
+        self.conversions
+            .iter()
+            .any(|c| std::mem::discriminant(c) == std::mem::discriminant(&want))
+    }
+
+    fn ascii_conv(&self) -> Option<AsciiConv> {
+        self.conversions.iter().find_map(|c| match c {
+            Conversion::Ascii(a) => Some(*a),
+            _ => None,
+        })
+    }
 }
 
 fn convert_ascii(data: &mut [u8], ascii_conv: &AsciiConv) {
@@ -200,18 +213,16 @@ fn convert_swab(data: &mut [u8]) {
 }
 
 fn convert_lcase(data: &mut [u8]) {
+    // Use the locale's LC_CTYPE mapping (faithful for single-byte locales)
+    // rather than ASCII-only arithmetic.
     for byte in data.iter_mut() {
-        if *byte >= b'A' && *byte <= b'Z' {
-            *byte += 32;
-        }
+        *byte = unsafe { libc::tolower(*byte as libc::c_int) as u8 };
     }
 }
 
 fn convert_ucase(data: &mut [u8]) {
     for byte in data.iter_mut() {
-        if *byte >= b'a' && *byte <= b'z' {
-            *byte -= 32;
-        }
+        *byte = unsafe { libc::toupper(*byte as libc::c_int) as u8 };
     }
 }
 
@@ -268,19 +279,36 @@ fn convert_unblock(data: &mut Vec<u8>, cbs: usize) {
     *data = result;
 }
 
+/// Apply conversions in the fixed order mandated by POSIX (EXTENDED
+/// DESCRIPTION processing steps), regardless of the order they were listed in
+/// the `conv=` operand: sync padding, then swab, then the charset/case and
+/// block/unblock conversions.
 fn apply_conversions(data: &mut Vec<u8>, config: &Config, stats: &mut Stats) {
     let use_space_padding = config.has_block_unblock();
 
-    for conversion in &config.conversions {
-        match conversion {
-            Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
-            Conversion::Lcase => convert_lcase(data),
-            Conversion::Ucase => convert_ucase(data),
-            Conversion::Swab => convert_swab(data),
-            Conversion::Sync => convert_sync(data, config.ibs, use_space_padding),
-            Conversion::Block => convert_block(data, config.cbs, &mut stats.truncated),
-            Conversion::Unblock => convert_unblock(data, config.cbs),
-        }
+    // Step 2: pad a short final block when sync is requested.
+    if config.has(Conversion::Sync) {
+        convert_sync(data, config.ibs, use_space_padding);
+    }
+    // Step 4: swab.
+    if config.has(Conversion::Swab) {
+        convert_swab(data);
+    }
+    // Step 5: remaining conversions (charset, case, block/unblock).
+    if let Some(ascii_conv) = config.ascii_conv() {
+        convert_ascii(data, &ascii_conv);
+    }
+    if config.has(Conversion::Lcase) {
+        convert_lcase(data);
+    }
+    if config.has(Conversion::Ucase) {
+        convert_ucase(data);
+    }
+    if config.has(Conversion::Block) {
+        convert_block(data, config.cbs, &mut stats.truncated);
+    }
+    if config.has(Conversion::Unblock) {
+        convert_unblock(data, config.cbs);
     }
 }
 
@@ -535,7 +563,9 @@ fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Erro
             chars.pop();
             match last {
                 'c' => scale = 1,
-                'w' => scale = 2,
+                // POSIX explicitly does not support the 'w' (word) suffix
+                // because the word size is non-portable; reject it rather than
+                // silently assuming 2.
                 'b' => scale = 512,
                 'k' | 'K' => scale = 1024,
                 'm' | 'M' => scale = 1024 * 1024,
@@ -612,6 +642,14 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
             }
         }
     }
+
+    // block/unblock are unspecified without a non-zero cbs; treat as an error.
+    if config.cbs == 0 && config.has_block_unblock() {
+        let msg = gettext("conv=block/unblock requires a non-zero cbs=");
+        eprintln!("dd: {}", msg);
+        return Err(msg.into());
+    }
+
     Ok(config)
 }
 

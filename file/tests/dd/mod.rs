@@ -402,6 +402,17 @@ fn test_combined_conversions() {
         expected_err: b"0+1 records in\n0+1 records out\n".to_vec(),
         expected_exit_code: 0,
     });
+
+    // DD-1: conversions are applied in the fixed spec order regardless of how
+    // they are listed; swab runs before ucase either way.
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![String::from("conv=swab,ucase")],
+        stdin_data: b"abcd".to_vec(),
+        expected_out: b"BADC".to_vec(),
+        expected_err: b"0+1 records in\n0+1 records out\n".to_vec(),
+        expected_exit_code: 0,
+    });
 }
 
 #[test]

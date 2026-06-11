@@ -202,6 +202,9 @@ m4_test!(dnl);
 m4_test!(dnl_nested);
 m4_test!(dumpdef);
 m4_test!(eval);
+m4_test!(eval_base_literals);
+m4_test!(eval_radix);
+m4_test!(eval_shift_precedence);
 m4_test!(evaluation_order);
 // file test needs the actual file path (uses __file__ macro), not stdin
 #[test]

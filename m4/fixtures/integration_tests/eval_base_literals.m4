@@ -1,0 +1,5 @@
+eval(0xff)
+eval(0XFF)
+eval(010)
+eval(0b101)
+eval(0)

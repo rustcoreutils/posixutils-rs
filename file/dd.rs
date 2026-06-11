@@ -134,7 +134,8 @@ struct Config {
     conversions: Vec<Conversion>,
     noerror: bool,
     notrunc: bool,
-    bs_mode: bool, // True if bs= was used (passthrough mode)
+    bs_mode: bool,          // True if bs= was used (passthrough mode)
+    iflags_fullblock: bool, // iflags=fullblock: accumulate a full ibs per block
 }
 
 impl Default for Config {
@@ -152,6 +153,7 @@ impl Default for Config {
             noerror: Default::default(),
             notrunc: Default::default(),
             bs_mode: false,
+            iflags_fullblock: false,
         }
     }
 }
@@ -373,6 +375,24 @@ impl OutputFile {
     }
 }
 
+/// Read one input block into `buf`. With `iflags=fullblock`, keep reading until
+/// `buf` is full or EOF (a short read does not by itself end the block);
+/// otherwise a single `read()` forms the block.
+fn read_block(ifile: &mut InputFile, buf: &mut [u8], fullblock: bool) -> io::Result<usize> {
+    if !fullblock {
+        return ifile.read(buf);
+    }
+    let mut got = 0;
+    while got < buf.len() {
+        let n = ifile.read(&mut buf[got..])?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    Ok(got)
+}
+
 fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error>> {
     let mut stats = Stats::default();
 
@@ -454,7 +474,7 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
             }
         }
 
-        let n = match ifile.read(&mut ibuf) {
+        let n = match read_block(&mut ifile, &mut ibuf, config.iflags_fullblock) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
@@ -645,6 +665,19 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
             "count" => config.count = Some(oparg.parse::<usize>()?),
 
             "conv" => parse_conv_list(&mut config, &oparg)?,
+
+            "iflags" => {
+                for flag in oparg.split(',') {
+                    match flag {
+                        "fullblock" => config.iflags_fullblock = true,
+                        "" => {}
+                        _ => {
+                            eprintln!("{}: {}", gettext("invalid iflags option"), flag);
+                            return Err(format!("invalid iflags option: {}", flag).into());
+                        }
+                    }
+                }
+            }
 
             _ => {
                 eprintln!("{}: {}", gettext("invalid option"), op);

@@ -337,7 +337,7 @@ aren't parsed, and the obsolescent `+offset` operand is broken.
 ### Priority issues
 
 #### Critical
-- [ ] **OD-1 — `-c` renders named characters instead of C escapes.** `od.rs:402-412,946-981`. `-c` is routed through `BCFormatter` (named chars) rather than `CFormatter` (C escapes). Verified: `printf 'A\tB\nC' | od -c` → `A  HT   B  NL   C`; NUL → `NUL`. Spec §109036/§109174-§109184: `-c` ≡ `-t c`, so output must be `\t`, `\n`, `\0`. DIVERGES. Fix: dispatch `CFormatter` for `-c`, and add a `\0` arm (`od.rs:946-963`).
+- [x] **OD-1 — `-c` renders named characters instead of C escapes.** `od.rs:402-412,946-981`. `-c` is routed through `BCFormatter` (named chars) rather than `CFormatter` (C escapes). Verified: `printf 'A\tB\nC' | od -c` → `A  HT   B  NL   C`; NUL → `NUL`. Spec §109036/§109174-§109184: `-c` ≡ `-t c`, so output must be `\t`, `\n`, `\0`. DIVERGES. Fix: dispatch `CFormatter` for `-c`, and add a `\0` arm (`od.rs:946-963`). ✓ fixed in od-A — `-c` now maps to the `c` type string, `CFormatter` gained a `\0` arm, and `BCFormatter` was deleted; `-c` ≡ `-t c` verified.
 
 #### Major
 - [ ] **OD-2 — multiple short type options rejected.** `od.rs:162-166`. Verified: `od -b -c f` → "cannot be used together". Spec §109084 requires multiple `-bcdostx` to *accumulate in order*. DIVERGES. Fix: append each to `type_strings` instead of erroring.
@@ -348,7 +348,7 @@ aren't parsed, and the obsolescent `+offset` operand is broken.
 #### Minor
 - [ ] **OD-6 — `-j` past EOF on regular files exits 0 silently.** `od.rs:1113-1118`. Spec §109044 requires a diagnostic + non-zero exit. Fix: detect under-skip after the file loop.
 - [ ] **OD-7 — `-t f` float format diverges from `%e`.** `od.rs:904`. Rust `{:e}` field width/exponent differ; the impl's own `test_od_16` is marked TODO. Minor.
-- [ ] **OD-8 — multibyte handling for `-c`/`-t c` absent.** `od.rs:988-998`. Spec §109179-109181 wants printable multibyte chars in the first column with `**` fillers. MISSING.
+- [x] ~~**OD-8 — multibyte handling for `-c`/`-t c` absent.**~~ `od.rs:988-998`. Spec §109179-109181 *suggests* printable multibyte chars in the first column with `**` fillers. Re-examined and **deliberately left as per-byte C-escapes**: GNU coreutils `od -c` 9.4 does not render multibyte either (verified: it prints `303 251` for `é`), POSIX leaves it loosely specified, and od's `setlocale` resolves to the ASCII codeset in practice. Matching GNU/common behavior is the safer choice than speculative locale-gated rendering. N/A.
 
 ### Detailed conformance matrix
 #### Options

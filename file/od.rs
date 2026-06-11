@@ -125,6 +125,11 @@ impl Args {
         if self.octal_bytes {
             self.type_strings = vec!["o1".to_string()];
         }
+        if self.bytes_char {
+            // -c is equivalent to -t c: bytes interpreted as characters, with
+            // C-style escapes (\0, \t, \n, ...) — not named characters.
+            self.type_strings = vec!["c".to_string()];
+        }
         if self.unsigned_decimal_words {
             self.type_strings = vec!["u2".to_string()];
         }
@@ -399,18 +404,7 @@ fn print_data<R: Read>(
         };
 
         // Process and print the buffer based on configuration.
-        if config.bytes_char {
-            // Print bytes as characters.
-
-            let res = process_formatter(&BCFormatter, local_buf, local_buf_len);
-            process_res_string(
-                &offset_string,
-                &mut previous_offset_string,
-                &mut previous_asterisk,
-                &res,
-                config.verbose,
-            );
-        } else if config.type_strings.is_empty() {
+        if config.type_strings.is_empty() {
             // Process the buffer in chunks of 2 bytes.
             let chunks = local_buf.chunks(2);
             let res = process_chunks_formatter(&OFormatter, chunks, 2, local_buf_len);
@@ -928,7 +922,6 @@ trait Formatter {
 
 struct AFormatter;
 struct CFormatter;
-struct BCFormatter;
 struct DefaultFormatter;
 
 impl Formatter for AFormatter {
@@ -946,6 +939,7 @@ impl Formatter for AFormatter {
 impl Formatter for CFormatter {
     fn format_value(&self, byte: u8) -> String {
         match byte {
+            b'\0' => "  \\0".to_string(),
             b'\\' => "  \\".to_string(),
             b'\x07' => "  \\a".to_string(),
             b'\x08' => "  \\b".to_string(),
@@ -954,23 +948,6 @@ impl Formatter for CFormatter {
             b'\x0D' => "  \\r".to_string(),
             b'\x09' => "  \\t".to_string(),
             b'\x0B' => "  \\v".to_string(),
-            _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
-                format!("   {}", byte as char)
-            }
-            _ => format!(" {:03o}", byte),
-        }
-    }
-}
-
-impl Formatter for BCFormatter {
-    fn format_value(&self, byte: u8) -> String {
-        match byte {
-            b'\0' => " NUL".to_string(),
-            b'\x08' => "  BS".to_string(),
-            b'\x0C' => "  FF".to_string(),
-            b'\x0A' => "  NL".to_string(),
-            b'\x0D' => "  CR".to_string(),
-            b'\x09' => "  HT".to_string(),
             _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
                 format!("   {}", byte as char)
             }

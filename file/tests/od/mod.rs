@@ -306,3 +306,22 @@ fn test_od_a_x_t_a() {
 ",
     );
 }
+
+// -c must use C-style escapes (\t, \n, \0), NOT named characters (HT, NL, NUL).
+#[test]
+fn test_od_c_uses_c_escapes() {
+    od_test(&["-c", "-An"], "A\tB\nC", "   A  \\t   B  \\n   C\n");
+}
+
+#[test]
+fn test_od_c_nul_is_backslash_zero() {
+    od_test(&["-c", "-An"], "X\0Y", "   X  \\0   Y\n");
+}
+
+// -c is equivalent to -t c.
+#[test]
+fn test_od_c_equals_t_c() {
+    let data = "A\tB\0";
+    od_test(&["-c", "-An"], data, "   A  \\t   B  \\0\n");
+    od_test(&["-t", "c", "-An"], data, "   A  \\t   B  \\0\n");
+}

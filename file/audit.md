@@ -276,15 +276,15 @@ absent.
 #### Major
 - [x] **FIND-3 — `-mount` primary missing.** Not in `find.rs`. POSIX.1-2024 §98215 (Defect 1133) requires it; semantically distinct from `-xdev` (excludes the crossing point itself). MISSING. ✓ fixed in find-B — `-mount` primary added; on a device crossing it excludes the mount-point directory and does not descend (vs `-xdev` which acts on the directory).
 - [x] **FIND-4 — `-exec {} +` does not honor `ARG_MAX`.** `find.rs:1052-1112`. All accumulated pathnames are passed in a single `Command`; large trees overflow the exec limit. Spec §98295-98298 requires splitting into sets. PARTIAL. Fix: chunk by `sysconf(_SC_ARG_MAX)`. ✓ fixed in find-C — `execute_batches` splits the file list into invocations sized under `sysconf(_SC_ARG_MAX)` (less env + utility/args + margin); batch identity now also compares `args_before`.
-- [ ] **FIND-5 — `-ok` uses hardcoded English `y`/`yes`.** `find.rs:874`. Spec ties the affirmative response to `LC_MESSAGES` (`yesexpr`). DIVERGES. Fix: match against `nl_langinfo(YESEXPR)`.
+- [x] **FIND-5 — `-ok` uses hardcoded English `y`/`yes`.** `find.rs:874`. Spec ties the affirmative response to `LC_MESSAGES` (`yesexpr`). DIVERGES. Fix: match against `nl_langinfo(YESEXPR)`. ✓ fixed in find-D — `-ok` matches the response against `nl_langinfo(YESEXPR)` (via `plib::regex` ERE), falling back to `^[yY]`.
 
 #### Minor
-- [ ] **FIND-6 — `-user`/`-group` re-resolve the name on every file.** `find.rs:745-760`. Spec §98346 evaluates the argument once. Fix: resolve to uid/gid at parse time.
-- [ ] **FIND-7 — `-atime`/`-ctime`/`-mtime` clamp future timestamps to 0.** `find.rs:903-908`. Use signed day arithmetic.
+- [x] **FIND-6 — `-user`/`-group` re-resolve the name on every file.** `find.rs:745-760`. Spec §98346 evaluates the argument once. Fix: resolve to uid/gid at parse time. ✓ fixed in find-D — `-user`/`-group` resolve to an id once at parse time (`User(Option<u32>)`/`Group(Option<u32>)`); an unknown name still never matches.
+- [x] **FIND-7 — `-atime`/`-ctime`/`-mtime` clamp future timestamps to 0.** `find.rs:903-908`. Use signed day arithmetic. ✓ fixed in find-D — `time_diff_days` uses signed seconds, so a future timestamp yields a negative day count.
 - [x] **FIND-8 — `-xdev` skips the crossing-point directory entry itself.** `find.rs:975-977`. Spec acts on the directory but does not descend. ✓ fixed in find-B — `-xdev` now evaluates the crossing-point directory itself and only blocks descent.
 - [x] **FIND-9 — cycle-detection diagnostic prints the same path twice.** `find.rs:963-972`. Track and report the previously-visited ancestor. ✓ fixed in find-B — `visited_paths` records the first path at each inode; the loop diagnostic names the ancestor.
-- [ ] **FIND-10 — symbolic `-perm` ignores the file-creation mask.** `find.rs:490-498`. POSIX.1-2024 (Defect 1392). Minor.
-- [ ] **FIND-11 — `-newer` reference always follows symlinks.** `find.rs:427-434`. Under `-H`/`-L` with a dangling reference, spec wants the link's mtime; impl errors. Minor.
+- [x] **FIND-10 — symbolic `-perm` ignores the file-creation mask.** `find.rs:490-498`. POSIX.1-2024 (Defect 1392). Minor. ✓ ~~re-examined~~ — already conformant: `parse_mode_value` routes symbolic `-perm` through `plib::modestr::mutate`, which applies the file-creation mask for who-less clauses (`modestr.rs:202-214`). No change needed; the audit over-claimed.
+- [x] **FIND-11 — `-newer` reference always follows symlinks.** `find.rs:427-434`. Under `-H`/`-L` with a dangling reference, spec wants the link's mtime; impl errors. Minor. ✓ fixed in find-D — `-newer` falls back to the link's own timestamp (`symlink_metadata`) when the reference is a dangling symlink.
 
 ### Detailed conformance matrix
 #### Options / operands

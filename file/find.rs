@@ -163,8 +163,10 @@ enum Primary {
     Type(FileTypeMatch),
     Perm(PermMode),
     Links(NumericComparison),
-    User(String),
-    Group(String),
+    // Resolved once at parse time; None means the name resolved to no id (never
+    // matches), preserving the "unknown user/group → no match" behavior.
+    User(Option<u32>),
+    Group(Option<u32>),
     Size {
         cmp: NumericComparison,
         in_bytes: bool,
@@ -444,12 +446,13 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             Ok(Expr::Primary(Primary::Links(cmp)))
         }
         "-user" => {
+            // POSIX: the argument is evaluated only once, so resolve it now.
             let uname = get_arg(tokens, idx, "-user")?;
-            Ok(Expr::Primary(Primary::User(uname.to_string())))
+            Ok(Expr::Primary(Primary::User(resolve_user(uname).ok())))
         }
         "-group" => {
             let gname = get_arg(tokens, idx, "-group")?;
-            Ok(Expr::Primary(Primary::Group(gname.to_string())))
+            Ok(Expr::Primary(Primary::Group(resolve_group(gname).ok())))
         }
         "-size" => {
             let size_str = get_arg(tokens, idx, "-size")?;
@@ -473,8 +476,12 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         "-newer" => {
             let file = get_arg(tokens, idx, "-newer")?;
-            let metadata =
-                fs::metadata(file).map_err(|e| format!("cannot access '{}': {}", file, e))?;
+            // Follow the link to the target; if it is a dangling symlink, fall
+            // back to the link's own timestamp (POSIX: use the link's mtime
+            // when the referenced file does not exist).
+            let metadata = fs::metadata(file)
+                .or_else(|_| fs::symlink_metadata(file))
+                .map_err(|e| format!("cannot access '{}': {}", file, e))?;
             let mtime = metadata
                 .modified()
                 .map_err(|e| format!("cannot get mtime of '{}': {}", file, e))?;
@@ -756,22 +763,8 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             let nlinks = ctx.metadata.nlink() as i64;
             EvalResult::new(cmp.matches(nlinks))
         }
-        Primary::User(uname) => {
-            // Resolve at evaluation time - return false if user doesn't exist
-            let target_uid = match resolve_user(uname) {
-                Ok(uid) => uid,
-                Err(_) => return EvalResult::new(false),
-            };
-            EvalResult::new(ctx.metadata.uid() == target_uid)
-        }
-        Primary::Group(gname) => {
-            // Resolve at evaluation time - return false if group doesn't exist
-            let target_gid = match resolve_group(gname) {
-                Ok(gid) => gid,
-                Err(_) => return EvalResult::new(false),
-            };
-            EvalResult::new(ctx.metadata.gid() == target_gid)
-        }
+        Primary::User(uid) => EvalResult::new(*uid == Some(ctx.metadata.uid())),
+        Primary::Group(gid) => EvalResult::new(*gid == Some(ctx.metadata.gid())),
         Primary::Size { cmp, in_bytes } => {
             let size = if *in_bytes {
                 ctx.metadata.len() as i64
@@ -884,8 +877,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 return EvalResult::new(false);
             }
 
-            let response = response.trim().to_lowercase();
-            if response != "y" && response != "yes" {
+            if !is_affirmative(response.trim_end_matches('\n')) {
                 return EvalResult::new(false);
             }
 
@@ -913,12 +905,38 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
     }
 }
 
-/// Calculate time difference in days (init_time - file_time) / 86400
-fn time_diff_days(init_time: SystemTime, file_time: SystemTime) -> i64 {
-    match init_time.duration_since(file_time) {
-        Ok(d) => (d.as_secs() / 86400) as i64,
-        Err(_) => 0, // File is in the future
+/// Does `response` match the locale's affirmative pattern (`YESEXPR`)? Used by
+/// `-ok` so the accepted answers follow `LC_MESSAGES` rather than hardcoded
+/// English. Falls back to `^[yY]` if the locale pattern is unavailable.
+fn is_affirmative(response: &str) -> bool {
+    use std::ffi::CStr;
+    let pattern = unsafe {
+        let p = libc::nl_langinfo(libc::YESEXPR);
+        if p.is_null() {
+            None
+        } else {
+            CStr::from_ptr(p).to_str().ok().map(str::to_owned)
+        }
+    };
+    let pattern = pattern.filter(|s| !s.is_empty());
+    match pattern {
+        Some(pat) => match plib::regex::Regex::ere(&pat) {
+            Ok(re) => re.is_match(response),
+            Err(_) => response.starts_with(['y', 'Y']),
+        },
+        None => response.starts_with(['y', 'Y']),
     }
+}
+
+/// Calculate time difference in days, (init_time - file_time) / 86400 with the
+/// remainder discarded. A file timestamp in the future yields a negative value
+/// (not clamped to 0), so comparisons like `-mtime -1` behave correctly.
+fn time_diff_days(init_time: SystemTime, file_time: SystemTime) -> i64 {
+    let secs = match init_time.duration_since(file_time) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    secs / 86400
 }
 
 /// Get metadata for a path, following symlinks according to mode

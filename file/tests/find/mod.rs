@@ -2,7 +2,7 @@ use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use plib::testing::{get_binary_path, run_test, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 
 fn run_test_find(
     args: &[&str],
@@ -369,4 +369,40 @@ fn find_name_question_mark() {
     let expect = format!("{ds}/ab");
     run_test_find_sorted(&[ds, "-name", "a?"], &[&expect], "", 0);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// FIND-5: -ok prompts and only runs the utility on an affirmative answer.
+fn run_ok_test(answer: &str, expect_stdout_nonempty: bool) {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let target = format!("{}/tests/find/other/empty_file.txt", project_root);
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("find"),
+            args: vec![
+                target.clone(),
+                String::from("-ok"),
+                String::from("echo"),
+                String::from("{}"),
+                String::from(";"),
+            ],
+            stdin_data: String::from(answer),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.contains(&target), expect_stdout_nonempty);
+        },
+    );
+}
+
+#[test]
+fn find_ok_accepted() {
+    run_ok_test("y\n", true);
+}
+
+#[test]
+fn find_ok_declined() {
+    run_ok_test("n\n", false);
 }

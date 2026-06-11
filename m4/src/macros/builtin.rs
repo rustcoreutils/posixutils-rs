@@ -6,6 +6,7 @@ use std::{io::Write, rc::Rc};
 
 use super::eval::parse_integer;
 use super::{BuiltinMacro, MacroDefinitionImplementation, MacroImplementation};
+use gettextrs::gettext;
 use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
@@ -90,19 +91,18 @@ impl DefineMacro {
             if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
                 name
             } else {
-                state.emit_warning(
-                    stderr,
-                    format_args!(
-                        "invalid macro name `{}' in builtin `define'",
-                        String::from_utf8_lossy(&name_bytes)
-                    ),
-                )?;
+                let msg = gettext("invalid macro name `{}' in builtin `define'").replacen(
+                    "{}",
+                    &String::from_utf8_lossy(&name_bytes),
+                    1,
+                );
+                state.emit_warning(stderr, format_args!("{msg}"))?;
                 return Ok((state, None));
             }
         } else {
             state.emit_warning(
                 stderr,
-                format_args!("too few arguments to builtin `define'"),
+                format_args!("{}", gettext("too few arguments to builtin `define'")),
             )?;
             return Ok((state, None));
         };
@@ -111,7 +111,7 @@ impl DefineMacro {
         } else {
             state.emit_warning(
                 stderr,
-                format_args!("too few arguments to builtin `define'"),
+                format_args!("{}", gettext("too few arguments to builtin `define'")),
             )?;
             return Ok((state, None));
         };
@@ -258,7 +258,10 @@ impl MacroImplementation for DefnMacro {
         let name = match MacroName::try_from_slice(&first_arg) {
             Ok(name) => name,
             Err(_) => {
-                state.emit_warning(stderr, format_args!("invalid macro name in builtin `defn'"))?;
+                state.emit_warning(
+                    stderr,
+                    format_args!("{}", gettext("invalid macro name in builtin `defn'")),
+                )?;
                 return Ok(state);
             }
         };
@@ -359,10 +362,12 @@ impl MacroImplementation for IncludeMacro {
                         &mut *syncline_output.borrow_mut(),
                     )?;
                 }
-                Err(error) => state.emit_error(
-                    stderr,
-                    format_args!("cannot open `{}': {}", path.display(), error),
-                )?,
+                Err(error) => {
+                    let msg = gettext("cannot open `{}': {}")
+                        .replacen("{}", &path.display().to_string(), 1)
+                        .replacen("{}", &error.to_string(), 1);
+                    state.emit_error(stderr, format_args!("{msg}"))?;
+                }
             }
         }
         Ok(state)
@@ -440,7 +445,10 @@ impl MacroImplementation for ChangecomMacro {
         if args_len > 2 {
             state.emit_warning(
                 stderr,
-                format_args!("excess arguments to builtin `changecom' ignored"),
+                format_args!(
+                    "{}",
+                    gettext("excess arguments to builtin `changecom' ignored")
+                ),
             )?;
         }
 
@@ -467,7 +475,10 @@ impl MacroImplementation for ChangequoteMacro {
                 if args_len > 2 {
                     state.emit_warning(
                         stderr,
-                        format_args!("excess arguments to builtin `changequote' ignored"),
+                        format_args!(
+                            "{}",
+                            gettext("excess arguments to builtin `changequote' ignored")
+                        ),
                     )?;
                 }
                 let mut args = frame.args.into_iter();
@@ -508,7 +519,7 @@ impl MacroImplementation for IncrMacro {
                 // expand to nothing, set a non-zero exit status, and continue.
                 _ => state.emit_error(
                     stderr,
-                    format_args!("non-numeric argument to builtin `incr'"),
+                    format_args!("{}", gettext("non-numeric argument to builtin `incr'")),
                 )?,
             }
         }
@@ -535,7 +546,7 @@ impl MacroImplementation for DecrMacro {
                     .pushback_string(number.wrapping_sub(1).to_string().as_bytes()),
                 _ => state.emit_error(
                     stderr,
-                    format_args!("non-numeric argument to builtin `decr'"),
+                    format_args!("{}", gettext("non-numeric argument to builtin `decr'")),
                 )?,
             }
         }
@@ -563,7 +574,7 @@ impl MacroImplementation for IfelseMacro {
         if args_len < 3 {
             state.emit_warning(
                 stderr,
-                format_args!("too few arguments to builtin `ifelse'"),
+                format_args!("{}", gettext("too few arguments to builtin `ifelse'")),
             )?;
             return Ok(state);
         }
@@ -592,7 +603,10 @@ impl MacroImplementation for IfelseMacro {
                         if args_len == 5 {
                             state.emit_warning(
                                 stderr,
-                                format_args!("excess arguments to builtin `ifelse' ignored"),
+                                format_args!(
+                                    "{}",
+                                    gettext("excess arguments to builtin `ifelse' ignored")
+                                ),
                             )?;
                         }
                         return Ok(state);
@@ -692,7 +706,10 @@ impl MacroImplementation for IndexMacro {
         let second_arg = match args.next() {
             Some(second_arg) => second_arg,
             None => {
-                state.emit_warning(stderr, format_args!("too few arguments to builtin `index'"))?;
+                state.emit_warning(
+                    stderr,
+                    format_args!("{}", gettext("too few arguments to builtin `index'")),
+                )?;
                 state.input.pushback_character(b'0');
                 return Ok(state);
             }
@@ -810,7 +827,7 @@ impl MacroImplementation for SubstrMacro {
                 Err(_) => {
                     state.emit_error(
                         stderr,
-                        format_args!("non-numeric argument to builtin `substr'"),
+                        format_args!("{}", gettext("non-numeric argument to builtin `substr'")),
                     )?;
                     return Ok(state);
                 }
@@ -836,7 +853,7 @@ impl MacroImplementation for SubstrMacro {
                 Err(_) => {
                     state.emit_error(
                         stderr,
-                        format_args!("non-numeric argument to builtin `substr'"),
+                        format_args!("{}", gettext("non-numeric argument to builtin `substr'")),
                     )?;
                     return Ok(state);
                 }
@@ -888,7 +905,7 @@ impl MacroImplementation for DumpdefMacro {
                 Err(_) => {
                     state.emit_warning(
                         stderr,
-                        format_args!("invalid macro name in builtin `dumpdef'"),
+                        format_args!("{}", gettext("invalid macro name in builtin `dumpdef'")),
                     )?;
                     continue;
                 }
@@ -904,7 +921,10 @@ impl MacroImplementation for DumpdefMacro {
                     )?;
                     stderr.write_all(b"\n")?;
                 }
-                None => state.emit_warning(stderr, format_args!("undefined macro `{name}'"))?,
+                None => {
+                    let msg = gettext("undefined macro `{}'").replacen("{}", &name.to_string(), 1);
+                    state.emit_warning(stderr, format_args!("{msg}"))?;
+                }
             }
         }
 
@@ -986,7 +1006,12 @@ impl MacroImplementation for MkstempMacro {
         match mkstemp(first_arg) {
             Ok(pathname) => state.input.pushback_string(&pathname),
             Err(error) => {
-                write!(stderr, "Error evaluating `mkstemp` macro: {}", error)?;
+                let msg = gettext("Error evaluating `mkstemp` macro: {}").replacen(
+                    "{}",
+                    &error.to_string(),
+                    1,
+                );
+                write!(stderr, "{msg}")?;
                 state.exit_error = true;
             }
         }
@@ -1016,7 +1041,7 @@ impl MacroImplementation for M4exitMacro {
                 Err(_) => {
                     state.emit_error(
                         stderr,
-                        format_args!("non-numeric argument to builtin `m4exit'"),
+                        format_args!("{}", gettext("non-numeric argument to builtin `m4exit'")),
                     )?;
                     return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
                 }
@@ -1107,7 +1132,8 @@ impl MacroImplementation for SysvalMacro {
                 Some(code) => state.input.pushback_string(code.to_string().as_bytes()),
                 None => write!(
                     stderr,
-                    "Last syscmd exited without exit code (process terminated by signal)"
+                    "{}",
+                    gettext("Last syscmd exited without exit code (process terminated by signal)")
                 )?,
             }
         }
@@ -1140,7 +1166,7 @@ impl MacroImplementation for DivertMacro {
                     Err(_) => {
                         state.emit_error(
                             stderr,
-                            format_args!("non-numeric argument to builtin `divert'"),
+                            format_args!("{}", gettext("non-numeric argument to builtin `divert'")),
                         )?;
                         return Ok(state);
                     }
@@ -1149,7 +1175,10 @@ impl MacroImplementation for DivertMacro {
             Some(_) => {
                 state.emit_warning(
                     stderr,
-                    format_args!("empty first argument to builtin `divert' treated as 0"),
+                    format_args!(
+                        "{}",
+                        gettext("empty first argument to builtin `divert' treated as 0")
+                    ),
                 )?;
                 0
             }
@@ -1213,17 +1242,16 @@ impl MacroImplementation for UndivertMacro {
             match nom::combinator::all_consuming(parse_index)(&arg) {
                 Ok((_, buffer_number)) => match DivertBufferNumber::try_from(buffer_number) {
                     Ok(n) => state.output.output.undivert(n)?,
-                    Err(_) => state.emit_warning(
-                        stderr,
-                        format_args!(
-                            "invalid diversion number {buffer_number} in builtin `undivert'"
-                        ),
-                    )?,
+                    Err(_) => {
+                        let msg = gettext("invalid diversion number {} in builtin `undivert'")
+                            .replacen("{}", &buffer_number.to_string(), 1);
+                        state.emit_warning(stderr, format_args!("{msg}"))?;
+                    }
                 },
                 // GNU m4: a non-numeric argument is a recoverable error.
                 Err(_) => state.emit_warning(
                     stderr,
-                    format_args!("non-numeric argument to builtin `undivert'"),
+                    format_args!("{}", gettext("non-numeric argument to builtin `undivert'")),
                 )?,
             }
         }

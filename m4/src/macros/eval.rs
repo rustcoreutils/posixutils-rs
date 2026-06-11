@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use gettextrs::gettext;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
@@ -43,13 +44,12 @@ impl MacroImplementation for EvalMacro {
             // zero, etc.) as a recoverable error: emit a diagnostic, expand to
             // the empty string, set a non-zero exit status, and keep going.
             Err(_) => {
-                state.emit_error(
-                    stderr,
-                    format_args!(
-                        "bad expression in eval: {}",
-                        String::from_utf8_lossy(&first_arg)
-                    ),
-                )?;
+                let msg = gettext("bad expression in eval: {}").replacen(
+                    "{}",
+                    &String::from_utf8_lossy(&first_arg),
+                    1,
+                );
+                state.emit_error(stderr, format_args!("{msg}"))?;
                 return Ok(state);
             }
         };
@@ -62,7 +62,10 @@ impl MacroImplementation for EvalMacro {
             _ => {
                 state.emit_error(
                     stderr,
-                    format_args!("radix out of range (2-36) or non-numeric in eval"),
+                    format_args!(
+                        "{}",
+                        gettext("radix out of range (2-36) or non-numeric in eval")
+                    ),
                 )?;
                 return Ok(state);
             }
@@ -73,7 +76,7 @@ impl MacroImplementation for EvalMacro {
             _ => {
                 state.emit_error(
                     stderr,
-                    format_args!("negative width or non-numeric in eval"),
+                    format_args!("{}", gettext("negative width or non-numeric in eval")),
                 )?;
                 return Ok(state);
             }

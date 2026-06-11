@@ -1,4 +1,5 @@
 use error::{Error, ErrorKind, Result};
+use gettextrs::gettext;
 use input::{Input, InputRead};
 use lexer::MacroName;
 use macros::MacroDefinition;
@@ -80,14 +81,18 @@ impl Args {
             .arg(
                 clap::Arg::new("line_synchronization")
                     .short('s')
-                    .help("Output line synchronization directives, suitable for cpp")
+                    .help(gettext(
+                        "Output line synchronization directives, suitable for cpp",
+                    ))
                     .action(clap::ArgAction::SetTrue),
             )
             .arg(
                 clap::Arg::new("define")
                     .short('D')
                     .value_name("name[=value]")
-                    .help("Define the symbol name to have some value (or NULL)")
+                    .help(gettext(
+                        "Define the symbol name to have some value (or NULL)",
+                    ))
                     .num_args(1)
                     .action(clap::ArgAction::Append),
             )
@@ -95,6 +100,7 @@ impl Args {
                 clap::Arg::new("undefine")
                     .short('U')
                     .value_name("name")
+                    .help(gettext("Undefine the symbol name"))
                     .num_args(1)
                     .action(clap::ArgAction::Append),
             )
@@ -207,7 +213,10 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                         // An unreadable file operand is a recoverable error (GNU
                         // m4): diagnose, flag failure, and continue.
                         Err(error) => {
-                            writeln!(stderr, "m4: cannot open `{}': {}", path.display(), error)?;
+                            let msg = gettext("cannot open `{}': {}")
+                                .replacen("{}", &path.display().to_string(), 1)
+                                .replacen("{}", &error.to_string(), 1);
+                            writeln!(stderr, "m4: {msg}")?;
                             state.exit_error = true;
                         }
                     }

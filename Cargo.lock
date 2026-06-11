@@ -1759,6 +1759,7 @@ dependencies = [
  "clap",
  "env_logger",
  "errno",
+ "gettext-rs",
  "libc",
  "log",
  "nom",

@@ -23,7 +23,7 @@ struct Args {
     #[arg(short, long, help = gettext("Ignore the SIGINT signal"))]
     ignore: bool,
 
-    #[arg(short, long, help = gettext("One or more output files"))]
+    #[arg(help = gettext("One or more output files"))]
     files: Vec<String>,
 }
 
@@ -79,6 +79,14 @@ fn tee_stdin(info: &mut TeeInfo) -> io::Result<()> {
         }
 
         let bufslice = &buffer[0..n_read];
+
+        // tee copies standard input to standard output, in addition to each
+        // named file (POSIX: "The standard output shall be a copy of the
+        // standard input.").
+        if let Err(e) = io::stdout().write_all(bufslice) {
+            eprintln!("stdout: {}", e);
+            return Err(e);
+        }
 
         for output in &mut info.outputs {
             let res = output.f.write_all(bufslice);

@@ -437,8 +437,8 @@ error instead of continuing and flagging. `-a` and `-i` are correct.
 ### Priority issues
 
 #### Critical
-- [ ] **TEE-1 — stdin is never copied to stdout.** `tee.rs:67-93`. `tee_stdin` writes each chunk to the output files only; there is no `io::stdout().write_all`. Verified: `printf 'hello' | tee -f F >out` leaves `out` empty. Spec STDOUT §116919: "The standard output shall be a copy of the standard input." DIVERGES. Fix: write each buffer to stdout (unbuffered) in addition to the files.
-- [ ] **TEE-2 — file operands are rejected.** `tee.rs:26-27`. `files: Vec<String>` carries `#[arg(short, long)]`, making it `-f/--files`; positional `tee FILE` → "unexpected argument". Verified. Spec SYNOPSIS `tee [-ai] [file...]` — `file` is a positional operand. DIVERGES. Fix: drop `short, long` so `files` is positional (`-` stays a literal filename per §116896).
+- [x] **TEE-1 — stdin is never copied to stdout.** `tee.rs:67-93`. `tee_stdin` writes each chunk to the output files only; there is no `io::stdout().write_all`. Verified: `printf 'hello' | tee -f F >out` leaves `out` empty. Spec STDOUT §116919: "The standard output shall be a copy of the standard input." DIVERGES. Fix: write each buffer to stdout (unbuffered) in addition to the files. ✓ fixed in tee-A.
+- [x] **TEE-2 — file operands are rejected.** `tee.rs:26-27`. `files: Vec<String>` carries `#[arg(short, long)]`, making it `-f/--files`; positional `tee FILE` → "unexpected argument". Verified. Spec SYNOPSIS `tee [-ai] [file...]` — `file` is a positional operand. DIVERGES. Fix: drop `short, long` so `files` is positional (`-` stays a literal filename per §116896). ✓ fixed in tee-A.
 
 #### Major
 - [ ] **TEE-3 — aborts on the first write error.** `tee.rs:83-89`. Returns `Err` immediately. Spec CONSEQUENCES OF ERRORS §116931: a failed write to one file must not stop writes to the others or to stdout; only the exit status becomes non-zero. DIVERGES. Fix: record the error, continue, exit non-zero at the end.

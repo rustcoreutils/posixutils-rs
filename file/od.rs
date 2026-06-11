@@ -107,67 +107,26 @@ impl Args {
             return Err("Options '-A', '-j', '-N', '-t', '-v' cannot be used together with offset syntax '[+]offset[.][b]'".to_string());
         }
 
-        // '-b', '-c', '-d', '-o', '-s', '-x' should not be used with '-t' options
-        if !self.type_strings.is_empty()
-            && (self.octal_bytes
-                || self.bytes_char
-                || self.unsigned_decimal_words
-                || self.octal_words
-                || self.signed_decimal_words
-                || self.hex_words)
-        {
-            return Err(
-                "Options '-b', '-c', '-d', '-o', '-s', '-x' cannot be used together with '-t'"
-                    .to_string(),
-            );
-        }
-
+        // The short type options -b/-c/-d/-o/-s/-x are shorthands for -t types
+        // and may be combined (with each other and with -t); the requested
+        // types accumulate. (-c ≡ -t c: C-style escapes, not named characters.)
         if self.octal_bytes {
-            self.type_strings = vec!["o1".to_string()];
+            self.type_strings.push("o1".to_string());
         }
         if self.bytes_char {
-            // -c is equivalent to -t c: bytes interpreted as characters, with
-            // C-style escapes (\0, \t, \n, ...) — not named characters.
-            self.type_strings = vec!["c".to_string()];
+            self.type_strings.push("c".to_string());
         }
         if self.unsigned_decimal_words {
-            self.type_strings = vec!["u2".to_string()];
+            self.type_strings.push("u2".to_string());
         }
         if self.octal_words {
-            self.type_strings = vec!["o2".to_string()];
+            self.type_strings.push("o2".to_string());
         }
         if self.signed_decimal_words {
-            self.type_strings = vec!["d2".to_string()];
+            self.type_strings.push("d2".to_string());
         }
         if self.hex_words {
-            self.type_strings = vec!["x2".to_string()];
-        }
-
-        // Check if multiple mutually exclusive options are used together
-        let mut basic_types = 0;
-        if self.octal_bytes {
-            basic_types += 1;
-        }
-        if self.bytes_char {
-            basic_types += 1;
-        }
-        if self.unsigned_decimal_words {
-            basic_types += 1;
-        }
-        if self.octal_words {
-            basic_types += 1;
-        }
-        if self.signed_decimal_words {
-            basic_types += 1;
-        }
-        if self.hex_words {
-            basic_types += 1;
-        }
-
-        if basic_types > 1 {
-            return Err(
-                "Options '-b', '-c', '-d', '-o', '-s', '-x' cannot be used together".to_string(),
-            );
+            self.type_strings.push("x2".to_string());
         }
 
         Ok(())
@@ -421,11 +380,12 @@ fn print_data<R: Read>(
                 // Determine the number of bytes to read for this type.
                 let mut chars = type_string.chars();
                 let type_char = chars.next().unwrap();
-                let num_bytes: usize = chars.as_str().parse().unwrap_or(match type_char {
+                let default_bytes = match type_char {
                     'd' | 'u' | 'o' | 'x' => 2, // Default to 2 bytes for integers
                     'f' => 4,                   // Default to 4 bytes for floats
                     _ => 1,                     // Default to 1 byte for unknown types
-                });
+                };
+                let num_bytes = parse_type_bytes(chars.as_str(), default_bytes);
 
                 let chunks = local_buf.chunks(num_bytes);
                 match type_char {
@@ -924,8 +884,24 @@ struct AFormatter;
 struct CFormatter;
 struct DefaultFormatter;
 
+/// Parse the size suffix of a `-t` integer/float type: a `C`/`S`/`I`/`L`
+/// letter (char/short/int/long) or an explicit byte count, defaulting when
+/// absent or unrecognized.
+fn parse_type_bytes(size_str: &str, default_bytes: usize) -> usize {
+    match size_str {
+        "" => default_bytes,
+        "C" => 1,
+        "S" => 2,
+        "I" => 4,
+        "L" => 8,
+        s => s.parse().unwrap_or(default_bytes),
+    }
+}
+
 impl Formatter for AFormatter {
     fn format_value(&self, byte: u8) -> String {
+        // Named-character output uses only the least significant seven bits.
+        let byte = byte & 0x7F;
         if let Some(name) = get_named_char(byte) {
             format!(" {name: >3}")
         } else if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {

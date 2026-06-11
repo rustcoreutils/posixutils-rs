@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_u8, TestPlan, TestPlanU8};
 
 fn od_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -324,4 +324,33 @@ fn test_od_c_equals_t_c() {
     let data = "A\tB\0";
     od_test(&["-c", "-An"], data, "   A  \\t   B  \\0\n");
     od_test(&["-t", "c", "-An"], data, "   A  \\t   B  \\0\n");
+}
+
+// OD-2: multiple short type options accumulate (one line per type).
+#[test]
+fn test_od_multiple_short_types() {
+    od_test(&["-An", "-b", "-c"], "AB", " 101 102\n   A   B\n");
+}
+
+// OD-4: C/S/I/L type size suffixes.
+#[test]
+fn test_od_type_size_long() {
+    od_test(
+        &["-An", "-t", "dL"],
+        "\x01\x00\x00\x00\x00\x00\x00\x00",
+        "                    1\n",
+    );
+}
+
+// OD-3: -t a uses only the least-significant seven bits (0x8A & 0x7F == 0x0A).
+#[test]
+fn test_od_named_char_seven_bit() {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("od"),
+        args: vec![String::from("-An"), String::from("-t"), String::from("a")],
+        stdin_data: vec![0x8a],
+        expected_out: b"  nl\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
 }

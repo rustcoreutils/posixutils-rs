@@ -1,0 +1,4 @@
+stdout=\nThis is from file 1\n
+stderr=m4: cannot open
+status=1
+expect_error=true

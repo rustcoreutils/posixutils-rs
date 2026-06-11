@@ -1,3 +1,3 @@
 stdout=hello\n
-stderr=
+stderr=m4:stdin:1: Warning: invalid macro name `hello world' in builtin `define'\n
 status=0

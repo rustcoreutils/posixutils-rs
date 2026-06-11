@@ -61,7 +61,7 @@ pub struct DefineMacro;
 impl DefineMacro {
     fn define(
         state: State,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<(State, Option<MacroDefinition>)> {
         let mut args = frame.args.into_iter();
@@ -69,20 +69,29 @@ impl DefineMacro {
             if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
                 name
             } else {
-                log::warn!(
-                    "Invalid macro name {:?}, skipping definition",
-                    String::from_utf8_lossy(&name_bytes)
-                );
+                state.emit_warning(
+                    stderr,
+                    format_args!(
+                        "invalid macro name `{}' in builtin `define'",
+                        String::from_utf8_lossy(&name_bytes)
+                    ),
+                )?;
                 return Ok((state, None));
             }
         } else {
-            log::warn!("No macro name specified, skipping definition");
+            state.emit_warning(
+                stderr,
+                format_args!("too few arguments to builtin `define'"),
+            )?;
             return Ok((state, None));
         };
         let definition = if let Some(definition) = args.next() {
             definition
         } else {
-            log::warn!("No macro definition provided, skipping definition");
+            state.emit_warning(
+                stderr,
+                format_args!("too few arguments to builtin `define'"),
+            )?;
             return Ok((state, None));
         };
         log::debug!(
@@ -219,16 +228,20 @@ impl MacroImplementation for UndefineMacro {
 pub struct DefnMacro;
 
 impl MacroImplementation for DefnMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let first_arg = frame
             .args
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        if let Some(definitions) = state
-            .macro_definitions
-            .get(&MacroName::try_from_slice(&first_arg)?)
-        {
+        let name = match MacroName::try_from_slice(&first_arg) {
+            Ok(name) => name,
+            Err(_) => {
+                state.emit_warning(stderr, format_args!("invalid macro name in builtin `defn'"))?;
+                return Ok(state);
+            }
+        };
+        if let Some(definitions) = state.macro_definitions.get(&name) {
             let definition = definitions
                 .last()
                 .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
@@ -308,13 +321,28 @@ impl MacroImplementation for IncludeMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         let path;
         (path, state) = Self::get_file_path(frame, state)?;
         if let Some(path) = path {
-            state = Self::include_impl(path, state)?;
+            // POSIX: "It shall be an error if the file cannot be read." GNU m4
+            // diagnoses and continues with a non-zero exit status rather than
+            // aborting.
+            match std::fs::File::open(&path) {
+                Ok(file) => {
+                    let syncline_output = state.output.output.stdout();
+                    state.input.input_push(
+                        Input::new(InputRead::File { file, path }),
+                        &mut *syncline_output.borrow_mut(),
+                    )?;
+                }
+                Err(error) => state.emit_error(
+                    stderr,
+                    format_args!("cannot open `{}': {}", path.display(), error),
+                )?,
+            }
         }
         Ok(state)
     }
@@ -384,7 +412,10 @@ impl MacroImplementation for ChangecomMacro {
         }
 
         if args_len > 2 {
-            stderr.write_all(b"Warning: excess arguments to builtin `changecom' ignored")?;
+            state.emit_warning(
+                stderr,
+                format_args!("excess arguments to builtin `changecom' ignored"),
+            )?;
         }
 
         Ok(state)
@@ -408,8 +439,10 @@ impl MacroImplementation for ChangequoteMacro {
             1 => {}
             args_len @ 2.. => {
                 if args_len > 2 {
-                    stderr
-                        .write_all(b"Warning: excess arguments to builtin `changequote' ignored")?;
+                    state.emit_warning(
+                        stderr,
+                        format_args!("excess arguments to builtin `changequote' ignored"),
+                    )?;
                 }
                 let mut args = frame.args.into_iter();
                 let open_tag = args.next().expect("2 arguments should be present");
@@ -434,18 +467,24 @@ impl MacroImplementation for ChangequoteMacro {
 pub struct IncrMacro;
 
 impl MacroImplementation for IncrMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         if let Some(first) = frame.args.into_iter().next() {
-            let (remaining, mut number) = super::eval::padded(super::eval::parse_integer)(&first)?;
-            if !remaining.is_empty() {
-                return Err(
-                    crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-                        "Error parsing number from {first:?}, remaining input: {remaining:?}"
-                    )),
-                );
+            match super::eval::padded(super::eval::parse_integer)(&first) {
+                Ok((b"", number)) => state
+                    .input
+                    .pushback_string(number.wrapping_add(1).to_string().as_bytes()),
+                // A non-numeric argument is a recoverable error (GNU m4): warn,
+                // expand to nothing, set a non-zero exit status, and continue.
+                _ => state.emit_error(
+                    stderr,
+                    format_args!("non-numeric argument to builtin `incr'"),
+                )?,
             }
-            number += 1;
-            state.input.pushback_string(number.to_string().as_bytes());
         }
         Ok(state)
     }
@@ -457,18 +496,22 @@ impl MacroImplementation for IncrMacro {
 pub struct DecrMacro;
 
 impl MacroImplementation for DecrMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         if let Some(first) = frame.args.into_iter().next() {
-            let (remaining, mut number) = super::eval::padded(super::eval::parse_integer)(&first)?;
-            if !remaining.is_empty() {
-                return Err(
-                    crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-                        "Error parsing number from {first:?}, remaining input: {remaining:?}"
-                    )),
-                );
+            match super::eval::padded(super::eval::parse_integer)(&first) {
+                Ok((b"", number)) => state
+                    .input
+                    .pushback_string(number.wrapping_sub(1).to_string().as_bytes()),
+                _ => state.emit_error(
+                    stderr,
+                    format_args!("non-numeric argument to builtin `decr'"),
+                )?,
             }
-            number -= 1;
-            state.input.pushback_string(number.to_string().as_bytes());
         }
         Ok(state)
     }
@@ -492,7 +535,10 @@ impl MacroImplementation for IfelseMacro {
     fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args_len = frame.args.len();
         if args_len < 3 {
-            write!(stderr, "Too few arguments to builtin `ifelse'")?;
+            state.emit_warning(
+                stderr,
+                format_args!("too few arguments to builtin `ifelse'"),
+            )?;
             return Ok(state);
         }
 
@@ -518,10 +564,9 @@ impl MacroImplementation for IfelseMacro {
                         let arg = args.next().expect("at least 4 args");
                         state.input.pushback_string(&arg);
                         if args_len == 5 {
-                            write!(
+                            state.emit_warning(
                                 stderr,
-                                "Excess argument {:?} to builtin `ifelse' will be ignored",
-                                args.next().expect("5 arguments")
+                                format_args!("excess arguments to builtin `ifelse' ignored"),
                             )?;
                         }
                         return Ok(state);
@@ -621,7 +666,7 @@ impl MacroImplementation for IndexMacro {
         let second_arg = match args.next() {
             Some(second_arg) => second_arg,
             None => {
-                stderr.write_all(b"Warning too few arguments for index macro")?;
+                state.emit_warning(stderr, format_args!("too few arguments to builtin `index'"))?;
                 state.input.pushback_character(b'0');
                 return Ok(state);
             }
@@ -711,7 +756,12 @@ impl MacroImplementation for TranslitMacro {
 pub struct SubstrMacro;
 
 impl MacroImplementation for SubstrMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -721,28 +771,43 @@ impl MacroImplementation for SubstrMacro {
             return Ok(state);
         }
 
-        let start_index = if let Some(second_arg) = args.next() {
-            let (_, i) = nom::combinator::all_consuming(parse_index)(&second_arg)?;
-            i
-        } else {
-            0
+        let start_index = match args.next() {
+            Some(second_arg) => match nom::combinator::all_consuming(parse_index)(&second_arg) {
+                Ok((_, i)) => i,
+                Err(_) => {
+                    state.emit_error(
+                        stderr,
+                        format_args!("non-numeric argument to builtin `substr'"),
+                    )?;
+                    return Ok(state);
+                }
+            },
+            None => 0,
         };
 
         if start_index > (first_arg.len() - 1) {
             return Ok(state);
         }
 
-        let out = if let Some(third_arg) = args.next() {
-            let (_, number_of_chars) = nom::combinator::all_consuming(parse_index)(&third_arg)?;
-
-            if number_of_chars > 0 {
-                let end_index = usize::min(start_index + number_of_chars, first_arg.len());
-                &first_arg[start_index..end_index]
-            } else {
-                return Ok(state);
-            }
-        } else {
-            &first_arg[start_index..]
+        let out = match args.next() {
+            Some(third_arg) => match nom::combinator::all_consuming(parse_index)(&third_arg) {
+                Ok((_, number_of_chars)) => {
+                    if number_of_chars > 0 {
+                        let end_index = usize::min(start_index + number_of_chars, first_arg.len());
+                        &first_arg[start_index..end_index]
+                    } else {
+                        return Ok(state);
+                    }
+                }
+                Err(_) => {
+                    state.emit_error(
+                        stderr,
+                        format_args!("non-numeric argument to builtin `substr'"),
+                    )?;
+                    return Ok(state);
+                }
+            },
+            None => &first_arg[start_index..],
         };
 
         state.input.pushback_string(out);
@@ -784,18 +849,29 @@ impl MacroImplementation for DumpdefMacro {
         }
 
         for arg in frame.args.into_iter() {
-            let name = MacroName::try_from_slice(&arg)?;
+            let name = match MacroName::try_from_slice(&arg) {
+                Ok(name) => name,
+                Err(_) => {
+                    state.emit_warning(
+                        stderr,
+                        format_args!("invalid macro name in builtin `dumpdef'"),
+                    )?;
+                    continue;
+                }
+            };
             match state.macro_definitions.get(&name) {
-                Some(definition) => dumpdef(
-                    stderr,
-                    &name,
-                    definition
-                        .last()
-                        .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
-                )?,
-                None => write!(stderr, "undefined macro {name}")?,
+                Some(definition) => {
+                    dumpdef(
+                        stderr,
+                        &name,
+                        definition
+                            .last()
+                            .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
+                    )?;
+                    stderr.write_all(b"\n")?;
+                }
+                None => state.emit_warning(stderr, format_args!("undefined macro `{name}'"))?,
             }
-            stderr.write_all(b"\n")?;
         }
 
         Ok(state)
@@ -892,12 +968,25 @@ impl MacroImplementation for MkstempMacro {
 pub struct M4exitMacro;
 
 impl MacroImplementation for M4exitMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         if let Some(first_arg) = frame.args.into_iter().next() {
-            let (_, exit_code) = nom::combinator::all_consuming(parse_index)(&first_arg)?;
-            let exit_code: i32 = i32::try_from(exit_code).map_err(|e| {
-                crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string())
-            })?;
+            let exit_code: i32 = match nom::combinator::all_consuming(parse_index)(&first_arg) {
+                Ok((_, code)) => i32::try_from(code).unwrap_or(1),
+                // GNU m4: a non-numeric argument is a recoverable error, but m4
+                // still exits (with a failure status).
+                Err(_) => {
+                    state.emit_error(
+                        stderr,
+                        format_args!("non-numeric argument to builtin `m4exit'"),
+                    )?;
+                    return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
+                }
+            };
             if exit_code == 0 && state.exit_error {
                 return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
             } else {
@@ -1008,24 +1097,29 @@ impl MacroImplementation for DivertMacro {
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        let divert_number = if let Some(first_arg) = frame.args.into_iter().next() {
-            if first_arg.is_empty() {
-                write!(
+        let divert_number = match frame.args.into_iter().next() {
+            Some(first_arg) if !first_arg.is_empty() => {
+                match nom::combinator::all_consuming(parse_integer)(&first_arg) {
+                    Ok((_, divert_number)) => divert_number,
+                    // GNU m4: a non-numeric argument is a recoverable error; the
+                    // current diversion is left unchanged.
+                    Err(_) => {
+                        state.emit_error(
+                            stderr,
+                            format_args!("non-numeric argument to builtin `divert'"),
+                        )?;
+                        return Ok(state);
+                    }
+                }
+            }
+            Some(_) => {
+                state.emit_warning(
                     stderr,
-                    "WARNING: treating empty first argument of `divert` macro as 0"
+                    format_args!("empty first argument to builtin `divert' treated as 0"),
                 )?;
                 0
-            } else {
-                let (_, divert_number) = nom::combinator::all_consuming(parse_integer)(&first_arg)?;
-                if divert_number > 9 {
-                    return Err(crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-                        "Error parsing first argument for `divert` macro with value {divert_number}, should be between 0 and 9"
-                    )));
-                }
-                divert_number
             }
-        } else {
-            0
+            None => 0,
         };
         state.output.output.divert(divert_number)?;
         Ok(state)
@@ -1075,25 +1169,29 @@ impl MacroImplementation for UndivertMacro {
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        let undivert_buffers: Vec<DivertBufferNumber> = if frame.args.is_empty() {
-            (1..=9)
-                .map(DivertBufferNumber::try_from)
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            let mut undivert_buffers: Vec<DivertBufferNumber> = Vec::new();
-            for arg in frame.args.into_iter() {
-                let (_, buffer_number) = nom::combinator::all_consuming(parse_index)(&arg)?;
-                match DivertBufferNumber::try_from(buffer_number) {
-                    Ok(n) => undivert_buffers.push(n),
-                    Err(error) => write!(stderr, "WARNING: {error}")?,
-                }
+        // No arguments: flush every diversion buffer in numerical order.
+        if frame.args.is_empty() {
+            state.output.output.undivert_all()?;
+            return Ok(state);
+        }
+
+        for arg in frame.args.into_iter() {
+            match nom::combinator::all_consuming(parse_index)(&arg) {
+                Ok((_, buffer_number)) => match DivertBufferNumber::try_from(buffer_number) {
+                    Ok(n) => state.output.output.undivert(n)?,
+                    Err(_) => state.emit_warning(
+                        stderr,
+                        format_args!(
+                            "invalid diversion number {buffer_number} in builtin `undivert'"
+                        ),
+                    )?,
+                },
+                // GNU m4: a non-numeric argument is a recoverable error.
+                Err(_) => state.emit_warning(
+                    stderr,
+                    format_args!("non-numeric argument to builtin `undivert'"),
+                )?,
             }
-
-            undivert_buffers
-        };
-
-        for buffer_number in undivert_buffers {
-            state.output.output.undivert(buffer_number)?;
         }
         Ok(state)
     }

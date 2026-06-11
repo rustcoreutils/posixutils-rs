@@ -70,6 +70,23 @@ impl State {
             .cloned())
     }
 
+    /// Emit a non-fatal warning to stderr in the GNU `m4:<file>:<line>: Warning:`
+    /// form. Warnings do not affect the exit status (see [`State::emit_error`]).
+    pub fn emit_warning(
+        &self,
+        stderr: &mut dyn Write,
+        args: std::fmt::Arguments<'_>,
+    ) -> std::io::Result<()> {
+        let (name, line) = self.input.current_location();
+        writeln!(
+            stderr,
+            "m4:{}:{}: Warning: {}",
+            String::from_utf8_lossy(&name),
+            line,
+            args
+        )
+    }
+
     /// Emit a recoverable error diagnostic to stderr (GNU `m4:<file>:<line>:`
     /// form) and flag the run so its final exit status is non-zero, without
     /// aborting further processing.

@@ -166,13 +166,27 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         )?;
     } else {
         for file_path in args.files {
-            state.input.input_push(
-                Input::new(InputRead::File {
-                    file: std::fs::File::open(&file_path)?,
-                    path: file_path,
-                }),
-                &mut *stdout.borrow_mut(),
-            )?;
+            // An unreadable file operand is a recoverable error (GNU m4):
+            // diagnose it, set a non-zero exit status, and continue with the
+            // remaining operands rather than aborting.
+            match std::fs::File::open(&file_path) {
+                Ok(file) => state.input.input_push(
+                    Input::new(InputRead::File {
+                        file,
+                        path: file_path,
+                    }),
+                    &mut *stdout.borrow_mut(),
+                )?,
+                Err(error) => {
+                    writeln!(
+                        stderr,
+                        "m4: cannot open `{}': {}",
+                        file_path.display(),
+                        error
+                    )?;
+                    state.exit_error = true;
+                }
+            }
         }
     };
 
@@ -194,12 +208,18 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         }
     }
 
-    let state = main_loop::main_loop(state, &mut stderr)?;
+    // If every file operand failed to open there is nothing to process (and the
+    // main loop requires at least one input); skip it but still report failure.
+    let exit_error = if state.input.input_len() > 0 {
+        main_loop::main_loop(state, &mut stderr)?.exit_error
+    } else {
+        state.exit_error
+    };
 
     // A recoverable error (a diagnostic emitted via State::emit_error, e.g. a
-    // bad eval expression) leaves processing intact but must still yield a
-    // non-zero exit status.
-    if state.exit_error {
+    // bad eval expression, or an unreadable file operand) leaves processing
+    // intact but must still yield a non-zero exit status.
+    if exit_error {
         return Err(Error::new(ErrorKind::Exit(1)));
     }
 

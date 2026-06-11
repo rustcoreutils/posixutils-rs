@@ -1,6 +1,7 @@
 use crate::{error::Result, input::InputStateRef, state::StackFrame};
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     io::{Seek, Write},
     rc::Rc,
 };
@@ -113,11 +114,14 @@ impl Write for OutputRef {
 /// NOTE: This currently uses an in-memory set of divert buffers, other implementations use
 /// temporary files, so this might change in the future, or become an optional feature.
 pub struct Output {
-    /// Divert buffers 1 through to 9. See [`DivertMacro`].
+    /// Diversion buffers, created on demand and keyed by a positive diversion
+    /// number. POSIX mandates buffers 1–9; larger numbers are
+    /// implementation-defined and supported here (matching GNU m4). The
+    /// [`BTreeMap`] keeps `undivert`-all in numerical order.
     ///
     /// NOTE: [`Rc`] and [`RefCell`] required because buffers can be diverted into each other via
     /// [`Output`].
-    divert_buffers: [Rc<RefCell<DivertableBuffer>>; 9],
+    divert_buffers: BTreeMap<usize, Rc<RefCell<DivertableBuffer>>>,
     /// See [`DivertMacro`].
     divert_number: i64,
     /// The real output, usually [`std::io::stdout`].
@@ -128,7 +132,7 @@ pub struct Output {
 impl Default for Output {
     fn default() -> Self {
         Self {
-            divert_buffers: Default::default(),
+            divert_buffers: BTreeMap::new(),
             divert_number: Default::default(),
             stdout: Rc::new(RefCell::new(std::io::stdout())),
             input: InputStateRef::default(),
@@ -141,7 +145,7 @@ impl Output {
         Self {
             stdout,
             input,
-            divert_buffers: Default::default(),
+            divert_buffers: BTreeMap::new(),
             divert_number: Default::default(),
         }
     }
@@ -159,22 +163,23 @@ impl Output {
     }
 
     pub fn divert_buffer_number(&self) -> Option<DivertBufferNumber> {
-        DivertBufferNumber::try_from(usize::try_from(self.divert_number).ok()?).ok()
+        usize::try_from(self.divert_number)
+            .ok()
+            .filter(|n| *n >= 1)
+            .map(DivertBufferNumber)
     }
 
     pub fn divert(&mut self, divert_number: i64) -> Result<()> {
-        if divert_number > 9 {
-            return Err(crate::error::Error::new(
-                crate::ErrorKind::InvalidDivertNumber(divert_number),
-            ));
-        }
+        // Any positive buffer number is accepted (POSIX requires 1–9 and leaves
+        // larger numbers implementation-defined; GNU m4 supports them).
         self.divert_number = divert_number;
         Ok(())
     }
 
     pub fn undivert_all(&mut self) -> Result<()> {
-        for buffer_number in (1..=self.divert_buffers.len()).map(DivertBufferNumber::try_from) {
-            self.undivert(buffer_number?)?;
+        let buffer_numbers: Vec<usize> = self.divert_buffers.keys().copied().collect();
+        for n in buffer_numbers {
+            self.undivert(DivertBufferNumber(n))?;
         }
         Ok(())
     }
@@ -185,7 +190,11 @@ impl Output {
             log::warn!("Skipping recursive divert");
             return Ok(());
         }
-        let buffer = self.divert_buffers[buffer_number.index()].clone();
+        let buffer = match self.divert_buffers.get(&buffer_number.0) {
+            Some(buffer) => buffer.clone(),
+            // Nothing was ever diverted to this buffer.
+            None => return Ok(()),
+        };
         let mut buffer = buffer.borrow_mut();
         buffer.0.rewind()?;
         let n = std::io::copy(&mut buffer.0, self)?;
@@ -199,12 +208,6 @@ impl Output {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct DivertBufferNumber(usize);
 
-impl DivertBufferNumber {
-    fn index(&self) -> usize {
-        self.0 - 1
-    }
-}
-
 impl std::fmt::Display for DivertBufferNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -215,10 +218,12 @@ impl TryFrom<usize> for DivertBufferNumber {
     type Error = crate::Error;
 
     fn try_from(value: usize) -> std::prelude::v1::Result<Self, Self::Error> {
-        if !(1..=9).contains(&value) {
+        // A diversion buffer is any positive number (0 selects normal output,
+        // negative discards); both are handled by the caller, not here.
+        if value < 1 {
             return Err(
                 crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-                    "Unexpected buffer number: {value}. Needs to be from 1 to 9"
+                    "Unexpected buffer number: {value}. Needs to be 1 or greater"
                 )),
             );
         }
@@ -226,28 +231,10 @@ impl TryFrom<usize> for DivertBufferNumber {
     }
 }
 
-impl Write for Output {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let output: &mut dyn Write = match self.divert_number {
-            0 => &mut *self.stdout.borrow_mut(),
-            1..=9 => {
-                &mut self.divert_buffers[self
-                    .divert_buffer_number()
-                    .expect("valid divert buffer number")
-                    .index()]
-                .borrow_mut()
-                .0
-            }
-            i if i < 0 => return Ok(buf.len()),
-            _ => unreachable!("unreachable, was checked in Self::divert()"),
-        };
-
-        log::debug!(
-            "writing[{}] {:?}",
-            self.divert_number,
-            String::from_utf8_lossy(buf)
-        );
-
+impl Output {
+    /// Write `buf` to `output`, inserting `#line` directives after each newline
+    /// when line synchronization is enabled.
+    fn write_synced(&mut self, output: &mut dyn Write, buf: &[u8]) -> std::io::Result<usize> {
         if self.input.sync_lines() {
             let mut n = 0;
             for c in buf {
@@ -261,19 +248,45 @@ impl Write for Output {
             output.write(buf)
         }
     }
+}
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        log::debug!(
+            "writing[{}] {:?}",
+            self.divert_number,
+            String::from_utf8_lossy(buf)
+        );
+
+        // Negative diversion: discard.
+        if self.divert_number < 0 {
+            return Ok(buf.len());
+        }
+        if self.divert_number == 0 {
+            let stdout = self.stdout.clone();
+            let mut out = stdout.borrow_mut();
+            self.write_synced(&mut *out, buf)
+        } else {
+            // Positive diversion: create the buffer on first use.
+            let buffer = self
+                .divert_buffers
+                .entry(self.divert_number as usize)
+                .or_default()
+                .clone();
+            let mut buffer = buffer.borrow_mut();
+            self.write_synced(&mut buffer.0, buf)
+        }
+    }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self.divert_number {
-            0 => self.stdout.borrow_mut().flush(),
-            1..=9 => self.divert_buffers[self
-                .divert_buffer_number()
-                .expect("valid divert buffer number")
-                .index()]
-            .borrow_mut()
-            .0
-            .flush(),
-            i if i < 0 => Ok(()),
-            _ => unreachable!("unreachable, was checked in Self::divert()"),
+        if self.divert_number < 0 {
+            Ok(())
+        } else if self.divert_number == 0 {
+            self.stdout.borrow_mut().flush()
+        } else if let Some(buffer) = self.divert_buffers.get(&(self.divert_number as usize)) {
+            buffer.borrow_mut().0.flush()
+        } else {
+            Ok(())
         }
     }
 }

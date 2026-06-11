@@ -1090,11 +1090,23 @@ fn find_or_create_batch(expr: &Expr, state: &mut FindState) -> Option<usize> {
     }
 
     if let Some(mode) = find_batch_exec(expr) {
-        // Check if we already have this batch
+        // A batch is identified by both its utility and its leading arguments,
+        // so two `-exec util a {} +` / `-exec util b {} +` do not collide.
         for (i, (m, _)) in state.exec_batches.iter().enumerate() {
-            if matches!((m, &mode), (ExecMode::Batch { utility: u1, .. }, ExecMode::Batch { utility: u2, .. }) if u1 == u2)
+            if let (
+                ExecMode::Batch {
+                    utility: u1,
+                    args_before: a1,
+                },
+                ExecMode::Batch {
+                    utility: u2,
+                    args_before: a2,
+                },
+            ) = (m, &mode)
             {
-                return Some(i);
+                if u1 == u2 && a1 == a2 {
+                    return Some(i);
+                }
             }
         }
         // Create new batch
@@ -1105,36 +1117,66 @@ fn find_or_create_batch(expr: &Expr, state: &mut FindState) -> Option<usize> {
     }
 }
 
-/// Execute all pending batched -exec commands
+/// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
+/// it exited successfully.
+fn run_exec_command(utility: &str, args_before: &[String], files: &[PathBuf]) -> bool {
+    let mut cmd = Command::new(utility);
+    cmd.args(args_before);
+    cmd.args(files);
+    match cmd.status() {
+        Ok(status) => status.success(),
+        Err(e) => {
+            eprintln!("find: '{}': {}", utility, e);
+            false
+        }
+    }
+}
+
+/// Execute all pending batched -exec commands, splitting the file list into
+/// invocations whose argument size stays under `ARG_MAX`.
 fn execute_batches(state: &mut FindState) {
+    let ptr = std::mem::size_of::<usize>();
+    let arg_max = match unsafe { libc::sysconf(libc::_SC_ARG_MAX) } {
+        n if n > 0 => n as usize,
+        _ => 1 << 17, // 128 KiB fallback
+    };
+    // Reserve room for the environment, the utility/args_before, and overhead.
+    let env_size: usize = std::env::vars_os()
+        .map(|(k, v)| k.len() + v.len() + 2 + ptr)
+        .sum();
+
     for (mode, files) in state.exec_batches.drain(..) {
         if files.is_empty() {
             continue;
         }
-
-        if let ExecMode::Batch {
+        let ExecMode::Batch {
             utility,
             args_before,
         } = mode
-        {
-            // Build command with all files
-            let mut cmd = Command::new(&utility);
-            cmd.args(&args_before);
-            for f in &files {
-                cmd.arg(f);
-            }
+        else {
+            continue;
+        };
 
-            match cmd.status() {
-                Ok(status) => {
-                    if !status.success() {
-                        state.had_error = true;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("find: '{}': {}", utility, e);
+        let fixed: usize =
+            utility.len() + 1 + ptr + args_before.iter().map(|a| a.len() + 1 + ptr).sum::<usize>();
+        let budget = arg_max.saturating_sub(env_size + fixed + 2048);
+
+        let mut chunk: Vec<PathBuf> = Vec::new();
+        let mut chunk_size = 0usize;
+        for f in files {
+            let cost = f.as_os_str().len() + 1 + ptr;
+            if !chunk.is_empty() && chunk_size + cost > budget {
+                if !run_exec_command(&utility, &args_before, &chunk) {
                     state.had_error = true;
                 }
+                chunk.clear();
+                chunk_size = 0;
             }
+            chunk_size += cost;
+            chunk.push(f);
+        }
+        if !chunk.is_empty() && !run_exec_command(&utility, &args_before, &chunk) {
+            state.had_error = true;
         }
     }
 }

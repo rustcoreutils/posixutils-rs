@@ -275,7 +275,7 @@ absent.
 
 #### Major
 - [x] **FIND-3 — `-mount` primary missing.** Not in `find.rs`. POSIX.1-2024 §98215 (Defect 1133) requires it; semantically distinct from `-xdev` (excludes the crossing point itself). MISSING. ✓ fixed in find-B — `-mount` primary added; on a device crossing it excludes the mount-point directory and does not descend (vs `-xdev` which acts on the directory).
-- [ ] **FIND-4 — `-exec {} +` does not honor `ARG_MAX`.** `find.rs:1052-1112`. All accumulated pathnames are passed in a single `Command`; large trees overflow the exec limit. Spec §98295-98298 requires splitting into sets. PARTIAL. Fix: chunk by `sysconf(_SC_ARG_MAX)`.
+- [x] **FIND-4 — `-exec {} +` does not honor `ARG_MAX`.** `find.rs:1052-1112`. All accumulated pathnames are passed in a single `Command`; large trees overflow the exec limit. Spec §98295-98298 requires splitting into sets. PARTIAL. Fix: chunk by `sysconf(_SC_ARG_MAX)`. ✓ fixed in find-C — `execute_batches` splits the file list into invocations sized under `sysconf(_SC_ARG_MAX)` (less env + utility/args + margin); batch identity now also compares `args_before`.
 - [ ] **FIND-5 — `-ok` uses hardcoded English `y`/`yes`.** `find.rs:874`. Spec ties the affirmative response to `LC_MESSAGES` (`yesexpr`). DIVERGES. Fix: match against `nl_langinfo(YESEXPR)`.
 
 #### Minor

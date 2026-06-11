@@ -274,15 +274,15 @@ absent.
 - [x] **FIND-2 — `-iname` primary missing.** Not in `find.rs`. POSIX.1-2024 §98201 (Defect 1031) requires it. MISSING. Fix: add case-folded fnmatch. ✓ fixed in find-A — `-iname` (and `-ipath`) added via `FNM_CASEFOLD`.
 
 #### Major
-- [ ] **FIND-3 — `-mount` primary missing.** Not in `find.rs`. POSIX.1-2024 §98215 (Defect 1133) requires it; semantically distinct from `-xdev` (excludes the crossing point itself). MISSING.
+- [x] **FIND-3 — `-mount` primary missing.** Not in `find.rs`. POSIX.1-2024 §98215 (Defect 1133) requires it; semantically distinct from `-xdev` (excludes the crossing point itself). MISSING. ✓ fixed in find-B — `-mount` primary added; on a device crossing it excludes the mount-point directory and does not descend (vs `-xdev` which acts on the directory).
 - [ ] **FIND-4 — `-exec {} +` does not honor `ARG_MAX`.** `find.rs:1052-1112`. All accumulated pathnames are passed in a single `Command`; large trees overflow the exec limit. Spec §98295-98298 requires splitting into sets. PARTIAL. Fix: chunk by `sysconf(_SC_ARG_MAX)`.
 - [ ] **FIND-5 — `-ok` uses hardcoded English `y`/`yes`.** `find.rs:874`. Spec ties the affirmative response to `LC_MESSAGES` (`yesexpr`). DIVERGES. Fix: match against `nl_langinfo(YESEXPR)`.
 
 #### Minor
 - [ ] **FIND-6 — `-user`/`-group` re-resolve the name on every file.** `find.rs:745-760`. Spec §98346 evaluates the argument once. Fix: resolve to uid/gid at parse time.
 - [ ] **FIND-7 — `-atime`/`-ctime`/`-mtime` clamp future timestamps to 0.** `find.rs:903-908`. Use signed day arithmetic.
-- [ ] **FIND-8 — `-xdev` skips the crossing-point directory entry itself.** `find.rs:975-977`. Spec acts on the directory but does not descend.
-- [ ] **FIND-9 — cycle-detection diagnostic prints the same path twice.** `find.rs:963-972`. Track and report the previously-visited ancestor.
+- [x] **FIND-8 — `-xdev` skips the crossing-point directory entry itself.** `find.rs:975-977`. Spec acts on the directory but does not descend. ✓ fixed in find-B — `-xdev` now evaluates the crossing-point directory itself and only blocks descent.
+- [x] **FIND-9 — cycle-detection diagnostic prints the same path twice.** `find.rs:963-972`. Track and report the previously-visited ancestor. ✓ fixed in find-B — `visited_paths` records the first path at each inode; the loop diagnostic names the ancestor.
 - [ ] **FIND-10 — symbolic `-perm` ignores the file-creation mask.** `find.rs:490-498`. POSIX.1-2024 (Defect 1392). Minor.
 - [ ] **FIND-11 — `-newer` reference always follows symlinks.** `find.rs:427-434`. Under `-H`/`-L` with a dangling reference, spec wants the link's mtime; impl errors. Minor.
 

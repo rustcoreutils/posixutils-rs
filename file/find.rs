@@ -189,6 +189,7 @@ enum Primary {
     // Global options (always true, affect traversal)
     Depth,
     XDev,
+    Mount,
 }
 
 /// Expression AST node
@@ -240,8 +241,13 @@ struct FindState {
     depth_first: bool,
     /// Whether -xdev was specified anywhere in expression
     xdev: bool,
-    /// Device IDs of visited directories (for cycle detection)
+    /// Whether -mount was specified anywhere in expression
+    mount: bool,
+    /// (dev, ino) of the directories on the current descent path (for
+    /// file-system loop detection)
     visited_inodes: HashSet<(u64, u64)>,
+    /// Path first seen at each visited inode, for the loop diagnostic
+    visited_paths: std::collections::HashMap<(u64, u64), PathBuf>,
     /// Whether expression contains any action (-print, -exec, -ok)
     has_action: bool,
     /// Files accumulated for batched -exec
@@ -254,7 +260,9 @@ impl FindState {
             had_error: false,
             depth_first: false,
             xdev: false,
+            mount: false,
             visited_inodes: HashSet::new(),
+            visited_paths: std::collections::HashMap::new(),
             has_action: false,
             exec_batches: Vec::new(),
         }
@@ -479,6 +487,7 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         "-prune" => Ok(Expr::Primary(Primary::Prune)),
         "-depth" => Ok(Expr::Primary(Primary::Depth)),
         "-xdev" => Ok(Expr::Primary(Primary::XDev)),
+        "-mount" => Ok(Expr::Primary(Primary::Mount)),
         "-exec" => {
             let exec_mode = parse_exec(tokens, idx)?;
             Ok(Expr::Primary(Primary::Exec(exec_mode)))
@@ -666,6 +675,16 @@ fn has_xdev(expr: &Expr) -> bool {
     }
 }
 
+/// Check if expression contains -mount
+fn has_mount(expr: &Expr) -> bool {
+    match expr {
+        Expr::Primary(Primary::Mount) => true,
+        Expr::Not(e) => has_mount(e),
+        Expr::And(l, r) | Expr::Or(l, r) => has_mount(l) || has_mount(r),
+        _ => false,
+    }
+}
+
 /// Evaluate expression against a file
 fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match expr {
@@ -819,7 +838,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             // Always true, affects traversal order (handled globally)
             EvalResult::new(true)
         }
-        Primary::XDev => {
+        Primary::XDev | Primary::Mount => {
             // Always true, affects traversal (handled globally)
             EvalResult::new(true)
         }
@@ -957,19 +976,29 @@ fn walk_tree(
     // Check for cycles (infinite loop detection)
     let inode_key = (metadata.dev(), metadata.ino());
     if metadata.is_dir() && state.visited_inodes.contains(&inode_key) {
+        let ancestor = state
+            .visited_paths
+            .get(&inode_key)
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf());
         eprintln!(
             "find: File system loop detected; '{}' is part of the same file system loop as '{}'.",
             path.display(),
-            path.display()
+            ancestor.display()
         );
         state.had_error = true;
         return;
     }
 
-    // Check xdev
-    if state.xdev && metadata.dev() != root_dev && !is_cmdline {
+    // Device-crossing handling for -xdev / -mount. When a directory on a
+    // different device is encountered (not a command-line path operand):
+    //   -mount: do not act on it and do not descend (excludes the mount point).
+    //   -xdev:  act on it but do not descend (includes the mount point).
+    let on_other_dev = !is_cmdline && metadata.dev() != root_dev;
+    if on_other_dev && state.mount {
         return;
     }
+    let block_descend = on_other_dev && state.xdev;
 
     let ctx = EvalContext {
         path,
@@ -979,10 +1008,12 @@ fn walk_tree(
     };
 
     // If depth-first, process children before this entry
-    if state.depth_first && metadata.is_dir() {
+    if state.depth_first && metadata.is_dir() && !block_descend {
         state.visited_inodes.insert(inode_key);
+        state.visited_paths.insert(inode_key, path.to_path_buf());
         process_children(path, expr, symlink_mode, root_dev, init_time, state);
         state.visited_inodes.remove(&inode_key);
+        state.visited_paths.remove(&inode_key);
     }
 
     // Evaluate expression for this entry
@@ -998,10 +1029,12 @@ fn walk_tree(
     }
 
     // If not depth-first and is directory, process children
-    if !state.depth_first && metadata.is_dir() && !result.prune {
+    if !state.depth_first && metadata.is_dir() && !result.prune && !block_descend {
         state.visited_inodes.insert(inode_key);
+        state.visited_paths.insert(inode_key, path.to_path_buf());
         process_children(path, expr, symlink_mode, root_dev, init_time, state);
         state.visited_inodes.remove(&inode_key);
+        state.visited_paths.remove(&inode_key);
     }
 }
 
@@ -1122,6 +1155,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
     let mut state = FindState::new();
     state.depth_first = has_depth(&expr);
     state.xdev = has_xdev(&expr);
+    state.mount = has_mount(&expr);
     state.has_action = expr_has_action;
 
     let init_time = SystemTime::now();

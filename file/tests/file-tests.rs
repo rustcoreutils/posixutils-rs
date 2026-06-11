@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod cat;
 mod cmp;
 mod dd;
 mod file;

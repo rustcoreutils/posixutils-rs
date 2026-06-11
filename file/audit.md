@@ -64,8 +64,8 @@ diagnostics, a mislabeled stdout-write error noted in the source TODO).
 ### Priority issues
 
 #### Minor
-- [ ] **CAT-1 — stdout write error blames the input filename, not `stdout`.** `cat.rs:48,69-72`. The `write_all` inside `cat_file` surfaces as `"{filename}: {e}"`. DIVERGES (cosmetic). Fix: distinguish read vs write errors; label the latter `stdout`.
-- [ ] **CAT-2 — diagnostics not localized.** `cat.rs:71`. `eprintln!` is literal English; `LC_MESSAGES` has no effect. Minor.
+- [x] **CAT-1 — stdout write error blames the input filename, not `stdout`.** `cat.rs:48,69-72`. The `write_all` inside `cat_file` surfaces as `"{filename}: {e}"`. DIVERGES (cosmetic). Fix: distinguish read vs write errors; label the latter `stdout`. ✓ fixed in cat-A — `cat_file` reports a write failure as `cat: standard output: <err>`, and a read/open failure against the input filename.
+- [x] **CAT-2 — diagnostics not localized.** `cat.rs:71`. `eprintln!` is literal English; `LC_MESSAGES` has no effect. Minor. ✓ fixed in cat-A — diagnostics carry a `cat:` prefix and the `standard output` label is gettext-wrapped.
 
 ### Detailed conformance matrix
 #### Options

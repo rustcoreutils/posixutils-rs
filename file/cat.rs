@@ -6,11 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - Bug:  if stdout write_all() produces Err, the program will erroneously
-//   output the filename as the culprit, rather than the string "stdout"
-// - Questionable behavior:  if write_all() produces Err, the program will
-//   continue to the next file, rather than stopping.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,20 +30,39 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-fn cat_file(pathname: &Path) -> io::Result<()> {
-    let mut file = input_stream(pathname, true)?;
+/// Copy one input file to standard output. Diagnostics are emitted here so a
+/// read/open error is attributed to the input file while a write error is
+/// attributed to standard output (not the input filename). Returns true if an
+/// error occurred.
+fn cat_file(pathname: &Path) -> bool {
+    let mut file = match input_stream(pathname, true) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cat: {}: {}", pathname.display(), e);
+            return true;
+        }
+    };
     let mut buffer = [0; BUFSZ];
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
 
     loop {
-        let n_read = file.read(&mut buffer[..])?;
-        if n_read == 0 {
-            break;
-        }
+        let n_read = match file.read(&mut buffer[..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("cat: {}: {}", pathname.display(), e);
+                return true;
+            }
+        };
 
-        io::stdout().write_all(&buffer[0..n_read])?;
+        if let Err(e) = handle.write_all(&buffer[0..n_read]) {
+            eprintln!("cat: {}: {}", gettext("standard output"), e);
+            return true;
+        }
     }
 
-    Ok(())
+    false
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,9 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filename in &args.files {
-        if let Err(e) = cat_file(filename) {
+        if cat_file(filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename.display(), e);
         }
     }
 

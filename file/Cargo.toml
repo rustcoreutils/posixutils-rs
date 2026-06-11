@@ -12,6 +12,7 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
+tempfile.workspace = true
 walkdir = "2"
 
 [lints]

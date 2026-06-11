@@ -10,7 +10,8 @@
 mod magic;
 
 use std::fs::{read_link, File};
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::{fs, io};
@@ -22,6 +23,14 @@ use crate::magic::{get_type_from_magic_file_dbs, ReadSeek, DEFAULT_MAGIC_FILE};
 
 /// Number of leading bytes inspected by the context-sensitive content tests.
 const CONTENT_PREFIX_LEN: usize = 8192;
+
+/// Upper bound on how much of a non-seekable stdin (a pipe/FIFO/tty) is spilled
+/// to a temporary file for the position-sensitive magic tests. A pipe cannot be
+/// rewound, so it must be captured to disk to allow seeking; bounding the
+/// capture keeps a huge stream from filling the temp filesystem. Magic entries
+/// reference small header offsets, so this window is comfortably sufficient
+/// (this mirrors how file(1)/libmagic classifies a pipe from a fixed prefix).
+const STDIN_SPILL_LIMIT: u64 = 1 << 20; // 1 MiB
 
 #[derive(Parser)]
 #[command(
@@ -209,8 +218,14 @@ fn classify(path: &str, met: &fs::Metadata, args: &Args, magic_files: &[PathBuf]
             return gettext("regular file");
         }
         let mut prefix = Vec::new();
-        if let Ok(f) = File::open(path) {
-            let _ = f.take(CONTENT_PREFIX_LEN as u64).read_to_end(&mut prefix);
+        match File::open(path) {
+            Ok(f) => {
+                let _ = f.take(CONTENT_PREFIX_LEN as u64).read_to_end(&mut prefix);
+            }
+            // Consistent with analyze_file()'s handling of other open failures:
+            // an unreadable regular file is reported as "cannot open" rather
+            // than being silently classified from empty content.
+            Err(_) => return gettext("cannot open"),
         }
         let owned = path.to_string();
         return classify_content(
@@ -272,22 +287,68 @@ fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
     println!("{path}: {}", classify(path, &lmet, args, magic_files));
 }
 
+/// Obtain a seekable handle to standard input without buffering it in memory.
+///
+/// Position-sensitive magic tests need random access, but stdin is not always
+/// seekable. When fd 0 is already seekable (e.g. `file - < file`), it is
+/// duplicated and used directly — zero extra memory and full random access,
+/// regardless of size. Otherwise (a pipe, FIFO, or terminal) the leading
+/// `STDIN_SPILL_LIMIT` bytes are spilled once to an anonymous temporary file;
+/// the rest of the stream is left unread so an arbitrarily large pipe neither
+/// fills the temp filesystem nor is drained in full.
+fn seekable_stdin() -> io::Result<File> {
+    // Duplicate fd 0 so we own a handle without closing the process's stdin.
+    let dup = unsafe { libc::dup(libc::STDIN_FILENO) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut f = unsafe { File::from_raw_fd(dup) };
+
+    // A regular-file redirect is seekable; a pipe/FIFO/tty yields ESPIPE.
+    if f.stream_position().is_ok() {
+        f.rewind()?;
+        return Ok(f);
+    }
+
+    // Non-seekable input: spill a bounded prefix to a temp file. io::copy uses
+    // a small internal buffer, so memory stays O(1); take() caps the on-disk
+    // capture so a 1 TiB pipe does not write 1 TiB to the temp directory.
+    let mut tmp = tempfile::tempfile()?;
+    io::copy(&mut f.take(STDIN_SPILL_LIMIT), &mut tmp)?;
+    tmp.rewind()?;
+    Ok(tmp)
+}
+
 /// Classify the content of standard input (the `-` operand).
 fn analyze_stdin(args: &Args, magic_files: &[PathBuf]) {
-    let mut buf = Vec::new();
-    let _ = io::stdin().read_to_end(&mut buf);
-
     let type_str = if args.no_further_file_classification {
         gettext("regular file")
     } else {
-        let prefix = buf[..buf.len().min(CONTENT_PREFIX_LEN)].to_vec();
-        classify_content(
-            buf.is_empty(),
-            &prefix,
-            default_tests_active(magic_files),
-            magic_files,
-            || Ok(Box::new(Cursor::new(buf.clone())) as Box<dyn ReadSeek>),
-        )
+        match seekable_stdin() {
+            Ok(file) => {
+                // Read the content prefix for the context-sensitive tests, then
+                // hand each magic database a fresh handle rewound to the start.
+                let mut prefix = Vec::new();
+                let _ = (&file)
+                    .take(CONTENT_PREFIX_LEN as u64)
+                    .read_to_end(&mut prefix);
+                classify_content(
+                    prefix.is_empty(),
+                    &prefix,
+                    default_tests_active(magic_files),
+                    magic_files,
+                    move || {
+                        let mut f = file.try_clone()?;
+                        f.rewind()?;
+                        Ok(Box::new(f) as Box<dyn ReadSeek>)
+                    },
+                )
+            }
+            Err(e) => {
+                eprintln!("file: {e}");
+                gettext("cannot open")
+            }
+        }
     };
     println!("/dev/stdin: {type_str}");
 }
@@ -307,7 +368,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // operand file is NOT an error per the spec.)
     let mut had_error = false;
     for mf in [&args.test_file1, &args.test_file2].into_iter().flatten() {
-        if fs::metadata(mf).is_err() {
+        // Probe with File::open (matching how the magic parser reads the file)
+        // so an unreadable magic file is detected; fs::metadata would succeed.
+        if File::open(mf).is_err() {
             eprintln!(
                 "file: {}: {}",
                 mf.display(),

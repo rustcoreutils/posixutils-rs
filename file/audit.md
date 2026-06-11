@@ -102,12 +102,12 @@ and the 0/1/2 exit ladder all conform. The one real bug: `-s` still writes the
 ### Priority issues
 
 #### Major
-- [ ] **CMP-1 — `-s` leaks the EOF diagnostic to stderr.** `cmp.rs:115-127`. The `(Some,_)/(_,Some)` EOF arm calls `eprintln!("cmp: EOF on …")` unconditionally, ignoring `args.silent`. Verified: `cmp -s a b` (a is a prefix of b) prints `cmp: EOF on a`. Spec §89813: "Write nothing to standard output **or standard error** when files differ." DIVERGES. Fix: gate the `eprintln!` on `!args.silent`.
+- [x] **CMP-1 — `-s` leaks the EOF diagnostic to stderr.** `cmp.rs:115-127`. The `(Some,_)/(_,Some)` EOF arm calls `eprintln!("cmp: EOF on …")` unconditionally, ignoring `args.silent`. Verified: `cmp -s a b` (a is a prefix of b) prints `cmp: EOF on a`. Spec §89813: "Write nothing to standard output **or standard error** when files differ." DIVERGES. Fix: gate the `eprintln!` on `!args.silent`. ✓ fixed in cmp-A.
 
 #### Minor
-- [ ] **CMP-2 — identical pathnames short-circuit without opening.** `cmp.rs:76-78`. `file1 == file2` returns `Ok(0)` (identical) before opening, so `cmp nofile nofile` exits 0 instead of 2. DIVERGES. Fix: only short-circuit after a successful `stat`, or drop the optimization.
-- [ ] **CMP-3 — I/O errors exit 2 with no diagnostic.** `cmp.rs:146-151`. Permitted by the spec (stderr is *may*), but unfriendly outside `-s`. Minor.
-- [ ] **CMP-4 — "differ: char/line" text not localized.** `cmp.rs:101-107`. Minor.
+- [x] **CMP-2 — identical pathnames short-circuit without opening.** `cmp.rs:76-78`. `file1 == file2` returns `Ok(0)` (identical) before opening, so `cmp nofile nofile` exits 0 instead of 2. DIVERGES. Fix: only short-circuit after a successful `stat`, or drop the optimization. ✓ fixed in cmp-A — only `cmp - -` short-circuits; identical real paths are opened (missing file → exit 2).
+- [x] **CMP-3 — I/O errors exit 2 with no diagnostic.** `cmp.rs:146-151`. Permitted by the spec (stderr is *may*), but unfriendly outside `-s`. Minor. ✓ fixed in cmp-A — `cmp: <path>: <err>` on stderr, suppressed under `-s`.
+- [x] **CMP-4 — "differ: char/line" text not localized.** `cmp.rs:101-107`. Minor. ✓ fixed in cmp-A — `char`/`line`/`EOF on` gettext-wrapped.
 
 ### Detailed conformance matrix
 #### Options / output

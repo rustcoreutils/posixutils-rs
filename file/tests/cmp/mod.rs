@@ -93,6 +93,14 @@ fn cmp_different_less_verbose() {
     }
 }
 
+// CMP-1: -s must suppress the "EOF on" diagnostic too (stdout AND stderr).
+#[test]
+fn cmp_eof_silent() {
+    let original = "tests/cmp/lorem_ipsum.txt";
+    let truncated = "tests/cmp/lorem_ipsum_trunc.txt";
+    run_test_helper(&["-s", original, truncated], "", "", 1);
+}
+
 #[test]
 fn cmp_eof() {
     let original = "tests/cmp/lorem_ipsum.txt";

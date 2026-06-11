@@ -11,7 +11,10 @@ use nom::IResult;
 
 use crate::error::{Result, ResultExt};
 use crate::input::{Input, InputRead};
-use crate::lexer::{MacroName, MacroParseConfig, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG};
+use crate::lexer::{
+    MacroName, MacroParseConfig, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_QUOTE_CLOSE_TAG,
+    DEFAULT_QUOTE_OPEN_TAG,
+};
 use crate::macros::user_defined::UserDefinedMacro;
 use crate::macros::MacroDefinition;
 use crate::output::{DivertBufferNumber, BUILTIN_DEFN_PREFIX, BUILTIN_DEFN_SUFFIX};
@@ -416,6 +419,11 @@ impl MacroImplementation for ChangecomMacro {
             );
             state.parse_config.comment_enabled = true;
             state.parse_config.comment_open_tag = open_tag;
+            // POSIX: with a single argument, the <newline> becomes the
+            // end-comment string (don't retain a previously set close tag).
+            if args_len < 2 {
+                state.parse_config.comment_close_tag = DEFAULT_COMMENT_CLOSE_TAG.to_vec();
+            }
         }
 
         if args_len >= 2 {
@@ -728,7 +736,7 @@ impl MacroImplementation for IndexMacro {
 pub struct TranslitMacro;
 
 impl MacroImplementation for TranslitMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -736,9 +744,10 @@ impl MacroImplementation for TranslitMacro {
 
         let second_arg = match args.next() {
             Some(second_arg) => second_arg,
+            // With no "from"/"to" sets there is nothing to transliterate: the
+            // result is the first argument unchanged (GNU m4).
             None => {
-                stderr.write_all(b"Warning too few arguments for index macro")?;
-                state.input.pushback_character(b'0');
+                state.input.pushback_string(&first_arg);
                 return Ok(state);
             }
         };

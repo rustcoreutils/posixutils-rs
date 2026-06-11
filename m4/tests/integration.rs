@@ -192,6 +192,7 @@ m4_test!(define_order_undefined);
 m4_test!(define_pushpopdef_undefine);
 m4_test!(define_stacked);
 m4_test!(define_undefine_order);
+m4_test!(define_undefine_operand_order);
 m4_test!(defn);
 m4_test!(defn_builtin_rename);
 m4_test!(dollar_hash_args);
@@ -225,6 +226,7 @@ fn file() {
 }
 m4_test!(forloop_nested);
 m4_test!(forloop_simple);
+m4_test!(forward_file_order);
 m4_test!(ifdef);
 m4_test!(ifelse);
 m4_test!(include);
@@ -250,6 +252,8 @@ m4_test!(sinclude);
 m4_test!(substr);
 m4_test!(trace);
 m4_test!(translit);
+m4_test!(translit_single_arg);
+m4_test!(changecom_single_arg);
 m4_test!(two_files);
 m4_test!(undivert);
 m4_test!(undivert_2);

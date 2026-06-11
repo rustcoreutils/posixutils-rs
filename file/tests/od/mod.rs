@@ -354,3 +354,27 @@ fn test_od_named_char_seven_bit() {
         expected_exit_code: 0,
     });
 }
+
+// OD-5: the obsolescent "[+]offset" operand sets the start offset and is not
+// opened as a file.
+#[test]
+fn test_od_plus_offset_operand() {
+    od_test(
+        &["-b", "+2"],
+        "ABCDEFGH",
+        "0000002 103 104 105 106 107 110\n0000010\n",
+    );
+}
+
+// OD-6: skipping past the end of input is a diagnostic error (exit > 0).
+#[test]
+fn test_od_skip_past_eof() {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("od"),
+        args: vec![String::from("-j"), String::from("100")],
+        stdin_data: b"ab".to_vec(),
+        expected_out: Vec::new(),
+        expected_err: b"cannot skip past end of input".to_vec(),
+        expected_exit_code: 1,
+    });
+}

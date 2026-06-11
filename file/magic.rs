@@ -419,35 +419,46 @@ impl RawMagicFileLine {
             return None;
         }
 
+        // On a match, the message is a printf-style format string whose single
+        // argument is the value read from the file (POSIX EXTENDED DESCRIPTION).
         match self.ty {
             Type::Unsigned(size, mask) | Type::Decimal(size, mask) => self
                 .number_test(size, mask, tf_reader)
-                .then(|| self.message.clone()),
-            Type::String => self.string_test(tf_reader).then(|| self.message.clone()),
+                .map(|v| format_message_num(&self.message, v)),
+            Type::String => self
+                .string_test(tf_reader)
+                .map(|bytes| format_message_str(&self.message, &bytes)),
         }
     }
 
-    fn string_test(&self, tf_reader: &mut BufReader<File>) -> bool {
+    /// Returns the matched bytes from the file on success.
+    fn string_test(&self, tf_reader: &mut BufReader<File>) -> Option<Vec<u8>> {
         if let Value::String(val) = &self.value {
             let mut buf = vec![0u8; val.len()];
             if tf_reader.read_exact(&mut buf).is_err() {
-                return false;
+                return None;
             }
-            buf == *val
+            (buf == *val).then_some(buf)
         } else {
-            false
+            None
         }
     }
 
-    fn number_test(&self, size: u64, mask: Option<u64>, tf_reader: &mut BufReader<File>) -> bool {
+    /// Returns the (masked) value read from the file on success.
+    fn number_test(
+        &self,
+        size: u64,
+        mask: Option<u64>,
+        tf_reader: &mut BufReader<File>,
+    ) -> Option<u64> {
         if size == 0 || size > 8 {
-            return false;
+            return None;
         }
 
         let size = size as usize;
         let mut buf = vec![0; size];
         if tf_reader.read_exact(&mut buf).is_err() {
-            return false;
+            return None;
         }
 
         let mut array_buf = [0u8; 8];
@@ -462,7 +473,7 @@ impl RawMagicFileLine {
             tf_val &= mask;
         }
 
-        match &self.value {
+        let matched = match &self.value {
             Value::Number(op, val) => match op {
                 ComparisonOperator::Equal => *val == tf_val,
                 // The comparison is "<value from file> OP <value field>".
@@ -480,8 +491,72 @@ impl RawMagicFileLine {
                 }
             },
             _ => false,
+        };
+        matched.then_some(tf_val)
+    }
+}
+
+/// Format a magic message that may contain a single printf conversion, using
+/// the numeric value read from the file as the argument. Only the conversions
+/// that appear in practical magic files are supported (`%d`/`%i`/`%u`,
+/// `%x`/`%X`, `%o`, `%c`, `%%`); an unrecognized specifier is passed through.
+fn format_message_num(fmt: &str, value: u64) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    let mut used = false;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some(spec @ ('d' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c')) if !used => {
+                chars.next();
+                used = true;
+                match spec {
+                    'd' | 'i' => out.push_str(&(value as i64).to_string()),
+                    'u' => out.push_str(&value.to_string()),
+                    'x' => out.push_str(&format!("{value:x}")),
+                    'X' => out.push_str(&format!("{value:X}")),
+                    'o' => out.push_str(&format!("{value:o}")),
+                    'c' => out.push((value as u8) as char),
+                    _ => unreachable!(),
+                }
+            }
+            _ => out.push('%'),
         }
     }
+    out
+}
+
+/// Format a magic message whose argument is the matched string value.
+fn format_message_str(fmt: &str, value: &[u8]) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    let mut used = false;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some('s') if !used => {
+                chars.next();
+                used = true;
+                out.push_str(&String::from_utf8_lossy(value));
+            }
+            _ => out.push('%'),
+        }
+    }
+    out
 }
 
 /// Parse a magic database file content line by line and test it against another file
@@ -496,16 +571,34 @@ fn parse_magic_file_and_test(
     let mf_reader = BufReader::new(File::open(magic_file)?);
     let mut tf_reader = BufReader::new(File::open(test_file)?);
 
-    let mut result = None;
+    let mut result: Option<String> = None;
+    let mut matched_top_level = false;
+
     for line in mf_reader.lines() {
-        if let Ok(raw_magic_file_line) = RawMagicFileLine::parse(&line?) {
-            if result.is_none() && !raw_magic_file_line.offset.is_continuation {
-                result = raw_magic_file_line.test(&mut tf_reader);
-            } else if let Some(ref r) = result {
-                if raw_magic_file_line.offset.is_continuation {
-                    result = raw_magic_file_line.test(&mut tf_reader).or(Some(r.clone()));
-                } else {
-                    return Ok(result);
+        let Ok(ml) = RawMagicFileLine::parse(&line?) else {
+            continue;
+        };
+
+        if !ml.offset.is_continuation {
+            // Once a top-level test has matched, no further top-level tests are
+            // applied (only the immediately-following '>' continuation lines).
+            if matched_top_level {
+                break;
+            }
+            if let Some(msg) = ml.test(&mut tf_reader) {
+                result = Some(msg);
+                matched_top_level = true;
+            }
+        } else if matched_top_level {
+            // A continuation ('>') line is applied only after a successful
+            // top-level test; on success its message is appended to the result.
+            if let Some(msg) = ml.test(&mut tf_reader) {
+                match &mut result {
+                    Some(r) => {
+                        r.push(' ');
+                        r.push_str(&msg);
+                    }
+                    None => result = Some(msg),
                 }
             }
         }

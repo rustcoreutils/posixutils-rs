@@ -338,6 +338,44 @@ fn file_magic_numeric_less_greater() {
     std::fs::remove_file(&high).unwrap();
 }
 
+// MAGIC-3: the magic message is a printf format taking the file value.
+#[test]
+fn file_magic_printf_message() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let magic = dir.join("printf_msg_tmp.magic");
+    std::fs::write(&magic, "0\tuC\t5\tvalue is %d here\n").unwrap();
+    let data = dir.join("printf_msg_data_tmp");
+    std::fs::write(&data, [0x05u8]).unwrap();
+
+    file_test(
+        &["-m", magic.to_str().unwrap(), data.to_str().unwrap()],
+        &format!("{}: value is 5 here\n", data.to_str().unwrap()),
+        "",
+    );
+
+    std::fs::remove_file(&magic).unwrap();
+    std::fs::remove_file(&data).unwrap();
+}
+
+// MAGIC-4: a '>' continuation appends its message to the parent's.
+#[test]
+fn file_magic_continuation_appends() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let magic = dir.join("contin_tmp.magic");
+    std::fs::write(&magic, "0\tuC\t1\tParent\n>1\tuC\t&0x80\tChild\n").unwrap();
+    let data = dir.join("contin_data_tmp");
+    std::fs::write(&data, [0x01u8, 0x80u8]).unwrap();
+
+    file_test(
+        &["-m", magic.to_str().unwrap(), data.to_str().unwrap()],
+        &format!("{}: Parent Child\n", data.to_str().unwrap()),
+        "",
+    );
+
+    std::fs::remove_file(&magic).unwrap();
+    std::fs::remove_file(&data).unwrap();
+}
+
 #[allow(non_snake_case)]
 #[test]
 fn file_magic_M_and_m_flag_cpio() {

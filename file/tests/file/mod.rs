@@ -9,7 +9,27 @@
 
 use std::{env, path::PathBuf};
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
+
+/// Assert only on stdout and exit code. Used for the default-system-test cases,
+/// which may emit a benign stderr note if the system magic file is absent.
+fn file_test_stdout(args: &[&str], stdin: &str, expected_stdout: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("file"),
+            args: str_args,
+            stdin_data: String::from(stdin),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected_stdout);
+            assert_eq!(output.status.code(), Some(0));
+        },
+    );
+}
 
 fn file_test(args: &[&str], expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -68,8 +88,11 @@ fn file_is_a_valid_sym_link() {
     let mut valid_sym_link = cargo_man_dir.clone();
     valid_sym_link.push("tests/file/sym_link.txt");
 
+    // Use an empty target so the default (follow-the-link) classification is
+    // deterministic regardless of the system magic database.
     let mut file = cargo_man_dir.clone();
-    file.push("tests/file/regular_file.txt");
+    file.push("tests/file/sym_link_empty_target_tmp");
+    std::fs::write(&file, b"").unwrap();
 
     // Remove the symlink or file inside the tests/file folder, if it already exists
     if symlink_metadata(&valid_sym_link).is_ok() {
@@ -79,18 +102,17 @@ fn file_is_a_valid_sym_link() {
     // Create the valid symlink
     symlink(&file, &valid_sym_link).unwrap();
 
+    // By default file resolves the link and reports the TARGET's type (here an
+    // empty file), not "symbolic link to ...".
     file_test(
         &[valid_sym_link.to_str().unwrap()],
-        &format!(
-            "{}: symbolic link to {}\n",
-            valid_sym_link.to_str().unwrap(),
-            file.to_str().unwrap()
-        ),
+        &format!("{}: empty\n", valid_sym_link.to_str().unwrap()),
         "",
     );
 
-    // Delete the symlink after testing
-    remove_file(valid_sym_link).unwrap()
+    // Delete the symlink and target after testing
+    remove_file(valid_sym_link).unwrap();
+    remove_file(file).unwrap();
 }
 
 #[test]
@@ -153,16 +175,25 @@ fn file_h_flag_symlinks() {
     symlink(&regular_file, &valid_symlink).unwrap();
     symlink(&regular_file, &broken_symlink).unwrap();
 
-    // test valid symbolic link
+    // With -h, file identifies the link itself, including its target (POSIX
+    // alternative output format "%s: %s %s"). Both links point to a real file.
     file_test(
         &["-h", valid_symlink.to_str().unwrap()],
-        &format!("{}: symbolic link\n", valid_symlink.to_str().unwrap(),),
+        &format!(
+            "{}: symbolic link to {}\n",
+            valid_symlink.to_str().unwrap(),
+            regular_file.to_str().unwrap()
+        ),
         "",
     );
 
     file_test(
         &["-h", broken_symlink.to_str().unwrap()],
-        &format!("{}: symbolic link\n", broken_symlink.to_str().unwrap(),),
+        &format!(
+            "{}: symbolic link to {}\n",
+            broken_symlink.to_str().unwrap(),
+            regular_file.to_str().unwrap()
+        ),
         "",
     );
 
@@ -292,6 +323,115 @@ fn file_magic_octal_escape_packed_data() {
     );
 
     std::fs::remove_file(&tmp_path).unwrap();
+}
+
+// MAGIC-1: numeric `<` / `>` magic comparisons are "<file value> OP <field>".
+#[test]
+fn file_magic_numeric_less_greater() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let magic = dir.join("cmp_test_tmp.magic");
+    std::fs::write(
+        &magic,
+        "0\tuC\t<10\tLESS_THAN_10\n0\tuC\t>10\tGREATER_THAN_10\n",
+    )
+    .unwrap();
+    let magic_s = magic.to_str().unwrap();
+
+    let low = dir.join("cmp_low_tmp");
+    std::fs::write(&low, [0x05u8]).unwrap();
+    file_test(
+        &["-m", magic_s, low.to_str().unwrap()],
+        &format!("{}: LESS_THAN_10\n", low.to_str().unwrap()),
+        "",
+    );
+
+    let high = dir.join("cmp_high_tmp");
+    std::fs::write(&high, [0x14u8]).unwrap();
+    file_test(
+        &["-m", magic_s, high.to_str().unwrap()],
+        &format!("{}: GREATER_THAN_10\n", high.to_str().unwrap()),
+        "",
+    );
+
+    std::fs::remove_file(&magic).unwrap();
+    std::fs::remove_file(&low).unwrap();
+    std::fs::remove_file(&high).unwrap();
+}
+
+// FILE-2: context-sensitive default system tests (shell / C source).
+#[test]
+fn file_context_shell_script() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let f = dir.join("ctx_shell_tmp");
+    std::fs::write(&f, "#!/bin/sh\necho hi\n").unwrap();
+    file_test_stdout(
+        &[f.to_str().unwrap()],
+        "",
+        &format!("{}: commands text\n", f.to_str().unwrap()),
+    );
+    std::fs::remove_file(&f).unwrap();
+}
+
+#[test]
+fn file_context_c_source() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let f = dir.join("ctx_c_tmp");
+    std::fs::write(&f, "#include <stdio.h>\nint main(){return 0;}\n").unwrap();
+    file_test_stdout(
+        &[f.to_str().unwrap()],
+        "",
+        &format!("{}: c program text\n", f.to_str().unwrap()),
+    );
+    std::fs::remove_file(&f).unwrap();
+}
+
+// FILE-4: a '-' operand classifies standard-input content.
+#[test]
+fn file_dash_classifies_stdin() {
+    file_test_stdout(&["-"], "#!/bin/bash\n", "/dev/stdin: commands text\n");
+}
+
+#[test]
+fn file_dash_empty_stdin() {
+    file_test_stdout(&["-"], "", "/dev/stdin: empty\n");
+}
+
+// MAGIC-3: the magic message is a printf format taking the file value.
+#[test]
+fn file_magic_printf_message() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let magic = dir.join("printf_msg_tmp.magic");
+    std::fs::write(&magic, "0\tuC\t5\tvalue is %d here\n").unwrap();
+    let data = dir.join("printf_msg_data_tmp");
+    std::fs::write(&data, [0x05u8]).unwrap();
+
+    file_test(
+        &["-m", magic.to_str().unwrap(), data.to_str().unwrap()],
+        &format!("{}: value is 5 here\n", data.to_str().unwrap()),
+        "",
+    );
+
+    std::fs::remove_file(&magic).unwrap();
+    std::fs::remove_file(&data).unwrap();
+}
+
+// MAGIC-4: a '>' continuation appends its message to the parent's.
+#[test]
+fn file_magic_continuation_appends() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let magic = dir.join("contin_tmp.magic");
+    std::fs::write(&magic, "0\tuC\t1\tParent\n>1\tuC\t&0x80\tChild\n").unwrap();
+    let data = dir.join("contin_data_tmp");
+    std::fs::write(&data, [0x01u8, 0x80u8]).unwrap();
+
+    file_test(
+        &["-m", magic.to_str().unwrap(), data.to_str().unwrap()],
+        &format!("{}: Parent Child\n", data.to_str().unwrap()),
+        "",
+    );
+
+    std::fs::remove_file(&magic).unwrap();
+    std::fs::remove_file(&data).unwrap();
 }
 
 #[allow(non_snake_case)]

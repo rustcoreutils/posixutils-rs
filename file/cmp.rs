@@ -72,13 +72,18 @@ fn getc(reader: &mut io::BufReader<Box<dyn Read>>) -> io::Result<Option<u8>> {
 
 // Helper function to allow using `?` in error handling.
 fn cmp_main(args: &Args) -> io::Result<u8> {
-    // Also guards against using stdin for both inputs
-    if args.file1 == args.file2 {
+    // Comparing standard input to itself is undefined; treat as identical
+    // rather than attempting to read stdin twice.
+    if args.file1 == args.file2 && args.file1.as_os_str() == "-" {
         return Ok(0);
     }
 
-    let mut reader1 = input_reader(&args.file1, true)?;
-    let mut reader2 = input_reader(&args.file2, true)?;
+    let open = |p: &PathBuf| {
+        input_reader(p, true)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", p.display(), e)))
+    };
+    let mut reader1 = open(&args.file1)?;
+    let mut reader2 = open(&args.file2)?;
 
     let mut lines: u64 = 1;
     let mut bytes: u64 = 0;
@@ -99,10 +104,12 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
                         println!("{} {:o} {:o}", &bytes, c1, c2);
                     } else {
                         println!(
-                            "{} {} differ: char {}, line {}",
+                            "{} {} differ: {} {}, {} {}",
                             args.file1.as_os_str().to_string_lossy(),
                             args.file2.as_os_str().to_string_lossy(),
+                            gettext("char"),
                             bytes,
+                            gettext("line"),
                             lines
                         );
                     }
@@ -113,16 +120,20 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
 
             // (Some, EOF) or (EOF, Some)
             (c1, _) => {
-                eprintln!(
-                    "cmp: EOF on {}",
-                    if c1.is_none() {
-                        &args.file1
-                    } else {
-                        &args.file2
-                    }
-                    .as_os_str()
-                    .to_string_lossy()
-                );
+                // -s suppresses all output, including this diagnostic.
+                if !args.silent {
+                    eprintln!(
+                        "cmp: {} {}",
+                        gettext("EOF on"),
+                        if c1.is_none() {
+                            &args.file1
+                        } else {
+                            &args.file2
+                        }
+                        .as_os_str()
+                        .to_string_lossy()
+                    );
+                }
                 return Ok(1);
             }
         }
@@ -144,9 +155,12 @@ fn main() -> ExitCode {
 
     match cmp_main(&args) {
         Ok(x) => ExitCode::from(x),
-        Err(_) => {
-            // Catches and prevents `io::Error` messages from being written to
-            // stderr which may be against the specification.
+        Err(e) => {
+            // With -s it is unspecified whether a diagnostic is written; we keep
+            // quiet. Otherwise report the error on stderr.
+            if !args.silent {
+                eprintln!("cmp: {}", e);
+            }
             ExitCode::from(2)
         }
     }

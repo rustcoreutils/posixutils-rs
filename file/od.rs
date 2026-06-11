@@ -87,82 +87,57 @@ struct Args {
 impl Args {
     /// Validate the arguments for any conflicts or invalid combinations.
     fn validate_args(&mut self) -> Result<(), String> {
-        // Check if conflicting options are used together
+        // The obsolescent offset operand "[+]offset[.][b]" is only valid in the
+        // obsolescent synopsis form, which uses -b/-c/-d/-o/-s/-x (and -v) but
+        // not -A/-j/-N/-t.
+        let new_form = self.address_base.is_some()
+            || self.skip.is_some()
+            || self.count.is_some()
+            || !self.type_strings.is_empty();
 
-        for file in &self.files {
-            let string = file.to_str().unwrap();
-            if string.starts_with('+') {
-                self.offset = Some(string.to_string());
+        if let Some(last) = self.files.last() {
+            let s = last.to_str().unwrap_or("");
+            let plus = s.starts_with('+');
+            // A '+'-prefixed last operand is always an offset. A bare numeric
+            // last operand is an offset only in the two-operand XSI form
+            // (file offset), to avoid misreading a numeric filename.
+            let bare_numeric = self.files.len() == 2 && s.starts_with(|c: char| c.is_ascii_digit());
+
+            if (plus || bare_numeric) && s != "-" {
+                if new_form {
+                    // Mixing the offset operand with the new-form options is an
+                    // error only for the explicit '+' form; a bare numeric
+                    // operand stays a filename.
+                    if plus {
+                        return Err("Options '-A', '-j', '-N', '-t' cannot be used with the offset operand '[+]offset[.][b]'".to_string());
+                    }
+                } else {
+                    self.offset = Some(s.strip_prefix('+').unwrap_or(s).to_string());
+                    self.files.pop();
+                }
             }
         }
 
-        // '-A', '-j', '-N', '-t', '-v' should not be used with offset syntax [+]offset[.][b]
-        if (self.address_base.is_some()
-            || self.skip.is_some()
-            || self.count.is_some()
-            || !self.type_strings.is_empty()
-            || self.verbose)
-            && self.offset.is_some()
-        {
-            return Err("Options '-A', '-j', '-N', '-t', '-v' cannot be used together with offset syntax '[+]offset[.][b]'".to_string());
-        }
-
-        // '-b', '-c', '-d', '-o', '-s', '-x' should not be used with '-t' options
-        if !self.type_strings.is_empty()
-            && (self.octal_bytes
-                || self.bytes_char
-                || self.unsigned_decimal_words
-                || self.octal_words
-                || self.signed_decimal_words
-                || self.hex_words)
-        {
-            return Err(
-                "Options '-b', '-c', '-d', '-o', '-s', '-x' cannot be used together with '-t'"
-                    .to_string(),
-            );
-        }
-
+        // The short type options -b/-c/-d/-o/-s/-x are shorthands for -t types
+        // and may be combined (with each other and with -t); the requested
+        // types accumulate. (-c ≡ -t c: C-style escapes, not named characters.)
         if self.octal_bytes {
-            self.type_strings = vec!["o1".to_string()];
-        }
-        if self.unsigned_decimal_words {
-            self.type_strings = vec!["u2".to_string()];
-        }
-        if self.octal_words {
-            self.type_strings = vec!["o2".to_string()];
-        }
-        if self.signed_decimal_words {
-            self.type_strings = vec!["d2".to_string()];
-        }
-        if self.hex_words {
-            self.type_strings = vec!["x2".to_string()];
-        }
-
-        // Check if multiple mutually exclusive options are used together
-        let mut basic_types = 0;
-        if self.octal_bytes {
-            basic_types += 1;
+            self.type_strings.push("o1".to_string());
         }
         if self.bytes_char {
-            basic_types += 1;
+            self.type_strings.push("c".to_string());
         }
         if self.unsigned_decimal_words {
-            basic_types += 1;
+            self.type_strings.push("u2".to_string());
         }
         if self.octal_words {
-            basic_types += 1;
+            self.type_strings.push("o2".to_string());
         }
         if self.signed_decimal_words {
-            basic_types += 1;
+            self.type_strings.push("d2".to_string());
         }
         if self.hex_words {
-            basic_types += 1;
-        }
-
-        if basic_types > 1 {
-            return Err(
-                "Options '-b', '-c', '-d', '-o', '-s', '-x' cannot be used together".to_string(),
-            );
+            self.type_strings.push("x2".to_string());
         }
 
         Ok(())
@@ -399,18 +374,7 @@ fn print_data<R: Read>(
         };
 
         // Process and print the buffer based on configuration.
-        if config.bytes_char {
-            // Print bytes as characters.
-
-            let res = process_formatter(&BCFormatter, local_buf, local_buf_len);
-            process_res_string(
-                &offset_string,
-                &mut previous_offset_string,
-                &mut previous_asterisk,
-                &res,
-                config.verbose,
-            );
-        } else if config.type_strings.is_empty() {
+        if config.type_strings.is_empty() {
             // Process the buffer in chunks of 2 bytes.
             let chunks = local_buf.chunks(2);
             let res = process_chunks_formatter(&OFormatter, chunks, 2, local_buf_len);
@@ -427,11 +391,12 @@ fn print_data<R: Read>(
                 // Determine the number of bytes to read for this type.
                 let mut chars = type_string.chars();
                 let type_char = chars.next().unwrap();
-                let num_bytes: usize = chars.as_str().parse().unwrap_or(match type_char {
+                let default_bytes = match type_char {
                     'd' | 'u' | 'o' | 'x' => 2, // Default to 2 bytes for integers
                     'f' => 4,                   // Default to 4 bytes for floats
                     _ => 1,                     // Default to 1 byte for unknown types
-                });
+                };
+                let num_bytes = parse_type_bytes(chars.as_str(), default_bytes);
 
                 let chunks = local_buf.chunks(num_bytes);
                 match type_char {
@@ -928,11 +893,26 @@ trait Formatter {
 
 struct AFormatter;
 struct CFormatter;
-struct BCFormatter;
 struct DefaultFormatter;
+
+/// Parse the size suffix of a `-t` integer/float type: a `C`/`S`/`I`/`L`
+/// letter (char/short/int/long) or an explicit byte count, defaulting when
+/// absent or unrecognized.
+fn parse_type_bytes(size_str: &str, default_bytes: usize) -> usize {
+    match size_str {
+        "" => default_bytes,
+        "C" => 1,
+        "S" => 2,
+        "I" => 4,
+        "L" => 8,
+        s => s.parse().unwrap_or(default_bytes),
+    }
+}
 
 impl Formatter for AFormatter {
     fn format_value(&self, byte: u8) -> String {
+        // Named-character output uses only the least significant seven bits.
+        let byte = byte & 0x7F;
         if let Some(name) = get_named_char(byte) {
             format!(" {name: >3}")
         } else if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
@@ -946,6 +926,7 @@ impl Formatter for AFormatter {
 impl Formatter for CFormatter {
     fn format_value(&self, byte: u8) -> String {
         match byte {
+            b'\0' => "  \\0".to_string(),
             b'\\' => "  \\".to_string(),
             b'\x07' => "  \\a".to_string(),
             b'\x08' => "  \\b".to_string(),
@@ -954,23 +935,6 @@ impl Formatter for CFormatter {
             b'\x0D' => "  \\r".to_string(),
             b'\x09' => "  \\t".to_string(),
             b'\x0B' => "  \\v".to_string(),
-            _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
-                format!("   {}", byte as char)
-            }
-            _ => format!(" {:03o}", byte),
-        }
-    }
-}
-
-impl Formatter for BCFormatter {
-    fn format_value(&self, byte: u8) -> String {
-        match byte {
-            b'\0' => " NUL".to_string(),
-            b'\x08' => "  BS".to_string(),
-            b'\x0C' => "  FF".to_string(),
-            b'\x0A' => "  NL".to_string(),
-            b'\x0D' => "  CR".to_string(),
-            b'\x09' => "  HT".to_string(),
             _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
                 format!("   {}", byte as char)
             }
@@ -1087,61 +1051,73 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let bytes_that_will_be_skipped = bytes_to_skip;
 
-    let mut reader: Box<dyn Read> =
-        if (args.files.len() == 1 && args.files[0].as_os_str() == "-") || args.files.is_empty() {
-            // If there is one file and it is "-" (stdin) or no files, read from stdin.
-            let mut stdin: Box<dyn Read> = Box::new(io::stdin().lock());
+    let mut reader: Box<dyn Read> = if (args.files.len() == 1 && args.files[0].as_os_str() == "-")
+        || args.files.is_empty()
+    {
+        // If there is one file and it is "-" (stdin) or no files, read from stdin.
+        let mut stdin: Box<dyn Read> = Box::new(io::stdin().lock());
 
-            // Buffer of size 1 byte for reading char by char to skip bytes.
-            let mut empty_buffer = [0; 1];
+        // Buffer of size 1 byte for reading char by char to skip bytes.
+        let mut empty_buffer = [0; 1];
 
-            // Skip the specified number of bytes from stdin.
-            while bytes_to_skip > 0 {
-                stdin.read_exact(&mut empty_buffer)?;
-                bytes_to_skip -= 1;
+        // Skip the specified number of bytes from stdin.
+        while bytes_to_skip > 0 {
+            match stdin.read(&mut empty_buffer)? {
+                0 => {
+                    // Spec: skipping past the end of input is a diagnostic
+                    // error with a non-zero exit status.
+                    return Err(io::Error::other(gettext("cannot skip past end of input")).into());
+                }
+                _ => bytes_to_skip -= 1,
             }
-            stdin // Use stdin as the reader.
+        }
+        stdin // Use stdin as the reader.
+    } else {
+        // Otherwise, process each specified file.
+        for file in &args.files {
+            let mut file = File::open(file)?; // Open the file.
+
+            if bytes_skipped < bytes_to_skip {
+                // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
+                let metadata = file.metadata()?; // Get file metadata.
+                let file_size = metadata.len(); // Get file size.
+
+                if bytes_skipped + file_size <= bytes_to_skip {
+                    // Skip the entire file if it is within the range of bytes to skip.
+                    bytes_skipped += file_size;
+                    continue; // Move to the next file.
+                } else {
+                    // Skip part of the file if only a portion of it is within the range of bytes to skip.
+                    let remaining_skip = bytes_to_skip - bytes_skipped;
+                    file.seek(SeekFrom::Start(remaining_skip))?; // Seek to the remaining bytes.
+                    bytes_skipped = bytes_to_skip; // Update the bytes skipped.
+                }
+            }
+
+            // Add the file reader to the vector of readers.
+            all_files.push(Box::new(BufReader::new(file)));
+        }
+
+        // The requested skip extended past the end of all input.
+        if bytes_skipped < bytes_to_skip {
+            return Err(io::Error::other(gettext("cannot skip past end of input")).into());
+        }
+
+        if all_files.len() > 1 {
+            // Combine multiple file readers into a single reader.
+            all_files
+                .into_iter()
+                .reduce(|acc, file| Box::new(acc.chain(file)) as Box<dyn Read>)
+                .ok_or_else(|| io::Error::other("No files to chain"))?
+        // Handle error if no files to chain.
         } else {
-            // Otherwise, process each specified file.
-            for file in &args.files {
-                let mut file = File::open(file)?; // Open the file.
-
-                if bytes_skipped < bytes_to_skip {
-                    // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
-                    let metadata = file.metadata()?; // Get file metadata.
-                    let file_size = metadata.len(); // Get file size.
-
-                    if bytes_skipped + file_size <= bytes_to_skip {
-                        // Skip the entire file if it is within the range of bytes to skip.
-                        bytes_skipped += file_size;
-                        continue; // Move to the next file.
-                    } else {
-                        // Skip part of the file if only a portion of it is within the range of bytes to skip.
-                        let remaining_skip = bytes_to_skip - bytes_skipped;
-                        file.seek(SeekFrom::Start(remaining_skip))?; // Seek to the remaining bytes.
-                        bytes_skipped = bytes_to_skip; // Update the bytes skipped.
-                    }
-                }
-
-                // Add the file reader to the vector of readers.
-                all_files.push(Box::new(BufReader::new(file)));
+            // If only one file, use it as the reader.
+            match all_files.pop() {
+                None => return Ok(()), // Return Ok if no files.
+                Some(f) => f,          // Use the single file as the reader.
             }
-
-            if all_files.len() > 1 {
-                // Combine multiple file readers into a single reader.
-                all_files
-                    .into_iter()
-                    .reduce(|acc, file| Box::new(acc.chain(file)) as Box<dyn Read>)
-                    .ok_or_else(|| io::Error::other("No files to chain"))?
-            // Handle error if no files to chain.
-            } else {
-                // If only one file, use it as the reader.
-                match all_files.pop() {
-                    None => return Ok(()), // Return Ok if no files.
-                    Some(f) => f,          // Use the single file as the reader.
-                }
-            }
-        };
+        }
+    };
 
     // Print the data using the reader.
     print_data(&mut reader, args, bytes_that_will_be_skipped)?;

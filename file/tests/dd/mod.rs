@@ -402,6 +402,17 @@ fn test_combined_conversions() {
         expected_err: b"0+1 records in\n0+1 records out\n".to_vec(),
         expected_exit_code: 0,
     });
+
+    // DD-1: conversions are applied in the fixed spec order regardless of how
+    // they are listed; swab runs before ucase either way.
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![String::from("conv=swab,ucase")],
+        stdin_data: b"abcd".to_vec(),
+        expected_out: b"BADC".to_vec(),
+        expected_err: b"0+1 records in\n0+1 records out\n".to_vec(),
+        expected_exit_code: 0,
+    });
 }
 
 #[test]
@@ -425,6 +436,24 @@ fn test_sync_with_block() {
         stdin_data: input_data.to_vec(),
         expected_out: b"test            ".to_vec(), // 4 chars + 4 spaces + 8 spaces = 16 bytes
         expected_err: b"0+1 records in\n0+1 records out\n".to_vec(),
+        expected_exit_code: 0,
+    });
+}
+
+// DD-5: iflags=fullblock accumulates a full ibs-sized block per read,
+// so count= counts whole blocks even when the input arrives in short reads.
+#[test]
+fn test_iflags_fullblock() {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![
+            String::from("ibs=4"),
+            String::from("count=1"),
+            String::from("iflags=fullblock"),
+        ],
+        stdin_data: b"abcdefgh".to_vec(),
+        expected_out: b"abcd".to_vec(),
+        expected_err: b"1+0 records in\n0+1 records out\n".to_vec(),
         expected_exit_code: 0,
     });
 }

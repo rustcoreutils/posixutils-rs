@@ -19,7 +19,22 @@ use std::time::SystemTime;
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::modestr;
-use regex::Regex;
+
+/// Match `string` against a shell filename pattern using POSIX `fnmatch(3)`,
+/// the matching notation mandated for `-name`/`-iname`/`-path` (XBD filename
+/// pattern matching), rather than a regular expression. `fold` requests a
+/// case-insensitive match (`FNM_CASEFOLD`, for `-iname`).
+///
+/// Neither `-name` nor `-path` sets `FNM_PATHNAME`: POSIX `-path` explicitly
+/// does not treat a `<slash>` specially, and `-name` only ever sees a basename.
+fn fnmatch(pattern: &str, string: &str, fold: bool) -> bool {
+    use std::ffi::CString;
+    let (Ok(p), Ok(s)) = (CString::new(pattern), CString::new(string)) else {
+        return false;
+    };
+    let flags = if fold { libc::FNM_CASEFOLD } else { 0 };
+    unsafe { libc::fnmatch(p.as_ptr(), s.as_ptr(), flags) == 0 }
+}
 
 /// Symlink following mode
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -137,13 +152,21 @@ enum ExecMode {
 #[derive(Clone, Debug)]
 enum Primary {
     // Tests
-    Name(Regex),
-    Path(Regex),
+    Name {
+        pattern: String,
+        fold: bool,
+    },
+    Path {
+        pattern: String,
+        fold: bool,
+    },
     Type(FileTypeMatch),
     Perm(PermMode),
     Links(NumericComparison),
-    User(String),
-    Group(String),
+    // Resolved once at parse time; None means the name resolved to no id (never
+    // matches), preserving the "unknown user/group → no match" behavior.
+    User(Option<u32>),
+    Group(Option<u32>),
     Size {
         cmp: NumericComparison,
         in_bytes: bool,
@@ -168,6 +191,7 @@ enum Primary {
     // Global options (always true, affect traversal)
     Depth,
     XDev,
+    Mount,
 }
 
 /// Expression AST node
@@ -219,8 +243,13 @@ struct FindState {
     depth_first: bool,
     /// Whether -xdev was specified anywhere in expression
     xdev: bool,
-    /// Device IDs of visited directories (for cycle detection)
+    /// Whether -mount was specified anywhere in expression
+    mount: bool,
+    /// (dev, ino) of the directories on the current descent path (for
+    /// file-system loop detection)
     visited_inodes: HashSet<(u64, u64)>,
+    /// Path first seen at each visited inode, for the loop diagnostic
+    visited_paths: std::collections::HashMap<(u64, u64), PathBuf>,
     /// Whether expression contains any action (-print, -exec, -ok)
     has_action: bool,
     /// Files accumulated for batched -exec
@@ -233,7 +262,9 @@ impl FindState {
             had_error: false,
             depth_first: false,
             xdev: false,
+            mount: false,
             visited_inodes: HashSet::new(),
+            visited_paths: std::collections::HashMap::new(),
             has_action: false,
             exec_batches: Vec::new(),
         }
@@ -369,13 +400,31 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
     match tok {
         "-name" => {
             let pattern = get_arg(tokens, idx, "-name")?;
-            let regex = pattern_to_regex(pattern)?;
-            Ok(Expr::Primary(Primary::Name(regex)))
+            Ok(Expr::Primary(Primary::Name {
+                pattern: pattern.to_string(),
+                fold: false,
+            }))
+        }
+        "-iname" => {
+            let pattern = get_arg(tokens, idx, "-iname")?;
+            Ok(Expr::Primary(Primary::Name {
+                pattern: pattern.to_string(),
+                fold: true,
+            }))
         }
         "-path" => {
             let pattern = get_arg(tokens, idx, "-path")?;
-            let regex = pattern_to_regex(pattern)?;
-            Ok(Expr::Primary(Primary::Path(regex)))
+            Ok(Expr::Primary(Primary::Path {
+                pattern: pattern.to_string(),
+                fold: false,
+            }))
+        }
+        "-ipath" => {
+            let pattern = get_arg(tokens, idx, "-ipath")?;
+            Ok(Expr::Primary(Primary::Path {
+                pattern: pattern.to_string(),
+                fold: true,
+            }))
         }
         "-type" => {
             let type_char = get_arg(tokens, idx, "-type")?;
@@ -397,12 +446,13 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             Ok(Expr::Primary(Primary::Links(cmp)))
         }
         "-user" => {
+            // POSIX: the argument is evaluated only once, so resolve it now.
             let uname = get_arg(tokens, idx, "-user")?;
-            Ok(Expr::Primary(Primary::User(uname.to_string())))
+            Ok(Expr::Primary(Primary::User(resolve_user(uname).ok())))
         }
         "-group" => {
             let gname = get_arg(tokens, idx, "-group")?;
-            Ok(Expr::Primary(Primary::Group(gname.to_string())))
+            Ok(Expr::Primary(Primary::Group(resolve_group(gname).ok())))
         }
         "-size" => {
             let size_str = get_arg(tokens, idx, "-size")?;
@@ -426,8 +476,12 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         "-newer" => {
             let file = get_arg(tokens, idx, "-newer")?;
-            let metadata =
-                fs::metadata(file).map_err(|e| format!("cannot access '{}': {}", file, e))?;
+            // Follow the link to the target; if it is a dangling symlink, fall
+            // back to the link's own timestamp (POSIX: use the link's mtime
+            // when the referenced file does not exist).
+            let metadata = fs::metadata(file)
+                .or_else(|_| fs::symlink_metadata(file))
+                .map_err(|e| format!("cannot access '{}': {}", file, e))?;
             let mtime = metadata
                 .modified()
                 .map_err(|e| format!("cannot get mtime of '{}': {}", file, e))?;
@@ -440,6 +494,7 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         "-prune" => Ok(Expr::Primary(Primary::Prune)),
         "-depth" => Ok(Expr::Primary(Primary::Depth)),
         "-xdev" => Ok(Expr::Primary(Primary::XDev)),
+        "-mount" => Ok(Expr::Primary(Primary::Mount)),
         "-exec" => {
             let exec_mode = parse_exec(tokens, idx)?;
             Ok(Expr::Primary(Primary::Exec(exec_mode)))
@@ -627,48 +682,14 @@ fn has_xdev(expr: &Expr) -> bool {
     }
 }
 
-/// Convert shell glob pattern to regex
-fn pattern_to_regex(pattern: &str) -> Result<Regex, String> {
-    let mut regex_str = String::from("^");
-
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => regex_str.push_str(".*"),
-            '?' => regex_str.push('.'),
-            '[' => {
-                regex_str.push('[');
-                // Handle character class
-                if chars.peek() == Some(&'!') {
-                    chars.next();
-                    regex_str.push('^');
-                }
-                // Copy until ]
-                let mut first = true;
-                while let Some(&cc) = chars.peek() {
-                    chars.next();
-                    if cc == ']' && !first {
-                        regex_str.push(']');
-                        break;
-                    }
-                    // Escape regex special chars inside class
-                    if cc == '\\' || cc == '^' || cc == '-' {
-                        regex_str.push('\\');
-                    }
-                    regex_str.push(cc);
-                    first = false;
-                }
-            }
-            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '\\' => {
-                regex_str.push('\\');
-                regex_str.push(c);
-            }
-            _ => regex_str.push(c),
-        }
+/// Check if expression contains -mount
+fn has_mount(expr: &Expr) -> bool {
+    match expr {
+        Expr::Primary(Primary::Mount) => true,
+        Expr::Not(e) => has_mount(e),
+        Expr::And(l, r) | Expr::Or(l, r) => has_mount(l) || has_mount(r),
+        _ => false,
     }
-
-    regex_str.push('$');
-    Regex::new(&regex_str).map_err(|e| format!("invalid pattern: {}", e))
 }
 
 /// Evaluate expression against a file
@@ -712,14 +733,14 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
 /// Evaluate a single primary
 fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match primary {
-        Primary::Name(regex) => {
+        Primary::Name { pattern, fold } => {
             let name = ctx.path.file_name().unwrap_or(OsStr::new(""));
             let name_str = name.to_string_lossy();
-            EvalResult::new(regex.is_match(&name_str))
+            EvalResult::new(fnmatch(pattern, &name_str, *fold))
         }
-        Primary::Path(regex) => {
+        Primary::Path { pattern, fold } => {
             let path_str = ctx.path.to_string_lossy();
-            EvalResult::new(regex.is_match(&path_str))
+            EvalResult::new(fnmatch(pattern, &path_str, *fold))
         }
         Primary::Type(ft) => {
             // When -L is used and checking for symlink, use link_metadata
@@ -742,22 +763,8 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             let nlinks = ctx.metadata.nlink() as i64;
             EvalResult::new(cmp.matches(nlinks))
         }
-        Primary::User(uname) => {
-            // Resolve at evaluation time - return false if user doesn't exist
-            let target_uid = match resolve_user(uname) {
-                Ok(uid) => uid,
-                Err(_) => return EvalResult::new(false),
-            };
-            EvalResult::new(ctx.metadata.uid() == target_uid)
-        }
-        Primary::Group(gname) => {
-            // Resolve at evaluation time - return false if group doesn't exist
-            let target_gid = match resolve_group(gname) {
-                Ok(gid) => gid,
-                Err(_) => return EvalResult::new(false),
-            };
-            EvalResult::new(ctx.metadata.gid() == target_gid)
-        }
+        Primary::User(uid) => EvalResult::new(*uid == Some(ctx.metadata.uid())),
+        Primary::Group(gid) => EvalResult::new(*gid == Some(ctx.metadata.gid())),
         Primary::Size { cmp, in_bytes } => {
             let size = if *in_bytes {
                 ctx.metadata.len() as i64
@@ -824,7 +831,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             // Always true, affects traversal order (handled globally)
             EvalResult::new(true)
         }
-        Primary::XDev => {
+        Primary::XDev | Primary::Mount => {
             // Always true, affects traversal (handled globally)
             EvalResult::new(true)
         }
@@ -870,8 +877,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 return EvalResult::new(false);
             }
 
-            let response = response.trim().to_lowercase();
-            if response != "y" && response != "yes" {
+            if !is_affirmative(response.trim_end_matches('\n')) {
                 return EvalResult::new(false);
             }
 
@@ -899,12 +905,38 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
     }
 }
 
-/// Calculate time difference in days (init_time - file_time) / 86400
-fn time_diff_days(init_time: SystemTime, file_time: SystemTime) -> i64 {
-    match init_time.duration_since(file_time) {
-        Ok(d) => (d.as_secs() / 86400) as i64,
-        Err(_) => 0, // File is in the future
+/// Does `response` match the locale's affirmative pattern (`YESEXPR`)? Used by
+/// `-ok` so the accepted answers follow `LC_MESSAGES` rather than hardcoded
+/// English. Falls back to `^[yY]` if the locale pattern is unavailable.
+fn is_affirmative(response: &str) -> bool {
+    use std::ffi::CStr;
+    let pattern = unsafe {
+        let p = libc::nl_langinfo(libc::YESEXPR);
+        if p.is_null() {
+            None
+        } else {
+            CStr::from_ptr(p).to_str().ok().map(str::to_owned)
+        }
+    };
+    let pattern = pattern.filter(|s| !s.is_empty());
+    match pattern {
+        Some(pat) => match plib::regex::Regex::ere(&pat) {
+            Ok(re) => re.is_match(response),
+            Err(_) => response.starts_with(['y', 'Y']),
+        },
+        None => response.starts_with(['y', 'Y']),
     }
+}
+
+/// Calculate time difference in days, (init_time - file_time) / 86400 with the
+/// remainder discarded. A file timestamp in the future yields a negative value
+/// (not clamped to 0), so comparisons like `-mtime -1` behave correctly.
+fn time_diff_days(init_time: SystemTime, file_time: SystemTime) -> i64 {
+    let secs = match init_time.duration_since(file_time) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    secs / 86400
 }
 
 /// Get metadata for a path, following symlinks according to mode
@@ -962,19 +994,29 @@ fn walk_tree(
     // Check for cycles (infinite loop detection)
     let inode_key = (metadata.dev(), metadata.ino());
     if metadata.is_dir() && state.visited_inodes.contains(&inode_key) {
+        let ancestor = state
+            .visited_paths
+            .get(&inode_key)
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf());
         eprintln!(
             "find: File system loop detected; '{}' is part of the same file system loop as '{}'.",
             path.display(),
-            path.display()
+            ancestor.display()
         );
         state.had_error = true;
         return;
     }
 
-    // Check xdev
-    if state.xdev && metadata.dev() != root_dev && !is_cmdline {
+    // Device-crossing handling for -xdev / -mount. When a directory on a
+    // different device is encountered (not a command-line path operand):
+    //   -mount: do not act on it and do not descend (excludes the mount point).
+    //   -xdev:  act on it but do not descend (includes the mount point).
+    let on_other_dev = !is_cmdline && metadata.dev() != root_dev;
+    if on_other_dev && state.mount {
         return;
     }
+    let block_descend = on_other_dev && state.xdev;
 
     let ctx = EvalContext {
         path,
@@ -984,10 +1026,12 @@ fn walk_tree(
     };
 
     // If depth-first, process children before this entry
-    if state.depth_first && metadata.is_dir() {
+    if state.depth_first && metadata.is_dir() && !block_descend {
         state.visited_inodes.insert(inode_key);
+        state.visited_paths.insert(inode_key, path.to_path_buf());
         process_children(path, expr, symlink_mode, root_dev, init_time, state);
         state.visited_inodes.remove(&inode_key);
+        state.visited_paths.remove(&inode_key);
     }
 
     // Evaluate expression for this entry
@@ -1003,10 +1047,12 @@ fn walk_tree(
     }
 
     // If not depth-first and is directory, process children
-    if !state.depth_first && metadata.is_dir() && !result.prune {
+    if !state.depth_first && metadata.is_dir() && !result.prune && !block_descend {
         state.visited_inodes.insert(inode_key);
+        state.visited_paths.insert(inode_key, path.to_path_buf());
         process_children(path, expr, symlink_mode, root_dev, init_time, state);
         state.visited_inodes.remove(&inode_key);
+        state.visited_paths.remove(&inode_key);
     }
 }
 
@@ -1062,11 +1108,23 @@ fn find_or_create_batch(expr: &Expr, state: &mut FindState) -> Option<usize> {
     }
 
     if let Some(mode) = find_batch_exec(expr) {
-        // Check if we already have this batch
+        // A batch is identified by both its utility and its leading arguments,
+        // so two `-exec util a {} +` / `-exec util b {} +` do not collide.
         for (i, (m, _)) in state.exec_batches.iter().enumerate() {
-            if matches!((m, &mode), (ExecMode::Batch { utility: u1, .. }, ExecMode::Batch { utility: u2, .. }) if u1 == u2)
+            if let (
+                ExecMode::Batch {
+                    utility: u1,
+                    args_before: a1,
+                },
+                ExecMode::Batch {
+                    utility: u2,
+                    args_before: a2,
+                },
+            ) = (m, &mode)
             {
-                return Some(i);
+                if u1 == u2 && a1 == a2 {
+                    return Some(i);
+                }
             }
         }
         // Create new batch
@@ -1077,36 +1135,66 @@ fn find_or_create_batch(expr: &Expr, state: &mut FindState) -> Option<usize> {
     }
 }
 
-/// Execute all pending batched -exec commands
+/// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
+/// it exited successfully.
+fn run_exec_command(utility: &str, args_before: &[String], files: &[PathBuf]) -> bool {
+    let mut cmd = Command::new(utility);
+    cmd.args(args_before);
+    cmd.args(files);
+    match cmd.status() {
+        Ok(status) => status.success(),
+        Err(e) => {
+            eprintln!("find: '{}': {}", utility, e);
+            false
+        }
+    }
+}
+
+/// Execute all pending batched -exec commands, splitting the file list into
+/// invocations whose argument size stays under `ARG_MAX`.
 fn execute_batches(state: &mut FindState) {
+    let ptr = std::mem::size_of::<usize>();
+    let arg_max = match unsafe { libc::sysconf(libc::_SC_ARG_MAX) } {
+        n if n > 0 => n as usize,
+        _ => 1 << 17, // 128 KiB fallback
+    };
+    // Reserve room for the environment, the utility/args_before, and overhead.
+    let env_size: usize = std::env::vars_os()
+        .map(|(k, v)| k.len() + v.len() + 2 + ptr)
+        .sum();
+
     for (mode, files) in state.exec_batches.drain(..) {
         if files.is_empty() {
             continue;
         }
-
-        if let ExecMode::Batch {
+        let ExecMode::Batch {
             utility,
             args_before,
         } = mode
-        {
-            // Build command with all files
-            let mut cmd = Command::new(&utility);
-            cmd.args(&args_before);
-            for f in &files {
-                cmd.arg(f);
-            }
+        else {
+            continue;
+        };
 
-            match cmd.status() {
-                Ok(status) => {
-                    if !status.success() {
-                        state.had_error = true;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("find: '{}': {}", utility, e);
+        let fixed: usize =
+            utility.len() + 1 + ptr + args_before.iter().map(|a| a.len() + 1 + ptr).sum::<usize>();
+        let budget = arg_max.saturating_sub(env_size + fixed + 2048);
+
+        let mut chunk: Vec<PathBuf> = Vec::new();
+        let mut chunk_size = 0usize;
+        for f in files {
+            let cost = f.as_os_str().len() + 1 + ptr;
+            if !chunk.is_empty() && chunk_size + cost > budget {
+                if !run_exec_command(&utility, &args_before, &chunk) {
                     state.had_error = true;
                 }
+                chunk.clear();
+                chunk_size = 0;
             }
+            chunk_size += cost;
+            chunk.push(f);
+        }
+        if !chunk.is_empty() && !run_exec_command(&utility, &args_before, &chunk) {
+            state.had_error = true;
         }
     }
 }
@@ -1127,6 +1215,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
     let mut state = FindState::new();
     state.depth_first = has_depth(&expr);
     state.xdev = has_xdev(&expr);
+    state.mount = has_mount(&expr);
     state.has_action = expr_has_action;
 
     let init_time = SystemTime::now();

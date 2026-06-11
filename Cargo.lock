@@ -1718,7 +1718,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "regex",
+ "tempfile",
  "walkdir",
 ]
 

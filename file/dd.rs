@@ -134,7 +134,8 @@ struct Config {
     conversions: Vec<Conversion>,
     noerror: bool,
     notrunc: bool,
-    bs_mode: bool, // True if bs= was used (passthrough mode)
+    bs_mode: bool,          // True if bs= was used (passthrough mode)
+    iflags_fullblock: bool, // iflags=fullblock: accumulate a full ibs per block
 }
 
 impl Default for Config {
@@ -152,6 +153,7 @@ impl Default for Config {
             noerror: Default::default(),
             notrunc: Default::default(),
             bs_mode: false,
+            iflags_fullblock: false,
         }
     }
 }
@@ -170,6 +172,19 @@ impl Config {
         self.conversions
             .iter()
             .any(|c| !matches!(c, Conversion::Sync))
+    }
+
+    fn has(&self, want: Conversion) -> bool {
+        self.conversions
+            .iter()
+            .any(|c| std::mem::discriminant(c) == std::mem::discriminant(&want))
+    }
+
+    fn ascii_conv(&self) -> Option<AsciiConv> {
+        self.conversions.iter().find_map(|c| match c {
+            Conversion::Ascii(a) => Some(*a),
+            _ => None,
+        })
     }
 }
 
@@ -200,18 +215,16 @@ fn convert_swab(data: &mut [u8]) {
 }
 
 fn convert_lcase(data: &mut [u8]) {
+    // Use the locale's LC_CTYPE mapping (faithful for single-byte locales)
+    // rather than ASCII-only arithmetic.
     for byte in data.iter_mut() {
-        if *byte >= b'A' && *byte <= b'Z' {
-            *byte += 32;
-        }
+        *byte = unsafe { libc::tolower(*byte as libc::c_int) as u8 };
     }
 }
 
 fn convert_ucase(data: &mut [u8]) {
     for byte in data.iter_mut() {
-        if *byte >= b'a' && *byte <= b'z' {
-            *byte -= 32;
-        }
+        *byte = unsafe { libc::toupper(*byte as libc::c_int) as u8 };
     }
 }
 
@@ -268,19 +281,36 @@ fn convert_unblock(data: &mut Vec<u8>, cbs: usize) {
     *data = result;
 }
 
+/// Apply conversions in the fixed order mandated by POSIX (EXTENDED
+/// DESCRIPTION processing steps), regardless of the order they were listed in
+/// the `conv=` operand: sync padding, then swab, then the charset/case and
+/// block/unblock conversions.
 fn apply_conversions(data: &mut Vec<u8>, config: &Config, stats: &mut Stats) {
     let use_space_padding = config.has_block_unblock();
 
-    for conversion in &config.conversions {
-        match conversion {
-            Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
-            Conversion::Lcase => convert_lcase(data),
-            Conversion::Ucase => convert_ucase(data),
-            Conversion::Swab => convert_swab(data),
-            Conversion::Sync => convert_sync(data, config.ibs, use_space_padding),
-            Conversion::Block => convert_block(data, config.cbs, &mut stats.truncated),
-            Conversion::Unblock => convert_unblock(data, config.cbs),
-        }
+    // Step 2: pad a short final block when sync is requested.
+    if config.has(Conversion::Sync) {
+        convert_sync(data, config.ibs, use_space_padding);
+    }
+    // Step 4: swab.
+    if config.has(Conversion::Swab) {
+        convert_swab(data);
+    }
+    // Step 5: remaining conversions (charset, case, block/unblock).
+    if let Some(ascii_conv) = config.ascii_conv() {
+        convert_ascii(data, &ascii_conv);
+    }
+    if config.has(Conversion::Lcase) {
+        convert_lcase(data);
+    }
+    if config.has(Conversion::Ucase) {
+        convert_ucase(data);
+    }
+    if config.has(Conversion::Block) {
+        convert_block(data, config.cbs, &mut stats.truncated);
+    }
+    if config.has(Conversion::Unblock) {
+        convert_unblock(data, config.cbs);
     }
 }
 
@@ -345,6 +375,24 @@ impl OutputFile {
     }
 }
 
+/// Read one input block into `buf`. With `iflags=fullblock`, keep reading until
+/// `buf` is full or EOF (a short read does not by itself end the block);
+/// otherwise a single `read()` forms the block.
+fn read_block(ifile: &mut InputFile, buf: &mut [u8], fullblock: bool) -> io::Result<usize> {
+    if !fullblock {
+        return ifile.read(buf);
+    }
+    let mut got = 0;
+    while got < buf.len() {
+        let n = ifile.read(&mut buf[got..])?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    Ok(got)
+}
+
 fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error>> {
     let mut stats = Stats::default();
 
@@ -376,12 +424,18 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
         let skip_bytes = config.skip * config.ibs;
         // Try to seek first
         if !ifile.try_seek(SeekFrom::Start(skip_bytes as u64))? {
-            // Non-seekable: read and discard
+            // Non-seekable: read and discard a full ibs-sized block at a time,
+            // accumulating short reads so each skipped block is exactly ibs
+            // bytes (not one read() call, which may return fewer bytes).
             let mut remaining = config.skip;
-            while remaining > 0 {
-                let n = ifile.read(&mut ibuf)?;
-                if n == 0 {
-                    break;
+            'skip: while remaining > 0 {
+                let mut got = 0;
+                while got < config.ibs {
+                    let n = ifile.read(&mut ibuf[got..])?;
+                    if n == 0 {
+                        break 'skip;
+                    }
+                    got += n;
                 }
                 remaining -= 1;
             }
@@ -420,7 +474,7 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
             }
         }
 
-        let n = match ifile.read(&mut ibuf) {
+        let n = match read_block(&mut ifile, &mut ibuf, config.iflags_fullblock) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
@@ -436,11 +490,15 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
                         ibuf.fill(0);
                         config.ibs
                     } else {
-                        // Skip this block
+                        // Skip this block, but still count it as a (partial)
+                        // input block that was read.
                         blocks_read += 1;
+                        stats.in_partial += 1;
                         continue;
                     }
                 } else {
+                    // Report the statistics gathered so far before aborting.
+                    stats.print();
                     return Err(e.into());
                 }
             }
@@ -535,7 +593,9 @@ fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Erro
             chars.pop();
             match last {
                 'c' => scale = 1,
-                'w' => scale = 2,
+                // POSIX explicitly does not support the 'w' (word) suffix
+                // because the word size is non-portable; reject it rather than
+                // silently assuming 2.
                 'b' => scale = 512,
                 'k' | 'K' => scale = 1024,
                 'm' | 'M' => scale = 1024 * 1024,
@@ -606,12 +666,33 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
 
             "conv" => parse_conv_list(&mut config, &oparg)?,
 
+            "iflags" => {
+                for flag in oparg.split(',') {
+                    match flag {
+                        "fullblock" => config.iflags_fullblock = true,
+                        "" => {}
+                        _ => {
+                            eprintln!("{}: {}", gettext("invalid iflags option"), flag);
+                            return Err(format!("invalid iflags option: {}", flag).into());
+                        }
+                    }
+                }
+            }
+
             _ => {
                 eprintln!("{}: {}", gettext("invalid option"), op);
                 return Err(format!("invalid option: {}", op).into());
             }
         }
     }
+
+    // block/unblock are unspecified without a non-zero cbs; treat as an error.
+    if config.cbs == 0 && config.has_block_unblock() {
+        let msg = gettext("conv=block/unblock requires a non-zero cbs=");
+        eprintln!("dd: {}", msg);
+        return Err(msg.into());
+    }
+
     Ok(config)
 }
 
@@ -634,9 +715,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats = copy_convert_file(&config)?;
     stats.print();
 
-    // If we were interrupted, exit with signal status
+    // On SIGINT, terminate "as if by the default action" so the parent sees
+    // the process as signal-killed (WIFSIGNALED): restore the default handler
+    // and re-raise, after the statistics have been written.
     if INTERRUPTED.load(Ordering::SeqCst) {
-        std::process::exit(128 + libc::SIGINT);
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::raise(libc::SIGINT);
+        }
     }
 
     Ok(())

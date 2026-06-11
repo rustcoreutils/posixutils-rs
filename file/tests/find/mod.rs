@@ -2,7 +2,7 @@ use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use plib::testing::{get_binary_path, run_test, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 
 fn run_test_find(
     args: &[&str],
@@ -318,4 +318,91 @@ fn find_print0_with_name_filter() {
     let file3 = format!("{}/file1.txt", test_dir);
 
     run_test_find_print0_sorted(&args, &[&file1, &file2, &file3], 0)
+}
+
+// --- fnmatch / -iname (find-A) ---
+
+/// Create a fresh temp dir with the given files; returns its path.
+fn make_fnmatch_dir(tag: &str, files: &[&str]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in files {
+        File::create(dir.join(f)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn find_name_bracket_range() {
+    // POSIX bracket expression [a-z] must match a single lowercase letter.
+    let dir = make_fnmatch_dir("bracket", &["m", "Q", "9", "abc"]);
+    let ds = dir.to_str().unwrap();
+    let expect = format!("{ds}/m");
+    run_test_find_sorted(&[ds, "-name", "[a-z]"], &[&expect], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_name_bracket_negation() {
+    let dir = make_fnmatch_dir("negation", &["m", "Q", "9"]);
+    let ds = dir.to_str().unwrap();
+    let e1 = format!("{ds}/Q");
+    let e2 = format!("{ds}/9");
+    run_test_find_sorted(&[ds, "-name", "[!a-z]"], &[&e1, &e2], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_iname_case_insensitive() {
+    let dir = make_fnmatch_dir("iname", &["README.md", "other.txt"]);
+    let ds = dir.to_str().unwrap();
+    let expect = format!("{ds}/README.md");
+    run_test_find_sorted(&[ds, "-iname", "readme.md"], &[&expect], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn find_name_question_mark() {
+    let dir = make_fnmatch_dir("qmark", &["ab", "abc", "a"]);
+    let ds = dir.to_str().unwrap();
+    let expect = format!("{ds}/ab");
+    run_test_find_sorted(&[ds, "-name", "a?"], &[&expect], "", 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// FIND-5: -ok prompts and only runs the utility on an affirmative answer.
+fn run_ok_test(answer: &str, expect_stdout_nonempty: bool) {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let target = format!("{}/tests/find/other/empty_file.txt", project_root);
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("find"),
+            args: vec![
+                target.clone(),
+                String::from("-ok"),
+                String::from("echo"),
+                String::from("{}"),
+                String::from(";"),
+            ],
+            stdin_data: String::from(answer),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.contains(&target), expect_stdout_nonempty);
+        },
+    );
+}
+
+#[test]
+fn find_ok_accepted() {
+    run_ok_test("y\n", true);
+}
+
+#[test]
+fn find_ok_declined() {
+    run_ok_test("n\n", false);
 }

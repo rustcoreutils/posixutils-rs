@@ -23,13 +23,16 @@ struct Args {
     #[arg(short, long, help = gettext("Ignore the SIGINT signal"))]
     ignore: bool,
 
-    #[arg(short, long, help = gettext("One or more output files"))]
+    #[arg(help = gettext("One or more output files"))]
     files: Vec<String>,
 }
 
 struct TeeFile {
     filename: String,
     f: File,
+    /// Cleared once a write to this file has failed; further writes are skipped
+    /// while writes to the other files and to standard output continue.
+    ok: bool,
 }
 
 #[derive(Default)]
@@ -37,7 +40,11 @@ struct TeeInfo {
     outputs: Vec<TeeFile>,
 }
 
-fn open_outputs(args: &Args, info: &mut TeeInfo) -> io::Result<()> {
+/// Open every file operand. A file that cannot be opened produces a diagnostic
+/// and is skipped — the remaining files are still opened — and the overall
+/// exit status becomes non-zero (returned as `had_error`).
+fn open_outputs(args: &Args, info: &mut TeeInfo) -> bool {
+    let mut had_error = false;
     for filename in &args.files {
         let f_res = OpenOptions::new()
             .read(false)
@@ -49,47 +56,65 @@ fn open_outputs(args: &Args, info: &mut TeeInfo) -> io::Result<()> {
 
         match f_res {
             Err(e) => {
-                eprintln!("{}: {}", filename, e);
-                return Err(e);
+                eprintln!("tee: {}: {}", filename, e);
+                had_error = true;
             }
             Ok(f) => {
                 info.outputs.push(TeeFile {
                     filename: filename.to_string(),
                     f,
+                    ok: true,
                 });
             }
         }
     }
 
-    Ok(())
+    had_error
 }
 
-fn tee_stdin(info: &mut TeeInfo) -> io::Result<()> {
+/// Copy standard input to standard output and to each open file. Per POSIX
+/// CONSEQUENCES OF ERRORS, a failed write to one file does not stop writes to
+/// the other files or to standard output; only the exit status becomes
+/// non-zero. Returns `had_error`.
+fn tee_stdin(info: &mut TeeInfo) -> bool {
     let mut buffer = [0; BUFSZ];
+    let mut had_error = false;
 
     loop {
-        let n_read_res = io::stdin().read(&mut buffer[..]);
-        if let Err(e) = n_read_res {
-            eprintln!("stdin: {}", e);
-            return Err(e);
-        }
-        let n_read = n_read_res.unwrap();
+        let n_read = match io::stdin().read(&mut buffer[..]) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("tee: stdin: {}", e);
+                return true;
+            }
+        };
         if n_read == 0 {
             break;
         }
 
         let bufslice = &buffer[0..n_read];
 
+        // tee copies standard input to standard output, in addition to each
+        // named file (POSIX: "The standard output shall be a copy of the
+        // standard input.").
+        if let Err(e) = io::stdout().write_all(bufslice) {
+            eprintln!("tee: stdout: {}", e);
+            had_error = true;
+        }
+
         for output in &mut info.outputs {
-            let res = output.f.write_all(bufslice);
-            if let Err(e) = res {
-                eprintln!("{}: {}", output.filename, e);
-                return Err(e);
+            if !output.ok {
+                continue;
+            }
+            if let Err(e) = output.f.write_all(bufslice) {
+                eprintln!("tee: {}: {}", output.filename, e);
+                output.ok = false;
+                had_error = true;
             }
         }
     }
 
-    Ok(())
+    had_error
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,8 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = TeeInfo::default();
 
-    open_outputs(&args, &mut state)?;
-    tee_stdin(&mut state)?;
+    let mut had_error = open_outputs(&args, &mut state);
+    had_error |= tee_stdin(&mut state);
 
+    if had_error {
+        std::process::exit(1);
+    }
     Ok(())
 }

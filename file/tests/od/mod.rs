@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_u8, TestPlan, TestPlanU8};
 
 fn od_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -305,4 +305,76 @@ fn test_od_a_x_t_a() {
 00000d
 ",
     );
+}
+
+// -c must use C-style escapes (\t, \n, \0), NOT named characters (HT, NL, NUL).
+#[test]
+fn test_od_c_uses_c_escapes() {
+    od_test(&["-c", "-An"], "A\tB\nC", "   A  \\t   B  \\n   C\n");
+}
+
+#[test]
+fn test_od_c_nul_is_backslash_zero() {
+    od_test(&["-c", "-An"], "X\0Y", "   X  \\0   Y\n");
+}
+
+// -c is equivalent to -t c.
+#[test]
+fn test_od_c_equals_t_c() {
+    let data = "A\tB\0";
+    od_test(&["-c", "-An"], data, "   A  \\t   B  \\0\n");
+    od_test(&["-t", "c", "-An"], data, "   A  \\t   B  \\0\n");
+}
+
+// OD-2: multiple short type options accumulate (one line per type).
+#[test]
+fn test_od_multiple_short_types() {
+    od_test(&["-An", "-b", "-c"], "AB", " 101 102\n   A   B\n");
+}
+
+// OD-4: C/S/I/L type size suffixes.
+#[test]
+fn test_od_type_size_long() {
+    od_test(
+        &["-An", "-t", "dL"],
+        "\x01\x00\x00\x00\x00\x00\x00\x00",
+        "                    1\n",
+    );
+}
+
+// OD-3: -t a uses only the least-significant seven bits (0x8A & 0x7F == 0x0A).
+#[test]
+fn test_od_named_char_seven_bit() {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("od"),
+        args: vec![String::from("-An"), String::from("-t"), String::from("a")],
+        stdin_data: vec![0x8a],
+        expected_out: b"  nl\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// OD-5: the obsolescent "[+]offset" operand sets the start offset and is not
+// opened as a file.
+#[test]
+fn test_od_plus_offset_operand() {
+    od_test(
+        &["-b", "+2"],
+        "ABCDEFGH",
+        "0000002 103 104 105 106 107 110\n0000010\n",
+    );
+}
+
+// OD-6: skipping past the end of input is a diagnostic error (exit > 0).
+#[test]
+fn test_od_skip_past_eof() {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("od"),
+        args: vec![String::from("-j"), String::from("100")],
+        stdin_data: b"ab".to_vec(),
+        expected_out: Vec::new(),
+        expected_err: b"cannot skip past end of input".to_vec(),
+        expected_exit_code: 1,
+    });
 }

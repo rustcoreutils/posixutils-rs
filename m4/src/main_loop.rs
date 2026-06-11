@@ -97,9 +97,15 @@ pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::erro
                 if l != b'(' && definition.parse_config.min_args > 0 {
                     state.output.write_all(&token)?;
                 } else {
-                    let frame = StackFrame::new(0, definition.clone());
+                    let mut frame = StackFrame::new(0, definition.clone());
 
                     if l == b'(' {
+                        // A parenthesised call always has at least one (possibly
+                        // empty) argument: POSIX makes $# "0 if the macro was
+                        // invoked without being followed by a <left-parenthesis>,
+                        // otherwise 1 more than the number of unquoted commas".
+                        // Seed that first argument so `macro()` reports $#==1.
+                        frame.args.push(Vec::new());
                         state.output.stack.push(frame);
                     } else {
                         state = definition.implementation.evaluate(state, stderr, frame)?;
@@ -112,6 +118,16 @@ pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::erro
             if state.input.input_len() == 1 {
                 if !state.output.stack.is_empty() {
                     return Err(Error::new(ErrorKind::UnclosedParenthesis));
+                }
+                // End of all input: any text queued by m4wrap is processed now,
+                // in the order the m4wrap calls were made (POSIX), by pushing it
+                // back onto the input and rescanning it (it may itself expand
+                // macros, divert, or queue further m4wrap text).
+                if !state.m4wrap.is_empty() {
+                    let wrapped: Vec<u8> = state.m4wrap.drain(..).flatten().collect();
+                    state.output.output.divert(0)?;
+                    state.input.pushback_string(&wrapped);
+                    continue 'main_loop;
                 }
                 break 'main_loop;
             }
@@ -214,10 +230,6 @@ pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::erro
 
     state.output.output.divert(0)?;
     state.output.output.undivert_all()?;
-
-    for wrap in &state.m4wrap {
-        state.output.write_all(wrap)?;
-    }
 
     Ok(state)
 }

@@ -5,10 +5,20 @@ use std::{
     rc::Rc,
 };
 
+/// Sentinel bytes wrapping a built-in macro name, emitted by `defn` for a
+/// built-in so that `define`/`pushdef` can reconstruct that built-in under a new
+/// name. When such a marker instead reaches real output (a built-in token used
+/// outside define/pushdef), it expands to nothing, as in GNU m4.
+pub(crate) const BUILTIN_DEFN_PREFIX: u8 = 0x01;
+pub(crate) const BUILTIN_DEFN_SUFFIX: u8 = 0x02;
+
 #[derive(Default)]
 pub struct OutputState {
     pub output: OutputRef,
     pub stack: Vec<StackFrame>,
+    /// Tracks a `defn`-of-built-in marker spanning multiple writes so its bytes
+    /// can be dropped from real output.
+    pub skipping_builtin_marker: bool,
 }
 
 impl OutputState {
@@ -16,7 +26,12 @@ impl OutputState {
     pub fn write_all(&mut self, buf: &[u8]) -> crate::Result<()> {
         if self.stack.is_empty() {
             log::trace!("Writing to output: {}", String::from_utf8_lossy(buf));
-            self.output.write_all(buf)?;
+            // A built-in token (defn marker) that is not consumed by
+            // define/pushdef vanishes rather than emitting control bytes.
+            let clean = self.filter_builtin_markers(buf);
+            if !clean.is_empty() {
+                self.output.write_all(&clean)?;
+            }
         } else {
             log::trace!(
                 "Writing to macro arg in stack: {:?}",
@@ -34,6 +49,24 @@ impl OutputState {
             arg_buffer.extend(buf);
         }
         Ok(())
+    }
+
+    /// Drop any `defn`-of-built-in marker byte ranges, carrying the in-marker
+    /// state across calls (a marker may be split over multiple writes).
+    fn filter_builtin_markers(&mut self, buf: &[u8]) -> Vec<u8> {
+        let mut clean = Vec::with_capacity(buf.len());
+        for &b in buf {
+            if self.skipping_builtin_marker {
+                if b == BUILTIN_DEFN_SUFFIX {
+                    self.skipping_builtin_marker = false;
+                }
+            } else if b == BUILTIN_DEFN_PREFIX {
+                self.skipping_builtin_marker = true;
+            } else {
+                clean.push(b);
+            }
+        }
+        clean
     }
 }
 

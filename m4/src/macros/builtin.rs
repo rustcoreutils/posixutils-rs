@@ -5,7 +5,7 @@ use std::process::ExitStatus;
 use std::{io::Write, rc::Rc};
 
 use super::eval::parse_integer;
-use super::{MacroDefinitionImplementation, MacroImplementation};
+use super::{BuiltinMacro, MacroDefinitionImplementation, MacroImplementation};
 use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
@@ -14,12 +14,23 @@ use crate::input::{Input, InputRead};
 use crate::lexer::{MacroName, MacroParseConfig, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG};
 use crate::macros::user_defined::UserDefinedMacro;
 use crate::macros::MacroDefinition;
-use crate::output::DivertBufferNumber;
+use crate::output::{DivertBufferNumber, BUILTIN_DEFN_PREFIX, BUILTIN_DEFN_SUFFIX};
 use crate::state::{StackFrame, State};
 use crate::EOF;
 
 const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
     "There should always be at least one macro definition";
+
+/// If `definition` is a `defn`-of-built-in marker, return the wrapped built-in
+/// name. The marker (emitted by `defn` for a built-in, spec: "useful for
+/// renaming macros, especially built-ins") wraps the name in control bytes that
+/// cannot occur in a macro name and are vanishingly unlikely in real text.
+fn decode_builtin_defn(definition: &[u8]) -> Option<&[u8]> {
+    match definition {
+        [BUILTIN_DEFN_PREFIX, name @ .., BUILTIN_DEFN_SUFFIX] => Some(name),
+        _ => None,
+    }
+}
 
 /// The dnl macro shall cause m4 to discard all input characters up to and including the next
 /// `<newline>`.
@@ -78,6 +89,23 @@ impl DefineMacro {
             "DefineMacro::define() defined macro {name}: {:?}",
             String::from_utf8_lossy(&definition)
         );
+        // `defn(<built-in>)` produces a marker; reconstruct that built-in under
+        // the new name (preserving its argument-parsing requirement).
+        if let Some(builtin_name) = decode_builtin_defn(&definition) {
+            if let Some(builtin) = BuiltinMacro::enumerate()
+                .iter()
+                .find(|b| b.name().0.as_slice() == builtin_name)
+            {
+                let definition = MacroDefinition {
+                    parse_config: MacroParseConfig {
+                        name,
+                        min_args: builtin.min_args(),
+                    },
+                    implementation: builtin.implementation(),
+                };
+                return Ok((state, Some(definition)));
+            }
+        }
         let definition = MacroDefinition {
             parse_config: MacroParseConfig { name, min_args: 0 },
             implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
@@ -204,16 +232,30 @@ impl MacroImplementation for DefnMacro {
             let definition = definitions
                 .last()
                 .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
-            if let MacroDefinitionImplementation::UserDefined(definition) =
-                &definition.implementation
-            {
-                state
-                    .input
-                    .pushback_string(&state.parse_config.quote_close_tag);
-                state.input.pushback_string(&definition.definition);
-                state
-                    .input
-                    .pushback_string(&state.parse_config.quote_open_tag);
+            match &definition.implementation {
+                MacroDefinitionImplementation::UserDefined(user_defined) => {
+                    state
+                        .input
+                        .pushback_string(&state.parse_config.quote_close_tag);
+                    state.input.pushback_string(&user_defined.definition);
+                    state
+                        .input
+                        .pushback_string(&state.parse_config.quote_open_tag);
+                }
+                // A built-in has no textual body; emit the internal marker
+                // (quoted, so it is not re-expanded while collecting arguments)
+                // that define/pushdef decode back into the built-in.
+                _ => {
+                    state
+                        .input
+                        .pushback_string(&state.parse_config.quote_close_tag);
+                    state.input.pushback_character(BUILTIN_DEFN_SUFFIX);
+                    state.input.pushback_string(&definition.parse_config.name.0);
+                    state.input.pushback_character(BUILTIN_DEFN_PREFIX);
+                    state
+                        .input
+                        .pushback_string(&state.parse_config.quote_open_tag);
+                }
             }
         }
         Ok(state)

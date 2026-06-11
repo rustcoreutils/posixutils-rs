@@ -108,6 +108,43 @@ fn get_magic_files(args: &Args, matches: &clap::ArgMatches) -> Vec<PathBuf> {
     magic_files
 }
 
+/// Classify a non-symlink file given its (followed) metadata, returning the
+/// `<type>` string for the `"%s: %s"` output. `met` describes the file whose
+/// contents `path` opens (the symlink target, when following a link).
+fn classify(path: &str, met: &fs::Metadata, args: &Args, magic_files: &[PathBuf]) -> String {
+    let file_type = met.file_type();
+
+    if file_type.is_char_device() {
+        return "character special".to_string();
+    }
+    if file_type.is_dir() {
+        return "directory".to_string();
+    }
+    if file_type.is_fifo() {
+        return "fifo".to_string();
+    }
+    if file_type.is_socket() {
+        return "socket".to_string();
+    }
+    if file_type.is_block_device() {
+        return "block special".to_string();
+    }
+    if file_type.is_file() {
+        if args.no_further_file_classification {
+            return "regular file".to_string();
+        }
+        if met.len() == 0 {
+            return "empty".to_string();
+        }
+        return match get_type_from_magic_file_dbs(std::path::Path::new(path), magic_files) {
+            Some(f_type) => f_type,
+            None => "data".to_string(),
+        };
+    }
+    // Any other (unknown) type.
+    "data".to_string()
+}
+
 fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
     let path = if path == "-" {
         let mut buf = String::new();
@@ -117,73 +154,38 @@ fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
         path.to_string()
     };
 
-    let met = match fs::symlink_metadata(&path) {
+    let lmet = match fs::symlink_metadata(&path) {
         Ok(met) => met,
         Err(_) => {
+            // Per spec this is reported but does not affect the exit status.
             println!("{path}: cannot open");
             return;
         }
     };
 
-    let file_type = met.file_type();
+    if lmet.file_type().is_symlink() {
+        // `metadata` follows the link; Ok means the target exists.
+        let target_meta = fs::metadata(&path);
+        let target = read_link(&path).ok();
 
-    if file_type.is_symlink() {
-        if args.identify_as_symbolic_link {
-            println!("{path}: symbolic link");
-            return;
-        }
-        match read_link(&path) {
-            Ok(file_p) => {
-                // trace the file pointed by symbolic link
-                if file_p.exists() {
-                    println!("{path}: symbolic link to {}", file_p.display());
-                } else {
-                    println!("{path}: broken symbolic link to {}", file_p.display());
-                }
+        // Identify the link itself when -h is given, or by default when the
+        // link is broken (POSIX: a dangling link is treated as if -h).
+        if args.identify_as_symbolic_link || target_meta.is_err() {
+            match (&target, target_meta.is_ok()) {
+                (Some(t), true) => println!("{path}: symbolic link to {}", t.display()),
+                (Some(t), false) => println!("{path}: broken symbolic link to {}", t.display()),
+                (None, _) => println!("{path}: symbolic link"),
             }
-            Err(_) => {
-                println!("{path}: symbolic link");
-            }
-        }
-        return;
-    }
-    if file_type.is_char_device() {
-        println!("{path}: character special");
-        return;
-    }
-    if file_type.is_dir() {
-        println!("{path}: directory");
-        return;
-    }
-    if file_type.is_fifo() {
-        println!("{path}: fifo");
-        return;
-    }
-    if file_type.is_socket() {
-        println!("{path}: socket");
-        return;
-    }
-    if file_type.is_block_device() {
-        println!("{path}: block special");
-        return;
-    }
-    if file_type.is_file() {
-        if args.no_further_file_classification {
-            debug_assert!(magic_files.is_empty());
-            println!("{path}: regular file");
             return;
         }
-        if met.len() == 0 {
-            println!("{path}: empty");
-            return;
-        }
-        match get_type_from_magic_file_dbs(std::path::Path::new(&path), magic_files) {
-            Some(f_type) => println!("{path}: {f_type}"),
-            None => println!("{path}: data"),
-        }
+
+        // Default: resolve the link and classify the referenced file's type.
+        let tmet = target_meta.unwrap();
+        println!("{path}: {}", classify(&path, &tmet, args, magic_files));
         return;
     }
-    unreachable!();
+
+    println!("{path}: {}", classify(&path, &lmet, args, magic_files));
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -196,9 +198,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let magic_files = get_magic_files(&args, &matches);
 
+    // A magic file named explicitly via -m/-M that cannot be opened is a
+    // genuine error and sets a non-zero exit status. (A missing or unreadable
+    // operand file is NOT an error per the spec.)
+    let mut had_error = false;
+    for mf in [&args.test_file1, &args.test_file2].into_iter().flatten() {
+        if fs::metadata(mf).is_err() {
+            eprintln!("file: {}: cannot open magic file", mf.display());
+            had_error = true;
+        }
+    }
+
     for file in &args.files {
         analyze_file(file, &args, &magic_files);
     }
 
+    if had_error {
+        std::process::exit(1);
+    }
     Ok(())
 }

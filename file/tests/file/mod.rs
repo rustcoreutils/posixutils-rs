@@ -68,8 +68,11 @@ fn file_is_a_valid_sym_link() {
     let mut valid_sym_link = cargo_man_dir.clone();
     valid_sym_link.push("tests/file/sym_link.txt");
 
+    // Use an empty target so the default (follow-the-link) classification is
+    // deterministic regardless of the system magic database.
     let mut file = cargo_man_dir.clone();
-    file.push("tests/file/regular_file.txt");
+    file.push("tests/file/sym_link_empty_target_tmp");
+    std::fs::write(&file, b"").unwrap();
 
     // Remove the symlink or file inside the tests/file folder, if it already exists
     if symlink_metadata(&valid_sym_link).is_ok() {
@@ -79,18 +82,17 @@ fn file_is_a_valid_sym_link() {
     // Create the valid symlink
     symlink(&file, &valid_sym_link).unwrap();
 
+    // By default file resolves the link and reports the TARGET's type (here an
+    // empty file), not "symbolic link to ...".
     file_test(
         &[valid_sym_link.to_str().unwrap()],
-        &format!(
-            "{}: symbolic link to {}\n",
-            valid_sym_link.to_str().unwrap(),
-            file.to_str().unwrap()
-        ),
+        &format!("{}: empty\n", valid_sym_link.to_str().unwrap()),
         "",
     );
 
-    // Delete the symlink after testing
-    remove_file(valid_sym_link).unwrap()
+    // Delete the symlink and target after testing
+    remove_file(valid_sym_link).unwrap();
+    remove_file(file).unwrap();
 }
 
 #[test]
@@ -153,16 +155,25 @@ fn file_h_flag_symlinks() {
     symlink(&regular_file, &valid_symlink).unwrap();
     symlink(&regular_file, &broken_symlink).unwrap();
 
-    // test valid symbolic link
+    // With -h, file identifies the link itself, including its target (POSIX
+    // alternative output format "%s: %s %s"). Both links point to a real file.
     file_test(
         &["-h", valid_symlink.to_str().unwrap()],
-        &format!("{}: symbolic link\n", valid_symlink.to_str().unwrap(),),
+        &format!(
+            "{}: symbolic link to {}\n",
+            valid_symlink.to_str().unwrap(),
+            regular_file.to_str().unwrap()
+        ),
         "",
     );
 
     file_test(
         &["-h", broken_symlink.to_str().unwrap()],
-        &format!("{}: symbolic link\n", broken_symlink.to_str().unwrap(),),
+        &format!(
+            "{}: symbolic link to {}\n",
+            broken_symlink.to_str().unwrap(),
+            regular_file.to_str().unwrap()
+        ),
         "",
     );
 

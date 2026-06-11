@@ -297,6 +297,10 @@ fn parse_type_spec_char(input: &str) -> Option<(char, &str)> {
     }
 }
 
+/// Default byte count for a bare `d`/`u` type with no explicit size: the size
+/// of a basic integer type of the implementation (POSIX EXTENDED DESCRIPTION).
+const DEFAULT_INT_SIZE: u64 = 4;
+
 fn parse_type_size(input: &str) -> Result<(u64, &str), RawMagicLineParseError> {
     match input.as_bytes().first() {
         Some(b'C') => Ok((1, &input[1..])),
@@ -313,6 +317,8 @@ fn parse_type_size(input: &str) -> Result<(u64, &str), RawMagicLineParseError> {
                 .map_err(|_| RawMagicLineParseError::Type)?;
             Ok((val, &input[end..]))
         }
+        // Bare `d`/`u`, or a mask immediately following (`d&...`): default size.
+        None | Some(b'&') => Ok((DEFAULT_INT_SIZE, input)),
         _ => Err(RawMagicLineParseError::Type),
     }
 }
@@ -459,10 +465,13 @@ impl RawMagicFileLine {
         match &self.value {
             Value::Number(op, val) => match op {
                 ComparisonOperator::Equal => *val == tf_val,
-                ComparisonOperator::LessThan => *val < tf_val,
-                ComparisonOperator::GreaterThan => *val > tf_val,
+                // The comparison is "<value from file> OP <value field>".
+                ComparisonOperator::LessThan => tf_val < *val,
+                ComparisonOperator::GreaterThan => tf_val > *val,
                 ComparisonOperator::AllSet => *val == (*val & tf_val),
-                ComparisonOperator::AnyUnset => (*val ^ tf_val) != 0,
+                // "^": at least one set bit in the value field is unset in the
+                // value from the file.
+                ComparisonOperator::AnyUnset => (*val & !tf_val) != 0,
                 ComparisonOperator::FileLargeEnough => {
                     // we'll directly return true here because
                     // if the file wasn't large enough to hold the value at the given offset

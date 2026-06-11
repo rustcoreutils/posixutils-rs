@@ -294,6 +294,39 @@ fn file_magic_octal_escape_packed_data() {
     std::fs::remove_file(&tmp_path).unwrap();
 }
 
+// MAGIC-1: numeric `<` / `>` magic comparisons are "<file value> OP <field>".
+#[test]
+fn file_magic_numeric_less_greater() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let magic = dir.join("cmp_test_tmp.magic");
+    std::fs::write(
+        &magic,
+        "0\tuC\t<10\tLESS_THAN_10\n0\tuC\t>10\tGREATER_THAN_10\n",
+    )
+    .unwrap();
+    let magic_s = magic.to_str().unwrap();
+
+    let low = dir.join("cmp_low_tmp");
+    std::fs::write(&low, [0x05u8]).unwrap();
+    file_test(
+        &["-m", magic_s, low.to_str().unwrap()],
+        &format!("{}: LESS_THAN_10\n", low.to_str().unwrap()),
+        "",
+    );
+
+    let high = dir.join("cmp_high_tmp");
+    std::fs::write(&high, [0x14u8]).unwrap();
+    file_test(
+        &["-m", magic_s, high.to_str().unwrap()],
+        &format!("{}: GREATER_THAN_10\n", high.to_str().unwrap()),
+        "",
+    );
+
+    std::fs::remove_file(&magic).unwrap();
+    std::fs::remove_file(&low).unwrap();
+    std::fs::remove_file(&high).unwrap();
+}
+
 #[allow(non_snake_case)]
 #[test]
 fn file_magic_M_and_m_flag_cpio() {

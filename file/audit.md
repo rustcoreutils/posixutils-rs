@@ -207,16 +207,16 @@ loses the parent message on `>` continuation lines.
 #### Major
 - [ ] **FILE-1 — default (no `-h`) does not resolve symlinks to classify the target.** `file.rs:130-148`. Spec test #2 (§97811-97813): "If file is a symbolic link, by default the link shall be resolved and file shall test the type of file referenced." Verified: `file link` → `link: symbolic link to /tmp/target` instead of the target's type. DIVERGES. Fix: when not `-h` and the target exists, classify the target.
 - [ ] **FILE-2 — context-sensitive default system tests missing.** `magic.rs` (whole engine) only runs position-sensitive magic-file tests. Verified: a `#!/bin/sh` script → `data`. Spec Table 3-10 requires `commands text` (shell), `c program text` (C), `fortran program text` (FORTRAN) via context-sensitive tests (note 5). MISSING. Fix: add built-in content heuristics applied after position-sensitive tests.
-- [ ] **MAGIC-1 — `<` and `>` numeric comparisons are inverted.** `magic.rs:462-463`. `LessThan => *val < tf_val` compares *magic-value < file-value* — the GREATER-THAN condition. Verified: file byte `5`, rule `<10` should match but `>10` matched instead. DIVERGES. Fix: swap to `tf_val < *val` / `tf_val > *val`.
+- [x] **MAGIC-1 — `<` and `>` numeric comparisons are inverted.** `magic.rs:462-463`. `LessThan => *val < tf_val` compares *magic-value < file-value* — the GREATER-THAN condition. Verified: file byte `5`, rule `<10` should match but `>10` matched instead. DIVERGES. Fix: swap to `tf_val < *val` / `tf_val > *val`. ✓ fixed in file-B.
 
 #### Minor
 - [ ] **FILE-3 — `-h` output omits the link contents.** `file.rs:131-133`. Spec alt format §97909 is `"%s: %s %s\n", file, type, <contents of link>`; impl prints only `symbolic link`. PARTIAL.
 - [ ] **FILE-4 — `-` operand reads a *filename* from stdin.** `file.rs:112-118`. Reads one line and treats it as a path rather than classifying stdin content. The `-`→stdin treatment is optional/unspecified (§97852), but this behavior is surprising. DIVERGES (Minor).
 - [ ] **FILE-5 — genuine errors never set non-zero exit.** `file.rs:189-203`. `main` always returns `Ok`. Nonexistent/unreadable → exit 0 is *correct* (§97911-97913), but a bad `-m` magic file should arguably exit >0. Minor.
-- [ ] **MAGIC-2 — `^` (any-unset) operator is wrong.** `magic.rs:465`. Uses `(*val ^ tf_val) != 0` ("differ in any bit") instead of "a set bit in the value field is unset in the file value" (`(*val & !tf_val) != 0`). DIVERGES (rare operator).
+- [x] **MAGIC-2 — `^` (any-unset) operator is wrong.** `magic.rs:465`. Uses `(*val ^ tf_val) != 0` ("differ in any bit") instead of "a set bit in the value field is unset in the file value" (`(*val & !tf_val) != 0`). DIVERGES (rare operator). ✓ fixed in file-B.
 - [ ] **MAGIC-3 — message field is printed literally; no `printf` substitution.** `magic.rs:418-420`. Spec §98000: the message is a `printf` format taking the file value (e.g. `%d bits`). MISSING.
 - [ ] **MAGIC-4 — `>` continuation drops the parent message and never concatenates.** `magic.rs:491-502`. On a successful continuation line the result is *replaced* by the child message rather than appended to the parent. DIVERGES.
-- [ ] **MAGIC-5 — bare `d`/`u` (no size) rejected.** `magic.rs:300-318`. Spec defaults bare `d`/`u` to the basic integer size; impl errors and skips the line. PARTIAL.
+- [x] **MAGIC-5 — bare `d`/`u` (no size) rejected.** `magic.rs:300-318`. Spec defaults bare `d`/`u` to the basic integer size; impl errors and skips the line. PARTIAL. ✓ fixed in file-B — bare `d`/`u` (and `d&mask`) default to a 4-byte basic integer.
 
 ### Detailed conformance matrix
 #### Options

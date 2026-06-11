@@ -90,3 +90,20 @@ fn tee_truncates_without_append() {
     assert_eq!(fs::read_to_string(&f).unwrap(), "new\n");
     let _ = fs::remove_file(&f);
 }
+
+#[test]
+fn tee_continues_after_unopenable_file() {
+    // One operand is in a non-existent directory and cannot be opened; tee must
+    // still write to the good file and to stdout, and exit non-zero.
+    let good = tmp_path("good_after_bad");
+    let bad = std::env::temp_dir().join("posixutils_tee_nodir_xyz/cannot");
+    let _ = fs::remove_file(&good);
+    run_tee(
+        &[bad.to_str().unwrap(), good.to_str().unwrap()],
+        "payload\n",
+        "payload\n",
+        1,
+    );
+    assert_eq!(fs::read_to_string(&good).unwrap(), "payload\n");
+    let _ = fs::remove_file(&good);
+}

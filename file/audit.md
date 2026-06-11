@@ -441,11 +441,11 @@ error instead of continuing and flagging. `-a` and `-i` are correct.
 - [x] **TEE-2 — file operands are rejected.** `tee.rs:26-27`. `files: Vec<String>` carries `#[arg(short, long)]`, making it `-f/--files`; positional `tee FILE` → "unexpected argument". Verified. Spec SYNOPSIS `tee [-ai] [file...]` — `file` is a positional operand. DIVERGES. Fix: drop `short, long` so `files` is positional (`-` stays a literal filename per §116896). ✓ fixed in tee-A.
 
 #### Major
-- [ ] **TEE-3 — aborts on the first write error.** `tee.rs:83-89`. Returns `Err` immediately. Spec CONSEQUENCES OF ERRORS §116931: a failed write to one file must not stop writes to the others or to stdout; only the exit status becomes non-zero. DIVERGES. Fix: record the error, continue, exit non-zero at the end.
-- [ ] **TEE-4 — aborts on the first open failure.** `tee.rs:40-64`. Returns `Err` on the first un-openable file. Historical `tee` reports `tee: cannot access …` and continues with the rest. DIVERGES. Fix: warn and continue; exit non-zero.
+- [x] **TEE-3 — aborts on the first write error.** `tee.rs:83-89`. Returns `Err` immediately. Spec CONSEQUENCES OF ERRORS §116931: a failed write to one file must not stop writes to the others or to stdout; only the exit status becomes non-zero. DIVERGES. Fix: record the error, continue, exit non-zero at the end. ✓ fixed in tee-B (per-file `ok` flag; `had_error` accumulated).
+- [x] **TEE-4 — aborts on the first open failure.** `tee.rs:40-64`. Returns `Err` on the first un-openable file. Historical `tee` reports `tee: cannot access …` and continues with the rest. DIVERGES. Fix: warn and continue; exit non-zero. ✓ fixed in tee-B.
 
 #### Minor
-- [ ] **TEE-5 — diagnostics not localized.** `tee.rs:52,73,86`. Minor.
+- [x] **TEE-5 — diagnostics not localized.** `tee.rs:52,73,86`. Minor. ✓ addressed in tee-B — diagnostics now carry a `tee:` prefix and only the path + OS error text (already localized by libc); no translatable English sentence remains.
 
 ### Detailed conformance matrix
 #### Options / operands

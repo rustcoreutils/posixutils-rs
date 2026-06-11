@@ -391,13 +391,13 @@ pre-check on prefix+suffix length is absent.
 ### Priority issues
 
 #### Major
-- [ ] **SPLIT-1 — `-` operand is not stdin.** `split.rs:218,242` call `input_stream/​input_reader(_, false)`, so only an *absent* file maps to stdin; `-` becomes a literal path. Verified: `printf … | split -l 1 - p` → `Os { NotFound }`. Spec §115760: "if … file is '−', the standard input shall be used." DIVERGES. Fix: pass `dashed_stdin = true`.
-- [ ] **SPLIT-2 — no `{NAME_MAX}` check on prefix + suffix length.** `split.rs:115-147`. Spec §115748-115751 / §115764: if `name`+`suffix_length` would exceed `{NAME_MAX}`, fail with a diagnostic and create no files. MISSING. Fix: validate before opening the first output.
+- [x] **SPLIT-1 — `-` operand is not stdin.** `split.rs:218,242` call `input_stream/​input_reader(_, false)`, so only an *absent* file maps to stdin; `-` becomes a literal path. Verified: `printf … | split -l 1 - p` → `Os { NotFound }`. Spec §115760: "if … file is '−', the standard input shall be used." DIVERGES. Fix: pass `dashed_stdin = true`. ✓ fixed in split-A — `input_stream`/`input_reader` use `dashed_stdin=true` and the `file` operand defaults to `-`, so both an explicit `-` and an omitted operand read stdin.
+- [x] **SPLIT-2 — no `{NAME_MAX}` check on prefix + suffix length.** `split.rs:115-147`. Spec §115748-115751 / §115764: if `name`+`suffix_length` would exceed `{NAME_MAX}`, fail with a diagnostic and create no files. MISSING. Fix: validate before opening the first output. ✓ fixed in split-A — `name_max_for()` checks basename(prefix)+suffix_length against `pathconf(_PC_NAME_MAX)` before any file is created.
 
 #### Minor
 - [ ] **SPLIT-3 — `-b` `g` suffix is a non-POSIX extension.** `split.rs:199-201`. POSIX defines only `k`/`m`. N/A (harmless; note only).
-- [ ] **SPLIT-4 — `-b` size `n*mul` can overflow.** `split.rs:209-210`. Wrapping multiply in release. Minor.
-- [ ] **SPLIT-5 — suffix-exhaustion message is non-standard.** `split.rs:131-134` (`"maximum suffix reached"`). Minor.
+- [x] **SPLIT-4 — `-b` size `n*mul` can overflow.** `split.rs:209-210`. Wrapping multiply in release. Minor. ✓ fixed in split-A — `checked_mul`.
+- [x] **SPLIT-5 — suffix-exhaustion message is non-standard.** `split.rs:131-134` (`"maximum suffix reached"`). Minor. ✓ fixed in split-A — clearer gettext message.
 
 ### Detailed conformance matrix
 #### Options / operands

@@ -8,9 +8,11 @@
 //
 
 use std::cmp;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Error, Read, Write};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -50,7 +52,7 @@ struct Args {
     )]
     bytes: Option<String>,
 
-    #[arg(default_value = "", help = gettext("File to be split"))]
+    #[arg(default_value = "-", help = gettext("File to be split ('-' or omitted: stdin)"))]
     file: PathBuf,
 
     #[arg(default_value = "x", help = gettext("Prefix of output files"))]
@@ -130,7 +132,9 @@ impl OutputState {
         let suffix = match self.suffix.next() {
             Some(s) => s,
             None => {
-                return Err(Error::other("maximum suffix reached"));
+                return Err(Error::other(gettext(
+                    "too many files: output suffixes exhausted",
+                )));
             }
         };
 
@@ -190,6 +194,24 @@ impl OutputState {
     }
 }
 
+/// The `{NAME_MAX}` for the directory that will hold the output files (the
+/// parent of `prefix`), falling back to 255 if it cannot be determined.
+fn name_max_for(prefix: &str) -> i64 {
+    let dir = Path::new(prefix)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Ok(cdir) = CString::new(dir.as_os_str().as_bytes()) else {
+        return 255;
+    };
+    let v = unsafe { libc::pathconf(cdir.as_ptr(), libc::_PC_NAME_MAX) };
+    if v < 0 {
+        255
+    } else {
+        v
+    }
+}
+
 fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
     let mul: u64 = {
         if bytesplit.ends_with("k") {
@@ -207,15 +229,17 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
         _ => &bytesplit[0..bytesplit.len() - 1],
     };
     let boundary: u64 = match bytestr.parse::<u64>() {
-        Ok(n) => n * mul,
+        Ok(n) => n
+            .checked_mul(mul)
+            .ok_or_else(|| Error::other(gettext("byte count too large")))?,
         Err(e) => {
-            eprintln!("{}", e);
-            return Err(Error::other("invalid byte spec"));
+            eprintln!("split: {}", e);
+            return Err(Error::other(gettext("invalid byte count")));
         }
     };
 
-    // open file, or stdin
-    let mut file = input_stream(&args.file, false)?;
+    // open file, or stdin ("-" or no operand)
+    let mut file = input_stream(&args.file, true)?;
     let mut raw_buffer = [0; BUFSZ];
     let mut state = OutputState::new(&args.prefix, boundary, args.suffix_len);
 
@@ -238,8 +262,8 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
 fn split_by_lines(args: &Args, linesplit: u64) -> io::Result<()> {
     assert!(linesplit > 0);
 
-    // open file, or stdin
-    let mut reader = input_reader(&args.file, false)?;
+    // open file, or stdin ("-" or no operand)
+    let mut reader = input_reader(&args.file, true)?;
     let mut state = OutputState::new(&args.prefix, linesplit, args.suffix_len);
 
     loop {
@@ -265,6 +289,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let mut args = Args::parse();
+
+    // {NAME_MAX} check: the basename of the prefix plus the suffix length must
+    // fit in a filename. If not, fail with a diagnostic before creating files.
+    let base_len = Path::new(&args.prefix)
+        .file_name()
+        .map(|s| s.len())
+        .unwrap_or(args.prefix.len());
+    if base_len as i64 + i64::from(args.suffix_len) > name_max_for(&args.prefix) {
+        eprintln!("split: {}", gettext("output filename too long"));
+        return Err(Box::new(Error::other(gettext("output filename too long"))));
+    }
 
     if args.lines.is_none() && args.bytes.is_none() {
         args.lines = Some(1000);

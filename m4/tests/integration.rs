@@ -225,6 +225,7 @@ m4_test!(include);
 m4_test!(include_divert);
 m4_test!(incr);
 m4_test!(index);
+m4_test!(index_empty_second_arg);
 m4_test!(len);
 m4_test!(m4exit_error);
 m4_test!(m4exit_no_args);
@@ -271,6 +272,8 @@ m4_test_expect_error!(define_parse_brackets);
 m4_test_expect_error!(define_quoted_number_stacked);
 m4_test_expect_error!(define_unquoted_number_arg);
 m4_test_expect_error!(dumpdef_notexist);
+m4_test_expect_error!(eval_divide_by_zero);
+m4_test_expect_error!(eval_modulo_by_zero);
 m4_test_expect_error!(index_too_few_args);
 m4_test_expect_error!(quoted_nested_eof_in_string);
 

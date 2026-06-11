@@ -585,6 +585,13 @@ impl MacroImplementation for IndexMacro {
             }
         };
 
+        // An empty search string matches at position 0 (GNU m4); `windows(0)`
+        // would otherwise panic.
+        if second_arg.is_empty() {
+            state.input.pushback_character(b'0');
+            return Ok(state);
+        }
+
         let index = first_arg
             .windows(second_arg.len())
             .position(|window| window == second_arg);

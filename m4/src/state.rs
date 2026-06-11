@@ -69,6 +69,26 @@ impl State {
             .unwrap_or_default()
             .cloned())
     }
+
+    /// Emit a recoverable error diagnostic to stderr (GNU `m4:<file>:<line>:`
+    /// form) and flag the run so its final exit status is non-zero, without
+    /// aborting further processing.
+    pub fn emit_error(
+        &mut self,
+        stderr: &mut dyn Write,
+        args: std::fmt::Arguments<'_>,
+    ) -> std::io::Result<()> {
+        let (name, line) = self.input.current_location();
+        writeln!(
+            stderr,
+            "m4:{}:{}: {}",
+            String::from_utf8_lossy(&name),
+            line,
+            args
+        )?;
+        self.exit_error = true;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for State {

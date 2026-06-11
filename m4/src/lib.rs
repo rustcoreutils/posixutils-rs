@@ -194,7 +194,14 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         }
     }
 
-    main_loop::main_loop(state, &mut stderr)?;
+    let state = main_loop::main_loop(state, &mut stderr)?;
+
+    // A recoverable error (a diagnostic emitted via State::emit_error, e.g. a
+    // bad eval expression) leaves processing intact but must still yield a
+    // non-zero exit status.
+    if state.exit_error {
+        return Err(Error::new(ErrorKind::Exit(1)));
+    }
 
     Ok(())
 }

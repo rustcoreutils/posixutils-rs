@@ -21,17 +21,33 @@ use super::MacroImplementation;
 pub struct EvalMacro;
 
 impl MacroImplementation for EvalMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         let first_arg = frame
             .args
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
-        let (_, output) = nom::combinator::all_consuming(nom::combinator::complete(
-            parse_and_evaluate,
-        ))(&first_arg)?;
-        state.input.pushback_string(output.to_string().as_bytes());
+        match nom::combinator::all_consuming(nom::combinator::complete(parse_and_evaluate))(
+            &first_arg,
+        ) {
+            Ok((_, output)) => state.input.pushback_string(output.to_string().as_bytes()),
+            // GNU m4 treats a malformed expression (syntax error, divide by
+            // zero, etc.) as a recoverable error: emit a diagnostic, expand to
+            // the empty string, set a non-zero exit status, and keep going.
+            Err(_) => state.emit_error(
+                stderr,
+                format_args!(
+                    "bad expression in eval: {}",
+                    String::from_utf8_lossy(&first_arg)
+                ),
+            )?,
+        }
         Ok(state)
     }
 }
@@ -147,17 +163,22 @@ pub fn parse_and_evaluate(input: &[u8]) -> IResult<&[u8], i64> {
             delimited(padded_tag(b"("), parse_and_evaluate, padded_tag(b")")),
         )),
         |op: Operation<&[u8], &[u8], &[u8], i64>| match op {
-            Operation::Prefix(b"-", o) => Ok(-o),
+            // Arithmetic uses wrapping operations: POSIX leaves signed overflow
+            // and out-of-range shifts undefined, and a panic (the Rust default
+            // in debug, and for `/`,`%` even in release) must never abort m4.
+            Operation::Prefix(b"-", o) => Ok(o.wrapping_neg()),
             Operation::Prefix(b"+", o) => Ok(o),
             Operation::Prefix(b"~", o) => Ok(!o),
             Operation::Prefix(b"!", o) => Ok(bool_to_int(!int_to_bool(o))),
-            Operation::Binary(lhs, b"*", rhs) => Ok(lhs * rhs),
-            Operation::Binary(lhs, b"/", rhs) => Ok(lhs / rhs),
-            Operation::Binary(lhs, b"%", rhs) => Ok(lhs % rhs),
-            Operation::Binary(lhs, b"<<", rhs) => Ok(lhs << rhs),
-            Operation::Binary(lhs, b">>", rhs) => Ok(lhs >> rhs),
-            Operation::Binary(lhs, b"+", rhs) => Ok(lhs + rhs),
-            Operation::Binary(lhs, b"-", rhs) => Ok(lhs - rhs),
+            Operation::Binary(lhs, b"*", rhs) => Ok(lhs.wrapping_mul(rhs)),
+            Operation::Binary(_, b"/", 0) => Err("divide by zero"),
+            Operation::Binary(lhs, b"/", rhs) => Ok(lhs.wrapping_div(rhs)),
+            Operation::Binary(_, b"%", 0) => Err("modulo by zero"),
+            Operation::Binary(lhs, b"%", rhs) => Ok(lhs.wrapping_rem(rhs)),
+            Operation::Binary(lhs, b"<<", rhs) => Ok(lhs.wrapping_shl(rhs as u32)),
+            Operation::Binary(lhs, b">>", rhs) => Ok(lhs.wrapping_shr(rhs as u32)),
+            Operation::Binary(lhs, b"+", rhs) => Ok(lhs.wrapping_add(rhs)),
+            Operation::Binary(lhs, b"-", rhs) => Ok(lhs.wrapping_sub(rhs)),
             Operation::Binary(lhs, b"<", rhs) => Ok(bool_to_int(lhs < rhs)),
             Operation::Binary(lhs, b"<=", rhs) => Ok(bool_to_int(lhs <= rhs)),
             Operation::Binary(lhs, b">", rhs) => Ok(bool_to_int(lhs > rhs)),

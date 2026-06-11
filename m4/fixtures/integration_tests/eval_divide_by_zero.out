@@ -1,0 +1,4 @@
+stdout=done
+stderr=m4:fixtures/integration_tests/eval_divide_by_zero.m4:1: bad expression in eval: 1/0\n
+status=1
+expect_error=true

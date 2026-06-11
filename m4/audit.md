@@ -80,20 +80,20 @@ instead of continuing, and all string handling is **byte-, not character-based**
 - [x] `-U name` CONFORMS — undefines (`lib.rs:191-193`).
 - [x] `-D`/`-U` relative order significant CONFORMS — directives sorted by CLI index (`lib.rs:114-126`); spec pp. 3090 ("order … shall be significant").
 - [x] Options interspersed with operands (basic) CONFORMS — `m4 m4src -D VER=2` verified.
-- [ ] **#16 PARTIAL** — `-D`/`-U` applied as a block before file processing; cannot interleave with operands.
+- [x] **#16 CONFORMS** (Phase F) — `-D`/`-U` and file operands processed in one command-line-ordered pass; interleaving verified.
 
 ### Operands / STDIN / input files
 - [x] ~~`file` operand processed in order CONFORMS~~ — re-examined: the `two_files` fixture is diversion-masked, hiding that operands were processed in **reverse** (input-stack LIFO). Fixed in Phase F (see #16); now forward order (`forward_file_order` fixture).
 - [x] No operand / `-` reads stdin CONFORMS — `lib.rs:162-166` (empty → stdin). (`-` literal routing relies on shell; default-stdin path verified.)
 - [x] Input is read as a byte text file CONFORMS — `input.rs:182-200` (streamed one byte at a time; a performance, not conformance, concern).
-- [ ] **#9 (operand half) DIVERGES** — an unreadable file operand aborts the run before processing instead of diagnosing and continuing.
+- [x] **#9 (operand half) CONFORMS** (Phase D) — an unreadable file operand is diagnosed (`m4: cannot open …`), the remaining operands are still processed, and the exit status is non-zero.
 
 ### Environment variables
-- [ ] **#13 `LANG` MISSING** — not read.
-- [ ] **#13 `LC_ALL` MISSING** — not read.
-- [ ] **#13 `LC_CTYPE` MISSING** — not read; byte semantics only (#10).
-- [ ] **#13 `LC_MESSAGES` MISSING** — not read; English diagnostics.
-- [ ] **#13 `NLSPATH` (XSI) MISSING** — not read.
+- [x] **#13 `LANG` CONFORMS** (Phase E) — honored via `setlocale(LC_ALL, "")` in `init_locale`.
+- [x] **#13 `LC_ALL` CONFORMS** (Phase E) — honored via `setlocale`.
+- [x] **#13 `LC_CTYPE` CONFORMS** (Phase E) — drives character-based `len`/`index`/`substr`/`translit` (#10).
+- [x] **#13 `LC_MESSAGES` PARTIAL** (Phase E) — locale set and diagnostics `m4:`-prefixed; per-string `gettext()` wrapping deferred (no catalog ships).
+- [x] **#13 `NLSPATH` (XSI) CONFORMS** (Phase E) — bound via `bind_textdomain_codeset`/`textdomain` in `init_locale`.
 
 ### Asynchronous events
 - [x] Default signal handling N/A — spec ASYNCHRONOUS EVENTS = "Default" (pp. 3090); m4 is non-interactive, so no custom handlers are required. (No findings.)
@@ -103,7 +103,7 @@ instead of continuing, and all string handling is **byte-, not character-based**
 - [x] `errprint` → stderr CONFORMS — `builtin.rs:225-235`.
 - [x] `traceon`/`traceoff` trace → stderr CONFORMS — `trace.rs:64-78` ("unspecified format" satisfied).
 - [x] `dumpdef` defined text → stderr CONFORMS — `builtin.rs:708-753`.
-- [ ] **#9/#13 PARTIAL** — diagnostic messages are English, un-prefixed, and not `LC_MESSAGES`-aware.
+- [x] **#9/#17 CONFORMS** (Phases D) — recoverable diagnostics now carry the GNU `m4:<file>:<line>: [Warning: ]` prefix via `State::emit_warning`/`emit_error`. (Per-string `gettext()` translation deferred — see #13.)
 
 ### Extended description — macro recognition
 - [x] Name token = `[_a-zA-Z][_a-zA-Z0-9]*`, longest match CONFORMS — `lexer.rs:85-139`, `state.rs:46-71`.
@@ -113,50 +113,50 @@ instead of continuing, and all string handling is **byte-, not character-based**
 - [x] Arguments expanded during collection unless quoted CONFORMS — inner frames write into the outer arg buffer (`output.rs:14-37`); EXAMPLES 4–6 logic.
 - [x] `$0`=name, `$1`–`$9`, `$*`, `$@` (quoted) CONFORMS — `user_defined.rs:44-84`; verified `$@`/`$*`/`shift`.
 - [x] `${` unspecified → emitted literally CONFORMS — `user_defined.rs:80-83`.
-- [ ] **#6 DIVERGES** — `$#` = 0 for `macro()` (spec requires 1).
+- [x] **#6 CONFORMS** (Phase C) — `$#` = 1 for `macro()` (seeded empty argument); 0 only without parentheses.
 
 ### Extended description — built-in macros
 - [x] `define` (preserve-current semantics), `pushdef`, `popdef`, `undefine` CONFORM — `builtin.rs:48-186`; fixtures `define_*`.
-- [ ] **`defn` #8 PARTIAL** — user-defined only; cannot reproduce built-ins (`builtin.rs:193-221`).
+- [x] **`defn` #8 CONFORMS** (Phase C) — reproduces user-defined macros and built-ins (via the internal marker decoded by `define`/`pushdef`).
 - [x] `ifdef`, `ifelse` (3/4-5/6+ restart) CONFORM — `builtin.rs:435-527`; verified.
-- [x] `incr`, `decr` CONFORM — `builtin.rs:389-433`; verified.
-- [ ] **`eval` #2/#3/#4/#5** — panics on `/0`,`%0`; ignores radix/min-digit args; no octal/hex; shift vs relational precedence wrong.
-- [x] `index` normal case CONFORMS (`builtin.rs:573-601`) — but **#1** panics on empty needle and **#10** counts bytes.
-- [x] `len` CONFORMS (`builtin.rs:553-565`) — but **#10** counts bytes.
-- [x] `substr` (start/len, beyond-end → null) CONFORMS (`builtin.rs:664-702`) — but **#9** aborts on non-numeric/negative and **#10** indexes bytes.
-- [x] `translit` (literal `-`, allowed per RATIONALE pp. 3096) CONFORMS (`builtin.rs:611-652`) — but **#11** single-arg bug and **#10** byte-based.
-- [x] `divert`/`divnum`/`undivert` (numerical-order EOF flush, negative=discard, undivert-into-buffer) CONFORM — `builtin.rs:953-1051`, `output.rs:142-163`; verified — but **#14** aborts for `>9`.
+- [x] `incr`, `decr` CONFORM — verified; non-numeric now diagnosed and continues (#9, Phase D).
+- [x] **`eval` #2/#3/#4/#5 CONFORM** (Phases A/B) — `/0`,`%0` diagnosed (no panic); radix/min-digit args honored; octal/hex/binary accepted; shift binds tighter than relational.
+- [x] `index` CONFORMS — empty needle → 0 (#1, Phase A); character position (#10, Phase E).
+- [x] `len` CONFORMS — character count (#10, Phase E).
+- [x] `substr` (start/len, beyond-end → null) CONFORMS — non-numeric diagnosed+continues (#9); character indexing (#10).
+- [x] `translit` (literal `-`, allowed per RATIONALE pp. 3096) CONFORMS — single-arg returns first arg (#11); character-based (#10).
+- [x] `divert`/`divnum`/`undivert` (numerical-order EOF flush, negative=discard, undivert-into-buffer) CONFORM — `output.rs`; any positive buffer number supported (#14, Phase D).
 - [x] `dnl` CONFORMS — `builtin.rs:24-39`.
-- [x] `include` (error if unreadable) / `sinclude` (silent) CONFORM — `builtin.rs:241-303`.
+- [x] `include` (error if unreadable, now diagnosed+continues — #9) / `sinclude` (silent) CONFORM.
 - [x] `syscmd` (`sh -c`, no redirection) / `sysval` CONFORM — `builtin.rs:890-944`.
 - [x] `mkstemp` (create+close, error → diagnostic + non-zero exit, empty defining text) CONFORMS — `builtin.rs:764-836`; verified exit 1.
-- [ ] **`m4wrap` #7 DIVERGES** — emitted verbatim, not rescanned (`main_loop.rs:218-220`).
+- [x] **`m4wrap` #7 CONFORMS** (Phase C) — wrap text rescanned at the true end of input (`main_loop::finalize`).
 - [x] `traceon`/`traceoff` CONFORM — `trace.rs`.
 - [x] `dumpdef` CONFORMS — `builtin.rs:708-753` (HashMap iteration order for the no-arg form is unspecified, acceptable).
 
 ### Exit status / consequences of errors
 - [x] Success → 0; `m4exit` sets the code CONFORMS — verified `m4exit(3)` → exit 3.
 - [x] `m4exit(0)`/no-arg after a prior error → non-zero CONFORMS — Austin Defect 984 (pp. 3094); `M4exitMacro` `builtin.rs:845-865`; verified via `mkstemp` failure → exit 1.
-- [ ] **PARTIAL** — the "prior error occurred" flag (`state.exit_error`) is set only by `mkstemp` (`builtin.rs:831`); most other recoverable errors abort instead (#9), so the `m4exit(0)`-after-error rule covers only the `mkstemp` case.
+- [x] **CONFORMS** (Phase D) — the "prior error occurred" flag (`state.exit_error`) is now set by every recoverable error (`State::emit_error`) and consulted both by `m4exit(0)`-after-error and by `run_impl`'s final exit-status check, so any prior error yields a non-zero exit.
 - [x] Errors → >0 CONFORMS — non-`Exit` errors map to exit 1 (`error.rs:131-147`).
 
 ## Test coverage signal
 
 Enabled fixtures cover define/pushdef/popdef, divert/undivert (incl. nested), eval,
 ifelse, ifdef, incr/index/len/substr/translit, dnl, shift, m4wrap, m4exit, include/
-sinclude, trace, and recursion. Gaps (no fixture exercises the verified defects):
+sinclude, trace, and recursion. Regression fixtures added while closing the audit
+(now 83 passing / 9 ignored):
 
-- [ ] `index`/`substr` with an **empty or zero-length** second argument (would catch #1).
-- [ ] `eval` **division/modulo by zero** (would catch #2).
-- [ ] `eval` **radix/min-digit** arguments and **octal/hex** literals (#3, #4).
-- [ ] `eval` **shift-vs-relational** precedence, e.g. `2 < 1 << 3` (#5).
-- [ ] `$#` for **`macro()`** empty parentheses — the spec's EXAMPLE 2 (#6).
-- [ ] `m4wrap` whose argument **contains a macro call** (#7); the enabled `m4wrap` fixture does not exercise rescanning.
-- [ ] `defn` of a **built-in** for renaming (#8).
-- [ ] **Continue-after-error** behaviour and unreadable **file operand** (#9).
-- [ ] **Multibyte** `len`/`index`/`substr` under a UTF-8 locale (#10).
-- [ ] `translit` with a **single argument** (#11); `changecom` single-arg close reset (#12).
-- [ ] The 9 `m4_test_ignore!` fixtures (`synclines_1/2`, `syscmd_sysval`, `define_eval_order_*`, `bsd`, `bsd_math`) remain disabled — known divergences to revisit.
+- [x] `index_empty_second_arg` (#1); `eval_divide_by_zero`, `eval_modulo_by_zero` (#2).
+- [x] `eval_radix` (#3), `eval_base_literals` (#4), `eval_shift_precedence` (#5).
+- [x] `dollar_hash_args` (#6); `m4wrap_rescan` (#7); `defn_builtin_rename` (#8).
+- [x] `incr_non_numeric`, `missing_file_operand` (#9); `divert_large` (#14).
+- [x] `translit_single_arg` (#11); `changecom_single_arg` (#12).
+- [x] `define_undefine_operand_order`, `forward_file_order` (#16, + the reverse-order regression).
+- [x] **Multibyte** `len`/`index`/`substr`/`translit` (#10) covered by `plib` unit tests
+  `mb_char_slices_*` (the m4 end-to-end case is locale-dependent, verified manually).
+- [ ] The 9 `m4_test_ignore!` fixtures (`synclines_1/2`, `syscmd_sysval`, `define_eval_order_*`,
+  `bsd`, `bsd_math`) remain disabled — known divergences to revisit (out of audit scope).
 
 ## Suggested PR groupings
 

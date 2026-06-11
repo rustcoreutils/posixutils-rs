@@ -9,7 +9,27 @@
 
 use std::{env, path::PathBuf};
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
+
+/// Assert only on stdout and exit code. Used for the default-system-test cases,
+/// which may emit a benign stderr note if the system magic file is absent.
+fn file_test_stdout(args: &[&str], stdin: &str, expected_stdout: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("file"),
+            args: str_args,
+            stdin_data: String::from(stdin),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected_stdout);
+            assert_eq!(output.status.code(), Some(0));
+        },
+    );
+}
 
 fn file_test(args: &[&str], expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -336,6 +356,44 @@ fn file_magic_numeric_less_greater() {
     std::fs::remove_file(&magic).unwrap();
     std::fs::remove_file(&low).unwrap();
     std::fs::remove_file(&high).unwrap();
+}
+
+// FILE-2: context-sensitive default system tests (shell / C source).
+#[test]
+fn file_context_shell_script() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let f = dir.join("ctx_shell_tmp");
+    std::fs::write(&f, "#!/bin/sh\necho hi\n").unwrap();
+    file_test_stdout(
+        &[f.to_str().unwrap()],
+        "",
+        &format!("{}: commands text\n", f.to_str().unwrap()),
+    );
+    std::fs::remove_file(&f).unwrap();
+}
+
+#[test]
+fn file_context_c_source() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("tests/file");
+    let f = dir.join("ctx_c_tmp");
+    std::fs::write(&f, "#include <stdio.h>\nint main(){return 0;}\n").unwrap();
+    file_test_stdout(
+        &[f.to_str().unwrap()],
+        "",
+        &format!("{}: c program text\n", f.to_str().unwrap()),
+    );
+    std::fs::remove_file(&f).unwrap();
+}
+
+// FILE-4: a '-' operand classifies standard-input content.
+#[test]
+fn file_dash_classifies_stdin() {
+    file_test_stdout(&["-"], "#!/bin/bash\n", "/dev/stdin: commands text\n");
+}
+
+#[test]
+fn file_dash_empty_stdin() {
+    file_test_stdout(&["-"], "", "/dev/stdin: empty\n");
 }
 
 // MAGIC-3: the magic message is a printf format taking the file value.

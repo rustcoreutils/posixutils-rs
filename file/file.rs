@@ -9,7 +9,8 @@
 
 mod magic;
 
-use std::fs::read_link;
+use std::fs::{read_link, File};
+use std::io::{Cursor, Read};
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::{fs, io};
@@ -17,7 +18,10 @@ use std::{fs, io};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
-use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
+use crate::magic::{get_type_from_magic_file_dbs, ReadSeek, DEFAULT_MAGIC_FILE};
+
+/// Number of leading bytes inspected by the context-sensitive content tests.
+const CONTENT_PREFIX_LEN: usize = 8192;
 
 #[derive(Parser)]
 #[command(
@@ -108,6 +112,77 @@ fn get_magic_files(args: &Args, matches: &clap::ArgMatches) -> Vec<PathBuf> {
     magic_files
 }
 
+/// True if the default system tests are in effect (i.e. the default magic file
+/// is part of the database list). The context-sensitive content tests are a
+/// default system test and must not run when only `-M`/`-m` databases apply.
+fn default_tests_active(magic_files: &[PathBuf]) -> bool {
+    magic_files
+        .iter()
+        .any(|p| p.as_path() == std::path::Path::new(DEFAULT_MAGIC_FILE))
+}
+
+/// Conservative context-sensitive content tests (POSIX default system tests):
+/// recognize shell scripts, C source, and FORTRAN source from a content prefix.
+/// Returns `None` for binary content or anything not recognized.
+fn content_type(prefix: &[u8]) -> Option<String> {
+    // Treat content containing a NUL byte as binary, not source text.
+    if prefix.is_empty() || prefix.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(prefix);
+
+    if text.starts_with("#!") {
+        return Some(gettext("commands text"));
+    }
+    if text.contains("#include") || text.contains("#define ") || text.contains("int main") {
+        return Some(gettext("c program text"));
+    }
+    if looks_like_fortran(&text) {
+        return Some(gettext("fortran program text"));
+    }
+    None
+}
+
+/// Very conservative FORTRAN heuristic: a line beginning with a distinctive
+/// FORTRAN keyword. Kept narrow to avoid misclassifying ordinary prose.
+fn looks_like_fortran(text: &str) -> bool {
+    text.lines().any(|line| {
+        let l = line.trim_start().to_ascii_lowercase();
+        l.starts_with("program ")
+            || l.starts_with("subroutine ")
+            || l.starts_with("implicit none")
+            || l.starts_with("end program")
+    })
+}
+
+/// Classify regular-file content. `is_empty` short-circuits to "empty";
+/// otherwise position-sensitive magic tests run first (via `make_reader`), then
+/// — only when the default tests are active — the context-sensitive content
+/// tests on `prefix`; failing both yields "data".
+fn classify_content<F>(
+    is_empty: bool,
+    prefix: &[u8],
+    default_active: bool,
+    magic_files: &[PathBuf],
+    make_reader: F,
+) -> String
+where
+    F: Fn() -> io::Result<Box<dyn ReadSeek>>,
+{
+    if is_empty {
+        return gettext("empty");
+    }
+    if let Some(f_type) = get_type_from_magic_file_dbs(make_reader, magic_files) {
+        return f_type;
+    }
+    if default_active {
+        if let Some(t) = content_type(prefix) {
+            return t;
+        }
+    }
+    gettext("data")
+}
+
 /// Classify a non-symlink file given its (followed) metadata, returning the
 /// `<type>` string for the `"%s: %s"` output. `met` describes the file whose
 /// contents `path` opens (the symlink target, when following a link).
@@ -115,77 +190,106 @@ fn classify(path: &str, met: &fs::Metadata, args: &Args, magic_files: &[PathBuf]
     let file_type = met.file_type();
 
     if file_type.is_char_device() {
-        return "character special".to_string();
+        return gettext("character special");
     }
     if file_type.is_dir() {
-        return "directory".to_string();
+        return gettext("directory");
     }
     if file_type.is_fifo() {
-        return "fifo".to_string();
+        return gettext("fifo");
     }
     if file_type.is_socket() {
-        return "socket".to_string();
+        return gettext("socket");
     }
     if file_type.is_block_device() {
-        return "block special".to_string();
+        return gettext("block special");
     }
     if file_type.is_file() {
         if args.no_further_file_classification {
-            return "regular file".to_string();
+            return gettext("regular file");
         }
-        if met.len() == 0 {
-            return "empty".to_string();
+        let mut prefix = Vec::new();
+        if let Ok(f) = File::open(path) {
+            let _ = f.take(CONTENT_PREFIX_LEN as u64).read_to_end(&mut prefix);
         }
-        return match get_type_from_magic_file_dbs(std::path::Path::new(path), magic_files) {
-            Some(f_type) => f_type,
-            None => "data".to_string(),
-        };
+        let owned = path.to_string();
+        return classify_content(
+            met.len() == 0,
+            &prefix,
+            default_tests_active(magic_files),
+            magic_files,
+            move || Ok(Box::new(File::open(&owned)?) as Box<dyn ReadSeek>),
+        );
     }
     // Any other (unknown) type.
-    "data".to_string()
+    gettext("data")
 }
 
 fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
-    let path = if path == "-" {
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf).unwrap();
-        buf.trim().to_string()
-    } else {
-        path.to_string()
-    };
+    // A '-' operand classifies the content of standard input.
+    if path == "-" {
+        analyze_stdin(args, magic_files);
+        return;
+    }
 
-    let lmet = match fs::symlink_metadata(&path) {
+    let lmet = match fs::symlink_metadata(path) {
         Ok(met) => met,
         Err(_) => {
             // Per spec this is reported but does not affect the exit status.
-            println!("{path}: cannot open");
+            println!("{path}: {}", gettext("cannot open"));
             return;
         }
     };
 
     if lmet.file_type().is_symlink() {
         // `metadata` follows the link; Ok means the target exists.
-        let target_meta = fs::metadata(&path);
-        let target = read_link(&path).ok();
+        let target_meta = fs::metadata(path);
+        let target = read_link(path).ok();
 
         // Identify the link itself when -h is given, or by default when the
         // link is broken (POSIX: a dangling link is treated as if -h).
         if args.identify_as_symbolic_link || target_meta.is_err() {
             match (&target, target_meta.is_ok()) {
-                (Some(t), true) => println!("{path}: symbolic link to {}", t.display()),
-                (Some(t), false) => println!("{path}: broken symbolic link to {}", t.display()),
-                (None, _) => println!("{path}: symbolic link"),
+                (Some(t), true) => {
+                    println!("{path}: {} {}", gettext("symbolic link to"), t.display())
+                }
+                (Some(t), false) => println!(
+                    "{path}: {} {}",
+                    gettext("broken symbolic link to"),
+                    t.display()
+                ),
+                (None, _) => println!("{path}: {}", gettext("symbolic link")),
             }
             return;
         }
 
         // Default: resolve the link and classify the referenced file's type.
         let tmet = target_meta.unwrap();
-        println!("{path}: {}", classify(&path, &tmet, args, magic_files));
+        println!("{path}: {}", classify(path, &tmet, args, magic_files));
         return;
     }
 
-    println!("{path}: {}", classify(&path, &lmet, args, magic_files));
+    println!("{path}: {}", classify(path, &lmet, args, magic_files));
+}
+
+/// Classify the content of standard input (the `-` operand).
+fn analyze_stdin(args: &Args, magic_files: &[PathBuf]) {
+    let mut buf = Vec::new();
+    let _ = io::stdin().read_to_end(&mut buf);
+
+    let type_str = if args.no_further_file_classification {
+        gettext("regular file")
+    } else {
+        let prefix = buf[..buf.len().min(CONTENT_PREFIX_LEN)].to_vec();
+        classify_content(
+            buf.is_empty(),
+            &prefix,
+            default_tests_active(magic_files),
+            magic_files,
+            || Ok(Box::new(Cursor::new(buf.clone())) as Box<dyn ReadSeek>),
+        )
+    };
+    println!("/dev/stdin: {type_str}");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -204,7 +308,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut had_error = false;
     for mf in [&args.test_file1, &args.test_file2].into_iter().flatten() {
         if fs::metadata(mf).is_err() {
-            eprintln!("file: {}: cannot open magic file", mf.display());
+            eprintln!(
+                "file: {}: {}",
+                mf.display(),
+                gettext("cannot open magic file")
+            );
             had_error = true;
         }
     }

@@ -22,13 +22,27 @@ pub const DEFAULT_MAGIC_FILE: &str = "/usr/share/file/magic/magic";
 /// Default raw (text based) magic file
 pub const DEFAULT_MAGIC_FILE: &str = "/etc/magic";
 
+/// A seekable byte source for the file under test. `make_reader` yields a fresh
+/// one for each magic database so each database starts from offset 0. This lets
+/// the engine test a regular file (`File`) or buffered standard input
+/// (`Cursor<Vec<u8>>`) uniformly.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
 /// Get type for the file from the magic file databases (traversed in order of argument)
-pub fn get_type_from_magic_file_dbs(
-    test_file: &Path,
-    magic_file_dbs: &[PathBuf],
-) -> Option<String> {
+pub fn get_type_from_magic_file_dbs<F>(make_reader: F, magic_file_dbs: &[PathBuf]) -> Option<String>
+where
+    F: Fn() -> io::Result<Box<dyn ReadSeek>>,
+{
     for magic_file in magic_file_dbs {
-        match parse_magic_file_and_test(magic_file, test_file) {
+        let mut tf_reader = match make_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("file: {}", e);
+                return None;
+            }
+        };
+        match parse_magic_file_and_test(magic_file, &mut *tf_reader) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => continue,
             Err(e) => {
@@ -414,7 +428,7 @@ impl RawMagicFileLine {
         result
     }
 
-    fn test(&self, tf_reader: &mut BufReader<File>) -> Option<String> {
+    fn test(&self, tf_reader: &mut dyn ReadSeek) -> Option<String> {
         if tf_reader.seek(SeekFrom::Start(self.offset.num)).is_err() {
             return None;
         }
@@ -432,7 +446,7 @@ impl RawMagicFileLine {
     }
 
     /// Returns the matched bytes from the file on success.
-    fn string_test(&self, tf_reader: &mut BufReader<File>) -> Option<Vec<u8>> {
+    fn string_test(&self, tf_reader: &mut dyn ReadSeek) -> Option<Vec<u8>> {
         if let Value::String(val) = &self.value {
             let mut buf = vec![0u8; val.len()];
             if tf_reader.read_exact(&mut buf).is_err() {
@@ -449,7 +463,7 @@ impl RawMagicFileLine {
         &self,
         size: u64,
         mask: Option<u64>,
-        tf_reader: &mut BufReader<File>,
+        tf_reader: &mut dyn ReadSeek,
     ) -> Option<u64> {
         if size == 0 || size > 8 {
             return None;
@@ -566,10 +580,9 @@ fn format_message_str(fmt: &str, value: &[u8]) -> String {
 /// the content of the test file.
 fn parse_magic_file_and_test(
     magic_file: &Path,
-    test_file: &Path,
+    tf_reader: &mut dyn ReadSeek,
 ) -> Result<Option<String>, io::Error> {
     let mf_reader = BufReader::new(File::open(magic_file)?);
-    let mut tf_reader = BufReader::new(File::open(test_file)?);
 
     let mut result: Option<String> = None;
     let mut matched_top_level = false;
@@ -585,14 +598,14 @@ fn parse_magic_file_and_test(
             if matched_top_level {
                 break;
             }
-            if let Some(msg) = ml.test(&mut tf_reader) {
+            if let Some(msg) = ml.test(&mut *tf_reader) {
                 result = Some(msg);
                 matched_top_level = true;
             }
         } else if matched_top_level {
             // A continuation ('>') line is applied only after a successful
             // top-level test; on success its message is appended to the result.
-            if let Some(msg) = ml.test(&mut tf_reader) {
+            if let Some(msg) = ml.test(&mut *tf_reader) {
                 match &mut result {
                     Some(r) => {
                         r.push(' ');

@@ -422,6 +422,7 @@ fn simple_inline(name: &str) -> Option<Macro> {
         "Ev" => Macro::Ev,
         "Fa" => Macro::Fa,
         "Fl" => Macro::Fl,
+        "Fr" => Macro::Fr,
         "Ft" => Macro::Ft,
         "Ic" => Macro::Ic,
         "Li" => Macro::Li,
@@ -429,6 +430,8 @@ fn simple_inline(name: &str) -> Option<Macro> {
         "Mt" => Macro::Mt,
         "No" => Macro::No,
         "Ns" => Macro::Ns,
+        // Deprecated `.Ot` renders as `.Ft`.
+        "Ot" => Macro::Ft,
         "Pa" => Macro::Pa,
         "Sx" => Macro::Sx,
         "Sy" => Macro::Sy,
@@ -1030,6 +1033,12 @@ mod tests {
         parity(".Fx 14.0\n");
         parity(".Ox 7.5\n");
         parity(".Bx 4.4\n");
+    }
+
+    #[test]
+    fn fr_and_ot() {
+        parity(".Fr 32\n");
+        parity(".Ot functype\n"); // deprecated, renders as Ft
     }
 
     #[test]

@@ -325,12 +325,16 @@ impl Parser {
                 }
             }
             _ if rs_submacro(name).is_some() => {
-                // A reference submacro (%A …): one Text node per word.
+                // A reference submacro (%A …): one Text node per word. It requires
+                // an argument, so an empty one produces nothing (as pest does).
                 let mac = rs_submacro(name).unwrap();
-                self.push(Element::Macro(MacroNode {
-                    mdoc_macro: mac,
-                    nodes: tokenize(rest).into_iter().map(Element::Text).collect(),
-                }));
+                let nodes: Vec<Element> = tokenize(rest).into_iter().map(Element::Text).collect();
+                if !nodes.is_empty() {
+                    self.push(Element::Macro(MacroNode {
+                        mdoc_macro: mac,
+                        nodes,
+                    }));
+                }
             }
             "Fo" => {
                 // Function block: first word is the funcname; the rest of the

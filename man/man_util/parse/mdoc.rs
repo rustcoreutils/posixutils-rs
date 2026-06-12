@@ -14,7 +14,7 @@
 //! arguments are tokenized per word into `Text` nodes; a plain text line becomes
 //! a single `Text` node, matching the pest AST.
 
-use crate::man_util::mdoc_macro::types::{AnType, SmMode};
+use crate::man_util::mdoc_macro::types::{AnType, BdType, BfType, OffsetType, SmMode};
 use crate::man_util::mdoc_macro::Macro;
 use crate::man_util::parser::{prepare_document, trim_quotes, Element, MacroNode, MdocDocument};
 
@@ -84,6 +84,25 @@ impl Parser {
             nodes: frame.nodes,
         });
         self.stack.last_mut().unwrap().nodes.push(node);
+    }
+
+    /// Close the nearest explicit block matching `is_match` (and any frames
+    /// nested inside it), for `.Ed`/`.Ef`/`.Ek`.
+    fn close_explicit(&mut self, is_match: fn(&Macro) -> bool) {
+        while self.stack.len() > 1 {
+            let matched = self
+                .stack
+                .last()
+                .unwrap()
+                .mac
+                .as_ref()
+                .map(is_match)
+                .unwrap_or(false);
+            self.close_top();
+            if matched {
+                break;
+            }
+        }
     }
 
     /// Close every open block and return the document elements.
@@ -156,6 +175,16 @@ impl Parser {
                 }));
             }
             "Dt" => self.push(parse_dt(rest)),
+            // Block-full-explicit displays close on .Ed/.Ef/.Ek.
+            "Bd" => self.open_block(parse_bd(rest), &[]),
+            "Bf" => self.open_block(
+                Macro::Bf(bf_type(tokenize(rest).first().map(|s| s.as_str()))),
+                &[],
+            ),
+            "Bk" => self.open_block(Macro::Bk, &[]),
+            "Ed" => self.close_explicit(is_bd),
+            "Ef" => self.close_explicit(is_bf),
+            "Ek" => self.close_explicit(is_bk),
             "Sm" => {
                 // Optional on/off spacing mode; the first arg is consumed either
                 // way (matching pest), the rest become text nodes.
@@ -368,6 +397,62 @@ fn parse_dt(rest: &str) -> Element {
     })
 }
 
+/// Parse a `.Bd -type [-offset X] [-compact]` display-block opener.
+fn parse_bd(rest: &str) -> Macro {
+    let toks = tokenize(rest);
+    let mut it = toks.iter();
+    let block_type = match it.next().map(|s| s.as_str()) {
+        Some("-centered") => BdType::Centered,
+        Some("-literal") => BdType::Literal,
+        Some("-ragged") => BdType::Ragged,
+        Some("-unfilled") => BdType::Unfilled,
+        _ => BdType::Filled,
+    };
+    let mut offset = None;
+    let mut compact = false;
+    while let Some(t) = it.next() {
+        match t.as_str() {
+            "-offset" => offset = it.next().map(|v| offset_type(v)),
+            "-compact" => compact = true,
+            _ => {}
+        }
+    }
+    Macro::Bd {
+        block_type,
+        offset,
+        compact,
+    }
+}
+
+fn offset_type(s: &str) -> OffsetType {
+    match s {
+        "indent-two" => OffsetType::IndentTwo,
+        "indent" => OffsetType::Indent,
+        "left" => OffsetType::Left,
+        "right" => OffsetType::Right,
+        "center" => OffsetType::Center,
+        _ => OffsetType::Indent,
+    }
+}
+
+fn bf_type(s: Option<&str>) -> BfType {
+    match s {
+        Some("-literal") | Some("Li") => BfType::Literal,
+        Some("-symbolic") | Some("Sy") => BfType::Symbolic,
+        _ => BfType::Emphasis,
+    }
+}
+
+fn is_bd(m: &Macro) -> bool {
+    matches!(m, Macro::Bd { .. })
+}
+fn is_bf(m: &Macro) -> bool {
+    matches!(m, Macro::Bf(_))
+}
+fn is_bk(m: &Macro) -> bool {
+    matches!(m, Macro::Bk)
+}
+
 /// Partial-implicit container macros: each wraps the remainder of the line.
 fn container_macro(name: &str) -> Option<Macro> {
     Some(match name {
@@ -558,6 +643,16 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn display_blocks() {
+        parity(".Bd -literal\ncode line\n.Ed\n");
+        parity(".Bd -filled -offset indent\ntext\n.Ed\n");
+        parity(".Bd -ragged -offset indent-two -compact\nx\n.Ed\n");
+        parity(".Bf -symbolic\nbold\n.Ef\n");
+        parity(".Bk -words\nkept\n.Ek\n");
+        parity(".Sh A\n.Bd -literal\nx\n.Ed\nafter\n");
     }
 
     #[test]

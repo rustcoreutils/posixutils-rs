@@ -273,20 +273,6 @@ impl Parser {
                     nodes: parse_inline_seq(tokenize(rest)),
                 }));
             }
-            "Es" => {
-                // Obsolete: end-of-sentence delimiters as two single chars.
-                let mut it = tokenize(rest).into_iter();
-                let opening_delimiter = it.next().and_then(|s| s.chars().next()).unwrap_or(' ');
-                let closing_delimiter = it.next().and_then(|s| s.chars().next()).unwrap_or(' ');
-                let nodes = parse_inline_seq(it.collect());
-                self.push(Element::Macro(MacroNode {
-                    mdoc_macro: Macro::Es {
-                        opening_delimiter,
-                        closing_delimiter,
-                    },
-                    nodes,
-                }));
-            }
             "St" => {
                 let mut it = tokenize(rest).into_iter();
                 match it.next().as_deref().and_then(st_type) {
@@ -552,6 +538,20 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
                 nodes: parse_inline_seq(rest),
             }));
             return out;
+        }
+        if tok == "Es" {
+            // Obsolete: end-of-sentence delimiters as two single chars; takes no
+            // child nodes (following content is sibling).
+            let opening_delimiter = toks.next().and_then(|s| s.chars().next()).unwrap_or(' ');
+            let closing_delimiter = toks.next().and_then(|s| s.chars().next()).unwrap_or(' ');
+            out.push(Element::Macro(MacroNode {
+                mdoc_macro: Macro::Es {
+                    opening_delimiter,
+                    closing_delimiter,
+                },
+                nodes: Vec::new(),
+            }));
+            continue;
         }
         if tok == "Pf" {
             // .Pf takes only the prefix word; following content is sibling.
@@ -877,7 +877,7 @@ fn is_callable(name: &str) -> bool {
     is_leaf(name)
         || container_macro(name).is_some()
         || is_text_prod(name)
-        || matches!(name, "An" | "Fn" | "Pf" | "Ta")
+        || matches!(name, "An" | "Es" | "Fn" | "Pf" | "Ta")
 }
 
 /// Parse a `.Bl -type [-width w] [-offset o] [-compact] [columns…]` list opener.

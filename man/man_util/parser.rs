@@ -379,6 +379,11 @@ impl MdocParser {
 
     /// Parses full mdoc file
     pub fn parse_mdoc(input: &str) -> Result<MdocDocument, MdocError> {
+        // Opt-in to the hand-written parser (being grown to parity with pest).
+        if std::env::var("MAN_PARSER").as_deref() == Ok("v2") {
+            return Ok(crate::man_util::parse::mdoc::parse_mdoc_v2(input));
+        }
+
         // Reject pathologically nested input before handing it to the PEG
         // parser, which backtracks exponentially (a single deeply nested line
         // otherwise hangs for seconds and eventually overflows the stack).

@@ -15,6 +15,8 @@ pub mod formatter;
 pub mod man7;
 /// Store [`Macro`] enum
 pub mod mdoc_macro;
+/// Hand-written mdoc/man parsers (replacing pest; selected via MAN_PARSER=v2)
+pub mod parse;
 /// Converts input mdoc file macros to AST
 pub mod parser;
 /// The roff front-end: request/escape interpreter (registers, conditionals,

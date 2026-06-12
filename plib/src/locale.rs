@@ -35,16 +35,32 @@ type WintT = libc::c_int;
 #[cfg(not(target_vendor = "apple"))]
 type WintT = libc::c_uint;
 
+/// Opaque `mbstate_t`. The `libc` crate exposes `mbstate_t` on Linux but not on
+/// macOS, so we declare our own buffer large enough for any supported platform's
+/// layout (glibc: 8 bytes; macOS/Darwin: 128 bytes) with 8-byte alignment. A
+/// freshly zeroed value is the documented initial conversion state; `mbrtowc`
+/// only touches the bytes its own ABI defines, so over-sizing is safe.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct MbStateT([u8; 128]);
+
+impl MbStateT {
+    fn zeroed() -> Self {
+        MbStateT([0u8; 128])
+    }
+}
+
 extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
     fn towlower(c: WintT) -> WintT;
     fn towupper(c: WintT) -> WintT;
-    // Not surfaced by the `libc` crate on all targets, so declared directly.
+    // `mbrtowc` and `mbstate_t` are not surfaced by the `libc` crate on all
+    // targets (notably macOS), so both are declared directly.
     fn mbrtowc(
         pwc: *mut libc::wchar_t,
         s: *const libc::c_char,
         n: libc::size_t,
-        ps: *mut libc::mbstate_t,
+        ps: *mut MbStateT,
     ) -> libc::size_t;
 }
 
@@ -187,8 +203,8 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
 /// and `translit`, per POSIX `LC_CTYPE`.
 pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
-    // SAFETY: an all-zero mbstate_t is the documented initial conversion state.
-    let mut state: libc::mbstate_t = unsafe { std::mem::zeroed() };
+    // An all-zero mbstate_t is the documented initial conversion state.
+    let mut state = MbStateT::zeroed();
     let mut i = 0;
     while i < bytes.len() {
         let remaining = &bytes[i..];
@@ -209,7 +225,7 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
         } else if n == usize::MAX || n == usize::MAX - 1 {
             // (size_t)-1 (invalid sequence) or (size_t)-2 (incomplete at end of
             // input): consume one byte and reset the conversion state.
-            state = unsafe { std::mem::zeroed() };
+            state = MbStateT::zeroed();
             1
         } else {
             n

@@ -117,6 +117,31 @@ impl Parser {
         }
     }
 
+    /// Close a block-partial-explicit enclosure: the closer node becomes the
+    /// opener's final child, then the opener frame is closed.
+    fn close_partial(&mut self, closer: Element, opener_is: fn(&Macro) -> bool) {
+        while self.stack.len() > 1 {
+            let matched = self
+                .stack
+                .last()
+                .unwrap()
+                .mac
+                .as_ref()
+                .map(opener_is)
+                .unwrap_or(false);
+            if matched {
+                break;
+            }
+            self.close_top();
+        }
+        if self.stack.len() > 1 {
+            self.stack.last_mut().unwrap().nodes.push(closer);
+            self.close_top();
+        } else {
+            self.push(closer);
+        }
+    }
+
     /// Close every open block and return the document elements.
     fn finish(&mut self) -> Vec<Element> {
         while self.stack.len() > 1 {
@@ -239,6 +264,23 @@ impl Parser {
                 mdoc_macro: Macro::Os,
                 nodes: tokenize(rest).into_iter().map(Element::Text).collect(),
             })),
+            // Block-partial-explicit openers (closed by a matching closer macro,
+            // which is kept as the block's final child).
+            _ if opener_macro(name).is_some() => {
+                let mac = opener_macro(name).unwrap();
+                self.stack.push(Frame {
+                    mac: Some(mac),
+                    nodes: parse_inline_seq(tokenize(rest)),
+                });
+            }
+            _ if closer_info(name).is_some() => {
+                let (closer, opener_is) = closer_info(name).unwrap();
+                let node = Element::Macro(MacroNode {
+                    mdoc_macro: closer,
+                    nodes: parse_inline_seq(tokenize(rest)),
+                });
+                self.close_partial(node, opener_is);
+            }
             _ if is_callable(name) => {
                 let mut tokens = vec![name.to_string()];
                 tokens.extend(tokenize(rest));
@@ -582,6 +624,38 @@ fn is_bl(m: &Macro) -> bool {
     matches!(m, Macro::Bl { .. })
 }
 
+/// Block-partial-explicit opener macros (multi-line enclosures).
+fn opener_macro(name: &str) -> Option<Macro> {
+    Some(match name {
+        "Ao" => Macro::Ao,
+        "Bo" => Macro::Bo,
+        "Bro" => Macro::Bro,
+        "Do" => Macro::Do,
+        "Oo" => Macro::Oo,
+        "Po" => Macro::Po,
+        "Qo" => Macro::Qo,
+        "So" => Macro::So,
+        "Xo" => Macro::Xo,
+        _ => return None,
+    })
+}
+
+/// Closer macros and the predicate identifying their matching opener.
+fn closer_info(name: &str) -> Option<(Macro, fn(&Macro) -> bool)> {
+    Some(match name {
+        "Ac" => (Macro::Ac, |m| matches!(m, Macro::Ao)),
+        "Bc" => (Macro::Bc, |m| matches!(m, Macro::Bo)),
+        "Brc" => (Macro::Brc, |m| matches!(m, Macro::Bro)),
+        "Dc" => (Macro::Dc, |m| matches!(m, Macro::Do)),
+        "Oc" => (Macro::Oc, |m| matches!(m, Macro::Oo)),
+        "Pc" => (Macro::Pc, |m| matches!(m, Macro::Po)),
+        "Qc" => (Macro::Qc, |m| matches!(m, Macro::Qo)),
+        "Sc" => (Macro::Sc, |m| matches!(m, Macro::So)),
+        "Xc" => (Macro::Xc, |m| matches!(m, Macro::Xo)),
+        _ => return None,
+    })
+}
+
 /// Build an `.An` author node.
 fn an_node(author_name_type: AnType, nodes: Vec<Element>) -> Element {
     Element::Macro(MacroNode {
@@ -741,6 +815,14 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn partial_explicit_blocks() {
+        parity(".Ao text\n.Ac\n");
+        parity(".Bo inside\n.Bc\n");
+        parity(".Sh A\n.Oo x\n.Oc\n");
+        parity(".Ao a\nb\n.Ac trailing\n");
     }
 
     #[test]

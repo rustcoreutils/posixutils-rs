@@ -12,9 +12,9 @@ use super::{
 // Private, zero-width style markers inserted during formatting and resolved by
 // `apply_styling` into nroff backspace-overstrike (or stripped). These control
 // characters never occur in manual-page text.
-const STYLE_BOLD: char = '\u{1}';
-const STYLE_UL: char = '\u{2}';
-const STYLE_RESET: char = '\u{3}';
+pub(crate) const STYLE_BOLD: char = '\u{1}';
+pub(crate) const STYLE_UL: char = '\u{2}';
+pub(crate) const STYLE_RESET: char = '\u{3}';
 
 fn is_style_marker(c: char) -> bool {
     matches!(c, STYLE_BOLD | STYLE_UL | STYLE_RESET)
@@ -23,7 +23,7 @@ fn is_style_marker(c: char) -> bool {
 /// Display width of `s` in terminal cells, ignoring the zero-width style
 /// markers. (Overstrike is applied only after wrapping, so no backspaces are
 /// present here.) For unstyled text this equals `chars().count()`.
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     s.chars().filter(|&c| !is_style_marker(c)).count()
 }
 
@@ -31,7 +31,7 @@ fn display_width(s: &str) -> usize {
 /// on, characters inside a bold/underline span become nroff overstrike
 /// (`c\bc` / `_\bc`); otherwise the markers are simply removed. The font state
 /// persists across newlines so a span that wraps keeps its style.
-fn apply_styling(content: &str, styling: bool) -> String {
+pub(crate) fn apply_styling(content: &str, styling: bool) -> String {
     let mut out = String::with_capacity(content.len());
     let mut state = STYLE_RESET;
     for ch in content.chars() {

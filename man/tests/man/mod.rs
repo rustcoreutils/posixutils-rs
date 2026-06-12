@@ -701,6 +701,52 @@ mod tests {
         );
     }
 
+    // Audit #3: a legacy man(7)/roff page (.TH/.SH/.B/.TP) renders its content
+    // (it previously produced an empty page).
+    #[test]
+    fn man7_page_renders() {
+        let page = write_temp_page(
+            "man7",
+            ".TH TEST 1 2024 \"util 1.0\"\n\
+             .SH NAME\n\
+             test \\- a test program\n\
+             .SH DESCRIPTION\n\
+             This is the description.\n\
+             .SH EXIT STATUS\n\
+             .TP\n\
+             .B 0\n\
+             Success.\n",
+        );
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(output.status.code(), Some(0), "man(7) page should render");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for needle in [
+            "TEST(1)",
+            "NAME",
+            "test - a test program",
+            "DESCRIPTION",
+            "This is the description.",
+            "EXIT STATUS",
+        ] {
+            assert!(stdout.contains(needle), "missing {needle:?} in:\n{stdout}");
+        }
+    }
+
+    // Audit #3 (exit-code half): a man(7)-detected page that produces no body is
+    // reported as an error (non-zero), not a silent empty success.
+    #[test]
+    fn man7_empty_page_errors() {
+        let page = write_temp_page("man7e", ".TH TEST 1\n");
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "empty page should be an error"
+        );
+    }
+
     // Audit #8: `-k` with a regex metacharacter keyword must not crash (the
     // native search compiles keywords as case-insensitive EREs, with a literal
     // fallback for invalid syntax).

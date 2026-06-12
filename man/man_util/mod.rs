@@ -11,6 +11,8 @@
 pub mod config;
 /// Converts AST to [`String`] and print it to terminal
 pub mod formatter;
+/// Minimal renderer for legacy `man(7)` (roff `man` macro) pages
+pub mod man7;
 /// Store [`Macro`] enum
 pub mod mdoc_macro;
 /// Converts input mdoc file macros to AST

@@ -11,6 +11,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
+use man_util::man7;
 use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
@@ -182,6 +183,10 @@ enum ManError {
     /// Not found error
     #[error("file: {0} was not found")]
     NotFound(PathBuf),
+
+    /// The page produced no renderable content (e.g. an unsupported format).
+    #[error("no renderable content in page")]
+    EmptyPage,
 }
 
 /// Parsing error types
@@ -482,6 +487,16 @@ fn format_man_page(
     // still renders instead of erroring out.
     let content = String::from_utf8(man_bytes)
         .unwrap_or_else(|err| err.into_bytes().iter().map(|&b| b as char).collect());
+
+    // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
+    // the mdoc engine only understands mdoc(7) and would otherwise emit an empty
+    // page. The synopsis-only mode (-h) is mdoc-specific.
+    if !synopsis && man7::is_man7(&content) {
+        if !man7::produced_body(&content, formatting) {
+            return Err(ManError::EmptyPage);
+        }
+        return Ok(man7::format_man7(&content, formatting));
+    }
 
     let mut formatter = MdocFormatter::new(*formatting);
 

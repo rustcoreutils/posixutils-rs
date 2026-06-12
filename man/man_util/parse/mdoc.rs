@@ -147,19 +147,57 @@ impl Parser {
                     nodes: Vec::new(),
                 }));
             }
-            // Not yet implemented: degrade to text so the v2 path stays usable.
-            // (Production defaults to pest until v2 reaches full coverage.)
             _ => {
-                let mut text = String::from(".");
-                text.push_str(name);
-                if !rest.is_empty() {
-                    text.push(' ');
-                    text.push_str(rest);
+                if let Some(mac) = simple_inline(name) {
+                    // Inline macros that take only text arguments, one Text node
+                    // per word.
+                    let nodes = tokenize(rest).into_iter().map(Element::Text).collect();
+                    self.push(Element::Macro(MacroNode {
+                        mdoc_macro: mac,
+                        nodes,
+                    }));
+                } else {
+                    // Not yet implemented: degrade to text so the v2 path stays
+                    // usable. (Production defaults to pest until v2 is complete.)
+                    let mut text = String::from(".");
+                    text.push_str(name);
+                    if !rest.is_empty() {
+                        text.push(' ');
+                        text.push_str(rest);
+                    }
+                    self.push(Element::Text(text));
                 }
-                self.push(Element::Text(text));
             }
         }
     }
+}
+
+/// Inline macros that take only text arguments and map to a unit `Macro`
+/// variant (each argument word becomes a `Text` child).
+fn simple_inline(name: &str) -> Option<Macro> {
+    Some(match name {
+        "Ad" => Macro::Ad,
+        "Ar" => Macro::Ar,
+        "Cd" => Macro::Cd,
+        "Cm" => Macro::Cm,
+        "Dv" => Macro::Dv,
+        "Em" => Macro::Em,
+        "Er" => Macro::Er,
+        "Ev" => Macro::Ev,
+        "Fa" => Macro::Fa,
+        "Fl" => Macro::Fl,
+        "Ft" => Macro::Ft,
+        "Ic" => Macro::Ic,
+        "Li" => Macro::Li,
+        "Ms" => Macro::Ms,
+        "No" => Macro::No,
+        "Pa" => Macro::Pa,
+        "Sx" => Macro::Sx,
+        "Sy" => Macro::Sy,
+        "Tn" => Macro::Tn,
+        "Va" => Macro::Va,
+        _ => return None,
+    })
 }
 
 fn macro_for_argless(name: &str) -> Macro {
@@ -260,5 +298,38 @@ mod tests {
     #[test]
     fn pp_paragraph() {
         parity(".Sh A\nline\n.Pp\nmore\n");
+    }
+
+    #[test]
+    fn inline_flag_and_arg() {
+        parity(".Fl x\n");
+        parity(".Ar file\n");
+        parity(".Fl\n");
+    }
+
+    #[test]
+    fn inline_multiple_text_args() {
+        parity(".Cm one two three\n");
+        parity(".Sy bold words\n");
+    }
+
+    #[test]
+    fn inline_in_section() {
+        parity(".Sh OPTIONS\n.Fl v\n.Ar path\n.Em note\n");
+    }
+
+    #[test]
+    fn inline_assorted_macros() {
+        for input in [
+            ".Pa /etc/passwd\n",
+            ".Va errno\n",
+            ".Dv NULL\n",
+            ".Ic command\n",
+            ".Li literal\n",
+            ".Ms alpha\n",
+            ".No normal\n",
+        ] {
+            parity(input);
+        }
     }
 }

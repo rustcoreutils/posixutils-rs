@@ -3942,7 +3942,7 @@ mod tests {
 
     /// Parse [`input`] into AST
     fn get_ast(input: &str) -> MdocDocument {
-        MdocParser::parse_mdoc(input).unwrap()
+        MdocParser::parse_mdoc(input)
     }
 
     /// Universal function for all tests.

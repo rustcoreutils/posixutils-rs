@@ -172,10 +172,6 @@ enum ManError {
     #[error("failed to execute command: {0}")]
     Io(#[from] io::Error),
 
-    /// Mdoc error
-    #[error("parsing error: {0}")]
-    Mdoc(#[from] man_util::parser::MdocError),
-
     /// Parsing error
     #[error("parsing error: {0}")]
     ParseError(#[from] ParseError),
@@ -529,7 +525,7 @@ fn format_man_page(
 
     let mut formatter = MdocFormatter::new(*formatting);
 
-    let document = MdocParser::parse_mdoc(&content)?;
+    let document = MdocParser::parse_mdoc(&content);
     let formatted_document = match synopsis {
         true => formatter.format_synopsis_section(document),
         false => formatter.format_mdoc(document),
@@ -669,8 +665,8 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                 }));
 
                 let document = match parse_result {
-                    Ok(Ok(d)) => d,
-                    _ => continue, // Skip on parse error or panic
+                    Ok(d) => d,
+                    _ => continue, // Skip on panic
                 };
 
                 if let Some((names, description)) = extract_name_info(&document) {

@@ -519,16 +519,18 @@ mod tests {
         let elapsed = start.elapsed();
         let _ = std::fs::remove_file(&page);
 
-        // A clean parse error (exit 1), not a panic (101) or stack overflow (134).
-        assert_eq!(output.status.code(), Some(1), "expected a graceful error");
+        // The hand-written parser has no exponential backtracking, so a
+        // pathologically nested line is handled quickly and without crashing —
+        // no panic (101) or stack overflow (134), and no need for the old
+        // nesting-limit rejection.
+        let code = output.status.code();
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("nested macros"),
-            "expected the nesting diagnostic, got: {}",
-            String::from_utf8_lossy(&output.stderr)
+            matches!(code, Some(0) | Some(1)),
+            "must not crash on deep nesting, got exit {code:?}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "rejection must be fast, took {elapsed:?}"
+            "must handle deep nesting fast, took {elapsed:?}"
         );
     }
 

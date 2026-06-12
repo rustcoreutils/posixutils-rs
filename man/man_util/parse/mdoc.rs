@@ -236,6 +236,20 @@ impl Parser {
                     nodes: it.map(Element::Text).collect(),
                 }));
             }
+            "Db" | "Hf" => {
+                let mac = if name == "Db" { Macro::Db } else { Macro::Hf };
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: mac,
+                    nodes: tokenize(rest).into_iter().map(Element::Text).collect(),
+                }));
+            }
+            "Tg" => {
+                let term = tokenize(rest).into_iter().next().filter(|s| !s.is_empty());
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Tg { term },
+                    nodes: Vec::new(),
+                }));
+            }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
             "Bd" => self.open_block(parse_bd(rest), &[]),
             "Bf" => self.open_block(
@@ -890,6 +904,14 @@ mod tests {
         parity(".Sh A\n.Ar file )\n");
         parity(".Sh A\n.Fl x ,\n");
         parity(".Sh A\n.Cm ( foo )\n");
+    }
+
+    #[test]
+    fn tag_hidden_hf_db() {
+        parity(".Tg keyword\n");
+        parity(".Tg\n");
+        parity(".Hf file.h\n");
+        parity(".Db on\n");
     }
 
     #[test]

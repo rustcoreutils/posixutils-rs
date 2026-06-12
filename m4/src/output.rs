@@ -258,35 +258,56 @@ impl Write for Output {
             String::from_utf8_lossy(buf)
         );
 
-        // Negative diversion: discard.
-        if self.divert_number < 0 {
-            return Ok(buf.len());
-        }
-        if self.divert_number == 0 {
-            let stdout = self.stdout.clone();
-            let mut out = stdout.borrow_mut();
-            self.write_synced(&mut *out, buf)
-        } else {
+        match self.diversion_key() {
+            // Normal output.
+            DiversionTarget::Stdout => {
+                let stdout = self.stdout.clone();
+                let mut out = stdout.borrow_mut();
+                self.write_synced(&mut *out, buf)
+            }
+            // Negative diversion (or an out-of-range buffer number): discard.
+            DiversionTarget::Discard => Ok(buf.len()),
             // Positive diversion: create the buffer on first use.
-            let buffer = self
-                .divert_buffers
-                .entry(self.divert_number as usize)
-                .or_default()
-                .clone();
-            let mut buffer = buffer.borrow_mut();
-            self.write_synced(&mut buffer.0, buf)
+            DiversionTarget::Buffer(key) => {
+                let buffer = self.divert_buffers.entry(key).or_default().clone();
+                let mut buffer = buffer.borrow_mut();
+                self.write_synced(&mut buffer.0, buf)
+            }
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if self.divert_number < 0 {
-            Ok(())
-        } else if self.divert_number == 0 {
-            self.stdout.borrow_mut().flush()
-        } else if let Some(buffer) = self.divert_buffers.get(&(self.divert_number as usize)) {
-            buffer.borrow_mut().0.flush()
-        } else {
-            Ok(())
+        match self.diversion_key() {
+            DiversionTarget::Stdout => self.stdout.borrow_mut().flush(),
+            DiversionTarget::Discard => Ok(()),
+            DiversionTarget::Buffer(key) => match self.divert_buffers.get(&key) {
+                Some(buffer) => buffer.borrow_mut().0.flush(),
+                None => Ok(()),
+            },
+        }
+    }
+}
+
+/// Where output for the current diversion number is directed.
+enum DiversionTarget {
+    Stdout,
+    Discard,
+    Buffer(usize),
+}
+
+impl Output {
+    /// Resolve the current `divert_number` to an output target. A positive number
+    /// is a buffer key; 0 is normal output; negative (or a value too large for
+    /// `usize`, which cannot happen on 64-bit but is handled for portability) is
+    /// discarded.
+    fn diversion_key(&self) -> DiversionTarget {
+        match self.divert_number {
+            0 => DiversionTarget::Stdout,
+            n if n < 0 => DiversionTarget::Discard,
+            n => match usize::try_from(n) {
+                Ok(key) => DiversionTarget::Buffer(key),
+                Err(_) => DiversionTarget::Discard,
+            },
         }
     }
 }

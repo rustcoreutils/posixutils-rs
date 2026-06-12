@@ -215,6 +215,19 @@ impl Parser {
                 }));
             }
             "Dt" => self.push(parse_dt(rest)),
+            "Ex" | "Rv" => {
+                // `.Ex -std [name…]` / `.Rv -std [name…]`: -std is a consumed
+                // literal; the remaining words are text nodes.
+                let mut toks = tokenize(rest);
+                if toks.first().map(|s| s == "-std").unwrap_or(false) {
+                    toks.remove(0);
+                }
+                let mac = if name == "Ex" { Macro::Ex } else { Macro::Rv };
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: mac,
+                    nodes: toks.into_iter().map(Element::Text).collect(),
+                }));
+            }
             "Lb" => {
                 let mut it = tokenize(rest).into_iter();
                 let lib_name = it.next().unwrap_or_default();
@@ -868,6 +881,13 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn exit_return_value() {
+        parity(".Ex -std cat\n");
+        parity(".Rv -std getpid wait\n");
+        parity(".Ex -std\n");
     }
 
     #[test]

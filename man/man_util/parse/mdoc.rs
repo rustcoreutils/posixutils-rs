@@ -263,6 +263,16 @@ impl Parser {
                     nodes: Vec::new(),
                 }));
             }
+            "D1" | "Dl" => {
+                // One-line display containers. They are NOT callable as macro
+                // arguments (pest's macro_arg exclusion), so they are handled here
+                // at the top level rather than via the inline path.
+                let mac = if name == "D1" { Macro::D1 } else { Macro::Dl };
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: mac,
+                    nodes: parse_inline_seq(tokenize(rest)),
+                }));
+            }
             "Es" => {
                 // Obsolete: end-of-sentence delimiters as two single chars.
                 let mut it = tokenize(rest).into_iter();
@@ -735,8 +745,6 @@ fn container_macro(name: &str) -> Option<Macro> {
         "Aq" => Macro::Aq,
         "Bq" => Macro::Bq,
         "Brq" => Macro::Brq,
-        "D1" => Macro::D1,
-        "Dl" => Macro::Dl,
         "Dq" => Macro::Dq,
         "En" => Macro::En,
         "Op" => Macro::Op,

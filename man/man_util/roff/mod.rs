@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Hemi Labs, Inc.
+// Copyright (c) 2026 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -153,6 +153,8 @@ impl Roff {
             // observable effect, so they are recognized and dropped rather than
             // leaked to the language parser.
             "wh" | "ch" | "dt" | "ev" | "evc" => {}
+            "TS" => self.do_tbl(queue),
+            "EQ" => self.do_eqn(queue),
             "so" | "mso" => self.do_so(args, queue),
             "nop" => {
                 if !args.is_empty() {
@@ -516,6 +518,42 @@ impl Roff {
                 break;
             }
         }
+    }
+
+    /// Capture a `.TS … .TE` table region, lay it out, and re-emit it as no-fill
+    /// text so the renderer preserves the column alignment.
+    fn do_tbl(&mut self, queue: &mut Vec<String>) {
+        let body = Self::capture_until(queue, "TE");
+        let table = crate::man_util::preproc::tbl::format(&body);
+        let mut emit = vec![".nf".to_string()];
+        emit.extend(table);
+        emit.push(".fi".to_string());
+        Self::push_front(queue, emit);
+    }
+
+    /// Capture a `.EQ … .EN` equation region and re-emit its linearized text.
+    fn do_eqn(&mut self, queue: &mut Vec<String>) {
+        let body = Self::capture_until(queue, "EN");
+        let eq = crate::man_util::preproc::eqn::format(&body);
+        Self::push_front(queue, eq);
+    }
+
+    /// Pop lines up to (and consuming) the `.END` control line.
+    fn capture_until(queue: &mut Vec<String>, end: &str) -> Vec<String> {
+        let mut body = Vec::new();
+        while let Some(line) = queue.pop() {
+            let trimmed = line.trim_start();
+            let is_end = trimmed
+                .strip_prefix('.')
+                .or_else(|| trimmed.strip_prefix('\''))
+                .map(|b| split_name(b.trim_start()).0 == end)
+                .unwrap_or(false);
+            if is_end {
+                break;
+            }
+            body.push(line);
+        }
+        body
     }
 
     fn do_so(&mut self, args: &str, queue: &mut Vec<String>) {

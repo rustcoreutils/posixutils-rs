@@ -19,6 +19,8 @@ pub mod mdoc_macro;
 pub mod parse;
 /// Converts input mdoc file macros to AST
 pub mod parser;
+/// tbl/eqn preprocessors for `.TS`/`.EQ` regions
+pub mod preproc;
 /// The roff front-end: request/escape interpreter (registers, conditionals,
 /// user macros, `.so`/`.ig`) run before mdoc/man parsing.
 pub mod roff;

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Hemi Labs, Inc.
+// Copyright (c) 2026 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -205,6 +205,22 @@ fn diversion_append() {
 fn traps_and_environments_dropped() {
     let input = ".wh 0 NL\n.ev 1\n.dt 5 X\nkept\n.ch NL 1\n.evc 0\n";
     assert_eq!(run(input), "kept\n");
+}
+
+#[test]
+fn tbl_region_is_laid_out() {
+    let out = run(".TS\nl l.\nName\tValue\n.TE\nafter\n");
+    assert!(out.contains(".nf"), "{out}");
+    assert!(out.contains("Name  Value"), "{out}");
+    assert!(out.contains(".fi"), "{out}");
+    assert!(out.contains("after"), "{out}");
+}
+
+#[test]
+fn eqn_region_is_linearized() {
+    let out = run(".EQ\nx over y\n.EN\nrest\n");
+    assert!(out.contains("x/y"), "{out}");
+    assert!(out.contains("rest"), "{out}");
 }
 
 // ── expression evaluator ─────────────────────────────────────────────────

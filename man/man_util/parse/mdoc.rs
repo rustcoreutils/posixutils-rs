@@ -238,6 +238,31 @@ impl Parser {
                 self.close_open_items();
                 self.close_explicit(is_bl);
             }
+            "Fo" => {
+                // Function block: first word is the funcname; the rest of the
+                // head plus the body (until .Fc) are the argument nodes.
+                let toks = tokenize(rest);
+                let funcname = toks.first().cloned().unwrap_or_default();
+                let nodes = parse_inline_seq(toks.into_iter().skip(1).collect());
+                self.stack.push(Frame {
+                    mac: Some(Macro::Fo { funcname }),
+                    nodes,
+                });
+            }
+            "Fc" => {
+                // .Fc closes .Fo and is not itself kept; any args flow into Fo.
+                while self.stack.len() > 1
+                    && !matches!(self.stack.last().unwrap().mac, Some(Macro::Fo { .. }))
+                {
+                    self.close_top();
+                }
+                if matches!(self.stack.last().unwrap().mac, Some(Macro::Fo { .. })) {
+                    for el in parse_inline_seq(tokenize(rest)) {
+                        self.stack.last_mut().unwrap().nodes.push(el);
+                    }
+                    self.close_top();
+                }
+            }
             "Sm" => {
                 // Optional on/off spacing mode; the first arg is consumed either
                 // way (matching pest), the rest become text nodes.
@@ -818,6 +843,12 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn function_block() {
+        parity(".Fo open\n.Fa path\n.Fa flags\n.Fc\n");
+        parity(".Fo getpid\n.Fc\n");
     }
 
     #[test]

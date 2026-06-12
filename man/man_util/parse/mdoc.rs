@@ -250,6 +250,23 @@ impl Parser {
                     nodes: Vec::new(),
                 }));
             }
+            "Bsx" | "Dx" | "Fx" | "Nx" | "Ox" | "Bx" => {
+                // BSD-family text production: no argument yields the OS name; a
+                // version argument yields "Name version" ("versionBSD" for Bx).
+                let (mac, name_str) = bsd_family(name);
+                let args = tokenize(rest);
+                let text = if args.is_empty() {
+                    name_str.to_string()
+                } else if name == "Bx" {
+                    format!("{}BSD", args.join(" "))
+                } else {
+                    format!("{} {}", name_str, args.join(" "))
+                };
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: mac,
+                    nodes: vec![Element::Text(text)],
+                }));
+            }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
             "Bd" => self.open_block(parse_bd(rest), &[]),
             "Bf" => self.open_block(
@@ -744,6 +761,19 @@ fn an_node(author_name_type: AnType, nodes: Vec<Element>) -> Element {
     })
 }
 
+/// BSD-family text-production macro and its OS name.
+fn bsd_family(name: &str) -> (Macro, &'static str) {
+    match name {
+        "Bsx" => (Macro::Bsx, "BSD/OS"),
+        "Bx" => (Macro::Bx, "BSD"),
+        "Dx" => (Macro::Dx, "DragonFly"),
+        "Fx" => (Macro::Fx, "FreeBSD"),
+        "Nx" => (Macro::Nx, "NetBSD"),
+        "Ox" => (Macro::Ox, "OpenBSD"),
+        _ => unreachable!(),
+    }
+}
+
 fn macro_for_argless(name: &str) -> Macro {
     match name {
         "Pp" => Macro::Pp,
@@ -904,6 +934,19 @@ mod tests {
         parity(".Sh A\n.Ar file )\n");
         parity(".Sh A\n.Fl x ,\n");
         parity(".Sh A\n.Cm ( foo )\n");
+    }
+
+    #[test]
+    fn bsd_text_production() {
+        parity(".Bx\n");
+        parity(".Ox\n");
+        parity(".Fx\n");
+        parity(".Nx\n");
+        parity(".Dx\n");
+        parity(".Bsx\n");
+        parity(".Fx 14.0\n");
+        parity(".Ox 7.5\n");
+        parity(".Bx 4.4\n");
     }
 
     #[test]

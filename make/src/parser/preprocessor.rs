@@ -399,6 +399,16 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                 }
 
                 let Some(macro_body) = env_macro.or(table_macro) else {
+                    // The special `MAKE` macro, when not otherwise defined, is
+                    // passed through to the rule stage (it expands to the make
+                    // program and marks the recipe for recursive execution).
+                    if macro_name == "MAKE" {
+                        result.push('$');
+                        result.push(open);
+                        result.push_str("MAKE");
+                        result.push(close);
+                        continue;
+                    }
                     Err(PreprocError::UndefinedMacro(macro_name.to_string()))?
                 };
                 result.push_str(&macro_body);

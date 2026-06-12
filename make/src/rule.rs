@@ -28,7 +28,6 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
-    env,
     fs::{File, FileTimes},
     process::{self, Command},
     sync::{Arc, LazyLock, Mutex},
@@ -196,7 +195,14 @@ impl Rule {
                     signal_handler::register_signals();
                 }
 
-                if !force_run {
+                // POSIX: a recipe line prefixed with `+`, or one containing the
+                // `$(MAKE)`/`${MAKE}` macro, is executed even under -n, -t, or
+                // -q (so recursive sub-makes still run).
+                let raw = recipe.inner();
+                let is_recursive = raw.contains("$(MAKE)") || raw.contains("${MAKE}");
+                let always_run = force_run || is_recursive;
+
+                if !always_run {
                     // -n flag
                     if dry_run {
                         println!("{}", recipe);
@@ -222,16 +228,26 @@ impl Rule {
                     println!("{}", recipe);
                 }
 
-                let mut command = Command::new(
-                    env::var(DEFAULT_SHELL_VAR)
-                        .as_ref()
-                        .map(|s| s.as_str())
-                        .unwrap_or(DEFAULT_SHELL),
-                );
+                // POSIX: the recipe shell comes from the `SHELL` macro
+                // (default /bin/sh); the `SHELL` *environment variable* shall
+                // not be used and shall not be modified by the macro.
+                let shell = macros
+                    .iter()
+                    .find(|v| v.name().as_deref() == Some(DEFAULT_SHELL_VAR))
+                    .and_then(|v| v.raw_value())
+                    .unwrap_or_else(|| DEFAULT_SHELL.to_string());
+                let mut command = Command::new(shell);
 
                 self.init_env(env_macros, &mut command, macros);
                 let recipe = self.substitute_internal_macros(target, recipe, &inout, newer);
-                command.args(["-c", recipe.as_ref()]);
+                // POSIX: when errors are not being ignored, the shell -e option
+                // shall also be in effect, so the recipe aborts on the first
+                // failing command.
+                if ignore {
+                    command.args(["-c", recipe.as_ref()]);
+                } else {
+                    command.args(["-e", "-c", recipe.as_ref()]);
+                }
 
                 let status = match command.status() {
                     Ok(status) => status,
@@ -379,6 +395,8 @@ impl Rule {
                                 &self.expand_internal_macro(sigil, modifier, target, files, newer),
                             );
                         }
+                        // The special `MAKE` macro expands to the make program.
+                        _ if inner == "MAKE" => result.push_str(&make_program()),
                         // Not an internal macro: re-emit verbatim.
                         _ => {
                             result.push('$');
@@ -407,6 +425,11 @@ impl Rule {
                 )
             })
             .collect();
+
+        // POSIX: the `SHELL` macro shall not modify the `SHELL` environment
+        // variable seen by recipes, so never export it. The child still
+        // inherits the real `SHELL` from this process's environment.
+        macros.remove(DEFAULT_SHELL_VAR);
 
         if env_macros {
             let env_vars: HashMap<String, String> = std::env::vars().collect();
@@ -465,6 +488,15 @@ fn find_files_with_extension(ext: &str) -> Result<Vec<PathBuf>, ErrorCode> {
     }
 
     Ok(result)
+}
+
+/// The make program to substitute for the `$(MAKE)` macro: this executable's
+/// path if known, else the bare name `make`.
+fn make_program() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "make".to_string())
 }
 
 /// The directory part of a path (the prefix without a trailing slash). For a

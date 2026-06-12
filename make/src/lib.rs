@@ -17,7 +17,7 @@ pub mod special_target;
 use std::{
     collections::HashSet,
     fs::{self},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use parser::{Makefile, VariableDefinition};
@@ -358,7 +358,100 @@ impl TryFrom<(Makefile, Config)> for Make {
 
 /// Retrieves the modified time of the file at the given path.
 fn get_modified_time(path: impl AsRef<str>) -> Option<SystemTime> {
-    fs::metadata(path.as_ref())
+    let path = path.as_ref();
+    // An `archive(member)` target's timestamp is the member's stored mtime
+    // inside the `ar` archive, not a file on disk.
+    if let Some((archive, member)) = parse_archive_target(path) {
+        return archive_member_mtime(archive, member);
+    }
+    fs::metadata(path)
         .ok()
         .and_then(|meta| meta.modified().ok())
+}
+
+/// Splits an `archive(member)` target into its `(archive, member)` parts.
+fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
+    let s = s.strip_suffix(')')?;
+    let open = s.find('(')?;
+    let (archive, member) = (&s[..open], &s[open + 1..]);
+    if archive.is_empty() || member.is_empty() {
+        return None;
+    }
+    Some((archive, member))
+}
+
+/// Reads the stored modification time of `member` inside the `ar` archive at
+/// `archive_path`. Supports the common System V / GNU short-name format (member
+/// names terminated by `/`). Returns `None` if the archive or member is absent
+/// or the header cannot be parsed.
+fn archive_member_mtime(archive_path: &str, member: &str) -> Option<SystemTime> {
+    const MAGIC: &[u8] = b"!<arch>\n";
+    const HEADER_LEN: usize = 60;
+
+    let data = fs::read(archive_path).ok()?;
+    if !data.starts_with(MAGIC) {
+        return None;
+    }
+
+    let mut pos = MAGIC.len();
+    while pos + HEADER_LEN <= data.len() {
+        let header = &data[pos..pos + HEADER_LEN];
+        let name = std::str::from_utf8(&header[0..16]).ok()?.trim_end();
+        let name = name.strip_suffix('/').unwrap_or(name);
+        let mtime = std::str::from_utf8(&header[16..28]).ok()?.trim();
+        let size: usize = std::str::from_utf8(&header[48..58])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+
+        if name == member {
+            let secs: u64 = mtime.parse().ok()?;
+            return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        }
+
+        // Member data follows the header, padded to an even boundary.
+        pos += HEADER_LEN + size + (size & 1);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_archive_target_splits() {
+        assert_eq!(
+            parse_archive_target("libfoo.a(member.o)"),
+            Some(("libfoo.a", "member.o"))
+        );
+        assert_eq!(parse_archive_target("plain.o"), None);
+        assert_eq!(parse_archive_target("libfoo.a()"), None);
+        assert_eq!(parse_archive_target("(member.o)"), None);
+    }
+
+    #[test]
+    fn archive_member_mtime_reads_header() {
+        // Build a minimal `ar` archive containing one member `m.o` (4 bytes)
+        // with mtime 1234567890, and confirm the stored time is read back.
+        let mut ar = Vec::new();
+        ar.extend_from_slice(b"!<arch>\n");
+        let header = format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            "m.o/", "1234567890", "0", "0", "100644", "4"
+        );
+        ar.extend_from_slice(header.as_bytes());
+        ar.extend_from_slice(b"data");
+
+        let path = std::env::temp_dir().join("posixutils_make_ar_member_test.a");
+        fs::write(&path, &ar).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(1234567890);
+        assert_eq!(archive_member_mtime(path_str, "m.o"), Some(expected));
+        assert_eq!(archive_member_mtime(path_str, "absent.o"), None);
+
+        let _ = fs::remove_file(&path);
+    }
 }

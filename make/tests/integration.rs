@@ -318,6 +318,45 @@ mod internal_macros {
     }
 }
 
+// Audit #11 (shell -e) and the `$(MAKE)` recursive-make special case.
+mod recipe_execution {
+    use super::*;
+
+    // Audit #11: with errors not ignored, the shell -e option is in effect, so
+    // a recipe line aborts at the first failing command.
+    #[test]
+    fn shell_e_aborts_on_first_failure() {
+        run_test_helper(
+            &["-sf", "tests/makefiles/recipe_execution/shell_e.mk"],
+            "",
+            "make: execution error: 1\n",
+            2,
+        );
+    }
+
+    // The `$(MAKE)` macro expands to the make program and its recipe line runs
+    // even under -n (recursive sub-make), while ordinary lines are only printed.
+    #[test]
+    fn make_macro_runs_under_dry_run() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args([
+                "-n",
+                "-f",
+                "tests/makefiles/recipe_execution/make_recurse.mk",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The plain line is printed (not executed); the $(MAKE) line executes
+        // the sub-make, which prints SUBMAKE-RAN.
+        assert!(stdout.contains("echo top-line"), "stdout: {stdout}");
+        assert!(stdout.contains("SUBMAKE-RAN"), "stdout: {stdout}");
+    }
+}
+
 // such tests should be moved directly to the package responsible for parsing makefiles
 mod parsing {
 

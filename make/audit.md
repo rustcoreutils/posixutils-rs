@@ -37,9 +37,9 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#10 — Multiple `-f makefile` options are rejected.** ✓ fixed (Phase 2): `makefile` is now `Vec<PathBuf>`; `parse_makefile` concatenates the operands in order (with `-` = stdin). Test `multiple_dash_f`. `main.rs:50–51` — `makefile: Option<PathBuf>`. Verified: `make -f A.mk -f B.mk …` → `error: the argument '--makefile <MAKEFILE>' cannot be used multiple times` (exit 2). Spec: multiple `-f` shall be processed in order. Fix: make it `Vec<PathBuf>` and concatenate the makefiles in order.
 
-- [ ] **#11 — The shell `-e` option is not in effect for non-ignored recipes.** `rule.rs:209–219` runs each line as `sh -c <line>` with no `-e`. Verified: a recipe `false; echo REACHED` prints `REACHED` and exits 0 (should abort). Spec Makefile Execution: "if errors are not being ignored then the shell −e option shall also be in effect." Fix: invoke `sh -ce <line>` when `!ignore`; plain `sh -c` when ignoring.
+- [x] **#11 — The shell `-e` option is not in effect for non-ignored recipes.** ✓ fixed (Phase 6): the recipe command is now run with `-e -c` when the recipe's errors are not ignored, and plain `-c` when they are (`-`/`.IGNORE`/`-i`). Test `recipe_execution::shell_e_aborts_on_first_failure`; verified `false; echo REACHED` now aborts (exit 2, no `REACHED`) and `-false; echo REACHED` still reaches it.
 
-- [ ] **#12 — Recipes are run with the `SHELL` *environment variable*, which the spec forbids.** `rule.rs:209–213` uses `env::var("SHELL")`. Spec ENVIRONMENT VARIABLES (p. 3132): "The value of the SHELL environment variable shall not be used as a macro and shall not be modified by defining the SHELL macro …". The recipe shell must come from the `SHELL` macro (default `/bin/sh`), never the env var. Fix: resolve the `SHELL` macro from the parsed macro set; ignore the `SHELL` env var for shell selection.
+- [x] **#12 — Recipes are run with the `SHELL` *environment variable*, which the spec forbids.** ✓ fixed (Phase 6): the recipe shell is resolved from the `SHELL` *macro* (default `/bin/sh`); the `SHELL` env var is no longer consulted for shell selection, and `init_env` no longer exports the `SHELL` macro to recipe sub-processes (so the macro cannot modify the child's `SHELL`). Verified: a `SHELL` macro selects the shell while a bogus `SHELL` env var is ignored.
 
 - [x] **#13 — `MAKEFLAGS` is ignored.** ✓ fixed (Phase 4): `args_with_makeflags()` seeds options from the env var ahead of the real command line. The letters-only first word (`kn`) becomes a combined short option (`-kn`); `-`-prefixed and `macro=value` words pass through. `MAKEFLAGS` is inherited by recipe sub-processes via the environment (sub-make propagation). Tests `internal_macros::makeflags_letters_form`; verified `MAKEFLAGS=n`, `MAKEFLAGS=-n`, and `MAKEFLAGS='V=hello'`. Note: full synthesis of command-line flags *into* `MAKEFLAGS` for children is not done (only env-provided flags propagate).
 
@@ -106,7 +106,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 ### Environment variables
 - [x] `LANG`/`LC_*` — `setlocale(LcAll, "")` at `main.rs:165` (CONFORMS for locale init; message coverage is #23).
 - [x] `MAKEFLAGS` honored (Major #13 fixed).
-- [ ] **`SHELL` env var misused for recipe shell (Major #12)** — spec forbids.
+- [x] `SHELL` macro (not env var) used for recipe shell (Major #12 fixed).
 - [ ] **`PROJECTDIR` (XSI) MISSING** — no SCCS search-path support **(static, N/A-ish)**.
 
 ### Asynchronous events
@@ -135,8 +135,8 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 ### Extended description / rendering
 - [x] One shell per recipe line CONFORMS — `rule.rs:209–219`.
 - [x] `@` (silent) / `-` (ignore) / `+` (force) prefixes recognized — `rule/recipe.rs`; `+` forces under `-n`/`-t` (verified indirectly).
-- [ ] **Shell `-e` missing (Major #11)**; **`+`/MAKE-macro lines under `-n`/`-q` not special-cased** — `rule.rs:183–202` has no `$(MAKE)` detection **(static, Major)**.
-- [ ] **Archive/library `lib(member.o)` targets PARTIAL** — `$@`/`$%` parse the form (`rule.rs:284–292`) but no `ar`-based member mtime lookup exists, so such targets cannot be brought up to date **(static, Major)**.
+- [x] Shell `-e` in effect (Major #11 fixed); `+`/`$(MAKE)` lines now run under `-n`/`-t`/`-q` (`$(MAKE)` is passed through preprocessing, detected in `run_with_files`, and expanded to the make program). Tests `recipe_execution::*`.
+- [x] **Archive/library `lib(member.o)` member mtime — PARTIAL→implemented for the timestamp:** `get_modified_time` now reads a member's stored mtime from the `ar` archive (`archive_member_mtime`/`parse_archive_target`, unit-tested), so an `archive(member)` *string* compares correctly. REMAINING (separate pre-existing parser gap, not the audited mtime issue): the rule parser cannot lex a `lib(member):` target header (`(` is a distinct token), so such a rule cannot yet be *declared* in a makefile.
 
 ## Test coverage signal
 
@@ -149,7 +149,7 @@ Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing 
 - [x] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7) — `preprocess::test_subst_*`, `test_continuation_*`.
 - [x] Single-suffix inference rules (#8) — `inference_rules::single_suffix_rule`.
 - [ ] `-j`, `.WAIT`, `.NOTPARALLEL` (#9); multiple `-f` (#10).
-- [ ] Shell `-e` abort on first failing command (#11); `SHELL` macro vs env var (#12).
+- [x] Shell `-e` abort on first failing command (#11) — `recipe_execution::shell_e_aborts_on_first_failure`; `SHELL` macro vs env var (#12, behaviorally verified).
 - [x] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15) — `internal_macros::*`, `rule::tests::dir_and_file_parts`.
 - [x] `.SUFFIXES` ordering + clear/append (#16) — `inference_rules::suffixes_clear_then_readd`.
 - [ ] Signal-driven cleanup, `.PRECIOUS` global, re-raise (#17, #18, #20, #21).

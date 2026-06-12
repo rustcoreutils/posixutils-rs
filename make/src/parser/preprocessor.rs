@@ -36,6 +36,78 @@ impl std::error::Error for PreprocError {}
 
 type Result<T> = std::result::Result<T, PreprocError>;
 
+/// Returns true if `s` ends with an odd number of backslashes, i.e. its final
+/// `<newline>` is escaped (a `\\` pair is a literal backslash, not a splice).
+fn ends_with_odd_backslash(s: &str) -> bool {
+    s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+}
+
+/// Fold escaped newlines (`\<newline>`) per POSIX. Outside command (recipe)
+/// lines the backslash, the newline, and any leading white space on the next
+/// line are replaced by a single <space>. In a command line (tab-indented) the
+/// continuation is spliced directly — a single leading <tab> of the next line
+/// is removed — so the whole logical command reaches the shell intact.
+fn fold_continuations(source: &str) -> String {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let n = lines.len();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < n {
+        let is_recipe = lines[i].starts_with('\t');
+        let mut current = lines[i].to_string();
+        i += 1;
+        while ends_with_odd_backslash(&current) && i < n {
+            current.pop(); // drop the trailing backslash
+            let next = lines[i];
+            i += 1;
+            if is_recipe {
+                current.push_str(next.strip_prefix('\t').unwrap_or(next));
+            } else {
+                current.push(' ');
+                current.push_str(next.trim_start());
+            }
+        }
+        out.push_str(&current);
+        if i < n {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Apply a `$(string:subst1=subst2)` substitution to an already-expanded macro
+/// value. Handles both the suffix form (`subst1` is matched as a suffix of each
+/// word) and the pattern form (`[op]%[os]=[np][%][ns]`).
+fn apply_substitution(value: &str, spec: &str) -> String {
+    let Some((lhs, rhs)) = spec.split_once('=') else {
+        return value.to_string();
+    };
+
+    value
+        .split_whitespace()
+        .map(|word| {
+            if let Some((op, os)) = lhs.split_once('%') {
+                // Pattern form: word must match op + (stem) + os.
+                if word.len() >= op.len() + os.len() && word.starts_with(op) && word.ends_with(os) {
+                    let stem = &word[op.len()..word.len() - os.len()];
+                    match rhs.split_once('%') {
+                        Some((np, ns)) => format!("{np}{stem}{ns}"),
+                        None => rhs.to_string(),
+                    }
+                } else {
+                    word.to_string()
+                }
+            } else if !lhs.is_empty() && word.ends_with(lhs) {
+                // Suffix form.
+                format!("{}{}", &word[..word.len() - lhs.len()], rhs)
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn skip_blank(letters: &mut Peekable<impl Iterator<Item = char>>) {
     while let Some(letter) = letters.peek() {
         if !letter.is_whitespace() {
@@ -248,7 +320,7 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
             // Internal macros - we leave them "as is"
             // yet as they will be dealt with in the
             // parsing stage with more context available
-            c @ ('$' | '@' | '%' | '?' | '<' | '*') => {
+            c @ ('$' | '@' | '%' | '?' | '<' | '*' | '^' | '+') => {
                 result.push('$');
                 result.push(c);
                 continue;
@@ -267,18 +339,31 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                 substitutions += 1;
                 continue;
             }
-            '(' | '{' => {
+            open @ ('(' | '{') => {
+                let close = if open == '(' { ')' } else { '}' };
+
+                // An internal-macro reference such as `$(@)`, `$(@D)`, `$(?F)`
+                // is left verbatim for the rule stage, which alone has the
+                // target/prerequisite context to expand it.
+                if matches!(
+                    letters.peek(),
+                    Some('@' | '%' | '?' | '<' | '*' | '^' | '+')
+                ) {
+                    result.push('$');
+                    result.push(open);
+                    for c in letters.by_ref() {
+                        result.push(c);
+                        if c == close {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
                 skip_blank(&mut letters);
                 let Ok(macro_name) = get_ident(&mut letters) else {
                     Err(PreprocError::BadMacroName)?
                 };
-                skip_blank(&mut letters);
-                let Some(finilizer) = letters.next() else {
-                    Err(PreprocError::UnexpectedEOF)?
-                };
-                if !matches!(finilizer, ')' | '}') {
-                    Err(PreprocError::UnexpectedSymbol(finilizer))?
-                }
 
                 let env_macro = if env_macros {
                     std::env::var(&macro_name).ok()
@@ -286,6 +371,33 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     None
                 };
                 let table_macro = table.get(&macro_name).cloned();
+
+                // `$(name:subst1=subst2)` substitution form.
+                if letters.peek() == Some(&':') {
+                    letters.next();
+                    let mut spec = String::new();
+                    for c in letters.by_ref() {
+                        if c == close {
+                            break;
+                        }
+                        spec.push(c);
+                    }
+                    let Some(macro_body) = env_macro.or(table_macro) else {
+                        Err(PreprocError::UndefinedMacro(macro_name.to_string()))?
+                    };
+                    result.push_str(&apply_substitution(&macro_body, &spec));
+                    substitutions += 1;
+                    continue;
+                }
+
+                skip_blank(&mut letters);
+                let Some(finilizer) = letters.next() else {
+                    Err(PreprocError::UnexpectedEOF)?
+                };
+                if finilizer != close {
+                    Err(PreprocError::UnexpectedSymbol(finilizer))?
+                }
+
                 let Some(macro_body) = env_macro.or(table_macro) else {
                     Err(PreprocError::UndefinedMacro(macro_name.to_string()))?
                 };
@@ -343,7 +455,7 @@ fn remove_variables(source: &str) -> String {
 
 /// Processes `include`s and macros
 pub fn preprocess(source: &str) -> Result<String> {
-    let mut source = source.to_string();
+    let mut source = fold_continuations(source);
     let mut includes = 1;
     let mut table = generate_macro_table(&source)?;
 

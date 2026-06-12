@@ -284,6 +284,40 @@ mod arguments {
     }
 }
 
+// Audit #15 (internal macros) and #13 (MAKEFLAGS) exercised end-to-end.
+mod internal_macros {
+    use super::*;
+
+    // `$^` removes duplicate prerequisites; `$+` keeps them in order.
+    #[test]
+    fn caret_and_plus() {
+        run_test_helper(
+            &["-f", "tests/makefiles/macros/internal.mk"],
+            "caret a b\nplus a b a\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #13: the `MAKEFLAGS` environment variable seeds options; `n`
+    // behaves as `-n` (print recipe, do not execute).
+    #[test]
+    fn makeflags_letters_form() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "tests/makefiles/macros/internal.mk"])
+            .env("MAKEFLAGS", "n")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Under -n the recipes are printed, not run.
+        assert!(stdout.contains("echo caret"), "stdout: {stdout}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+}
+
 // such tests should be moved directly to the package responsible for parsing makefiles
 mod parsing {
 

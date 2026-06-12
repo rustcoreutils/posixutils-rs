@@ -27,9 +27,9 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 ### Major
 
-- [ ] **#6 — `$(string:subst1=subst2)` substitution form is unimplemented and hard-errors.** `parser/preprocessor.rs` `substitute` (`get_ident` stops at `:`). Verified: `$(SRC:.c=.o)` → `make: parse error: UnexpectedSymbol(':')` (exit 4). Spec "Macros" defines both `:subst=` and the `%`-pattern form. Fix: after the name inside `$(…)`, detect `:` and implement word-wise suffix replacement (and the `%` pattern variant).
+- [x] **#6 — `$(string:subst1=subst2)` substitution form is unimplemented and hard-errors.** ✓ fixed (Phase 4): the `(`/`{` branch of `substitute` now detects `:` after the macro name and applies `apply_substitution`, which handles both the suffix form and the `[op]%[os]=[np][%][ns]` pattern form word-wise. Tests `preprocess::test_subst_suffix`, `test_subst_pattern`; verified `$(SRC:.c=.o)`→`a.o b.o foo.o`, `$(O:%.o=%.x)`→`a.x b.x`. `parser/preprocessor.rs` `substitute`.
 
-- [ ] **#7 — Backslash-newline line continuation is not folded.** Neither `parser/lex.rs` nor `parser/preprocessor.rs` joins `\<newline>`. Verified: `FOO = a \`<newline>`b` expands to `[a ]` — the continuation and `b` are lost (should be `a b`). Fix: pre-pass that replaces `\<newline>` + leading whitespace with a single space outside recipe lines.
+- [x] **#7 — Backslash-newline line continuation is not folded.** ✓ fixed (Phase 4): `preprocess` now runs `fold_continuations` first. Outside recipe lines, `\<newline>` + leading white space of the next line collapse to a single space; in a recipe (tab-indented) line the continuation is spliced (one leading tab of the next line removed) so the whole command reaches the shell. An escaped trailing backslash (`\\`) is not treated as a splice. Tests `preprocess::test_continuation_macro`, `test_continuation_recipe`; verified `FOO = a \`<newline>`b` → `a b`.
 
 - [ ] **#8 — Single-suffix inference rules (`.c:`, `.sh:`) are never applied.** `rule/target.rs` `try_parse_inference` requires two suffixes. Verified: with `bar.c` present and a `.c:` rule, `make bar` → `make: no target 'bar'` (exit 6). Fix: accept a single-suffix target as `Inference { from: <suffix>, to: "" }`.
 
@@ -41,11 +41,11 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [ ] **#12 — Recipes are run with the `SHELL` *environment variable*, which the spec forbids.** `rule.rs:209–213` uses `env::var("SHELL")`. Spec ENVIRONMENT VARIABLES (p. 3132): "The value of the SHELL environment variable shall not be used as a macro and shall not be modified by defining the SHELL macro …". The recipe shell must come from the `SHELL` macro (default `/bin/sh`), never the env var. Fix: resolve the `SHELL` macro from the parsed macro set; ignore the `SHELL` env var for shell selection.
 
-- [ ] **#13 — `MAKEFLAGS` is ignored.** No parsing of the env var anywhere. Verified: `MAKEFLAGS=n make …` still executes the recipe (should behave as `-n`). Spec requires both the letters-only and getopt-style forms, including `macro=value`. Fix: parse `MAKEFLAGS` into default options before the command line; re-export for sub-makes.
+- [x] **#13 — `MAKEFLAGS` is ignored.** ✓ fixed (Phase 4): `args_with_makeflags()` seeds options from the env var ahead of the real command line. The letters-only first word (`kn`) becomes a combined short option (`-kn`); `-`-prefixed and `macro=value` words pass through. `MAKEFLAGS` is inherited by recipe sub-processes via the environment (sub-make propagation). Tests `internal_macros::makeflags_letters_form`; verified `MAKEFLAGS=n`, `MAKEFLAGS=-n`, and `MAKEFLAGS='V=hello'`. Note: full synthesis of command-line flags *into* `MAKEFLAGS` for children is not done (only env-provided flags propagate).
 
-- [ ] **#14 — `$?` expands to *all* prerequisites, not those newer than the target.** `rule.rs:294–298` iterates the full prerequisite list; the newer-only set computed in `lib.rs:198–220` is never threaded into macro substitution. **(static — the `=`-parse bug (#1) blocks a direct behavioral test of `$?`.)** Fix: pass the `get_newer_prerequisites` slice for `$?` while keeping the full list for `$^`/`$+`.
+- [x] **#14 — `$?` expands to *all* prerequisites, not those newer than the target.** ✓ fixed (Phase 4): `run_rule_with_prerequisites` now threads the `get_newer_prerequisites` slice through `run`/`run_for_target`/`run_with_files` into `substitute_internal_macros`, where `$?` uses the newer-only list (space-separated; the old code concatenated with no separator). `$^`/`$+` keep the full list. Behaviorally verified: with `prog: a.o b.o a.o` and only `b.o` newer, `$?`→`b.o`.
 
-- [ ] **#15 — `$^`, `$+`, and the `$(@D)`/`$(@F)` (dir/file) macro variants are missing.** `rule.rs:266–309` has no arms for `^`, `+`, or two-character `D`/`F` forms; they expand to empty. **(static.)** These are POSIX.1-2024 additions. Fix: add the arms with dedup (`$^`) vs no-dedup (`$+`) and `dirname`/`basename` handling for `D`/`F`.
+- [x] **#15 — `$^`, `$+`, and the `$(@D)`/`$(@F)` (dir/file) macro variants are missing.** ✓ fixed (Phase 4): `substitute_internal_macros` was rewritten around `expand_internal_macro`, which supports sigils `@ % ? < * ^ +` in both the two-char (`$^`) and bracketed (`$(@D)`, `${?F}`) forms. `$^` dedups (order preserved); `$+` keeps duplicates; the `D`/`F` modifiers take `dir_part`/`file_part` of each element. The preprocessor passes internal-macro references through verbatim (added `^`/`+` to the two-char passthrough and a `$(`-internal passthrough) so they reach the rule stage. Tests `internal_macros::caret_and_plus`, unit tests `rule::tests::dir_and_file_parts`; verified `$(@D)`/`$(@F)`/`${@F}`. Note: targets containing `/` still do not parse (separate pre-existing lexer limitation, not in this audit), so `$(@D)` is `.` for ordinary targets.
 
 - [ ] **#16 — `.SUFFIXES` is stored in a `BTreeSet`, destroying search order; additive/clear semantics are also broken.** `config.rs:57–64`, `special_target.rs` `process_suffixes` (insert *replaces* the set). Spec: suffix declaration order defines inference search order; an empty `.SUFFIXES:` clears, a later one appends. `BTreeSet` sorts lexicographically and `insert` overwrites. **(static.)** Fix: use an insertion-ordered container (`Vec`/`IndexSet`); empty prereqs → clear, non-empty → extend.
 
@@ -91,10 +91,10 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `$(NAME)` / `${NAME}` CONFORMS — verified (`CC=echo` expands in recipe; refutes an agent "verbatim to shell" claim). `preprocessor.rs` `substitute`.
 - [x] Single internal macros `$@ $% $? $< $*` CONFORMS *in isolation* — `rule.rs:284–301`; `$@` verified equal to GNU. But see #14 (`$?` semantics) and #1 (a same-line `=` still aborts the parse).
 - [x] `$$` → `$` CONFORMS — verified (`echo price is $$5` → `price is `). Refutes an agent DIVERGES claim.
-- [ ] **`$(VAR:a=b)` / `%`-pattern MISSING (Major #6)**.
-- [ ] **`$^` / `$+` / `$(@D)` / `$(@F)` MISSING (Major #15)**.
-- [ ] **Command-line macro precedence MISSING (Critical #5)**; **`MAKEFLAGS` MISSING (Major #13)**.
-- [ ] **Backslash-newline in macro bodies broken (Major #7)**.
+- [x] `$(VAR:a=b)` / `%`-pattern CONFORMS (Major #6 fixed).
+- [x] `$^` / `$+` / `$(@D)` / `$(@F)` CONFORMS (Major #15 fixed).
+- [x] Command-line macro precedence (Critical #5 done) and `MAKEFLAGS` (Major #13 fixed).
+- [x] Backslash-newline in macro bodies folded (Major #7 fixed).
 - [x] `?=`, `+=`, `!=` — `?=` verified correct (kept existing value; fell back when unset — refutes an agent "inverted" claim). `+=`/`!=` not behaviorally re-verified here; flavor (immediate vs deferred) is not tracked (`preprocessor.rs`) — **(static, low priority)**.
 
 ### Operands / STDIN / Include
@@ -105,7 +105,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 ### Environment variables
 - [x] `LANG`/`LC_*` — `setlocale(LcAll, "")` at `main.rs:165` (CONFORMS for locale init; message coverage is #23).
-- [ ] **`MAKEFLAGS` MISSING (Major #13)**.
+- [x] `MAKEFLAGS` honored (Major #13 fixed).
 - [ ] **`SHELL` env var misused for recipe shell (Major #12)** — spec forbids.
 - [ ] **`PROJECTDIR` (XSI) MISSING** — no SCCS search-path support **(static, N/A-ish)**.
 
@@ -146,11 +146,11 @@ Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing 
 - [ ] Missing `include` file → graceful error, and `-include` → ignore (#3, #19).
 - [x] `make -k` exit status on success and on partial failure (#4) — `arguments::dash_k_success` + `arguments::dash_k`.
 - [ ] Command-line `macro=value` operands and precedence (#5).
-- [ ] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7).
+- [x] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7) — `preprocess::test_subst_*`, `test_continuation_*`.
 - [ ] Single-suffix inference rules (#8).
 - [ ] `-j`, `.WAIT`, `.NOTPARALLEL` (#9); multiple `-f` (#10).
 - [ ] Shell `-e` abort on first failing command (#11); `SHELL` macro vs env var (#12).
-- [ ] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15).
+- [x] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15) — `internal_macros::*`, `rule::tests::dir_and_file_parts`.
 - [ ] `.SUFFIXES` ordering + clear/append (#16).
 - [ ] Signal-driven cleanup, `.PRECIOUS` global, re-raise (#17, #18, #20, #21).
 

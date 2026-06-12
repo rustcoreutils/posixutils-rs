@@ -29,6 +29,47 @@ all:
         };
         assert_eq!(result, EXPECTED);
     }
+
+    // Audit #6: `$(VAR:subst1=subst2)` suffix substitution.
+    #[test]
+    fn test_subst_suffix() {
+        let result = preprocess("SRC = a.c b.c foo.c\nall:\n\t@echo $(SRC:.c=.o)\n").unwrap();
+        assert!(result.contains("@echo a.o b.o foo.o"), "got: {result:?}");
+    }
+
+    // Audit #6: `$(VAR:op%os=np%ns)` pattern substitution.
+    #[test]
+    fn test_subst_pattern() {
+        let result = preprocess("O = a.o b.o\nall:\n\t@echo $(O:%.o=%.x)\n").unwrap();
+        assert!(result.contains("@echo a.x b.x"), "got: {result:?}");
+    }
+
+    // Audit #7: backslash-newline continuation is folded to a space in a
+    // macro definition.
+    #[test]
+    fn test_continuation_macro() {
+        let result = preprocess("FOO = a\\\nb\nall:\n\t@echo $(FOO)\n").unwrap();
+        assert!(result.contains("@echo a b"), "got: {result:?}");
+    }
+
+    // Audit #7: backslash-newline continuation in a recipe line is spliced
+    // (the leading tab of the continuation is removed).
+    #[test]
+    fn test_continuation_recipe() {
+        let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap();
+        assert!(result.contains("@echo one two"), "got: {result:?}");
+    }
+
+    // Audit #15: internal-macro references survive preprocessing for the
+    // rule stage rather than being expanded or rejected here.
+    #[test]
+    fn test_internal_macros_passthrough() {
+        let result = preprocess("all: a b\n\t@echo $^ $+ $(@D) $(@F) ${?F}\n").unwrap();
+        assert!(
+            result.contains("@echo $^ $+ $(@D) $(@F) ${?F}"),
+            "got: {result:?}"
+        );
+    }
 }
 
 mod lex {

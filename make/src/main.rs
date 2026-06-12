@@ -118,6 +118,39 @@ fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
     print!("{:?}", rules);
 }
 
+/// Build the effective argument vector, seeding options from the `MAKEFLAGS`
+/// environment variable ahead of the real command line (POSIX). The letters-only
+/// first word (e.g. `MAKEFLAGS=kn`) becomes a combined short option (`-kn`);
+/// words containing `=` are macro operands; words already starting with `-` are
+/// passed verbatim. `MAKEFLAGS` is inherited by recipe sub-processes via the
+/// environment, so it propagates to sub-makes.
+fn args_with_makeflags() -> Vec<OsString> {
+    let mut args: Vec<OsString> = env::args_os().collect();
+    let Ok(flags) = env::var("MAKEFLAGS") else {
+        return args;
+    };
+    let flags = flags.trim();
+    if flags.is_empty() {
+        return args;
+    }
+
+    let mut injected: Vec<OsString> = Vec::new();
+    for (i, word) in flags.split_whitespace().enumerate() {
+        if i == 0 && !word.starts_with('-') && !word.contains('=') {
+            // Letters-only form: `kn` -> `-kn`.
+            injected.push(OsString::from(format!("-{word}")));
+        } else {
+            injected.push(OsString::from(word));
+        }
+    }
+
+    // Insert the seeded options just after argv[0], before the real arguments.
+    let tail = args.split_off(1);
+    args.extend(injected);
+    args.extend(tail);
+    args
+}
+
 /// Read one makefile operand into a string, honoring `-` as standard input.
 fn read_makefile(path: &Path) -> Result<String, ErrorCode> {
     if path == Path::new("-") {
@@ -193,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminate,
         keep_going,
         mut targets,
-    } = Args::parse();
+    } = Args::parse_from(args_with_makeflags());
 
     let mut status_code = 0;
 

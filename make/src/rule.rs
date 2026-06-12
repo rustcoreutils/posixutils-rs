@@ -83,6 +83,7 @@ impl Rule {
         macros: &[VariableDefinition],
         target: &Target,
         up_to_date: bool,
+        newer: &[String],
     ) -> Result<(), ErrorCode> {
         // For an inference rule applied to a specific target, compute the
         // input/output pair from the target name and the rule's suffixes.
@@ -100,7 +101,7 @@ impl Rule {
             vec![(PathBuf::from(""), PathBuf::from(""))]
         };
 
-        self.run_with_files(global_config, macros, target, up_to_date, files)
+        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
     }
 
     /// Runs the rule with the global config and macros passed in.
@@ -112,6 +113,7 @@ impl Rule {
         macros: &[VariableDefinition],
         target: &Target,
         up_to_date: bool,
+        newer: &[String],
     ) -> Result<(), ErrorCode> {
         let files = match target {
             Target::Inference { from, to, .. } => find_files_with_extension(from)?
@@ -127,7 +129,7 @@ impl Rule {
             }
         };
 
-        self.run_with_files(global_config, macros, target, up_to_date, files)
+        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
     }
 
     /// Internal helper: runs the rule's recipes for the given input/output file pairs.
@@ -138,6 +140,7 @@ impl Rule {
         target: &Target,
         up_to_date: bool,
         files: Vec<(PathBuf, PathBuf)>,
+        newer: &[String],
     ) -> Result<(), ErrorCode> {
         let GlobalConfig {
             ignore: global_ignore,
@@ -220,8 +223,7 @@ impl Rule {
                 );
 
                 self.init_env(env_macros, &mut command, macros);
-                let recipe =
-                    self.substitute_internal_macros(target, recipe, &inout, self.prerequisites());
+                let recipe = self.substitute_internal_macros(target, recipe, &inout, newer);
                 command.args(["-c", recipe.as_ref()]);
 
                 let status = match command.status() {
@@ -270,15 +272,67 @@ impl Rule {
         Ok(())
     }
 
-    fn substitute_internal_macros<'a>(
+    /// Expand the internal macro identified by `sigil` (one of
+    /// `@ % ? < * ^ +`), optionally taking the directory (`D`) or filename
+    /// (`F`) part of each element.
+    fn expand_internal_macro(
+        &self,
+        sigil: char,
+        modifier: Option<char>,
+        target: &Target,
+        files: &(PathBuf, PathBuf),
+        newer: &[String],
+    ) -> String {
+        // `$@` is the target name; for an `archive(member)` target `$%` is the
+        // member and `$@` is the archive name.
+        let target_name = target.as_ref();
+        let archive_name = target_name.split('(').next().unwrap_or(target_name);
+        let member = target_name
+            .split_once('(')
+            .map(|(_, m)| m.strip_suffix(')').unwrap_or(m))
+            .unwrap_or("");
+
+        let all_prereqs: Vec<String> = self
+            .prerequisites()
+            .map(|p| p.as_ref().to_string())
+            .collect();
+
+        let base: Vec<String> = match sigil {
+            '@' => vec![archive_name.to_string()],
+            '%' => vec![member.to_string()],
+            '?' => newer.to_vec(),
+            '^' => {
+                // All prerequisites, duplicates removed, order preserved.
+                let mut seen = std::collections::HashSet::new();
+                all_prereqs
+                    .into_iter()
+                    .filter(|p| seen.insert(p.clone()))
+                    .collect()
+            }
+            '+' => all_prereqs,
+            '<' => vec![files.0.to_string_lossy().into_owned()],
+            '*' => vec![files.1.to_string_lossy().into_owned()],
+            _ => return String::new(),
+        };
+
+        let parts: Vec<String> = match modifier {
+            Some('D') => base.iter().map(|p| dir_part(p)).collect(),
+            Some('F') => base.iter().map(|p| file_part(p)).collect(),
+            _ => base,
+        };
+        parts.join(" ")
+    }
+
+    fn substitute_internal_macros(
         &self,
         target: &Target,
         recipe: &Recipe,
         files: &(PathBuf, PathBuf),
-        mut prereqs: impl Iterator<Item = &'a Prerequisite>,
+        newer: &[String],
     ) -> Recipe {
+        const SIGILS: [char; 7] = ['@', '%', '?', '<', '*', '^', '+'];
         let recipe = recipe.inner();
-        let mut stream = recipe.chars();
+        let mut stream = recipe.chars().peekable();
         let mut result = String::new();
 
         while let Some(ch) = stream.next() {
@@ -287,29 +341,48 @@ impl Rule {
                 continue;
             }
 
-            match stream.next() {
-                Some('@') => {
-                    if let Some(s) = target.as_ref().split('(').next() {
-                        result.push_str(s)
+            match stream.peek().copied() {
+                Some('$') => {
+                    stream.next();
+                    result.push('$');
+                }
+                // Two-character form, e.g. `$@`, `$^`, `$?`.
+                Some(c) if SIGILS.contains(&c) => {
+                    stream.next();
+                    result.push_str(&self.expand_internal_macro(c, None, target, files, newer));
+                }
+                // Bracketed form, e.g. `$(@)`, `$(@D)`, `$(?F)`.
+                Some(open @ ('(' | '{')) => {
+                    let close = if open == '(' { ')' } else { '}' };
+                    let mut inner = String::new();
+                    stream.next();
+                    while let Some(&c) = stream.peek() {
+                        if c == close {
+                            stream.next();
+                            break;
+                        }
+                        inner.push(c);
+                        stream.next();
+                    }
+                    let mut chars = inner.chars();
+                    match chars.next() {
+                        Some(sigil) if SIGILS.contains(&sigil) => {
+                            let modifier = chars.next().filter(|m| matches!(m, 'D' | 'F'));
+                            result.push_str(
+                                &self.expand_internal_macro(sigil, modifier, target, files, newer),
+                            );
+                        }
+                        // Not an internal macro: re-emit verbatim.
+                        _ => {
+                            result.push('$');
+                            result.push(open);
+                            result.push_str(&inner);
+                            result.push(close);
+                        }
                     }
                 }
-                Some('%') => {
-                    if let Some(body) = target.as_ref().split('(').nth(1) {
-                        result.push_str(body.strip_suffix(')').unwrap_or(body))
-                    }
-                }
-                Some('?') => {
-                    (&mut prereqs)
-                        .map(|x| x.as_ref())
-                        .for_each(|x| result.push_str(x));
-                }
-                Some('$') => result.push('$'),
-                Some('<') => result.push_str(files.0.to_str().unwrap()),
-                Some('*') => result.push_str(files.1.to_str().unwrap()),
-                Some(_) => break,
-                None => {
-                    eprintln!("Unexpected `$` at the end of the rule!")
-                }
+                // A stray `$` (or `$` at end of line): emit it literally.
+                _ => result.push('$'),
             }
         }
 
@@ -385,4 +458,41 @@ fn find_files_with_extension(ext: &str) -> Result<Vec<PathBuf>, ErrorCode> {
     }
 
     Ok(result)
+}
+
+/// The directory part of a path (the prefix without a trailing slash). For a
+/// path with no slash the directory part is `.`; for a root-anchored name the
+/// directory part is `/`.
+fn dir_part(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => path[..i].to_string(),
+        None => ".".to_string(),
+    }
+}
+
+/// The filename part of a path (everything after the last slash).
+fn file_part(path: &str) -> String {
+    match path.rfind('/') {
+        Some(i) => path[i + 1..].to_string(),
+        None => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dir_part, file_part};
+
+    #[test]
+    fn dir_and_file_parts() {
+        // No directory component -> "." and the whole name (audit #15 D/F).
+        assert_eq!(dir_part("obj.o"), ".");
+        assert_eq!(file_part("obj.o"), "obj.o");
+        // Nested path.
+        assert_eq!(dir_part("sub/dir/obj.o"), "sub/dir");
+        assert_eq!(file_part("sub/dir/obj.o"), "obj.o");
+        // Root-anchored.
+        assert_eq!(dir_part("/obj.o"), "/");
+        assert_eq!(file_part("/obj.o"), "obj.o");
+    }
 }

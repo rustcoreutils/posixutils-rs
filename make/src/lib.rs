@@ -176,18 +176,30 @@ impl Make {
             self.build_target(prerequisite)?;
         }
 
+        // `$?` expands to the prerequisites newer than the target.
+        let newer: Vec<String> = newer_prerequisites
+            .iter()
+            .map(|p| p.as_ref().to_string())
+            .collect();
+
         // Per POSIX: "When no target rule with commands is found to update a
         // target, the inference rules shall be checked."  If the matched target
         // rule has no recipes, look for a matching inference rule and run it
         // for this specific target instead.
         if rule.recipes().count() == 0 {
             if let Some(inference_rule) = self.find_inference_rule(target.as_ref()) {
-                inference_rule.run_for_target(&self.config, &self.macros, target, up_to_date)?;
+                inference_rule.run_for_target(
+                    &self.config,
+                    &self.macros,
+                    target,
+                    up_to_date,
+                    &newer,
+                )?;
                 return Ok(true);
             }
         }
 
-        rule.run(&self.config, &self.macros, target, up_to_date)?;
+        rule.run(&self.config, &self.macros, target, up_to_date, &newer)?;
 
         Ok(true)
     }

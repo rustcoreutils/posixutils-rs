@@ -17,5 +17,8 @@ pub mod man7;
 pub mod mdoc_macro;
 /// Converts input mdoc file macros to AST
 pub mod parser;
+/// The roff front-end: request/escape interpreter (registers, conditionals,
+/// user macros, `.so`/`.ig`) run before mdoc/man parsing.
+pub mod roff;
 /// The single terminal backend (fill/wrap/indent/assembly)
 pub mod term;

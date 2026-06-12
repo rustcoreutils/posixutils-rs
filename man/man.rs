@@ -464,6 +464,29 @@ fn get_man_page_from_path(path: &PathBuf) -> Result<Vec<u8>, ManError> {
     Ok(output.stdout)
 }
 
+/// Resolve a roff `.so` include target to its (decompressed) text for the roff
+/// front-end. Tries the target as given, then under each system man root, with
+/// and without a `.gz` suffix. Returns `None` if nothing readable is found.
+fn load_so(target: &str) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(target)];
+    for root in MAN_PATHS {
+        candidates.push(PathBuf::from(root).join(target));
+    }
+    for cand in candidates {
+        let gz = PathBuf::from(format!("{}.gz", cand.display()));
+        for path in [cand, gz] {
+            if path.is_file() {
+                if let Ok(bytes) = get_man_page_from_path(&path) {
+                    return Some(String::from_utf8(bytes).unwrap_or_else(|err| {
+                        err.into_bytes().iter().map(|&b| b as char).collect()
+                    }));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Parse and format a man page’s raw content into text suitable for display.
 ///
 /// # Arguments
@@ -487,6 +510,12 @@ fn format_man_page(
     // still renders instead of erroring out.
     let content = String::from_utf8(man_bytes)
         .unwrap_or_else(|err| err.into_bytes().iter().map(|&b| b as char).collect());
+
+    // Run the roff front-end first: execute roff programmability (registers,
+    // conditionals, user macros, `.so` includes) and normalize the stream before
+    // language detection and parsing. A page without roff programmability is
+    // returned essentially unchanged.
+    let content = man_util::roff::preprocess_with_loader(&content, load_so);
 
     // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
     // the mdoc engine only understands mdoc(7) and would otherwise emit an empty

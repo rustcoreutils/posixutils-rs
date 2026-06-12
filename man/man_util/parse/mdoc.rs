@@ -142,6 +142,23 @@ impl Parser {
                 mdoc_macro: macro_for_argless(name),
                 nodes: Vec::new(),
             })),
+            "Dd" => {
+                // The whole date line is a single Text node.
+                let nodes = if rest.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Element::Text(rest.trim_end().to_string())]
+                };
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Dd,
+                    nodes,
+                }));
+            }
+            "Dt" => self.push(parse_dt(rest)),
+            "Os" => self.push(Element::Macro(MacroNode {
+                mdoc_macro: Macro::Os,
+                nodes: tokenize(rest).into_iter().map(Element::Text).collect(),
+            })),
             _ if is_callable(name) => {
                 let mut tokens = vec![name.to_string()];
                 tokens.extend(tokenize(rest));
@@ -261,6 +278,26 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
         }
     };
     Element::Macro(node)
+}
+
+/// Parse a `.Dt title section [arch]` line. With a single argument it is the
+/// section (no title), matching pest's optional-title rule.
+fn parse_dt(rest: &str) -> Element {
+    let args = tokenize(rest);
+    let (title, section) = match args.len() {
+        0 => (None, String::new()),
+        1 => (None, args[0].clone()),
+        _ => (Some(args[0].clone()), args[1].clone()),
+    };
+    let arch = args.get(2).map(|a| a.trim().to_string());
+    Element::Macro(MacroNode {
+        mdoc_macro: Macro::Dt {
+            title,
+            section,
+            arch,
+        },
+        nodes: Vec::new(),
+    })
 }
 
 /// Partial-implicit container macros: each wraps the remainder of the line.
@@ -430,6 +467,19 @@ mod tests {
         parity(".Nm foo Ar bar\n");
         parity(".Fl v Ar file\n");
         parity(".Xr cat 1 Ar end\n");
+    }
+
+    #[test]
+    fn document_prologue() {
+        parity(".Dd July 4, 2024\n.Dt PROGNAME 1\n.Os\n");
+        parity(".Dt FOO 8 i386\n");
+        parity(".Dd $Mdocdate$\n");
+        parity(".Os FreeBSD 14.0\n");
+    }
+
+    #[test]
+    fn full_prologue_with_name() {
+        parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
     }
 
     #[test]

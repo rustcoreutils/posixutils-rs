@@ -138,19 +138,18 @@ impl TryFrom<(Target, Config)> for InferenceTarget {
     type Error = ParseError;
 
     fn try_from((target, config): (Target, Config)) -> Result<Self, Self::Error> {
-        let map = &BTreeSet::new();
-        let suffixes = config.rules.get(".SUFFIXES").unwrap_or(map);
+        let suffixes = &config.suffixes;
         let source = target.to_string();
 
         let from = suffixes
             .iter()
-            .filter_map(|x| source.strip_prefix(x))
+            .filter_map(|x| source.strip_prefix(x.as_str()))
             .next()
             .ok_or(ParseError)?
             .to_string();
         let to = suffixes
             .iter()
-            .filter_map(|x| source.strip_prefix(x))
+            .filter_map(|x| source.strip_prefix(x.as_str()))
             .next()
             .map(|x| x.to_string());
 
@@ -276,18 +275,22 @@ impl Processor<'_> {
         Ok(())
     }
 
+    /// Per POSIX: a `.SUFFIXES` with no prerequisites clears the suffix list; a
+    /// later `.SUFFIXES` with prerequisites appends to it (preserving order).
     fn process_suffixes(self) -> Result<(), Error> {
-        let suffixes_key = Suffixes.as_ref();
-        let suffixes_set = self
+        let new_suffixes: Vec<String> = self
             .rule
             .prerequisites()
             .map(|suffix| suffix.as_ref().to_string())
-            .collect::<BTreeSet<String>>();
+            .collect();
 
-        self.make
-            .config
-            .rules
-            .insert(suffixes_key.to_string(), suffixes_set);
+        if new_suffixes.is_empty() {
+            self.make.config.clear_suffixes();
+        } else {
+            for suffix in new_suffixes {
+                self.make.config.add_suffix(&suffix);
+            }
+        }
 
         Ok(())
     }

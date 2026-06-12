@@ -982,4 +982,51 @@ mod inference_rules {
             0,
         );
     }
+
+    // Audit #8: a single-suffix inference rule (`.c:`) builds a suffixless
+    // target from its `.c` prerequisite.
+    #[test]
+    fn single_suffix_rule() {
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-sf",
+                "tests/makefiles/inference_rules/single_suffix.mk",
+                "ssfx_test",
+            ],
+            "built ssfx_test from ssfx_test.c\n",
+            "",
+            0,
+            || {
+                File::create("ssfx_test.c").expect("failed to create file");
+            },
+            || {
+                let _ = remove_file("ssfx_test.c");
+                let _ = remove_file("ssfx_test");
+            },
+        );
+    }
+
+    // Audit #16: an empty `.SUFFIXES:` clears the suffix list; a later
+    // `.SUFFIXES:` with prerequisites appends, so inference works on the
+    // re-added suffixes.
+    #[test]
+    fn suffixes_clear_then_readd() {
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-sf",
+                "tests/makefiles/special_targets/suffixes/clear_then_readd.mk",
+                "cleartest.p2",
+            ],
+            "converted cleartest.p1 to cleartest.p2\n",
+            "",
+            0,
+            || {
+                File::create("cleartest.p1").expect("failed to create file");
+            },
+            || {
+                let _ = remove_file("cleartest.p1");
+                let _ = remove_file("cleartest.p2");
+            },
+        );
+    }
 }

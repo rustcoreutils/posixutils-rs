@@ -413,18 +413,39 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
     Ok((result, substitutions))
 }
 
+/// Recognize an include directive: the word `include`, optionally prefixed with
+/// a `-` (whose missing file is ignored), at the start of a line and followed by
+/// one or more blanks. Returns `(path_spec, ignore_missing)`. Requiring the
+/// trailing blank avoids matching `includedir=...` and similar.
+fn parse_include_directive(line: &str) -> Option<(&str, bool)> {
+    let (rest, ignore_missing) = if let Some(rest) = line.strip_prefix("-include") {
+        (rest, true)
+    } else if let Some(rest) = line.strip_prefix("include") {
+        (rest, false)
+    } else {
+        return None;
+    };
+    if rest.starts_with([' ', '\t']) {
+        Some((rest.trim(), ignore_missing))
+    } else {
+        None
+    }
+}
+
 /// Copy-pastes included makefiles into single one recursively.
 /// Pretty much the same as C preprocessor and `#include` directive
 fn process_include_lines(source: &str, table: &HashMap<String, String>) -> Result<(String, usize)> {
     let mut counter = 0;
     let mut result = String::new();
     for line in source.lines() {
-        let expanded = if let Some(s) = line.strip_prefix("include") {
+        let expanded = if let Some((path_spec, ignore_missing)) = parse_include_directive(line) {
             counter += 1;
-            let s = s.trim();
-            let (path, _) = substitute(s, table).unwrap_or_default();
+            let (path, _) = substitute(path_spec, table).unwrap_or_default();
             match fs::read_to_string(Path::new(&path)) {
                 Ok(contents) => contents,
+                // `-include` silently ignores a missing/unreadable file;
+                // plain `include` is a hard error.
+                Err(_) if ignore_missing => String::new(),
                 Err(err) => {
                     return Err(PreprocError::IncludeFailed {
                         path,

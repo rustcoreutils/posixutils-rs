@@ -31,7 +31,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#7 — Backslash-newline line continuation is not folded.** ✓ fixed (Phase 4): `preprocess` now runs `fold_continuations` first. Outside recipe lines, `\<newline>` + leading white space of the next line collapse to a single space; in a recipe (tab-indented) line the continuation is spliced (one leading tab of the next line removed) so the whole command reaches the shell. An escaped trailing backslash (`\\`) is not treated as a splice. Tests `preprocess::test_continuation_macro`, `test_continuation_recipe`; verified `FOO = a \`<newline>`b` → `a b`.
 
-- [ ] **#8 — Single-suffix inference rules (`.c:`, `.sh:`) are never applied.** `rule/target.rs` `try_parse_inference` requires two suffixes. Verified: with `bar.c` present and a `.c:` rule, `make bar` → `make: no target 'bar'` (exit 6). Fix: accept a single-suffix target as `Inference { from: <suffix>, to: "" }`.
+- [x] **#8 — Single-suffix inference rules (`.c:`, `.sh:`) are never applied.** ✓ fixed (Phase 5): `try_parse_inference` now accepts a single-suffix target as `Inference { from: <suffix>, to: "" }`; `find_inference_rule` searches single-suffix rules (where the suffixless target's `<name>.<from>` exists) after double-suffix, and `build_target`'s no-rule branch invokes inference before falling through to `.DEFAULT`/`NoTarget`; `run_for_target` computes the `<target>.<from>` input for `to==""`. Test `inference_rules::single_suffix_rule`; verified `make bar` with `bar.c` + `.c:` → `built bar from bar.c`.
 
 - [ ] **#9 — Parallel execution machinery is entirely absent: `-j`, token pool, `.WAIT`, `.NOTPARALLEL`.** `main.rs` `Args` has no `-j`; `special_target.rs:20–39` enum omits `.WAIT`/`.NOTPARALLEL` (silently ignored at `:173–176`). Verified: `make -j 2 …` → `error: unexpected argument '-j'` (exit 2). These are POSIX.1-2024 requirements, not extensions. Fix: implement `-j maxjobs` with the token-pool model, and validate/honor `.WAIT`/`.NOTPARALLEL`.
 
@@ -47,13 +47,13 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#15 — `$^`, `$+`, and the `$(@D)`/`$(@F)` (dir/file) macro variants are missing.** ✓ fixed (Phase 4): `substitute_internal_macros` was rewritten around `expand_internal_macro`, which supports sigils `@ % ? < * ^ +` in both the two-char (`$^`) and bracketed (`$(@D)`, `${?F}`) forms. `$^` dedups (order preserved); `$+` keeps duplicates; the `D`/`F` modifiers take `dir_part`/`file_part` of each element. The preprocessor passes internal-macro references through verbatim (added `^`/`+` to the two-char passthrough and a `$(`-internal passthrough) so they reach the rule stage. Tests `internal_macros::caret_and_plus`, unit tests `rule::tests::dir_and_file_parts`; verified `$(@D)`/`$(@F)`/`${@F}`. Note: targets containing `/` still do not parse (separate pre-existing lexer limitation, not in this audit), so `$(@D)` is `.` for ordinary targets.
 
-- [ ] **#16 — `.SUFFIXES` is stored in a `BTreeSet`, destroying search order; additive/clear semantics are also broken.** `config.rs:57–64`, `special_target.rs` `process_suffixes` (insert *replaces* the set). Spec: suffix declaration order defines inference search order; an empty `.SUFFIXES:` clears, a later one appends. `BTreeSet` sorts lexicographically and `insert` overwrites. **(static.)** Fix: use an insertion-ordered container (`Vec`/`IndexSet`); empty prereqs → clear, non-empty → extend.
+- [x] **#16 — `.SUFFIXES` is stored in a `BTreeSet`, destroying search order; additive/clear semantics are also broken.** ✓ fixed (Phase 5): added an authoritative insertion-ordered `Config.suffixes: Vec<String>` (consumed by `find_inference_rule` and `InferenceTarget`); the sorted `rules[".SUFFIXES"]` `BTreeSet` is kept only as a mirror for the `-p` dump. `process_suffixes` now clears on empty prerequisites (`clear_suffixes`) and appends otherwise (`add_suffix`, order-preserving, dedup) instead of replacing. `-r` clears the Vec too. Test `inference_rules::suffixes_clear_then_readd`; verified append keeps built-ins, empty `.SUFFIXES:` clears them, and a later `.SUFFIXES: .c .o` re-enables inference.
 
 - [ ] **#17 — Signal registration is gated on the wrong condition.** `rule.rs:179–181` registers signals only when `!ignore || print || quit || dry_run`. Under `-i` alone, signals are *not* registered; under `-n`/`-p`/`-q`, the spec says make shall take the *default* action (i.e. not catch), yet the code registers when those are set. **(static — signal timing not behaviorally tested.)** Fix: register unless `-n`/`-p`/`-q` is set; `-i` is not an exemption.
 
 - [ ] **#18 — `.PRECIOUS` with no prerequisites does not protect targets on signal.** `special_target.rs` `process_precious` never sets the global `config.precious`; the signal cleanup reads `global_precious || rule_precious` (`rule.rs:173`). So the "no prerequisites ⇒ all targets precious" case fails and a partially built target may be deleted on SIGINT/SIGTERM. **(static.)** Fix: set `make.config.precious = true` when `.PRECIOUS` has no prerequisites.
 
-- [ ] **#19 — `-include` is not actually implemented (line passed through).** `parser/preprocessor.rs:273` matches only `strip_prefix("include")`, so a `-include` line is left in the source rather than remade per spec. Verified: it does not crash and the build proceeds, but no immediate/delayed-remaking semantics occur. (Also: `strip_prefix("include")` matches `includedir=…`-style lines — a latent mis-parse.) Fix: recognize the optional `-`-prefix, implement the remaking + missing-file-ignore semantics.
+- [x] **#19 — `-include` is not actually implemented (line passed through).** ✓ fixed (Phase 5): `parse_include_directive` recognizes both `include` and the `-include` form, requires the trailing blank (so `includedir=…` is no longer mis-parsed as an include), and inlines the file; a missing/unreadable file is silently ignored for `-include` and a hard error for `include`. Tests `preprocess::test_dash_include_missing_ignored`, `test_include_missing_errors`, `test_includedir_not_mistaken_for_include`. Note: full immediate/delayed re-making of include files is not implemented (the file is simply inlined), which matches the existing `include` behavior.
 
 ### Minor
 
@@ -101,7 +101,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `-` operand to `-f` reads stdin — `main.rs:140–141`.
 - [x] First non-special target as default — `lib.rs:65–76`; verified via `.DEFAULT` and normal targets.
 - [x] `include existing.mk` CONFORMS — verified.
-- [ ] **`include missing.mk` panics (Critical #3)**; **`-include` not implemented (Major #19)**.
+- [x] `include missing.mk` graceful error (Critical #3 done); `-include` implemented with missing-file-ignore (Major #19 fixed).
 
 ### Environment variables
 - [x] `LANG`/`LC_*` — `setlocale(LcAll, "")` at `main.rs:165` (CONFORMS for locale init; message coverage is #23).
@@ -127,7 +127,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `.IGNORE` PARTIAL — global form works; ordering caveat #22.
 - [x] `.SCCS_GET` (XSI) PARTIAL — recognized/stored; no runtime SCCS retrieval traced. **(static.)**
 - [ ] **`.POSIX` rejected (Critical #2)**.
-- [ ] **`.SUFFIXES` ordering/accumulation broken (Major #16)**.
+- [x] `.SUFFIXES` insertion-ordered with clear/append (Major #16 fixed).
 - [ ] **`.PRECIOUS` global protection broken (Major #18)**.
 - [ ] **`.WAIT` / `.NOTPARALLEL` unrecognized (Major #9)** — silently ignored.
 - [ ] **Subsequent-occurrence accumulation order-dependent (Minor #22)**.
@@ -143,15 +143,15 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing of includes, recipe prefixes, and several special targets. Not covered (each is a "write a test" item):
 - [ ] Recipe lines containing `=` (the #1 regression — no fixture exercises this).
 - [ ] `.POSIX:` as the first line (#2).
-- [ ] Missing `include` file → graceful error, and `-include` → ignore (#3, #19).
+- [x] Missing `include` file → graceful error, and `-include` → ignore (#3, #19) — `preprocess::test_*include*`.
 - [x] `make -k` exit status on success and on partial failure (#4) — `arguments::dash_k_success` + `arguments::dash_k`.
 - [ ] Command-line `macro=value` operands and precedence (#5).
 - [x] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7) — `preprocess::test_subst_*`, `test_continuation_*`.
-- [ ] Single-suffix inference rules (#8).
+- [x] Single-suffix inference rules (#8) — `inference_rules::single_suffix_rule`.
 - [ ] `-j`, `.WAIT`, `.NOTPARALLEL` (#9); multiple `-f` (#10).
 - [ ] Shell `-e` abort on first failing command (#11); `SHELL` macro vs env var (#12).
 - [x] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15) — `internal_macros::*`, `rule::tests::dir_and_file_parts`.
-- [ ] `.SUFFIXES` ordering + clear/append (#16).
+- [x] `.SUFFIXES` ordering + clear/append (#16) — `inference_rules::suffixes_clear_then_readd`.
 - [ ] Signal-driven cleanup, `.PRECIOUS` global, re-raise (#17, #18, #20, #21).
 
 ## Suggested PR groupings

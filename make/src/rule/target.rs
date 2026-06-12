@@ -82,6 +82,20 @@ impl Target {
             source.next();
         }
 
+        // A single-suffix inference rule (`.c:`) has no second suffix: the
+        // target produced has an empty suffix. POSIX requires these to be
+        // recognized alongside the two-suffix (`.c.o`) form.
+        if from.is_empty() {
+            None?
+        }
+        if !matches!(source.peek(), Some('.')) {
+            return Some(Self::Inference {
+                name: format!(".{from}").leak(),
+                from: from.leak(),
+                to: "",
+            });
+        }
+
         let Some('.') = source.next() else { None? };
         while let Some(c) = source.peek() {
             match c {

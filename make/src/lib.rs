@@ -81,25 +81,34 @@ impl Make {
     /// If found, inference rules are searched for the first .s2.s1 rule whose
     /// prerequisite file ($*.s2) exists.
     fn find_inference_rule(&self, name: &str) -> Option<&Rule> {
-        let suffixes = self.config.rules.get(".SUFFIXES")?;
+        let suffixes = &self.config.suffixes;
 
-        // Find the target's suffix (.s1)
-        let target_suffix = suffixes
+        // Double-suffix: the target has a known suffix `.s1`; find a `.s2.s1`
+        // rule whose prerequisite `$*.s2` exists.
+        if let Some(target_suffix) = suffixes
             .iter()
             .filter(|s| name.ends_with(s.as_str()))
-            .max_by_key(|s| s.len())?;
+            .max_by_key(|s| s.len())
+        {
+            let stem = &name[..name.len() - target_suffix.len()];
+            for rule in &self.inference_rules {
+                if let Some(Target::Inference { from, to, .. }) = rule.targets().next() {
+                    if !to.is_empty() && format!(".{}", to) == *target_suffix {
+                        let prereq_path = format!("{}.{}", stem, from);
+                        if std::path::Path::new(&prereq_path).exists() {
+                            return Some(rule);
+                        }
+                    }
+                }
+            }
+        }
 
-        let stem = &name[..name.len() - target_suffix.len()];
-
-        // Search inference rules for .s2.s1 where $*.s2 exists
+        // Single-suffix: the target has no suffix; find a `.s2` (single-suffix)
+        // rule whose prerequisite `<name>.s2` exists.
         for rule in &self.inference_rules {
-            let Some(rule_target) = rule.targets().next() else {
-                continue;
-            };
-            if let Target::Inference { from, to, .. } = rule_target {
-                let expected_suffix = format!(".{}", to);
-                if expected_suffix == *target_suffix {
-                    let prereq_path = format!("{}.{}", stem, from);
+            if let Some(Target::Inference { from, to, .. }) = rule.targets().next() {
+                if to.is_empty() {
+                    let prereq_path = format!("{}.{}", name, from);
                     if std::path::Path::new(&prereq_path).exists() {
                         return Some(rule);
                     }
@@ -126,6 +135,19 @@ impl Make {
             {
                 Some(rule) => rule,
                 None => {
+                    // No target rule named `name`: try to infer one (single- or
+                    // double-suffix) from an existing prerequisite file.
+                    if let Some(inference_rule) = self.find_inference_rule(name.as_ref()) {
+                        let target = Target::new(name.as_ref());
+                        inference_rule.run_for_target(
+                            &self.config,
+                            &self.macros,
+                            &target,
+                            false,
+                            &[],
+                        )?;
+                        return Ok(true);
+                    }
                     // Per POSIX: "If a target exists and there is neither a target rule
                     // nor an inference rule for the target, the target shall be considered
                     // up-to-date."

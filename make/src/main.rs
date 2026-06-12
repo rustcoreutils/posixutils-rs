@@ -252,6 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if clear {
         config.rules.clear();
+        config.suffixes.clear();
     }
 
     ENV_MACROS.store(env_macros, Relaxed);

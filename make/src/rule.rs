@@ -89,13 +89,19 @@ impl Rule {
         // input/output pair from the target name and the rule's suffixes.
         let files = if let Some(Target::Inference { from, to, .. }) = self.targets().next() {
             let target_name = target.as_ref();
-            let expected_suffix = format!(".{}", to);
-            if let Some(stem) = target_name.strip_suffix(&expected_suffix) {
-                let input = PathBuf::from(format!("{}.{}", stem, from));
-                let output = PathBuf::from(target_name);
-                vec![(input, output)]
+            if to.is_empty() {
+                // Single-suffix rule (`.s2:`): build `target` from `target.s2`.
+                let input = PathBuf::from(format!("{}.{}", target_name, from));
+                vec![(input, PathBuf::from(target_name))]
             } else {
-                vec![(PathBuf::from(""), PathBuf::from(""))]
+                let expected_suffix = format!(".{}", to);
+                if let Some(stem) = target_name.strip_suffix(&expected_suffix) {
+                    let input = PathBuf::from(format!("{}.{}", stem, from));
+                    let output = PathBuf::from(target_name);
+                    vec![(input, output)]
+                } else {
+                    vec![(PathBuf::from(""), PathBuf::from(""))]
+                }
             }
         } else {
             vec![(PathBuf::from(""), PathBuf::from(""))]
@@ -154,6 +160,7 @@ impl Rule {
             keep_going: global_keep_going,
             terminate: global_terminate,
             precious: global_precious,
+            suffixes: _,
             rules: _,
         } = *global_config;
         let Config {

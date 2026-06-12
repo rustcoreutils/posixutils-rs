@@ -70,6 +70,29 @@ all:
             "got: {result:?}"
         );
     }
+
+    // Audit #19: a missing `-include` file is ignored (no error); a missing
+    // plain `include` is an error.
+    #[test]
+    fn test_dash_include_missing_ignored() {
+        let result = preprocess("-include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert!(result.unwrap().contains("@echo ok"));
+    }
+
+    #[test]
+    fn test_include_missing_errors() {
+        let result = preprocess("include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
+        assert!(result.is_err());
+    }
+
+    // Audit #19: `includedir = ...` is a macro definition, not an include
+    // directive (it lacks the required trailing blank after `include`).
+    #[test]
+    fn test_includedir_not_mistaken_for_include() {
+        let result = preprocess("includedir = /usr\nall:\n\t@echo $(includedir)\n").unwrap();
+        assert!(result.contains("@echo /usr"), "got: {result:?}");
+    }
 }
 
 mod lex {

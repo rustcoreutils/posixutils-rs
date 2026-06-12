@@ -138,7 +138,7 @@ impl Parser {
                     self.push(Element::Text(word));
                 }
             }
-            "Pp" | "Lp" => self.push(Element::Macro(MacroNode {
+            "Pp" | "Lp" | "Bt" | "Ud" => self.push(Element::Macro(MacroNode {
                 mdoc_macro: macro_for_argless(name),
                 nodes: Vec::new(),
             })),
@@ -335,6 +335,8 @@ fn macro_for_argless(name: &str) -> Macro {
     match name {
         "Pp" => Macro::Pp,
         "Lp" => Macro::Lp,
+        "Bt" => Macro::Bt,
+        "Ud" => Macro::Ud,
         _ => unreachable!(),
     }
 }
@@ -480,6 +482,13 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn argless_macros() {
+        parity(".Pp\n");
+        parity(".Bt\n");
+        parity(".Ud\n");
     }
 
     #[test]

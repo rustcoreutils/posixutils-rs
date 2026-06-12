@@ -215,6 +215,14 @@ impl Parser {
                 }));
             }
             "Dt" => self.push(parse_dt(rest)),
+            "Lb" => {
+                let mut it = tokenize(rest).into_iter();
+                let lib_name = it.next().unwrap_or_default();
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Lb { lib_name },
+                    nodes: it.map(Element::Text).collect(),
+                }));
+            }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
             "Bd" => self.open_block(parse_bd(rest), &[]),
             "Bf" => self.open_block(
@@ -410,6 +418,15 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
             }));
             return out;
         }
+        if tok == "Pf" {
+            // .Pf takes only the prefix word; following content is sibling.
+            let prefix = toks.next().unwrap_or_default();
+            out.push(Element::Macro(MacroNode {
+                mdoc_macro: Macro::Pf { prefix },
+                nodes: Vec::new(),
+            }));
+            continue;
+        }
         if let Some(mac) = container_macro(&tok) {
             let rest: Vec<String> = toks.collect();
             out.push(Element::Macro(MacroNode {
@@ -457,6 +474,14 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
         let uri = it.next().unwrap_or_default();
         MacroNode {
             mdoc_macro: Macro::Lk { uri },
+            nodes: it.map(Element::Text).collect(),
+        }
+    } else if name == "In" {
+        // In: the first argument is the include filename.
+        let mut it = args.into_iter();
+        let filename = it.next().unwrap_or_default();
+        MacroNode {
+            mdoc_macro: Macro::In { filename },
             nodes: it.map(Element::Text).collect(),
         }
     } else {
@@ -578,13 +603,13 @@ fn container_macro(name: &str) -> Option<Macro> {
 
 /// A leaf inline macro (consumes following text words as arguments).
 fn is_leaf(name: &str) -> bool {
-    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm" | "Lk")
+    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm" | "Lk" | "In")
 }
 
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to
 /// dispatch and as the chaining boundary).
 fn is_callable(name: &str) -> bool {
-    is_leaf(name) || container_macro(name).is_some() || matches!(name, "An" | "Fn" | "Ta")
+    is_leaf(name) || container_macro(name).is_some() || matches!(name, "An" | "Fn" | "Pf" | "Ta")
 }
 
 /// Parse a `.Bl -type [-width w] [-offset o] [-compact] [columns…]` list opener.
@@ -843,6 +868,14 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn include_lib_prefix() {
+        parity(".In stdio.h\n");
+        parity(".Lb libc\n");
+        parity(".Sh A\n.Pf ( Ar x\n");
+        parity(".In sys/types.h\n");
     }
 
     #[test]

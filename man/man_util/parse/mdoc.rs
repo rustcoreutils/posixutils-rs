@@ -390,10 +390,26 @@ impl Parser {
             // which is kept as the block's final child).
             _ if opener_macro(name).is_some() => {
                 let mac = opener_macro(name).unwrap();
+                // The head stops at an inline closer (`.Ao … Ac`); the closer then
+                // closes this block on the same line.
+                let toks = tokenize(rest);
+                let cut = toks.iter().position(|t| closer_info(t).is_some());
+                let head: Vec<String> = match cut {
+                    Some(i) => toks[..i].to_vec(),
+                    None => toks.clone(),
+                };
                 self.stack.push(Frame {
                     mac: Some(mac),
-                    nodes: parse_inline_seq(tokenize(rest)),
+                    nodes: parse_inline_seq(head),
                 });
+                if let Some(i) = cut {
+                    let (closer, opener_is) = closer_info(&toks[i]).unwrap();
+                    let node = Element::Macro(MacroNode {
+                        mdoc_macro: closer,
+                        nodes: parse_inline_seq(toks[i + 1..].to_vec()),
+                    });
+                    self.close_partial(node, opener_is);
+                }
             }
             _ if closer_info(name).is_some() => {
                 let (closer, opener_is) = closer_info(name).unwrap();
@@ -1304,6 +1320,9 @@ mod tests {
         parity(".Bo inside\n.Bc\n");
         parity(".Sh A\n.Oo x\n.Oc\n");
         parity(".Ao a\nb\n.Ac trailing\n");
+        // An inline closer on the opener line closes the block.
+        parity(".Ao Ac\n.Ao\n.Ac\n");
+        parity(".Sh A\n.Bo arg Bc\n");
     }
 
     #[test]

@@ -229,11 +229,20 @@ impl Parser {
                 }));
             }
             "Lb" => {
-                let mut it = tokenize(rest).into_iter();
+                // A leading opening delimiter and a single trailing delimiter
+                // are separate Text nodes around the library name.
+                let mut it = tokenize(rest).into_iter().peekable();
+                let mut nodes = Vec::new();
+                if it.peek().map(|s| is_opening_delim(s)).unwrap_or(false) {
+                    nodes.push(Element::Text(it.next().unwrap()));
+                }
                 let lib_name = it.next().unwrap_or_default();
+                if let Some(trailing) = it.next() {
+                    nodes.push(Element::Text(trailing));
+                }
                 self.push(Element::Macro(MacroNode {
                     mdoc_macro: Macro::Lb { lib_name },
-                    nodes: it.map(Element::Text).collect(),
+                    nodes,
                 }));
             }
             "Db" | "Hf" => {
@@ -479,9 +488,14 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
             continue;
         }
         if tok == "Fn" {
-            // .Fn funcname [args…] — funcname is the first word, the rest are
-            // (possibly nested) argument nodes.
-            let funcname = toks.next().unwrap_or_default();
+            // .Fn [(|[] funcname [args…] — a leading opening delimiter is
+            // prepended to the funcname; the rest are argument nodes.
+            let mut funcname = toks.next().unwrap_or_default();
+            if is_opening_delim(&funcname) {
+                if let Some(next) = toks.next() {
+                    funcname.push_str(&next);
+                }
+            }
             let rest: Vec<String> = toks.by_ref().collect();
             out.push(Element::Macro(MacroNode {
                 mdoc_macro: Macro::Fn { funcname },
@@ -548,9 +562,14 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
             nodes: it.map(Element::Text).collect(),
         }
     } else if name == "In" {
-        // In: the first argument is the include filename.
+        // In: a leading opening delimiter is prepended to the include filename.
         let mut it = args.into_iter();
-        let filename = it.next().unwrap_or_default();
+        let mut filename = it.next().unwrap_or_default();
+        if is_opening_delim(&filename) {
+            if let Some(next) = it.next() {
+                filename.push_str(&next);
+            }
+        }
         MacroNode {
             mdoc_macro: Macro::In { filename },
             nodes: it.map(Element::Text).collect(),
@@ -673,6 +692,11 @@ fn container_macro(name: &str) -> Option<Macro> {
 }
 
 /// A leaf inline macro (consumes following text words as arguments).
+/// An mdoc opening delimiter (attaches to the following content).
+fn is_opening_delim(s: &str) -> bool {
+    s == "(" || s == "["
+}
+
 fn is_leaf(name: &str) -> bool {
     simple_inline(name).is_some() || matches!(name, "Xr" | "Nm" | "Lk" | "In")
 }
@@ -1033,6 +1057,13 @@ mod tests {
         parity(".Fx 14.0\n");
         parity(".Ox 7.5\n");
         parity(".Bx 4.4\n");
+    }
+
+    #[test]
+    fn structured_macros_with_delimiters() {
+        parity(".Sh A\n.Fn ( random ) text !\n");
+        parity(".Sh A\n.In ( stdio.h )\n");
+        parity(".Sh A\n.Lb ( libc )\n");
     }
 
     #[test]

@@ -259,23 +259,6 @@ impl Parser {
                     nodes: Vec::new(),
                 }));
             }
-            "Bsx" | "Dx" | "Fx" | "Nx" | "Ox" | "Bx" => {
-                // BSD-family text production: no argument yields the OS name; a
-                // version argument yields "Name version" ("versionBSD" for Bx).
-                let (mac, name_str) = bsd_family(name);
-                let args = tokenize(rest);
-                let text = if args.is_empty() {
-                    name_str.to_string()
-                } else if name == "Bx" {
-                    format!("{}BSD", args.join(" "))
-                } else {
-                    format!("{} {}", name_str, args.join(" "))
-                };
-                self.push(Element::Macro(MacroNode {
-                    mdoc_macro: mac,
-                    nodes: vec![Element::Text(text)],
-                }));
-            }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
             "Bd" => self.open_block(parse_bd(rest), &[]),
             "Bf" => self.open_block(
@@ -445,6 +428,7 @@ fn simple_inline(name: &str) -> Option<Macro> {
         "Sx" => Macro::Sx,
         "Sy" => Macro::Sy,
         "Tn" => Macro::Tn,
+        "Ux" => Macro::Ux,
         "Va" => Macro::Va,
         _ => return None,
     })
@@ -510,6 +494,19 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
                 mdoc_macro: Macro::Pf { prefix },
                 nodes: Vec::new(),
             }));
+            continue;
+        }
+        if is_text_prod(&tok) {
+            // Text-production macros (BSD family) consume following non-callable
+            // words as their argument run, then apply the delimiter+format rules.
+            let mut args = Vec::new();
+            while let Some(t) = toks.peek() {
+                if is_callable(t) {
+                    break;
+                }
+                args.push(toks.next().unwrap());
+            }
+            out.push(text_production_node(&tok, args));
             continue;
         }
         if let Some(mac) = container_macro(&tok) {
@@ -697,6 +694,103 @@ fn is_opening_delim(s: &str) -> bool {
     s == "(" || s == "["
 }
 
+/// An mdoc closing delimiter (attaches to the preceding content).
+fn is_closing_delim(s: &str) -> bool {
+    matches!(s, "." | "," | ":" | ";" | ")" | "]" | "?" | "!")
+}
+
+/// Text-production macros (callable; delimiter+version aware).
+fn is_text_prod(name: &str) -> bool {
+    matches!(name, "At" | "Bsx" | "Bx" | "Dx" | "Fx" | "Nx" | "Ox")
+}
+
+/// Format a recognized `.At` version argument, or None if it is not a known
+/// AT&T UNIX version token (in which case the default name plus the literal
+/// argument are emitted).
+fn at_version(arg: &str) -> Option<String> {
+    let bytes = arg.as_bytes();
+    if bytes.len() == 2 && bytes[0] == b'v' && (b'1'..=b'7').contains(&bytes[1]) {
+        return Some(format!("Version {} AT&T UNIX", &arg[1..]));
+    }
+    match arg {
+        "32v" => return Some("AT&T UNIX v32".to_string()),
+        "III" => return Some("AT&T System III UNIX".to_string()),
+        "V" => return Some("AT&T System V UNIX".to_string()),
+        _ => {}
+    }
+    if let Some(n) = arg.strip_prefix("V.") {
+        if n.len() == 1 && matches!(n.as_bytes()[0], b'1'..=b'4') {
+            return Some(format!("AT&T System V Release {n} UNIX"));
+        }
+    }
+    None
+}
+
+/// Build a text-production node: leading opening delimiters and trailing closing
+/// delimiters become Text siblings; the middle argument is the formatted version
+/// (or the OS-name default when absent).
+fn text_production_node(name: &str, args: Vec<String>) -> Element {
+    let (mac, default) = bsd_family(name);
+    if args.is_empty() {
+        return Element::Macro(MacroNode {
+            mdoc_macro: mac,
+            nodes: vec![Element::Text(default.to_string())],
+        });
+    }
+
+    let mut nodes = Vec::new();
+    let mut i = 0;
+    while i < args.len() && is_opening_delim(&args[i]) {
+        nodes.push(Element::Text(args[i].clone()));
+        i += 1;
+    }
+    if i < args.len() {
+        if is_closing_delim(&args[i]) {
+            nodes.push(Element::Text(default.to_string()));
+            nodes.push(Element::Text(args[i].clone()));
+            i += 1;
+        } else if name == "At" {
+            // A recognized version token formats; otherwise the default name and
+            // the literal argument are both emitted.
+            match at_version(&args[i]) {
+                Some(text) => nodes.push(Element::Text(text)),
+                None => {
+                    nodes.push(Element::Text(default.to_string()));
+                    nodes.push(Element::Text(args[i].clone()));
+                }
+            }
+            i += 1;
+        } else if name == "Bx" {
+            // Bx takes a version and an optional variant: "versionBSD[-variant]".
+            let version = args[i].clone();
+            i += 1;
+            let variant = if i < args.len() && !is_closing_delim(&args[i]) {
+                let v = args[i].clone();
+                i += 1;
+                Some(v)
+            } else {
+                None
+            };
+            let text = match variant {
+                Some(v) => format!("{version}BSD-{v}"),
+                None => format!("{version}BSD"),
+            };
+            nodes.push(Element::Text(text));
+        } else {
+            nodes.push(Element::Text(format!("{default} {}", args[i])));
+            i += 1;
+        }
+    }
+    while i < args.len() {
+        nodes.push(Element::Text(args[i].clone()));
+        i += 1;
+    }
+    Element::Macro(MacroNode {
+        mdoc_macro: mac,
+        nodes,
+    })
+}
+
 fn is_leaf(name: &str) -> bool {
     simple_inline(name).is_some() || matches!(name, "Xr" | "Nm" | "Lk" | "In")
 }
@@ -704,7 +798,10 @@ fn is_leaf(name: &str) -> bool {
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to
 /// dispatch and as the chaining boundary).
 fn is_callable(name: &str) -> bool {
-    is_leaf(name) || container_macro(name).is_some() || matches!(name, "An" | "Fn" | "Pf" | "Ta")
+    is_leaf(name)
+        || container_macro(name).is_some()
+        || is_text_prod(name)
+        || matches!(name, "An" | "Fn" | "Pf" | "Ta")
 }
 
 /// Parse a `.Bl -type [-width w] [-offset o] [-compact] [columns…]` list opener.
@@ -863,9 +960,10 @@ const RS_ORDER: &[Macro] = &[
     Macro::O,
 ];
 
-/// BSD-family text-production macro and its OS name.
+/// Text-production macro and its default name.
 fn bsd_family(name: &str) -> (Macro, &'static str) {
     match name {
+        "At" => (Macro::At, "AT&T UNIX"),
         "Bsx" => (Macro::Bsx, "BSD/OS"),
         "Bx" => (Macro::Bx, "BSD"),
         "Dx" => (Macro::Dx, "DragonFly"),
@@ -1057,6 +1155,18 @@ mod tests {
         parity(".Fx 14.0\n");
         parity(".Ox 7.5\n");
         parity(".Bx 4.4\n");
+        parity(".Ux\n");
+    }
+
+    #[test]
+    fn text_production_delimiters_and_versions() {
+        parity(".Sh A\n.Fx ( text )\n");
+        parity(".Sh A\n.Ox text .\n");
+        parity(".Sh A\n.Bx 4.3 Tahoe\n");
+        parity(".Sh A\n.At v7\n");
+        parity(".Sh A\n.At V.4\n");
+        parity(".Sh A\n.At 32v\n");
+        parity(".Sh A\n.At ( other )\n");
     }
 
     #[test]

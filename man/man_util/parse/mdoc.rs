@@ -142,7 +142,13 @@ impl Parser {
                 mdoc_macro: macro_for_argless(name),
                 nodes: Vec::new(),
             })),
-            _ if is_callable(name) => self.inline_chain(name, tokenize(rest)),
+            _ if is_callable(name) => {
+                let mut tokens = vec![name.to_string()];
+                tokens.extend(tokenize(rest));
+                for el in parse_inline_seq(tokens) {
+                    self.push(el);
+                }
+            }
             // Not yet implemented: degrade to text so the v2 path stays usable.
             // (Production defaults to pest until v2 is complete.)
             _ => {
@@ -155,67 +161,6 @@ impl Parser {
                 self.push(Element::Text(text));
             }
         }
-    }
-
-    /// Parse a chain of inline macros on one control line. Each macro consumes
-    /// following text words until the next callable-macro token, which begins a
-    /// sibling macro (mdoc inline chaining, e.g. `.Nm foo Ar bar`).
-    fn inline_chain(&mut self, first: &str, rest_tokens: Vec<String>) {
-        let mut cur = first.to_string();
-        let mut toks = rest_tokens.into_iter().peekable();
-        loop {
-            let mut args = Vec::new();
-            while let Some(t) = toks.peek() {
-                if is_callable(t) {
-                    break;
-                }
-                args.push(toks.next().unwrap());
-            }
-            self.emit_inline_macro(&cur, args);
-            match toks.next() {
-                Some(next) => cur = next,
-                None => break,
-            }
-        }
-    }
-
-    fn emit_inline_macro(&mut self, name: &str, args: Vec<String>) {
-        let node = if let Some(mac) = simple_inline(name) {
-            MacroNode {
-                mdoc_macro: mac,
-                nodes: args.into_iter().map(Element::Text).collect(),
-            }
-        } else if name == "Xr" {
-            // Xr: name, optional section, then any trailing text nodes.
-            let mut it = args.into_iter();
-            let xr_name = it.next().unwrap_or_default();
-            let section = it.next().unwrap_or_default();
-            MacroNode {
-                mdoc_macro: Macro::Xr {
-                    name: xr_name,
-                    section,
-                },
-                nodes: it.map(Element::Text).collect(),
-            }
-        } else {
-            // Nm: first arg is the name if purely alphanumeric, else a text node.
-            let mut nm_name = None;
-            let mut nodes = Vec::new();
-            let mut it = args.into_iter();
-            if let Some(first) = it.next() {
-                if first.chars().all(|c| c.is_alphanumeric()) {
-                    nm_name = Some(first);
-                } else {
-                    nodes.push(Element::Text(first));
-                }
-            }
-            nodes.extend(it.map(Element::Text));
-            MacroNode {
-                mdoc_macro: Macro::Nm { name: nm_name },
-                nodes,
-            }
-        };
-        self.push(Element::Macro(node));
     }
 }
 
@@ -247,10 +192,106 @@ fn simple_inline(name: &str) -> Option<Macro> {
     })
 }
 
+/// Parse a sequence of inline elements from a token stream (a control line's
+/// words). A *leaf* macro (Fl/Ar/Xr/Nm/…) consumes following text words as its
+/// arguments until the next callable token; a *container* partial-implicit macro
+/// (Op/Aq/Bq/…) greedily wraps the rest of the line as its children. Bare words
+/// become Text nodes.
+fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
+    let mut out = Vec::new();
+    let mut toks = tokens.into_iter().peekable();
+    while let Some(tok) = toks.next() {
+        if let Some(mac) = container_macro(&tok) {
+            let rest: Vec<String> = toks.collect();
+            out.push(Element::Macro(MacroNode {
+                mdoc_macro: mac,
+                nodes: parse_inline_seq(rest),
+            }));
+            return out;
+        } else if is_leaf(&tok) {
+            let mut args = Vec::new();
+            while let Some(t) = toks.peek() {
+                if is_callable(t) {
+                    break;
+                }
+                args.push(toks.next().unwrap());
+            }
+            out.push(make_leaf(&tok, args));
+        } else {
+            out.push(Element::Text(tok));
+        }
+    }
+    out
+}
+
+/// Build a leaf inline macro node (simple text-arg macro, or Xr/Nm).
+fn make_leaf(name: &str, args: Vec<String>) -> Element {
+    let node = if let Some(mac) = simple_inline(name) {
+        MacroNode {
+            mdoc_macro: mac,
+            nodes: args.into_iter().map(Element::Text).collect(),
+        }
+    } else if name == "Xr" {
+        let mut it = args.into_iter();
+        let xr_name = it.next().unwrap_or_default();
+        let section = it.next().unwrap_or_default();
+        MacroNode {
+            mdoc_macro: Macro::Xr {
+                name: xr_name,
+                section,
+            },
+            nodes: it.map(Element::Text).collect(),
+        }
+    } else {
+        // Nm: first arg is the name if purely alphanumeric, else a text node.
+        let mut nm_name = None;
+        let mut nodes = Vec::new();
+        let mut it = args.into_iter();
+        if let Some(first) = it.next() {
+            if first.chars().all(|c| c.is_alphanumeric()) {
+                nm_name = Some(first);
+            } else {
+                nodes.push(Element::Text(first));
+            }
+        }
+        nodes.extend(it.map(Element::Text));
+        MacroNode {
+            mdoc_macro: Macro::Nm { name: nm_name },
+            nodes,
+        }
+    };
+    Element::Macro(node)
+}
+
+/// Partial-implicit container macros: each wraps the remainder of the line.
+fn container_macro(name: &str) -> Option<Macro> {
+    Some(match name {
+        "Aq" => Macro::Aq,
+        "Bq" => Macro::Bq,
+        "Brq" => Macro::Brq,
+        "D1" => Macro::D1,
+        "Dl" => Macro::Dl,
+        "Dq" => Macro::Dq,
+        "En" => Macro::En,
+        "Op" => Macro::Op,
+        "Pq" => Macro::Pq,
+        "Ql" => Macro::Ql,
+        "Qq" => Macro::Qq,
+        "Sq" => Macro::Sq,
+        "Vt" => Macro::Vt,
+        _ => return None,
+    })
+}
+
+/// A leaf inline macro (consumes following text words as arguments).
+fn is_leaf(name: &str) -> bool {
+    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm")
+}
+
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to
 /// dispatch and as the chaining boundary).
 fn is_callable(name: &str) -> bool {
-    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm")
+    is_leaf(name) || container_macro(name).is_some()
 }
 
 fn macro_for_argless(name: &str) -> Macro {
@@ -389,6 +430,26 @@ mod tests {
         parity(".Nm foo Ar bar\n");
         parity(".Fl v Ar file\n");
         parity(".Xr cat 1 Ar end\n");
+    }
+
+    #[test]
+    fn partial_implicit_containers() {
+        parity(".Op Fl x\n");
+        parity(".Aq address\n");
+        parity(".Bq text\n");
+        parity(".Op\n");
+    }
+
+    #[test]
+    fn partial_implicit_nesting() {
+        parity(".Op Fl x Ar file\n");
+        parity(".Op Aq Fl v\n");
+        parity(".Dq quoted words\n");
+    }
+
+    #[test]
+    fn inline_then_container() {
+        parity(".Fl a Op Fl b\n");
     }
 
     #[test]

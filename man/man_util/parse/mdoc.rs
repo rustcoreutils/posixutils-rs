@@ -506,9 +506,16 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
                     out.push(an_node(AnType::NoSplit, Vec::new()));
                 }
                 _ => {
-                    let rest: Vec<String> = toks.by_ref().collect();
-                    out.push(an_node(AnType::Name, parse_inline_seq(rest)));
-                    return out;
+                    // The author name is the following text words only; a
+                    // subsequent macro is a sibling, not a child.
+                    let mut args = Vec::new();
+                    while let Some(t) = toks.peek() {
+                        if is_callable(t) {
+                            break;
+                        }
+                        args.push(Element::Text(toks.next().unwrap()));
+                    }
+                    out.push(an_node(AnType::Name, args));
                 }
             }
             continue;
@@ -565,6 +572,11 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
                     break;
                 }
                 args.push(toks.next().unwrap());
+            }
+            // A macro that grammatically requires an argument but has none is a
+            // parse failure in pest (it produces nothing); drop it.
+            if args.is_empty() && requires_args(&tok) {
+                continue;
             }
             out.push(make_leaf(&tok, args));
         } else {
@@ -835,6 +847,13 @@ fn text_production_node(name: &str, args: Vec<String>) -> Element {
 
 fn is_leaf(name: &str) -> bool {
     simple_inline(name).is_some() || matches!(name, "Xr" | "Nm" | "Lk" | "In")
+}
+
+/// Whether a leaf macro grammatically requires at least one argument. The few
+/// that allow zero (Ar/Fl/Ux take `*`; Nm's name is optional; Ap/Ns stand alone)
+/// are excluded.
+fn requires_args(name: &str) -> bool {
+    is_leaf(name) && !matches!(name, "Ar" | "Fl" | "Ux" | "Nm" | "Ap" | "Ns")
 }
 
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to

@@ -49,17 +49,17 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#16 — `.SUFFIXES` is stored in a `BTreeSet`, destroying search order; additive/clear semantics are also broken.** ✓ fixed (Phase 5): added an authoritative insertion-ordered `Config.suffixes: Vec<String>` (consumed by `find_inference_rule` and `InferenceTarget`); the sorted `rules[".SUFFIXES"]` `BTreeSet` is kept only as a mirror for the `-p` dump. `process_suffixes` now clears on empty prerequisites (`clear_suffixes`) and appends otherwise (`add_suffix`, order-preserving, dedup) instead of replacing. `-r` clears the Vec too. Test `inference_rules::suffixes_clear_then_readd`; verified append keeps built-ins, empty `.SUFFIXES:` clears them, and a later `.SUFFIXES: .c .o` re-enables inference.
 
-- [ ] **#17 — Signal registration is gated on the wrong condition.** `rule.rs:179–181` registers signals only when `!ignore || print || quit || dry_run`. Under `-i` alone, signals are *not* registered; under `-n`/`-p`/`-q`, the spec says make shall take the *default* action (i.e. not catch), yet the code registers when those are set. **(static — signal timing not behaviorally tested.)** Fix: register unless `-n`/`-p`/`-q` is set; `-i` is not an exemption.
+- [x] **#17 — Signal registration is gated on the wrong condition.** ✓ fixed (Phase 8): registration is now `if !dry_run && !print && !quit` — make catches signals unless `-n`/`-p`/`-q` is set (those take the default action), and `-i` is no longer an exemption. Test `target_behavior::async_events_registered_under_dash_i` confirms an interrupt under `-i` still cleans up and re-raises.
 
-- [ ] **#18 — `.PRECIOUS` with no prerequisites does not protect targets on signal.** `special_target.rs` `process_precious` never sets the global `config.precious`; the signal cleanup reads `global_precious || rule_precious` (`rule.rs:173`). So the "no prerequisites ⇒ all targets precious" case fails and a partially built target may be deleted on SIGINT/SIGTERM. **(static.)** Fix: set `make.config.precious = true` when `.PRECIOUS` has no prerequisites.
+- [x] **#18 — `.PRECIOUS` with no prerequisites does not protect targets on signal.** ✓ fixed (Phase 8): `process_precious` now sets `make.config.precious = true` when `.PRECIOUS` has no prerequisites, so the global-precious flag the signal handler consults protects every in-progress target.
 
 - [x] **#19 — `-include` is not actually implemented (line passed through).** ✓ fixed (Phase 5): `parse_include_directive` recognizes both `include` and the `-include` form, requires the trailing blank (so `includedir=…` is no longer mis-parsed as an include), and inlines the file; a missing/unreadable file is silently ignored for `-include` and a hard error for `include`. Tests `preprocess::test_dash_include_missing_ignored`, `test_include_missing_errors`, `test_includedir_not_mistaken_for_include`. Note: full immediate/delayed re-making of include files is not implemented (the file is simply inlined), which matches the existing `include` behavior.
 
 ### Minor
 
-- [ ] **#20 — Signal handler calls `process::exit(128+sig)` instead of resetting to default and re-raising.** `signal_handler.rs:35`. Spec: "set the signal to default and re-signal itself" so the parent sees a signal death. Fix: `signal(sig, SIG_DFL); raise(sig)`.
+- [x] **#20 — Signal handler calls `process::exit(128+sig)` instead of resetting to default and re-raising.** ✓ fixed (Phase 8): the handler now does `signal(sig, SIG_DFL); raise(sig)`, so make dies *from* the signal and the parent observes a signal death (verified: `status.code()` is `None`, `status.signal()` is `SIGINT`). Tests updated accordingly.
 
-- [ ] **#21 — Signal cleanup ignores `.PHONY` membership and the mtime-change condition.** `signal_handler.rs:19–32` deletes unconditionally (no record of the target's pre-recipe mtime) and has no awareness of the phony set. Spec deletes only if the target's mtime changed and it is not a `.PHONY`/`.PRECIOUS` prerequisite. **(static.)**
+- [x] **#21 — Signal cleanup ignores `.PHONY` membership and the mtime-change condition.** ✓ fixed (Phase 8): `INTERRUPT_FLAG` now carries an `InterruptInfo { target, precious, phony, original_mtime }`. The target's mtime is captured once before its recipe sequence; on interrupt the handler deletes only when the target is not precious, not phony, and its mtime changed (i.e. the recipe had begun writing the file). Verified by `target_behavior::async_events` (a freshly created `text.txt` is deleted) and `special_targets::precious` (a precious target is kept).
 
 - [ ] **#22 — `.IGNORE`/`.SILENT`/`.PHONY`/`.PRECIOUS` "subsequent occurrences add to the list" and per-target forms are order-dependent.** `special_target.rs` `additive()`/`global()` only mutate rules already parsed at process time, and several handlers `insert` (replace) rather than accumulate. A target defined *after* the special target may not be affected. **(static; `.SILENT:` global form was behaviorally confirmed working.)**
 
@@ -112,7 +112,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 ### Asynchronous events
 - [x] SIGHUP/SIGINT/SIGQUIT/SIGTERM handlers installed — `signal_handler.rs:40–43`.
 - [x] Non-precious in-progress target removed on signal — `signal_handler.rs:19–32`.
-- [ ] **Registration gated on wrong condition (Major #17)**; **`.PRECIOUS` global not honored (Major #18)**; **exit instead of re-raise (Minor #20)**; **no mtime/`.PHONY` check (Minor #21)**.
+- [x] Registration gated correctly (Major #17 fixed); `.PRECIOUS` global honored (Major #18 fixed); reset-and-re-raise (Minor #20 fixed); mtime/`.PHONY` cleanup check (Minor #21 fixed).
 
 ### STDOUT / STDERR / Exit status
 - [x] Recipe echo to stdout; diagnostics to stderr — `rule.rs`, `main.rs`.
@@ -128,7 +128,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `.SCCS_GET` (XSI) PARTIAL — recognized/stored; no runtime SCCS retrieval traced. **(static.)**
 - [ ] **`.POSIX` rejected (Critical #2)**.
 - [x] `.SUFFIXES` insertion-ordered with clear/append (Major #16 fixed).
-- [ ] **`.PRECIOUS` global protection broken (Major #18)**.
+- [x] `.PRECIOUS` global protection honored (Major #18 fixed).
 - [x] `.WAIT` / `.NOTPARALLEL` recognized and honored (Major #9 fixed).
 - [ ] **Subsequent-occurrence accumulation order-dependent (Minor #22)**.
 
@@ -152,7 +152,7 @@ Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing 
 - [x] Shell `-e` abort on first failing command (#11) — `recipe_execution::shell_e_aborts_on_first_failure`; `SHELL` macro vs env var (#12, behaviorally verified).
 - [x] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15) — `internal_macros::*`, `rule::tests::dir_and_file_parts`.
 - [x] `.SUFFIXES` ordering + clear/append (#16) — `inference_rules::suffixes_clear_then_readd`.
-- [ ] Signal-driven cleanup, `.PRECIOUS` global, re-raise (#17, #18, #20, #21).
+- [x] Signal-driven cleanup, `.PRECIOUS` global, re-raise (#17, #18, #20, #21) — `target_behavior::async_events*`, `special_targets::precious`.
 
 ## Suggested PR groupings
 

@@ -37,7 +37,19 @@ use target::Target;
 
 type LazyArcMutex<T> = LazyLock<Arc<Mutex<T>>>;
 
-pub static INTERRUPT_FLAG: LazyArcMutex<Option<(String, bool)>> =
+/// State about the target whose recipe is currently running, used by the signal
+/// handler to decide whether to delete a partially built target on interrupt.
+#[derive(Debug, Clone)]
+pub struct InterruptInfo {
+    pub target: String,
+    pub precious: bool,
+    pub phony: bool,
+    /// The target's modification time before its recipe started, so the handler
+    /// can tell whether the interrupted recipe actually changed the file.
+    pub original_mtime: Option<SystemTime>,
+}
+
+pub static INTERRUPT_FLAG: LazyArcMutex<Option<InterruptInfo>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 
 /// Set when a non-ignored recipe error is swallowed under `-k` (keep going) so
@@ -168,8 +180,15 @@ impl Rule {
             ignore: rule_ignore,
             silent: rule_silent,
             precious: rule_precious,
-            phony: _,
+            phony: rule_phony,
         } = self.config;
+
+        // Capture the target's modification time once, before any recipe line
+        // runs, so the signal handler can tell whether an interrupted recipe
+        // changed the (possibly newly created) target.
+        let original_mtime = std::fs::metadata(target.as_ref())
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         for inout in files {
             for recipe in self.recipes() {
@@ -191,9 +210,16 @@ impl Rule {
                 let keep_going = global_keep_going;
                 let terminate = global_terminate;
 
-                *INTERRUPT_FLAG.lock().unwrap() = Some((target.as_ref().to_string(), precious));
+                *INTERRUPT_FLAG.lock().unwrap() = Some(InterruptInfo {
+                    target: target.as_ref().to_string(),
+                    precious,
+                    phony: rule_phony,
+                    original_mtime,
+                });
 
-                if !ignore || print || quit || dry_run {
+                // POSIX: make catches signals unless -n, -p, or -q is set (those
+                // take the default action). -i is not an exemption.
+                if !dry_run && !print && !quit {
                     signal_handler::register_signals();
                 }
 

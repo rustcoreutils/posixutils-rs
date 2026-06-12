@@ -696,10 +696,46 @@ mod target_behavior {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(stderr, "make: Interrupt\nmake: Deleting file 'text.txt'\n");
 
-        assert_eq!(output.status.code(), Some(130));
+        // Audit #20: make resets the signal to default and re-raises it, so it
+        // dies *from* the signal (no exit code) rather than exiting 128+signo.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.code(), None);
+        assert_eq!(output.status.signal(), Some(SIGINT));
 
         // The makefile creates text.txt and the signal handler should delete it,
         // but clean up anyway in case test fails
+        let _ = remove_file("text.txt");
+    }
+
+    // Audit #17: signals are caught even under -i (ignore errors); -i is not an
+    // exemption from registration, so an interrupt still cleans up and the
+    // process dies from the re-raised signal.
+    #[test]
+    fn async_events_registered_under_dash_i() {
+        let _ = remove_file("text.txt");
+
+        let args = [
+            "-i",
+            "-f",
+            "tests/makefiles/target_behavior/async_events/signal.mk",
+        ];
+        let child = manual_test_helper(&args);
+        let pid = child.id() as i32;
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            unsafe {
+                kill(pid, SIGINT);
+            }
+        });
+
+        let output = child.wait_with_output().expect("failed to wait for child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("make: Interrupt"), "stderr: {stderr}");
+
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.signal(), Some(SIGINT));
+
         let _ = remove_file("text.txt");
     }
 }
@@ -897,7 +933,10 @@ mod special_targets {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(stderr, "make: Interrupt\n");
 
-        assert_eq!(output.status.code(), Some(130));
+        // Audit #20: dies from the re-raised signal rather than exiting 128+signo.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.code(), None);
+        assert_eq!(output.status.signal(), Some(SIGINT));
 
         let _ = remove_file("precious_text.txt");
         remove_file("preciousdir/some.txt").unwrap();

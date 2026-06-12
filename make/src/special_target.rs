@@ -335,6 +335,12 @@ impl Processor<'_> {
             .map(|val| val.as_ref().to_string())
             .collect::<BTreeSet<String>>();
 
+        // POSIX: with no prerequisites, `.PRECIOUS` protects *all* targets, so
+        // set the global flag the signal handler consults.
+        if precious_set.is_empty() {
+            self.make.config.precious = true;
+        }
+
         let what_to_do = |rule: &mut Rule| rule.config.precious = true;
 
         self.additive(what_to_do);

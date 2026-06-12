@@ -531,4 +531,110 @@ mod tests {
             "rejection must be fast, took {elapsed:?}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Pager & width fidelity (audit Phase 2)
+    // -------------------------------------------------------------------------
+
+    fn longest_line(stdout: &[u8]) -> usize {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn format_local(env: &[(&str, &str)], page: &std::path::Path) -> std::process::Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_man"));
+        cmd.args(["-c", "-l"])
+            .arg(page)
+            .args(["-C", "man.test.conf"]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("Failed to run man -c -l")
+    }
+
+    // Audit #7: COLUMNS sets the rendering width (wider and narrower than the
+    // 78-column default), instead of being ignored.
+    #[test]
+    fn columns_env_sets_width() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh DESCRIPTION\n");
+        for i in 0..40 {
+            body.push_str(&format!("word{i:02} "));
+        }
+        body.push('\n');
+        let page = write_temp_page("cols", &body);
+
+        let wide = longest_line(&format_local(&[("COLUMNS", "120")], &page).stdout);
+        let narrow = longest_line(&format_local(&[("COLUMNS", "40")], &page).stdout);
+        let _ = std::fs::remove_file(&page);
+
+        assert!(wide > 90, "COLUMNS=120 should widen lines, got {wide}");
+        assert!(narrow <= 39, "COLUMNS=40 should narrow lines, got {narrow}");
+    }
+
+    // Audit #12: a COLUMNS value of 0 must not underflow the width computation.
+    #[test]
+    fn columns_zero_does_not_underflow() {
+        let page = write_temp_page("colz", ".Dd x\n.Dt T 1\n.Os\n.Sh D\nhello\n");
+        let output = format_local(&[("COLUMNS", "0")], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(longest_line(&output.stdout) <= 200, "width must stay sane");
+    }
+
+    // Audit #13: a `.Bl -width` larger than 20 is honored, not silently clamped.
+    #[test]
+    fn bl_width_above_20_is_honored() {
+        let page = write_temp_page(
+            "blw",
+            ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Bl -tag -width 30\n.It tag\nbody\n.El\n",
+        );
+        // Wide page so 30 fits.
+        let output = format_local(&[("COLUMNS", "100")], &page);
+        let _ = std::fs::remove_file(&page);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The tag and body share a line: `<indent>tag<pad>body`. The column
+        // where `body` begins reflects the tag-column width; with -width 30 it
+        // must sit past the old 20-clamp (base indent + 20 = 26).
+        let body_line = stdout
+            .lines()
+            .find(|l| l.contains("tag") && l.contains("body"))
+            .expect("tag+body line present");
+        let body_col = body_line.find("body").unwrap();
+        assert!(
+            body_col > 26,
+            "body should start past the old 20-clamp, got column {body_col}"
+        );
+    }
+
+    // Audit #6: with no `-c` and stdout not a terminal (piped), output is written
+    // directly, NOT through PAGER.
+    #[test]
+    fn pager_not_invoked_when_piped() {
+        // A PAGER marker script; if invoked it prepends a sentinel line.
+        let pager = std::env::temp_dir().join(format!("man_audit_pager_{}.sh", std::process::id()));
+        std::fs::write(&pager, "#!/bin/sh\necho __PAGER_RAN__\ncat\n").unwrap();
+        let mut perms = std::fs::metadata(&pager).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&pager, perms).unwrap();
+
+        let page = write_temp_page("pgr", ".Dd x\n.Dt T 1\n.Os\n.Sh NAME\n.Nm t\n");
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args(["-l"])
+            .arg(&page)
+            .args(["-C", "man.test.conf"])
+            .env("PAGER", &pager)
+            .output()
+            .expect("Failed to run man -l");
+        let _ = std::fs::remove_file(&page);
+        let _ = std::fs::remove_file(&pager);
+
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("__PAGER_RAN__"),
+            "PAGER must not be invoked when stdout is not a terminal"
+        );
+    }
 }

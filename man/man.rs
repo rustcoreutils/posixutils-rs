@@ -376,18 +376,36 @@ fn get_pager_settings(config: &ManConfig) -> Result<FormattingSettings, ManError
             .map_err(|err| ManError::ParseError(ParseError::ParseIntError(err)))?;
     }
 
-    if let Some(Some(val_str)) = config.output_options.get("width") {
-        settings.width = val_str
-            .parse::<usize>()
-            .map_err(|err| ManError::ParseError(ParseError::ParseIntError(err)))?;
+    let config_width = match config.output_options.get("width") {
+        Some(Some(val_str)) => Some(
+            val_str
+                .parse::<usize>()
+                .map_err(|err| ManError::ParseError(ParseError::ParseIntError(err)))?,
+        ),
+        _ => None,
+    };
+
+    // Width precedence: COLUMNS (a per-invocation override, honored even when
+    // piped) > an explicit config width > the terminal's own size (when stdout
+    // is a tty) > the default width (78). A one-column right margin is kept when
+    // deriving from a column count.
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+    {
+        apply_terminal_width(&mut settings, cols);
+        return Ok(settings);
     }
 
-    // If stdout is not a terminal, don't try to ioctl for size
+    if let Some(width) = config_width {
+        settings.width = width;
+        return Ok(settings);
+    }
+
     if !io::stdout().is_terminal() {
         return Ok(settings);
     }
 
-    // If it is a terminal, try to get the window size via ioctl.
     let mut winsize = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -400,16 +418,22 @@ fn get_pager_settings(config: &ManConfig) -> Result<FormattingSettings, ManError
         return Err(ManError::GetTerminalSize);
     }
 
-    // If the terminal is narrower than 79 columns, reduce the width setting
-    if winsize.ws_col < 79 {
-        settings.width = (winsize.ws_col - 1) as usize;
-        // If extremely narrow, reduce indent too
-        if winsize.ws_col < 66 {
-            settings.indent = 3;
-        }
-    }
+    apply_terminal_width(&mut settings, winsize.ws_col as usize);
 
     Ok(settings)
+}
+
+/// Set the formatting width from a terminal column count, keeping a one-column
+/// right margin and narrowing the indent on very small terminals. A reported
+/// width of 0 (or 1) leaves the default in place rather than underflowing.
+fn apply_terminal_width(settings: &mut FormattingSettings, cols: usize) {
+    if cols < 2 {
+        return;
+    }
+    settings.width = cols - 1;
+    if cols < 66 {
+        settings.indent = 3;
+    }
 }
 
 /// Read a local man page file (possibly .gz), uncompress if needed, and return
@@ -467,7 +491,10 @@ fn format_man_page(
 ///
 /// [ManError] if failed to execute pager or failed write to its STDIN.
 fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
-    if copy_mode {
+    // POSIX: the output is piped through PAGER only "When standard output is a
+    // terminal device." With `-c`, or when stdout is not a terminal (e.g.
+    // `man foo | grep bar`), write directly to stdout instead.
+    if copy_mode || !io::stdout().is_terminal() {
         io::stdout().write_all(&man_page)?;
         io::stdout().flush()?;
         return Ok(());

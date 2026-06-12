@@ -10,8 +10,6 @@ use super::{
 };
 
 /// Max Bl -width parameter value
-const MAX_INDENT: u8 = 20;
-
 fn regex_unicode() -> &'static Regex {
     static CELL: OnceLock<Regex> = OnceLock::new();
     CELL.get_or_init(|| {
@@ -1333,11 +1331,11 @@ fn remove_empty_lines(input: &str, delimiter_size: usize) -> String {
 // Formatting block full-explicit.
 impl MdocFormatter {
     fn get_width_indent(&self, width: &Option<u8>) -> usize {
-        let mut width = width.unwrap_or(0).min(MAX_INDENT) as usize;
-        if width < 2 {
-            width = 2;
-        }
-        width
+        // Honor the declared `.Bl -width`, bounded only by the page width (so a
+        // wide tag list is not silently clamped to 20), with a small remainder
+        // reserved for the item text.
+        let cap = self.formatting_settings.width.saturating_sub(4).max(2);
+        (width.unwrap_or(0) as usize).clamp(2, cap)
     }
 
     fn get_offset_indent(&self, offset: &Option<OffsetType>) -> usize {

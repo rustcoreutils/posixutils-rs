@@ -191,10 +191,6 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                     apply_define_item(&mut state, &item)
                 }
                 InputItem::File(path) => {
-                    // Discard the previous (now exhausted) input before the next.
-                    while state.input.input_len() > 0 {
-                        state.input.input_pop();
-                    }
                     let reader = if path.as_os_str() == "-" {
                         Ok(InputRead::Stdin(std::io::stdin()))
                     } else {
@@ -205,6 +201,14 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                     };
                     match reader {
                         Ok(read) => {
+                            // Discard the previous (now exhausted) input only once
+                            // the next one has opened. Popping before the open
+                            // would, on a failed open, leave the input stack empty
+                            // and cause finalize() to be skipped — dropping any
+                            // m4wrap text or diversions queued by earlier files.
+                            while state.input.input_len() > 0 {
+                                state.input.input_pop();
+                            }
                             state
                                 .input
                                 .input_push(Input::new(read), &mut *stdout.borrow_mut())?;

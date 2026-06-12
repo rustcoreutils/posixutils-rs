@@ -283,6 +283,7 @@ m4_test_expect_error!(define_parse_brackets);
 m4_test_expect_error!(define_quoted_number_stacked);
 m4_test_expect_error!(define_unquoted_number_arg);
 m4_test_expect_error!(dumpdef_notexist);
+m4_test_expect_error!(divert_survives_failed_operand);
 m4_test_expect_error!(incr_non_numeric);
 m4_test_expect_error!(missing_file_operand);
 m4_test_expect_error!(eval_divide_by_zero);

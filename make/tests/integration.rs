@@ -253,6 +253,23 @@ mod arguments {
             2,
         );
     }
+
+    // Audit #10: multiple `-f` makefiles shall be processed in order.
+    #[test]
+    fn multiple_dash_f() {
+        run_test_helper(
+            &[
+                "-f",
+                "tests/makefiles/arguments/multi_f/a.mk",
+                "-f",
+                "tests/makefiles/arguments/multi_f/b.mk",
+                "b",
+            ],
+            "from-b\n",
+            "",
+            0,
+        );
+    }
 }
 
 // such tests should be moved directly to the package responsible for parsing makefiles
@@ -379,6 +396,38 @@ mod macros {
         fn clean_env_vars() {
             env::remove_var("MACRO");
         }
+    }
+
+    // Audit #5: a command-line `macro=value` operand defines a macro and takes
+    // precedence over a definition in the makefile.
+    #[test]
+    fn cmdline_macro_overrides_file() {
+        run_test_helper(
+            &[
+                "-sf",
+                "tests/makefiles/macros/cmdline_macro.mk",
+                "FOO=override",
+                "all",
+            ],
+            "FOO=override\n",
+            "",
+            0,
+        );
+    }
+
+    #[test]
+    fn cmdline_macro_defines() {
+        run_test_helper(
+            &[
+                "-sf",
+                "tests/makefiles/macros/cmdline_only_macro.mk",
+                "BAR=hi",
+                "all",
+            ],
+            "BAR=hi\n",
+            "",
+            0,
+        );
     }
 }
 
@@ -610,6 +659,18 @@ mod special_targets {
                 "nonexisting_target",
             ],
             "echo Default\nDefault\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #2: `.POSIX` must be accepted (a portable makefile is required to
+    // include it), not rejected as an unsupported special target.
+    #[test]
+    fn posix() {
+        run_test_helper(
+            &["-f", "tests/makefiles/special_targets/posix.mk"],
+            "posix-ok\n",
             "",
             0,
         );

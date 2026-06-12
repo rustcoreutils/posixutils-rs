@@ -177,13 +177,13 @@ pub fn process(rule: Rule, make: &mut Make) -> Result<(), ErrorCode> {
 
     match target {
         Default => this.process_default(),
+        Posix => this.process_posix(),
         Ignore => this.process_ignore(),
         Silent => this.process_silent(),
         Suffixes => this.process_suffixes(),
         Phony => this.process_phony(),
         Precious => this.process_precious(),
         SccsGet => this.process_sccs_get(),
-        unsupported => Err(Error::NotSupported(unsupported)),
     }
     .map_err(|err| ErrorCode::SpecialTargetConstraintNotFulfilled {
         target: target.to_string(),
@@ -242,6 +242,16 @@ impl Processor<'_> {
         self.without_prerequisites()?;
 
         self.make.default_rule.replace(self.rule);
+
+        Ok(())
+    }
+
+    /// `.POSIX` requests strictly conformant behavior. POSIX requires it to be
+    /// specified without prerequisites or commands; beyond validating that, we
+    /// simply accept it (the implementation already follows POSIX semantics).
+    fn process_posix(self) -> Result<(), Error> {
+        self.without_prerequisites()?;
+        self.without_recipes()?;
 
         Ok(())
     }

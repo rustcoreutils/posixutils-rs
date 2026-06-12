@@ -60,7 +60,7 @@ fn suitable_ident(c: &char) -> bool {
 /// macro definition only when it is not a recipe line and the text preceding
 /// the assignment operator is a single valid macro name (optionally prefixed
 /// with `export`).
-fn is_macro_definition(line: &str) -> bool {
+pub fn is_macro_definition(line: &str) -> bool {
     // Recipe lines are tab-indented and are never macro definitions.
     if line.starts_with('\t') {
         return false;

@@ -47,8 +47,12 @@ struct Args {
     )]
     terminate: bool,
 
-    #[arg(short = 'f', long, help = "Path to the makefile to parse")]
-    makefile: Option<PathBuf>,
+    #[arg(
+        short = 'f',
+        long,
+        help = "Path to a makefile to parse (may be given multiple times; processed in order)"
+    )]
+    makefile: Vec<PathBuf>,
 
     #[arg(short = 'i', long, help = "Ignore errors in the recipe")]
     ignore: bool,
@@ -113,40 +117,48 @@ fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
     print!("{:?}", rules);
 }
 
-/// Parse the makefile at the given path, or the first default makefile found.
-/// If no makefile is found, print an error message and exit.
-fn parse_makefile(path: Option<impl AsRef<Path>>) -> Result<Makefile, ErrorCode> {
-    let path = path.as_ref().map(|p| p.as_ref());
-
-    let path = match path {
-        Some(path) => path,
-        None => {
-            let mut makefile = None;
-            for m in MAKEFILE_PATH.iter() {
-                let path = Path::new(m);
-                if path.exists() {
-                    makefile = Some(path);
-                    break;
-                }
-            }
-            if let Some(makefile) = makefile {
-                makefile
-            } else {
-                return Err(NoMakefile);
-            }
-        }
-    };
-
-    let contents = if path == Path::new("-") {
-        read_stdin()?
+/// Read one makefile operand into a string, honoring `-` as standard input.
+fn read_makefile(path: &Path) -> Result<String, ErrorCode> {
+    if path == Path::new("-") {
+        read_stdin()
     } else {
-        match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                return Err(IoError(err.kind()));
-            }
+        fs::read_to_string(path).map_err(|err| IoError(err.kind()))
+    }
+}
+
+/// Append `part` to `contents`, inserting a separating newline only between
+/// non-empty parts. A trailing newline is never added, so a single empty
+/// makefile stays empty (which the parser reports as "No targets").
+fn append_part(contents: &mut String, part: &str) {
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(part);
+}
+
+/// Parse the makefile(s). Multiple `-f` operands are concatenated in the order
+/// given (POSIX); with none, the first default makefile found is used.
+/// Command-line `macro=value` operands are appended last so they take
+/// precedence over definitions in the makefile(s).
+fn parse_makefile(paths: &[PathBuf], cmdline_macros: &[String]) -> Result<Makefile, ErrorCode> {
+    let mut contents = String::new();
+
+    if paths.is_empty() {
+        let default = MAKEFILE_PATH
+            .iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+            .ok_or(NoMakefile)?;
+        append_part(&mut contents, &read_makefile(default)?);
+    } else {
+        for path in paths {
+            append_part(&mut contents, &read_makefile(path)?);
         }
-    };
+    }
+
+    for macro_def in cmdline_macros {
+        append_part(&mut contents, macro_def);
+    }
 
     match Makefile::from_str(&contents) {
         Ok(makefile) => Ok(makefile),
@@ -210,7 +222,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ENV_MACROS.store(env_macros, Relaxed);
 
-    let parsed = match parse_makefile(makefile.as_ref()) {
+    // Separate command-line `macro=value` operands from target operands
+    // (POSIX SYNOPSIS allows them to be intermixed).
+    let mut cmdline_macros: Vec<String> = Vec::new();
+    targets.retain(|operand| {
+        let operand = operand.to_string_lossy();
+        if posixutils_make::parser::preprocessor::is_macro_definition(&operand) {
+            cmdline_macros.push(operand.into_owned());
+            false
+        } else {
+            true
+        }
+    });
+
+    let parsed = match parse_makefile(&makefile, &cmdline_macros) {
         Ok(parsed) => parsed,
         Err(err) => {
             // -p flag

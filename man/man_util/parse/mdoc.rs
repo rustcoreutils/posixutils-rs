@@ -18,6 +18,9 @@ use crate::man_util::mdoc_macro::types::{AnType, BdType, BfType, BlType, OffsetT
 use crate::man_util::mdoc_macro::Macro;
 use crate::man_util::parser::{prepare_document, trim_quotes, Element, MacroNode, MdocDocument};
 
+/// A predicate over a macro (e.g. "is this the opener for this closer?").
+type MacroPred = fn(&Macro) -> bool;
+
 /// A partially-built block: its macro (None = document root) and its children.
 struct Frame {
     mac: Option<Macro>,
@@ -67,7 +70,7 @@ impl Parser {
     }
 
     /// Open a new implicit block, after closing the blocks it terminates.
-    fn open_block(&mut self, mac: Macro, closes: &[fn(&Macro) -> bool]) {
+    fn open_block(&mut self, mac: Macro, closes: &[MacroPred]) {
         while self.stack.len() > 1 {
             let top_is_closable = self
                 .stack
@@ -100,7 +103,7 @@ impl Parser {
 
     /// Close the nearest explicit block matching `is_match` (and any frames
     /// nested inside it), for `.Ed`/`.Ef`/`.Ek`.
-    fn close_explicit(&mut self, is_match: fn(&Macro) -> bool) {
+    fn close_explicit(&mut self, is_match: MacroPred) {
         while self.stack.len() > 1 {
             let matched = self
                 .stack
@@ -119,7 +122,7 @@ impl Parser {
 
     /// Close a block-partial-explicit enclosure: the closer node becomes the
     /// opener's final child, then the opener frame is closed.
-    fn close_partial(&mut self, closer: Element, opener_is: fn(&Macro) -> bool) {
+    fn close_partial(&mut self, closer: Element, opener_is: MacroPred) {
         while self.stack.len() > 1 {
             let matched = self
                 .stack
@@ -641,7 +644,7 @@ fn opener_macro(name: &str) -> Option<Macro> {
 }
 
 /// Closer macros and the predicate identifying their matching opener.
-fn closer_info(name: &str) -> Option<(Macro, fn(&Macro) -> bool)> {
+fn closer_info(name: &str) -> Option<(Macro, MacroPred)> {
     Some(match name {
         "Ac" => (Macro::Ac, |m| matches!(m, Macro::Ao)),
         "Bc" => (Macro::Bc, |m| matches!(m, Macro::Bo)),

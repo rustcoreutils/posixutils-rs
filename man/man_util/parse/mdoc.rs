@@ -14,6 +14,7 @@
 //! arguments are tokenized per word into `Text` nodes; a plain text line becomes
 //! a single `Text` node, matching the pest AST.
 
+use crate::man_util::mdoc_macro::text_production::StType;
 use crate::man_util::mdoc_macro::types::{AnType, BdType, BfType, BlType, OffsetType, SmMode};
 use crate::man_util::mdoc_macro::Macro;
 use crate::man_util::parser::{prepare_document, trim_quotes, Element, MacroNode, MdocDocument};
@@ -258,6 +259,31 @@ impl Parser {
                     mdoc_macro: Macro::Tg { term },
                     nodes: Vec::new(),
                 }));
+            }
+            "Es" => {
+                // Obsolete: end-of-sentence delimiters as two single chars.
+                let mut it = tokenize(rest).into_iter();
+                let opening_delimiter = it.next().and_then(|s| s.chars().next()).unwrap_or(' ');
+                let closing_delimiter = it.next().and_then(|s| s.chars().next()).unwrap_or(' ');
+                let nodes = parse_inline_seq(it.collect());
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Es {
+                        opening_delimiter,
+                        closing_delimiter,
+                    },
+                    nodes,
+                }));
+            }
+            "St" => {
+                let mut it = tokenize(rest).into_iter();
+                match it.next().as_deref().and_then(st_type) {
+                    Some(st) => self.push(Element::Macro(MacroNode {
+                        mdoc_macro: Macro::St(st),
+                        nodes: it.map(Element::Text).collect(),
+                    })),
+                    // Unknown standard abbreviation: pest rejects it; degrade.
+                    None => self.push(Element::Text(format!(".St {rest}"))),
+                }
             }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
             "Bd" => self.open_block(parse_bd(rest), &[]),
@@ -960,6 +986,59 @@ const RS_ORDER: &[Macro] = &[
     Macro::O,
 ];
 
+/// Map a `.St` standard abbreviation to its `StType`.
+fn st_type(flag: &str) -> Option<StType> {
+    Some(match flag {
+        "-ansiC" => StType::AnsiC,
+        "-ansiC-89" => StType::AnsiC89,
+        "-isoC" => StType::IsoC,
+        "-isoC-90" => StType::IsoC90,
+        "-isoC-amd1" => StType::IsoCAmd1,
+        "-isoC-tcor1" => StType::IsoCTcor1,
+        "-isoC-tcor2" => StType::IsoCTcor2,
+        "-isoC-99" => StType::IsoC99,
+        "-isoC-2011" => StType::IsoC2011,
+        "-p1003.1-88" => StType::P1003188,
+        "-p1003.1" => StType::P10031,
+        "-p1003.1-90" => StType::P1003190,
+        "-iso9945-1-90" => StType::Iso9945190,
+        "-p1003.1b-93" => StType::P10031B93,
+        "-p1003.1b" => StType::P10031B,
+        "-p1003.1c-95" => StType::P10031C95,
+        "-p1003.1i-95" => StType::P10031I95,
+        "-p1003.1-96" => StType::P1003196,
+        "-iso9945-1-96" => StType::Iso9945196,
+        "-xpg3" => StType::Xpg3,
+        "-p1003.2" => StType::P10032,
+        "-p1003.2-92" => StType::P1003292,
+        "-iso9945-2-93" => StType::Iso9945293,
+        "-p1003.2a-92" => StType::P10032A92,
+        "-xpg4" => StType::Xpg4,
+        "-susv1" => StType::Susv1,
+        "-xpg4.2" => StType::Xpg42,
+        "-xcurses4.2" => StType::XCurses42,
+        "-p1003.1g-2000" => StType::P10031G2000,
+        "-svid4" => StType::Svid4,
+        "-susv2" => StType::Susv2,
+        "-xbd5" => StType::Xbd5,
+        "-xsh5" => StType::Xsh5,
+        "-xcu5" => StType::Xcu5,
+        "-xns5" => StType::Xns5,
+        "-xns5.2" => StType::Xns52,
+        "-p1003.1-2001" => StType::P100312001,
+        "-susv3" => StType::Susv3,
+        "-p1003.1-2004" => StType::P100312004,
+        "-p1003.1-2008" => StType::P100312008,
+        "-susv4" => StType::Susv4,
+        "-p1003.1-2024" => StType::P100312024,
+        "-ieee754" => StType::Ieee754,
+        "-iso8601" => StType::Iso8601,
+        "-iso8802-3" => StType::Iso88023,
+        "-ieee1275-94" => StType::Ieee127594,
+        _ => return None,
+    })
+}
+
 /// Text-production macro and its default name.
 fn bsd_family(name: &str) -> (Macro, &'static str) {
     match name {
@@ -1174,6 +1253,14 @@ mod tests {
         parity(".Sh A\n.Fn ( random ) text !\n");
         parity(".Sh A\n.In ( stdio.h )\n");
         parity(".Sh A\n.Lb ( libc )\n");
+    }
+
+    #[test]
+    fn standards_and_es() {
+        parity(".St -ansiC word\n");
+        parity(".St -iso9945-1-96\n");
+        parity(".St -p1003.1-2024\n");
+        parity(".Es ( )\n");
     }
 
     #[test]

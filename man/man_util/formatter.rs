@@ -7,52 +7,8 @@ use terminfo::Database;
 use super::{
     mdoc_macro::{text_production::*, types::*, Macro},
     parser::{trim_quotes, Element, MacroNode, MdocDocument},
+    term::style::{apply_styling, display_width, STYLE_BOLD, STYLE_RESET, STYLE_UL},
 };
-
-// Private, zero-width style markers inserted during formatting and resolved by
-// `apply_styling` into nroff backspace-overstrike (or stripped). These control
-// characters never occur in manual-page text.
-pub(crate) const STYLE_BOLD: char = '\u{1}';
-pub(crate) const STYLE_UL: char = '\u{2}';
-pub(crate) const STYLE_RESET: char = '\u{3}';
-
-fn is_style_marker(c: char) -> bool {
-    matches!(c, STYLE_BOLD | STYLE_UL | STYLE_RESET)
-}
-
-/// Display width of `s` in terminal cells, ignoring the zero-width style
-/// markers. (Overstrike is applied only after wrapping, so no backspaces are
-/// present here.) For unstyled text this equals `chars().count()`.
-pub(crate) fn display_width(s: &str) -> usize {
-    s.chars().filter(|&c| !is_style_marker(c)).count()
-}
-
-/// Resolve the style markers in the fully formatted document. When `styling` is
-/// on, characters inside a bold/underline span become nroff overstrike
-/// (`c\bc` / `_\bc`); otherwise the markers are simply removed. The font state
-/// persists across newlines so a span that wraps keeps its style.
-pub(crate) fn apply_styling(content: &str, styling: bool) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut state = STYLE_RESET;
-    for ch in content.chars() {
-        match ch {
-            STYLE_BOLD | STYLE_UL | STYLE_RESET => state = ch,
-            _ if !styling || ch.is_whitespace() => out.push(ch),
-            _ if state == STYLE_BOLD => {
-                out.push(ch);
-                out.push('\u{8}');
-                out.push(ch);
-            }
-            _ if state == STYLE_UL => {
-                out.push('_');
-                out.push('\u{8}');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
-}
 
 /// Replace roff font escapes (`\fB`, `\fI`, `\fR`/`\fP`, `\f(CB`, `\f[name]`, …)
 /// with style markers. This both stops the escapes from leaking as literal text
@@ -1065,8 +1021,8 @@ fn split_by_width(words: Vec<String>, width: usize) -> Vec<String> {
     let mut line = String::new();
     let mut i = 0;
     while i < words.len() {
-        let word_len = replace_escapes(&words[i]).len();
-        let line_len = replace_escapes(&line).len();
+        let word_len = display_width(&replace_escapes(&words[i]));
+        let line_len = display_width(&replace_escapes(&line));
         if line.is_empty() || word_len > width {
             lines.extend(
                 words[i]
@@ -1566,7 +1522,7 @@ impl MdocFormatter {
 
         for node in macro_node.nodes.into_iter() {
             let formatted_node = self.format_node(node);
-            let formatted_node_len = formatted_node.chars().count();
+            let formatted_node_len = display_width(&formatted_node);
 
             current_len += formatted_node_len;
 
@@ -2463,7 +2419,7 @@ impl MdocFormatter {
             indent: usize,
             max_width: usize,
         ) {
-            let formatted_node_len = formatted_node.chars().count();
+            let formatted_node_len = display_width(formatted_node);
             *current_len += formatted_node_len;
 
             if !content.is_empty() && *current_len > max_width {
@@ -4833,10 +4789,10 @@ Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu 
                 let output =
                     "PROGNAME(1)                 General Commands Manual                PROGNAME(1)
 
-head1  Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do
-eiusmod tempor incididunt ut labore et dolore magna aliqua.
-head2  Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris
-nisi ut aliquip ex ea commodo consequat.
+head1  Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua.
+head2  Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi
+ut aliquip ex ea commodo consequat.
 head3  Duis aute irure dolor in reprehenderit in voluptate velit esse cillum
 dolore eu fugiat nulla pariatur.
 

@@ -17,3 +17,5 @@ pub mod man7;
 pub mod mdoc_macro;
 /// Converts input mdoc file macros to AST
 pub mod parser;
+/// The single terminal backend (fill/wrap/indent/assembly)
+pub mod term;

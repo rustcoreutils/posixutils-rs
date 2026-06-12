@@ -7,15 +7,20 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! A minimal renderer for legacy `man(7)` (roff `man` macro) pages.
+//! A renderer for legacy `man(7)` (roff `man` macro) pages.
 //!
 //! The main engine in `formatter.rs` handles `mdoc(7)` only; most Linux pages
 //! are `man(7)` (`.TH`/`.SH`/`.B`/`.TP`/…), which that engine renders as an
 //! empty page. This module covers the common `man(7)` macro subset so those
-//! pages display. It deliberately does *not* implement roff programmability
+//! pages display. It drives the shared [`Term`] backend, so fill/wrap/indent
+//! and emphasis behave identically to the mdoc renderer.
+//!
+//! It deliberately does *not* implement roff programmability
 //! (`.if`/`.ie`/`.de`/`.nr`/`.ds`/`.so`).
 
-use crate::man_util::formatter::{apply_styling, display_width, STYLE_BOLD, STYLE_RESET, STYLE_UL};
+use crate::man_util::formatter::replace_escapes;
+use crate::man_util::term::style::{STYLE_BOLD, STYLE_RESET, STYLE_UL};
+use crate::man_util::term::Term;
 use crate::FormattingSettings;
 
 /// Returns true if `content` looks like a `man(7)` page (its first macro is
@@ -47,8 +52,8 @@ pub fn format_man7(content: &str, settings: &FormattingSettings) -> Vec<u8> {
 pub fn produced_body(content: &str, settings: &FormattingSettings) -> bool {
     let mut f = Man7Formatter::new(settings);
     f.process(content);
-    f.flush_fill();
-    f.has_body
+    f.term.flush();
+    f.term.has_body()
 }
 
 /// Map a manual section number to its conventional volume title (used to center
@@ -66,23 +71,6 @@ fn volume_title(section: &str) -> &'static str {
         Some('9') => "Kernel Developer's Manual",
         _ => "Manual",
     }
-}
-
-/// Compose a three-part header/footer line: `left` flush-left, `center`
-/// centered, `right` flush-right, within `width` columns.
-fn three_part(left: &str, center: &str, right: &str, width: usize) -> String {
-    let mut line = String::from(left);
-    let center_start = width.saturating_sub(center.chars().count()) / 2;
-    while line.chars().count() < center_start {
-        line.push(' ');
-    }
-    line.push_str(center);
-    let right_start = width.saturating_sub(right.chars().count());
-    while line.chars().count() < right_start {
-        line.push(' ');
-    }
-    line.push_str(right);
-    line
 }
 
 /// Tokenize a macro line into the macro name and its arguments, honoring double
@@ -117,65 +105,36 @@ fn macro_args(rest: &str) -> Vec<String> {
 }
 
 struct Man7Formatter {
-    width: usize,
+    /// Base indentation step (also the default `.RS`/`.TP`/`.IP` amount).
     indent: usize,
+    /// Whether to emit bold/underline emphasis.
     styling: bool,
-    /// Output lines accumulated so far.
-    lines: Vec<String>,
-    /// Words pending in the current filled paragraph.
-    pending: Vec<String>,
-    /// Current left indent (base indent + `.RS` levels + tag indent).
-    cur_indent: usize,
-    /// Stack of `.RS` indents for `.RE`.
-    rs_stack: Vec<usize>,
+    /// The shared terminal backend that owns fill/wrap/indent/assembly.
+    term: Term,
     /// No-fill mode (`.nf`); lines are emitted verbatim.
     no_fill: bool,
-    /// Header text (from `.TH`).
-    header: String,
-    /// Footer text (from `.TH`).
-    footer: String,
     /// When a `.TP` tag is pending, the body indent to switch to once the tag
     /// (the next content-producing line, text or font macro) is emitted.
     tp_body_indent: Option<usize>,
-    /// True if any body content was produced (for the empty-render check).
-    has_body: bool,
 }
 
 impl Man7Formatter {
     fn new(settings: &FormattingSettings) -> Self {
-        Man7Formatter {
-            width: settings.width.max(1),
+        let mut f = Man7Formatter {
             indent: settings.indent,
             styling: settings.styling,
-            lines: Vec::new(),
-            pending: Vec::new(),
-            cur_indent: settings.indent,
-            rs_stack: Vec::new(),
+            term: Term::new(settings.width, settings.styling),
             no_fill: false,
-            header: String::new(),
-            footer: String::new(),
             tp_body_indent: None,
-            has_body: false,
-        }
+        };
+        // Body text starts at the base indent (sections reset to it).
+        f.term.set_offset(settings.indent);
+        f
     }
 
     fn render(mut self, content: &str) -> Vec<u8> {
         self.process(content);
-        self.flush_fill();
-
-        let mut out = Vec::new();
-        if !self.header.is_empty() {
-            out.push(self.header.clone());
-            out.push(String::new());
-        }
-        out.extend(self.lines.clone());
-        if !self.footer.is_empty() {
-            out.push(String::new());
-            out.push(self.footer.clone());
-        }
-
-        let joined = collapse_blank_lines(&out);
-        apply_styling(&joined, self.styling).into_bytes()
+        self.term.finish()
     }
 
     fn process(&mut self, content: &str) {
@@ -202,47 +161,33 @@ impl Man7Formatter {
             "TH" => self.do_th(args),
             "SH" => self.do_heading(args, false),
             "SS" => self.do_heading(args, true),
-            "PP" | "LP" | "P" | "sp" | "Sp" => {
-                self.flush_fill();
-                self.lines.push(String::new());
-            }
-            "br" => self.flush_fill(),
+            "PP" | "LP" | "P" | "sp" | "Sp" => self.term.blank_line(),
+            "br" => self.term.break_line(),
             "nf" => {
-                self.flush_fill();
+                self.term.break_line();
                 self.no_fill = true;
             }
             "fi" => {
-                self.flush_fill();
+                self.term.break_line();
                 self.no_fill = false;
             }
             "RS" => {
-                self.flush_fill();
-                self.rs_stack.push(self.cur_indent);
                 let extra = macro_args(args)
                     .first()
                     .and_then(|n| n.parse::<usize>().ok())
                     .unwrap_or(self.indent);
-                self.cur_indent += extra;
+                self.term.push_indent(extra);
             }
-            "RE" => {
-                self.flush_fill();
-                if let Some(prev) = self.rs_stack.pop() {
-                    self.cur_indent = prev;
-                }
-            }
+            "RE" => self.term.pop_indent(),
             "TP" => {
-                self.flush_fill();
                 let extra = macro_args(args)
                     .first()
                     .and_then(|n| n.parse::<usize>().ok())
                     .unwrap_or(self.indent);
-                self.tp_body_indent = Some(self.cur_indent + extra);
+                self.tp_body_indent = Some(self.term.offset() + extra);
             }
             "IP" => self.do_ip(args),
-            "HP" => {
-                self.flush_fill();
-                self.lines.push(String::new());
-            }
+            "HP" => self.term.blank_line(),
             "B" | "I" | "SM" | "SB" => {
                 let marker = if name == "I" { STYLE_UL } else { STYLE_BOLD };
                 let text = if name == "SM" {
@@ -278,43 +223,36 @@ impl Man7Formatter {
         } else {
             format!("{title}({section})")
         };
-        self.header = three_part(&left, &manual, &left, self.width);
-        self.footer = three_part(&source, &date, &source, self.width);
+        self.term.set_header(&left, &manual, &left);
+        self.term.set_footer(&source, &date, &source);
     }
 
     fn do_heading(&mut self, args: &str, sub: bool) {
-        self.flush_fill();
         // Reset indentation at each new section.
-        self.cur_indent = self.indent;
-        self.rs_stack.clear();
         self.tp_body_indent = None;
         let title = macro_args(args).join(" ");
         let title = self.resolve(&title);
-        self.lines.push(String::new());
+        self.term.reset_indent(self.indent);
+        self.term.blank_line();
         let indent = if sub { self.indent / 2 } else { 0 };
-        self.lines.push(format!(
-            "{}{}",
-            " ".repeat(indent),
-            wrap_marker(&title.to_string(), STYLE_BOLD, self.styling)
-        ));
-        self.has_body = true;
+        self.term
+            .emit(indent, wrap_marker(&title, STYLE_BOLD, self.styling));
     }
 
     fn do_ip(&mut self, args: &str) {
-        self.flush_fill();
         let a = macro_args(args);
         let tag = a.first().cloned();
         let extra = a
             .get(1)
             .and_then(|n| n.parse::<usize>().ok())
             .unwrap_or(self.indent);
-        let body_indent = self.cur_indent + extra;
+        let body_indent = self.term.offset() + extra;
         if let Some(tag) = tag {
             let tag = self.resolve(&tag);
-            self.lines
-                .push(format!("{}{}", " ".repeat(self.cur_indent), tag));
+            let off = self.term.offset();
+            self.term.emit(off, tag);
         }
-        self.cur_indent = body_indent;
+        self.term.set_offset(body_indent);
     }
 
     /// A plain text line: in fill mode add its words to the paragraph, else emit
@@ -323,80 +261,44 @@ impl Man7Formatter {
         if let Some(body_indent) = self.tp_body_indent.take() {
             // The line after `.TP` is the tag; the following text is the body.
             let tag = self.resolve(raw.trim());
-            self.lines
-                .push(format!("{}{}", " ".repeat(self.cur_indent), tag));
-            self.cur_indent = body_indent;
-            self.has_body = true;
+            let off = self.term.offset();
+            self.term.emit(off, tag);
+            self.term.set_offset(body_indent);
             return;
         }
 
         if self.no_fill {
             let resolved = self.resolve(raw);
-            self.lines
-                .push(format!("{}{}", " ".repeat(self.cur_indent), resolved));
-            if !resolved.trim().is_empty() {
-                self.has_body = true;
-            }
+            let off = self.term.offset();
+            self.term.emit(off, resolved);
             return;
         }
 
         if raw.trim().is_empty() {
-            self.flush_fill();
-            self.lines.push(String::new());
+            self.term.blank_line();
             return;
         }
 
         for word in raw.split_whitespace() {
-            self.pending.push(self.resolve(word));
+            self.term.word(self.resolve(word));
         }
-        self.has_body = true;
     }
 
     fn emit_inline(&mut self, text: String) {
         // A `.TP` tag may itself be a font macro (e.g. `.B 0`); capture it as the
         // tag line and switch to the body indent.
         if let Some(body_indent) = self.tp_body_indent.take() {
-            self.lines
-                .push(format!("{}{}", " ".repeat(self.cur_indent), text));
-            self.cur_indent = body_indent;
-            self.has_body = true;
+            let off = self.term.offset();
+            self.term.emit(off, text);
+            self.term.set_offset(body_indent);
             return;
         }
 
         if self.no_fill {
-            self.flush_fill();
-            self.lines
-                .push(format!("{}{}", " ".repeat(self.cur_indent), text));
+            let off = self.term.offset();
+            self.term.emit(off, text);
         } else {
-            self.pending.push(text);
-        }
-        self.has_body = true;
-    }
-
-    /// Wrap and emit the pending paragraph words at the current indent.
-    fn flush_fill(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let words = std::mem::take(&mut self.pending);
-        let indent = " ".repeat(self.cur_indent);
-        let max = self.width.saturating_sub(self.cur_indent).max(1);
-        let mut line = String::new();
-        for word in words {
-            let wlen = display_width(&word);
-            if !line.is_empty() && display_width(&line) + 1 + wlen > max {
-                self.lines.push(format!("{indent}{line}"));
-                line = String::new();
-            }
-            if line.is_empty() {
-                line = word;
-            } else {
-                line.push(' ');
-                line.push_str(&word);
-            }
-        }
-        if !line.is_empty() {
-            self.lines.push(format!("{indent}{line}"));
+            self.term.word(text);
         }
     }
 
@@ -439,7 +341,7 @@ impl Man7Formatter {
     /// Resolve roff escapes (`\fB…`, `\-`, special chars) using the shared mdoc
     /// escape machinery.
     fn resolve(&self, s: &str) -> String {
-        crate::man_util::formatter::replace_escapes(s)
+        replace_escapes(s)
     }
 }
 
@@ -449,21 +351,6 @@ fn wrap_marker(text: &str, marker: char, styling: bool) -> String {
     } else {
         text.to_string()
     }
-}
-
-/// Join lines, collapsing runs of more than one blank line into a single blank.
-fn collapse_blank_lines(lines: &[String]) -> String {
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut prev_blank = false;
-    for line in lines {
-        let blank = line.trim().is_empty();
-        if blank && prev_blank {
-            continue;
-        }
-        out.push(line);
-        prev_blank = blank;
-    }
-    out.join("\n")
 }
 
 #[cfg(test)]

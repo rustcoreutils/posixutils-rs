@@ -376,11 +376,18 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                 if letters.peek() == Some(&':') {
                     letters.next();
                     let mut spec = String::new();
+                    let mut closed = false;
                     for c in letters.by_ref() {
                         if c == close {
+                            closed = true;
                             break;
                         }
                         spec.push(c);
+                    }
+                    // Like the plain `$(name)` path, require the closing
+                    // delimiter rather than silently accepting EOF.
+                    if !closed {
+                        Err(PreprocError::UnexpectedEOF)?
                     }
                     let Some(macro_body) = env_macro.or(table_macro) else {
                         Err(PreprocError::UndefinedMacro(macro_name.to_string()))?
@@ -450,7 +457,9 @@ fn process_include_lines(source: &str, table: &HashMap<String, String>) -> Resul
     for line in source.lines() {
         let expanded = if let Some((path_spec, ignore_missing)) = parse_include_directive(line) {
             counter += 1;
-            let (path, _) = substitute(path_spec, table).unwrap_or_default();
+            // Propagate a substitution error (e.g. an undefined macro in the
+            // path) rather than defaulting to an empty, misleading path.
+            let (path, _) = substitute(path_spec, table)?;
             match fs::read_to_string(Path::new(&path)) {
                 Ok(contents) => contents,
                 // `-include` silently ignores a missing/unreadable file;

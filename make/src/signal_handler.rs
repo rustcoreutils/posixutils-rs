@@ -16,8 +16,16 @@ use libc::{raise, signal, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIG_DFL};
 /// Handles incoming signals: deletes the partially built target (when
 /// appropriate), then resets the signal to its default action and re-raises it
 /// so the process dies from the signal and the parent observes a signal death.
+///
+/// NOTE: a strictly async-signal-safe handler would only set an atomic flag (or
+/// write to a self-pipe) and do the cleanup/printing from normal control flow.
+/// That is a larger redesign; here the handler does the cleanup directly but
+/// uses `try_lock` on `INTERRUPT_FLAG` so it can never deadlock against the
+/// build thread that briefly holds that lock while recording the active target.
 pub fn handle_signals(signal_code: libc::c_int) {
-    if let Some(info) = INTERRUPT_FLAG.lock().unwrap().as_ref() {
+    // `try_lock` (never `lock`): if the interrupted thread happens to hold the
+    // lock, skip cleanup rather than deadlock — re-raising still terminates make.
+    if let Some(info) = INTERRUPT_FLAG.try_lock().ok().and_then(|g| g.clone()) {
         eprintln!("{}", gettext("make: Interrupt"));
 
         // POSIX: delete the target only if it is not a `.PRECIOUS`/`.PHONY`

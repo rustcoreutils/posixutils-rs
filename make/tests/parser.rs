@@ -93,6 +93,22 @@ all:
         let result = preprocess("includedir = /usr\nall:\n\t@echo $(includedir)\n").unwrap();
         assert!(result.contains("@echo /usr"), "got: {result:?}");
     }
+
+    // Review (c2): a substitution error in an include path is propagated, not
+    // swallowed into a misleading empty path.
+    #[test]
+    fn test_include_path_substitution_error_propagates() {
+        let result = preprocess("include $(UNDEF)/x.mk\nall:\n\t@echo hi\n");
+        assert!(result.is_err(), "expected an error, got: {result:?}");
+    }
+
+    // Review (c3): a `$(name:subst=...)` form missing its closing delimiter is a
+    // clear error rather than silently consuming to EOF.
+    #[test]
+    fn test_subst_missing_close_errors() {
+        let result = preprocess("V = a.c\nall:\n\t@echo $(V:.c=.o\n");
+        assert!(result.is_err(), "expected an error, got: {result:?}");
+    }
 }
 
 mod lex {

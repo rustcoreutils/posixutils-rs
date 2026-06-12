@@ -712,18 +712,19 @@ mod target_behavior {
     // process dies from the re-raised signal.
     #[test]
     fn async_events_registered_under_dash_i() {
-        let _ = remove_file("text.txt");
+        // Uses its own target file so it does not race async_events on text.txt.
+        let _ = remove_file("text_i.txt");
 
         let args = [
             "-i",
             "-f",
-            "tests/makefiles/target_behavior/async_events/signal.mk",
+            "tests/makefiles/target_behavior/async_events/signal_i.mk",
         ];
         let child = manual_test_helper(&args);
         let pid = child.id() as i32;
 
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(300));
             unsafe {
                 kill(pid, SIGINT);
             }
@@ -736,7 +737,7 @@ mod target_behavior {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(output.status.signal(), Some(SIGINT));
 
-        let _ = remove_file("text.txt");
+        let _ = remove_file("text_i.txt");
     }
 }
 
@@ -833,6 +834,24 @@ mod special_targets {
     use posixutils_make::special_target;
     use std::fs::remove_dir;
     use std::{fs, thread, time::Duration};
+
+    // Audit #22: subsequent occurrences of `.PHONY` add to (not replace) the
+    // list, observable in the `-p` dump.
+    #[test]
+    fn phony_accumulates() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-pf", "tests/makefiles/special_targets/phony_accumulate.mk"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("\".PHONY\": {\"a\", \"b\"}"),
+            "stdout: {stdout}"
+        );
+    }
 
     #[test]
     fn default() {
@@ -1011,6 +1030,22 @@ mod special_targets {
                 ErrorCode::SpecialTargetConstraintNotFulfilled {
                     target: String::default(),
                     constraint: special_target::Error::MustNotHaveRecipes,
+                }
+                .into(),
+            );
+        }
+
+        // Audit (Phase 9): `.DEFAULT` is specified with commands; an empty
+        // `.DEFAULT:` is a constraint violation.
+        #[test]
+        fn default_without_recipes() {
+            run_test_helper(
+                &["-f", "tests/makefiles/special_targets/validations/default_without_recipes.mk"],
+                "",
+                "make: '.DEFAULT' special target constraint is not fulfilled: the special target must have recipes\n",
+                ErrorCode::SpecialTargetConstraintNotFulfilled {
+                    target: String::default(),
+                    constraint: special_target::Error::MustHaveRecipes,
                 }
                 .into(),
             );

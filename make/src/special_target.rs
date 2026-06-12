@@ -93,6 +93,7 @@ impl InferenceTarget {
 pub enum Error {
     MustNotHavePrerequisites,
     MustNotHaveRecipes,
+    MustHaveRecipes,
 
     NotSupported(SpecialTarget),
 }
@@ -111,6 +112,9 @@ impl fmt::Display for Error {
             }
             MustNotHaveRecipes => {
                 write!(f, "{}", gettext("the special target must not have recipes"))
+            }
+            MustHaveRecipes => {
+                write!(f, "{}", gettext("the special target must have recipes"))
             }
             NotSupported(target) => {
                 write!(
@@ -248,12 +252,21 @@ impl Processor<'_> {
         }
         Ok(())
     }
+
+    fn with_recipes(&self) -> Result<(), Error> {
+        if self.rule.recipes().count() == 0 {
+            return Err(Error::MustHaveRecipes);
+        }
+        Ok(())
+    }
 }
 
 /// This impl block contains processing logic for special targets
 impl Processor<'_> {
     fn process_default(self) -> Result<(), Error> {
+        // POSIX: `.DEFAULT` is specified with commands but without prerequisites.
         self.without_prerequisites()?;
+        self.with_recipes()?;
 
         self.make.default_rule.replace(self.rule);
 
@@ -310,16 +323,18 @@ impl Processor<'_> {
         Ok(())
     }
     fn process_phony(mut self) -> Result<(), Error> {
-        let suffixes_set = self
+        // POSIX: subsequent occurrences add to the list, so extend rather than
+        // replace the stored set.
+        let names = self
             .rule
             .prerequisites()
-            .map(|suffix| suffix.as_ref().to_string())
-            .collect::<BTreeSet<String>>();
-
+            .map(|suffix| suffix.as_ref().to_string());
         self.make
             .config
             .rules
-            .insert(Phony.as_ref().to_string(), suffixes_set);
+            .entry(Phony.as_ref().to_string())
+            .or_default()
+            .extend(names);
 
         let what_to_do = |rule: &mut Rule| rule.config.phony = true;
         self.additive(what_to_do);
@@ -329,15 +344,15 @@ impl Processor<'_> {
     }
 
     fn process_precious(mut self) -> Result<(), Error> {
-        let precious_set = self
+        let precious_names: Vec<String> = self
             .rule
             .prerequisites()
             .map(|val| val.as_ref().to_string())
-            .collect::<BTreeSet<String>>();
+            .collect();
 
         // POSIX: with no prerequisites, `.PRECIOUS` protects *all* targets, so
         // set the global flag the signal handler consults.
-        if precious_set.is_empty() {
+        if precious_names.is_empty() {
             self.make.config.precious = true;
         }
 
@@ -346,10 +361,13 @@ impl Processor<'_> {
         self.additive(what_to_do);
         self.global(what_to_do);
 
+        // POSIX: subsequent occurrences add to the list.
         self.make
             .config
             .rules
-            .insert(Precious.as_ref().to_string(), precious_set);
+            .entry(Precious.as_ref().to_string())
+            .or_default()
+            .extend(precious_names);
         Ok(())
     }
     /// `.WAIT` as a target has no effect; it must have no prerequisites or

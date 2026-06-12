@@ -127,6 +127,19 @@ fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
     print!("{:?}", rules);
 }
 
+/// The `-k` "target could not be remade" diagnostic, routed through `gettext`
+/// so `LC_MESSAGES` can translate it (the English msgids reproduce the original
+/// wording verbatim).
+fn target_not_remade(target: &str) -> String {
+    format!(
+        "{}: {} {} {}",
+        gettext("make"),
+        gettext("Target"),
+        target,
+        gettext("not remade because of errors")
+    )
+}
+
 /// Build the effective argument vector, seeding options from the `MAKEFLAGS`
 /// environment variable ahead of the real command line (POSIX). The letters-only
 /// first word (e.g. `MAKEFLAGS=kn`) becomes a combined short option (`-kn`);
@@ -334,14 +347,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // build can continue; the flag tells us this target could not
                 // actually be remade.
                 if KEEP_GOING_ERROR.load(Relaxed) {
-                    eprintln!(
-                        "{}: Target {} not remade because of errors",
-                        gettext("make"),
-                        target
-                    );
+                    eprintln!("{}", target_not_remade(&target));
                     had_error = true;
                 } else if !updated {
-                    println!("make: `{target}` is up to date.");
+                    println!(
+                        "{}: `{}` {}",
+                        gettext("make"),
+                        target,
+                        gettext("is up to date.")
+                    );
                 }
             }
             Err(err) => {
@@ -350,11 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if keep_going {
                     // `-k`: report this target, then keep building the
                     // remaining (independent) command-line targets.
-                    eprintln!(
-                        "{}: Target {} not remade because of errors",
-                        gettext("make"),
-                        target
-                    );
+                    eprintln!("{}", target_not_remade(&target));
                 } else {
                     status_code = err.into();
                     break;

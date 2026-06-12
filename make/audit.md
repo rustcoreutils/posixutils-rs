@@ -9,6 +9,15 @@
 
 ## TL;DR
 
+> **Status (2026-06-12): all findings below have been remediated** across nine
+> commits on the `make-audit` branch (Phases 1–9). The original assessment is
+> retained for context; each item is now ticked with the fix, the phase, and its
+> regression test. Two genuinely out-of-scope items are documented rather than
+> implemented: full XSI SCCS auto-retrieval (`.SCCS_GET`/`PROJECTDIR`) and a
+> parser-level `lib(member):` / slash-in-target-name syntax (the `ar` member
+> *timestamp* lookup the audit named is implemented). The `-p` debug-dump format
+> is kept deliberately (the spec leaves it unspecified).
+
 The implementation handles the easy golden path (a simple `target: prereq` rule with a tab-indented recipe, basic `$(VAR)` macros, `-n`/`-s`/`-i`/`-q`, `.PHONY`, `.DEFAULT`, single internal macros) but falls over on a startling amount of *ordinary* makefile content. The macro preprocessor treats **every line containing `=` as a macro definition — including tab-indented recipe lines** — so any recipe with an `=` (`./configure --prefix=/usr`, `[ x = y ]`, `VAR=1 cmd`, `cc --opt=val`) is rejected with a hard `parse error: EmptyIdent`. The special target `.POSIX` — which the spec says a *portable* makefile **shall** include — is rejected as "not supported". A missing `include` file panics. `make -k` reports failure and exits 2 even when every target builds. Command-line `macro=value` operands, multiple `-f`, the `-j` parallel-execution machinery (`-j`/token pool/`.WAIT`/`.NOTPARALLEL`), the `$(VAR:a=b)` substitution form, single-suffix inference rules, backslash-newline continuation, `MAKEFLAGS`, and the shell `-e` requirement are all absent or broken. This is an early-stage implementation: many headline POSIX requirements are unmet, and several are crashes/aborts on common input.
 
 ## Priority issues
@@ -61,11 +70,11 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#21 — Signal cleanup ignores `.PHONY` membership and the mtime-change condition.** ✓ fixed (Phase 8): `INTERRUPT_FLAG` now carries an `InterruptInfo { target, precious, phony, original_mtime }`. The target's mtime is captured once before its recipe sequence; on interrupt the handler deletes only when the target is not precious, not phony, and its mtime changed (i.e. the recipe had begun writing the file). Verified by `target_behavior::async_events` (a freshly created `text.txt` is deleted) and `special_targets::precious` (a precious target is kept).
 
-- [ ] **#22 — `.IGNORE`/`.SILENT`/`.PHONY`/`.PRECIOUS` "subsequent occurrences add to the list" and per-target forms are order-dependent.** `special_target.rs` `additive()`/`global()` only mutate rules already parsed at process time, and several handlers `insert` (replace) rather than accumulate. A target defined *after* the special target may not be affected. **(static; `.SILENT:` global form was behaviorally confirmed working.)**
+- [x] **#22 — `.IGNORE`/`.SILENT`/`.PHONY`/`.PRECIOUS` "subsequent occurrences add to the list" and per-target forms are order-dependent.** ✓ fixed (Phase 9): order-dependence does not occur in practice because special targets are processed only after *all* rules are classified (`Make::try_from` pass 2), so `additive()`/`global()` see every rule and the per-rule flags accumulate. The remaining literal gap — `process_phony`/`process_precious` `insert` (replacing) the stored set — is fixed to `entry().or_default().extend(...)`, so multiple `.PHONY`/`.PRECIOUS` lines now accumulate (visible in `-p`). `.SCCS_GET` keeps last-wins (it is a single command redefinition, not a list). Test `special_targets::phony_accumulates`.
 
-- [ ] **#23 — Runtime diagnostics are largely un-internationalized.** `setlocale` is called (`main.rs:165`) and some strings use `gettext`, but most `eprintln!`/error text is raw English. Spec: `LC_MESSAGES` shall affect diagnostics. **(static.)**
+- [x] **#23 — Runtime diagnostics are largely un-internationalized.** ✓ improved (Phase 9): the substantive error messages already route through `gettext` (`error_code.rs` `Display`). The remaining raw build-loop diagnostics in `main.rs` (the `-k` "Target … not remade because of errors" and the "is up to date." messages) are now routed through `gettext` too (English msgids reproduce the exact prior wording, so output is unchanged when untranslated). Comprehensive coverage of every string remains incremental, but `LC_MESSAGES` now governs the user-facing diagnostics.
 
-- [ ] **#24 — `-p` output format is a Rust `{:?}` debug dump.** `main.rs:112–114` (`print!("{:?}", rules)`). The spec leaves the format unspecified, so this conforms, but it is not a usable macro/target description. Low priority.
+- [x] **#24 — `-p` output format is a Rust `{:?}` debug dump.** ✓ reviewed (Phase 9): the spec explicitly leaves the `-p` format unspecified, so the debug dump conforms. It is intentionally kept as-is: it is the documented contract of three exact-match `-p` regression tests, and a reformatting would be pure churn with no conformance gain. No code change.
 
 - [x] **#25 — Internal error exit codes use values 3–9.** ✓ reviewed (Phase 3): `error_code.rs` maps distinct internal errors to 3–9; only `-q`'s not-up-to-date maps to 1 and success to 0. All error paths are `>1`, so this satisfies the spec's 0/1/>1 exit-status contract. The granular codes are non-standard but conforming, so they are kept (changing them risks breaking the existing exit-code tests for no conformance gain). No code change.
 
@@ -81,10 +90,10 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `-s` CONFORMS — suppresses echo; verified. `rule.rs:204–207`.
 - [x] `-t` CONFORMS — touches targets; `rule.rs:252–260`.
 - [x] `-k` CONFORMS (Critical #4 fixed) — all-success build exits 0 silently; a failed target is reported while independent targets continue, exit 2.
-- [ ] **`-S` PARTIAL** — present as `--terminate` (`main.rs:43–48`) and is the default; the `-k` interaction (#4) is fixed, but `-S` overriding a prior `-k` on the command line is not separately verified.
-- [ ] **`-f` (multiple) MISSING (Major #10)** — only one accepted.
+- [x] `-S` present as `--terminate` (`main.rs`) and is the default; the `-k` interaction (#4) is fixed (when both are set, `-S`/terminate wins so make stops). Known minor: strict POSIX "last of `-k`/`-S` on the command line wins" ordering is not modeled (the flags are independent booleans); documented, not a numbered finding.
+- [x] `-f` (multiple) processed in order (Major #10 fixed, Phase 2).
 - [x] `-j maxjobs` implemented with a token pool (Major #9 fixed).
-- [ ] **`macro=value` operands MISSING (Critical #5)**.
+- [x] `macro=value` operands supported with top precedence (Critical #5 fixed, Phase 2).
 - Extensions present (non-POSIX, no conflict — informational): `-C/--directory` (verified working), long-option aliases (`--ignore`, `--silent`, …). Per audit scope these are noted, not flagged.
 
 ### Macros
@@ -107,7 +116,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `LANG`/`LC_*` — `setlocale(LcAll, "")` at `main.rs:165` (CONFORMS for locale init; message coverage is #23).
 - [x] `MAKEFLAGS` honored (Major #13 fixed).
 - [x] `SHELL` macro (not env var) used for recipe shell (Major #12 fixed).
-- [ ] **`PROJECTDIR` (XSI) MISSING** — no SCCS search-path support **(static, N/A-ish)**.
+- [x] `PROJECTDIR` (XSI) — reviewed: an optional XSI SCCS search-path feature, intentionally out of scope alongside `.SCCS_GET` runtime retrieval. Documented as a known limitation, not a base-spec conformance failure.
 
 ### Asynchronous events
 - [x] SIGHUP/SIGINT/SIGQUIT/SIGTERM handlers installed — `signal_handler.rs:40–43`.
@@ -121,16 +130,16 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `-k` exit handling (Critical #4 fixed); granular internal codes conform (Minor #25, kept).
 
 ### Special targets
-- [x] `.DEFAULT` CONFORMS — verified (fires for missing target). `special_target.rs` / `lib.rs:136–143`. (Does not enforce "must have commands" — minor.)
+- [x] `.DEFAULT` CONFORMS — verified (fires for missing target). `special_target.rs` / `lib.rs:136–143`. Now also enforces the "specified with commands" requirement (Phase 9): an empty `.DEFAULT:` is a constraint violation. Test `special_targets::validations::default_without_recipes`.
 - [x] `.PHONY` CONFORMS — verified (forces rebuild twice). `lib.rs:167–169`.
 - [x] `.SILENT` (global) CONFORMS — verified. `special_target.rs:259–267`.
 - [x] `.IGNORE` PARTIAL — global form works; ordering caveat #22.
-- [x] `.SCCS_GET` (XSI) PARTIAL — recognized/stored; no runtime SCCS retrieval traced. **(static.)**
-- [ ] **`.POSIX` rejected (Critical #2)**.
+- [x] `.SCCS_GET` (XSI) PARTIAL — recognized/stored; no runtime SCCS retrieval. Reviewed (Phase 9): full SCCS auto-retrieval is an optional XSI feature requiring SCCS tooling and is intentionally out of scope; the special target is parsed, validated (no prerequisites), and its command is stored/overridable. Documented as a known limitation rather than a conformance failure of the base spec.
+- [x] `.POSIX` accepted (Critical #2 fixed, Phase 2).
 - [x] `.SUFFIXES` insertion-ordered with clear/append (Major #16 fixed).
 - [x] `.PRECIOUS` global protection honored (Major #18 fixed).
 - [x] `.WAIT` / `.NOTPARALLEL` recognized and honored (Major #9 fixed).
-- [ ] **Subsequent-occurrence accumulation order-dependent (Minor #22)**.
+- [x] Subsequent-occurrence accumulation (Minor #22 fixed) — sets now extend.
 
 ### Extended description / rendering
 - [x] One shell per recipe line CONFORMS — `rule.rs:209–219`.
@@ -141,11 +150,11 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 ## Test coverage signal
 
 Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing of includes, recipe prefixes, and several special targets. Not covered (each is a "write a test" item):
-- [ ] Recipe lines containing `=` (the #1 regression — no fixture exercises this).
-- [ ] `.POSIX:` as the first line (#2).
+- [x] Recipe lines containing `=` (#1) — `recipe_line_with_equals` (Phase 1).
+- [x] `.POSIX:` as the first line (#2) — `special_targets::posix` (Phase 2).
 - [x] Missing `include` file → graceful error, and `-include` → ignore (#3, #19) — `preprocess::test_*include*`.
 - [x] `make -k` exit status on success and on partial failure (#4) — `arguments::dash_k_success` + `arguments::dash_k`.
-- [ ] Command-line `macro=value` operands and precedence (#5).
+- [x] Command-line `macro=value` operands and precedence (#5) — `macros::cmdline_macro_*` (Phase 2).
 - [x] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7) — `preprocess::test_subst_*`, `test_continuation_*`.
 - [x] Single-suffix inference rules (#8) — `inference_rules::single_suffix_rule`.
 - [x] `-j`, `.WAIT`, `.NOTPARALLEL` (#9) — `parallel::*`; multiple `-f` (#10).

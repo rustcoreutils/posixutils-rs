@@ -4,6 +4,9 @@ use posixutils_m4::error::GetExitCode;
 
 fn main() -> ExitCode {
     env_logger::init();
+    // Honor LC_ALL/LC_CTYPE/LANG (and NLSPATH/LC_MESSAGES for the catalog) so
+    // that character-oriented built-ins interpret multibyte input correctly.
+    plib::diag::init_locale("m4");
     let args = posixutils_m4::Args::parse();
 
     let stdout = std::io::stdout();

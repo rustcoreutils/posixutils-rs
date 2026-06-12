@@ -1,0 +1,4 @@
+stdout=after
+stderr=m4:stdin:1: non-numeric argument to builtin `incr'\n
+status=1
+expect_error=true

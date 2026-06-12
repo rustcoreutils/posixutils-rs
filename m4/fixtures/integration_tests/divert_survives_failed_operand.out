@@ -1,0 +1,4 @@
+stdout=visible\nDIVERTED\n
+stderr=m4: cannot open
+status=1
+expect_error=true

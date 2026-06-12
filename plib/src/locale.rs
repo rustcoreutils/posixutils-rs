@@ -35,10 +35,33 @@ type WintT = libc::c_int;
 #[cfg(not(target_vendor = "apple"))]
 type WintT = libc::c_uint;
 
+/// Opaque `mbstate_t`. The `libc` crate exposes `mbstate_t` on Linux but not on
+/// macOS, so we declare our own buffer large enough for any supported platform's
+/// layout (glibc: 8 bytes; macOS/Darwin: 128 bytes) with 8-byte alignment. A
+/// freshly zeroed value is the documented initial conversion state; `mbrtowc`
+/// only touches the bytes its own ABI defines, so over-sizing is safe.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct MbStateT([u8; 128]);
+
+impl MbStateT {
+    fn zeroed() -> Self {
+        MbStateT([0u8; 128])
+    }
+}
+
 extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
     fn towlower(c: WintT) -> WintT;
     fn towupper(c: WintT) -> WintT;
+    // `mbrtowc` and `mbstate_t` are not surfaced by the `libc` crate on all
+    // targets (notably macOS), so both are declared directly.
+    fn mbrtowc(
+        pwc: *mut libc::wchar_t,
+        s: *const libc::c_char,
+        n: libc::size_t,
+        ps: *mut MbStateT,
+    ) -> libc::size_t;
 }
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
@@ -168,6 +191,51 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
     }
 }
 
+/// Split `bytes` into multibyte characters under the current `LC_CTYPE`, each
+/// returned as the sub-slice of bytes comprising one character.
+///
+/// `setlocale(LC_ALL, "")` must have been called for non-ASCII multibyte
+/// encodings (e.g. UTF-8) to be recognized; in the default `C` locale every
+/// byte is its own character. Invalid or incomplete byte sequences fall back to
+/// a single byte so the function is total and never loses data.
+///
+/// Used by `m4` for character- (not byte-) oriented `len`, `index`, `substr`,
+/// and `translit`, per POSIX `LC_CTYPE`.
+pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut result = Vec::new();
+    // An all-zero mbstate_t is the documented initial conversion state.
+    let mut state = MbStateT::zeroed();
+    let mut i = 0;
+    while i < bytes.len() {
+        let remaining = &bytes[i..];
+        // SAFETY: the pointer/length describe a valid slice, and `state` is a
+        // live mbstate_t owned by this call. A null first argument means "do
+        // not store the wide character", only report the byte count.
+        let n = unsafe {
+            mbrtowc(
+                std::ptr::null_mut(),
+                remaining.as_ptr() as *const libc::c_char,
+                remaining.len() as libc::size_t,
+                &mut state,
+            )
+        };
+        let consumed = if n == 0 {
+            // A NUL wide character occupies one byte.
+            1
+        } else if n == usize::MAX || n == usize::MAX - 1 {
+            // (size_t)-1 (invalid sequence) or (size_t)-2 (incomplete at end of
+            // input): consume one byte and reset the conversion state.
+            state = MbStateT::zeroed();
+            1
+        } else {
+            n
+        };
+        result.push(&bytes[i..i + consumed]);
+        i += consumed;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +307,52 @@ mod tests {
     #[test]
     fn strftime_nul_in_format_errors() {
         assert!(strftime("%Y\0%m", 0).is_err());
+    }
+
+    #[test]
+    fn mb_char_slices_ascii_is_one_byte_each() {
+        // ASCII is single-byte in every locale.
+        let slices = mb_char_slices(b"abc");
+        assert_eq!(slices, vec![b"a".as_slice(), b"b", b"c"]);
+        assert_eq!(mb_char_slices(b"").len(), 0);
+    }
+
+    // Serializes tests that mutate the process-global locale via setlocale, so
+    // they cannot interleave with each other when the test harness runs in
+    // parallel.
+    static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mb_char_slices_utf8_after_setlocale() {
+        // Recover from a poisoned lock (a prior test panicked while holding it):
+        // the guarded data is just (), so the lock is still usable.
+        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Save the exact current locale so it can be restored afterwards
+        // (setlocale(_, NULL) returns it; the string must be copied immediately
+        // as the next setlocale call may invalidate it).
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8. Only assert when a UTF-8 locale is
+        // actually available (mirrors isprint_non_ascii_requires_setlocale).
+        let slices = mb_char_slices("é".as_bytes());
+        let matched = slices == vec![&[0xC3u8, 0xA9u8][..]];
+
+        // Restore the precise prior locale before asserting (so a failure does
+        // not leak the C.UTF-8 locale into other tests).
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
+        }
+        if !ok.is_null() {
+            assert!(
+                matched,
+                "expected é to be one 2-byte character, got {slices:?}"
+            );
+        }
     }
 
     #[test]

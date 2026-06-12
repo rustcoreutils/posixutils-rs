@@ -102,6 +102,22 @@ impl InputState {
             .expect("at least one input")
             .emit_syncline(output, check_line_numbers)
     }
+
+    /// The name and current line number of the active input, for diagnostics
+    /// (`stdin` when reading standard input). Used to format GNU-style
+    /// `m4:<file>:<line>:` messages.
+    pub fn current_location(&self) -> (Vec<u8>, usize) {
+        match self.input.last() {
+            Some(input) => {
+                let name = match &input.input {
+                    InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().to_vec(),
+                    InputRead::Stdin(_) => b"stdin".to_vec(),
+                };
+                (name, input.line_number)
+            }
+            None => (b"stdin".to_vec(), 0),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -159,6 +175,10 @@ impl InputStateRef {
 
     pub fn sync_lines(&self) -> bool {
         self.0.borrow().line_synchronization
+    }
+
+    pub fn current_location(&self) -> (Vec<u8>, usize) {
+        self.0.borrow().current_location()
     }
 }
 

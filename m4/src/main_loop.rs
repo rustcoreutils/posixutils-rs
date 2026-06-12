@@ -6,8 +6,12 @@ use crate::macros::MacroImplementation;
 use crate::state::{StackFrame, State};
 use crate::EOF;
 
-/// The main loop, the most important function in this program.
-pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
+/// Process the current input stack until it is exhausted, expanding macros and
+/// writing to the output. Does NOT run m4wrap or flush diversions — those happen
+/// once, at the true end of all input, in [`finalize`]. This lets the driver in
+/// `run_impl` process file operands one at a time (interspersed with `-D`/`-U`)
+/// while keeping a single end-of-input finalization.
+pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
     let mut token: Vec<u8> = Vec::new();
 
     // TODO(style): rename these to something sensible.
@@ -97,9 +101,15 @@ pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::erro
                 if l != b'(' && definition.parse_config.min_args > 0 {
                     state.output.write_all(&token)?;
                 } else {
-                    let frame = StackFrame::new(0, definition.clone());
+                    let mut frame = StackFrame::new(0, definition.clone());
 
                     if l == b'(' {
+                        // A parenthesised call always has at least one (possibly
+                        // empty) argument: POSIX makes $# "0 if the macro was
+                        // invoked without being followed by a <left-parenthesis>,
+                        // otherwise 1 more than the number of unquoted commas".
+                        // Seed that first argument so `macro()` reports $#==1.
+                        frame.args.push(Vec::new());
                         state.output.stack.push(frame);
                     } else {
                         state = definition.implementation.evaluate(state, stderr, frame)?;
@@ -212,12 +222,24 @@ pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::erro
         }
     }
 
+    Ok(state)
+}
+
+/// Finalize processing at the true end of all input: run queued m4wrap text
+/// (rescanned, in the order the m4wrap calls were made — POSIX), then flush any
+/// remaining diversion buffers to standard output in numerical order.
+pub(crate) fn finalize(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
+    // Wrapped text may itself expand macros, divert, or queue further m4wrap
+    // text, so loop until the queue is empty.
+    while !state.m4wrap.is_empty() {
+        let wrapped: Vec<u8> = state.m4wrap.drain(..).flatten().collect();
+        state.output.output.divert(0)?;
+        state.input.pushback_string(&wrapped);
+        state = process(state, stderr)?;
+    }
+
     state.output.output.divert(0)?;
     state.output.output.undivert_all()?;
-
-    for wrap in &state.m4wrap {
-        state.output.write_all(wrap)?;
-    }
 
     Ok(state)
 }

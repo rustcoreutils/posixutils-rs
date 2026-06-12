@@ -41,6 +41,12 @@ type LazyArcMutex<T> = LazyLock<Arc<Mutex<T>>>;
 pub static INTERRUPT_FLAG: LazyArcMutex<Option<(String, bool)>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 
+/// Set when a non-ignored recipe error is swallowed under `-k` (keep going) so
+/// that `make` can report the failure and exit nonzero even though the build
+/// loop continued with the remaining, independent targets.
+pub static KEEP_GOING_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rule {
     /// The targets of the rule
@@ -237,6 +243,7 @@ impl Rule {
                                 exit_code: status.code(),
                             }
                         );
+                        KEEP_GOING_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     } else {
                         return Err(ExecutionError {

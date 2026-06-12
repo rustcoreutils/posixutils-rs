@@ -23,6 +23,7 @@ use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
     parser::{preprocessor::ENV_MACROS, Makefile},
+    rule::KEEP_GOING_ERROR,
     Make,
 };
 
@@ -277,33 +278,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut had_error = false;
     for target in targets {
         let target = target.into_string().unwrap();
+        KEEP_GOING_ERROR.store(false, Relaxed);
         match make.build_target(&target) {
             Ok(updated) => {
-                if !updated {
+                // Under `-k` a failed recipe is reported and swallowed so the
+                // build can continue; the flag tells us this target could not
+                // actually be remade.
+                if KEEP_GOING_ERROR.load(Relaxed) {
+                    eprintln!(
+                        "{}: Target {} not remade because of errors",
+                        gettext("make"),
+                        target
+                    );
+                    had_error = true;
+                } else if !updated {
                     println!("make: `{target}` is up to date.");
                 }
             }
             Err(err) => {
                 eprintln!("make: {}", err);
-                status_code = err.into();
+                had_error = true;
+                if keep_going {
+                    // `-k`: report this target, then keep building the
+                    // remaining (independent) command-line targets.
+                    eprintln!(
+                        "{}: Target {} not remade because of errors",
+                        gettext("make"),
+                        target
+                    );
+                } else {
+                    status_code = err.into();
+                    break;
+                }
             }
-        }
-
-        if keep_going {
-            eprintln!(
-                "{}: Target {} not remade because of errors",
-                gettext("make"),
-                target
-            );
-            had_error = true;
-        }
-
-        if status_code != 0 {
-            break;
         }
     }
 
-    if had_error {
+    // Any non-ignored build failure must exit with a status > 1.
+    if had_error && status_code == 0 {
         status_code = 2;
     }
     process::exit(status_code);

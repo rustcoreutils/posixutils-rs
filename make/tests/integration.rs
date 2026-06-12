@@ -254,6 +254,18 @@ mod arguments {
         );
     }
 
+    // Audit #4: `-k` must not report failure (or exit nonzero) when every
+    // target builds successfully.
+    #[test]
+    fn dash_k_success() {
+        run_test_helper(
+            &["-kf", "tests/makefiles/arguments/dash_k_success.mk"],
+            "a-ok\nb-ok\n",
+            "",
+            0,
+        );
+    }
+
     // Audit #10: multiple `-f` makefiles shall be processed in order.
     #[test]
     fn multiple_dash_f() {

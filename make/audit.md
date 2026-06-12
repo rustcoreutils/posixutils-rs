@@ -21,7 +21,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#3 — `include` of a missing/unreadable file panics.** ✓ fixed (Phase 1): `process_include_lines` now returns a `PreprocError::IncludeFailed` with a readable message instead of `unwrap()`-panicking; regression test `missing_include_is_graceful_error`. `parser/preprocessor.rs:279` — `fs::read_to_string(path).unwrap()`. Verified: `include /nonexistent.mk` → `thread 'main' panicked … Result::unwrap() on an Err` (exit 101). The spec (Include Lines, p. 3135) requires a diagnostic and error exit for a non-prefixed `include`, not a panic. Fix: replace `unwrap()` with a graceful `ErrorCode::IoError`; for the `-include` (hyphen-prefixed) form, ignore a missing file per spec.
 
-- [ ] **#4 — `make -k` reports failure and exits 2 even when all targets succeed.** `main.rs:266–283` — after a *successful* `build_target`, the `if keep_going { eprintln!("…Target … not remade because of errors"); had_error = true; }` block fires unconditionally, and `had_error` forces `status_code = 2`. Verified: `make -k all` on a building target prints `ok` then `make: Target all not remade because of errors` and exits 2. `-k` is unusable. Fix: only emit the diagnostic / set `had_error` when that target actually failed; track per-target error state instead of flagging every iteration.
+- [x] **#4 — `make -k` reports failure and exits 2 even when all targets succeed.** ✓ fixed (Phase 3): the unconditional `if keep_going` block in `main.rs` was the only failure signal, because under `-k` `rule.rs` swallows a failed recipe (prints the error, `break`s, returns `Ok`) so the error never reached `main`. Added a `KEEP_GOING_ERROR` atomic (`rule.rs`) set when a non-ignored recipe error is swallowed; `main` resets it before each command-line target and reports `Target … not remade because of errors` (and sets `had_error`) only when it fired — so an all-success `-k` build now exits 0 with no diagnostic. Tests `arguments::dash_k_success` (success ⇒ exit 0, silent) plus the preserved `arguments::dash_k` (failure ⇒ message + exit 2). Behaviorally verified: independent command-line targets still build after one fails. `main.rs:266–283` — after a *successful* `build_target`, the `if keep_going { eprintln!("…Target … not remade because of errors"); had_error = true; }` block fired unconditionally, and `had_error` forced `status_code = 2`.
 
 - [x] **#5 — Command-line `macro=value` operands are unsupported.** ✓ fixed (Phase 2): `main()` partitions operands with `is_macro_definition()`; macro operands are appended after the makefile(s) so they take precedence. Tests `cmdline_macro_overrides_file`, `cmdline_macro_defines`. `main.rs:108–110` — all positional args go into `targets: Vec<OsString>`; nothing splits out `name=value`. Verified: `make FOO=bar all` → `make: parse error: UndefinedMacro("FOO")` (exit 4). The SYNOPSIS mandates `[macro[::[:]]=value...]` operands, and the spec gives them the highest macro precedence. Fix: before queueing targets, peel off args matching the macro-assignment forms and inject them as a top-precedence macro layer (the `ENV_MACROS` atomic in `preprocessor.rs` is a usable precedent).
 
@@ -67,7 +67,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [ ] **#24 — `-p` output format is a Rust `{:?}` debug dump.** `main.rs:112–114` (`print!("{:?}", rules)`). The spec leaves the format unspecified, so this conforms, but it is not a usable macro/target description. Low priority.
 
-- [ ] **#25 — Internal error exit codes use values 3–9.** `error_code.rs` maps distinct internal errors to 3–9. All are `>1` so this satisfies the spec's 0/1/>1 contract, but the granular codes are non-standard. Low priority.
+- [x] **#25 — Internal error exit codes use values 3–9.** ✓ reviewed (Phase 3): `error_code.rs` maps distinct internal errors to 3–9; only `-q`'s not-up-to-date maps to 1 and success to 0. All error paths are `>1`, so this satisfies the spec's 0/1/>1 exit-status contract. The granular codes are non-standard but conforming, so they are kept (changing them risks breaking the existing exit-code tests for no conformance gain). No code change.
 
 ## Detailed conformance matrix
 
@@ -80,8 +80,8 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `-r` CONFORMS — clears suffixes / built-ins; `main.rs:207–209`.
 - [x] `-s` CONFORMS — suppresses echo; verified. `rule.rs:204–207`.
 - [x] `-t` CONFORMS — touches targets; `rule.rs:252–260`.
-- [ ] **`-k` DIVERGES (Critical #4)** — reports failure + exit 2 on success.
-- [ ] **`-S` PARTIAL** — present as `--terminate` (`main.rs:43–48`) and is the default; interaction with `-k` is the #4 bug.
+- [x] `-k` CONFORMS (Critical #4 fixed) — all-success build exits 0 silently; a failed target is reported while independent targets continue, exit 2.
+- [ ] **`-S` PARTIAL** — present as `--terminate` (`main.rs:43–48`) and is the default; the `-k` interaction (#4) is fixed, but `-S` overriding a prior `-k` on the command line is not separately verified.
 - [ ] **`-f` (multiple) MISSING (Major #10)** — only one accepted.
 - [ ] **`-j` MISSING (Major #9)** — not a recognized option.
 - [ ] **`macro=value` operands MISSING (Critical #5)**.
@@ -118,7 +118,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] Recipe echo to stdout; diagnostics to stderr — `rule.rs`, `main.rs`.
 - [x] Recipe command failure → exit 2 — verified (`false` → `execution error: 1`, exit 2). `error_code.rs`.
 - [x] Up-to-date message — `main.rs:257–258`.
-- [ ] **`-k` exit handling (Critical #4)**; granular internal codes (Minor #25).
+- [x] `-k` exit handling (Critical #4 fixed); granular internal codes conform (Minor #25, kept).
 
 ### Special targets
 - [x] `.DEFAULT` CONFORMS — verified (fires for missing target). `special_target.rs` / `lib.rs:136–143`. (Does not enforce "must have commands" — minor.)
@@ -144,7 +144,7 @@ Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing 
 - [ ] Recipe lines containing `=` (the #1 regression — no fixture exercises this).
 - [ ] `.POSIX:` as the first line (#2).
 - [ ] Missing `include` file → graceful error, and `-include` → ignore (#3, #19).
-- [ ] `make -k` exit status on success and on partial failure (#4).
+- [x] `make -k` exit status on success and on partial failure (#4) — `arguments::dash_k_success` + `arguments::dash_k`.
 - [ ] Command-line `macro=value` operands and precedence (#5).
 - [ ] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7).
 - [ ] Single-suffix inference rules (#8).

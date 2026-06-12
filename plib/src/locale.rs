@@ -317,19 +317,42 @@ mod tests {
         assert_eq!(mb_char_slices(b"").len(), 0);
     }
 
+    // Serializes tests that mutate the process-global locale via setlocale, so
+    // they cannot interleave with each other when the test harness runs in
+    // parallel.
+    static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn mb_char_slices_utf8_after_setlocale() {
-        // Exercise the multibyte path; only assert when a UTF-8 locale is
-        // actually available (mirrors isprint_non_ascii_requires_setlocale).
+        // Recover from a poisoned lock (a prior test panicked while holding it):
+        // the guarded data is just (), so the lock is still usable.
+        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Save the exact current locale so it can be restored afterwards
+        // (setlocale(_, NULL) returns it; the string must be copied immediately
+        // as the next setlocale call may invalidate it).
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+
         let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
         let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
-        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8.
+        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8. Only assert when a UTF-8 locale is
+        // actually available (mirrors isprint_non_ascii_requires_setlocale).
         let slices = mb_char_slices("é".as_bytes());
-        if !ok.is_null() {
-            assert_eq!(slices, vec![&[0xC3u8, 0xA9u8][..]]);
+        let matched = slices == vec![&[0xC3u8, 0xA9u8][..]];
+
+        // Restore the precise prior locale before asserting (so a failure does
+        // not leak the C.UTF-8 locale into other tests).
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
         }
-        // Restore the environment locale so other tests are unaffected.
-        unsafe { libc::setlocale(libc::LC_ALL, c"".as_ptr()) };
+        if !ok.is_null() {
+            assert!(
+                matched,
+                "expected é to be one 2-byte character, got {slices:?}"
+            );
+        }
     }
 
     #[test]

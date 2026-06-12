@@ -119,56 +119,103 @@ impl Parser {
 
     fn control(&mut self, name: &str, rest: &str) {
         match name {
-            "Sh" => {
-                self.open_block(
-                    Macro::Sh {
-                        title: tokenize(rest).join(" "),
-                    },
-                    &[is_sh, is_ss, is_nd],
-                );
-            }
-            "Ss" => {
-                self.open_block(
-                    Macro::Ss {
-                        title: tokenize(rest).join(" "),
-                    },
-                    &[is_ss, is_nd],
-                );
-            }
+            // The Sh/Ss title is the raw remainder (trailing space trimmed).
+            "Sh" => self.open_block(
+                Macro::Sh {
+                    title: rest.trim_end().to_string(),
+                },
+                &[is_sh, is_ss, is_nd],
+            ),
+            "Ss" => self.open_block(
+                Macro::Ss {
+                    title: rest.trim_end().to_string(),
+                },
+                &[is_ss, is_nd],
+            ),
             "Nd" => {
                 self.open_block(Macro::Nd, &[is_nd]);
                 for word in tokenize(rest) {
                     self.push(Element::Text(word));
                 }
             }
-            "Pp" | "Lp" => {
-                self.push(Element::Macro(MacroNode {
-                    mdoc_macro: macro_for_argless(name),
-                    nodes: Vec::new(),
-                }));
-            }
+            "Pp" | "Lp" => self.push(Element::Macro(MacroNode {
+                mdoc_macro: macro_for_argless(name),
+                nodes: Vec::new(),
+            })),
+            _ if is_callable(name) => self.inline_chain(name, tokenize(rest)),
+            // Not yet implemented: degrade to text so the v2 path stays usable.
+            // (Production defaults to pest until v2 is complete.)
             _ => {
-                if let Some(mac) = simple_inline(name) {
-                    // Inline macros that take only text arguments, one Text node
-                    // per word.
-                    let nodes = tokenize(rest).into_iter().map(Element::Text).collect();
-                    self.push(Element::Macro(MacroNode {
-                        mdoc_macro: mac,
-                        nodes,
-                    }));
-                } else {
-                    // Not yet implemented: degrade to text so the v2 path stays
-                    // usable. (Production defaults to pest until v2 is complete.)
-                    let mut text = String::from(".");
-                    text.push_str(name);
-                    if !rest.is_empty() {
-                        text.push(' ');
-                        text.push_str(rest);
-                    }
-                    self.push(Element::Text(text));
+                let mut text = String::from(".");
+                text.push_str(name);
+                if !rest.is_empty() {
+                    text.push(' ');
+                    text.push_str(rest);
                 }
+                self.push(Element::Text(text));
             }
         }
+    }
+
+    /// Parse a chain of inline macros on one control line. Each macro consumes
+    /// following text words until the next callable-macro token, which begins a
+    /// sibling macro (mdoc inline chaining, e.g. `.Nm foo Ar bar`).
+    fn inline_chain(&mut self, first: &str, rest_tokens: Vec<String>) {
+        let mut cur = first.to_string();
+        let mut toks = rest_tokens.into_iter().peekable();
+        loop {
+            let mut args = Vec::new();
+            while let Some(t) = toks.peek() {
+                if is_callable(t) {
+                    break;
+                }
+                args.push(toks.next().unwrap());
+            }
+            self.emit_inline_macro(&cur, args);
+            match toks.next() {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+    }
+
+    fn emit_inline_macro(&mut self, name: &str, args: Vec<String>) {
+        let node = if let Some(mac) = simple_inline(name) {
+            MacroNode {
+                mdoc_macro: mac,
+                nodes: args.into_iter().map(Element::Text).collect(),
+            }
+        } else if name == "Xr" {
+            // Xr: name, optional section, then any trailing text nodes.
+            let mut it = args.into_iter();
+            let xr_name = it.next().unwrap_or_default();
+            let section = it.next().unwrap_or_default();
+            MacroNode {
+                mdoc_macro: Macro::Xr {
+                    name: xr_name,
+                    section,
+                },
+                nodes: it.map(Element::Text).collect(),
+            }
+        } else {
+            // Nm: first arg is the name if purely alphanumeric, else a text node.
+            let mut nm_name = None;
+            let mut nodes = Vec::new();
+            let mut it = args.into_iter();
+            if let Some(first) = it.next() {
+                if first.chars().all(|c| c.is_alphanumeric()) {
+                    nm_name = Some(first);
+                } else {
+                    nodes.push(Element::Text(first));
+                }
+            }
+            nodes.extend(it.map(Element::Text));
+            MacroNode {
+                mdoc_macro: Macro::Nm { name: nm_name },
+                nodes,
+            }
+        };
+        self.push(Element::Macro(node));
     }
 }
 
@@ -198,6 +245,12 @@ fn simple_inline(name: &str) -> Option<Macro> {
         "Va" => Macro::Va,
         _ => return None,
     })
+}
+
+/// Whether `name` is a callable inline macro the v2 parser handles (used both to
+/// dispatch and as the chaining boundary).
+fn is_callable(name: &str) -> bool {
+    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm")
 }
 
 fn macro_for_argless(name: &str) -> Macro {
@@ -316,6 +369,26 @@ mod tests {
     #[test]
     fn inline_in_section() {
         parity(".Sh OPTIONS\n.Fl v\n.Ar path\n.Em note\n");
+    }
+
+    #[test]
+    fn xr_with_and_without_section() {
+        parity(".Xr cat 1\n");
+        parity(".Xr printf\n");
+    }
+
+    #[test]
+    fn nm_name_and_text() {
+        parity(".Nm cat\n");
+        parity(".Nm \\-x\n");
+        parity(".Sh NAME\n.Nm grep\n");
+    }
+
+    #[test]
+    fn inline_chaining_siblings() {
+        parity(".Nm foo Ar bar\n");
+        parity(".Fl v Ar file\n");
+        parity(".Xr cat 1 Ar end\n");
     }
 
     #[test]

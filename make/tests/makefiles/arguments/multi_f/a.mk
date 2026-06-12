@@ -1,0 +1,2 @@
+a:
+	@echo from-a

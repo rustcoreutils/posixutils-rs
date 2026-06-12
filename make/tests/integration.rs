@@ -253,6 +253,171 @@ mod arguments {
             2,
         );
     }
+
+    // Audit #4: `-k` must not report failure (or exit nonzero) when every
+    // target builds successfully.
+    #[test]
+    fn dash_k_success() {
+        run_test_helper(
+            &["-kf", "tests/makefiles/arguments/dash_k_success.mk"],
+            "a-ok\nb-ok\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #10: multiple `-f` makefiles shall be processed in order.
+    #[test]
+    fn multiple_dash_f() {
+        run_test_helper(
+            &[
+                "-f",
+                "tests/makefiles/arguments/multi_f/a.mk",
+                "-f",
+                "tests/makefiles/arguments/multi_f/b.mk",
+                "b",
+            ],
+            "from-b\n",
+            "",
+            0,
+        );
+    }
+}
+
+// Audit #15 (internal macros) and #13 (MAKEFLAGS) exercised end-to-end.
+mod internal_macros {
+    use super::*;
+
+    // `$^` removes duplicate prerequisites; `$+` keeps them in order.
+    #[test]
+    fn caret_and_plus() {
+        run_test_helper(
+            &["-f", "tests/makefiles/macros/internal.mk"],
+            "caret a b\nplus a b a\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #13: the `MAKEFLAGS` environment variable seeds options; `n`
+    // behaves as `-n` (print recipe, do not execute).
+    #[test]
+    fn makeflags_letters_form() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "tests/makefiles/macros/internal.mk"])
+            .env("MAKEFLAGS", "n")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Under -n the recipes are printed, not run.
+        assert!(stdout.contains("echo caret"), "stdout: {stdout}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+}
+
+// Audit #9: parallel execution (`-j`, `.WAIT`, `.NOTPARALLEL`).
+mod parallel {
+    use super::*;
+
+    fn run_capture(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.code(),
+        )
+    }
+
+    // `-j` is accepted and builds all independent targets (output order is
+    // unspecified under parallelism, so only membership/exit are checked).
+    #[test]
+    fn dash_j_builds_all_targets() {
+        let (out, code) =
+            run_capture(&["-j", "2", "-f", "tests/makefiles/parallel/independent.mk"]);
+        assert_eq!(code, Some(0), "out: {out}");
+        for t in ["a", "b", "c"] {
+            assert!(out.contains(t), "missing {t} in: {out}");
+        }
+    }
+
+    // The last `-j` value wins (POSIX) — `-j 1 -j 2` must not be rejected.
+    #[test]
+    fn dash_j_last_value_wins() {
+        let (_out, code) = run_capture(&[
+            "-j",
+            "1",
+            "-j",
+            "2",
+            "-f",
+            "tests/makefiles/parallel/independent.mk",
+        ]);
+        assert_eq!(code, Some(0));
+    }
+
+    // `.NOTPARALLEL` is recognized (not rejected) and the build succeeds.
+    #[test]
+    fn notparallel_recognized() {
+        let (out, code) =
+            run_capture(&["-j", "2", "-f", "tests/makefiles/parallel/notparallel.mk"]);
+        assert_eq!(code, Some(0), "out: {out}");
+        assert!(out.contains('a') && out.contains('b'), "out: {out}");
+    }
+
+    // `.WAIT` as a target has no effect and as a prerequisite is a barrier, not
+    // a target to build (so it must not error with "no target '.WAIT'").
+    #[test]
+    fn wait_barrier_is_not_built() {
+        let (out, code) = run_capture(&["-j", "2", "-f", "tests/makefiles/parallel/wait.mk"]);
+        assert_eq!(code, Some(0), "out: {out}");
+        assert!(out.contains('a') && out.contains('b'), "out: {out}");
+    }
+}
+
+// Audit #11 (shell -e) and the `$(MAKE)` recursive-make special case.
+mod recipe_execution {
+    use super::*;
+
+    // Audit #11: with errors not ignored, the shell -e option is in effect, so
+    // a recipe line aborts at the first failing command.
+    #[test]
+    fn shell_e_aborts_on_first_failure() {
+        run_test_helper(
+            &["-sf", "tests/makefiles/recipe_execution/shell_e.mk"],
+            "",
+            "make: execution error: 1\n",
+            2,
+        );
+    }
+
+    // The `$(MAKE)` macro expands to the make program and its recipe line runs
+    // even under -n (recursive sub-make), while ordinary lines are only printed.
+    #[test]
+    fn make_macro_runs_under_dry_run() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args([
+                "-n",
+                "-f",
+                "tests/makefiles/recipe_execution/make_recurse.mk",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The plain line is printed (not executed); the $(MAKE) line executes
+        // the sub-make, which prints SUBMAKE-RAN.
+        assert!(stdout.contains("echo top-line"), "stdout: {stdout}");
+        assert!(stdout.contains("SUBMAKE-RAN"), "stdout: {stdout}");
+    }
 }
 
 // such tests should be moved directly to the package responsible for parsing makefiles
@@ -290,6 +455,33 @@ mod parsing {
     //         ErrorCode::ParseError("no targets".into()).into(),
     //     );
     // }
+
+    // Audit #1: a recipe line that contains '=' (a shell assignment, an
+    // option like --prefix=, or a `test x = y`) must not be mistaken for a
+    // macro definition and must not abort the parse.
+    #[test]
+    fn recipe_line_with_equals() {
+        run_test_helper(
+            &["-f", "tests/makefiles/parsing/recipe_with_equals.mk"],
+            "result=ok\ntesteq_ok\n./configure --prefix=/usr\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #3: a missing `include` file must produce a graceful error, not
+    // an uncontrolled panic (which exits 101).
+    #[test]
+    fn missing_include_is_graceful_error() {
+        run_test_helper_without_error_message(
+            &["-f", "tests/makefiles/parsing/missing_include.mk"],
+            "",
+            ErrorCode::ParserError {
+                constraint: posixutils_make::parser::parse::ParseError(vec![]),
+            }
+            .into(),
+        );
+    }
 }
 
 mod io {
@@ -352,6 +544,38 @@ mod macros {
         fn clean_env_vars() {
             env::remove_var("MACRO");
         }
+    }
+
+    // Audit #5: a command-line `macro=value` operand defines a macro and takes
+    // precedence over a definition in the makefile.
+    #[test]
+    fn cmdline_macro_overrides_file() {
+        run_test_helper(
+            &[
+                "-sf",
+                "tests/makefiles/macros/cmdline_macro.mk",
+                "FOO=override",
+                "all",
+            ],
+            "FOO=override\n",
+            "",
+            0,
+        );
+    }
+
+    #[test]
+    fn cmdline_macro_defines() {
+        run_test_helper(
+            &[
+                "-sf",
+                "tests/makefiles/macros/cmdline_only_macro.mk",
+                "BAR=hi",
+                "all",
+            ],
+            "BAR=hi\n",
+            "",
+            0,
+        );
     }
 }
 
@@ -472,11 +696,48 @@ mod target_behavior {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(stderr, "make: Interrupt\nmake: Deleting file 'text.txt'\n");
 
-        assert_eq!(output.status.code(), Some(130));
+        // Audit #20: make resets the signal to default and re-raises it, so it
+        // dies *from* the signal (no exit code) rather than exiting 128+signo.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.code(), None);
+        assert_eq!(output.status.signal(), Some(SIGINT));
 
         // The makefile creates text.txt and the signal handler should delete it,
         // but clean up anyway in case test fails
         let _ = remove_file("text.txt");
+    }
+
+    // Audit #17: signals are caught even under -i (ignore errors); -i is not an
+    // exemption from registration, so an interrupt still cleans up and the
+    // process dies from the re-raised signal.
+    #[test]
+    fn async_events_registered_under_dash_i() {
+        // Uses its own target file so it does not race async_events on text.txt.
+        let _ = remove_file("text_i.txt");
+
+        let args = [
+            "-i",
+            "-f",
+            "tests/makefiles/target_behavior/async_events/signal_i.mk",
+        ];
+        let child = manual_test_helper(&args);
+        let pid = child.id() as i32;
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            unsafe {
+                kill(pid, SIGINT);
+            }
+        });
+
+        let output = child.wait_with_output().expect("failed to wait for child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("make: Interrupt"), "stderr: {stderr}");
+
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.signal(), Some(SIGINT));
+
+        let _ = remove_file("text_i.txt");
     }
 }
 
@@ -574,6 +835,24 @@ mod special_targets {
     use std::fs::remove_dir;
     use std::{fs, thread, time::Duration};
 
+    // Audit #22: subsequent occurrences of `.PHONY` add to (not replace) the
+    // list, observable in the `-p` dump.
+    #[test]
+    fn phony_accumulates() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-pf", "tests/makefiles/special_targets/phony_accumulate.mk"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("\".PHONY\": {\"a\", \"b\"}"),
+            "stdout: {stdout}"
+        );
+    }
+
     #[test]
     fn default() {
         run_test_helper(
@@ -583,6 +862,18 @@ mod special_targets {
                 "nonexisting_target",
             ],
             "echo Default\nDefault\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #2: `.POSIX` must be accepted (a portable makefile is required to
+    // include it), not rejected as an unsupported special target.
+    #[test]
+    fn posix() {
+        run_test_helper(
+            &["-f", "tests/makefiles/special_targets/posix.mk"],
+            "posix-ok\n",
             "",
             0,
         );
@@ -661,7 +952,10 @@ mod special_targets {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(stderr, "make: Interrupt\n");
 
-        assert_eq!(output.status.code(), Some(130));
+        // Audit #20: dies from the re-raised signal rather than exiting 128+signo.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.code(), None);
+        assert_eq!(output.status.signal(), Some(SIGINT));
 
         let _ = remove_file("precious_text.txt");
         remove_file("preciousdir/some.txt").unwrap();
@@ -736,6 +1030,22 @@ mod special_targets {
                 ErrorCode::SpecialTargetConstraintNotFulfilled {
                     target: String::default(),
                     constraint: special_target::Error::MustNotHaveRecipes,
+                }
+                .into(),
+            );
+        }
+
+        // Audit (Phase 9): `.DEFAULT` is specified with commands; an empty
+        // `.DEFAULT:` is a constraint violation.
+        #[test]
+        fn default_without_recipes() {
+            run_test_helper(
+                &["-f", "tests/makefiles/special_targets/validations/default_without_recipes.mk"],
+                "",
+                "make: '.DEFAULT' special target constraint is not fulfilled: the special target must have recipes\n",
+                ErrorCode::SpecialTargetConstraintNotFulfilled {
+                    target: String::default(),
+                    constraint: special_target::Error::MustHaveRecipes,
                 }
                 .into(),
             );
@@ -846,6 +1156,53 @@ mod inference_rules {
             "CORRECT: real target ran\n",
             "",
             0,
+        );
+    }
+
+    // Audit #8: a single-suffix inference rule (`.c:`) builds a suffixless
+    // target from its `.c` prerequisite.
+    #[test]
+    fn single_suffix_rule() {
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-sf",
+                "tests/makefiles/inference_rules/single_suffix.mk",
+                "ssfx_test",
+            ],
+            "built ssfx_test from ssfx_test.c\n",
+            "",
+            0,
+            || {
+                File::create("ssfx_test.c").expect("failed to create file");
+            },
+            || {
+                let _ = remove_file("ssfx_test.c");
+                let _ = remove_file("ssfx_test");
+            },
+        );
+    }
+
+    // Audit #16: an empty `.SUFFIXES:` clears the suffix list; a later
+    // `.SUFFIXES:` with prerequisites appends, so inference works on the
+    // re-added suffixes.
+    #[test]
+    fn suffixes_clear_then_readd() {
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-sf",
+                "tests/makefiles/special_targets/suffixes/clear_then_readd.mk",
+                "cleartest.p2",
+            ],
+            "converted cleartest.p1 to cleartest.p2\n",
+            "",
+            0,
+            || {
+                File::create("cleartest.p1").expect("failed to create file");
+            },
+            || {
+                let _ = remove_file("cleartest.p1");
+                let _ = remove_file("cleartest.p2");
+            },
         );
     }
 }

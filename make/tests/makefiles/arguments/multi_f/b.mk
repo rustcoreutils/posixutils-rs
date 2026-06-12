@@ -1,0 +1,2 @@
+b:
+	@echo from-b

@@ -34,6 +34,16 @@ pub struct Config {
     pub print: bool,
     /// Whether to not delete interrupted files on async events.
     pub precious: bool,
+    /// Maximum number of targets to update concurrently (`-j`); 1 = sequential.
+    pub jobs: usize,
+    /// Whether `.NOTPARALLEL` was specified (forces sequential builds).
+    pub not_parallel: bool,
+
+    /// The `.SUFFIXES` list, kept in declaration (insertion) order, which
+    /// defines the inference-rule search order (POSIX). This is the
+    /// authoritative store; the `.SUFFIXES` entry in `rules` is a sorted mirror
+    /// retained for the `-p` dump.
+    pub suffixes: Vec<String>,
 
     pub rules: BTreeMap<String, BTreeSet<String>>,
 }
@@ -51,7 +61,13 @@ impl Default for Config {
             clear: false,
             print: false,
             precious: false,
+            jobs: 1,
+            not_parallel: false,
             terminate: true,
+            suffixes: [".o", ".c", ".y", ".l", ".a", ".sh", ".c~", ".y~", ".l~", ".sh~"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             rules: BTreeMap::from([
                 (
                     ".SUFFIXES".to_string(),
@@ -118,11 +134,21 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Adds a new suffix to the `.SUFFIXES` rule.
+    /// Adds a new suffix to the `.SUFFIXES` list, preserving insertion order and
+    /// avoiding duplicates. The sorted `rules` mirror is kept in sync.
     pub fn add_suffix(&mut self, new_suffix: &str) {
+        if !self.suffixes.iter().any(|s| s == new_suffix) {
+            self.suffixes.push(new_suffix.to_string());
+        }
         self.rules
             .entry(".SUFFIXES".to_string())
             .or_default()
             .insert(new_suffix.to_string());
+    }
+
+    /// Clears the `.SUFFIXES` list (an empty `.SUFFIXES:` special target).
+    pub fn clear_suffixes(&mut self) {
+        self.suffixes.clear();
+        self.rules.insert(".SUFFIXES".to_string(), BTreeSet::new());
     }
 }

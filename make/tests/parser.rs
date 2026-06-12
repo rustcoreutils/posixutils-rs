@@ -29,6 +29,86 @@ all:
         };
         assert_eq!(result, EXPECTED);
     }
+
+    // Audit #6: `$(VAR:subst1=subst2)` suffix substitution.
+    #[test]
+    fn test_subst_suffix() {
+        let result = preprocess("SRC = a.c b.c foo.c\nall:\n\t@echo $(SRC:.c=.o)\n").unwrap();
+        assert!(result.contains("@echo a.o b.o foo.o"), "got: {result:?}");
+    }
+
+    // Audit #6: `$(VAR:op%os=np%ns)` pattern substitution.
+    #[test]
+    fn test_subst_pattern() {
+        let result = preprocess("O = a.o b.o\nall:\n\t@echo $(O:%.o=%.x)\n").unwrap();
+        assert!(result.contains("@echo a.x b.x"), "got: {result:?}");
+    }
+
+    // Audit #7: backslash-newline continuation is folded to a space in a
+    // macro definition.
+    #[test]
+    fn test_continuation_macro() {
+        let result = preprocess("FOO = a\\\nb\nall:\n\t@echo $(FOO)\n").unwrap();
+        assert!(result.contains("@echo a b"), "got: {result:?}");
+    }
+
+    // Audit #7: backslash-newline continuation in a recipe line is spliced
+    // (the leading tab of the continuation is removed).
+    #[test]
+    fn test_continuation_recipe() {
+        let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap();
+        assert!(result.contains("@echo one two"), "got: {result:?}");
+    }
+
+    // Audit #15: internal-macro references survive preprocessing for the
+    // rule stage rather than being expanded or rejected here.
+    #[test]
+    fn test_internal_macros_passthrough() {
+        let result = preprocess("all: a b\n\t@echo $^ $+ $(@D) $(@F) ${?F}\n").unwrap();
+        assert!(
+            result.contains("@echo $^ $+ $(@D) $(@F) ${?F}"),
+            "got: {result:?}"
+        );
+    }
+
+    // Audit #19: a missing `-include` file is ignored (no error); a missing
+    // plain `include` is an error.
+    #[test]
+    fn test_dash_include_missing_ignored() {
+        let result = preprocess("-include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert!(result.unwrap().contains("@echo ok"));
+    }
+
+    #[test]
+    fn test_include_missing_errors() {
+        let result = preprocess("include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
+        assert!(result.is_err());
+    }
+
+    // Audit #19: `includedir = ...` is a macro definition, not an include
+    // directive (it lacks the required trailing blank after `include`).
+    #[test]
+    fn test_includedir_not_mistaken_for_include() {
+        let result = preprocess("includedir = /usr\nall:\n\t@echo $(includedir)\n").unwrap();
+        assert!(result.contains("@echo /usr"), "got: {result:?}");
+    }
+
+    // Review (c2): a substitution error in an include path is propagated, not
+    // swallowed into a misleading empty path.
+    #[test]
+    fn test_include_path_substitution_error_propagates() {
+        let result = preprocess("include $(UNDEF)/x.mk\nall:\n\t@echo hi\n");
+        assert!(result.is_err(), "expected an error, got: {result:?}");
+    }
+
+    // Review (c3): a `$(name:subst=...)` form missing its closing delimiter is a
+    // clear error rather than silently consuming to EOF.
+    #[test]
+    fn test_subst_missing_close_errors() {
+        let result = preprocess("V = a.c\nall:\n\t@echo $(V:.c=.o\n");
+        assert!(result.is_err(), "expected an error, got: {result:?}");
+    }
 }
 
 mod lex {

@@ -1,0 +1,2 @@
+.c:
+	@echo built $@ from $<

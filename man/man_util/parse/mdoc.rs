@@ -155,6 +155,9 @@ impl Parser {
     }
 
     fn line(&mut self, line: &str) {
+        // Strip a trailing `\"` comment (the parser path; the roff front-end also
+        // removes these before the parser sees them in production).
+        let line = strip_comment(line);
         // A control line begins with the control char '.'.
         let is_control = line.starts_with('.');
         if !is_control {
@@ -1110,6 +1113,26 @@ fn is_ss(m: &Macro) -> bool {
 }
 fn is_nd(m: &Macro) -> bool {
     matches!(m, Macro::Nd)
+}
+
+/// Truncate `line` at an unescaped `\"` comment.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut backslashes = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'"' && backslashes % 2 == 0 {
+                return &line[..i];
+            }
+            backslashes += 1;
+            i += 1;
+            continue;
+        }
+        backslashes = 0;
+        i += 1;
+    }
+    line
 }
 
 /// Split a string into its first whitespace-delimited token and the remainder.

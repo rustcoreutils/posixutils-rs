@@ -55,6 +55,15 @@ struct Args {
     )]
     makefile: Vec<PathBuf>,
 
+    #[arg(
+        short = 'j',
+        long,
+        value_name = "maxjobs",
+        overrides_with = "jobs",
+        help = "Maximum number of targets to update concurrently (last value wins)"
+    )]
+    jobs: Option<usize>,
+
     #[arg(short = 'i', long, help = "Ignore errors in the recipe")]
     ignore: bool,
 
@@ -225,10 +234,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print,
         terminate,
         keep_going,
+        jobs,
         mut targets,
     } = Args::parse_from(args_with_makeflags());
 
     let mut status_code = 0;
+
+    // -j maxjobs: a non-positive value is unspecified; treat it (and absence)
+    // as 1 (no parallelism).
+    let jobs = jobs.filter(|&j| j >= 1).unwrap_or(1);
 
     // -C flag
     if let Some(dir) = directory {
@@ -246,6 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         clear,
         print,
         precious: false,
+        jobs,
         terminate,
         ..Default::default()
     };

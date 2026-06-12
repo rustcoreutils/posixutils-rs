@@ -34,6 +34,10 @@ pub struct Config {
     pub print: bool,
     /// Whether to not delete interrupted files on async events.
     pub precious: bool,
+    /// Maximum number of targets to update concurrently (`-j`); 1 = sequential.
+    pub jobs: usize,
+    /// Whether `.NOTPARALLEL` was specified (forces sequential builds).
+    pub not_parallel: bool,
 
     /// The `.SUFFIXES` list, kept in declaration (insertion) order, which
     /// defines the inference-rule search order (POSIX). This is the
@@ -57,6 +61,8 @@ impl Default for Config {
             clear: false,
             print: false,
             precious: false,
+            jobs: 1,
+            not_parallel: false,
             terminate: true,
             suffixes: [".o", ".c", ".y", ".l", ".a", ".sh", ".c~", ".y~", ".l~", ".sh~"]
                 .into_iter()

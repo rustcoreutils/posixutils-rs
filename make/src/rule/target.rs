@@ -53,6 +53,8 @@ impl Target {
                 SpecialTarget::Silent => ".SILENT",
                 SpecialTarget::Suffixes => ".SUFFIXES",
                 SpecialTarget::Phony => ".PHONY",
+                SpecialTarget::Wait => ".WAIT",
+                SpecialTarget::NotParallel => ".NOTPARALLEL",
             },
         }
     }

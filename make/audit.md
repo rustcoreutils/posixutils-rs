@@ -33,7 +33,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 
 - [x] **#8 — Single-suffix inference rules (`.c:`, `.sh:`) are never applied.** ✓ fixed (Phase 5): `try_parse_inference` now accepts a single-suffix target as `Inference { from: <suffix>, to: "" }`; `find_inference_rule` searches single-suffix rules (where the suffixless target's `<name>.<from>` exists) after double-suffix, and `build_target`'s no-rule branch invokes inference before falling through to `.DEFAULT`/`NoTarget`; `run_for_target` computes the `<target>.<from>` input for `to==""`. Test `inference_rules::single_suffix_rule`; verified `make bar` with `bar.c` + `.c:` → `built bar from bar.c`.
 
-- [ ] **#9 — Parallel execution machinery is entirely absent: `-j`, token pool, `.WAIT`, `.NOTPARALLEL`.** `main.rs` `Args` has no `-j`; `special_target.rs:20–39` enum omits `.WAIT`/`.NOTPARALLEL` (silently ignored at `:173–176`). Verified: `make -j 2 …` → `error: unexpected argument '-j'` (exit 2). These are POSIX.1-2024 requirements, not extensions. Fix: implement `-j maxjobs` with the token-pool model, and validate/honor `.WAIT`/`.NOTPARALLEL`.
+- [x] **#9 — Parallel execution machinery is entirely absent: `-j`, token pool, `.WAIT`, `.NOTPARALLEL`.** ✓ fixed (Phase 7): added `-j maxjobs` (last value wins via `overrides_with`; non-positive ⇒ 1). `Make` was made `Send`/`Sync` (macros now owned `(String,String)`), and a non-blocking `TokenPool` of `maxjobs-1` tokens bounds concurrency. `build_prerequisites` splits a target's prerequisites on `.WAIT` barriers (build left-of-`.WAIT` before right-of-`.WAIT`) and, under `-j>1`, builds each segment with `std::thread::scope`: each prerequisite that obtains a token runs in a worker thread, the rest build inline (so the recursion is deadlock-free). `.WAIT`/`.NOTPARALLEL` are now real `SpecialTarget` variants — `.WAIT` as a target is a no-op and as a prerequisite is a barrier (no longer "no target '.WAIT'"); `.NOTPARALLEL` forces sequential builds. Tests `parallel::{dash_j_builds_all_targets,dash_j_last_value_wins,notparallel_recognized,wait_barrier_is_not_built}`; behaviorally verified `-j2` halves wall-clock for two independent sleeps, `.WAIT`/`.NOTPARALLEL` serialize, and a diamond build does not deadlock.
 
 - [x] **#10 — Multiple `-f makefile` options are rejected.** ✓ fixed (Phase 2): `makefile` is now `Vec<PathBuf>`; `parse_makefile` concatenates the operands in order (with `-` = stdin). Test `multiple_dash_f`. `main.rs:50–51` — `makefile: Option<PathBuf>`. Verified: `make -f A.mk -f B.mk …` → `error: the argument '--makefile <MAKEFILE>' cannot be used multiple times` (exit 2). Spec: multiple `-f` shall be processed in order. Fix: make it `Vec<PathBuf>` and concatenate the makefiles in order.
 
@@ -83,7 +83,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [x] `-k` CONFORMS (Critical #4 fixed) — all-success build exits 0 silently; a failed target is reported while independent targets continue, exit 2.
 - [ ] **`-S` PARTIAL** — present as `--terminate` (`main.rs:43–48`) and is the default; the `-k` interaction (#4) is fixed, but `-S` overriding a prior `-k` on the command line is not separately verified.
 - [ ] **`-f` (multiple) MISSING (Major #10)** — only one accepted.
-- [ ] **`-j` MISSING (Major #9)** — not a recognized option.
+- [x] `-j maxjobs` implemented with a token pool (Major #9 fixed).
 - [ ] **`macro=value` operands MISSING (Critical #5)**.
 - Extensions present (non-POSIX, no conflict — informational): `-C/--directory` (verified working), long-option aliases (`--ignore`, `--silent`, …). Per audit scope these are noted, not flagged.
 
@@ -129,7 +129,7 @@ The implementation handles the easy golden path (a simple `target: prereq` rule 
 - [ ] **`.POSIX` rejected (Critical #2)**.
 - [x] `.SUFFIXES` insertion-ordered with clear/append (Major #16 fixed).
 - [ ] **`.PRECIOUS` global protection broken (Major #18)**.
-- [ ] **`.WAIT` / `.NOTPARALLEL` unrecognized (Major #9)** — silently ignored.
+- [x] `.WAIT` / `.NOTPARALLEL` recognized and honored (Major #9 fixed).
 - [ ] **Subsequent-occurrence accumulation order-dependent (Minor #22)**.
 
 ### Extended description / rendering
@@ -148,7 +148,7 @@ Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing 
 - [ ] Command-line `macro=value` operands and precedence (#5).
 - [x] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7) — `preprocess::test_subst_*`, `test_continuation_*`.
 - [x] Single-suffix inference rules (#8) — `inference_rules::single_suffix_rule`.
-- [ ] `-j`, `.WAIT`, `.NOTPARALLEL` (#9); multiple `-f` (#10).
+- [x] `-j`, `.WAIT`, `.NOTPARALLEL` (#9) — `parallel::*`; multiple `-f` (#10).
 - [x] Shell `-e` abort on first failing command (#11) — `recipe_execution::shell_e_aborts_on_first_failure`; `SHELL` macro vs env var (#12, behaviorally verified).
 - [x] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15) — `internal_macros::*`, `rule::tests::dir_and_file_parts`.
 - [x] `.SUFFIXES` ordering + clear/append (#16) — `inference_rules::suffixes_clear_then_readd`.

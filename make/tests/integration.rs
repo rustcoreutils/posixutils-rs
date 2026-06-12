@@ -318,6 +318,69 @@ mod internal_macros {
     }
 }
 
+// Audit #9: parallel execution (`-j`, `.WAIT`, `.NOTPARALLEL`).
+mod parallel {
+    use super::*;
+
+    fn run_capture(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.code(),
+        )
+    }
+
+    // `-j` is accepted and builds all independent targets (output order is
+    // unspecified under parallelism, so only membership/exit are checked).
+    #[test]
+    fn dash_j_builds_all_targets() {
+        let (out, code) =
+            run_capture(&["-j", "2", "-f", "tests/makefiles/parallel/independent.mk"]);
+        assert_eq!(code, Some(0), "out: {out}");
+        for t in ["a", "b", "c"] {
+            assert!(out.contains(t), "missing {t} in: {out}");
+        }
+    }
+
+    // The last `-j` value wins (POSIX) — `-j 1 -j 2` must not be rejected.
+    #[test]
+    fn dash_j_last_value_wins() {
+        let (_out, code) = run_capture(&[
+            "-j",
+            "1",
+            "-j",
+            "2",
+            "-f",
+            "tests/makefiles/parallel/independent.mk",
+        ]);
+        assert_eq!(code, Some(0));
+    }
+
+    // `.NOTPARALLEL` is recognized (not rejected) and the build succeeds.
+    #[test]
+    fn notparallel_recognized() {
+        let (out, code) =
+            run_capture(&["-j", "2", "-f", "tests/makefiles/parallel/notparallel.mk"]);
+        assert_eq!(code, Some(0), "out: {out}");
+        assert!(out.contains('a') && out.contains('b'), "out: {out}");
+    }
+
+    // `.WAIT` as a target has no effect and as a prerequisite is a barrier, not
+    // a target to build (so it must not error with "no target '.WAIT'").
+    #[test]
+    fn wait_barrier_is_not_built() {
+        let (out, code) = run_capture(&["-j", "2", "-f", "tests/makefiles/parallel/wait.mk"]);
+        assert_eq!(code, Some(0), "out: {out}");
+        assert!(out.contains('a') && out.contains('b'), "out: {out}");
+    }
+}
+
 // Audit #11 (shell -e) and the `$(MAKE)` recursive-make special case.
 mod recipe_execution {
     use super::*;

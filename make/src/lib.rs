@@ -20,7 +20,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use parser::{Makefile, VariableDefinition};
+use parser::Makefile;
+
+/// An owned macro definition `(name, value)`. Owning the data (rather than
+/// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
+pub type Macro = (String, String);
 
 use crate::special_target::InferenceTarget;
 use config::Config;
@@ -34,11 +38,44 @@ const DEFAULT_SHELL_VAR: &str = "SHELL";
 /// The default shell to use for running recipes. Linux and MacOS
 const DEFAULT_SHELL: &str = "/bin/sh";
 
+/// The `.WAIT` special target, used as a prerequisite-list barrier.
+const WAIT_TARGET: &str = ".WAIT";
+
+/// A pool of build tokens bounding how many targets are updated concurrently
+/// under `-j`. Acquisition is non-blocking: a caller that cannot get a token
+/// builds the target inline instead, which keeps the recursive build
+/// deadlock-free (the inline path always makes progress).
+struct TokenPool {
+    available: std::sync::Mutex<usize>,
+}
+
+impl TokenPool {
+    fn new(tokens: usize) -> Self {
+        TokenPool {
+            available: std::sync::Mutex::new(tokens),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut available = self.available.lock().unwrap();
+        if *available > 0 {
+            *available -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self) {
+        *self.available.lock().unwrap() += 1;
+    }
+}
+
 /// Represents the make utility with its data and configuration.
 ///
 /// The only way to create a Make is from a Makefile and a Config.
 pub struct Make {
-    macros: Vec<VariableDefinition>,
+    macros: Vec<Macro>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
@@ -46,6 +83,9 @@ pub struct Make {
     /// Inference rules (e.g. `.c.o:`, `.txt.out:`).
     inference_rules: Vec<Rule>,
     default_rule: Option<Rule>, // .DEFAULT
+    /// Token pool bounding concurrent target updates under `-j` (maxjobs - 1
+    /// tokens; the inline build needs no token).
+    pool: TokenPool,
     pub config: Config,
 }
 
@@ -194,14 +234,14 @@ impl Make {
             return Ok(false);
         }
 
-        for prerequisite in &newer_prerequisites {
-            self.build_target(prerequisite)?;
-        }
+        self.build_prerequisites(&newer_prerequisites)?;
 
-        // `$?` expands to the prerequisites newer than the target.
+        // `$?` expands to the prerequisites newer than the target (the `.WAIT`
+        // barrier markers are not real prerequisites).
         let newer: Vec<String> = newer_prerequisites
             .iter()
             .map(|p| p.as_ref().to_string())
+            .filter(|p| p != WAIT_TARGET)
             .collect();
 
         // Per POSIX: "When no target rule with commands is found to update a
@@ -224,6 +264,83 @@ impl Make {
         rule.run(&self.config, &self.macros, target, up_to_date, &newer)?;
 
         Ok(true)
+    }
+
+    /// Builds a target's prerequisites, honoring `.WAIT` barriers and, under
+    /// `-j`, building independent prerequisites concurrently.
+    ///
+    /// `.WAIT` prerequisites split the list into segments that must be built in
+    /// order: every prerequisite to the left of a `.WAIT` is brought up to date
+    /// before any to its right. Within a segment, prerequisites are independent.
+    fn build_prerequisites(&self, prerequisites: &[&Prerequisite]) -> Result<(), ErrorCode> {
+        let parallel = self.config.jobs > 1
+            && !self.config.not_parallel
+            && !self.config.dry_run
+            && !self.config.quit
+            && !self.config.touch;
+
+        let mut segment: Vec<&str> = Vec::new();
+        for prerequisite in prerequisites {
+            let name = prerequisite.as_ref();
+            if name == WAIT_TARGET {
+                // Barrier: finish the current segment before continuing.
+                self.build_segment(&segment, parallel)?;
+                segment.clear();
+            } else {
+                segment.push(name);
+            }
+        }
+        self.build_segment(&segment, parallel)
+    }
+
+    /// Builds one segment of independent prerequisites, in parallel when `-j`
+    /// allows it. Parallelism is bounded by the token pool; a prerequisite that
+    /// cannot obtain a token is built inline so the build always progresses.
+    fn build_segment(&self, names: &[&str], parallel: bool) -> Result<(), ErrorCode> {
+        if !parallel || names.len() <= 1 {
+            for name in names {
+                self.build_target(name)?;
+            }
+            return Ok(());
+        }
+
+        let errors: std::sync::Mutex<Vec<ErrorCode>> = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut inline: Vec<&str> = Vec::new();
+            // Spawn a worker for each prerequisite that can obtain a token; the
+            // rest are built inline in this thread. Spawning first (before any
+            // inline build) is what lets the work actually overlap.
+            for &name in names {
+                if self.pool.try_acquire() {
+                    let errors = &errors;
+                    handles.push(scope.spawn(move || {
+                        let result = self.build_target(name);
+                        self.pool.release();
+                        if let Err(err) = result {
+                            errors.lock().unwrap().push(err);
+                        }
+                    }));
+                } else {
+                    inline.push(name);
+                }
+            }
+            for name in inline {
+                if let Err(err) = self.build_target(name) {
+                    errors.lock().unwrap().push(err);
+                }
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+
+        // Report the first error (if any); recipe-level `-k` handling already
+        // happens inside the recipe runner via the KEEP_GOING_ERROR flag.
+        match errors.into_inner().unwrap().into_iter().next() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Retrieves the prerequisites of the target that are newer than the target.
@@ -318,11 +435,21 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         // Build the Make struct early so we can process .SUFFIXES via the
         // normal special_target::process path (which writes to make.config).
+        let pool = TokenPool::new(config.jobs.saturating_sub(1));
         let mut make = Self {
             rules: vec![],
             inference_rules: vec![],
-            macros: makefile.variable_definitions().collect(),
+            macros: makefile
+                .variable_definitions()
+                .map(|v| {
+                    (
+                        v.name().unwrap_or_default(),
+                        v.raw_value().unwrap_or_default(),
+                    )
+                })
+                .collect(),
             default_rule: None,
+            pool,
             config,
         };
 

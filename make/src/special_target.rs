@@ -26,6 +26,8 @@ pub enum SpecialTarget {
     SccsGet,
     Silent,
     Suffixes,
+    Wait,
+    NotParallel,
 }
 use crate::config::Config;
 use gettextrs::gettext;
@@ -33,9 +35,18 @@ use SpecialTarget::*;
 
 impl SpecialTarget {
     // could be automated with `strum`
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 10;
     pub const VARIANTS: [Self; Self::COUNT] = [
-        Default, Ignore, Posix, Precious, SccsGet, Silent, Suffixes, Phony,
+        Default,
+        Ignore,
+        Posix,
+        Precious,
+        SccsGet,
+        Silent,
+        Suffixes,
+        Phony,
+        Wait,
+        NotParallel,
     ];
 }
 
@@ -50,6 +61,8 @@ impl AsRef<str> for SpecialTarget {
             Silent => ".SILENT",
             Suffixes => ".SUFFIXES",
             Phony => ".PHONY",
+            Wait => ".WAIT",
+            NotParallel => ".NOTPARALLEL",
         }
     }
 }
@@ -183,6 +196,8 @@ pub fn process(rule: Rule, make: &mut Make) -> Result<(), ErrorCode> {
         Phony => this.process_phony(),
         Precious => this.process_precious(),
         SccsGet => this.process_sccs_get(),
+        Wait => this.process_wait(),
+        NotParallel => this.process_not_parallel(),
     }
     .map_err(|err| ErrorCode::SpecialTargetConstraintNotFulfilled {
         target: target.to_string(),
@@ -331,6 +346,23 @@ impl Processor<'_> {
             .insert(Precious.as_ref().to_string(), precious_set);
         Ok(())
     }
+    /// `.WAIT` as a target has no effect; it must have no prerequisites or
+    /// commands. Its meaning as a prerequisite is handled during the build.
+    fn process_wait(self) -> Result<(), Error> {
+        self.without_prerequisites()?;
+        self.without_recipes()?;
+        Ok(())
+    }
+
+    /// `.NOTPARALLEL` forces make to update one target at a time regardless of
+    /// `-j`. It must have no prerequisites or commands.
+    fn process_not_parallel(self) -> Result<(), Error> {
+        self.without_prerequisites()?;
+        self.without_recipes()?;
+        self.make.config.not_parallel = true;
+        Ok(())
+    }
+
     fn process_sccs_get(self) -> Result<(), Error> {
         self.without_prerequisites()?;
 

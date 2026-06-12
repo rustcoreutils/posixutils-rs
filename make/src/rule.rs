@@ -15,8 +15,8 @@ pub mod target;
 use crate::{
     config::Config as GlobalConfig,
     error_code::ErrorCode::{self, *},
-    parser::{Rule as ParsedRule, VariableDefinition},
-    signal_handler, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
+    parser::Rule as ParsedRule,
+    signal_handler, Macro, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
 };
 use config::Config;
 use gettextrs::gettext;
@@ -79,7 +79,7 @@ impl Rule {
     pub fn run_for_target(
         &self,
         global_config: &GlobalConfig,
-        macros: &[VariableDefinition],
+        macros: &[Macro],
         target: &Target,
         up_to_date: bool,
         newer: &[String],
@@ -115,7 +115,7 @@ impl Rule {
     pub fn run(
         &self,
         global_config: &GlobalConfig,
-        macros: &[VariableDefinition],
+        macros: &[Macro],
         target: &Target,
         up_to_date: bool,
         newer: &[String],
@@ -141,7 +141,7 @@ impl Rule {
     fn run_with_files(
         &self,
         global_config: &GlobalConfig,
-        macros: &[VariableDefinition],
+        macros: &[Macro],
         target: &Target,
         up_to_date: bool,
         files: Vec<(PathBuf, PathBuf)>,
@@ -159,6 +159,8 @@ impl Rule {
             keep_going: global_keep_going,
             terminate: global_terminate,
             precious: global_precious,
+            jobs: _,
+            not_parallel: _,
             suffixes: _,
             rules: _,
         } = *global_config;
@@ -233,8 +235,8 @@ impl Rule {
                 // not be used and shall not be modified by the macro.
                 let shell = macros
                     .iter()
-                    .find(|v| v.name().as_deref() == Some(DEFAULT_SHELL_VAR))
-                    .and_then(|v| v.raw_value())
+                    .find(|(name, _)| name == DEFAULT_SHELL_VAR)
+                    .map(|(_, value)| value.clone())
                     .unwrap_or_else(|| DEFAULT_SHELL.to_string());
                 let mut command = Command::new(shell);
 
@@ -415,16 +417,8 @@ impl Rule {
     }
 
     /// A helper function to initialize env vars for shell commands.
-    fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[VariableDefinition]) {
-        let mut macros: HashMap<String, String> = variables
-            .iter()
-            .map(|v| {
-                (
-                    v.name().unwrap_or_default(),
-                    v.raw_value().unwrap_or_default(),
-                )
-            })
-            .collect();
+    fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[Macro]) {
+        let mut macros: HashMap<String, String> = variables.iter().cloned().collect();
 
         // POSIX: the `SHELL` macro shall not modify the `SHELL` environment
         // variable seen by recipes, so never export it. The child still

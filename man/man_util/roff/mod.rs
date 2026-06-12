@@ -148,6 +148,11 @@ impl Roff {
             "di" => self.do_di(args, false),
             "da" => self.do_di(args, true),
             "while" => self.do_while(args, queue),
+            // Traps and environments are pure typesetting-position constructs:
+            // on a terminal device (where the pager handles paging) they have no
+            // observable effect, so they are recognized and dropped rather than
+            // leaked to the language parser.
+            "wh" | "ch" | "dt" | "ev" | "evc" => {}
             "so" | "mso" => self.do_so(args, queue),
             "nop" => {
                 if !args.is_empty() {

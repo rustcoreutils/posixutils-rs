@@ -201,6 +201,12 @@ fn diversion_append() {
     assert_eq!(run(input), "one\ntwo\n");
 }
 
+#[test]
+fn traps_and_environments_dropped() {
+    let input = ".wh 0 NL\n.ev 1\n.dt 5 X\nkept\n.ch NL 1\n.evc 0\n";
+    assert_eq!(run(input), "kept\n");
+}
+
 // ── expression evaluator ─────────────────────────────────────────────────
 
 #[test]

@@ -667,12 +667,25 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
 /// section (no title), matching pest's optional-title rule.
 fn parse_dt(rest: &str) -> Element {
     let args = tokenize(rest);
-    let (title, section) = match args.len() {
-        0 => (None, String::new()),
-        1 => (None, args[0].clone()),
-        _ => (Some(args[0].clone()), args[1].clone()),
+    // A title must not begin with a digit (grammar: `!ASCII_DIGIT ~ word`) and is
+    // only present when a section follows it.
+    let first_is_title = args
+        .first()
+        .map(|s| !s.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(false);
+    let (title, section, arch) = if first_is_title && args.len() >= 2 {
+        (
+            Some(args[0].clone()),
+            args[1].clone(),
+            args.get(2).map(|a| a.trim().to_string()),
+        )
+    } else {
+        (
+            None,
+            args.first().cloned().unwrap_or_default(),
+            args.get(1).map(|a| a.trim().to_string()),
+        )
     };
-    let arch = args.get(2).map(|a| a.trim().to_string());
     Element::Macro(MacroNode {
         mdoc_macro: Macro::Dt {
             title,

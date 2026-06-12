@@ -186,6 +186,7 @@ impl Parser {
 fn simple_inline(name: &str) -> Option<Macro> {
     Some(match name {
         "Ad" => Macro::Ad,
+        "Ap" => Macro::Ap,
         "Ar" => Macro::Ar,
         "Cd" => Macro::Cd,
         "Cm" => Macro::Cm,
@@ -199,7 +200,9 @@ fn simple_inline(name: &str) -> Option<Macro> {
         "Ic" => Macro::Ic,
         "Li" => Macro::Li,
         "Ms" => Macro::Ms,
+        "Mt" => Macro::Mt,
         "No" => Macro::No,
+        "Ns" => Macro::Ns,
         "Pa" => Macro::Pa,
         "Sx" => Macro::Sx,
         "Sy" => Macro::Sy,
@@ -257,6 +260,14 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
                 name: xr_name,
                 section,
             },
+            nodes: it.map(Element::Text).collect(),
+        }
+    } else if name == "Lk" {
+        // Lk: the first argument is the URI, the rest are link-text nodes.
+        let mut it = args.into_iter();
+        let uri = it.next().unwrap_or_default();
+        MacroNode {
+            mdoc_macro: Macro::Lk { uri },
             nodes: it.map(Element::Text).collect(),
         }
     } else {
@@ -322,7 +333,7 @@ fn container_macro(name: &str) -> Option<Macro> {
 
 /// A leaf inline macro (consumes following text words as arguments).
 fn is_leaf(name: &str) -> bool {
-    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm")
+    simple_inline(name).is_some() || matches!(name, "Xr" | "Nm" | "Lk")
 }
 
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to
@@ -482,6 +493,14 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn link_and_spacing_macros() {
+        parity(".Mt user@example.com\n");
+        parity(".Lk https://example.com label\n");
+        parity(".Ap\n");
+        parity(".Sh A\n.Ar x Ns y\n");
     }
 
     #[test]

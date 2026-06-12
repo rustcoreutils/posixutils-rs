@@ -290,6 +290,30 @@ impl Parser {
                 self.close_open_items();
                 self.close_explicit(is_bl);
             }
+            "Rs" => self.stack.push(Frame {
+                mac: Some(Macro::Rs),
+                nodes: Vec::new(),
+            }),
+            "Re" => {
+                while self.stack.len() > 1
+                    && !matches!(self.stack.last().unwrap().mac, Some(Macro::Rs))
+                {
+                    self.close_top();
+                }
+                if matches!(self.stack.last().unwrap().mac, Some(Macro::Rs)) {
+                    // .Rs sorts its reference submacros by a fixed order.
+                    self.stack.last_mut().unwrap().nodes.sort_by_key(rs_rank);
+                    self.close_top();
+                }
+            }
+            _ if rs_submacro(name).is_some() => {
+                // A reference submacro (%A …): one Text node per word.
+                let mac = rs_submacro(name).unwrap();
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: mac,
+                    nodes: tokenize(rest).into_iter().map(Element::Text).collect(),
+                }));
+            }
             "Fo" => {
                 // Function block: first word is the funcname; the rest of the
                 // head plus the body (until .Fc) are the argument nodes.
@@ -761,6 +785,57 @@ fn an_node(author_name_type: AnType, nodes: Vec<Element>) -> Element {
     })
 }
 
+/// Reference submacros (`%A`…`%V`) and their `Macro` variants.
+fn rs_submacro(name: &str) -> Option<Macro> {
+    Some(match name {
+        "%A" => Macro::A,
+        "%B" => Macro::B,
+        "%C" => Macro::C,
+        "%D" => Macro::D,
+        "%I" => Macro::I,
+        "%J" => Macro::J,
+        "%N" => Macro::N,
+        "%O" => Macro::O,
+        "%P" => Macro::P,
+        "%Q" => Macro::Q,
+        "%R" => Macro::R,
+        "%T" => Macro::T,
+        "%U" => Macro::U,
+        "%V" => Macro::V,
+        _ => return None,
+    })
+}
+
+/// Sort rank of a reference submacro element within an `.Rs` block.
+fn rs_rank(el: &Element) -> usize {
+    let m = match el {
+        Element::Macro(node) => &node.mdoc_macro,
+        _ => return RS_ORDER.len(),
+    };
+    RS_ORDER
+        .iter()
+        .position(|r| std::mem::discriminant(r) == std::mem::discriminant(m))
+        .unwrap_or(RS_ORDER.len())
+}
+
+/// Canonical ordering of reference submacros (mandoc `RS_SUBMACRO_ORDER`).
+const RS_ORDER: &[Macro] = &[
+    Macro::A,
+    Macro::T,
+    Macro::B,
+    Macro::I,
+    Macro::J,
+    Macro::R,
+    Macro::N,
+    Macro::V,
+    Macro::U,
+    Macro::P,
+    Macro::Q,
+    Macro::C,
+    Macro::D,
+    Macro::O,
+];
+
 /// BSD-family text-production macro and its OS name.
 fn bsd_family(name: &str) -> (Macro, &'static str) {
     match name {
@@ -934,6 +1009,14 @@ mod tests {
         parity(".Sh A\n.Ar file )\n");
         parity(".Sh A\n.Fl x ,\n");
         parity(".Sh A\n.Cm ( foo )\n");
+    }
+
+    #[test]
+    fn reference_block() {
+        parity(".Rs\n.%A John Doe\n.%T A Title\n.Re\n");
+        // Submacros given out of order are sorted (T before B in the order).
+        parity(".Rs\n.%B Book\n.%A Author\n.%T Title\n.Re\n");
+        parity(".Sh REFS\n.Rs\n.%A One\n.%D 2024\n.Re\n");
     }
 
     #[test]

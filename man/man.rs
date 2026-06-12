@@ -264,6 +264,10 @@ pub struct FormattingSettings {
     pub width: usize,
     /// Lines indentation
     pub indent: usize,
+    /// Whether to emit bold/underline via nroff backspace-overstrike. Enabled
+    /// when the output goes to an interactive terminal; off when piped so the
+    /// text stays clean for `grep`/redirection.
+    pub styling: bool,
 }
 
 impl Default for FormattingSettings {
@@ -271,6 +275,7 @@ impl Default for FormattingSettings {
         Self {
             width: 78,
             indent: 6,
+            styling: false,
         }
     }
 }
@@ -368,7 +373,12 @@ where
 ///
 /// Returns [ManError] if working on terminal and failed to get terminal size.
 fn get_pager_settings(config: &ManConfig) -> Result<FormattingSettings, ManError> {
-    let mut settings = FormattingSettings::default();
+    // Emphasis (overstrike) is only emitted for an interactive terminal, so
+    // piped/redirected output stays plain text.
+    let mut settings = FormattingSettings {
+        styling: io::stdout().is_terminal(),
+        ..FormattingSettings::default()
+    };
 
     if let Some(Some(val_str)) = config.output_options.get("indent") {
         settings.indent = val_str

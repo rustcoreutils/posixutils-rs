@@ -884,6 +884,15 @@ mod tests {
     }
 
     #[test]
+    fn common_macros_keep_delimiters_as_text() {
+        // The delimiter machinery is specific to text-production/Eo macros; for
+        // ordinary inline macros punctuation stays part of the text arguments.
+        parity(".Sh A\n.Ar file )\n");
+        parity(".Sh A\n.Fl x ,\n");
+        parity(".Sh A\n.Cm ( foo )\n");
+    }
+
+    #[test]
     fn exit_return_value() {
         parity(".Ex -std cat\n");
         parity(".Rv -std getpid wait\n");

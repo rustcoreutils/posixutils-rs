@@ -178,14 +178,30 @@ fn does_start_with_macro(word: &str) -> bool {
 
 pub fn prepare_document(text: &str) -> String {
     let mut is_bd_literal_block = false;
+    let mut bl_depth: i32 = 0;
 
     text.lines()
-        .filter(|l| !l.trim_start().starts_with(".Tg"))
         .map(|l| {
-            let line = if l.contains(".It") {
-                l.replace('\t', " Ta ").replace("    ", " Ta ")
+            // Track list nesting so a `.It` that is not inside any `.Bl` (stray)
+            // can be rendered as plain text instead of being silently dropped by
+            // the grammar (which only recognizes `.It` within a list).
+            let trimmed = l.trim_start();
+            if trimmed.starts_with(".Bl") {
+                bl_depth += 1;
+            } else if trimmed.starts_with(".El") {
+                bl_depth = (bl_depth - 1).max(0);
+            }
+            let stray_it = bl_depth == 0 && trimmed.starts_with(".It");
+            let source = if stray_it {
+                trimmed.strip_prefix(".It").unwrap_or(trimmed).trim()
             } else {
-                l.to_string()
+                l
+            };
+
+            let line = if !stray_it && source.contains(".It") {
+                source.replace('\t', " Ta ").replace("    ", " Ta ")
+            } else {
+                source.to_string()
             };
 
             if line.contains(".Bd") && (line.contains("-literal") || line.contains("-unfilled")) {

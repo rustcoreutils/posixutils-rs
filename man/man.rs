@@ -477,8 +477,11 @@ fn format_man_page(
     formatting: &FormattingSettings,
     synopsis: bool,
 ) -> Result<Vec<u8>, ManError> {
+    // Most pages are UTF-8; a page that is not (e.g. Latin-1) is decoded
+    // byte-for-byte into the Latin-1 Unicode block rather than rejected, so it
+    // still renders instead of erroring out.
     let content = String::from_utf8(man_bytes)
-        .map_err(|err| ManError::ParseError(ParseError::FromUtf8Error(err)))?;
+        .unwrap_or_else(|err| err.into_bytes().iter().map(|&b| b as char).collect());
 
     let mut formatter = MdocFormatter::new(*formatting);
 
@@ -654,15 +657,37 @@ fn native_keyword_search(
     let pages = scan_man_pages(search_paths, sections);
     let mut results = Vec::new();
 
+    // POSIX: `-k` keywords are case-insensitive extended regular expressions
+    // (the spec describes the search as equivalent to `grep -Ei`). Compile each
+    // keyword once; fall back to a literal substring match if it is not valid
+    // regex syntax.
+    enum Matcher {
+        Regex(regex::Regex),
+        Literal(String),
+    }
+    impl Matcher {
+        fn is_match(&self, haystack: &str) -> bool {
+            match self {
+                Matcher::Regex(re) => re.is_match(haystack),
+                Matcher::Literal(lit) => haystack.to_lowercase().contains(lit),
+            }
+        }
+    }
+    let matchers: Vec<Matcher> = keywords
+        .iter()
+        .map(
+            |kw| match regex::RegexBuilder::new(kw).case_insensitive(true).build() {
+                Ok(re) => Matcher::Regex(re),
+                Err(_) => Matcher::Literal(kw.to_lowercase()),
+            },
+        )
+        .collect();
+
     for page in &pages {
-        // Check if any keyword matches name or description (case-insensitive)
-        let matches = keywords.iter().any(|keyword| {
-            let keyword_lower = keyword.to_lowercase();
-            page.names
-                .iter()
-                .any(|n| n.to_lowercase().contains(&keyword_lower))
-                || page.description.to_lowercase().contains(&keyword_lower)
-        });
+        // Check if any keyword matches name or description (case-insensitive ERE)
+        let matches = matchers
+            .iter()
+            .any(|m| page.names.iter().any(|n| m.is_match(n)) || m.is_match(&page.description));
 
         if matches {
             // Format output: "name(section) - description"
@@ -920,7 +945,7 @@ impl Man {
 
                 if results.is_empty() {
                     for keyword in &self.args.names {
-                        eprintln!("{}: nothing appropriate", keyword);
+                        eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
                     }
                     no_errors = false;
                 } else {
@@ -934,12 +959,20 @@ impl Man {
         }
 
         for name in &self.args.names {
-            if self.args.list_pathnames {
-                let paths = self.get_man_page_paths(name, true)?;
-                self.display_paths(paths)?;
+            // A failure for one operand (e.g. page not found) is reported but
+            // does not abort the remaining operands; the exit status is still
+            // non-zero overall.
+            let result = if self.args.list_pathnames {
+                self.get_man_page_paths(name, true)
+                    .and_then(|paths| self.display_paths(paths))
             } else {
-                let paths = self.get_man_page_paths(name, self.args.all)?;
-                self.display_all_man_pages(paths)?;
+                self.get_man_page_paths(name, self.args.all)
+                    .and_then(|paths| self.display_all_man_pages(paths))
+            };
+
+            if let Err(err) = result {
+                eprintln!("man: {err}");
+                no_errors = false;
             }
         }
 

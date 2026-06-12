@@ -2359,8 +2359,16 @@ impl MdocFormatter {
 
 // Formatting block full-implicit.
 impl MdocFormatter {
-    fn format_it_block(&mut self, _head: Vec<Element>, _macro_node: MacroNode) -> String {
-        String::new()
+    fn format_it_block(&mut self, head: Vec<Element>, macro_node: MacroNode) -> String {
+        // A `.It` outside any `.Bl` is normally handled by the enclosing list
+        // formatter; reaching here means it is stray. Render its text (mandoc
+        // does too) rather than dropping it silently.
+        head.into_iter()
+            .chain(macro_node.nodes)
+            .map(|node| self.format_node(node))
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn format_nd(&mut self, macro_node: MacroNode) -> String {

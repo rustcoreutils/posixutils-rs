@@ -637,4 +637,85 @@ mod tests {
             "PAGER must not be invoked when stdout is not a terminal"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Search, encoding & misc (audit Phase 4)
+    // -------------------------------------------------------------------------
+
+    // Audit #10: a non-UTF-8 (Latin-1) page renders instead of erroring out.
+    #[test]
+    fn non_utf8_page_renders() {
+        let mut bytes = b".Dd x\n.Dt T 1\n.Os\n.Sh D\n".to_vec();
+        bytes.extend_from_slice(b"caf\xe9\n"); // Latin-1 'é'
+        let path = std::env::temp_dir().join(format!("man_audit_latin1_{}.1", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let output = format_local(&[], &path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(output.status.code(), Some(0), "should not error on Latin-1");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("caf"));
+    }
+
+    // Audit #11: a `.It` outside any `.Bl` renders its text rather than vanishing.
+    #[test]
+    fn stray_it_renders() {
+        let page = write_temp_page("it", ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.It orphanitem\n");
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("orphanitem"),
+            "stray .It text should render"
+        );
+    }
+
+    // Audit #15: a `.Tg` line no longer breaks parsing or leaks; it renders
+    // nothing while surrounding text is preserved.
+    #[test]
+    fn tg_line_is_harmless() {
+        let page = write_temp_page("tg", ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Tg sometag\nbody text\n");
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("body text") && !stdout.contains("sometag"));
+    }
+
+    // Audit #16: a missing name does not abort the batch; later operands are
+    // still processed and the overall status is non-zero.
+    #[test]
+    fn missing_name_does_not_abort_batch() {
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args([
+                "man_audit_absent_one",
+                "man_audit_absent_two",
+                "-C",
+                "man.test.conf",
+            ])
+            .output()
+            .expect("Failed to run man");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("man_audit_absent_one") && stderr.contains("man_audit_absent_two"),
+            "both missing names should be reported, got: {stderr}"
+        );
+    }
+
+    // Audit #8: `-k` with a regex metacharacter keyword must not crash (the
+    // native search compiles keywords as case-insensitive EREs, with a literal
+    // fallback for invalid syntax).
+    #[test]
+    fn apropos_regex_keyword_does_not_crash() {
+        for kw in ["pri.tf", "^l", "(unclosed"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_man"))
+                .args(["-k", kw, "-C", "man.test.conf"])
+                .output()
+                .expect("Failed to run man -k");
+            assert!(
+                matches!(output.status.code(), Some(0) | Some(1)),
+                "keyword {kw:?} should exit 0/1, got {:?}",
+                output.status.code()
+            );
+        }
+    }
 }

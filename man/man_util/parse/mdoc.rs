@@ -14,6 +14,7 @@
 //! arguments are tokenized per word into `Text` nodes; a plain text line becomes
 //! a single `Text` node, matching the pest AST.
 
+use crate::man_util::mdoc_macro::types::{AnType, SmMode};
 use crate::man_util::mdoc_macro::Macro;
 use crate::man_util::parser::{prepare_document, trim_quotes, Element, MacroNode, MdocDocument};
 
@@ -155,6 +156,31 @@ impl Parser {
                 }));
             }
             "Dt" => self.push(parse_dt(rest)),
+            "Sm" => {
+                // Optional on/off spacing mode; the first arg is consumed either
+                // way (matching pest), the rest become text nodes.
+                let mut it = tokenize(rest).into_iter();
+                let mode = match it.next().as_deref() {
+                    Some("on") => Some(SmMode::On),
+                    Some("off") => Some(SmMode::Off),
+                    _ => None,
+                };
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Sm(mode),
+                    nodes: it.map(Element::Text).collect(),
+                }));
+            }
+            "Fd" => {
+                let mut it = tokenize(rest).into_iter();
+                let directive = it.next().unwrap_or_default();
+                self.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Fd {
+                        directive,
+                        arguments: it.collect(),
+                    },
+                    nodes: Vec::new(),
+                }));
+            }
             "Os" => self.push(Element::Macro(MacroNode {
                 mdoc_macro: Macro::Os,
                 nodes: tokenize(rest).into_iter().map(Element::Text).collect(),
@@ -221,6 +247,37 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
     let mut out = Vec::new();
     let mut toks = tokens.into_iter().peekable();
     while let Some(tok) = toks.next() {
+        if tok == "An" {
+            // .An -split / -nosplit consume only the flag; otherwise the rest of
+            // the line is the author name.
+            match toks.peek().map(|s| s.as_str()) {
+                Some("-split") => {
+                    toks.next();
+                    out.push(an_node(AnType::Split, Vec::new()));
+                }
+                Some("-nosplit") => {
+                    toks.next();
+                    out.push(an_node(AnType::NoSplit, Vec::new()));
+                }
+                _ => {
+                    let rest: Vec<String> = toks.by_ref().collect();
+                    out.push(an_node(AnType::Name, parse_inline_seq(rest)));
+                    return out;
+                }
+            }
+            continue;
+        }
+        if tok == "Fn" {
+            // .Fn funcname [args…] — funcname is the first word, the rest are
+            // (possibly nested) argument nodes.
+            let funcname = toks.next().unwrap_or_default();
+            let rest: Vec<String> = toks.by_ref().collect();
+            out.push(Element::Macro(MacroNode {
+                mdoc_macro: Macro::Fn { funcname },
+                nodes: parse_inline_seq(rest),
+            }));
+            return out;
+        }
         if let Some(mac) = container_macro(&tok) {
             let rest: Vec<String> = toks.collect();
             out.push(Element::Macro(MacroNode {
@@ -339,7 +396,15 @@ fn is_leaf(name: &str) -> bool {
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to
 /// dispatch and as the chaining boundary).
 fn is_callable(name: &str) -> bool {
-    is_leaf(name) || container_macro(name).is_some()
+    is_leaf(name) || container_macro(name).is_some() || matches!(name, "An" | "Fn")
+}
+
+/// Build an `.An` author node.
+fn an_node(author_name_type: AnType, nodes: Vec<Element>) -> Element {
+    Element::Macro(MacroNode {
+        mdoc_macro: Macro::An { author_name_type },
+        nodes,
+    })
 }
 
 fn macro_for_argless(name: &str) -> Macro {
@@ -493,6 +558,18 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn special_field_macros() {
+        parity(".An -split\n");
+        parity(".An -nosplit\n");
+        parity(".An John Doe\n");
+        parity(".Fn main int argc\n");
+        parity(".Sm off\n");
+        parity(".Sm on\n");
+        parity(".Sm\n");
+        parity(".Fd #include <stdio.h>\n");
     }
 
     #[test]

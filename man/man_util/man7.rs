@@ -41,19 +41,11 @@ pub fn is_man7(content: &str) -> bool {
     false
 }
 
-/// Render a `man(7)` page to terminal bytes.
-pub fn format_man7(content: &str, settings: &FormattingSettings) -> Vec<u8> {
+/// Render a `man(7)` page to terminal bytes, or `None` if the page produced no
+/// real content (beyond header/footer) — used to reject an unsupported/empty
+/// page with a non-zero exit rather than displaying a bare header.
+pub fn format_man7(content: &str, settings: &FormattingSettings) -> Option<Vec<u8>> {
     Man7Formatter::new(settings).render(content)
-}
-
-/// Did the page render any real content (beyond header/footer)? Used to reject
-/// an unsupported/empty page with a non-zero exit rather than displaying a bare
-/// header.
-pub fn produced_body(content: &str, settings: &FormattingSettings) -> bool {
-    let mut f = Man7Formatter::new(settings);
-    f.process(content);
-    f.term.flush();
-    f.term.has_body()
 }
 
 /// Map a manual section number to its conventional volume title (used to center
@@ -132,9 +124,13 @@ impl Man7Formatter {
         f
     }
 
-    fn render(mut self, content: &str) -> Vec<u8> {
+    fn render(mut self, content: &str) -> Option<Vec<u8>> {
         self.process(content);
-        self.term.finish()
+        if self.term.has_body() {
+            Some(self.term.finish())
+        } else {
+            None
+        }
     }
 
     fn process(&mut self, content: &str) {
@@ -364,7 +360,7 @@ mod tests {
     };
 
     fn render(content: &str) -> String {
-        String::from_utf8(format_man7(content, &SETTINGS)).unwrap()
+        String::from_utf8(format_man7(content, &SETTINGS).unwrap()).unwrap()
     }
 
     #[test]
@@ -410,8 +406,8 @@ mod tests {
 
     #[test]
     fn empty_man7_has_no_body() {
-        assert!(!produced_body(".TH T 1\n", &SETTINGS));
-        assert!(produced_body(".TH T 1\n.SH NAME\nx\n", &SETTINGS));
+        assert!(format_man7(".TH T 1\n", &SETTINGS).is_none());
+        assert!(format_man7(".TH T 1\n.SH NAME\nx\n", &SETTINGS).is_some());
     }
 
     #[test]
@@ -420,7 +416,8 @@ mod tests {
             styling: true,
             ..SETTINGS
         };
-        let out = String::from_utf8(format_man7(".TH T 1\n.SH D\n.B bold\n", &styled)).unwrap();
+        let out =
+            String::from_utf8(format_man7(".TH T 1\n.SH D\n.B bold\n", &styled).unwrap()).unwrap();
         assert!(out.contains("b\u{8}bo\u{8}ol\u{8}ld\u{8}d"), "{out:?}");
     }
 }

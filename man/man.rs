@@ -517,10 +517,7 @@ fn format_man_page(
     // the mdoc engine only understands mdoc(7) and would otherwise emit an empty
     // page. The synopsis-only mode (-h) is mdoc-specific.
     if !synopsis && man7::is_man7(&content) {
-        if !man7::produced_body(&content, formatting) {
-            return Err(ManError::EmptyPage);
-        }
-        return Ok(man7::format_man7(&content, formatting));
+        return man7::format_man7(&content, formatting).ok_or(ManError::EmptyPage);
     }
 
     let mut formatter = MdocFormatter::new(*formatting);
@@ -620,12 +617,6 @@ struct ManPageInfo {
 
 /// Scans man page directories and extracts NAME section info from all pages.
 fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPageInfo> {
-    use std::panic;
-
-    // Temporarily suppress panic output for parsing non-mdoc format pages
-    let prev_hook = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
-
     let mut results = Vec::new();
 
     for search_path in search_paths {
@@ -659,15 +650,8 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                     Err(_) => continue,
                 };
 
-                // Use catch_unwind to handle parser panics on non-mdoc format pages
-                let parse_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    MdocParser::parse_mdoc(&content)
-                }));
-
-                let document = match parse_result {
-                    Ok(d) => d,
-                    _ => continue, // Skip on panic
-                };
+                // The hand-written parser is total, so no panic guard is needed.
+                let document = MdocParser::parse_mdoc(&content);
 
                 if let Some((names, description)) = extract_name_info(&document) {
                     results.push(ManPageInfo {
@@ -679,9 +663,6 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
             }
         }
     }
-
-    // Restore the previous panic hook
-    panic::set_hook(prev_hook);
 
     results
 }

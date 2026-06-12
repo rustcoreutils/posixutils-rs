@@ -461,4 +461,74 @@ mod tests {
             output.status.code()
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Robustness — malformed pages must not crash (audit Phase 1)
+    // -------------------------------------------------------------------------
+
+    /// Write `content` to a uniquely named temp file and return its path.
+    fn write_temp_page(tag: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("man_audit_{}_{}.1", tag, std::process::id()));
+        std::fs::write(&path, content).expect("write temp page");
+        path
+    }
+
+    // Audit #1: `.Xr name` with a missing section number must not panic; it
+    // renders as the bare name.
+    #[test]
+    fn xr_missing_section_does_not_crash() {
+        let page = write_temp_page("xr", ".Dd x\n.Dt T 1\n.Os\n.Sh DESCRIPTION\n.Xr grep\n");
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args(["-c", "-l"])
+            .arg(&page)
+            .args(["-C", "man.test.conf"])
+            .output()
+            .expect("Failed to run man -c -l");
+        let _ = std::fs::remove_file(&page);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "expected clean exit, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("grep"),
+            "expected the bare name to render"
+        );
+    }
+
+    // Audit #2: a single line with an absurd number of nested partial macros is
+    // rejected up front (the PEG grammar otherwise backtracks exponentially and
+    // overflows the stack). Must fail fast with a parse error, not hang/crash.
+    #[test]
+    fn deeply_nested_macros_rejected() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n");
+        body.push_str(&".Aq ".repeat(20_000));
+        body.push_str("x\n");
+        let page = write_temp_page("deep", &body);
+
+        let start = std::time::Instant::now();
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args(["-c", "-l"])
+            .arg(&page)
+            .args(["-C", "man.test.conf"])
+            .output()
+            .expect("Failed to run man -c -l");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&page);
+
+        // A clean parse error (exit 1), not a panic (101) or stack overflow (134).
+        assert_eq!(output.status.code(), Some(1), "expected a graceful error");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("nested macros"),
+            "expected the nesting diagnostic, got: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "rejection must be fast, took {elapsed:?}"
+        );
+    }
 }

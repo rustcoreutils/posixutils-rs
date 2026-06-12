@@ -290,6 +290,37 @@ pub enum MdocError {
     /// Pest rules violation
     #[error("mdoc: {0}")]
     Pest(#[from] Box<pest::error::Error<Rule>>),
+
+    /// A single input line nests partial macros far past anything a real page
+    /// uses. The PEG grammar backtracks exponentially on such input, so it is
+    /// rejected up front rather than hanging or overflowing the stack.
+    #[error("mdoc: input line has too many nested macros (limit {0})")]
+    TooDeeplyNested(usize),
+}
+
+/// Partial-implicit and partial-explicit mdoc macros whose grammar rules recurse
+/// (each wraps the remainder of the line). A line with an absurd number of these
+/// triggers exponential PEG backtracking; see [`MdocError::TooDeeplyNested`].
+const NESTING_MACROS: &[&str] = &[
+    "Aq", "Bq", "Brq", "Dq", "Pq", "Qq", "Sq", "Op", "En", "Ql", "Vt", "D1", "Dl", "Ao", "Ac",
+    "Bo", "Bc", "Bro", "Brc", "Do", "Dc", "Eo", "Ec", "Fo", "Fc", "Oo", "Oc", "Po", "Pc", "Qo",
+    "Qc", "So", "Sc", "Xo", "Xc", "Rs", "Re",
+];
+
+/// Maximum number of nesting macros allowed on a single input line. Real pages
+/// stay at or below ~5; the exponential blowup begins around 14, so 12 leaves a
+/// wide margin while keeping worst-case parse time well under a second.
+const MAX_NESTING_PER_LINE: usize = 12;
+
+/// Count the nesting macros on one raw input line (a token may carry a leading
+/// `.` control character, e.g. `.Aq`).
+fn line_nesting_count(line: &str) -> usize {
+    line.split_whitespace()
+        .filter(|tok| {
+            let name = tok.strip_prefix('.').unwrap_or(tok);
+            NESTING_MACROS.contains(&name)
+        })
+        .count()
 }
 
 impl MdocParser {
@@ -332,6 +363,16 @@ impl MdocParser {
 
     /// Parses full mdoc file
     pub fn parse_mdoc(input: &str) -> Result<MdocDocument, MdocError> {
+        // Reject pathologically nested input before handing it to the PEG
+        // parser, which backtracks exponentially (a single deeply nested line
+        // otherwise hangs for seconds and eventually overflows the stack).
+        if input
+            .lines()
+            .any(|line| line_nesting_count(line) > MAX_NESTING_PER_LINE)
+        {
+            return Err(MdocError::TooDeeplyNested(MAX_NESTING_PER_LINE));
+        }
+
         let input = prepare_document(input);
         let pairs = MdocParser::parse(Rule::mdoc, input.as_ref())
             .map_err(|err| MdocError::Pest(Box::new(err)))?;
@@ -2668,16 +2709,19 @@ impl MdocParser {
     fn parse_xr(pair: Pair<Rule>) -> Element {
         let mut inner = pair.into_inner();
 
+        // The grammar guarantees at least one `text_arg` (the name).
         let name = inner.next().unwrap();
         let name = match name.as_rule() {
             Rule::text_arg => name.as_str().to_string(),
             _ => unreachable!(),
         };
 
-        let section = inner.next().unwrap();
-        let section = match section.as_rule() {
-            Rule::text_arg => section.as_str().to_string(),
-            _ => unreachable!(),
+        // The section is optional: a page may write `.Xr name` with no section
+        // number. Do not unwrap a missing second argument (that panicked the
+        // whole process). A missing section renders as the bare name.
+        let section = match inner.peek().map(|p| p.as_rule()) {
+            Some(Rule::text_arg) => inner.next().unwrap().as_str().to_string(),
+            _ => String::new(),
         };
 
         let nodes = inner.map(Self::parse_element).collect();

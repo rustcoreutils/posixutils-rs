@@ -3972,11 +3972,19 @@ impl MdocFormatter {
     fn format_xr(&self, name: &str, section: &str, macro_node: MacroNode) -> String {
         let content = self.format_inline_macro(macro_node);
 
+        // A `.Xr` with no section number renders as the bare name (mandoc
+        // behavior); with a section it is `name(section)`.
+        let head = if section.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}({section})")
+        };
+
         if is_first_char_delimiter(&content) {
-            return format!("{name}({section}){content}");
+            return format!("{head}{content}");
         }
 
-        format!("{}({}) {}", name, section, content.trim())
+        format!("{} {}", head, content.trim())
     }
 }
 

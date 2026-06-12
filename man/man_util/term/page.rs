@@ -28,17 +28,44 @@ pub fn three_part(left: &str, center: &str, right: &str, width: usize) -> String
     line
 }
 
-/// Join lines, collapsing runs of more than one blank line into a single blank.
-pub fn collapse_blank_lines(lines: &[String]) -> String {
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut prev_blank = false;
-    for line in lines {
-        let blank = line.trim().is_empty();
-        if blank && prev_blank {
-            continue;
+/// Collapse runs of blank lines. A run longer than one blank collapses to a
+/// `delimiter_size`-newline gap; a single blank stays a single blank. Whitespace-
+/// only lines count as blank. (Ported verbatim from the mdoc formatter so both
+/// renderers share one blank-line policy.)
+pub fn remove_empty_lines(input: &str, delimiter_size: usize) -> String {
+    let input = input
+        .lines()
+        .map(|line| {
+            if line.chars().all(|ch| ch.is_whitespace()) {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = String::with_capacity(input.len());
+    let mut iter = input.chars().peekable();
+    let lines_delimiter_big = "\n".repeat(delimiter_size);
+    let mut nl_count = 0;
+
+    while let Some(current_char) = iter.next() {
+        if current_char == '\n' {
+            if iter.peek() != Some(&'\n') {
+                let lines_delimiter = if nl_count > 1 {
+                    &lines_delimiter_big.clone()
+                } else {
+                    "\n"
+                };
+                result.push_str(lines_delimiter);
+                nl_count = 1;
+            } else {
+                nl_count += 1;
+            }
+        } else {
+            result.push(current_char);
         }
-        out.push(line);
-        prev_blank = blank;
     }
-    out.join("\n")
+
+    result
 }

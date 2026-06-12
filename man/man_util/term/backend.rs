@@ -17,8 +17,9 @@
 //! Assembly (`finish`) frames the body with the three-part header/footer,
 //! collapses blank runs, and resolves style markers into nroff overstrike.
 
-use super::page::{collapse_blank_lines, three_part};
+use super::page::{remove_empty_lines, three_part};
 use super::style::{apply_styling, display_width};
+use crate::man_util::formatter::replace_escapes;
 
 /// Terminal output builder. See the module docs for the driving model.
 pub struct Term {
@@ -30,6 +31,10 @@ pub struct Term {
     out: Vec<String>,
     /// Words pending in the current filled paragraph (already style-marked).
     pending: Vec<String>,
+    /// Carry buffer for block ingestion (`append_block`): the partially-filled
+    /// line that spans across appended blocks, mirroring the mdoc formatter's
+    /// single `current_line` accumulator.
+    current_line: String,
     /// Current left margin applied to filled text and `emit`/verbatim lines.
     offset: usize,
     /// Saved offsets for [`Term::push_indent`]/[`Term::pop_indent`].
@@ -49,6 +54,7 @@ impl Term {
             styling,
             out: Vec::new(),
             pending: Vec::new(),
+            current_line: String::new(),
             offset: 0,
             indent_stack: Vec::new(),
             header: String::new(),
@@ -67,14 +73,29 @@ impl Term {
         self.has_body
     }
 
-    /// Set the centered three-part header line (`left`/`center`/`right`).
+    /// Set the centered three-part header line (`left`/`center`/`right`). A
+    /// trailing newline is kept so the framing in [`Term::finish`] reproduces the
+    /// blank line beneath the header.
     pub fn set_header(&mut self, left: &str, center: &str, right: &str) {
-        self.header = three_part(left, center, right, self.width);
+        self.header = three_part(left, center, right, self.width) + "\n";
     }
 
-    /// Set the centered three-part footer line (`left`/`center`/`right`).
+    /// Set the header to an already-composed line (mdoc supplies its own centered
+    /// header string, including its trailing newline).
+    pub fn set_header_line(&mut self, line: String) {
+        self.header = line;
+    }
+
+    /// Set the centered three-part footer line (`left`/`center`/`right`). A
+    /// leading newline is kept to reproduce the blank line above the footer.
     pub fn set_footer(&mut self, left: &str, center: &str, right: &str) {
-        self.footer = three_part(left, center, right, self.width);
+        self.footer = format!("\n{}", three_part(left, center, right, self.width));
+    }
+
+    /// Set the footer to an already-composed line (mdoc supplies its own footer
+    /// string, including its leading newline).
+    pub fn set_footer_line(&mut self, line: String) {
+        self.footer = line;
     }
 
     /// Add one already-styled word to the current filled paragraph.
@@ -137,6 +158,63 @@ impl Term {
         self.indent_stack.clear();
     }
 
+    /// Ingest a pre-rendered block string (one top-level node's output) and
+    /// re-flow it to width, preserving each line's own leading indentation. This
+    /// is the mdoc front-end's path into the backend; it carries a partial line
+    /// across calls via `current_line`. Escapes are resolved here. (Ported from
+    /// the formatter's former `append_formatted_text`, the canonical wrapper.)
+    pub fn append_block(&mut self, formatted: &str) {
+        if !formatted.trim().is_empty() {
+            self.has_body = true;
+        }
+        let get_indent = |l: &str| {
+            l.chars()
+                .take_while(|ch| ch.is_whitespace())
+                .collect::<String>()
+        };
+
+        let is_one_line = !formatted.contains('\n');
+        let max_width = self.width;
+
+        for line in formatted.split('\n') {
+            let line = replace_escapes(line);
+
+            if !is_one_line && !self.current_line.is_empty() {
+                self.out.push(self.current_line.trim_end().to_string());
+                self.current_line.clear();
+            }
+
+            let line_len = display_width(&self.current_line) + display_width(&line);
+            if line_len > max_width || is_one_line {
+                let indent = get_indent(&line);
+                let max_width = max_width.saturating_sub(display_width(&indent));
+
+                for word in line.split_whitespace() {
+                    let line_len = display_width(&self.current_line) + display_width(word);
+                    if line_len > max_width {
+                        self.out.push(indent.clone() + self.current_line.trim());
+                        self.current_line.clear();
+                    }
+
+                    self.current_line.push_str(word);
+
+                    if !word.chars().all(|ch| ch.is_control()) {
+                        self.current_line.push(' ');
+                    }
+                }
+
+                let is_not_empty = !(self.current_line.chars().all(|ch| ch.is_whitespace())
+                    || self.current_line.is_empty());
+
+                if is_not_empty {
+                    self.current_line = indent + &self.current_line;
+                }
+            } else {
+                self.out.push(line.to_string());
+            }
+        }
+    }
+
     /// Wrap and emit the pending paragraph words at the current offset.
     pub fn flush(&mut self) {
         if self.pending.is_empty() {
@@ -165,22 +243,35 @@ impl Term {
     }
 
     /// Assemble the framed page (header + body + footer), collapse blank runs,
-    /// and resolve style markers into terminal output bytes.
+    /// and resolve style markers into terminal output bytes. Handles both the
+    /// word-stream path (`flush` of `pending`) and the block path (`current_line`).
     pub fn finish(mut self) -> Vec<u8> {
         self.flush();
-
-        let mut lines = Vec::with_capacity(self.out.len() + 4);
-        if !self.header.is_empty() {
-            lines.push(self.header.clone());
-            lines.push(String::new());
+        if !self.current_line.is_empty() {
+            self.out.push(self.current_line.trim_end().to_string());
+            self.current_line.clear();
         }
-        lines.append(&mut self.out);
+
+        // Drop leading blank lines so the page opens at the header.
+        let lead = self
+            .out
+            .iter()
+            .take_while(|l| l.chars().all(|c| c.is_whitespace()))
+            .count();
+        let mut lines = self.out.split_off(lead);
+
+        // The header carries its own trailing newline and the footer its own
+        // leading newline; the inserted blank reproduces the gap beneath the
+        // header. `remove_empty_lines` then normalizes the runs.
+        if !self.header.is_empty() {
+            lines.insert(0, String::new());
+            lines.insert(0, self.header.clone());
+        }
         if !self.footer.is_empty() {
-            lines.push(String::new());
             lines.push(self.footer.clone());
         }
 
-        let joined = collapse_blank_lines(&lines);
-        apply_styling(&joined, self.styling).into_bytes()
+        let content = remove_empty_lines(&lines.join("\n"), 2);
+        apply_styling(&content, self.styling).into_bytes()
     }
 }

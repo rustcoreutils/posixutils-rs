@@ -7,7 +7,10 @@ use terminfo::Database;
 use super::{
     mdoc_macro::{text_production::*, types::*, Macro},
     parser::{trim_quotes, Element, MacroNode, MdocDocument},
-    term::style::{apply_styling, display_width, STYLE_BOLD, STYLE_RESET, STYLE_UL},
+    term::{
+        style::{display_width, STYLE_BOLD, STYLE_RESET, STYLE_UL},
+        Term,
+    },
 };
 
 /// Replace roff font escapes (`\fB`, `\fI`, `\fR`/`\fP`, `\f(CB`, `\f[name]`, …)
@@ -607,68 +610,13 @@ impl MdocFormatter {
 
 // Base formatting functions.
 impl MdocFormatter {
-    /// Append formatted macros on highest mdoc level.
-    /// Split lines longer than terminal width and
-    /// adds indentation for new lines
-    fn append_formatted_text(
-        &mut self,
-        formatted: &str,
-        current_line: &mut String,
-        lines: &mut Vec<String>,
-    ) {
-        let get_indent = |l: &str| {
-            l.chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>()
-        };
-
-        let is_one_line = !formatted.contains("\n");
-        let max_width = self.formatting_settings.width;
-
-        for line in formatted.split("\n") {
-            let line = replace_escapes(line);
-
-            if !is_one_line && !current_line.is_empty() {
-                lines.push(current_line.trim_end().to_string());
-                current_line.clear();
-            }
-
-            let line_len = display_width(current_line) + display_width(&line);
-            if line_len > max_width || is_one_line {
-                let indent = get_indent(&line);
-                let max_width = max_width.saturating_sub(display_width(&indent));
-
-                for word in line.split_whitespace() {
-                    let line_len = display_width(current_line) + display_width(word);
-                    if line_len > max_width {
-                        lines.push(indent.clone() + current_line.trim());
-                        current_line.clear();
-                    }
-
-                    current_line.push_str(word);
-
-                    if !word.chars().all(|ch| ch.is_control()) {
-                        current_line.push(' ');
-                    }
-                }
-
-                let is_not_empty =
-                    !(current_line.chars().all(|ch| ch.is_whitespace()) || current_line.is_empty());
-
-                if is_not_empty {
-                    *current_line = indent + current_line;
-                }
-            } else {
-                lines.push(line.to_string());
-            }
-        }
-    }
-
     /// If -h man parameter is enabled this function is used instead
     /// [`format_mdoc`] for displaying only `SINOPSYS` section
     pub fn format_synopsis_section(&mut self, ast: MdocDocument) -> Vec<u8> {
-        let mut lines = Vec::new();
-        let mut current_line = String::new();
+        let mut term = Term::new(
+            self.formatting_settings.width,
+            self.formatting_settings.styling,
+        );
 
         for node in ast.elements {
             let formatted_node = match node {
@@ -686,21 +634,18 @@ impl MdocFormatter {
                 _ => continue,
             };
 
-            self.append_formatted_text(&formatted_node, &mut current_line, &mut lines);
+            term.append_block(&formatted_node);
         }
 
-        if !current_line.is_empty() {
-            lines.push(current_line.trim_end().to_string());
-        }
-
-        let content = replace_escapes(&lines.join("\n"));
-        apply_styling(&content, self.formatting_settings.styling).into_bytes()
+        term.finish()
     }
 
     /// Format full [`MdocDocument`] and returns UTF-8 binary string
     pub fn format_mdoc(&mut self, ast: MdocDocument) -> Vec<u8> {
-        let mut lines = Vec::new();
-        let mut current_line = String::new();
+        let mut term = Term::new(
+            self.formatting_settings.width,
+            self.formatting_settings.styling,
+        );
 
         for node in ast.elements {
             let mut formatted_node = self.format_node(node.clone());
@@ -723,36 +668,21 @@ impl MdocFormatter {
                 }
             }
 
-            self.append_formatted_text(&formatted_node, &mut current_line, &mut lines);
+            term.append_block(&formatted_node);
         }
 
-        if !current_line.is_empty() {
-            lines.push(current_line.trim_end().to_string());
-        }
+        // The header is produced by `.Dt` during the walk above (falling back to
+        // the default); the footer uses the date captured during the walk. Both
+        // carry their own newline padding for the framing in `Term::finish`.
+        let header = self
+            .formatting_state
+            .header_text
+            .clone()
+            .unwrap_or_else(|| self.format_default_header());
+        term.set_header_line(header);
+        term.set_footer_line(self.format_footer());
 
-        let first_empty_count = lines
-            .iter()
-            .take_while(|l| l.chars().all(|ch| ch.is_whitespace()))
-            .count();
-
-        lines = lines.split_at(first_empty_count).1.to_vec();
-
-        lines.insert(0, "".to_string());
-
-        lines.insert(
-            0,
-            self.formatting_state
-                .header_text
-                .clone()
-                .unwrap_or_else(|| self.format_default_header()),
-        );
-
-        lines.push(self.format_footer());
-
-        let content = remove_empty_lines(&lines.join("\n"), 2);
-        let content = apply_styling(&content, self.formatting_settings.styling);
-
-        content.into_bytes()
+        term.finish()
     }
 
     fn format_default_header(&mut self) -> String {
@@ -1316,44 +1246,6 @@ fn split_nested_bl(bl: MacroNode) -> Vec<Element> {
 }
 
 /// Removes reduntant empty lines or lines that contains only whitespaces from [`input`]
-fn remove_empty_lines(input: &str, delimiter_size: usize) -> String {
-    let input = input
-        .lines()
-        .map(|line| {
-            if line.chars().all(|ch| ch.is_whitespace()) {
-                ""
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut result = String::with_capacity(input.len());
-    let mut iter = input.chars().peekable();
-    let lines_delimiter_big = "\n".repeat(delimiter_size);
-    let mut nl_count = 0;
-
-    while let Some(current_char) = iter.next() {
-        if current_char == '\n' {
-            if iter.peek() != Some(&'\n') {
-                let lines_delimiter = if nl_count > 1 {
-                    &lines_delimiter_big.clone()
-                } else {
-                    "\n"
-                };
-                result.push_str(lines_delimiter);
-                nl_count = 1;
-            } else {
-                nl_count += 1;
-            }
-        } else {
-            result.push(current_char);
-        }
-    }
-
-    result
-}
-
 // Formatting block full-explicit.
 impl MdocFormatter {
     fn get_width_indent(&self, width: &Option<u8>) -> usize {
@@ -4053,11 +3945,34 @@ mod tests {
         MdocParser::parse_mdoc(input).unwrap()
     }
 
-    /// Universal function for all tests
+    /// Universal function for all tests.
+    ///
+    /// Snapshot regeneration: when the `MAN_BLESS` env var is set to a file
+    /// path, a mismatch is not an assertion failure; instead the call-site line
+    /// (via `#[track_caller]`) and the hex-encoded actual output are appended to
+    /// that file. `dev/bless_man_snapshots.py` then rewrites the inline expected
+    /// strings. This is the regen mechanism for the whole renderer rewrite.
+    #[track_caller]
     pub fn test_formatting(input: &str, output: &str) {
         let ast = get_ast(input);
         let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
         let result = String::from_utf8(formatter.format_mdoc(ast)).unwrap();
+
+        if let Ok(path) = std::env::var("MAN_BLESS") {
+            if result != output {
+                use std::io::Write;
+                let line = std::panic::Location::caller().line();
+                let hex: String = result.bytes().map(|b| format!("{b:02x}")).collect();
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                writeln!(f, "{line} {hex}").unwrap();
+            }
+            return;
+        }
+
         println!(
             "Formatted document:\nTarget:\n{}\n{}\nReal:\n{}\n",
             output,

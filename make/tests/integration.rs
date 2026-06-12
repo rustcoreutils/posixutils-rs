@@ -290,6 +290,33 @@ mod parsing {
     //         ErrorCode::ParseError("no targets".into()).into(),
     //     );
     // }
+
+    // Audit #1: a recipe line that contains '=' (a shell assignment, an
+    // option like --prefix=, or a `test x = y`) must not be mistaken for a
+    // macro definition and must not abort the parse.
+    #[test]
+    fn recipe_line_with_equals() {
+        run_test_helper(
+            &["-f", "tests/makefiles/parsing/recipe_with_equals.mk"],
+            "result=ok\ntesteq_ok\n./configure --prefix=/usr\n",
+            "",
+            0,
+        );
+    }
+
+    // Audit #3: a missing `include` file must produce a graceful error, not
+    // an uncontrolled panic (which exits 101).
+    #[test]
+    fn missing_include_is_graceful_error() {
+        run_test_helper_without_error_message(
+            &["-f", "tests/makefiles/parsing/missing_include.mk"],
+            "",
+            ErrorCode::ParserError {
+                constraint: posixutils_make::parser::parse::ParseError(vec![]),
+            }
+            .into(),
+        );
+    }
 }
 
 mod io {

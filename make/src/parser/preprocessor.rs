@@ -16,12 +16,19 @@ pub enum PreprocError {
     CommandFailed,
     UndefinedMacro(String),
     BadMacroName,
+    IncludeFailed { path: String, reason: String },
 }
 
 impl Display for PreprocError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{:?}", self)?;
-        Ok(())
+        match self {
+            // A missing/unreadable include is a user-facing condition, so give
+            // it a readable message rather than the debug representation.
+            PreprocError::IncludeFailed { path, reason } => {
+                writeln!(f, "cannot open include file '{path}': {reason}")
+            }
+            other => writeln!(f, "{:?}", other),
+        }
     }
 }
 
@@ -40,6 +47,37 @@ fn skip_blank(letters: &mut Peekable<impl Iterator<Item = char>>) {
 
 fn suitable_ident(c: &char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '.')
+}
+
+/// Decide whether a whole makefile line is a macro definition, as opposed to a
+/// recipe line, a rule header, or arbitrary text.
+///
+/// The preprocessor scans the file line-by-line for macro definitions and also
+/// strips those lines before the rule parser runs. Both passes must agree, and
+/// both must avoid misclassifying ordinary content: a recipe line is indented
+/// with a `<tab>` and frequently contains `=` (shell assignments, `--opt=val`,
+/// `test x = y`), and such a line is never a macro definition. A line is a
+/// macro definition only when it is not a recipe line and the text preceding
+/// the assignment operator is a single valid macro name (optionally prefixed
+/// with `export`).
+fn is_macro_definition(line: &str) -> bool {
+    // Recipe lines are tab-indented and are never macro definitions.
+    if line.starts_with('\t') {
+        return false;
+    }
+    let Some(eq) = line.find('=') else {
+        return false;
+    };
+    // Drop a trailing assignment-operator prefix (`:`, `?`, `+`, `!`) so that
+    // `:=`, `::=`, `:::=`, `?=`, `+=`, and `!=` all reduce to the name.
+    let mut name = line[..eq].trim_end_matches([':', '?', '+', '!']).trim();
+    if let Some(rest) = name.strip_prefix("export") {
+        // Require whitespace after `export` so `exported=1` is not mis-split.
+        if rest.starts_with(char::is_whitespace) {
+            name = rest.trim();
+        }
+    }
+    !name.is_empty() && name.chars().all(|c| suitable_ident(&c))
 }
 
 fn get_ident(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<String> {
@@ -79,7 +117,7 @@ fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
 fn generate_macro_table(
     source: &str,
 ) -> std::result::Result<HashMap<String, String>, PreprocError> {
-    let macro_defs = source.lines().filter(|line| line.contains('='));
+    let macro_defs = source.lines().filter(|line| is_macro_definition(line));
     let mut macro_table = HashMap::<String, String>::new();
 
     for def in macro_defs {
@@ -265,34 +303,36 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
 
 /// Copy-pastes included makefiles into single one recursively.
 /// Pretty much the same as C preprocessor and `#include` directive
-fn process_include_lines(source: &str, table: &HashMap<String, String>) -> (String, usize) {
+fn process_include_lines(source: &str, table: &HashMap<String, String>) -> Result<(String, usize)> {
     let mut counter = 0;
-    let result = source
-        .lines()
-        .map(|x| {
-            if let Some(s) = x.strip_prefix("include") {
-                counter += 1;
-                let s = s.trim();
-                let (source, _) = substitute(s, table).unwrap_or_default();
-                let path = Path::new(&source);
-
-                fs::read_to_string(path).unwrap()
-            } else {
-                x.to_string()
+    let mut result = String::new();
+    for line in source.lines() {
+        let expanded = if let Some(s) = line.strip_prefix("include") {
+            counter += 1;
+            let s = s.trim();
+            let (path, _) = substitute(s, table).unwrap_or_default();
+            match fs::read_to_string(Path::new(&path)) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    return Err(PreprocError::IncludeFailed {
+                        path,
+                        reason: err.to_string(),
+                    })
+                }
             }
-        })
-        .map(|mut x| {
-            x.push('\n');
-            x
-        })
-        .collect::<String>();
-    (result, counter)
+        } else {
+            line.to_string()
+        };
+        result.push_str(&expanded);
+        result.push('\n');
+    }
+    Ok((result, counter))
 }
 
 fn remove_variables(source: &str) -> String {
     source
         .lines()
-        .filter(|line| !line.contains('='))
+        .filter(|line| !is_macro_definition(line))
         .map(|x| {
             let mut x = x.to_string();
             x.push('\n');
@@ -308,7 +348,7 @@ pub fn preprocess(source: &str) -> Result<String> {
     let mut table = generate_macro_table(&source)?;
 
     while includes > 0 {
-        (source, includes) = process_include_lines(&source, &HashMap::new());
+        (source, includes) = process_include_lines(&source, &HashMap::new())?;
         table = generate_macro_table(&source)?;
     }
 

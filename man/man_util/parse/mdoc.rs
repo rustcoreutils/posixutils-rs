@@ -146,6 +146,24 @@ impl Parser {
         }
     }
 
+    /// Close the nearest `.Eo` enclosure, recording its closing delimiter.
+    fn close_eo(&mut self, close: Option<char>) {
+        while self.stack.len() > 1
+            && !matches!(self.stack.last().unwrap().mac, Some(Macro::Eo { .. }))
+        {
+            self.close_top();
+        }
+        if matches!(self.stack.last().unwrap().mac, Some(Macro::Eo { .. })) {
+            if let Some(Macro::Eo {
+                closing_delimiter, ..
+            }) = self.stack.last_mut().unwrap().mac.as_mut()
+            {
+                *closing_delimiter = close;
+            }
+            self.close_top();
+        }
+    }
+
     /// Close every open block and return the document elements.
     fn finish(&mut self) -> Vec<Element> {
         while self.stack.len() > 1 {
@@ -334,6 +352,38 @@ impl Parser {
                         nodes,
                     }));
                 }
+            }
+            "Eo" => {
+                // Extended enclosure: optional leading opening delimiter, head
+                // args, body until .Ec; the closing delimiter comes from .Ec. The
+                // delimiters live on the Eo node and .Ec is not kept.
+                let toks = tokenize(rest);
+                let mut idx = 0;
+                let opening_delimiter =
+                    if toks.first().map(|s| is_opening_delim(s)).unwrap_or(false) {
+                        idx = 1;
+                        toks[0].chars().next()
+                    } else {
+                        None
+                    };
+                let ec_pos = toks[idx..].iter().position(|t| t == "Ec").map(|p| p + idx);
+                let head_end = ec_pos.unwrap_or(toks.len());
+                let head_nodes = parse_inline_seq(toks[idx..head_end].to_vec());
+                self.stack.push(Frame {
+                    mac: Some(Macro::Eo {
+                        opening_delimiter,
+                        closing_delimiter: None,
+                    }),
+                    nodes: head_nodes,
+                });
+                if let Some(p) = ec_pos {
+                    let close = toks.get(p + 1).and_then(|s| s.chars().next());
+                    self.close_eo(close);
+                }
+            }
+            "Ec" => {
+                let close = tokenize(rest).first().and_then(|s| s.chars().next());
+                self.close_eo(close);
             }
             "Fo" => {
                 // Function block: first word is the funcname; the rest of the
@@ -1373,6 +1423,14 @@ mod tests {
         parity(".Lb libc\n");
         parity(".Sh A\n.Pf ( Ar x\n");
         parity(".In sys/types.h\n");
+    }
+
+    #[test]
+    fn extended_enclosure() {
+        parity(".Eo\nLine\n.Ec\n");
+        parity(".Eo [\nLine\n.Ec ]\n");
+        parity(".Eo [ arg1 arg2 Ec ]\n");
+        parity(".Eo arg1 arg2 Ec .\n");
     }
 
     #[test]

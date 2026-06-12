@@ -14,7 +14,7 @@
 //! arguments are tokenized per word into `Text` nodes; a plain text line becomes
 //! a single `Text` node, matching the pest AST.
 
-use crate::man_util::mdoc_macro::types::{AnType, BdType, BfType, OffsetType, SmMode};
+use crate::man_util::mdoc_macro::types::{AnType, BdType, BfType, BlType, OffsetType, SmMode};
 use crate::man_util::mdoc_macro::Macro;
 use crate::man_util::parser::{prepare_document, trim_quotes, Element, MacroNode, MdocDocument};
 
@@ -49,9 +49,21 @@ struct Parser {
 }
 
 impl Parser {
-    /// Append a finished element to the innermost open block.
+    /// Append a finished element to the innermost open block. Content directly
+    /// inside a `.Bl` (i.e. not within an `.It`) is `bl_skip` — dropped.
     fn push(&mut self, el: Element) {
-        self.stack.last_mut().unwrap().nodes.push(el);
+        let top = self.stack.last_mut().unwrap();
+        if matches!(top.mac, Some(Macro::Bl { .. })) {
+            return;
+        }
+        top.nodes.push(el);
+    }
+
+    /// Close any open `.It` item back to the enclosing `.Bl`.
+    fn close_open_items(&mut self) {
+        while matches!(self.stack.last().unwrap().mac, Some(Macro::It { .. })) {
+            self.close_top();
+        }
     }
 
     /// Open a new implicit block, after closing the blocks it terminates.
@@ -185,6 +197,19 @@ impl Parser {
             "Ed" => self.close_explicit(is_bd),
             "Ef" => self.close_explicit(is_bf),
             "Ek" => self.close_explicit(is_bk),
+            "Bl" => self.open_block(parse_bl(rest), &[]),
+            "It" => {
+                self.close_open_items();
+                let head = parse_inline_seq(tokenize(rest));
+                self.stack.push(Frame {
+                    mac: Some(Macro::It { head }),
+                    nodes: Vec::new(),
+                });
+            }
+            "El" => {
+                self.close_open_items();
+                self.close_explicit(is_bl);
+            }
             "Sm" => {
                 // Optional on/off spacing mode; the first arg is consumed either
                 // way (matching pest), the rest become text nodes.
@@ -276,6 +301,14 @@ fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
     let mut out = Vec::new();
     let mut toks = tokens.into_iter().peekable();
     while let Some(tok) = toks.next() {
+        if tok == "Ta" {
+            // Column separator (its own macro node).
+            out.push(Element::Macro(MacroNode {
+                mdoc_macro: Macro::Ta,
+                nodes: Vec::new(),
+            }));
+            continue;
+        }
         if tok == "An" {
             // .An -split / -nosplit consume only the flag; otherwise the rest of
             // the line is the author name.
@@ -481,7 +514,72 @@ fn is_leaf(name: &str) -> bool {
 /// Whether `name` is a callable inline macro the v2 parser handles (used both to
 /// dispatch and as the chaining boundary).
 fn is_callable(name: &str) -> bool {
-    is_leaf(name) || container_macro(name).is_some() || matches!(name, "An" | "Fn")
+    is_leaf(name) || container_macro(name).is_some() || matches!(name, "An" | "Fn" | "Ta")
+}
+
+/// Parse a `.Bl -type [-width w] [-offset o] [-compact] [columns…]` list opener.
+fn parse_bl(rest: &str) -> Macro {
+    let toks = tokenize(rest);
+    let mut it = toks.iter();
+    let list_type = match it.next().map(|s| s.as_str()) {
+        Some("-bullet") => BlType::Bullet,
+        Some("-column") => BlType::Column,
+        Some("-dash") | Some("-hyphen") => BlType::Dash,
+        Some("-diag") => BlType::Diag,
+        Some("-enum") => BlType::Enum,
+        Some("-hang") => BlType::Hang,
+        Some("-inset") => BlType::Inset,
+        Some("-ohang") => BlType::Ohang,
+        Some("-tag") => BlType::Tag,
+        _ => BlType::Item,
+    };
+    let mut width = None;
+    let mut offset = None;
+    let mut columns = Vec::new();
+    let (mut seen_w, mut seen_o, mut compact) = (false, false, false);
+    while let Some(t) = it.next() {
+        match t.as_str() {
+            "-width" if !seen_w => {
+                seen_w = true;
+                width = parse_width(it.next());
+            }
+            "-offset" if !seen_o => {
+                seen_o = true;
+                offset = it.next().map(|s| offset_type(s));
+            }
+            "-compact" if !compact => compact = true,
+            _ => columns.push(t.clone()),
+        }
+    }
+    Macro::Bl {
+        list_type,
+        width,
+        offset,
+        compact,
+        columns,
+    }
+}
+
+/// Parse a `.Bl -width` value: a leading number, a known macro width, else the
+/// argument's character length.
+fn parse_width(w: Option<&String>) -> Option<u8> {
+    let s = w?;
+    if s.chars().next()?.is_ascii_digit() {
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u8>().ok()
+    } else {
+        match s.as_str() {
+            "Er" => Some(19),
+            "Ds" => Some(8),
+            "Ev" => Some(17),
+            "Fl" => Some(12),
+            _ => u8::try_from(s.len()).ok(),
+        }
+    }
+}
+
+fn is_bl(m: &Macro) -> bool {
+    matches!(m, Macro::Bl { .. })
 }
 
 /// Build an `.An` author node.
@@ -643,6 +741,26 @@ mod tests {
     #[test]
     fn full_prologue_with_name() {
         parity(".Dd June 1, 2024\n.Dt CAT 1\n.Os\n.Sh NAME\n.Nm cat\n.Nd concatenate\n");
+    }
+
+    #[test]
+    fn lists() {
+        parity(".Bl -bullet\n.It\nfirst\n.It\nsecond\n.El\n");
+        parity(".Bl -tag -width Ds\n.It item one\nbody one\n.It item two\nbody two\n.El\n");
+        parity(".Bl -enum -compact\n.It\na\n.It\nb\n.El\n");
+        parity(".Bl -dash -offset indent\n.It\nx\n.El\n");
+    }
+
+    #[test]
+    fn list_with_flag_heads() {
+        parity(
+            ".Sh OPTIONS\n.Bl -tag -width Fl\n.It Fl v\nverbose\n.It Fl o Ar file\noutput\n.El\n",
+        );
+    }
+
+    #[test]
+    fn list_stray_content_skipped() {
+        parity(".Bl -bullet\nstray text\n.It\nitem\n.El\n");
     }
 
     #[test]

@@ -39,6 +39,15 @@ type MacroBody = Vec<String>;
 /// Resolver for `.so` include targets (`None` disables inclusion).
 type SoLoader = Box<dyn Fn(&str) -> Option<String>>;
 
+/// An active output diversion (`.di`/`.da`): emitted lines are captured into
+/// `buf` instead of the output, and stored as macro `name` when the diversion
+/// ends.
+struct Diversion {
+    name: String,
+    append: bool,
+    buf: Vec<String>,
+}
+
 /// roff interpreter state.
 #[derive(Default)]
 pub struct Roff {
@@ -52,6 +61,8 @@ pub struct Roff {
     last_cond: bool,
     /// Emitted output lines.
     out: Vec<String>,
+    /// The active output diversion, if any (`.di`/`.da`).
+    divert: Option<Diversion>,
     /// Resolves `.so` targets to file contents (None disables `.so`).
     loader: Option<SoLoader>,
 }
@@ -134,6 +145,9 @@ impl Roff {
             "ie" => self.do_if(args, queue, true),
             "el" => self.do_el(args, queue),
             "ig" => self.do_ig(args, queue),
+            "di" => self.do_di(args, false),
+            "da" => self.do_di(args, true),
+            "while" => self.do_while(args, queue),
             "so" | "mso" => self.do_so(args, queue),
             "nop" => {
                 if !args.is_empty() {
@@ -151,14 +165,22 @@ impl Roff {
             _ => {
                 let line = self.strip_comment(&line);
                 let line = self.interpolate(&line);
-                self.out.push(line);
+                self.emit_line(line);
             }
         }
     }
 
     fn emit_text(&mut self, line: String) {
         let line = self.interpolate(&line);
-        self.out.push(line);
+        self.emit_line(line);
+    }
+
+    /// Route an emitted line to the active diversion, or to the output.
+    fn emit_line(&mut self, line: String) {
+        match &mut self.divert {
+            Some(d) => d.buf.push(line),
+            None => self.out.push(line),
+        }
     }
 
     // ── Macro definition & expansion ──────────────────────────────────────
@@ -294,9 +316,17 @@ impl Roff {
         self.run_conditional_body(cond, args.to_string(), queue);
     }
 
-    /// Execute (or skip) a conditional body. The body is either the remainder of
-    /// the line, or a `\{ … \}` block that may span lines pulled from `queue`.
+    /// Execute (or skip) a conditional body.
     fn run_conditional_body(&mut self, cond: bool, rest: String, queue: &mut Vec<String>) {
+        let lines = Self::collect_body(&rest, queue);
+        if cond {
+            Self::push_front(queue, lines);
+        }
+    }
+
+    /// Collect a request/conditional body: either the remainder of the line, or a
+    /// `\{ … \}` block that may span lines pulled from `queue`.
+    fn collect_body(rest: &str, queue: &mut Vec<String>) -> Vec<String> {
         let rest = rest.trim_start();
         let mut lines: Vec<String> = Vec::new();
 
@@ -330,15 +360,57 @@ impl Roff {
                 }
             }
         } else if !rest.is_empty() {
-            // Single-line body: the remainder is one request/text line. If it has
-            // a leading control char it is already a control line; otherwise it is
-            // a request fragment like `.ds x` written as `ds x` is not valid, so
-            // treat the remainder verbatim.
+            // Single-line body: the remainder is one request/text line.
             lines.push(rest.to_string());
         }
 
-        if cond {
-            Self::push_front(queue, lines);
+        lines
+    }
+
+    /// `.while COND body` — repeatedly run `body` while `COND` holds. The body is
+    /// captured once; the condition is re-evaluated each iteration against the
+    /// (mutating) register state. A hard iteration cap guards against runaway
+    /// loops.
+    fn do_while(&mut self, args: &str, queue: &mut Vec<String>) {
+        let (_, rest) = self.eval_condition(args);
+        let body = Self::collect_body(&rest, queue);
+
+        let mut iters = 0;
+        while self.eval_condition(args).0 {
+            iters += 1;
+            if iters > 100_000 || body.is_empty() {
+                break;
+            }
+            let mut subq: Vec<String> = body.iter().rev().cloned().collect();
+            let mut steps = 0;
+            while let Some(l) = subq.pop() {
+                steps += 1;
+                if steps > MAX_OUTPUT_LINES {
+                    break;
+                }
+                self.process_line(l, &mut subq);
+            }
+        }
+    }
+
+    /// `.di NAME` / `.da NAME` start (or, with no name, end) an output diversion.
+    /// Captured lines become macro `NAME`, so `.NAME` re-emits the diverted text.
+    fn do_di(&mut self, args: &str, append: bool) {
+        // Close any diversion already in progress.
+        if let Some(d) = self.divert.take() {
+            if d.append {
+                self.de.entry(d.name).or_default().extend(d.buf);
+            } else {
+                self.de.insert(d.name, d.buf);
+            }
+        }
+        let name = split_name(args).0;
+        if !name.is_empty() {
+            self.divert = Some(Diversion {
+                name: name.to_string(),
+                append,
+                buf: Vec::new(),
+            });
         }
     }
 

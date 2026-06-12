@@ -172,6 +172,35 @@ fn width_escape_resolves_to_cell_count() {
     assert_eq!(run(".if \\w'hello'=5 yes\n"), "yes\n");
 }
 
+#[test]
+fn while_block_loop() {
+    let input = ".nr i 0\n.while \\n[i]<3 \\{\\\n\\n[i]\n.nr i +1\n\\}\n";
+    assert_eq!(run(input), "0\n1\n2\n");
+}
+
+#[test]
+fn while_single_line_body() {
+    let input = ".nr i 0\n.while \\n[i]<2 .nr i +1\ndone \\n[i]\n";
+    assert_eq!(run(input), "done 2\n");
+}
+
+#[test]
+fn while_false_runs_zero_times() {
+    assert_eq!(run(".if 1 a\n.while 0 never\nb\n"), "a\nb\n");
+}
+
+#[test]
+fn diversion_capture_and_replay() {
+    let input = ".di SAVE\ncaptured line\n.di\nbefore\n.SAVE\nafter\n";
+    assert_eq!(run(input), "before\ncaptured line\nafter\n");
+}
+
+#[test]
+fn diversion_append() {
+    let input = ".di D\none\n.di\n.da D\ntwo\n.di\n.D\n";
+    assert_eq!(run(input), "one\ntwo\n");
+}
+
 // ── expression evaluator ─────────────────────────────────────────────────
 
 #[test]

@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use gettextrs::gettext;
 use std::{cell::Cell, iter, rc::Rc};
 
 /// Convert UTF-8 to UCS-4
@@ -21,7 +22,8 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
     let fail = move |msg: &str, suppress: bool, flag: &Rc<Cell<bool>>| {
         flag.set(true);
         if !suppress {
-            eprintln!("{}", msg);
+            // Route through gettext so LC_MESSAGES can localize the diagnostic.
+            eprintln!("{}", gettext(msg));
         }
     };
 

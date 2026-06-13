@@ -70,13 +70,13 @@ fn main() {
     // Non-`-s` form: `[textdomain] msgid` (exactly one msgid).
     let (operand_domain, msgid): (Option<&str>, &str) = match args.args.len() {
         0 => {
-            eprintln!("gettext: missing message");
+            eprintln!("{}", gettext("gettext: missing message"));
             exit(1);
         }
         1 => (None, &args.args[0]),
         2 => (Some(args.args[0].as_str()), &args.args[1]),
         _ => {
-            eprintln!("gettext: too many arguments");
+            eprintln!("{}", gettext("gettext: too many arguments"));
             exit(1);
         }
     };

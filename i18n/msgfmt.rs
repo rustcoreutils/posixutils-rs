@@ -96,7 +96,7 @@ fn main() {
     // POSIX: at least one pathname operand is required, but report it as a
     // usage diagnostic rather than a clap argument error.
     if args.files.is_empty() {
-        eprintln!("msgfmt: no input file given");
+        eprintln!("{}", gettext("msgfmt: no input file given"));
         exit(1);
     }
 

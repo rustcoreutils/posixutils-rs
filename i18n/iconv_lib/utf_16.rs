@@ -8,6 +8,7 @@
 //
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use gettextrs::gettext;
 use std::{cell::Cell, iter, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +81,10 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                         } else {
                             had_error.set(true);
                             if !suppress_error {
-                                eprintln!("Error: Unpaired surrogate at end of input");
+                                eprintln!(
+                                    "{}",
+                                    gettext("Error: Unpaired surrogate at end of input")
+                                );
                             }
                             return None;
                         }
@@ -100,7 +104,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                     } else {
                         had_error.set(true);
                         if !suppress_error {
-                            eprintln!("Error: Invalid low surrogate");
+                            eprintln!("{}", gettext("Error: Invalid low surrogate"));
                         }
                         return None;
                     }
@@ -120,7 +124,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 } else {
                     had_error.set(true);
                     if !suppress_error {
-                        eprintln!("Error: Unpaired low surrogate");
+                        eprintln!("{}", gettext("Error: Unpaired low surrogate"));
                     }
                     return None;
                 }

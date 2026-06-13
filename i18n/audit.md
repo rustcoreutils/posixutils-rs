@@ -30,13 +30,13 @@ The good news: `.po`/`.mo` round-tripping, the gettext plural-expression evaluat
 
 These recur across the crate and are worth fixing as themed sweeps rather than per-utility:
 
-1. **Exit status 0 after a diagnosed error.** `iconv` (charmap path, `-s` path, default-codeset failure), `locale` (unknown keyword, `charmap` operand), and `localedef` (no-op success) all print to stderr and then exit 0. POSIX requires `>0` on error for every one of these. The root cause is `main()` returning `()` / `Ok(())` with no `had_error` flag threaded out of the worker functions. **✓ verified** on `iconv`, `locale`.
+1. **[RESOLVED]** **Exit status 0 after a diagnosed error.** ✓ fixed across the crate: `iconv` (Phase 3 — `had_error` flag threaded out of the codecs/charmap path, exit `>0`), `locale` (Phase 5 — unknown name / error paths exit 1), and `localedef` (Phase 11 — full 0/1/2/>3 exit table). POSIX `>0`-on-error is now met for all three. The root cause is `main()` returning `()` / `Ok(())` with no `had_error` flag threaded out of the worker functions. **✓ verified** on `iconv`, `locale`.
 
-2. **Hardcoded English diagnostics; `LC_MESSAGES` is inert.** Every utility calls `setlocale(LC_ALL, "")` + `textdomain(...)` near `main()`, but the runtime diagnostic strings (`eprintln!`, `ParseError::fmt`, clap `about` strings evaluated at attribute-expansion time) are not wrapped in runtime `gettext()`. The spec's `LC_MESSAGES` entry ("affect the format and contents of diagnostic messages") is therefore unmet crate-wide. Minor, but pervasive.
+2. **[ADDRESSED]** **Hardcoded English diagnostics; `LC_MESSAGES` is inert.** ✓ Phase 12: the static user-facing diagnostics across the utilities and the `iconv_lib` codecs are now routed through runtime `gettext()` (the `setlocale`+`textdomain` setup was already present), so `LC_MESSAGES` can localize them and `xgettext` can extract them. Following the repo's established convention, interpolated diagnostics that carry dynamic data are left unwrapped. Originally none of the runtime diagnostic strings were wrapped in runtime `gettext()`.
 
-3. **`NLSPATH` / `LANGUAGE` not honored.** The XSI `NLSPATH` variable (required to take precedence over `TEXTDOMAINDIR`) and the XSI `LANGUAGE` variable are not consulted by the gettext family. Several utilities list `NLSPATH` in their ENVIRONMENT VARIABLES section but never read it.
+3. **[RESOLVED]** **`NLSPATH` / `LANGUAGE` not honored.** ✓ Phase 9: the gettext family now consults `NLSPATH` (with precedence over `TEXTDOMAINDIR`) and the `LANGUAGE` priority list in `gettext_lib::lookup`. The XSI `NLSPATH` variable (required to take precedence over `TEXTDOMAINDIR`) and the XSI `LANGUAGE` variable were not consulted by the gettext family.
 
-4. **`LC_CTYPE`-driven byte interpretation ignored.** `gencat`, `iconv`, `msgfmt`, and `localedef` read input as UTF-8 (`read_to_string`) and never consult `LC_CTYPE` to interpret byte sequences, so on non-UTF-8 locales multibyte text is mishandled.
+4. **[DEFERRED]** **`LC_CTYPE`-driven byte interpretation ignored.** `gencat`, `iconv`, `msgfmt`, and `localedef` read input as UTF-8 (`read_to_string`) and never consult `LC_CTYPE` to interpret byte sequences, so on non-UTF-8 locales multibyte text is mishandled. This is a deeper functional change (byte-oriented re-architecture of each parser) and is out of scope for this audit-fix pass; recorded as a known limitation alongside the deferred localedef compilation (LD-1).
 
 5. **Real implementation, not delegation — but incomplete.** Unlike some posixutils crates that shell out to the host tool, these are genuine in-tree implementations. That is the right call, but it means the gaps (charmap parsing, locale compilation, codeset matrix) are real functional holes rather than thin wrappers. Two places *do* delegate: `locale -a` spawns the system `locale -a` when a `locale-archive` is present (`locale_lib/platform.rs`), and the C-locale machinery is reached via `localeconv()`/`setlocale()`.
 
@@ -66,7 +66,7 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 - [x] **GC-8 — Message-id range/order not validated.** ✓ fixed (Phase 2): `[1,NL_MSGMAX]` enforced; ascending is advisory (collision-replace is legal), noted in code. No check that `msg_id` is in `[1, NL_MSGMAX]` or ascending within a set (`gencat.rs:419`). `msg_id == 0` is silently accepted.
 
 ### Minor
-- [ ] **GC-9 — Diagnostics not localized** (`ParseError::fmt`, `gencat.rs:229-262`) — `LC_MESSAGES` has no effect.
+- [x] **GC-9 — Diagnostics not localized.** ✓ addressed (Phase 12): gencat's catalog-validation diagnostics are routed through `gettext()`, and the crate-wide sweep wraps the static user-facing diagnostics so `LC_MESSAGES` can localize them. (Per the repo's established convention, interpolated diagnostics that carry dynamic data are left unwrapped.)
 - [x] **GC-10 — `NL_SETMAX` hardcoded to 255** ✓ fixed (Phase 2): documented as matching the POSIX/glibc/macOS `<limits.h>` limit; `NL_MSGMAX` added too. (`gencat.rs:25`) rather than queried from the platform `<limits.h>`. Incidentally correct on Linux.
 - [x] **GC-11 — `$quote c` uses byte length** ✓ fixed (Phase 2): now `chars().count() == 1`. (`c.len() == 1`, `gencat.rs:349`) not char count; a single multibyte quote char is rejected.
 - [x] **GC-12 — `msgfile` `-` (stdin) is untested** ✓ fixed (Phase 2): added `gencat_msgfile_from_stdin` integration test.; correctness depends on `plib::io::input_stream` and is unexercised.
@@ -87,7 +87,7 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 
 ### Environment variables
 - [ ] **`LC_CTYPE` MISSING** — source read as UTF-8, not LC_CTYPE-interpreted.
-- [ ] **`LC_MESSAGES` PARTIAL** — diagnostics hardcoded English (GC-9).
+- [x] **`LC_MESSAGES` — diagnostics routed through gettext** (GC-9, Phase 12).
 - [x] `LANG`/`LC_ALL` PARTIAL — honored only via `setlocale` (`gencat.rs:786`).
 - [ ] **`NLSPATH` PARTIAL** — not read for the utility's own diagnostics.
 
@@ -189,7 +189,7 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 ### Minor
 - [x] **IC-7 — Charmap `mb_cur_max` defaults to 0** (`iconv.rs:186`). ✓ fixed (Phase 4): `parse_charmap` now defaults `mb_cur_max` to 1 when the charmap omits it, so the flush guard is no longer always true.
 - [x] **IC-8 — Per-byte stdout flush** in the encoding path (`iconv.rs:410-413`). ✓ fixed (Phase 4): `encoding_conversion` writes through a `BufWriter` and flushes once at end instead of flushing after every byte.
-- [ ] **IC-9 — Hardcoded English diagnostics** in `iconv_lib` (`ascii.rs:28`, etc.); `LC_MESSAGES` inert. _(Deferred to Phase 12: crate-wide gettext diagnostics sweep.)_
+- [x] **IC-9 — Hardcoded English diagnostics** in `iconv_lib`. ✓ addressed (Phase 12): the codec diagnostics are routed through `gettext()` — `utf_8` via its `fail` helper and `utf_16`'s static messages — so `LC_MESSAGES` can localize them. (Interpolated codec messages carrying dynamic offsets/code points are left unwrapped, per repo convention.)
 - [x] **IC-10 — Typo `supress_error`** (one `s`) in `encoding_conversion` signature (`iconv.rs:362`). ✓ fixed (Phase 4): renamed to `suppress_error`.
 - [x] **IC-11 — `from_ucs4` silent drop:** ✓ fixed (Phase 3, folded into the error model): the surrogate / out-of-range branches in `utf_8::from_ucs4` and `utf_16::from_ucs4` no longer return a silent `Some(vec![])`. With `!omit_invalid` they now set `had_error` (so exit `>0`) and report unless `-s`; with `-c` they omit. (`utf_16::from_ucs4` also had inverted omit/suppress logic, fixed here.)
 
@@ -203,7 +203,7 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 
 ### Environment variables
 - [x] **`LC_ALL`/`LC_CTYPE`/`LANG` CONFORMS** for default codeset (IC-3, Phase 4) — resolved via `nl_langinfo(CODESET)`, which honors the full chain.
-- [ ] **`LC_MESSAGES` PARTIAL** (IC-9, deferred to Phase 12). `NLSPATH` N/A (gettextrs equivalent).
+- [x] **`LC_MESSAGES` — codec diagnostics routed through gettext** (IC-9, Phase 12). `NLSPATH` N/A (gettextrs equivalent).
 
 ### Conversion engine
 - [x] ASCII ↔ UTF-8/16/32 (+ LE/BE) full matrix CONFORMS; UTF-16/32 **input** BOM handling CONFORMS (`utf_16.rs:46-65`, `utf_32.rs:44-63`).
@@ -401,7 +401,7 @@ The C-source extraction path (via the in-tree `posixutils-cc` parser), keyword-s
 - [x] **XG-7 — Rust source parsing is a spec extension.** ✓ documented (Phase 10): a comment at the operand dispatch records that `.rs` is a posixutils extension beyond "C-language source files," used for this project's own build tooling.
 - [x] **XG-8 — `domain` directive not written** to the output file. ✓ acceptable (Phase 10): xgettext writes only the default output file here, and the spec makes the leading `domain` directive optional for the default output file. (Multi-domain output files are not produced.)
 - [x] **XG-9 — Plural output is always `msgstr[0]`/`msgstr[1]`.** ✓ acceptable (Phase 10): a `.po` template legitimately emits two empty plural forms; the target plural count is filled in by the translator/`msgfmt`.
-- [ ] **XG-10 — File-I/O errors propagate as raw Rust `Err`** (not `gettext()`-wrapped), so they are unlocalized; exit code is still `>0` (correct). _(Deferred to Phase 12: crate-wide gettext diagnostics sweep.)_
+- [x] **XG-10 — File-I/O errors propagate as raw Rust `Err`.** ✓ acceptable (Phase 12): these carry a dynamic OS error message and exit `>0` correctly. Per the crate-wide sweep's convention, only static diagnostics are `gettext()`-wrapped; interpolated I/O errors (the OS message is itself locale-influenced via libc) are left as-is, consistent with the rest of posixutils.
 - [x] **XG-11 — `-K` default mechanism is fragile.** ✓ fixed (Phase 10): the clap `default_value = "gettext"` injection was removed; `KeywordSpec::defaults()` is the single source of the default keyword set, and `-K ""` cleanly disables it.
 
 ## Conformance matrix

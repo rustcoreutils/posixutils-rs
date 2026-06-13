@@ -555,7 +555,7 @@ fn charmap_conversion(
             } else {
                 had_error.set(true);
                 if !suppress_error {
-                    eprintln!("Error: Invalid or unmapped character");
+                    eprintln!("{}", gettext("Error: Invalid or unmapped character"));
                 }
                 if let Err(e) = stdout.write_all(&[buffer[0]]) {
                     eprintln!("Error writing to stdout: {}", e);
@@ -578,7 +578,10 @@ fn charmap_conversion(
                 eprintln!("Error flushing stdout: {}", e);
             }
             if !suppress_error {
-                eprintln!("Error: Invalid or unmapped character at end of input");
+                eprintln!(
+                    "{}",
+                    gettext("Error: Invalid or unmapped character at end of input")
+                );
             }
         }
     }

@@ -69,7 +69,7 @@ fn main() {
             &args.args[3],
         ),
         _ => {
-            eprintln!("ngettext: usage: ngettext [-e|-E] [-d textdomain] [textdomain] msgid msgid_plural n");
+            eprintln!("{}", gettext("ngettext: usage: ngettext [-e|-E] [-d textdomain] [textdomain] msgid msgid_plural n"));
             exit(1);
         }
     };

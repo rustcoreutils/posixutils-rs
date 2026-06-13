@@ -461,4 +461,309 @@ mod tests {
             output.status.code()
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Robustness — malformed pages must not crash (audit Phase 1)
+    // -------------------------------------------------------------------------
+
+    /// Write `content` to a uniquely named temp file and return its path.
+    fn write_temp_page(tag: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("man_audit_{}_{}.1", tag, std::process::id()));
+        std::fs::write(&path, content).expect("write temp page");
+        path
+    }
+
+    // Audit #1: `.Xr name` with a missing section number must not panic; it
+    // renders as the bare name.
+    #[test]
+    fn xr_missing_section_does_not_crash() {
+        let page = write_temp_page("xr", ".Dd x\n.Dt T 1\n.Os\n.Sh DESCRIPTION\n.Xr grep\n");
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args(["-c", "-l"])
+            .arg(&page)
+            .args(["-C", "man.test.conf"])
+            .output()
+            .expect("Failed to run man -c -l");
+        let _ = std::fs::remove_file(&page);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "expected clean exit, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("grep"),
+            "expected the bare name to render"
+        );
+    }
+
+    // Audit #2: a single line with an absurd number of nested partial macros is
+    // rejected up front (the PEG grammar otherwise backtracks exponentially and
+    // overflows the stack). Must fail fast with a parse error, not hang/crash.
+    #[test]
+    fn deeply_nested_macros_rejected() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n");
+        body.push_str(&".Aq ".repeat(20_000));
+        body.push_str("x\n");
+        let page = write_temp_page("deep", &body);
+
+        let start = std::time::Instant::now();
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args(["-c", "-l"])
+            .arg(&page)
+            .args(["-C", "man.test.conf"])
+            .output()
+            .expect("Failed to run man -c -l");
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&page);
+
+        // The hand-written parser has no exponential backtracking, so a
+        // pathologically nested line is handled quickly and without crashing —
+        // no panic (101) or stack overflow (134), and no need for the old
+        // nesting-limit rejection.
+        let code = output.status.code();
+        assert!(
+            matches!(code, Some(0) | Some(1)),
+            "must not crash on deep nesting, got exit {code:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must handle deep nesting fast, took {elapsed:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Pager & width fidelity (audit Phase 2)
+    // -------------------------------------------------------------------------
+
+    fn longest_line(stdout: &[u8]) -> usize {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn format_local(env: &[(&str, &str)], page: &std::path::Path) -> std::process::Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_man"));
+        cmd.args(["-c", "-l"])
+            .arg(page)
+            .args(["-C", "man.test.conf"]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("Failed to run man -c -l")
+    }
+
+    // Audit #7: COLUMNS sets the rendering width (wider and narrower than the
+    // 78-column default), instead of being ignored.
+    #[test]
+    fn columns_env_sets_width() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh DESCRIPTION\n");
+        for i in 0..40 {
+            body.push_str(&format!("word{i:02} "));
+        }
+        body.push('\n');
+        let page = write_temp_page("cols", &body);
+
+        let wide = longest_line(&format_local(&[("COLUMNS", "120")], &page).stdout);
+        let narrow = longest_line(&format_local(&[("COLUMNS", "40")], &page).stdout);
+        let _ = std::fs::remove_file(&page);
+
+        assert!(wide > 90, "COLUMNS=120 should widen lines, got {wide}");
+        assert!(narrow <= 39, "COLUMNS=40 should narrow lines, got {narrow}");
+    }
+
+    // Audit #12: a COLUMNS value of 0 must not underflow the width computation.
+    #[test]
+    fn columns_zero_does_not_underflow() {
+        let page = write_temp_page("colz", ".Dd x\n.Dt T 1\n.Os\n.Sh D\nhello\n");
+        let output = format_local(&[("COLUMNS", "0")], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(longest_line(&output.stdout) <= 200, "width must stay sane");
+    }
+
+    // Audit #13: a `.Bl -width` larger than 20 is honored, not silently clamped.
+    #[test]
+    fn bl_width_above_20_is_honored() {
+        let page = write_temp_page(
+            "blw",
+            ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Bl -tag -width 30\n.It tag\nbody\n.El\n",
+        );
+        // Wide page so 30 fits.
+        let output = format_local(&[("COLUMNS", "100")], &page);
+        let _ = std::fs::remove_file(&page);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The tag and body share a line: `<indent>tag<pad>body`. The column
+        // where `body` begins reflects the tag-column width; with -width 30 it
+        // must sit past the old 20-clamp (base indent + 20 = 26).
+        let body_line = stdout
+            .lines()
+            .find(|l| l.contains("tag") && l.contains("body"))
+            .expect("tag+body line present");
+        let body_col = body_line.find("body").unwrap();
+        assert!(
+            body_col > 26,
+            "body should start past the old 20-clamp, got column {body_col}"
+        );
+    }
+
+    // Audit #6: with no `-c` and stdout not a terminal (piped), output is written
+    // directly, NOT through PAGER.
+    #[test]
+    fn pager_not_invoked_when_piped() {
+        // A PAGER marker script; if invoked it prepends a sentinel line.
+        let pager = std::env::temp_dir().join(format!("man_audit_pager_{}.sh", std::process::id()));
+        std::fs::write(&pager, "#!/bin/sh\necho __PAGER_RAN__\ncat\n").unwrap();
+        let mut perms = std::fs::metadata(&pager).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&pager, perms).unwrap();
+
+        let page = write_temp_page("pgr", ".Dd x\n.Dt T 1\n.Os\n.Sh NAME\n.Nm t\n");
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args(["-l"])
+            .arg(&page)
+            .args(["-C", "man.test.conf"])
+            .env("PAGER", &pager)
+            .output()
+            .expect("Failed to run man -l");
+        let _ = std::fs::remove_file(&page);
+        let _ = std::fs::remove_file(&pager);
+
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("__PAGER_RAN__"),
+            "PAGER must not be invoked when stdout is not a terminal"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Search, encoding & misc (audit Phase 4)
+    // -------------------------------------------------------------------------
+
+    // Audit #10: a non-UTF-8 (Latin-1) page renders instead of erroring out.
+    #[test]
+    fn non_utf8_page_renders() {
+        let mut bytes = b".Dd x\n.Dt T 1\n.Os\n.Sh D\n".to_vec();
+        bytes.extend_from_slice(b"caf\xe9\n"); // Latin-1 'é'
+        let path = std::env::temp_dir().join(format!("man_audit_latin1_{}.1", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let output = format_local(&[], &path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(output.status.code(), Some(0), "should not error on Latin-1");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("caf"));
+    }
+
+    // Audit #11: a `.It` outside any `.Bl` renders its text rather than vanishing.
+    #[test]
+    fn stray_it_renders() {
+        let page = write_temp_page("it", ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.It orphanitem\n");
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("orphanitem"),
+            "stray .It text should render"
+        );
+    }
+
+    // Audit #15: a `.Tg` line no longer breaks parsing or leaks; it renders
+    // nothing while surrounding text is preserved.
+    #[test]
+    fn tg_line_is_harmless() {
+        let page = write_temp_page("tg", ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Tg sometag\nbody text\n");
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("body text") && !stdout.contains("sometag"));
+    }
+
+    // Audit #16: a missing name does not abort the batch; later operands are
+    // still processed and the overall status is non-zero.
+    #[test]
+    fn missing_name_does_not_abort_batch() {
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .args([
+                "man_audit_absent_one",
+                "man_audit_absent_two",
+                "-C",
+                "man.test.conf",
+            ])
+            .output()
+            .expect("Failed to run man");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("man_audit_absent_one") && stderr.contains("man_audit_absent_two"),
+            "both missing names should be reported, got: {stderr}"
+        );
+    }
+
+    // Audit #3: a legacy man(7)/roff page (.TH/.SH/.B/.TP) renders its content
+    // (it previously produced an empty page).
+    #[test]
+    fn man7_page_renders() {
+        let page = write_temp_page(
+            "man7",
+            ".TH TEST 1 2024 \"util 1.0\"\n\
+             .SH NAME\n\
+             test \\- a test program\n\
+             .SH DESCRIPTION\n\
+             This is the description.\n\
+             .SH EXIT STATUS\n\
+             .TP\n\
+             .B 0\n\
+             Success.\n",
+        );
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(output.status.code(), Some(0), "man(7) page should render");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for needle in [
+            "TEST(1)",
+            "NAME",
+            "test - a test program",
+            "DESCRIPTION",
+            "This is the description.",
+            "EXIT STATUS",
+        ] {
+            assert!(stdout.contains(needle), "missing {needle:?} in:\n{stdout}");
+        }
+    }
+
+    // Audit #3 (exit-code half): a man(7)-detected page that produces no body is
+    // reported as an error (non-zero), not a silent empty success.
+    #[test]
+    fn man7_empty_page_errors() {
+        let page = write_temp_page("man7e", ".TH TEST 1\n");
+        let output = format_local(&[], &page);
+        let _ = std::fs::remove_file(&page);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "empty page should be an error"
+        );
+    }
+
+    // Audit #8: `-k` with a regex metacharacter keyword must not crash (the
+    // native search compiles keywords as case-insensitive EREs, with a literal
+    // fallback for invalid syntax).
+    #[test]
+    fn apropos_regex_keyword_does_not_crash() {
+        for kw in ["pri.tf", "^l", "(unclosed"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_man"))
+                .args(["-k", kw, "-C", "man.test.conf"])
+                .output()
+                .expect("Failed to run man -k");
+            assert!(
+                matches!(output.status.code(), Some(0) | Some(1)),
+                "keyword {kw:?} should exit 0/1, got {:?}",
+                output.status.code()
+            );
+        }
+    }
 }

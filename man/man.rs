@@ -11,6 +11,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
+use man_util::man7;
 use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
@@ -171,10 +172,6 @@ enum ManError {
     #[error("failed to execute command: {0}")]
     Io(#[from] io::Error),
 
-    /// Mdoc error
-    #[error("parsing error: {0}")]
-    Mdoc(#[from] man_util::parser::MdocError),
-
     /// Parsing error
     #[error("parsing error: {0}")]
     ParseError(#[from] ParseError),
@@ -182,6 +179,10 @@ enum ManError {
     /// Not found error
     #[error("file: {0} was not found")]
     NotFound(PathBuf),
+
+    /// The page produced no renderable content (e.g. an unsupported format).
+    #[error("no renderable content in page")]
+    EmptyPage,
 }
 
 /// Parsing error types
@@ -264,6 +265,10 @@ pub struct FormattingSettings {
     pub width: usize,
     /// Lines indentation
     pub indent: usize,
+    /// Whether to emit bold/underline via nroff backspace-overstrike. Enabled
+    /// when the output goes to an interactive terminal; off when piped so the
+    /// text stays clean for `grep`/redirection.
+    pub styling: bool,
 }
 
 impl Default for FormattingSettings {
@@ -271,6 +276,7 @@ impl Default for FormattingSettings {
         Self {
             width: 78,
             indent: 6,
+            styling: false,
         }
     }
 }
@@ -368,7 +374,12 @@ where
 ///
 /// Returns [ManError] if working on terminal and failed to get terminal size.
 fn get_pager_settings(config: &ManConfig) -> Result<FormattingSettings, ManError> {
-    let mut settings = FormattingSettings::default();
+    // Emphasis (overstrike) is only emitted for an interactive terminal, so
+    // piped/redirected output stays plain text.
+    let mut settings = FormattingSettings {
+        styling: io::stdout().is_terminal(),
+        ..FormattingSettings::default()
+    };
 
     if let Some(Some(val_str)) = config.output_options.get("indent") {
         settings.indent = val_str
@@ -376,18 +387,36 @@ fn get_pager_settings(config: &ManConfig) -> Result<FormattingSettings, ManError
             .map_err(|err| ManError::ParseError(ParseError::ParseIntError(err)))?;
     }
 
-    if let Some(Some(val_str)) = config.output_options.get("width") {
-        settings.width = val_str
-            .parse::<usize>()
-            .map_err(|err| ManError::ParseError(ParseError::ParseIntError(err)))?;
+    let config_width = match config.output_options.get("width") {
+        Some(Some(val_str)) => Some(
+            val_str
+                .parse::<usize>()
+                .map_err(|err| ManError::ParseError(ParseError::ParseIntError(err)))?,
+        ),
+        _ => None,
+    };
+
+    // Width precedence: COLUMNS (a per-invocation override, honored even when
+    // piped) > an explicit config width > the terminal's own size (when stdout
+    // is a tty) > the default width (78). A one-column right margin is kept when
+    // deriving from a column count.
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+    {
+        apply_terminal_width(&mut settings, cols);
+        return Ok(settings);
     }
 
-    // If stdout is not a terminal, don't try to ioctl for size
+    if let Some(width) = config_width {
+        settings.width = width;
+        return Ok(settings);
+    }
+
     if !io::stdout().is_terminal() {
         return Ok(settings);
     }
 
-    // If it is a terminal, try to get the window size via ioctl.
     let mut winsize = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -400,16 +429,22 @@ fn get_pager_settings(config: &ManConfig) -> Result<FormattingSettings, ManError
         return Err(ManError::GetTerminalSize);
     }
 
-    // If the terminal is narrower than 79 columns, reduce the width setting
-    if winsize.ws_col < 79 {
-        settings.width = (winsize.ws_col - 1) as usize;
-        // If extremely narrow, reduce indent too
-        if winsize.ws_col < 66 {
-            settings.indent = 3;
-        }
-    }
+    apply_terminal_width(&mut settings, winsize.ws_col as usize);
 
     Ok(settings)
+}
+
+/// Set the formatting width from a terminal column count, keeping a one-column
+/// right margin and narrowing the indent on very small terminals. A reported
+/// width of 0 (or 1) leaves the default in place rather than underflowing.
+fn apply_terminal_width(settings: &mut FormattingSettings, cols: usize) {
+    if cols < 2 {
+        return;
+    }
+    settings.width = cols - 1;
+    if cols < 66 {
+        settings.indent = 3;
+    }
 }
 
 /// Read a local man page file (possibly .gz), uncompress if needed, and return
@@ -423,6 +458,29 @@ fn get_man_page_from_path(path: &PathBuf) -> Result<Vec<u8>, ManError> {
 
     let output = spawn(cat_cmd, [path], None, Stdio::piped())?;
     Ok(output.stdout)
+}
+
+/// Resolve a roff `.so` include target to its (decompressed) text for the roff
+/// front-end. Tries the target as given, then under each system man root, with
+/// and without a `.gz` suffix. Returns `None` if nothing readable is found.
+fn load_so(target: &str) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(target)];
+    for root in MAN_PATHS {
+        candidates.push(PathBuf::from(root).join(target));
+    }
+    for cand in candidates {
+        let gz = PathBuf::from(format!("{}.gz", cand.display()));
+        for path in [cand, gz] {
+            if path.is_file() {
+                if let Ok(bytes) = get_man_page_from_path(&path) {
+                    return Some(String::from_utf8(bytes).unwrap_or_else(|err| {
+                        err.into_bytes().iter().map(|&b| b as char).collect()
+                    }));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse and format a man page’s raw content into text suitable for display.
@@ -443,12 +501,28 @@ fn format_man_page(
     formatting: &FormattingSettings,
     synopsis: bool,
 ) -> Result<Vec<u8>, ManError> {
+    // Most pages are UTF-8; a page that is not (e.g. Latin-1) is decoded
+    // byte-for-byte into the Latin-1 Unicode block rather than rejected, so it
+    // still renders instead of erroring out.
     let content = String::from_utf8(man_bytes)
-        .map_err(|err| ManError::ParseError(ParseError::FromUtf8Error(err)))?;
+        .unwrap_or_else(|err| err.into_bytes().iter().map(|&b| b as char).collect());
+
+    // Run the roff front-end first: execute roff programmability (registers,
+    // conditionals, user macros, `.so` includes) and normalize the stream before
+    // language detection and parsing. A page without roff programmability is
+    // returned essentially unchanged.
+    let content = man_util::roff::preprocess_with_loader(&content, load_so);
+
+    // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
+    // the mdoc engine only understands mdoc(7) and would otherwise emit an empty
+    // page. The synopsis-only mode (-h) is mdoc-specific.
+    if !synopsis && man7::is_man7(&content) {
+        return man7::format_man7(&content, formatting).ok_or(ManError::EmptyPage);
+    }
 
     let mut formatter = MdocFormatter::new(*formatting);
 
-    let document = MdocParser::parse_mdoc(&content)?;
+    let document = MdocParser::parse_mdoc(&content);
     let formatted_document = match synopsis {
         true => formatter.format_synopsis_section(document),
         false => formatter.format_mdoc(document),
@@ -467,7 +541,10 @@ fn format_man_page(
 ///
 /// [ManError] if failed to execute pager or failed write to its STDIN.
 fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
-    if copy_mode {
+    // POSIX: the output is piped through PAGER only "When standard output is a
+    // terminal device." With `-c`, or when stdout is not a terminal (e.g.
+    // `man foo | grep bar`), write directly to stdout instead.
+    if copy_mode || !io::stdout().is_terminal() {
         io::stdout().write_all(&man_page)?;
         io::stdout().flush()?;
         return Ok(());
@@ -540,12 +617,6 @@ struct ManPageInfo {
 
 /// Scans man page directories and extracts NAME section info from all pages.
 fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPageInfo> {
-    use std::panic;
-
-    // Temporarily suppress panic output for parsing non-mdoc format pages
-    let prev_hook = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
-
     let mut results = Vec::new();
 
     for search_path in search_paths {
@@ -579,15 +650,8 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                     Err(_) => continue,
                 };
 
-                // Use catch_unwind to handle parser panics on non-mdoc format pages
-                let parse_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    MdocParser::parse_mdoc(&content)
-                }));
-
-                let document = match parse_result {
-                    Ok(Ok(d)) => d,
-                    _ => continue, // Skip on parse error or panic
-                };
+                // The hand-written parser is total, so no panic guard is needed.
+                let document = MdocParser::parse_mdoc(&content);
 
                 if let Some((names, description)) = extract_name_info(&document) {
                     results.push(ManPageInfo {
@@ -599,9 +663,6 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
             }
         }
     }
-
-    // Restore the previous panic hook
-    panic::set_hook(prev_hook);
 
     results
 }
@@ -617,15 +678,37 @@ fn native_keyword_search(
     let pages = scan_man_pages(search_paths, sections);
     let mut results = Vec::new();
 
+    // POSIX: `-k` keywords are case-insensitive extended regular expressions
+    // (the spec describes the search as equivalent to `grep -Ei`). Use the
+    // project's POSIX ERE engine (libc regcomp via `plib::regex`) so the
+    // semantics match the spec, not Rust-regex syntax; fall back to a literal
+    // substring match if the keyword is not valid ERE syntax.
+    use plib::regex::{Regex, RegexFlags};
+    enum Matcher {
+        Regex(Regex),
+        Literal(String),
+    }
+    impl Matcher {
+        fn is_match(&self, haystack: &str) -> bool {
+            match self {
+                Matcher::Regex(re) => re.is_match(haystack),
+                Matcher::Literal(lit) => haystack.to_lowercase().contains(lit),
+            }
+        }
+    }
+    let matchers: Vec<Matcher> = keywords
+        .iter()
+        .map(|kw| match Regex::new(kw, RegexFlags::ere().ignore_case()) {
+            Ok(re) => Matcher::Regex(re),
+            Err(_) => Matcher::Literal(kw.to_lowercase()),
+        })
+        .collect();
+
     for page in &pages {
-        // Check if any keyword matches name or description (case-insensitive)
-        let matches = keywords.iter().any(|keyword| {
-            let keyword_lower = keyword.to_lowercase();
-            page.names
-                .iter()
-                .any(|n| n.to_lowercase().contains(&keyword_lower))
-                || page.description.to_lowercase().contains(&keyword_lower)
-        });
+        // Check if any keyword matches name or description (case-insensitive ERE)
+        let matches = matchers
+            .iter()
+            .any(|m| page.names.iter().any(|n| m.is_match(n)) || m.is_match(&page.description));
 
         if matches {
             // Format output: "name(section) - description"
@@ -883,7 +966,7 @@ impl Man {
 
                 if results.is_empty() {
                     for keyword in &self.args.names {
-                        eprintln!("{}: nothing appropriate", keyword);
+                        eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
                     }
                     no_errors = false;
                 } else {
@@ -897,12 +980,20 @@ impl Man {
         }
 
         for name in &self.args.names {
-            if self.args.list_pathnames {
-                let paths = self.get_man_page_paths(name, true)?;
-                self.display_paths(paths)?;
+            // A failure for one operand (e.g. page not found) is reported but
+            // does not abort the remaining operands; the exit status is still
+            // non-zero overall.
+            let result = if self.args.list_pathnames {
+                self.get_man_page_paths(name, true)
+                    .and_then(|paths| self.display_paths(paths))
             } else {
-                let paths = self.get_man_page_paths(name, self.args.all)?;
-                self.display_all_man_pages(paths)?;
+                self.get_man_page_paths(name, self.args.all)
+                    .and_then(|paths| self.display_all_man_pages(paths))
+            };
+
+            if let Err(err) = result {
+                eprintln!("man: {err}");
+                no_errors = false;
             }
         }
 

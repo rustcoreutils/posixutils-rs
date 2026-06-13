@@ -7,11 +7,35 @@ use terminfo::Database;
 use super::{
     mdoc_macro::{text_production::*, types::*, Macro},
     parser::{trim_quotes, Element, MacroNode, MdocDocument},
+    term::{
+        style::{display_width, STYLE_BOLD, STYLE_RESET, STYLE_UL},
+        Term,
+    },
 };
 
-/// Max Bl -width parameter value
-const MAX_INDENT: u8 = 20;
+/// Replace roff font escapes (`\fB`, `\fI`, `\fR`/`\fP`, `\f(CB`, `\f[name]`, …)
+/// with style markers. This both stops the escapes from leaking as literal text
+/// and, when styling is enabled, drives the emphasis.
+fn regex_font() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| Regex::new(r"\\f(\[[^\]]*\]|\(..|.)").unwrap())
+}
 
+fn replace_font_escapes(input: &str) -> String {
+    regex_font()
+        .replace_all(input, |caps: &regex::Captures| {
+            let spec = caps[1].trim_start_matches(['[', '(']).trim_end_matches(']');
+            let marker = match spec {
+                "B" | "CB" | "3" => STYLE_BOLD,
+                "I" | "CI" | "2" | "em" => STYLE_UL,
+                _ => STYLE_RESET, // R, P, CR, CW, 1, 0, unknown -> reset
+            };
+            marker.to_string()
+        })
+        .to_string()
+}
+
+/// Max Bl -width parameter value
 fn regex_unicode() -> &'static Regex {
     static CELL: OnceLock<Regex> = OnceLock::new();
     CELL.get_or_init(|| {
@@ -458,8 +482,9 @@ fn outer_regex() -> &'static Regex {
 }
 
 pub fn replace_escapes(input: &str) -> String {
+    let input = replace_font_escapes(input);
     let input = outer_regex()
-        .replace_all(input, |caps: &regex::Captures| {
+        .replace_all(&input, |caps: &regex::Captures| {
             if let Some(esc) = caps.name("esc") {
                 substitutions()
                     .get(esc.as_str())
@@ -585,68 +610,13 @@ impl MdocFormatter {
 
 // Base formatting functions.
 impl MdocFormatter {
-    /// Append formatted macros on highest mdoc level.
-    /// Split lines longer than terminal width and
-    /// adds indentation for new lines
-    fn append_formatted_text(
-        &mut self,
-        formatted: &str,
-        current_line: &mut String,
-        lines: &mut Vec<String>,
-    ) {
-        let get_indent = |l: &str| {
-            l.chars()
-                .take_while(|ch| ch.is_whitespace())
-                .collect::<String>()
-        };
-
-        let is_one_line = !formatted.contains("\n");
-        let max_width = self.formatting_settings.width;
-
-        for line in formatted.split("\n") {
-            let line = replace_escapes(line);
-
-            if !is_one_line && !current_line.is_empty() {
-                lines.push(current_line.trim_end().to_string());
-                current_line.clear();
-            }
-
-            let line_len = current_line.chars().count() + line.chars().count();
-            if line_len > max_width || is_one_line {
-                let indent = get_indent(&line);
-                let max_width = max_width.saturating_sub(indent.chars().count());
-
-                for word in line.split_whitespace() {
-                    let line_len = current_line.chars().count() + word.chars().count();
-                    if line_len > max_width {
-                        lines.push(indent.clone() + current_line.trim());
-                        current_line.clear();
-                    }
-
-                    current_line.push_str(word);
-
-                    if !word.chars().all(|ch| ch.is_control()) {
-                        current_line.push(' ');
-                    }
-                }
-
-                let is_not_empty =
-                    !(current_line.chars().all(|ch| ch.is_whitespace()) || current_line.is_empty());
-
-                if is_not_empty {
-                    *current_line = indent + current_line;
-                }
-            } else {
-                lines.push(line.to_string());
-            }
-        }
-    }
-
     /// If -h man parameter is enabled this function is used instead
     /// [`format_mdoc`] for displaying only `SINOPSYS` section
     pub fn format_synopsis_section(&mut self, ast: MdocDocument) -> Vec<u8> {
-        let mut lines = Vec::new();
-        let mut current_line = String::new();
+        let mut term = Term::new(
+            self.formatting_settings.width,
+            self.formatting_settings.styling,
+        );
 
         for node in ast.elements {
             let formatted_node = match node {
@@ -664,20 +634,18 @@ impl MdocFormatter {
                 _ => continue,
             };
 
-            self.append_formatted_text(&formatted_node, &mut current_line, &mut lines);
+            term.append_block(&formatted_node);
         }
 
-        if !current_line.is_empty() {
-            lines.push(current_line.trim_end().to_string());
-        }
-
-        replace_escapes(&lines.join("\n")).into_bytes()
+        term.finish()
     }
 
     /// Format full [`MdocDocument`] and returns UTF-8 binary string
     pub fn format_mdoc(&mut self, ast: MdocDocument) -> Vec<u8> {
-        let mut lines = Vec::new();
-        let mut current_line = String::new();
+        let mut term = Term::new(
+            self.formatting_settings.width,
+            self.formatting_settings.styling,
+        );
 
         for node in ast.elements {
             let mut formatted_node = self.format_node(node.clone());
@@ -700,35 +668,21 @@ impl MdocFormatter {
                 }
             }
 
-            self.append_formatted_text(&formatted_node, &mut current_line, &mut lines);
+            term.append_block(&formatted_node);
         }
 
-        if !current_line.is_empty() {
-            lines.push(current_line.trim_end().to_string());
-        }
+        // The header is produced by `.Dt` during the walk above (falling back to
+        // the default); the footer uses the date captured during the walk. Both
+        // carry their own newline padding for the framing in `Term::finish`.
+        let header = self
+            .formatting_state
+            .header_text
+            .clone()
+            .unwrap_or_else(|| self.format_default_header());
+        term.set_header_line(header);
+        term.set_footer_line(self.format_footer());
 
-        let first_empty_count = lines
-            .iter()
-            .take_while(|l| l.chars().all(|ch| ch.is_whitespace()))
-            .count();
-
-        lines = lines.split_at(first_empty_count).1.to_vec();
-
-        lines.insert(0, "".to_string());
-
-        lines.insert(
-            0,
-            self.formatting_state
-                .header_text
-                .clone()
-                .unwrap_or_else(|| self.format_default_header()),
-        );
-
-        lines.push(self.format_footer());
-
-        let content = remove_empty_lines(&lines.join("\n"), 2);
-
-        content.into_bytes()
+        term.finish()
     }
 
     fn format_default_header(&mut self) -> String {
@@ -997,8 +951,8 @@ fn split_by_width(words: Vec<String>, width: usize) -> Vec<String> {
     let mut line = String::new();
     let mut i = 0;
     while i < words.len() {
-        let word_len = replace_escapes(&words[i]).len();
-        let line_len = replace_escapes(&line).len();
+        let word_len = display_width(&replace_escapes(&words[i]));
+        let line_len = display_width(&replace_escapes(&line));
         if line.is_empty() || word_len > width {
             lines.extend(
                 words[i]
@@ -1292,52 +1246,14 @@ fn split_nested_bl(bl: MacroNode) -> Vec<Element> {
 }
 
 /// Removes reduntant empty lines or lines that contains only whitespaces from [`input`]
-fn remove_empty_lines(input: &str, delimiter_size: usize) -> String {
-    let input = input
-        .lines()
-        .map(|line| {
-            if line.chars().all(|ch| ch.is_whitespace()) {
-                ""
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut result = String::with_capacity(input.len());
-    let mut iter = input.chars().peekable();
-    let lines_delimiter_big = "\n".repeat(delimiter_size);
-    let mut nl_count = 0;
-
-    while let Some(current_char) = iter.next() {
-        if current_char == '\n' {
-            if iter.peek() != Some(&'\n') {
-                let lines_delimiter = if nl_count > 1 {
-                    &lines_delimiter_big.clone()
-                } else {
-                    "\n"
-                };
-                result.push_str(lines_delimiter);
-                nl_count = 1;
-            } else {
-                nl_count += 1;
-            }
-        } else {
-            result.push(current_char);
-        }
-    }
-
-    result
-}
-
 // Formatting block full-explicit.
 impl MdocFormatter {
     fn get_width_indent(&self, width: &Option<u8>) -> usize {
-        let mut width = width.unwrap_or(0).min(MAX_INDENT) as usize;
-        if width < 2 {
-            width = 2;
-        }
-        width
+        // Honor the declared `.Bl -width`, bounded only by the page width (so a
+        // wide tag list is not silently clamped to 20), with a small remainder
+        // reserved for the item text.
+        let cap = self.formatting_settings.width.saturating_sub(4).max(2);
+        (width.unwrap_or(0) as usize).clamp(2, cap)
     }
 
     fn get_offset_indent(&self, offset: &Option<OffsetType>) -> usize {
@@ -1463,29 +1379,13 @@ impl MdocFormatter {
     }
 
     fn format_bf_block(&mut self, bf_type: BfType, macro_node: MacroNode) -> String {
-        let _font_change = match bf_type {
-            BfType::Emphasis => {
-                // if self.supports_italic() {
-                //     "\x1b[3m".to_string()
-                // } else if self.supports_underline() {
-                //     "\x1b[4m".to_string()
-                // } else{
-                //     String::new()
-                // }
-                String::new()
-            }
-            BfType::Literal => String::new(),
-            BfType::Symbolic => {
-                // if self.supports_bold(){
-                //     "\x1b[1m".to_string()
-                // }else{
-                //     String::new()
-                // }
-                String::new()
-            }
+        let marker = match bf_type {
+            BfType::Emphasis => Some(STYLE_UL),
+            BfType::Symbolic => Some(STYLE_BOLD),
+            BfType::Literal => None,
         };
 
-        macro_node
+        let content = macro_node
             .nodes
             .into_iter()
             .map(|node| {
@@ -1497,7 +1397,12 @@ impl MdocFormatter {
             })
             .filter(|s| !s.is_empty())
             .collect::<Vec<String>>()
-            .join("")
+            .join("");
+
+        match marker {
+            Some(marker) => self.styled(marker, content),
+            None => content,
+        }
     }
 
     fn format_bk_block(&mut self, macro_node: MacroNode) -> String {
@@ -1509,7 +1414,7 @@ impl MdocFormatter {
 
         for node in macro_node.nodes.into_iter() {
             let formatted_node = self.format_node(node);
-            let formatted_node_len = formatted_node.chars().count();
+            let formatted_node_len = display_width(&formatted_node);
 
             current_len += formatted_node_len;
 
@@ -2302,8 +2207,16 @@ impl MdocFormatter {
 
 // Formatting block full-implicit.
 impl MdocFormatter {
-    fn format_it_block(&mut self, _head: Vec<Element>, _macro_node: MacroNode) -> String {
-        String::new()
+    fn format_it_block(&mut self, head: Vec<Element>, macro_node: MacroNode) -> String {
+        // A `.It` outside any `.Bl` is normally handled by the enclosing list
+        // formatter; reaching here means it is stray. Render its text (mandoc
+        // does too) rather than dropping it silently.
+        head.into_iter()
+            .chain(macro_node.nodes)
+            .map(|node| self.format_node(node))
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn format_nd(&mut self, macro_node: MacroNode) -> String {
@@ -2378,6 +2291,18 @@ impl MdocFormatter {
             .join("\n");
     }
 
+    /// Wrap `text` in a style span (resolved later by `apply_styling`). When
+    /// styling is disabled the text is returned unchanged, so non-terminal
+    /// output and the snapshot tests stay byte-for-byte plain.
+    fn styled(&self, marker: char, text: impl Into<String>) -> String {
+        let text = text.into();
+        if self.formatting_settings.styling {
+            format!("{marker}{text}{STYLE_RESET}")
+        } else {
+            text
+        }
+    }
+
     fn format_sh_block(&mut self, title: String, macro_node: MacroNode) -> String {
         fn append_formatted_node(
             content: &mut String,
@@ -2386,7 +2311,7 @@ impl MdocFormatter {
             indent: usize,
             max_width: usize,
         ) {
-            let formatted_node_len = formatted_node.chars().count();
+            let formatted_node_len = display_width(formatted_node);
             *current_len += formatted_node_len;
 
             if !content.is_empty() && *current_len > max_width {
@@ -2554,7 +2479,11 @@ impl MdocFormatter {
             content
         };
 
-        format!("\n{}\n{}", title.to_uppercase(), content.trim_end())
+        format!(
+            "\n{}\n{}",
+            self.styled(STYLE_BOLD, title.to_uppercase()),
+            content.trim_end()
+        )
     }
 
     fn format_ss_block(&mut self, title: String, macro_node: MacroNode) -> String {
@@ -2578,7 +2507,10 @@ impl MdocFormatter {
         self.add_missing_indent(&mut content);
         self.formatting_state.current_indent = 0;
 
-        format!("\n\n\\[ssindent]{title}\n\n{content}\n")
+        format!(
+            "\n\n\\[ssindent]{}\n\n{content}\n",
+            self.styled(STYLE_BOLD, title)
+        )
     }
 }
 
@@ -3284,7 +3216,19 @@ impl MdocFormatter {
                         prev_was_open = false;
                     }
                 },
-                _ => unreachable!("macro can't contain macro node or EOI!"),
+                // Defensive: a nested macro is not expected here, but format its
+                // content rather than panicking — a renderer must be total.
+                Element::Macro(node) => {
+                    let inner = self.format_inline_macro(node);
+                    if !inner.is_empty() {
+                        if !is_first_node {
+                            result.push_str(self.formatting_state.spacing.as_str());
+                        }
+                        result.push_str(&inner);
+                    }
+                    prev_was_open = false;
+                }
+                Element::Eoi => {}
             }
 
             if is_first_node {
@@ -3343,11 +3287,12 @@ impl MdocFormatter {
     }
 
     fn format_ar(&self, macro_node: MacroNode) -> String {
-        if macro_node.nodes.is_empty() {
-            return "file ...".to_string();
-        }
-
-        self.format_inline_macro(macro_node)
+        let content = if macro_node.nodes.is_empty() {
+            "file ...".to_string()
+        } else {
+            self.format_inline_macro(macro_node)
+        };
+        self.styled(STYLE_UL, content)
     }
 
     fn format_bt(&self) -> String {
@@ -3371,16 +3316,8 @@ impl MdocFormatter {
     }
 
     fn format_em(&self, macro_node: MacroNode) -> String {
-        // let line = self.format_inline_macro(macro_node);
-
-        // if self.supports_italic() {
-        //     format!("\x1b[3m{line}\x1b[0m")
-        // } else if self.supports_underline() {
-        //     format!("\x1b[4m{line}\x1b[0m")
-        // } else {
-        //     line
-        // }
-        self.format_inline_macro(macro_node)
+        let content = self.format_inline_macro(macro_node);
+        self.styled(STYLE_UL, content)
     }
 
     fn format_dt(&mut self, title: Option<String>, section: &str, arch: Option<String>) -> String {
@@ -3623,7 +3560,19 @@ impl MdocFormatter {
                         prev_was_open = false;
                     }
                 },
-                _ => unreachable!("macro can't contain macro node or EOI!"),
+                // Defensive: a nested macro is not expected here, but format its
+                // content rather than panicking — a renderer must be total.
+                Element::Macro(node) => {
+                    let inner = self.format_inline_macro(node);
+                    if !inner.is_empty() {
+                        if !is_first_node {
+                            result.push_str(self.formatting_state.spacing.as_str());
+                        }
+                        result.push_str(&inner);
+                    }
+                    prev_was_open = false;
+                }
+                Element::Eoi => {}
             }
 
             if is_first_node {
@@ -3682,7 +3631,19 @@ impl MdocFormatter {
                                         prev_was_open = false;
                                     }
                                 },
-                                _ => unreachable!("macro can't contain macro node or EOI!"),
+                                // Defensive: a nested macro is not expected here, but format its
+                                // content rather than panicking — a renderer must be total.
+                                Element::Macro(node) => {
+                                    let inner = self.format_inline_macro(node);
+                                    if !inner.is_empty() {
+                                        if !is_first_node {
+                                            result.push_str(self.formatting_state.spacing.as_str());
+                                        }
+                                        result.push_str(&inner);
+                                    }
+                                    prev_was_open = false;
+                                }
+                                Element::Eoi => {}
                             }
 
                             if is_first_node {
@@ -3933,14 +3894,8 @@ impl MdocFormatter {
     }
 
     fn format_sy(&mut self, macro_node: MacroNode) -> String {
-        // let line = self.format_inline_macro(macro_node);
-
-        // if self.supports_bold() {
-        //     format!("\x1b[1m{line}\x1b[0m")
-        // } else {
-        //     line
-        // }
-        self.format_inline_macro(macro_node)
+        let content = self.format_inline_macro(macro_node);
+        self.styled(STYLE_BOLD, content)
     }
 
     fn format_tg(&self, _term: Option<String>) -> String {
@@ -3972,11 +3927,19 @@ impl MdocFormatter {
     fn format_xr(&self, name: &str, section: &str, macro_node: MacroNode) -> String {
         let content = self.format_inline_macro(macro_node);
 
+        // A `.Xr` with no section number renders as the bare name (mandoc
+        // behavior); with a section it is `name(section)`.
+        let head = if section.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}({section})")
+        };
+
         if is_first_char_delimiter(&content) {
-            return format!("{name}({section}){content}");
+            return format!("{head}{content}");
         }
 
-        format!("{}({}) {}", name, section, content.trim())
+        format!("{} {}", head, content.trim())
     }
 }
 
@@ -4010,18 +3973,42 @@ mod tests {
     const FORMATTING_SETTINGS: FormattingSettings = FormattingSettings {
         width: 78,
         indent: 5,
+        styling: false,
     };
 
     /// Parse [`input`] into AST
     fn get_ast(input: &str) -> MdocDocument {
-        MdocParser::parse_mdoc(input).unwrap()
+        MdocParser::parse_mdoc(input)
     }
 
-    /// Universal function for all tests
+    /// Universal function for all tests.
+    ///
+    /// Snapshot regeneration: when the `MAN_BLESS` env var is set to a file
+    /// path, a mismatch is not an assertion failure; instead the call-site line
+    /// (via `#[track_caller]`) and the hex-encoded actual output are appended to
+    /// that file. `dev/bless_man_snapshots.py` then rewrites the inline expected
+    /// strings. This is the regen mechanism for the whole renderer rewrite.
+    #[track_caller]
     pub fn test_formatting(input: &str, output: &str) {
         let ast = get_ast(input);
         let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
         let result = String::from_utf8(formatter.format_mdoc(ast)).unwrap();
+
+        if let Ok(path) = std::env::var("MAN_BLESS") {
+            if result != output {
+                use std::io::Write;
+                let line = std::panic::Location::caller().line();
+                let hex: String = result.bytes().map(|b| format!("{b:02x}")).collect();
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                writeln!(f, "{line} {hex}").unwrap();
+            }
+            return;
+        }
+
         println!(
             "Formatted document:\nTarget:\n{}\n{}\nReal:\n{}\n",
             output,
@@ -4031,6 +4018,54 @@ mod tests {
             result
         );
         assert_eq!(output, result);
+    }
+
+    // Emphasis via nroff backspace-overstrike (audit Phase 3, #4/#5). Styling is
+    // only emitted with `styling: true`; render the doc and return its text.
+    fn format_styled(input: &str) -> String {
+        let settings = FormattingSettings {
+            styling: true,
+            ..FORMATTING_SETTINGS
+        };
+        let mut formatter = MdocFormatter::new(settings);
+        String::from_utf8(formatter.format_mdoc(get_ast(input))).unwrap()
+    }
+
+    #[test]
+    fn sy_is_bold_overstrike() {
+        let out = format_styled(".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Sy word\n");
+        // bold `word` = w\bwo\bo... ; the heading is bold too.
+        assert!(out.contains("w\u{8}wo\u{8}or\u{8}rd\u{8}d"), "got: {out:?}");
+    }
+
+    #[test]
+    fn em_and_ar_are_underline_overstrike() {
+        let em = format_styled(".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Em word\n");
+        assert!(em.contains("_\u{8}w_\u{8}o_\u{8}r_\u{8}d"), "Em: {em:?}");
+        let ar = format_styled(".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Ar file\n");
+        assert!(ar.contains("_\u{8}f_\u{8}i_\u{8}l_\u{8}e"), "Ar: {ar:?}");
+    }
+
+    #[test]
+    fn font_escapes_styled_when_on() {
+        let out = format_styled(".Dd x\n.Dt T 1\n.Os\n.Sh D\nuse \\fBbold\\fR now\n");
+        assert!(out.contains("b\u{8}bo\u{8}ol\u{8}ld\u{8}d"), "got: {out:?}");
+    }
+
+    #[test]
+    fn font_escapes_stripped_when_off() {
+        // styling off (the default const): the \fB/\fR escapes are removed, not
+        // rendered and not leaked as literal text.
+        let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
+        let out = String::from_utf8(formatter.format_mdoc(get_ast(
+            ".Dd x\n.Dt T 1\n.Os\n.Sh D\nuse \\fBbold\\fR now\n",
+        )))
+        .unwrap();
+        assert!(out.contains("use bold now"), "got: {out:?}");
+        assert!(
+            !out.contains("\\fB") && !out.contains('\u{8}'),
+            "got: {out:?}"
+        );
     }
 
     mod special_chars {
@@ -4705,10 +4740,10 @@ Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu 
                 let output =
                     "PROGNAME(1)                 General Commands Manual                PROGNAME(1)
 
-head1  Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do
-eiusmod tempor incididunt ut labore et dolore magna aliqua.
-head2  Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris
-nisi ut aliquip ex ea commodo consequat.
+head1  Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua.
+head2  Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi
+ut aliquip ex ea commodo consequat.
 head3  Duis aute irure dolor in reprehenderit in voluptate velit esse cillum
 dolore eu fugiat nulla pariatur.
 

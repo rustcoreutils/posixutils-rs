@@ -7,10 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use pest::iterators::Pair;
-
-use crate::man_util::parser::Rule;
-
 /// Bd block variants
 #[derive(Debug, Clone, PartialEq)]
 pub enum BdType {
@@ -19,19 +15,6 @@ pub enum BdType {
     Literal,
     Ragged,
     Unfilled,
-}
-
-impl From<Pair<'_, Rule>> for BdType {
-    fn from(pair: Pair<'_, Rule>) -> Self {
-        match pair.into_inner().next().unwrap().as_rule() {
-            Rule::bd_centered => Self::Centered,
-            Rule::bd_filled => Self::Filled,
-            Rule::bd_literal => Self::Literal,
-            Rule::bd_ragged => Self::Ragged,
-            Rule::bd_unfilled => Self::Unfilled,
-            _ => unreachable!(),
-        }
-    }
 }
 
 /// Bd, Bl blocks offset variants
@@ -45,20 +28,6 @@ pub enum OffsetType {
     Center,
 }
 
-impl From<Pair<'_, Rule>> for OffsetType {
-    fn from(pair: Pair<'_, Rule>) -> Self {
-        match pair.into_inner().next().unwrap().as_rule() {
-            Rule::off_indent => Self::Indent,
-            Rule::off_indent_two => Self::IndentTwo,
-            Rule::off_left => Self::Left,
-            Rule::off_right => Self::Right,
-            Rule::off_center => Self::Center,
-            Rule::word => Self::Indent,
-            _ => unreachable!(),
-        }
-    }
-}
-
 /// Bf block font style variants
 #[derive(Debug, Clone, PartialEq)]
 pub enum BfType {
@@ -68,17 +37,6 @@ pub enum BfType {
     Literal,
     /// Enables boldface font mode
     Symbolic,
-}
-
-impl From<Pair<'_, Rule>> for BfType {
-    fn from(pair: Pair<'_, Rule>) -> Self {
-        match pair.into_inner().next().unwrap().as_rule() {
-            Rule::bf_emphasis | Rule::bf_em => Self::Emphasis,
-            Rule::bf_literal | Rule::bf_li => Self::Literal,
-            Rule::bf_symbolic | Rule::bf_sy => Self::Symbolic,
-            _ => unreachable!(),
-        }
-    }
 }
 
 /// Bl block variants
@@ -104,24 +62,6 @@ pub enum BlType {
     Ohang,
     /// Item bodies are indented according to the -width argument
     Tag,
-}
-
-impl From<Pair<'_, Rule>> for BlType {
-    fn from(pair: Pair<'_, Rule>) -> Self {
-        match pair.into_inner().next().unwrap().as_rule() {
-            Rule::bl_bullet => Self::Bullet,
-            Rule::bl_column => Self::Column,
-            Rule::bl_dash | Rule::bl_hyphen => Self::Dash,
-            Rule::bl_diag => Self::Diag,
-            Rule::bl_enum => Self::Enum,
-            Rule::bl_hang => Self::Hang,
-            Rule::bl_inset => Self::Inset,
-            Rule::bl_item => Self::Item,
-            Rule::bl_ohang => Self::Ohang,
-            Rule::bl_tag => Self::Tag,
-            _ => unreachable!(),
-        }
-    }
 }
 
 /// Defines how split authors names

@@ -54,14 +54,14 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 ## Priority issues
 
 ### Critical
-- [ ] **GC-1 — Escape sequences not processed.** `\n`, `\t`, `\v`, `\b`, `\r`, `\f`, `\\`, and `\ddd` octal are stored verbatim as two characters instead of being converted. `gencat.rs:420` (text taken straight from `input.lines()` at `:335`). **✓ verified:** `1 Hello\tWorld` is stored as bytes `…48 65 6c 6c 6f 5c 74 57…` (`\t` literal `5c 74`, not a tab `09`). Fix: run a `process_escapes()` pass over the message text before storing.
-- [ ] **GC-2 — Process panics on a pre-existing catalog with an unexpected magic/header.** `panic!("DOESNT MATCH")` at `gencat.rs:580`. **✓ verified:** `gencat junk.cat m1.msg` → `thread 'main' panicked at i18n/gencat.rs:580 … DOESNT MATCH`, `exit 101`. Fix: return a graceful `Err` → exit `>0`.
-- [ ] **GC-3 — Backslash-newline line continuation not implemented.** `input.lines()` at `gencat.rs:335` splits on `\n` before any continuation join, so a line ending in `\` is mis-parsed. Fix: join continued lines before tokenizing.
+- [x] **GC-1 — Escape sequences not processed.** ✓ fixed (Phase 1): `process_escapes()` expands `\n \t \v \b \r \f \\ \ddd`. `\n`, `\t`, `\v`, `\b`, `\r`, `\f`, `\\`, and `\ddd` octal are stored verbatim as two characters instead of being converted. `gencat.rs:420` (text taken straight from `input.lines()` at `:335`). **✓ verified:** `1 Hello\tWorld` is stored as bytes `…48 65 6c 6c 6f 5c 74 57…` (`\t` literal `5c 74`, not a tab `09`). Fix: run a `process_escapes()` pass over the message text before storing.
+- [x] **GC-2 — Process panics on a pre-existing catalog with an unexpected magic/header.** ✓ fixed (Phase 1): graceful `InvalidData` error + length guard; exit 1. `panic!("DOESNT MATCH")` at `gencat.rs:580`. **✓ verified:** `gencat junk.cat m1.msg` → `thread 'main' panicked at i18n/gencat.rs:580 … DOESNT MATCH`, `exit 101`. Fix: return a graceful `Err` → exit `>0`.
+- [x] **GC-3 — Backslash-newline line continuation not implemented.** ✓ fixed (Phase 1): trailing-backslash continuation joined before tokenizing. `input.lines()` at `gencat.rs:335` splits on `\n` before any continuation join, so a line ending in `\` is mis-parsed. Fix: join continued lines before tokenizing.
 
 ### Major
-- [ ] **GC-4 — msgid collision appends instead of replaces.** Spec DESCRIPTION: "If set and message numbers collide, the new message text … shall replace the old." `add_msg` appends a new list node (`gencat.rs:463-485`). **✓ verified:** a source with `1 First` then `1 Second` in `$set 1` emits **both** `First` and `Second`. Fix: replace existing `msg_id` text in-place.
+- [x] **GC-4 — msgid collision appends instead of replaces.** ✓ fixed (Phase 1): `add_msg` replaces existing `msg_id` text in-place. Spec DESCRIPTION: "If set and message numbers collide, the new message text … shall replace the old." `add_msg` appends a new list node (`gencat.rs:463-485`). **✓ verified:** a source with `1 First` then `1 Second` in `$set 1` emits **both** `First` and `Second`. Fix: replace existing `msg_id` text in-place.
 - [ ] **GC-5 — Only one `msgfile` accepted; synopsis is `msgfile...`.** `msgfile: PathBuf` (`gencat.rs:46`) should be `Vec<PathBuf>` processed in order. **✓ verified:** `gencat cat m1.msg m2.msg` → clap `error: unexpected argument 'm2.msg'`, `exit 2`.
-- [ ] **GC-6 — Delete-by-number form rejected.** A message line with a number and no separator/text shall *delete* that message; instead it errors. `gencat.rs:412-413`. **✓ verified:** bare `1` line → `Error: Invalid line 3 with content 1`, `exit 1`.
+- [x] **GC-6 — Delete-by-number form rejected.** ✓ fixed (Phase 1): a bare message-number line deletes that message via `delete_msg`. A message line with a number and no separator/text shall *delete* that message; instead it errors. `gencat.rs:412-413`. **✓ verified:** bare `1` line → `Error: Invalid line 3 with content 1`, `exit 1`.
 - [ ] **GC-7 — `$delset` breaks on a trailing comment and skips range validation.** `rem.trim().parse::<u32>()` (`gencat.rs:369`) parses the whole remainder, so `$delset 2 a comment` is a parse error; no `[1, NL_SETMAX]` check. Fix: `splitn(2, …)`, validate the first token.
 - [ ] **GC-8 — Message-id range/order not validated.** No check that `msg_id` is in `[1, NL_MSGMAX]` or ascending within a set (`gencat.rs:419`). `msg_id == 0` is silently accepted.
 
@@ -96,7 +96,7 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 - [x] `$set n` ascending check + `[1,NL_SETMAX]` CONFORMS (`gencat.rs:389-393`); repeated same set number silently accepted (Minor).
 - [ ] **`$delset` DIVERGES** (GC-7).
 - [x] `$quote c` / empty `$quote` CONFORMS (`gencat.rs:343-356`), byte-length caveat (GC-11).
-- [ ] **message escapes MISSING** (GC-1); **continuation MISSING** (GC-3); **delete-by-number MISSING** (GC-6); **collision replace DIVERGES** (GC-4).
+- [x] **message escapes** (GC-1), **continuation** (GC-3), **delete-by-number** (GC-6), **collision replace** (GC-4) — ✓ fixed (Phase 1).
 
 ### Exit status / errors
 - [x] `0` success / `>0` error CONFORMS for parse errors (`gencat.rs:817-822`) — except the GC-2 panic path.

@@ -264,6 +264,53 @@ impl Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Return `true` if `s` ends with an unescaped (odd count of) trailing
+/// backslash, indicating a line continuation per the POSIX gencat grammar.
+fn ends_with_continuation(s: &str) -> bool {
+    s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+}
+
+/// Process the C-style escape sequences defined for gencat message text:
+/// `\n \t \v \b \r \f \\` and `\ddd` (1-3 octal digits). A backslash
+/// followed by any other character is discarded, leaving that character
+/// (per "the <backslash> shall be ignored"). A trailing backslash with no
+/// following character is dropped.
+fn process_escapes(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\x0b'),
+            Some('b') => out.push('\x08'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\x0c'),
+            Some('\\') => out.push('\\'),
+            Some(d @ '0'..='7') => {
+                let mut val = d.to_digit(8).unwrap();
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(n @ '0'..='7') => {
+                            val = val * 8 + n.to_digit(8).unwrap();
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from(val as u8));
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
 /// For set if it's $set NUMBER #COMMENT
 impl MessageCatalog {
     pub fn new(
@@ -309,6 +356,15 @@ impl MessageCatalog {
         let mut input = String::new();
         file.read_to_string(&mut input)?;
 
+        Self::parse_str(&input, catfile_catalog)
+    }
+
+    /// Parse message-text source from an in-memory string. Split out from
+    /// [`parse`](Self::parse) so the grammar can be unit-tested directly.
+    pub fn parse_str(
+        input: &str,
+        catfile_catalog: Option<MessageCatalog>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut catalog = match catfile_catalog {
             Some(catalog) => catalog,
             None => MessageCatalog::new(true),
@@ -332,11 +388,14 @@ impl MessageCatalog {
         // and sets
         let mut quote_char: Option<char> = None;
 
-        for (line_num, line) in input.lines().enumerate() {
-            let line = line.trim();
+        let lines: Vec<&str> = input.lines().collect();
+        let mut line_num = 0;
+        while line_num < lines.len() {
+            let line = lines[line_num].trim();
 
             // Skip empty lines and comments
             if line.is_empty() || line.starts_with("$ ") {
+                line_num += 1;
                 continue;
             }
 
@@ -410,26 +469,55 @@ impl MessageCatalog {
                 }
             } else {
                 let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
-                if parts.len() != 2 {
-                    return Err(Box::new(ParseError::InvalidLine(
-                        line_num + 1,
-                        line.to_string(),
-                    )));
-                }
-                let msg_id = parts[0].parse::<usize>()?;
-                let msg = parts[1].to_string();
-                let msg = if let Some(q) = quote_char {
-                    if msg.starts_with(q) && msg.ends_with(q) {
-                        msg[1..msg.len() - 1].to_string()
-                    } else {
-                        msg
+                // The message-number field must be a number; anything else is
+                // an invalid line.
+                let msg_id = match parts[0].parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Err(Box::new(ParseError::InvalidLine(
+                            line_num + 1,
+                            line.to_string(),
+                        )));
                     }
-                } else {
-                    msg
                 };
 
-                catalog.add_msg(current_set.as_ref().unwrap(), msg_id, msg);
+                if parts.len() == 1 {
+                    // A message-number with no separating <blank> and no text
+                    // deletes the message from the current set.
+                    if let Some(set) = current_set.as_ref() {
+                        catalog.delete_msg(set, msg_id);
+                    }
+                    line_num += 1;
+                    continue;
+                }
+
+                // Assemble the message text, honoring trailing-backslash line
+                // continuation (the backslash is discarded and the following
+                // physical line is appended without an intervening newline).
+                let mut text = parts[1].to_string();
+                while ends_with_continuation(&text) {
+                    text.pop();
+                    line_num += 1;
+                    match lines.get(line_num) {
+                        Some(next) => text.push_str(next.trim_end()),
+                        None => break,
+                    }
+                }
+
+                // Strip a surrounding pair of quote characters, if set.
+                if let Some(q) = quote_char {
+                    if text.chars().count() >= 2 && text.starts_with(q) && text.ends_with(q) {
+                        let mut it = text.chars();
+                        it.next();
+                        it.next_back();
+                        text = it.as_str().to_string();
+                    }
+                }
+
+                let text = process_escapes(&text);
+                catalog.add_msg(current_set.as_ref().unwrap(), msg_id, text);
             }
+            line_num += 1;
         }
 
         Ok(catalog)
@@ -461,6 +549,20 @@ impl MessageCatalog {
     }
 
     fn add_msg(&self, set: &Rc<RefCell<Set>>, msg_id: usize, msg: String) {
+        // If a message with this id already exists in the set, the new text
+        // replaces the old per the POSIX merge rule (rather than appending a
+        // duplicate).
+        {
+            let mut current = set.borrow().first_msg.clone();
+            while let Some(existing) = current {
+                if existing.borrow().msg_id == msg_id {
+                    existing.borrow_mut().msg = msg;
+                    return;
+                }
+                current = existing.borrow().next.clone();
+            }
+        }
+
         let new_msg = Rc::new(RefCell::new(Msg {
             msg_id,
             msg,
@@ -481,6 +583,33 @@ impl MessageCatalog {
                 set.first_msg = Some(Rc::clone(&new_msg));
                 set.last_msg = Some(Rc::clone(&new_msg));
             }
+        }
+    }
+
+    /// Remove the message with `msg_id` from `set`, if present (the
+    /// delete-by-number form of a message-text source line).
+    fn delete_msg(&self, set: &Rc<RefCell<Set>>, msg_id: usize) {
+        let mut set = set.borrow_mut();
+        let mut current = set.first_msg.clone();
+        let mut prev: Option<Rc<RefCell<Msg>>> = None;
+
+        while let Some(msg) = current {
+            let next = msg.borrow().next.clone();
+            if msg.borrow().msg_id == msg_id {
+                match prev.as_ref() {
+                    Some(p) => p.borrow_mut().next = next.clone(),
+                    None => set.first_msg = next.clone(),
+                }
+                if let Some(n) = next.as_ref() {
+                    n.borrow_mut().prev = prev.clone();
+                } else {
+                    // deleted the tail
+                    set.last_msg = prev.clone();
+                }
+                return;
+            }
+            prev = Some(msg);
+            current = next;
         }
     }
 
@@ -573,11 +702,23 @@ impl MessageCatalog {
         input.read_to_end(&mut buf)?;
         let mut ptr = 0;
 
+        // The header is three u32 words (magic, plane size, plane depth);
+        // a shorter file cannot be a valid catalog.
+        if buf.len() < 12 {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                gettext("gencat: existing catalog file is truncated or not a message catalog"),
+            )));
+        }
+
         let header = NativeEndian::read_u32(&buf[ptr..(ptr + 4)]);
         ptr += 4;
 
         if header != GLIBC_MAGIC {
-            panic!("DOESNT MATCH");
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                gettext("gencat: existing catalog file has an invalid magic number"),
+            )));
         }
 
         let plane_size = NativeEndian::read_u32(&buf[ptr..(ptr + 4)]);
@@ -798,7 +939,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if catfile_path_str != "-" && args.catfile.exists() {
         let catfile_catalog_file = File::open(&args.catfile)?;
-        catfile_catalog = Some(MessageCatalog::read_catfile(catfile_catalog_file)?);
+        match MessageCatalog::read_catfile(catfile_catalog_file) {
+            Ok(catalog) => catfile_catalog = Some(catalog),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                std::process::exit(1);
+            }
+        }
     }
 
     match MessageCatalog::parse(&args.msgfile, catfile_catalog) {
@@ -820,4 +967,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count_msgs(cat: &MessageCatalog, set_id: u32) -> usize {
+        let Some(set) = cat.cat.find_set(set_id) else {
+            return 0;
+        };
+        let mut n = 0;
+        let mut cur = set.borrow().first_msg.clone();
+        while let Some(m) = cur {
+            n += 1;
+            cur = m.borrow().next.clone();
+        }
+        n
+    }
+
+    fn msg_text(cat: &MessageCatalog, set_id: u32, msg_id: usize) -> Option<String> {
+        let set = cat.cat.find_set(set_id)?;
+        let mut cur = set.borrow().first_msg.clone();
+        while let Some(m) = cur {
+            if m.borrow().msg_id == msg_id {
+                return Some(m.borrow().msg.clone());
+            }
+            cur = m.borrow().next.clone();
+        }
+        None
+    }
+
+    #[test]
+    fn process_escapes_handles_c_sequences() {
+        assert_eq!(process_escapes(r"Hello\tWorld"), "Hello\tWorld");
+        assert_eq!(process_escapes(r"a\nb\r"), "a\nb\r");
+        assert_eq!(process_escapes(r"\\"), "\\");
+        assert_eq!(process_escapes(r"\101"), "A"); // octal 101 == 'A'
+        assert_eq!(process_escapes(r"\1"), "\u{1}");
+        assert_eq!(process_escapes(r"\q"), "q"); // unknown escape: backslash dropped
+    }
+
+    #[test]
+    fn ends_with_continuation_counts_backslashes() {
+        assert!(ends_with_continuation(r"abc\"));
+        assert!(!ends_with_continuation(r"abc\\"));
+        assert!(ends_with_continuation(r"abc\\\"));
+        assert!(!ends_with_continuation("abc"));
+    }
+
+    #[test]
+    fn gc1_message_escapes_expanded_in_catalog() {
+        let cat = MessageCatalog::parse_str("$set 1\n1 Hello\\tWorld\n", None).unwrap();
+        assert_eq!(msg_text(&cat, 1, 1).as_deref(), Some("Hello\tWorld"));
+    }
+
+    #[test]
+    fn gc3_line_continuation_joins_text() {
+        let cat = MessageCatalog::parse_str("$set 1\n1 Hello\\\nWorld\n", None).unwrap();
+        assert_eq!(msg_text(&cat, 1, 1).as_deref(), Some("HelloWorld"));
+    }
+
+    #[test]
+    fn gc4_colliding_msgid_is_replaced_not_appended() {
+        let cat = MessageCatalog::parse_str("$set 1\n1 First\n1 Second\n", None).unwrap();
+        assert_eq!(msg_text(&cat, 1, 1).as_deref(), Some("Second"));
+        assert_eq!(count_msgs(&cat, 1), 1);
+    }
+
+    #[test]
+    fn gc6_bare_number_deletes_message() {
+        let cat = MessageCatalog::parse_str("$set 1\n1 Hello\n2 Bye\n1\n", None).unwrap();
+        assert_eq!(msg_text(&cat, 1, 1), None);
+        assert_eq!(msg_text(&cat, 1, 2).as_deref(), Some("Bye"));
+        assert_eq!(count_msgs(&cat, 1), 1);
+    }
+
+    #[test]
+    fn gc2_bad_magic_is_error_not_panic() {
+        let data = b"not a valid catalog file at all";
+        assert!(MessageCatalog::read_catfile(&data[..]).is_err());
+        // Truncated input must also error rather than panic on slicing.
+        let short = b"\x00\x00";
+        assert!(MessageCatalog::read_catfile(&short[..]).is_err());
+    }
 }

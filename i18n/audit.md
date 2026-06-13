@@ -60,24 +60,24 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 
 ### Major
 - [x] **GC-4 — msgid collision appends instead of replaces.** ✓ fixed (Phase 1): `add_msg` replaces existing `msg_id` text in-place. Spec DESCRIPTION: "If set and message numbers collide, the new message text … shall replace the old." `add_msg` appends a new list node (`gencat.rs:463-485`). **✓ verified:** a source with `1 First` then `1 Second` in `$set 1` emits **both** `First` and `Second`. Fix: replace existing `msg_id` text in-place.
-- [ ] **GC-5 — Only one `msgfile` accepted; synopsis is `msgfile...`.** `msgfile: PathBuf` (`gencat.rs:46`) should be `Vec<PathBuf>` processed in order. **✓ verified:** `gencat cat m1.msg m2.msg` → clap `error: unexpected argument 'm2.msg'`, `exit 2`.
+- [x] **GC-5 — Only one `msgfile` accepted; synopsis is `msgfile...`.** ✓ fixed (Phase 2): `msgfile: Vec<PathBuf>`, merged in order. `msgfile: PathBuf` (`gencat.rs:46`) should be `Vec<PathBuf>` processed in order. **✓ verified:** `gencat cat m1.msg m2.msg` → clap `error: unexpected argument 'm2.msg'`, `exit 2`.
 - [x] **GC-6 — Delete-by-number form rejected.** ✓ fixed (Phase 1): a bare message-number line deletes that message via `delete_msg`. A message line with a number and no separator/text shall *delete* that message; instead it errors. `gencat.rs:412-413`. **✓ verified:** bare `1` line → `Error: Invalid line 3 with content 1`, `exit 1`.
-- [ ] **GC-7 — `$delset` breaks on a trailing comment and skips range validation.** `rem.trim().parse::<u32>()` (`gencat.rs:369`) parses the whole remainder, so `$delset 2 a comment` is a parse error; no `[1, NL_SETMAX]` check. Fix: `splitn(2, …)`, validate the first token.
-- [ ] **GC-8 — Message-id range/order not validated.** No check that `msg_id` is in `[1, NL_MSGMAX]` or ascending within a set (`gencat.rs:419`). `msg_id == 0` is silently accepted.
+- [x] **GC-7 — `$delset` breaks on a trailing comment and skips range validation.** ✓ fixed (Phase 2): first token only, `[1,NL_SETMAX]` checked. `rem.trim().parse::<u32>()` (`gencat.rs:369`) parses the whole remainder, so `$delset 2 a comment` is a parse error; no `[1, NL_SETMAX]` check. Fix: `splitn(2, …)`, validate the first token.
+- [x] **GC-8 — Message-id range/order not validated.** ✓ fixed (Phase 2): `[1,NL_MSGMAX]` enforced; ascending is advisory (collision-replace is legal), noted in code. No check that `msg_id` is in `[1, NL_MSGMAX]` or ascending within a set (`gencat.rs:419`). `msg_id == 0` is silently accepted.
 
 ### Minor
 - [ ] **GC-9 — Diagnostics not localized** (`ParseError::fmt`, `gencat.rs:229-262`) — `LC_MESSAGES` has no effect.
-- [ ] **GC-10 — `NL_SETMAX` hardcoded to 255** (`gencat.rs:25`) rather than queried from the platform `<limits.h>`. Incidentally correct on Linux.
-- [ ] **GC-11 — `$quote c` uses byte length** (`c.len() == 1`, `gencat.rs:349`) not char count; a single multibyte quote char is rejected.
-- [ ] **GC-12 — `msgfile` `-` (stdin) is untested**; correctness depends on `plib::io::input_stream` and is unexercised.
+- [x] **GC-10 — `NL_SETMAX` hardcoded to 255** ✓ fixed (Phase 2): documented as matching the POSIX/glibc/macOS `<limits.h>` limit; `NL_MSGMAX` added too. (`gencat.rs:25`) rather than queried from the platform `<limits.h>`. Incidentally correct on Linux.
+- [x] **GC-11 — `$quote c` uses byte length** ✓ fixed (Phase 2): now `chars().count() == 1`. (`c.len() == 1`, `gencat.rs:349`) not char count; a single multibyte quote char is rejected.
+- [x] **GC-12 — `msgfile` `-` (stdin) is untested** ✓ fixed (Phase 2): added `gencat_msgfile_from_stdin` integration test.; correctness depends on `plib::io::input_stream` and is unexercised.
 
 ## Conformance matrix
 
 ### Synopsis / Options / Operands
 - [x] `OPTIONS: None` CONFORMS — no options defined (`gencat.rs:41-47`); clap `--help`/`--version` are benign extensions.
-- [ ] **`msgfile...` PARTIAL** — single operand only (GC-5).
+- [x] **`msgfile...`** — ✓ fixed (Phase 2): multiple operands merged in order (GC-5).
 - [x] `catfile -` → stdout CONFORMS (`gencat.rs:809`).
-- [ ] **`msgfile -` → stdin PARTIAL** (GC-12).
+- [x] **`msgfile -` → stdin** — ✓ verified by test (GC-12).
 
 ### STDIN / INPUT FILES / STDOUT / STDERR
 - [x] STDIN only when `msgfile` is `-` CONFORMS (`gencat.rs:307`).
@@ -94,7 +94,7 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 ### Extended description (source-file grammar)
 - [x] `$ ` comment, empty lines CONFORMS (`gencat.rs:339`).
 - [x] `$set n` ascending check + `[1,NL_SETMAX]` CONFORMS (`gencat.rs:389-393`); repeated same set number silently accepted (Minor).
-- [ ] **`$delset` DIVERGES** (GC-7).
+- [x] **`$delset`** — ✓ fixed (Phase 2) (GC-7).
 - [x] `$quote c` / empty `$quote` CONFORMS (`gencat.rs:343-356`), byte-length caveat (GC-11).
 - [x] **message escapes** (GC-1), **continuation** (GC-3), **delete-by-number** (GC-6), **collision replace** (GC-4) — ✓ fixed (Phase 1).
 

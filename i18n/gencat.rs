@@ -22,7 +22,13 @@ use std::{
     rc::Rc,
 };
 
-const NL_SETMAX: u32 = 255; //max set number(the limits.h defines it and is mentioned in POSIX specification)
+// Maximum set number. POSIX requires this to come from `<limits.h>`; both the
+// POSIX minimum and the glibc/Linux and macOS values for `NL_SETMAX` are 255,
+// so the constant matches the platform limit on every supported target.
+const NL_SETMAX: u32 = 255;
+// Maximum message number, per `<limits.h>` `NL_MSGMAX` (255 minimum in POSIX;
+// 32767 on glibc/Linux and macOS).
+const NL_MSGMAX: usize = 32767;
 const NL_SETD: u32 = 1; // the default set number for the messages that are not in any set
 const GLIBC_MAGIC: u32 = 0x960408de;
 
@@ -42,8 +48,8 @@ struct Args {
     #[arg(help = gettext("A pathname of the formatted message catalog"))]
     catfile: PathBuf,
 
-    #[arg(help = gettext("A pathname of a message text source file"))]
-    msgfile: PathBuf,
+    #[arg(required = true, help = gettext("A pathname of a message text source file"))]
+    msgfile: Vec<PathBuf>,
 }
 
 /// In memory representation of a message
@@ -220,6 +226,7 @@ pub enum ParseError {
     NoSetNumber(usize, String),
     ParseSetNumber(usize, ParseIntError),
     InvalidSetNumber(usize, u32),
+    InvalidMsgNumber(usize, usize),
     SetNumberNotInAscending(usize, u32, u32),
     InvalidLine(usize, String),
     InvalidQuoteChar(usize, String),
@@ -245,6 +252,9 @@ impl Display for ParseError {
             }
             ParseError::InvalidSetNumber(line_num, set_num) => {
                 write!(f, "Invalid set number {set_num} at line {line_num}")
+            }
+            ParseError::InvalidMsgNumber(line_num, msg_num) => {
+                write!(f, "Invalid message number {msg_num} at line {line_num}")
             }
             ParseError::SetNumberNotInAscending(line_num, prev_set_num, current_set_num) => {
                 write!(
@@ -405,7 +415,7 @@ impl MessageCatalog {
                     if c.is_empty() {
                         // unset quote character
                         quote_char = None;
-                    } else if c.len() == 1 {
+                    } else if c.chars().count() == 1 {
                         quote_char = c.chars().next();
                     } else {
                         return Err(Box::new(ParseError::InvalidQuoteChar(
@@ -423,10 +433,16 @@ impl MessageCatalog {
                 // Hmm..no coz the specification doesn't mention anything about the implementation details(it was GNU's choice to do that)
                 // and the GNU implementation is just one of the many ways to implement it, and the catopen will interpret it the sameway
                 if let Some(rem) = line.strip_prefix("$delset") {
-                    let set_id = rem
-                        .trim()
+                    // Only the first token is the set number; any remaining text
+                    // on the line is a comment.
+                    let first = rem.split_whitespace().next().unwrap_or("");
+                    let set_id = first
                         .parse::<u32>()
                         .map_err(|e| Box::new(ParseError::ParseSetNumber(line_num, e)))?;
+
+                    if set_id == 0 || set_id > NL_SETMAX {
+                        return Err(Box::new(ParseError::InvalidSetNumber(line_num, set_id)));
+                    }
 
                     catalog.cat.delete_set(set_id);
                 }
@@ -480,6 +496,14 @@ impl MessageCatalog {
                         )));
                     }
                 };
+
+                // Message numbers must be within [1, NL_MSGMAX]. (Ascending
+                // order within a set is advisory only — the POSIX merge rule
+                // explicitly permits a repeated number to replace an earlier
+                // message, so strict ordering is not enforced.)
+                if msg_id == 0 || msg_id > NL_MSGMAX {
+                    return Err(Box::new(ParseError::InvalidMsgNumber(line_num + 1, msg_id)));
+                }
 
                 if parts.len() == 1 {
                     // A message-number with no separating <blank> and no text
@@ -948,8 +972,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    match MessageCatalog::parse(&args.msgfile, catfile_catalog) {
-        Ok(catalog) => {
+    // Merge each msgfile, in command-line order, into the catalog.
+    let mut catalog_acc: Option<MessageCatalog> = catfile_catalog;
+    let mut parse_failed = false;
+    for msgfile in &args.msgfile {
+        match MessageCatalog::parse(msgfile, catalog_acc.take()) {
+            Ok(catalog) => catalog_acc = Some(catalog),
+            Err(err) => {
+                exit_code = 1;
+                parse_failed = true;
+                eprintln!("Error: {err}");
+                break;
+            }
+        }
+    }
+
+    if !parse_failed {
+        if let Some(catalog) = catalog_acc {
             let mut buffer = Cursor::new(Vec::new());
             catalog.write_catfile(&mut buffer)?;
 
@@ -959,10 +998,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut file = File::create(&args.catfile)?;
                 file.write_all(buffer.get_ref())?;
             }
-        }
-        Err(err) => {
-            exit_code = 1;
-            eprintln!("Error: {err}");
         }
     }
 
@@ -1041,6 +1076,32 @@ mod tests {
         assert_eq!(msg_text(&cat, 1, 1), None);
         assert_eq!(msg_text(&cat, 1, 2).as_deref(), Some("Bye"));
         assert_eq!(count_msgs(&cat, 1), 1);
+    }
+
+    #[test]
+    fn gc5_multiple_msgfiles_merge_in_order() {
+        // main() threads the accumulated catalog through successive parses;
+        // emulate that here.
+        let first = MessageCatalog::parse_str("$set 1\n1 First\n", None).unwrap();
+        let merged = MessageCatalog::parse_str("$set 2\n1 Second\n", Some(first)).unwrap();
+        assert_eq!(msg_text(&merged, 1, 1).as_deref(), Some("First"));
+        assert_eq!(msg_text(&merged, 2, 1).as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn gc7_delset_allows_trailing_comment_and_validates_range() {
+        let cat =
+            MessageCatalog::parse_str("$set 1\n1 X\n$delset 1 this is a comment\n", None).unwrap();
+        assert!(cat.cat.find_set(1).is_none());
+        assert!(MessageCatalog::parse_str("$delset 0\n", None).is_err());
+        assert!(MessageCatalog::parse_str("$delset 99999\n", None).is_err());
+    }
+
+    #[test]
+    fn gc8_message_number_range_enforced() {
+        assert!(MessageCatalog::parse_str("$set 1\n0 X\n", None).is_err());
+        assert!(MessageCatalog::parse_str("$set 1\n99999 X\n", None).is_err());
+        assert!(MessageCatalog::parse_str("$set 1\n1 X\n", None).is_ok());
     }
 
     #[test]

@@ -86,10 +86,10 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 - [x] Input read as text CONFORMS (`gencat.rs:309`), modulo LC_CTYPE (theme 4).
 
 ### Environment variables
-- [ ] **`LC_CTYPE` MISSING** — source read as UTF-8, not LC_CTYPE-interpreted.
+- [ ] **`LC_CTYPE` MISSING** — source read as UTF-8, not LC_CTYPE-interpreted. _(DEFERRED — cross-cutting theme 4; a byte-oriented parser re-architecture, out of scope for this pass.)_
 - [x] **`LC_MESSAGES` — diagnostics routed through gettext** (GC-9, Phase 12).
 - [x] `LANG`/`LC_ALL` PARTIAL — honored only via `setlocale` (`gencat.rs:786`).
-- [ ] **`NLSPATH` PARTIAL** — not read for the utility's own diagnostics.
+- [ ] **`NLSPATH` PARTIAL** — not read for the utility's own diagnostics. _(DEFERRED — self-localization via NLSPATH needs catalog-loader support that `gettextrs` does not expose; the gettext *family* honors NLSPATH (Phase 9). Out of scope for the compiler utilities.)_
 
 ### Extended description (source-file grammar)
 - [x] `$ ` comment, empty lines CONFORMS (`gencat.rs:339`).
@@ -101,10 +101,10 @@ The message-text-source grammar is only half-implemented: escape sequences and l
 ### Exit status / errors
 - [x] `0` success / `>0` error CONFORMS for parse errors (`gencat.rs:817-822`) — except the GC-2 panic path.
 
-## Test coverage — not covered
-- [ ] Escape sequences, line continuation, delete-by-number, msgid collision-replace.
-- [ ] Pre-existing catalog merge (would have caught GC-2).
-- [ ] `msgfile -` (stdin); multiple `msgfile` operands.
+## Test coverage — now covered (Phases 1–2)
+- [x] Escape sequences, line continuation, delete-by-number, msgid collision-replace — unit tests `gc1`/`gc3`/`gc6`/`gc4`.
+- [x] Pre-existing catalog merge / bad magic — unit test `gc2_bad_magic_is_error_not_panic`.
+- [x] `msgfile -` (stdin); multiple `msgfile` operands — `gencat_msgfile_from_stdin`, `gc5_multiple_msgfiles_merge_in_order`.
 
 ---
 
@@ -368,7 +368,7 @@ Single-domain `.po` → `.mo` compilation, multi-line string concatenation, fuzz
 - [x] **`domain` CONFORMS** (MF-1, Phase 7); **C escapes CONFORMS** (MF-6, Phase 8); **header charset CONFORMS** (MF-7, Phase 8); **`no-c-format` CONFORMS** (MF-8, Phase 8). `#~` obsolete handling partial.
 
 ### Env / stdout / stderr / output files / exit
-- [ ] **`LC_CTYPE` PARTIAL** (input assumed UTF-8); `NLSPATH`/`LANGUAGE` N/A for the compiler.
+- [ ] **`LC_CTYPE` PARTIAL** (input assumed UTF-8); `NLSPATH`/`LANGUAGE` N/A for the compiler. _(DEFERRED — cross-cutting theme 4.)_
 - [x] STDOUT not used / STDERR diagnostics CONFORMS; `.mo` binary format N/A (unspecified).
 - [x] **default output naming CONFORMS** (MF-1/MF-3, Phase 7 — per-domain `domainname[.mo]`); **exit status CONFORMS** (MF-2, Phase 8).
 

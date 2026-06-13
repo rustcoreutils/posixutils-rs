@@ -337,11 +337,11 @@ Single-domain `.po` → `.mo` compilation, multi-line string concatenation, fuzz
 ## Priority issues
 
 ### Critical
-- [ ] **MF-1 — `domain` directives ignored → wrong output files.** Parser `continue`s on `domain` (`po_file.rs:232`); `PoFile::domain` is never populated. All sections merge into one `HashMap` and one output file named from `args.files[0]` (`msgfmt.rs:97`, `:220-235`). Spec: each domain section → `domainname.mo`. **✓ verified:** a `module1.po` containing `domain "other"` produces a single `module1.mo` (spec wants `messages.mo` + `other.mo`). Fix: accumulate per-domain and write per-domain.
+- [x] **MF-1 — `domain` directives ignored → wrong output files.** ✓ fixed (Phase 7): the parser now recognizes `domain domainname` directives, tags each `PoEntry` with its domain (default `None` = `messages`), and msgfmt accumulates messages per domain. Without `-o`, one messages object file is written per domain, named after the domain; with `-o`, all domains are merged into the single named file (directives ignored, per spec). Verified: a `.po` with `domain "other"` now yields `messages`+`other` (or `messages.mo`+`other.mo` with `-S`). Spec: each domain section → `domainname.mo`. Fix: accumulate per-domain and write per-domain.
 - [ ] **MF-2 — `-c`/`-v` checks never affect exit status.** `validate_entry` emits every diagnostic with `is_error: false` (`msgfmt.rs:238-300`), so `has_errors` stays false and exit stays 0. Spec: "If an abnormality is detected, the exit status shall be non-zero." Fix: set `is_error: true` for genuine abnormalities.
 
 ### Major
-- [ ] **MF-3 — `-S` is dead code.** `output.set_extension("mo")` runs unconditionally before the `-S` check (`msgfmt.rs:227-233`), so the `ends_with(".mo")` guard is always false. Output naming is input-filename-based, not domain-based (see MF-1).
+- [x] **MF-3 — `-S` is dead code.** ✓ fixed (Phase 7): the buggy `set_extension`-then-guard logic is gone. Output naming is now domain-based; `apply_suffix` appends `.mo` only when `-S` is set and the name does not already end in `.mo`. Without `-S` the bare domain name is used (POSIX leaves this implementation-defined), so `-S` has an observable effect. It also applies to the `-o` filename. Output naming is input-filename-based, not domain-based (see MF-1).
 - [ ] **MF-4 — `-c` runs without `-v`.** Spec ties the checks to `-c -v` (behavior unspecified for `-c` alone); `validate_entry` is gated on `args.check` only (`msgfmt.rs:152`).
 - [ ] **MF-5 — Newline check is wrong.** Spec: abnormal if one string *starts or ends* with `\n` while the other doesn't. The impl compares *total* newline counts (`msgfmt.rs:246-249`), flagging internal newlines and missing the boundary case.
 - [ ] **MF-6 — Missing C escapes in the `.po` parser.** `\a`, `\b`, `\f`, `\v`, `\ooo` octal, `\xhh` hex are unhandled (`po_file.rs:362-380`); unknown escapes are passed through verbatim instead of erroring.
@@ -358,17 +358,17 @@ Single-domain `.po` → `.mo` compilation, multi-line string concatenation, fuzz
 
 ### Options / Operands
 - [x] `-f` (fuzzy skip), `-D` (dir search) CONFORMS (`msgfmt.rs:37-47`, `:203-217`).
-- [ ] **`-S` DIVERGES** (MF-3); **`-c`/`-v` PARTIAL** (MF-2/MF-4); **`-o` PARTIAL** (domain handling, MF-1).
+- [x] **`-S` CONFORMS** (MF-3, Phase 7); **`-o` CONFORMS** (MF-1, Phase 7 — merges domains into one file). **`-c`/`-v` PARTIAL** (MF-2/MF-4, Phase 8).
 - [x] `pathname...` multiple operands CONFORMS (`msgfmt.rs:102`); STDIN "Not used" (no `-` form) consistent with spec.
 
 ### Input files (.po grammar)
 - [x] `msgid`/`msgstr`/`msgid_plural`/`msgstr[n]`, multi-line concatenation, `#:`/`#.`/`#,`/`#` comments, fuzzy flag CONFORMS (`po_file.rs:232-336`).
-- [ ] **`domain` MISSING** (MF-1); **C escapes PARTIAL** (MF-6); **header charset PARTIAL** (MF-7); **`no-c-format` MISSING** (MF-8). `#~` obsolete handling partial.
+- [x] **`domain` CONFORMS** (MF-1, Phase 7); **C escapes PARTIAL** (MF-6, Phase 8); **header charset PARTIAL** (MF-7, Phase 8); **`no-c-format` MISSING** (MF-8, Phase 8). `#~` obsolete handling partial.
 
 ### Env / stdout / stderr / output files / exit
 - [ ] **`LC_CTYPE` PARTIAL** (input assumed UTF-8); `NLSPATH`/`LANGUAGE` N/A for the compiler.
 - [x] STDOUT not used / STDERR diagnostics CONFORMS; `.mo` binary format N/A (unspecified).
-- [ ] **default output naming DIVERGES** (MF-1/MF-3); **exit status PARTIAL** (MF-2).
+- [x] **default output naming CONFORMS** (MF-1/MF-3, Phase 7 — per-domain `domainname[.mo]`); **exit status PARTIAL** (MF-2, Phase 8).
 
 ## Test coverage — not covered
 - [ ] Multi-domain `.po` → multiple `.mo` (would have caught MF-1); `-c -v` exit status; `-S` suffix; `\xhh`/`\ooo` escapes; bare `charset=` header.

@@ -165,6 +165,55 @@ msgstr "Mensaje difuso"
     assert!(mo_path.exists());
 }
 
+/// MF-1: a `domain` directive must not be silently dropped. With `-o`, all
+/// domains are merged into the single output file (the directives are ignored),
+/// so a message from a non-default domain section is still present.
+#[test]
+fn test_msgfmt_multidomain_merged_with_o() {
+    let po_content = r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Hello"
+msgstr "Hola"
+
+domain "other"
+
+msgid "Goodbye"
+msgstr "Adios"
+"#;
+
+    let (temp_dir, po_path) = create_temp_po_file(po_content);
+    let mo_path = temp_dir.path().join("merged.mo");
+
+    run_test(TestPlan {
+        cmd: String::from("msgfmt"),
+        args: vec![
+            String::from("-o"),
+            mo_path.to_str().unwrap().to_string(),
+            po_path.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let data = fs::read(&mo_path).unwrap();
+    // Both the default-domain and "other"-domain translations are present.
+    let needle_hola = b"Hola";
+    let needle_adios = b"Adios";
+    assert!(
+        data.windows(needle_hola.len()).any(|w| w == needle_hola),
+        "merged .mo should contain the default-domain translation"
+    );
+    assert!(
+        data.windows(needle_adios.len()).any(|w| w == needle_adios),
+        "merged .mo should contain the 'other'-domain translation (domain not dropped)"
+    );
+}
+
 /// Test msgfmt with empty .po file
 #[test]
 fn test_msgfmt_empty() {

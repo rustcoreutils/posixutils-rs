@@ -24,7 +24,7 @@ _None._
 ### Minor
 - [x] **#1 — `test` `<` / `>` ignore `LC_COLLATE`; compare by byte/scalar order.** `misc/test.rs:274-275` (`eval_binary_str` uses Rust `s1 < s2`); `LC_COLLATE` is never read. Spec (Vol. 3 p. 3433): "`s1 < s2` True if s1 collates before s2 **in the current locale**" and (p. 3434) "`LC_COLLATE` — Determine the locale for the behavior of the `>` and `<` string comparison operators." Verified: under `LC_ALL=en_US.UTF-8`, glibc collates `a` < `B`, but `test a \< B` exits 1 (false) because byte `a`(0x61) > `B`(0x42). DIVERGES. ✓ **fixed (Phase 1)** — `<`/`>` now route through `libc::strcoll`. Root cause was deeper than the symptom: `gettext-rs`'s `setlocale` does not establish the C library's global locale, so `main()` now also calls `libc::setlocale(LC_ALL, "")` (`misc/test.rs`). Regression tests assert C-locale byte order and best-effort `en_US.UTF-8` collation.
 - [ ] **#2 — Removed operators `-a` / `-o` / `(` / `)` are implemented inconsistently.** `misc/test.rs:362-494` (`ExprParser`) supports `-a`, `-o`, `!`, `(`, `)` for the >4-argument path, but the 3-argument forms `test x -a y` / `test x -o y` return `syntax error` (exit 2) at `misc/test.rs:548`. Spec APPLICATION USAGE (Vol. 3 p. 3435): "The `-a` and `-o` binary primaries and the `'('` and `')'` operators **have been removed.**" Both behaviors fall in POSIX's "unspecified" zone (>4 args, and the 3-arg "Otherwise" cases), so neither is non-conforming — but the split is surprising. Decision item: either keep the historical extension uniformly (also accept `test x -a y`) or document that the legacy operators are accepted only in compound (>4-arg) expressions.
-- [ ] **#3 — Integer operands are `i64`-bounded and reject surrounding whitespace.** `misc/test.rs:230-250` (`eval_binary_int` uses `str::parse::<i64>`). `test 99999999999999999999 -gt 1` → `integer expression expected` (exit 2); `test ' 5' -eq 5` → error. POSIX says only "integers … algebraically" with no stated bound, and historical `test` tolerates leading blanks. Both are edge cases; GNU also uses a fixed-width type. Fix (optional): trim surrounding blanks before parse; the `i64` bound is acceptable.
+- [x] **#3 — Integer operands are `i64`-bounded and reject surrounding whitespace.** `misc/test.rs:230-250` (`eval_binary_int` uses `str::parse::<i64>`). `test 99999999999999999999 -gt 1` → `integer expression expected` (exit 2); `test ' 5' -eq 5` → error. POSIX says only "integers … algebraically" with no stated bound, and historical `test` tolerates leading blanks. ✓ **fixed (Phase 2)** — added `parse_int` helper that `trim()`s surrounding blanks before parsing; the `i64` bound is retained (overflow is still diagnosed, as in GNU). Tested in `test_intops_operands`.
 - [ ] **#4 — Dead unreachable branch in `eval_unary`.** `misc/test.rs:175-178` prints `unknown operator` and returns false, but every caller (`misc/test.rs:463`, `misc/test.rs:516`) pre-checks `parse_unary_op(...).is_some()`, so the `None` arm is unreachable. Code-quality only (CLAUDE.md forbids dead code), not a conformance issue. Fix: collapse `eval_unary` to take a parsed `UnaryOp`.
 
 ## Detailed conformance matrix
@@ -58,7 +58,7 @@ _None._
 - [x] `-nt`,`-ot` CONFORMS — including the "one side unresolvable" rules (newer-than true if p1 exists and p2 doesn't; older-than symmetric). `misc/test.rs:299-323`.
 - [x] `=`,`!=` CONFORMS — byte-exact string identity. `misc/test.rs:272-273`.
 - [x] **`<`,`>` CONFORMS** — ✓ fixed (#1): now collate via `libc::strcoll` under the active `LC_COLLATE`. `misc/test.rs` (`strcoll` helper + `eval_binary_str`).
-- [x] `-eq`,`-ne`,`-lt`,`-gt`,`-ge`,`-le` CONFORMS — `i64` algebraic comparison; non-integer operand → diagnostic + exit 2 (per "an error occurred"). `misc/test.rs:230-268`. See **#3** for the bound/whitespace edge.
+- [x] `-eq`,`-ne`,`-lt`,`-gt`,`-ge`,`-le` CONFORMS — `i64` algebraic comparison; non-integer operand → diagnostic + exit 2 (per "an error occurred"). `misc/test.rs:230-268`. ✓ #3 fixed: surrounding blanks now trimmed via `parse_int`.
 
 ### `test` — Argument-count precedence algorithm (`misc/test.rs:497-577`)
 - [x] **0 args → false (1) CONFORMS.** `misc/test.rs:499`. Verified.
@@ -92,7 +92,7 @@ Not covered:
 - [ ] `-t` terminal test (true and false fd cases)
 - [ ] `-nt` / `-ot` timestamp comparison (both files exist; one missing)
 - [x] `LC_COLLATE` collation behavior of `<`/`>` — ✓ added (`test_str_collation`)
-- [ ] Integer overflow / leading-blank operand error paths (**#3**)
+- [x] Integer overflow / leading-blank operand error paths (**#3**) — ✓ added (`test_intops_operands`)
 - [ ] `>4`-argument `ExprParser` precedence (`-a` tighter than `-o`, `!`, nested `()`)
 - [ ] `true`/`false` argument-discard (`true --`, `false foo`) — `true`/`false` mod.rs are minimal
 

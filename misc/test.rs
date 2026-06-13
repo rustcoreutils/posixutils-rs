@@ -227,26 +227,23 @@ impl EvalResult {
     }
 }
 
+/// Parse an integer operand, tolerating surrounding blanks as historical
+/// `test` implementations do. The diagnostic preserves the original operand.
+/// (audit #3)
+fn parse_int(s: &str) -> Result<i64, EvalResult> {
+    s.trim().parse().map_err(|_| {
+        EvalResult::Error(format!("{}: {}", gettext("integer expression expected"), s))
+    })
+}
+
 fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> EvalResult {
-    let i1: i64 = match s1.parse() {
+    let i1: i64 = match parse_int(s1) {
         Ok(v) => v,
-        Err(_) => {
-            return EvalResult::Error(format!(
-                "{}: {}",
-                gettext("integer expression expected"),
-                s1
-            ))
-        }
+        Err(e) => return e,
     };
-    let i2: i64 = match s2.parse() {
+    let i2: i64 = match parse_int(s2) {
         Ok(v) => v,
-        Err(_) => {
-            return EvalResult::Error(format!(
-                "{}: {}",
-                gettext("integer expression expected"),
-                s2
-            ))
-        }
+        Err(e) => return e,
     };
 
     let result = match op {

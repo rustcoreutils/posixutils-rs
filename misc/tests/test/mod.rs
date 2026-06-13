@@ -90,6 +90,28 @@ fn test_intops() {
     test_test(&["20", "-le", "20"], 0);
 }
 
+/// Integer operand robustness: surrounding blanks tolerated; explicit sign
+/// accepted; non-numeric and i64-overflow operands are diagnosed (exit 2).
+/// (audit #3)
+#[test]
+fn test_intops_operands() {
+    // Leading/trailing blanks are tolerated (historical `test` behavior).
+    test_test(&[" 5", "-eq", "5"], 0);
+    test_test(&["5", "-eq", "5 "], 0);
+    test_test(&[" 5 ", "-eq", "5"], 0);
+
+    // Explicit sign and leading zeros.
+    test_test(&["+5", "-eq", "5"], 0);
+    test_test(&["-5", "-lt", "0"], 0);
+    test_test(&["-5", "-eq", "-5"], 0);
+    test_test(&["05", "-eq", "5"], 0);
+
+    // Non-numeric and overflow operands are errors (exit > 1).
+    test_test_with_err(&["abc", "-eq", "1"], 2);
+    test_test_with_err(&["", "-eq", "1"], 2);
+    test_test_with_err(&["99999999999999999999", "-gt", "1"], 2);
+}
+
 #[test]
 fn test_strops() {
     test_test(&["a", "=", "a"], 0);

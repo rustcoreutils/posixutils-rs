@@ -52,7 +52,12 @@ struct Args {
 }
 
 fn main() {
-    // Set up localization
+    // Set up localization. Use libc::setlocale directly so the C global locale
+    // (read by localeconv/nl_langinfo below) is actually switched to the
+    // environment locale; the gettextrs wrapper does not reliably apply it here.
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+    }
     setlocale(GettextCategory::LcAll, "");
     if textdomain("posixutils-rs").is_err() {
         // Ignore error - translation may not be available
@@ -87,17 +92,35 @@ fn main() {
     }
 
     // Query specific categories or keywords
+    let mut had_error = false;
     for name in &args.names {
-        if let Some(category) = LocaleCategory::from_name(name) {
+        if name == "charmap" {
+            // Reserved operand: the codeset name of the current locale.
+            print_charmap(args.keyword_names);
+        } else if let Some(category) = LocaleCategory::from_name(name) {
             // It's a category name
             if args.category_names {
                 println!("{}", category);
             }
-            print_category_info(&settings, category, args.keyword_names);
-        } else {
-            // It's a keyword name - find which category it belongs to
-            print_keyword_info(name, args.category_names, args.keyword_names);
+            print_category_info(category, args.keyword_names);
+        } else if !print_keyword_info(name, args.category_names, args.keyword_names) {
+            // Unknown name: diagnosed on stderr and reflected in the exit status.
+            had_error = true;
         }
+    }
+
+    if had_error {
+        std::process::exit(1);
+    }
+}
+
+/// Print the `charmap` reserved operand: the codeset of the current locale.
+fn print_charmap(show_name: bool) {
+    let codeset = locale_codeset();
+    if show_name {
+        print_keyword("charmap", codeset);
+    } else {
+        println!("{}", codeset);
     }
 }
 
@@ -123,74 +146,74 @@ fn print_all_settings(settings: &LocaleSettings) {
     }
 }
 
-/// Print information about a specific category
-fn print_category_info(settings: &LocaleSettings, category: LocaleCategory, show_keywords: bool) {
-    let locale = settings.effective(category);
-
-    if show_keywords {
-        // Print keyword=value pairs for this category
-        match category {
-            LocaleCategory::LcNumeric => {
-                print_keyword("decimal_point", get_decimal_point());
-                print_keyword("thousands_sep", get_thousands_sep());
-                print_keyword("grouping", get_grouping());
-            }
-            LocaleCategory::LcMonetary => {
-                print_keyword("currency_symbol", get_currency_symbol());
-                print_keyword("int_curr_symbol", get_int_curr_symbol());
-                print_keyword("mon_decimal_point", get_mon_decimal_point());
-            }
-            LocaleCategory::LcTime => {
-                print_keyword("d_t_fmt", get_d_t_fmt());
-                print_keyword("d_fmt", get_d_fmt());
-                print_keyword("t_fmt", get_t_fmt());
-            }
-            LocaleCategory::LcMessages => {
-                print_keyword("yesexpr", get_yesexpr());
-                print_keyword("noexpr", get_noexpr());
-            }
-            _ => {
-                // For other categories, just show the locale name
-                println!("{}={}", category, locale);
-            }
-        }
-    } else {
-        println!("{}={}", category, locale);
+/// The keywords this implementation exposes for each category, in output order.
+/// Per POSIX, no keyword values are written for `LC_CTYPE`/`LC_COLLATE`.
+fn category_keywords(category: LocaleCategory) -> &'static [&'static str] {
+    match category {
+        LocaleCategory::LcNumeric => &["decimal_point", "thousands_sep", "grouping"],
+        LocaleCategory::LcMonetary => &["int_curr_symbol", "currency_symbol", "mon_decimal_point"],
+        LocaleCategory::LcTime => &["d_t_fmt", "d_fmt", "t_fmt"],
+        LocaleCategory::LcMessages => &["yesexpr", "noexpr"],
+        LocaleCategory::LcCtype | LocaleCategory::LcCollate => &[],
     }
 }
 
-/// Print information about a specific keyword
-fn print_keyword_info(keyword: &str, show_category: bool, show_name: bool) {
-    let (category, value) = match keyword {
-        // LC_NUMERIC keywords
-        "decimal_point" => (Some(LocaleCategory::LcNumeric), get_decimal_point()),
-        "thousands_sep" => (Some(LocaleCategory::LcNumeric), get_thousands_sep()),
-        "grouping" => (Some(LocaleCategory::LcNumeric), get_grouping()),
+/// Look up the category and current value of a keyword, or `None` if this
+/// implementation does not expose it.
+fn keyword_value(keyword: &str) -> Option<(LocaleCategory, String)> {
+    use LocaleCategory::*;
+    let entry = match keyword {
+        "decimal_point" => (LcNumeric, get_decimal_point()),
+        "thousands_sep" => (LcNumeric, get_thousands_sep()),
+        "grouping" => (LcNumeric, get_grouping()),
 
-        // LC_MONETARY keywords
-        "currency_symbol" => (Some(LocaleCategory::LcMonetary), get_currency_symbol()),
-        "int_curr_symbol" => (Some(LocaleCategory::LcMonetary), get_int_curr_symbol()),
-        "mon_decimal_point" => (Some(LocaleCategory::LcMonetary), get_mon_decimal_point()),
+        "int_curr_symbol" => (LcMonetary, get_int_curr_symbol()),
+        "currency_symbol" => (LcMonetary, get_currency_symbol()),
+        "mon_decimal_point" => (LcMonetary, get_mon_decimal_point()),
 
-        // LC_TIME keywords
-        "d_t_fmt" => (Some(LocaleCategory::LcTime), get_d_t_fmt()),
-        "d_fmt" => (Some(LocaleCategory::LcTime), get_d_fmt()),
-        "t_fmt" => (Some(LocaleCategory::LcTime), get_t_fmt()),
+        "d_t_fmt" => (LcTime, get_d_t_fmt()),
+        "d_fmt" => (LcTime, get_d_fmt()),
+        "t_fmt" => (LcTime, get_t_fmt()),
 
-        // LC_MESSAGES keywords
-        "yesexpr" => (Some(LocaleCategory::LcMessages), get_yesexpr()),
-        "noexpr" => (Some(LocaleCategory::LcMessages), get_noexpr()),
+        "yesexpr" => (LcMessages, get_yesexpr()),
+        "noexpr" => (LcMessages, get_noexpr()),
 
-        _ => {
-            eprintln!("locale: unknown keyword: {}", keyword);
-            return;
+        _ => return None,
+    };
+    Some(entry)
+}
+
+/// Print information about a specific category. Categories with no exposed
+/// keywords (LC_CTYPE/LC_COLLATE) simply produce no keyword output, rather than
+/// the malformed `CATEGORY=locale_name` line the previous code emitted.
+fn print_category_info(category: LocaleCategory, show_keywords: bool) {
+    for keyword in category_keywords(category) {
+        let value = match keyword_value(keyword) {
+            Some((_, v)) => v,
+            None => continue,
+        };
+        if show_keywords {
+            print_keyword(keyword, value);
+        } else {
+            // Item 4: without `-k`, write only the selected keyword values.
+            println!("{}", value);
+        }
+    }
+}
+
+/// Print information about a specific keyword. Returns `false` (and diagnoses on
+/// stderr) when the name is not a keyword this implementation recognizes.
+fn print_keyword_info(keyword: &str, show_category: bool, show_name: bool) -> bool {
+    let (category, value) = match keyword_value(keyword) {
+        Some(entry) => entry,
+        None => {
+            eprintln!("locale: unknown name \"{}\"", keyword);
+            return false;
         }
     };
 
     if show_category {
-        if let Some(cat) = category {
-            println!("{}", cat);
-        }
+        println!("{}", category);
     }
 
     if show_name {
@@ -198,9 +221,10 @@ fn print_keyword_info(keyword: &str, show_category: bool, show_name: bool) {
     } else {
         println!("{}", value);
     }
+    true
 }
 
-/// Print a keyword=value pair
+/// Print a keyword=value pair (non-numeric keyword format).
 fn print_keyword(name: &str, value: String) {
     println!("{}=\"{}\"", name, value);
 }
@@ -293,23 +317,76 @@ fn get_mon_decimal_point() -> String {
     "".to_string()
 }
 
+/// Query `nl_langinfo(item)` for the active locale, returning `None` if it is
+/// unavailable or empty. Used for the `LC_TIME`/`LC_MESSAGES` keywords and the
+/// `charmap` operand, which `localeconv()` does not provide.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn nl_langinfo_string(item: libc::nl_item) -> Option<String> {
+    unsafe {
+        let ptr = libc::nl_langinfo(item);
+        if ptr.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(ptr)
+            .to_str()
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn nl_langinfo_string(_item: i32) -> Option<String> {
+    None
+}
+
+/// Codeset of the current locale, for the `charmap` operand.
+fn locale_codeset() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if let Some(s) = nl_langinfo_string(libc::CODESET) {
+            return s;
+        }
+    }
+    "ANSI_X3.4-1968".to_string()
+}
+
 fn get_d_t_fmt() -> String {
-    // Return typical format
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(s) = nl_langinfo_string(libc::D_T_FMT) {
+        return s;
+    }
     "%a %b %e %H:%M:%S %Y".to_string()
 }
 
 fn get_d_fmt() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(s) = nl_langinfo_string(libc::D_FMT) {
+        return s;
+    }
     "%m/%d/%y".to_string()
 }
 
 fn get_t_fmt() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(s) = nl_langinfo_string(libc::T_FMT) {
+        return s;
+    }
     "%H:%M:%S".to_string()
 }
 
 fn get_yesexpr() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(s) = nl_langinfo_string(libc::YESEXPR) {
+        return s;
+    }
     "^[yY]".to_string()
 }
 
 fn get_noexpr() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(s) = nl_langinfo_string(libc::NOEXPR) {
+        return s;
+    }
     "^[nN]".to_string()
 }

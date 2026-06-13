@@ -230,12 +230,12 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 ## Priority issues
 
 ### Critical
-- [ ] **LO-1 — `LC_TIME`/`LC_MESSAGES` keyword values are hardcoded.** `d_t_fmt`/`d_fmt`/`t_fmt` (`locale.rs:296-307`) and `yesexpr`/`noexpr` (`:309-315`) return fixed strings regardless of locale. **✓ verified:** `LC_ALL=C locale yesexpr` and `LC_ALL=fr_FR.UTF-8 locale yesexpr` both print `^[yY]`; `d_fmt` is `%m/%d/%y` regardless. Fix: `nl_langinfo(D_FMT/T_FMT/D_T_FMT/YESEXPR/NOEXPR)`.
-- [ ] **LO-2 — Category operand without `-k` prints `CATEGORY=locale_name`** instead of one keyword value per line (`locale.rs:152-159`). Diverges from STDOUT format items 2/3.
+- [x] **LO-1 — `LC_TIME`/`LC_MESSAGES` keyword values are hardcoded.** ✓ fixed (Phase 5): `d_t_fmt`/`d_fmt`/`t_fmt`/`yesexpr`/`noexpr` now read `nl_langinfo(D_T_FMT/D_FMT/T_FMT/YESEXPR/NOEXPR)` (falling back to the prior constants off-Linux/macOS). **Root-cause fix:** the C global locale was never actually switched — `gettextrs::setlocale(LcAll, "")` did not apply, so `localeconv`/`nl_langinfo` always saw the C locale. Added an explicit `libc::setlocale(LC_ALL, "")` (also in iconv, which makes IC-3 actually work). Verified `LC_ALL=en_US.UTF-8 locale d_fmt`→`%m/%d/%Y`, `yesexpr`→`^[+1yY]`, matching glibc. Fix: `nl_langinfo(D_FMT/T_FMT/D_T_FMT/YESEXPR/NOEXPR)`.
+- [x] **LO-2 — Category operand without `-k` prints `CATEGORY=locale_name`** instead of one keyword value per line. ✓ fixed (Phase 5): `print_category_info` now iterates the category's exposed keywords and writes each value (`%s\n`) without `-k`, or `name="value"` pairs with `-k`. `LC_CTYPE`/`LC_COLLATE` (no exposed keywords) now produce no output instead of a malformed line. Diverges from STDOUT format items 2/3.
 
 ### Major
-- [ ] **LO-3 — Error paths exit 0.** Unknown keyword and the `charmap` operand print to stderr and fall through to an implicit exit 0. **✓ verified:** `locale charmap` → `locale: unknown keyword: charmap`, **`exit 0`**; `locale frac_digits` → `unknown keyword`. Spec: `>0` on error. `locale.rs:183-188`.
-- [ ] **LO-4 — Reserved `charmap` / `code_set_name` operand unhandled** (`locale.rs:164-188`) — falls into the unknown-keyword arm (LO-3). Fix: add a `charmap` arm via `nl_langinfo(CODESET)`.
+- [x] **LO-3 — Error paths exit 0.** ✓ fixed (Phase 5): an unknown name is diagnosed (`locale: unknown name "X"`) and `main` exits 1; the `charmap` operand is now handled (LO-4). **✓ verified:** `locale charmap` → `locale: unknown keyword: charmap`, **`exit 0`**; `locale frac_digits` → `unknown keyword`. Spec: `>0` on error. `locale.rs:183-188`.
+- [x] **LO-4 — Reserved `charmap` / `code_set_name` operand unhandled.** ✓ fixed (Phase 5): a `charmap` operand prints `nl_langinfo(CODESET)` (value, or `charmap="..."` with `-k`). Fix: add a `charmap` arm via `nl_langinfo(CODESET)`.
 - [ ] **LO-5 — Numeric keywords double-quoted.** Spec: numeric keyword → `%s=%d` (unquoted). All keywords use `%s="%s"` (`locale.rs:204-206`). **✓ verified:** `locale -k grouping` → `grouping="-1"` (quoted, and the `-1` is a CHAR_MAX-sentinel bug, see LO-8).
 - [ ] **LO-6 — ~30 required keywords missing from dispatch.** `LC_MONETARY` exposes only 3 of ~24 (missing `mon_thousands_sep`, `mon_grouping`, `positive_sign`, `negative_sign`, `int_frac_digits`, `frac_digits`, `p_cs_precedes`, `p_sep_by_space`, `n_cs_precedes`, `n_sep_by_space`, `p_sign_posn`, `n_sign_posn`, and the `int_*` POSIX.1-2008 set); `LC_TIME` missing `abday`/`day`/`abmon`/`mon`/`am_pm`/`t_fmt_ampm`. **✓ verified:** `locale -k frac_digits` → `unknown keyword`. `types.rs` defines the keyword arrays but the query path never consults them.
 - [ ] **LO-7 — `-a`/`-m` not mutually exclusive** and not exclusive with the `[-ck] name…` form; `-a` silently wins (`locale.rs:32-37`). Add clap `conflicts_with`.
@@ -251,7 +251,7 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 ### Options / Operands
 - [ ] **`-a`/`-m` PARTIAL** (LO-7); **`-c`/`-k` PARTIAL** (LO-5).
 - [x] No-operand default output (LANG/LC_*/LC_ALL with correct implied-vs-set quoting) CONFORMS (`locale.rs:105-124`, `env.rs:83-106`).
-- [ ] **category operand DIVERGES** (LO-2); **`charmap` operand MISSING** (LO-4).
+- [x] **category operand CONFORMS** (LO-2, Phase 5); **`charmap` operand CONFORMS** (LO-4, Phase 5).
 
 ### Environment variables
 - [x] `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES` + precedence CONFORMS (`env.rs:41-80`). `NLSPATH` N/A.
@@ -262,8 +262,8 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 
 ### Keyword coverage / exit status
 - [x] `decimal_point`, `thousands_sep`, `currency_symbol`, `int_curr_symbol`, `mon_decimal_point` CONFORMS (via `localeconv()`).
-- [ ] **LC_TIME/LC_MESSAGES hardcoded** (LO-1); **~30 keywords MISSING** (LO-6).
-- [ ] **error exit status DIVERGES** (LO-3).
+- [x] **LC_TIME/LC_MESSAGES now live** (LO-1, Phase 5 via nl_langinfo); **~30 keywords MISSING** (LO-6, Phase 6).
+- [x] **error exit status CONFORMS** (LO-3, Phase 5) — unknown name exits 1.
 
 ## Test coverage — not covered
 - [ ] `charmap` operand; error exit code; hardcoded-vs-live `LC_TIME`/`LC_MESSAGES`; full `LC_MONETARY` keyword set; numeric-keyword quoting.

@@ -97,6 +97,9 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     variant: UTF32Variant,
     had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u8>> {
+    // The generic `UTF-32` form is endianness-ambiguous, so a leading U+FEFF
+    // byte-order mark is emitted; the explicit LE/BE forms write none.
+    let emit_bom = variant == UTF32Variant::UTF32;
     let variant = match variant {
         UTF32Variant::UTF32LE => UTF32Variant::UTF32LE,
         UTF32Variant::UTF32BE => UTF32Variant::UTF32BE,
@@ -107,6 +110,14 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                 UTF32Variant::UTF32BE
             }
         }
+    };
+
+    let bom = if emit_bom {
+        let mut b = [0u8; 4];
+        write_u32(&mut b, BOM, variant);
+        b.to_vec()
+    } else {
+        Vec::new()
     };
 
     let mut code_point = input.peekable();
@@ -139,7 +150,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
         }
     });
 
-    Box::new(iter)
+    Box::new(bom.into_iter().chain(iter))
 }
 
 #[inline]

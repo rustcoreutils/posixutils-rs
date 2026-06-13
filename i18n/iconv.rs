@@ -19,7 +19,6 @@ use plib::io::input_stream;
 use std::{
     cell::Cell,
     collections::HashMap,
-    env,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -165,8 +164,8 @@ enum Encodings {
 
 impl Encodings {
     fn parse(encoding: &str) -> Self {
-        let cleaned_encoding = encoding.trim_matches('"');
-        match Encodings::from_str(cleaned_encoding) {
+        let cleaned_encoding = encoding.trim().trim_matches('"');
+        match Encodings::from_str(Self::canonical_name(cleaned_encoding)) {
             Ok(encoding) => encoding,
             Err(_) => {
                 eprintln!("Error: Unknown encoding: {}", cleaned_encoding);
@@ -174,12 +173,55 @@ impl Encodings {
             }
         }
     }
+
+    /// Map a user- or locale-supplied codeset name to the canonical serialized
+    /// form accepted by `from_str`. Matching is case-insensitive and tolerates
+    /// the common spellings/aliases (including the names `nl_langinfo(CODESET)`
+    /// reports for the C/POSIX locale on glibc and macOS).
+    fn canonical_name(name: &str) -> &'static str {
+        match name.to_ascii_uppercase().as_str() {
+            "ASCII" | "US-ASCII" | "USASCII" | "ANSI_X3.4-1968" | "ANSI_X3.4-1986"
+            | "ISO646-US" | "ISO-646-US" | "646" | "C" | "POSIX" => "ASCII",
+            "UTF-8" | "UTF8" => "UTF-8",
+            "UTF-16" | "UTF16" | "UCS-2" | "UCS2" => "UTF-16",
+            "UTF-16LE" | "UTF16LE" | "UCS-2LE" => "UTF-16LE",
+            "UTF-16BE" | "UTF16BE" | "UCS-2BE" => "UTF-16BE",
+            "UTF-32" | "UTF32" | "UCS-4" | "UCS4" => "UTF-32",
+            "UTF-32LE" | "UTF32LE" | "UCS-4LE" => "UTF-32LE",
+            "UTF-32BE" | "UTF32BE" | "UCS-4BE" => "UTF-32BE",
+            // Unknown: hand the cleaned name back so `from_str` reports it.
+            _ => "",
+        }
+    }
 }
 
 fn list_encodings() {
+    // Print the serialized (hyphenated) form, e.g. `UTF-8`, so the listed names
+    // round-trip through `-f`/`-t` (Display uses the SCREAMING-KEBAB-CASE form;
+    // Debug would print the underscored variant identifiers).
     for encoding in Encodings::iter() {
-        println!("{:?}", encoding);
+        println!("{}", encoding);
     }
+}
+
+/// Codeset of the current locale, used when `-f`/`-t` is omitted. Per POSIX the
+/// default is the codeset of the current locale, which follows the
+/// `LC_ALL` > `LC_CTYPE` > `LANG` chain — this is exactly what `nl_langinfo(CODESET)`
+/// returns after `setlocale(LC_ALL, "")`. On platforms without `nl_langinfo`,
+/// or if it yields nothing usable, fall back to UTF-8.
+fn locale_codeset() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unsafe {
+        let ptr = libc::nl_langinfo(libc::CODESET);
+        if !ptr.is_null() {
+            if let Ok(s) = std::ffi::CStr::from_ptr(ptr).to_str() {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    "UTF-8".to_string()
 }
 
 #[derive(Debug, Default)]
@@ -338,6 +380,13 @@ fn parse_charmap(path: &Path) -> Result<Charmap, Box<dyn std::error::Error>> {
         }
     }
 
+    // <mb_cur_max> defaults to 1 when the charmap omits it; a value of 0 would
+    // make the conversion flush guard (`buffer.len() >= mb_cur_max`) always
+    // true and emit one byte at a time.
+    if charmap.header.mb_cur_max == 0 {
+        charmap.header.mb_cur_max = 1;
+    }
+
     Ok(charmap)
 }
 
@@ -360,108 +409,110 @@ fn encoding_conversion(
     to: &Encodings,
     input: CircularBuffer<Box<dyn Read>>,
     omit_invalid: bool,
-    supress_error: bool,
+    suppress_error: bool,
     had_error: &Rc<Cell<bool>>,
 ) {
     let iter = input.into_iter();
     let ucs4 = match from {
-        Encodings::UTF_8 => utf_8::to_ucs4(iter, omit_invalid, supress_error, had_error.clone()),
+        Encodings::UTF_8 => utf_8::to_ucs4(iter, omit_invalid, suppress_error, had_error.clone()),
         Encodings::UTF_16 => utf_16::to_ucs4(
             iter,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF16Variant::UTF16,
             had_error.clone(),
         ),
         Encodings::UTF_16LE => utf_16::to_ucs4(
             iter,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF16Variant::UTF16LE,
             had_error.clone(),
         ),
         Encodings::UTF_16BE => utf_16::to_ucs4(
             iter,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF16Variant::UTF16BE,
             had_error.clone(),
         ),
         Encodings::UTF_32 => utf_32::to_ucs4(
             iter,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF32Variant::UTF32,
             had_error.clone(),
         ),
         Encodings::UTF_32LE => utf_32::to_ucs4(
             iter,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF32Variant::UTF32LE,
             had_error.clone(),
         ),
         Encodings::UTF_32BE => utf_32::to_ucs4(
             iter,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF32Variant::UTF32BE,
             had_error.clone(),
         ),
-        Encodings::ASCII => ascii::to_ucs4(iter, omit_invalid, supress_error, had_error.clone()),
+        Encodings::ASCII => ascii::to_ucs4(iter, omit_invalid, suppress_error, had_error.clone()),
     };
 
     let expected = match to {
-        Encodings::UTF_8 => utf_8::from_ucs4(ucs4, omit_invalid, supress_error, had_error.clone()),
+        Encodings::UTF_8 => utf_8::from_ucs4(ucs4, omit_invalid, suppress_error, had_error.clone()),
         Encodings::UTF_16 => utf_16::from_ucs4(
             ucs4,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF16Variant::UTF16,
             had_error.clone(),
         ),
         Encodings::UTF_16BE => utf_16::from_ucs4(
             ucs4,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF16Variant::UTF16BE,
             had_error.clone(),
         ),
         Encodings::UTF_16LE => utf_16::from_ucs4(
             ucs4,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF16Variant::UTF16LE,
             had_error.clone(),
         ),
         Encodings::UTF_32 => utf_32::from_ucs4(
             ucs4,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF32Variant::UTF32,
             had_error.clone(),
         ),
         Encodings::UTF_32LE => utf_32::from_ucs4(
             ucs4,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF32Variant::UTF32LE,
             had_error.clone(),
         ),
         Encodings::UTF_32BE => utf_32::from_ucs4(
             ucs4,
             omit_invalid,
-            supress_error,
+            suppress_error,
             UTF32Variant::UTF32BE,
             had_error.clone(),
         ),
-        Encodings::ASCII => ascii::from_ucs4(ucs4, omit_invalid, supress_error, had_error.clone()),
+        Encodings::ASCII => ascii::from_ucs4(ucs4, omit_invalid, suppress_error, had_error.clone()),
     };
 
-    expected.for_each(|byte| {
-        io::stdout().write_all(&[byte]).unwrap();
-        io::stdout().flush().unwrap();
-    });
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for byte in expected {
+        out.write_all(&[byte]).unwrap();
+    }
+    out.flush().unwrap();
 }
 
 fn charmap_conversion(
@@ -545,25 +596,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exit(0);
     }
 
-    let from_codeset = args.from_codeset.unwrap_or_else(|| {
-        env::var("LANG")
-            .ok()
-            .and_then(|lang| lang.split('.').nth(1).map(String::from))
-            .unwrap_or_else(|| {
-                eprintln!("Error: Could not find a codeset from your locale");
-                exit(1);
-            })
-    });
-
-    let to_codeset = args.to_codeset.unwrap_or_else(|| {
-        env::var("LANG")
-            .ok()
-            .and_then(|lang| lang.split('.').nth(1).map(String::from))
-            .unwrap_or_else(|| {
-                eprintln!("Error: Could not find a codeset from your locale");
-                exit(1);
-            })
-    });
+    let from_codeset = args.from_codeset.unwrap_or_else(locale_codeset);
+    let to_codeset = args.to_codeset.unwrap_or_else(locale_codeset);
 
     let from_codeset = parse_codeset(&from_codeset)?;
     let to_codeset = parse_codeset(&to_codeset)?;

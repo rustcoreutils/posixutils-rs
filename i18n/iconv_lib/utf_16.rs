@@ -142,6 +142,9 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     variant: UTF16Variant,
     had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u8>> {
+    // The generic `UTF-16` form is endianness-ambiguous, so a leading U+FEFF
+    // byte-order mark is emitted; the explicit LE/BE forms write none.
+    let emit_bom = variant == UTF16Variant::UTF16;
     let variant = match variant {
         UTF16Variant::UTF16LE | UTF16Variant::UTF16BE => variant,
         UTF16Variant::UTF16 => {
@@ -151,6 +154,12 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                 UTF16Variant::UTF16BE
             }
         }
+    };
+
+    let bom = if emit_bom {
+        to_bytes(&[BOM], variant)
+    } else {
+        Vec::new()
     };
 
     let iter = input.flat_map(move |code_point| {
@@ -184,7 +193,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
         to_bytes(&utf16, variant)
     });
 
-    Box::new(iter)
+    Box::new(bom.into_iter().chain(iter))
 }
 
 #[inline]

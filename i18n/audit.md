@@ -181,16 +181,16 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 - [x] **IC-2 — `exit(1)` called from inside library iterators** (`ascii.rs:29`, `utf_8.rs:48-178`). ✓ fixed (Phase 3): every codec error path now sets `had_error` and returns `None` (stopping that stream) instead of calling `process::exit`; the exit status is decided once in `main`. Remaining file operands are no longer bypassed by a mid-stream process abort.
 
 ### Major
-- [ ] **IC-3 — Default codeset reads only `LANG`, splitting on `.`.** Ignores the `LC_ALL > LC_CTYPE > LANG` chain; `LANG=C`, `LANG=POSIX`, `LANG=en_US` (no `.`), or unset all hit the error/exit branch (`iconv.rs:494-512`). **✓ verified** (see IC-1). Fix: `nl_langinfo(CODESET)` after `setlocale`.
+- [x] **IC-3 — Default codeset reads only `LANG`, splitting on `.`.** ✓ fixed (Phase 4): `locale_codeset()` now calls `nl_langinfo(CODESET)` (after the existing `setlocale(LC_ALL, "")`), which honors the `LC_ALL > LC_CTYPE > LANG` chain; on non-Linux/macOS or an empty result it falls back to UTF-8. `LANG=C`/`POSIX` now resolve to the codeset name `nl_langinfo` reports (`ANSI_X3.4-1968` / `US-ASCII`), which `Encodings::canonical_name` maps to ASCII, so `printf A | LANG=C iconv` succeeds (exit 0) instead of erroring. Ignores the `LC_ALL > LC_CTYPE > LANG` chain; `LANG=C`, `LANG=POSIX`, `LANG=en_US` (no `.`), or unset all hit the error/exit branch (`iconv.rs:494-512`). **✓ verified** (see IC-1). Fix: `nl_langinfo(CODESET)` after `setlocale`.
 - [x] **IC-4 — `-s` truncates the stream.** ✓ fixed (Phase 3): `-s` (`suppress_error`) now gates only the stderr message; it no longer governs stream/exit behavior. Stream termination on an unconvertible character is decided solely by the absence of `-c`, and the error is recorded via `had_error` regardless of `-s`. So `-s` without `-c` exits `1` with empty stderr (was: silently `return None` → exit 0). Spec: `-s` "Suppress any messages" (stderr only). The impl uses `return None` as a stream terminator when `-s` is set without `-c` (`ascii.rs:31`, `utf_16.rs:84-106`). Fix: continue after a suppressed error; never use iteration end as an error signal.
-- [ ] **IC-5 — `-l` lists names the parser rejects.** **✓ verified:** `iconv -l` prints `UTF_8`, `UTF_16LE` (underscores, Debug format) but `-f`/`-t` require `UTF-8`/`UTF-16LE` (hyphens), and names are case-sensitive (`iconv -f utf-8 …` → `Error: Unknown encoding: utf-8`). `iconv.rs:178-181`, `:165-175`. Fix: print the serialized (hyphen) form; normalize/upper-case input and accept common aliases.
-- [ ] **IC-6 — Generic `UTF-16`/`UTF-32` output writes no BOM** (`utf_16.rs:143-151`, `utf_32.rs:98-108`), producing endianness-ambiguous output. Fix: emit a leading U+FEFF for the non-LE/BE variants.
+- [x] **IC-5 — `-l` lists names the parser rejects.** ✓ fixed (Phase 4): `list_encodings()` now prints the serialized hyphen form via `Display` (`UTF-8`, `UTF-16LE`), and `Encodings::canonical_name` normalizes `-f`/`-t` input case-insensitively and accepts common aliases (`utf8`, `US-ASCII`, `ANSI_X3.4-1968`, `UCS-2`/`UCS-4`, …). The listed names now round-trip. **✓ verified:** `iconv -l` prints `UTF_8`, `UTF_16LE` (underscores, Debug format) but `-f`/`-t` require `UTF-8`/`UTF-16LE` (hyphens), and names are case-sensitive (`iconv -f utf-8 …` → `Error: Unknown encoding: utf-8`). `iconv.rs:178-181`, `:165-175`. Fix: print the serialized (hyphen) form; normalize/upper-case input and accept common aliases.
+- [x] **IC-6 — Generic `UTF-16`/`UTF-32` output writes no BOM** (`utf_16.rs:143-151`, `utf_32.rs:98-108`). ✓ fixed (Phase 4): `from_ucs4` prepends a U+FEFF BOM (in the resolved host endianness) when the requested variant is the generic `UTF-16`/`UTF-32`; the explicit LE/BE forms still write none. Verified by round-trip (generic output re-decodes with the BOM consumed).
 
 ### Minor
-- [ ] **IC-7 — Charmap `mb_cur_max` defaults to 0** (`iconv.rs:186`), so the flush guard `len >= mb_cur_max` is always true → premature flush per byte. Fix: default 1 / require the field.
-- [ ] **IC-8 — Per-byte stdout flush** in the encoding path (`iconv.rs:410-413`) — severe perf, not conformance. Use `BufWriter`.
-- [ ] **IC-9 — Hardcoded English diagnostics** in `iconv_lib` (`ascii.rs:28`, etc.); `LC_MESSAGES` inert.
-- [ ] **IC-10 — Typo `supress_error`** (one `s`) in `encoding_conversion` signature (`iconv.rs:362`).
+- [x] **IC-7 — Charmap `mb_cur_max` defaults to 0** (`iconv.rs:186`). ✓ fixed (Phase 4): `parse_charmap` now defaults `mb_cur_max` to 1 when the charmap omits it, so the flush guard is no longer always true.
+- [x] **IC-8 — Per-byte stdout flush** in the encoding path (`iconv.rs:410-413`). ✓ fixed (Phase 4): `encoding_conversion` writes through a `BufWriter` and flushes once at end instead of flushing after every byte.
+- [ ] **IC-9 — Hardcoded English diagnostics** in `iconv_lib` (`ascii.rs:28`, etc.); `LC_MESSAGES` inert. _(Deferred to Phase 12: crate-wide gettext diagnostics sweep.)_
+- [x] **IC-10 — Typo `supress_error`** (one `s`) in `encoding_conversion` signature (`iconv.rs:362`). ✓ fixed (Phase 4): renamed to `suppress_error`.
 - [x] **IC-11 — `from_ucs4` silent drop:** ✓ fixed (Phase 3, folded into the error model): the surrogate / out-of-range branches in `utf_8::from_ucs4` and `utf_16::from_ucs4` no longer return a silent `Some(vec![])`. With `!omit_invalid` they now set `had_error` (so exit `>0`) and report unless `-s`; with `-c` they omit. (`utf_16::from_ucs4` also had inverted omit/suppress logic, fixed here.)
 
 ## Conformance matrix
@@ -198,22 +198,22 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 ### Synopsis / Options / Operands
 - [x] `-f`/`-t` (both charmap-file and codeset forms) CONFORMS — slash-detection dispatch (`iconv.rs:348-354`).
 - [x] **`-c` CONFORMS** — exit-status interaction fixed (IC-1/IC-2, Phase 3): `-c` omits and succeeds; absence of `-c` on an unconvertible character exits `>0`.
-- [x] **`-s` CONFORMS** (IC-4, Phase 3) — gates only the stderr message, not stream/exit. **`-l` PARTIAL** (IC-5, Phase 4).
+- [x] **`-s` CONFORMS** (IC-4, Phase 3) — gates only the stderr message, not stream/exit. **`-l` CONFORMS** (IC-5, Phase 4) — prints round-trippable hyphen names.
 - [x] `file...`, `-` → stdin, missing-operand → stdin CONFORMS (`iconv.rs:517-523`). **✓ verified** by the existing `-` tests.
 
 ### Environment variables
-- [ ] **`LC_CTYPE`/`LC_ALL` MISSING** for default codeset (IC-3); **`LANG` PARTIAL**.
-- [ ] **`LC_MESSAGES` PARTIAL** (IC-9). `NLSPATH` N/A (gettextrs equivalent).
+- [x] **`LC_ALL`/`LC_CTYPE`/`LANG` CONFORMS** for default codeset (IC-3, Phase 4) — resolved via `nl_langinfo(CODESET)`, which honors the full chain.
+- [ ] **`LC_MESSAGES` PARTIAL** (IC-9, deferred to Phase 12). `NLSPATH` N/A (gettextrs equivalent).
 
 ### Conversion engine
 - [x] ASCII ↔ UTF-8/16/32 (+ LE/BE) full matrix CONFORMS; UTF-16/32 **input** BOM handling CONFORMS (`utf_16.rs:46-65`, `utf_32.rs:44-63`).
-- [ ] **UTF-16/32 output BOM PARTIAL** (IC-6). No ISO-8859-x / locale-derived codesets (implementation-defined per spec, but a practical gap). Mixed charmap+codeset correctly rejected (`iconv.rs:534-540`).
+- [x] **UTF-16/32 output BOM CONFORMS** (IC-6, Phase 4) — generic forms emit a leading U+FEFF; explicit LE/BE do not. No ISO-8859-x / locale-derived codesets (implementation-defined per spec, but a practical gap). Mixed charmap+codeset correctly rejected (`iconv.rs:534-540`).
 
 ### Exit status
 - [x] **CONFORMS** (IC-1/IC-2/IC-4, Phase 3) — a conversion error now yields exit `>0` via the shared `had_error` flag; `-c`/`-s` no longer wrongly force exit 0. (Default-codeset error path is IC-3, Phase 4.)
 
 ## Test coverage — not covered
-- [ ] Exit status on unconvertible input (with/without `-c`/`-s`); `LANG=C`/unset default codeset; `-l` round-trip; generic UTF-16/32 output BOM.
+- [x] Exit status on unconvertible input (with/without `-c`/`-s`); `-l` round-trip (alias/case); generic UTF-16/32 output BOM — now covered by added integration tests (Phases 3–4). `LANG=C` default-codeset path verified manually (locale-dependent, not asserted in CI).
 
 ---
 

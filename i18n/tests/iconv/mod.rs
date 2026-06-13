@@ -88,6 +88,48 @@ fn iconv_invalid_with_s_flag_suppresses_message_but_exits_nonzero() {
     );
 }
 
+// IC-5: codeset names are matched case-insensitively and common aliases are
+// accepted (e.g. `utf8`, `US-ASCII`), so the names printed by `-l` round-trip
+// through `-f`/`-t`.
+#[test]
+fn iconv_codeset_aliases_and_case_insensitive() {
+    iconv_test(
+        &["-f", "utf8", "-t", "us-ascii"],
+        b"hello".to_vec(),
+        b"hello".to_vec(),
+        Vec::new(),
+    );
+}
+
+// IC-6: the generic `UTF-16`/`UTF-32` output forms (no explicit endianness)
+// must begin with a U+FEFF byte-order mark; the explicit LE/BE forms must not.
+#[test]
+fn iconv_generic_utf16_output_has_bom() {
+    let le_bom = cfg!(target_endian = "little");
+    let mut expected = if le_bom {
+        vec![0xFF, 0xFE]
+    } else {
+        vec![0xFE, 0xFF]
+    };
+    expected.extend(if le_bom { [b'A', 0x00] } else { [0x00, b'A'] });
+    iconv_test(
+        &["-f", "UTF-8", "-t", "UTF-16"],
+        b"A".to_vec(),
+        expected,
+        Vec::new(),
+    );
+}
+
+#[test]
+fn iconv_explicit_utf16le_output_has_no_bom() {
+    iconv_test(
+        &["-f", "UTF-8", "-t", "UTF-16LE"],
+        b"A".to_vec(),
+        vec![b'A', 0x00],
+        Vec::new(),
+    );
+}
+
 #[test]
 #[ignore]
 fn iconv_no_flag_data_input() {

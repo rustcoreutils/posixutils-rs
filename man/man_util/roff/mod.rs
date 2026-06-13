@@ -268,21 +268,17 @@ impl Roff {
         }
         let rest = self.interpolate(rest);
         let expr = rest.split_whitespace().next().unwrap_or("");
-        // Leading +/- means increment/decrement the existing value.
-        let (base, incr) = match expr.strip_prefix('+') {
-            Some(e) => (*self.nr.get(name).unwrap_or(&0), Some(e)),
-            None => match expr.strip_prefix('-') {
-                Some(_) => (0, None),
-                None => (0, None),
-            },
+        let cur = *self.nr.get(name).unwrap_or(&0);
+        // A leading `+`/`-` increments/decrements the existing value by the
+        // operand; otherwise the register is set to the absolute value.
+        let new = if let Some(e) = expr.strip_prefix('+') {
+            eval_numeric(e).map(|v| cur + v)
+        } else if let Some(e) = expr.strip_prefix('-') {
+            eval_numeric(e).map(|v| cur - v)
+        } else {
+            eval_numeric(expr)
         };
-        if let Some(e) = incr {
-            if let Some(v) = eval_numeric(e) {
-                self.nr.insert(name.to_string(), base + v);
-            }
-            return;
-        }
-        if let Some(v) = eval_numeric(expr) {
+        if let Some(v) = new {
             self.nr.insert(name.to_string(), v);
         }
     }

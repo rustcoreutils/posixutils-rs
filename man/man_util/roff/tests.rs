@@ -54,6 +54,8 @@ fn string_append() {
 fn number_register_and_interpolate() {
     assert_eq!(run(".nr N 40\nwidth \\n(N\n"), "width 40\n");
     assert_eq!(run(".nr N 5\n.nr N +3\n\\n[N]\n"), "8\n");
+    // A leading `-` decrements the existing value (not an absolute negative).
+    assert_eq!(run(".nr N 10\n.nr N -3\n\\n[N]\n"), "7\n");
 }
 
 #[test]

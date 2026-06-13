@@ -124,6 +124,130 @@ fn test_localedef_verbose() {
     );
 }
 
+/// LD-5/LD-9: a valid source exits 0 and reports the processed categories on
+/// standard output.
+#[test]
+fn test_localedef_reports_categories() {
+    let temp_dir = TempDir::new().unwrap();
+    let src = temp_dir.path().join("ok.locale");
+    let mut f = File::create(&src).unwrap();
+    write!(
+        f,
+        "LC_NUMERIC\ndecimal_point \".\"\nthousands_sep \",\"\nEND LC_NUMERIC\n"
+    )
+    .unwrap();
+    let out = temp_dir.path().join("loc");
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("localedef"),
+            args: vec![
+                String::from("-i"),
+                src.to_str().unwrap().to_string(),
+                out.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output: &Output| {
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("LC_NUMERIC"), "stdout report: {stdout:?}");
+        },
+    );
+}
+
+/// LD-12: an `END` that does not match the open category is an error, so no
+/// output is created and the exit status is > 3.
+#[test]
+fn test_localedef_mismatched_end_errors() {
+    let temp_dir = TempDir::new().unwrap();
+    let src = temp_dir.path().join("bad.locale");
+    let mut f = File::create(&src).unwrap();
+    write!(f, "LC_NUMERIC\ndecimal_point \".\"\nEND LC_MONETARY\n").unwrap();
+    let out = temp_dir.path().join("loc");
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("localedef"),
+            args: vec![
+                String::from("-i"),
+                src.to_str().unwrap().to_string(),
+                out.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 4,
+        },
+        |_plan, output: &Output| {
+            assert!(output.status.code().unwrap() > 3, "errors must exit > 3");
+            assert!(!out.exists(), "no output on error");
+        },
+    );
+}
+
+/// LD-10/LD-11: an unknown keyword is a warning shown on stderr (even without
+/// -v); without -c the warning prevents output and the exit status is > 3.
+#[test]
+fn test_localedef_unknown_keyword_warns() {
+    let temp_dir = TempDir::new().unwrap();
+    let src = temp_dir.path().join("warn.locale");
+    let mut f = File::create(&src).unwrap();
+    write!(f, "LC_NUMERIC\nbogus_keyword \"x\"\nEND LC_NUMERIC\n").unwrap();
+    let out = temp_dir.path().join("loc");
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("localedef"),
+            args: vec![
+                String::from("-i"),
+                src.to_str().unwrap().to_string(),
+                out.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 4,
+        },
+        |_plan, output: &Output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("bogus_keyword"), "warning: {stderr:?}");
+            assert!(output.status.code().unwrap() > 3);
+        },
+    );
+}
+
+/// LD-2: a `-f charmap` that cannot be read means the charset is unsupported;
+/// exit 2 and no output.
+#[test]
+fn test_localedef_missing_charmap_exit2() {
+    let temp_dir = TempDir::new().unwrap();
+    let src = temp_dir.path().join("ok.locale");
+    let mut f = File::create(&src).unwrap();
+    write!(f, "LC_NUMERIC\ndecimal_point \".\"\nEND LC_NUMERIC\n").unwrap();
+    let out = temp_dir.path().join("loc");
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("localedef"),
+            args: vec![
+                String::from("-f"),
+                String::from("/nonexistent/charmap.xyz"),
+                String::from("-i"),
+                src.to_str().unwrap().to_string(),
+                out.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_plan, output: &Output| {
+            assert_eq!(output.status.code(), Some(2), "unsupported charset -> 2");
+            assert!(!out.exists(), "no output");
+        },
+    );
+}
+
 /// Test localedef with empty input
 #[test]
 fn test_localedef_empty_input() {

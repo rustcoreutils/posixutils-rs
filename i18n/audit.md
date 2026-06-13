@@ -388,34 +388,34 @@ The C-source extraction path (via the in-tree `posixutils-cc` parser), keyword-s
 ## Priority issues
 
 ### Major
-- [ ] **XG-1 — Output file is `.pot`, not `.po`.** Spec mandates `messages.po` (or `default-domain.po`). `format!("{}.pot", …)` at `xgettext.rs:1096`. **✓ verified:** `xgettext -n t.c` writes `messages.pot`. Downstream `msgfmt messages.po` won't find it. Fix: `.po`.
-- [ ] **XG-2 — Exclude option is `-X`, not `-x`.** `short = 'X'` (`xgettext.rs:93-100`); spec synopsis form 2 is `-x exclude-file`. **✓ verified:** `--help` shows `-X <EXCLUDE_FILE>`. Fix: `short = 'x'`.
-- [ ] **XG-3 — Output sorted alphabetically, not extraction order.** Spec: "The msgid values shall be in the same order that the strings are extracted." Output is sorted by `MessageKey` (`xgettext.rs:915-916`) — exactly the behavior the spec's RATIONALE warns deprives translators of context. Fix: preserve insertion order.
-- [ ] **XG-4 — `-j` does not deduplicate.** Spec: appended duplicates "shall … be commented out or omitted." The impl concatenates `existing + new` with no merge (`xgettext.rs:1107-1113`, self-described as "simple join").
-- [ ] **XG-5 — Non-`.c`/`.h`/`.rs` operands rejected.** The spec restricts operands by *content* (C source), not extension; a C file named `source` (no extension) errors and exits 1 (`xgettext.rs:1080-1088`).
-- [ ] **XG-6 — `_l` keyword variants absent from defaults.** Spec lists `gettext_l`, `ngettext_l`, `dgettext_l`, `dngettext_l`, `dcgettext_l`, `dcngettext_l`; `KeywordSpec::defaults()` omits them (`xgettext.rs:227-283`).
+- [x] **XG-1 — Output file is `.pot`, not `.po`.** ✓ fixed (Phase 10): the default output is now `{default-domain}.po`. The repo `Makefile` was updated to match (template `locale/${PROJECT_NAME}.po`, and `POS` scoped to `*/LC_MESSAGES/*.po` so the generated template is not mistaken for a translation).
+- [x] **XG-2 — Exclude option is `-X`, not `-x`.** ✓ fixed (Phase 10): `short = 'x'`; `-X` is no longer accepted.
+- [x] **XG-3 — Output sorted alphabetically, not extraction order.** ✓ fixed (Phase 10): `Walker` records keys in first-extracted order (`order: Vec<MessageKey>`) and `render()` emits in that order. Verified: `test_clap` output is now in monotonic source order.
+- [x] **XG-4 — `-j` does not deduplicate.** ✓ fixed (Phase 10): `parse_existing_keys` collects the `(msgctxt, msgid)` keys already in the target file, and `render(exclude)` omits newly extracted duplicates; the existing content is preserved ahead of the new entries.
+- [x] **XG-5 — Non-`.c`/`.h`/`.rs` operands rejected.** ✓ fixed (Phase 10): only `.rs` selects the Rust path; every other operand (including a C file with no extension) is processed as C source. Verified with a no-extension fixture.
+- [x] **XG-6 — `_l` keyword variants absent from defaults.** ✓ fixed (Phase 10): `gettext_l`/`ngettext_l`/`dgettext_l`/`dngettext_l`/`dcgettext_l`/`dcngettext_l` are added (mirroring their base forms' argument positions).
 
 ### Minor
-- [ ] **XG-7 — Rust source parsing is a spec extension.** `.rs` files are parsed with `syn`/`proc_macro2` (Rust grammar), not C (`xgettext.rs:1066-1069`). Intentional for posixutils' own build tooling, but outside "C-language source files." Document it.
-- [ ] **XG-8 — `domain` directive not written** to non-default per-domain output files (the tool emits a single file anyway); spec makes it optional only for the default file.
-- [ ] **XG-9 — Plural output is always `msgstr[0]`/`msgstr[1]`** (`xgettext.rs:934-938`) regardless of target plural count (acceptable for a template).
-- [ ] **XG-10 — File-I/O errors propagate as raw Rust `Err`** (not `gettext()`-wrapped `eprintln!`), so they are unlocalized; exit code is still `>0` (correct).
-- [ ] **XG-11 — `-K` default mechanism is fragile** — clap injects a `"gettext"` default into the spec vec, making the `-K ""` "disable defaults" contract work only by accident (`xgettext.rs:77`, `:345-351`).
+- [x] **XG-7 — Rust source parsing is a spec extension.** ✓ documented (Phase 10): a comment at the operand dispatch records that `.rs` is a posixutils extension beyond "C-language source files," used for this project's own build tooling.
+- [x] **XG-8 — `domain` directive not written** to the output file. ✓ acceptable (Phase 10): xgettext writes only the default output file here, and the spec makes the leading `domain` directive optional for the default output file. (Multi-domain output files are not produced.)
+- [x] **XG-9 — Plural output is always `msgstr[0]`/`msgstr[1]`.** ✓ acceptable (Phase 10): a `.po` template legitimately emits two empty plural forms; the target plural count is filled in by the translator/`msgfmt`.
+- [ ] **XG-10 — File-I/O errors propagate as raw Rust `Err`** (not `gettext()`-wrapped), so they are unlocalized; exit code is still `>0` (correct). _(Deferred to Phase 12: crate-wide gettext diagnostics sweep.)_
+- [x] **XG-11 — `-K` default mechanism is fragile.** ✓ fixed (Phase 10): the clap `default_value = "gettext"` injection was removed; `KeywordSpec::defaults()` is the single source of the default keyword set, and `-K ""` cleanly disables it.
 
 ## Conformance matrix
 
 ### Synopsis / Options / Operands
 - [x] `-a`, `-d`, `-n`, `-p`, `-K` (all four spec forms) CONFORMS (`xgettext.rs:43-91`, `:137-164`).
-- [ ] **`-x`→`-X` DIVERGES** (XG-2); **`-j` PARTIAL** (XG-4).
+- [x] **`-x` CONFORMS** (XG-2, Phase 10); **`-j` CONFORMS** (XG-4, Phase 10 — dedups against the existing file).
 - [x] `file...` and `-` (stdin as C) CONFORMS (`xgettext.rs:108-113`, `:1054-1062`).
-- [ ] **operand extension gate DIVERGES** (XG-5).
+- [x] **operand acceptance CONFORMS** (XG-5, Phase 10 — non-`.rs` treated as C by content, not extension).
 
 ### Input files / keyword recognition
 - [x] C extraction via `posixutils-cc` AST CONFORMS; `gettext`/`ngettext`/`dgettext`/`dngettext`/`dcgettext`/`dcngettext` recognized.
-- [ ] **`_l` variants MISSING** (XG-6); **Rust path is an extension** (XG-7); wide `L"…"` literal handling unverified.
+- [x] **`_l` variants CONFORMS** (XG-6, Phase 10); **Rust path is a documented extension** (XG-7); wide `L"…"` literal handling unverified.
 
 ### Output files / .po content / exit
-- [ ] **`.pot` vs `.po` DIVERGES** (XG-1); **ordering DIVERGES** (XG-3); **`domain` directive PARTIAL** (XG-8).
+- [x] **`.po` output CONFORMS** (XG-1, Phase 10); **extraction-order CONFORMS** (XG-3, Phase 10); **`domain` directive optional-for-default OK** (XG-8).
 - [x] `msgid`/`msgid_plural`/`msgstr`/`msgstr[n]`, `#:` refs (`-n`) CONFORMS (`xgettext.rs:919-938`).
 - [x] STDOUT not used / STDERR diagnostics CONFORMS; exit `0`/`>0` CONFORMS (`xgettext.rs:1031-1118`).
 
@@ -423,7 +423,7 @@ The C-source extraction path (via the in-tree `posixutils-cc` parser), keyword-s
 - [x] `LANG`/`LANGUAGE`/`LC_*`/`NLSPATH` handled implicitly via `setlocale`/`textdomain` (`xgettext.rs:1019-1024`) — adequate for an extraction tool.
 
 ## Test coverage — not covered
-- [ ] `.po` (vs `.pot`) output name; extraction-order output; `-j` dedup; no-extension C operand; `_l` keywords; adjacent C literal concatenation; wide `L"…"` literals.
+- [x] `.po` output name; extraction-order output; no-extension C operand; `_l` keywords — now covered (Phase 10: golden fixtures updated to `.po`/extraction order, no-extension fixture + `_l` unit test). `-j` dedup, adjacent C literal concatenation, and wide `L"…"` literals remain exercised only manually.
 
 ---
 

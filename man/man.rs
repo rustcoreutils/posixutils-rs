@@ -679,11 +679,13 @@ fn native_keyword_search(
     let mut results = Vec::new();
 
     // POSIX: `-k` keywords are case-insensitive extended regular expressions
-    // (the spec describes the search as equivalent to `grep -Ei`). Compile each
-    // keyword once; fall back to a literal substring match if it is not valid
-    // regex syntax.
+    // (the spec describes the search as equivalent to `grep -Ei`). Use the
+    // project's POSIX ERE engine (libc regcomp via `plib::regex`) so the
+    // semantics match the spec, not Rust-regex syntax; fall back to a literal
+    // substring match if the keyword is not valid ERE syntax.
+    use plib::regex::{Regex, RegexFlags};
     enum Matcher {
-        Regex(regex::Regex),
+        Regex(Regex),
         Literal(String),
     }
     impl Matcher {
@@ -696,12 +698,10 @@ fn native_keyword_search(
     }
     let matchers: Vec<Matcher> = keywords
         .iter()
-        .map(
-            |kw| match regex::RegexBuilder::new(kw).case_insensitive(true).build() {
-                Ok(re) => Matcher::Regex(re),
-                Err(_) => Matcher::Literal(kw.to_lowercase()),
-            },
-        )
+        .map(|kw| match Regex::new(kw, RegexFlags::ere().ignore_case()) {
+            Ok(re) => Matcher::Regex(re),
+            Err(_) => Matcher::Literal(kw.to_lowercase()),
+        })
         .collect();
 
     for page in &pages {

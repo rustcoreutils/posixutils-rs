@@ -25,6 +25,69 @@ fn iconv_test(args: &[&str], input: Vec<u8>, expected_output: Vec<u8>, expected_
     })
 }
 
+fn iconv_test_exit(
+    args: &[&str],
+    input: Vec<u8>,
+    expected_output: Vec<u8>,
+    expected_error: Vec<u8>,
+    expected_exit_code: i32,
+) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("iconv"),
+        args: str_args,
+        stdin_data: input,
+        expected_out: expected_output,
+        expected_err: expected_error,
+        expected_exit_code,
+    })
+}
+
+// Invalid input bytes: 'A', a lone UTF-8 lead byte 0xC3 followed by '(' (not a
+// valid continuation byte), then 'B'.
+const INVALID_UTF8: &[u8] = &[b'A', 0xC3, b'(', b'B'];
+
+// IC-1/IC-2: an unconvertible character without `-c` must yield a non-zero exit
+// status (POSIX: ">0 An error occurred"), report it on stderr, and must not
+// abort via a process exit from inside a codec iterator.
+#[test]
+fn iconv_invalid_without_c_flag_exits_nonzero() {
+    iconv_test_exit(
+        &["-f", "UTF-8", "-t", "ASCII"],
+        INVALID_UTF8.to_vec(),
+        b"A".to_vec(),
+        b"Error: Invalid 2-byte UTF-8 sequence\n".to_vec(),
+        1,
+    );
+}
+
+// `-c` (omit) handles the invalid character, so the conversion succeeds: exit 0
+// and no diagnostics. The presence of `-c` is what changes the exit status here.
+#[test]
+fn iconv_invalid_with_c_flag_exits_zero() {
+    iconv_test_exit(
+        &["-c", "-f", "UTF-8", "-t", "ASCII"],
+        INVALID_UTF8.to_vec(),
+        b"A(B".to_vec(),
+        Vec::new(),
+        0,
+    );
+}
+
+// IC-4: `-s` suppresses only the stderr message; it must not affect the exit
+// status nor silently truncate to a success. Without `-c` the error still
+// yields a non-zero exit, but with empty stderr.
+#[test]
+fn iconv_invalid_with_s_flag_suppresses_message_but_exits_nonzero() {
+    iconv_test_exit(
+        &["-s", "-f", "UTF-8", "-t", "ASCII"],
+        INVALID_UTF8.to_vec(),
+        b"A".to_vec(),
+        Vec::new(),
+        1,
+    );
+}
+
 #[test]
 #[ignore]
 fn iconv_no_flag_data_input() {

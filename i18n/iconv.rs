@@ -17,12 +17,14 @@ use iconv_lib::{
 };
 use plib::io::input_stream;
 use std::{
+    cell::Cell,
     collections::HashMap,
     env,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::exit,
+    rc::Rc,
     str::FromStr,
 };
 use strum::IntoEnumIterator;
@@ -359,52 +361,101 @@ fn encoding_conversion(
     input: CircularBuffer<Box<dyn Read>>,
     omit_invalid: bool,
     supress_error: bool,
+    had_error: &Rc<Cell<bool>>,
 ) {
     let iter = input.into_iter();
     let ucs4 = match from {
-        Encodings::UTF_8 => utf_8::to_ucs4(iter, omit_invalid, supress_error),
-        Encodings::UTF_16 => {
-            utf_16::to_ucs4(iter, omit_invalid, supress_error, UTF16Variant::UTF16)
-        }
-        Encodings::UTF_16LE => {
-            utf_16::to_ucs4(iter, omit_invalid, supress_error, UTF16Variant::UTF16LE)
-        }
-        Encodings::UTF_16BE => {
-            utf_16::to_ucs4(iter, omit_invalid, supress_error, UTF16Variant::UTF16BE)
-        }
-        Encodings::UTF_32 => {
-            utf_32::to_ucs4(iter, omit_invalid, supress_error, UTF32Variant::UTF32)
-        }
-        Encodings::UTF_32LE => {
-            utf_32::to_ucs4(iter, omit_invalid, supress_error, UTF32Variant::UTF32LE)
-        }
-        Encodings::UTF_32BE => {
-            utf_32::to_ucs4(iter, omit_invalid, supress_error, UTF32Variant::UTF32BE)
-        }
-        Encodings::ASCII => ascii::to_ucs4(iter, omit_invalid, supress_error),
+        Encodings::UTF_8 => utf_8::to_ucs4(iter, omit_invalid, supress_error, had_error.clone()),
+        Encodings::UTF_16 => utf_16::to_ucs4(
+            iter,
+            omit_invalid,
+            supress_error,
+            UTF16Variant::UTF16,
+            had_error.clone(),
+        ),
+        Encodings::UTF_16LE => utf_16::to_ucs4(
+            iter,
+            omit_invalid,
+            supress_error,
+            UTF16Variant::UTF16LE,
+            had_error.clone(),
+        ),
+        Encodings::UTF_16BE => utf_16::to_ucs4(
+            iter,
+            omit_invalid,
+            supress_error,
+            UTF16Variant::UTF16BE,
+            had_error.clone(),
+        ),
+        Encodings::UTF_32 => utf_32::to_ucs4(
+            iter,
+            omit_invalid,
+            supress_error,
+            UTF32Variant::UTF32,
+            had_error.clone(),
+        ),
+        Encodings::UTF_32LE => utf_32::to_ucs4(
+            iter,
+            omit_invalid,
+            supress_error,
+            UTF32Variant::UTF32LE,
+            had_error.clone(),
+        ),
+        Encodings::UTF_32BE => utf_32::to_ucs4(
+            iter,
+            omit_invalid,
+            supress_error,
+            UTF32Variant::UTF32BE,
+            had_error.clone(),
+        ),
+        Encodings::ASCII => ascii::to_ucs4(iter, omit_invalid, supress_error, had_error.clone()),
     };
 
     let expected = match to {
-        Encodings::UTF_8 => utf_8::from_ucs4(ucs4, omit_invalid, supress_error),
-        Encodings::UTF_16 => {
-            utf_16::from_ucs4(ucs4, omit_invalid, supress_error, UTF16Variant::UTF16)
-        }
-        Encodings::UTF_16BE => {
-            utf_16::from_ucs4(ucs4, omit_invalid, supress_error, UTF16Variant::UTF16BE)
-        }
-        Encodings::UTF_16LE => {
-            utf_16::from_ucs4(ucs4, omit_invalid, supress_error, UTF16Variant::UTF16LE)
-        }
-        Encodings::UTF_32 => {
-            utf_32::from_ucs4(ucs4, omit_invalid, supress_error, UTF32Variant::UTF32)
-        }
-        Encodings::UTF_32LE => {
-            utf_32::from_ucs4(ucs4, omit_invalid, supress_error, UTF32Variant::UTF32LE)
-        }
-        Encodings::UTF_32BE => {
-            utf_32::from_ucs4(ucs4, omit_invalid, supress_error, UTF32Variant::UTF32BE)
-        }
-        Encodings::ASCII => ascii::from_ucs4(ucs4, omit_invalid, supress_error),
+        Encodings::UTF_8 => utf_8::from_ucs4(ucs4, omit_invalid, supress_error, had_error.clone()),
+        Encodings::UTF_16 => utf_16::from_ucs4(
+            ucs4,
+            omit_invalid,
+            supress_error,
+            UTF16Variant::UTF16,
+            had_error.clone(),
+        ),
+        Encodings::UTF_16BE => utf_16::from_ucs4(
+            ucs4,
+            omit_invalid,
+            supress_error,
+            UTF16Variant::UTF16BE,
+            had_error.clone(),
+        ),
+        Encodings::UTF_16LE => utf_16::from_ucs4(
+            ucs4,
+            omit_invalid,
+            supress_error,
+            UTF16Variant::UTF16LE,
+            had_error.clone(),
+        ),
+        Encodings::UTF_32 => utf_32::from_ucs4(
+            ucs4,
+            omit_invalid,
+            supress_error,
+            UTF32Variant::UTF32,
+            had_error.clone(),
+        ),
+        Encodings::UTF_32LE => utf_32::from_ucs4(
+            ucs4,
+            omit_invalid,
+            supress_error,
+            UTF32Variant::UTF32LE,
+            had_error.clone(),
+        ),
+        Encodings::UTF_32BE => utf_32::from_ucs4(
+            ucs4,
+            omit_invalid,
+            supress_error,
+            UTF32Variant::UTF32BE,
+            had_error.clone(),
+        ),
+        Encodings::ASCII => ascii::from_ucs4(ucs4, omit_invalid, supress_error, had_error.clone()),
     };
 
     expected.for_each(|byte| {
@@ -419,6 +470,7 @@ fn charmap_conversion(
     input: CircularBuffer<Box<dyn Read>>,
     omit_invalid: bool,
     suppress_error: bool,
+    had_error: &Rc<Cell<bool>>,
 ) {
     let mut buffer = Vec::new();
     let stdout = io::stdout();
@@ -447,12 +499,13 @@ fn charmap_conversion(
             }
         }
         if !found && buffer.len() >= from.header.mb_cur_max {
-            if !suppress_error {
-                eprintln!("Error: Invalid or unmapped character");
-            }
             if omit_invalid {
                 buffer.clear();
             } else {
+                had_error.set(true);
+                if !suppress_error {
+                    eprintln!("Error: Invalid or unmapped character");
+                }
                 if let Err(e) = stdout.write_all(&[buffer[0]]) {
                     eprintln!("Error writing to stdout: {}", e);
                 }
@@ -466,15 +519,16 @@ fn charmap_conversion(
 
     for &byte in &buffer {
         if !omit_invalid {
+            had_error.set(true);
             if let Err(e) = stdout.write_all(&[byte]) {
                 eprintln!("Error writing to stdout: {}", e);
             }
             if let Err(e) = stdout.flush() {
                 eprintln!("Error flushing stdout: {}", e);
             }
-        }
-        if !suppress_error {
-            eprintln!("Error: Invalid or unmapped character at end of input");
+            if !suppress_error {
+                eprintln!("Error: Invalid or unmapped character at end of input");
+            }
         }
     }
 }
@@ -522,14 +576,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => vec![Box::new(io::stdin().lock())],
     };
 
+    // Shared flag set by the conversion routines when an invalid character is
+    // encountered without `-c`. Per POSIX, such an error must yield a non-zero
+    // exit status regardless of `-s`; `-c` (omit) handles the character and is
+    // not an error.
+    let had_error = Rc::new(Cell::new(false));
+
     for input in inputs {
         let buf = CircularBuffer::new(input);
         match (&from_codeset, &to_codeset) {
             (CodesetType::Encoding(from), CodesetType::Encoding(to)) => {
-                encoding_conversion(from, to, buf, args.omit_invalid, args.suppress_messages);
+                encoding_conversion(
+                    from,
+                    to,
+                    buf,
+                    args.omit_invalid,
+                    args.suppress_messages,
+                    &had_error,
+                );
             }
             (CodesetType::Charmap(from), CodesetType::Charmap(to)) => {
-                charmap_conversion(from, to, buf, args.omit_invalid, args.suppress_messages);
+                charmap_conversion(
+                    from,
+                    to,
+                    buf,
+                    args.omit_invalid,
+                    args.suppress_messages,
+                    &had_error,
+                );
             }
             _ => {
                 eprintln!(
@@ -538,6 +612,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exit(1);
             }
         }
+    }
+
+    if had_error.get() {
+        exit(1);
     }
 
     Ok(())

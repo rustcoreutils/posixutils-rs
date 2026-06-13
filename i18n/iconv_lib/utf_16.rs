@@ -8,10 +8,7 @@
 //
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::{
-    iter::{self},
-    process::exit,
-};
+use std::{cell::Cell, iter, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF16Variant {
@@ -29,6 +26,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF16Variant,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u32>> {
     let mut buffer = Vec::with_capacity(4);
     let mut determined_variant = variant;
@@ -80,6 +78,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                             buffer.clear();
                             continue;
                         } else {
+                            had_error.set(true);
                             if !suppress_error {
                                 eprintln!("Error: Unpaired surrogate at end of input");
                             }
@@ -99,6 +98,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                         buffer.drain(0..2);
                         continue;
                     } else {
+                        had_error.set(true);
                         if !suppress_error {
                             eprintln!("Error: Invalid low surrogate");
                         }
@@ -118,6 +118,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                     buffer.drain(0..2);
                     continue;
                 } else {
+                    had_error.set(true);
                     if !suppress_error {
                         eprintln!("Error: Unpaired low surrogate");
                     }
@@ -139,6 +140,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF16Variant,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u8>> {
     let variant = match variant {
         UTF16Variant::UTF16LE | UTF16Variant::UTF16BE => variant,
@@ -158,25 +160,25 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
             utf16.push(code_point as u16);
         } else if (0xD800..=0xDFFF).contains(&code_point) {
             if !omit_invalid {
-                return Vec::new();
-            } else {
+                had_error.set(true);
                 if !suppress_error {
                     eprintln!("Error: Isolated surrogate code point U+{:04X}", code_point);
                 }
-                exit(1)
             }
+            return Vec::new();
         } else if code_point <= 0x10FFFF {
             let code_point = code_point - 0x10000;
             let high_surrogate = ((code_point >> 10) as u16) + 0xD800;
             let low_surrogate = ((code_point & 0x3FF) as u16) + 0xDC00;
             utf16.extend_from_slice(&[high_surrogate, low_surrogate]);
-        } else if !omit_invalid {
-            return Vec::new();
         } else {
-            if !suppress_error {
-                eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
+            if !omit_invalid {
+                had_error.set(true);
+                if !suppress_error {
+                    eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
+                }
             }
-            exit(1)
+            return Vec::new();
         }
 
         to_bytes(&utf16, variant)

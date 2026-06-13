@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{iter, process::exit};
+use std::{cell::Cell, iter, rc::Rc};
 
 // Convert ASCII to UCS-4
 pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
     mut input: I,
     omit_invalid: bool,
     suppress_error: bool,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u32>> {
     let mut position = 0;
 
@@ -24,10 +25,11 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 return Some(code_point as u32);
             } else if omit_invalid {
                 continue;
-            } else if !suppress_error {
-                eprintln!("Error: Invalid input position {}", position - 1);
-                std::process::exit(1);
             } else {
+                had_error.set(true);
+                if !suppress_error {
+                    eprintln!("Error: Invalid input position {}", position - 1);
+                }
                 return None;
             }
         }
@@ -41,6 +43,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     mut input: I,
     omit_invalid: bool,
     suppress_error: bool,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u8>> {
     let mut position = 0;
 
@@ -52,9 +55,9 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
             } else if omit_invalid {
                 continue;
             } else {
+                had_error.set(true);
                 if !suppress_error {
                     eprintln!("Error: Invalid input position {}", position - 1);
-                    exit(1)
                 }
                 return None;
             }

@@ -177,12 +177,12 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 ## Priority issues
 
 ### Critical
-- [ ] **IC-1 — Exit status 0 after a conversion/codeset error.** `main()` returns `Ok(())` even when conversion failed. **✓ verified:** `printf A | LANG=C iconv` → `Error: Could not find a codeset from your locale`, **`exit 0`**. Also the whole `charmap_conversion` path reports via `eprintln!` and returns `()` (`iconv.rs:416-480`), and `-s` error paths `return None` (`ascii.rs:31`, `utf_16.rs:84-106`, `utf_32.rs:75-82`) → exit 0. Spec: ">0 An error occurred," and "absence of `-c`/`-s` shall not affect the exit status." Fix: thread a `had_error` flag to `main` and exit `>0`.
-- [ ] **IC-2 — `exit(1)` called from inside library iterators** (`ascii.rs:29`, `utf_8.rs:48-178`), aborting mid-stream and bypassing remaining file operands. Fix: return `Result`, propagate to `main`.
+- [x] **IC-1 — Exit status 0 after a conversion/codeset error.** ✓ fixed (Phase 3): a shared `had_error: Rc<Cell<bool>>` is threaded into every codec (`to_ucs4`/`from_ucs4`) and into `encoding_conversion`/`charmap_conversion`; `main` exits `1` if it is set after processing all operands. An unconvertible character without `-c` now exits `1` (matching GNU). `main()` returns `Ok(())` even when conversion failed. **✓ verified:** `printf A | LANG=C iconv` → `Error: Could not find a codeset from your locale`, **`exit 0`**. Also the whole `charmap_conversion` path reports via `eprintln!` and returns `()` (`iconv.rs:416-480`), and `-s` error paths `return None` (`ascii.rs:31`, `utf_16.rs:84-106`, `utf_32.rs:75-82`) → exit 0. Spec: ">0 An error occurred," and "absence of `-c`/`-s` shall not affect the exit status." Fix: thread a `had_error` flag to `main` and exit `>0`. (The `LANG`/codeset branch is IC-3, Phase 4.)
+- [x] **IC-2 — `exit(1)` called from inside library iterators** (`ascii.rs:29`, `utf_8.rs:48-178`). ✓ fixed (Phase 3): every codec error path now sets `had_error` and returns `None` (stopping that stream) instead of calling `process::exit`; the exit status is decided once in `main`. Remaining file operands are no longer bypassed by a mid-stream process abort.
 
 ### Major
 - [ ] **IC-3 — Default codeset reads only `LANG`, splitting on `.`.** Ignores the `LC_ALL > LC_CTYPE > LANG` chain; `LANG=C`, `LANG=POSIX`, `LANG=en_US` (no `.`), or unset all hit the error/exit branch (`iconv.rs:494-512`). **✓ verified** (see IC-1). Fix: `nl_langinfo(CODESET)` after `setlocale`.
-- [ ] **IC-4 — `-s` truncates the stream.** Spec: `-s` "Suppress any messages" (stderr only). The impl uses `return None` as a stream terminator when `-s` is set without `-c` (`ascii.rs:31`, `utf_16.rs:84-106`). Fix: continue after a suppressed error; never use iteration end as an error signal.
+- [x] **IC-4 — `-s` truncates the stream.** ✓ fixed (Phase 3): `-s` (`suppress_error`) now gates only the stderr message; it no longer governs stream/exit behavior. Stream termination on an unconvertible character is decided solely by the absence of `-c`, and the error is recorded via `had_error` regardless of `-s`. So `-s` without `-c` exits `1` with empty stderr (was: silently `return None` → exit 0). Spec: `-s` "Suppress any messages" (stderr only). The impl uses `return None` as a stream terminator when `-s` is set without `-c` (`ascii.rs:31`, `utf_16.rs:84-106`). Fix: continue after a suppressed error; never use iteration end as an error signal.
 - [ ] **IC-5 — `-l` lists names the parser rejects.** **✓ verified:** `iconv -l` prints `UTF_8`, `UTF_16LE` (underscores, Debug format) but `-f`/`-t` require `UTF-8`/`UTF-16LE` (hyphens), and names are case-sensitive (`iconv -f utf-8 …` → `Error: Unknown encoding: utf-8`). `iconv.rs:178-181`, `:165-175`. Fix: print the serialized (hyphen) form; normalize/upper-case input and accept common aliases.
 - [ ] **IC-6 — Generic `UTF-16`/`UTF-32` output writes no BOM** (`utf_16.rs:143-151`, `utf_32.rs:98-108`), producing endianness-ambiguous output. Fix: emit a leading U+FEFF for the non-LE/BE variants.
 
@@ -191,14 +191,14 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 - [ ] **IC-8 — Per-byte stdout flush** in the encoding path (`iconv.rs:410-413`) — severe perf, not conformance. Use `BufWriter`.
 - [ ] **IC-9 — Hardcoded English diagnostics** in `iconv_lib` (`ascii.rs:28`, etc.); `LC_MESSAGES` inert.
 - [ ] **IC-10 — Typo `supress_error`** (one `s`) in `encoding_conversion` signature (`iconv.rs:362`).
-- [ ] **IC-11 — `from_ucs4` silent drop:** a surrogate with `!omit_invalid` returns `Some(vec![])` (`utf_8.rs:207-210`) — neither omitted nor an error.
+- [x] **IC-11 — `from_ucs4` silent drop:** ✓ fixed (Phase 3, folded into the error model): the surrogate / out-of-range branches in `utf_8::from_ucs4` and `utf_16::from_ucs4` no longer return a silent `Some(vec![])`. With `!omit_invalid` they now set `had_error` (so exit `>0`) and report unless `-s`; with `-c` they omit. (`utf_16::from_ucs4` also had inverted omit/suppress logic, fixed here.)
 
 ## Conformance matrix
 
 ### Synopsis / Options / Operands
 - [x] `-f`/`-t` (both charmap-file and codeset forms) CONFORMS — slash-detection dispatch (`iconv.rs:348-354`).
-- [ ] **`-c` PARTIAL** — wired, but exit-status interaction wrong (IC-1/IC-2).
-- [ ] **`-s` DIVERGES** (IC-4); **`-l` PARTIAL** (IC-5).
+- [x] **`-c` CONFORMS** — exit-status interaction fixed (IC-1/IC-2, Phase 3): `-c` omits and succeeds; absence of `-c` on an unconvertible character exits `>0`.
+- [x] **`-s` CONFORMS** (IC-4, Phase 3) — gates only the stderr message, not stream/exit. **`-l` PARTIAL** (IC-5, Phase 4).
 - [x] `file...`, `-` → stdin, missing-operand → stdin CONFORMS (`iconv.rs:517-523`). **✓ verified** by the existing `-` tests.
 
 ### Environment variables
@@ -210,7 +210,7 @@ UTF-8/16/32 + ASCII transcoding with BOM detection works and is well-tested. But
 - [ ] **UTF-16/32 output BOM PARTIAL** (IC-6). No ISO-8859-x / locale-derived codesets (implementation-defined per spec, but a practical gap). Mixed charmap+codeset correctly rejected (`iconv.rs:534-540`).
 
 ### Exit status
-- [ ] **DIVERGES — exit 0 after error** (IC-1/IC-2/IC-4).
+- [x] **CONFORMS** (IC-1/IC-2/IC-4, Phase 3) — a conversion error now yields exit `>0` via the shared `had_error` flag; `-c`/`-s` no longer wrongly force exit 0. (Default-codeset error path is IC-3, Phase 4.)
 
 ## Test coverage — not covered
 - [ ] Exit status on unconvertible input (with/without `-c`/`-s`); `LANG=C`/unset default codeset; `-l` round-trip; generic UTF-16/32 output BOM.

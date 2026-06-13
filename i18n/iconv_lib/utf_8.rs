@@ -7,14 +7,24 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{iter, process::exit};
+use std::{cell::Cell, iter, rc::Rc};
 
 /// Convert UTF-8 to UCS-4
 pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
     mut input: I,
     omit_invalid: bool,
     suppress_error: bool,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u32>> {
+    // Record an invalid sequence: flag it for the exit status and report it
+    // unless `-s` was given. Returns `None` so the caller stops the stream.
+    let fail = move |msg: &str, suppress: bool, flag: &Rc<Cell<bool>>| {
+        flag.set(true);
+        if !suppress {
+            eprintln!("{}", msg);
+        }
+    };
+
     let mut buffer = Vec::with_capacity(4);
     let iter = iter::from_fn(move || {
         loop {
@@ -41,36 +51,39 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                         if omit_invalid {
                             buffer.clear();
                             continue;
-                        } else {
-                            if !suppress_error {
-                                eprintln!("Error: Incomplete 2-byte UTF-8 sequence");
-                            }
-                            exit(1)
                         }
+                        fail(
+                            "Error: Incomplete 2-byte UTF-8 sequence",
+                            suppress_error,
+                            &had_error,
+                        );
+                        return None;
                     }
                 }
                 if (buffer[1] & 0xC0) != 0x80 {
                     if omit_invalid {
                         buffer.drain(0..1);
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid 2-byte UTF-8 sequence");
-                        }
-                        exit(1)
                     }
+                    fail(
+                        "Error: Invalid 2-byte UTF-8 sequence",
+                        suppress_error,
+                        &had_error,
+                    );
+                    return None;
                 }
                 let code_point = ((byte as u32 & 0x1F) << 6) | (buffer[1] as u32 & 0x3F);
                 if code_point < 0x80 {
                     if omit_invalid {
                         buffer.drain(0..2);
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Overlong 2-byte sequence");
-                        }
-                        exit(1)
                     }
+                    fail(
+                        "Error: Overlong 2-byte sequence",
+                        suppress_error,
+                        &had_error,
+                    );
+                    return None;
                 }
                 buffer.drain(0..2);
                 return Some(code_point);
@@ -84,24 +97,26 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                         if omit_invalid {
                             buffer.clear();
                             continue;
-                        } else {
-                            if !suppress_error {
-                                eprintln!("Error: Incomplete 3-byte UTF-8 sequence");
-                            }
-                            exit(1)
                         }
+                        fail(
+                            "Error: Incomplete 3-byte UTF-8 sequence",
+                            suppress_error,
+                            &had_error,
+                        );
+                        return None;
                     }
                 }
                 if (buffer[1] & 0xC0) != 0x80 || (buffer[2] & 0xC0) != 0x80 {
                     if omit_invalid {
                         buffer.drain(0..1);
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid 3-byte UTF-8 sequence");
-                        }
-                        exit(1)
                     }
+                    fail(
+                        "Error: Invalid 3-byte UTF-8 sequence",
+                        suppress_error,
+                        &had_error,
+                    );
+                    return None;
                 }
                 let code_point = ((byte as u32 & 0x0F) << 12)
                     | ((buffer[1] as u32 & 0x3F) << 6)
@@ -110,12 +125,9 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                     if omit_invalid {
                         buffer.drain(0..3);
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid 3-byte sequence");
-                        }
-                        exit(1)
                     }
+                    fail("Error: Invalid 3-byte sequence", suppress_error, &had_error);
+                    return None;
                 }
                 buffer.drain(0..3);
                 return Some(code_point);
@@ -129,12 +141,13 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                         if omit_invalid {
                             buffer.clear();
                             continue;
-                        } else {
-                            if !suppress_error {
-                                eprintln!("Error: Incomplete 4-byte UTF-8 sequence");
-                            }
-                            exit(1)
                         }
+                        fail(
+                            "Error: Incomplete 4-byte UTF-8 sequence",
+                            suppress_error,
+                            &had_error,
+                        );
+                        return None;
                     }
                 }
                 if (buffer[1] & 0xC0) != 0x80
@@ -144,12 +157,13 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                     if omit_invalid {
                         buffer.drain(0..1);
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid 4-byte UTF-8 sequence");
-                        }
-                        exit(1)
                     }
+                    fail(
+                        "Error: Invalid 4-byte UTF-8 sequence",
+                        suppress_error,
+                        &had_error,
+                    );
+                    return None;
                 }
                 let code_point = ((byte as u32 & 0x07) << 18)
                     | ((buffer[1] as u32 & 0x3F) << 12)
@@ -159,12 +173,13 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                     if omit_invalid {
                         buffer.drain(0..4);
                         continue;
-                    } else {
-                        if !suppress_error {
-                            eprintln!("Error: Invalid code point in 4-byte sequence");
-                        }
-                        exit(1)
                     }
+                    fail(
+                        "Error: Invalid code point in 4-byte sequence",
+                        suppress_error,
+                        &had_error,
+                    );
+                    return None;
                 }
                 buffer.drain(0..4);
                 return Some(code_point);
@@ -172,10 +187,8 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 buffer.drain(0..1);
                 continue;
             } else {
-                if !suppress_error {
-                    eprintln!("Error: Invalid byte");
-                }
-                exit(1);
+                fail("Error: Invalid byte", suppress_error, &had_error);
+                return None;
             }
         }
     });
@@ -187,6 +200,7 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     input: I,
     omit_invalid: bool,
     suppress_error: bool,
+    had_error: Rc<Cell<bool>>,
 ) -> Box<dyn Iterator<Item = u8>> {
     let iter = input.flat_map(move |code_point| {
         if code_point <= 0x7F {
@@ -198,17 +212,16 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
             ])
         } else if code_point <= 0xFFFF {
             if (0xD800..=0xDFFF).contains(&code_point) {
-                if !suppress_error {
-                    eprintln!(
-                        "Error: Surrogate code point U+{:04X} is not allowed in UTF-8",
-                        code_point
-                    );
+                if !omit_invalid {
+                    had_error.set(true);
+                    if !suppress_error {
+                        eprintln!(
+                            "Error: Surrogate code point U+{:04X} is not allowed in UTF-8",
+                            code_point
+                        );
+                    }
                 }
-                if omit_invalid {
-                    None
-                } else {
-                    Some(vec![])
-                }
+                None
             } else {
                 Some(vec![
                     0xE0 | ((code_point >> 12) as u8),
@@ -223,17 +236,17 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                 0x80 | (((code_point >> 6) & 0x3F) as u8),
                 0x80 | ((code_point & 0x3F) as u8),
             ])
-        } else if omit_invalid {
-            None
         } else {
-            if !suppress_error {
-                eprintln!(
-                    "Error: Code point U+{:X} is out of valid Unicode range",
-                    code_point
-                );
-                exit(1)
+            if !omit_invalid {
+                had_error.set(true);
+                if !suppress_error {
+                    eprintln!(
+                        "Error: Code point U+{:X} is out of valid Unicode range",
+                        code_point
+                    );
+                }
             }
-            Some(vec![])
+            None
         }
     });
     Box::new(iter.flatten())

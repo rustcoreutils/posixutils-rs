@@ -17,7 +17,8 @@ fn test_gettext_no_catalog() {
             cmd: String::from("gettext"),
             args: vec![String::from("Hello, World!")],
             stdin_data: String::new(),
-            expected_out: String::from("Hello, World!\n"),
+            // GT-2: the non-`-s` form does not append a trailing newline.
+            expected_out: String::from("Hello, World!"),
             expected_err: String::new(),
             expected_exit_code: 0,
         },
@@ -45,7 +46,9 @@ fn test_gettext_expand_escapes() {
         cmd: String::from("gettext"),
         args: vec![String::from("-e"), String::from("Hello\\nWorld")],
         stdin_data: String::new(),
-        expected_out: String::from("Hello\nWorld\n"),
+        // GT-2: no trailing newline in the non-`-s` form (the `\n` here is from
+        // the processed escape in the message itself).
+        expected_out: String::from("Hello\nWorld"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
@@ -80,12 +83,26 @@ fn test_gettext_with_domain() {
                 String::from("Test message"),
             ],
             stdin_data: String::new(),
-            expected_out: String::from("Test message\n"),
+            // GT-2: no trailing newline in the non-`-s` form.
+            expected_out: String::from("Test message"),
             expected_err: String::new(),
             expected_exit_code: 0,
         },
         &[("LC_ALL", "C")],
     );
+}
+
+/// GT-1: `-E` disables escape processing (the default), so `\n` stays literal.
+#[test]
+fn test_gettext_no_escape_with_capital_e() {
+    run_test(TestPlan {
+        cmd: String::from("gettext"),
+        args: vec![String::from("-E"), String::from("Hello\\nWorld")],
+        stdin_data: String::new(),
+        expected_out: String::from("Hello\\nWorld"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
 }
 
 /// Test gettext shell mode (-s) with multiple arguments

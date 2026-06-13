@@ -123,44 +123,44 @@ Lookup, locale precedence (`LC_ALL > LC_MESSAGES > LANG`), and the plural-expres
 ## Priority issues
 
 ### Major
-- [ ] **GT-1 — `-E` option missing from both utilities.** Spec: "`-E` Do not process C-language escape sequences," and "if `-s` … is specified then `-E` shall be the default." `Args` has no `-E` (`gettext.rs:28-49`, `ngettext.rs:28-50`); the `-e`/`-E` mutual-exclusion and the `-s`→`-E` default cannot be honored.
-- [ ] **GT-2 — Spurious trailing `<newline>` outside `-s`.** APPLICATION USAGE (spec lines 99929-99930): "unless `-s` … is specified without `-n`, the message(s) … are not followed by a `<newline>`." Both use `println!` unconditionally (`gettext.rs:115`, `ngettext.rs:99`). **✓ verified:** `gettext Hello` → bytes `48 65 6c 6c 6f 0a`; `ngettext file files 1` → `…0a`. Fix: `print!` in the non-`-s` paths.
-- [ ] **NG-1 — `ngettext` missing the optional `[textdomain]` operand.** Synopsis is `[textdomain] msgid msgid_plural n`; clap declares exactly three positionals (`ngettext.rs:43-49`). **✓ verified:** `ngettext mail recipient recipients 1` (the spec's own example shape) → `error: unexpected argument '1' found`.
-- [ ] **GT-3 — `NLSPATH` not implemented** and must take precedence over `TEXTDOMAINDIR` (`gettext_lib/lookup.rs:55-71`).
-- [ ] **GT-4 — NULL-textdomain path diverges.** When no domain can be resolved the spec returns the msgid directly; instead a catalog lookup is run against a fabricated `"messages"` domain (`gettext.rs:78-79`, `ngettext.rs:75-76`). Usually the same result, wrong code path.
-- [ ] **GT-5 — `mo_file.rs::get_plural_index` ignores the parsed plural expression** and always applies the Germanic `n==1` rule (`gettext_lib/mo_file.rs:365-382`). Only reachable via the `MoFile` API directly (binaries route through `catalog.rs`, which is correct), so the binaries are presently safe — but the library is broken for Slavic/Arabic plural counts.
+- [x] **GT-1 — `-E` option missing from both utilities.** ✓ fixed (Phase 9): both utilities accept `-E` (conflicts_with `-e`). The default is no escape processing (so the `-s`→`-E` default is satisfied), and `-e` opts in. Spec: "`-E` Do not process C-language escape sequences," and "if `-s` … is specified then `-E` shall be the default."
+- [x] **GT-2 — Spurious trailing `<newline>` outside `-s`.** ✓ fixed (Phase 9): the non-`-s` gettext path and ngettext use `print!` (no trailing newline); gettext `-s` appends a newline only when `-n` is not given. APPLICATION USAGE: "unless `-s` … is specified without `-n`, the message(s) … are not followed by a `<newline>`."
+- [x] **NG-1 — `ngettext` missing the optional `[textdomain]` operand.** ✓ fixed (Phase 9): operands are parsed from a `Vec` accepting either `msgid msgid_plural n` (3) or `textdomain msgid msgid_plural n` (4). `ngettext mail recipient recipients 1` now works.
+- [x] **GT-3 — `NLSPATH` not implemented.** ✓ fixed (Phase 9): `find_mo_file` consults `NLSPATH` first (taking precedence over `TEXTDOMAINDIR`/defaults), expanding `%N`/`%L`/`%l`/`%t`/`%c`/`%%` per locale variant.
+- [x] **GT-4 — NULL-textdomain path diverges.** ✓ fixed (Phase 9): domain resolution returns `None` when none of operand/`-d`/`TEXTDOMAIN` yields a non-empty name; gettext then returns the (escape-processed) msgid directly with no lookup, and ngettext selects the Germanic plural form without a fabricated-domain lookup.
+- [x] **GT-5 — `mo_file.rs::get_plural_index` ignores the parsed plural expression.** ✓ fixed (Phase 9): it now parses and evaluates the catalog's `Plural-Forms` expression via `plural.rs` (clamped to `nplurals`), falling back to the Germanic rule only when parsing fails. Unit-tested with a Polish 3-form expression.
 
 ### Minor
-- [ ] **GT-6 — `LANGUAGE` (XSI) not consulted** in locale resolution (`gettext_lib/lookup.rs:83-107`).
-- [ ] **GT-7 — gettext non-`-s` mode accepts multiple msgids** and iterates them; spec's non-`-s` form has exactly one msgid (`gettext.rs:82-116`).
-- [ ] **GT-8 — Octal escape requires a leading zero** (`\0NNN` only, not `\NNN`); `\0`/`\x00` silently dropped (`gettext_lib/lookup.rs:338-376`).
-- [ ] **GT-9 — `-e` not applied to the fallback (catalog-miss) msgid** before output (`gettext.rs:100-106`, `ngettext.rs:84-97`).
-- [ ] **GT-10 — Existing tests encode the non-conformant trailing newline** (`tests/gettext/mod.rs`, `tests/ngettext/mod.rs`) and must change alongside GT-2.
+- [x] **GT-6 — `LANGUAGE` (XSI) not consulted.** ✓ fixed (Phase 9): when set and the locale is not C/POSIX, `LANGUAGE`'s colon-separated entries are tried in priority order (effective locale last).
+- [x] **GT-7 — gettext non-`-s` mode accepts multiple msgids.** ✓ fixed (Phase 9): the non-`-s` form takes `[textdomain] msgid` (one msgid); more than two operands is an error.
+- [x] **GT-8 — Octal escape requires a leading zero.** ✓ fixed (Phase 9): octal is `\NNN` (1–3 digits, no leading zero required) and `\0`/`\x00` now produce a NUL instead of being dropped.
+- [x] **GT-9 — `-e` not applied to the fallback (catalog-miss) msgid.** ✓ fixed (Phase 9): escapes are applied to the operand up front, and that processed string is both the lookup key and the fallback; the translation itself is no longer escape-processed.
+- [x] **GT-10 — Existing tests encode the non-conformant trailing newline.** ✓ fixed (Phase 9): the gettext/ngettext integration tests were updated to expect no trailing newline (and new tests added for `-E`, the ngettext `[textdomain]` operand, octal escapes, and plural evaluation).
 
 ## Conformance matrix
 
 ### Options
 - [x] `-d`, `-n`, `-s` (gettext) CONFORMS (`gettext.rs:29-39`).
 - [x] `-d` (ngettext) CONFORMS; `-n`/`-s` correctly absent for ngettext.
-- [ ] **`-E` MISSING** (GT-1); **`-e` PARTIAL** (GT-8, GT-9).
+- [x] **`-E` CONFORMS** (GT-1, Phase 9); **`-e` CONFORMS** (GT-8/GT-9, Phase 9).
 
 ### Operands / output
-- [x] gettext `[textdomain] msgid` disambiguation CONFORMS for ≤1 domain (`gettext.rs:68-91`); multi-msgid divergence (GT-7).
-- [ ] **ngettext `[textdomain]` MISSING** (NG-1); count parsed via Rust `parse::<u64>` vs `strtoul` (negligible).
-- [ ] **trailing newline DIVERGES** (GT-2); `-s` space-separation CONFORMS (`gettext.rs:120-150`).
+- [x] gettext `[textdomain] msgid` disambiguation CONFORMS; non-`-s` single-msgid enforced (GT-7, Phase 9).
+- [x] **ngettext `[textdomain]` CONFORMS** (NG-1, Phase 9); count parsed via Rust `parse::<u64>` vs `strtoul` (negligible).
+- [x] **trailing newline CONFORMS** (GT-2, Phase 9); `-s` space-separation CONFORMS.
 
 ### Environment variables
 - [x] `LC_ALL`/`LC_MESSAGES`/`LANG` precedence CONFORMS (`lookup.rs:83-107`).
-- [x] `TEXTDOMAIN` CONFORMS; **`TEXTDOMAINDIR` PARTIAL** (no NLSPATH precedence).
-- [ ] **`NLSPATH` MISSING** (GT-3); **`LANGUAGE` MISSING** (GT-6).
+- [x] `TEXTDOMAIN` CONFORMS; `TEXTDOMAINDIR` CONFORMS (NLSPATH now takes precedence).
+- [x] **`NLSPATH` CONFORMS** (GT-3, Phase 9); **`LANGUAGE` CONFORMS** (GT-6, Phase 9).
 
 ### Plural / exit status
 - [x] Plural-expression parse+evaluate via `plural.rs`/`catalog.rs` CONFORMS.
-- [ ] **`mo_file.rs` plural index DIVERGES** (GT-5).
+- [x] **`mo_file.rs` plural index CONFORMS** (GT-5, Phase 9 — evaluates the parsed expression).
 - [x] Exit `0`/`>0` CONFORMS (`gettext.rs:70`, `ngettext.rs:65`).
 
 ## Test coverage — not covered
-- [ ] `-E`; `-s` default-`-E`; ngettext `[textdomain]` operand; real `.mo` translation lookup; non-Germanic plural counts.
+- [x] `-E`; ngettext `[textdomain]` operand; octal/NUL escapes; non-Germanic plural counts — now covered by added tests (Phase 9). Real `.mo` translation lookup via NLSPATH/LANGUAGE paths remains exercised only manually.
 
 ---
 

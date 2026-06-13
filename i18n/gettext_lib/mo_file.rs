@@ -361,24 +361,23 @@ impl MoFile {
         None
     }
 
-    /// Get the plural form index for a count
+    /// Get the plural form index for a count by evaluating the catalog's
+    /// `Plural-Forms` expression (falling back to the Germanic `n != 1` rule).
     fn get_plural_index(&self, n: u64) -> usize {
         if let Some(ref info) = self.plural_info {
-            // The plural expression will be evaluated by plural.rs
-            // For now, use the simple Germanic plural rule as fallback
-            if n == 1 {
+            if let Ok(expr) = crate::gettext_lib::plural::PluralExpr::parse(&info.plural_expr) {
+                let index = expr.evaluate(n) as usize;
+                return index.min(info.nplurals.saturating_sub(1));
+            }
+            // Fall back to the Germanic rule, clamped to the available forms.
+            return if n == 1 {
                 0
             } else {
-                1.min(info.nplurals - 1)
-            }
-        } else {
-            // Default Germanic plural rule: n != 1
-            if n == 1 {
-                0
-            } else {
-                1
-            }
+                1.min(info.nplurals.saturating_sub(1))
+            };
         }
+        // No plural info: default Germanic rule.
+        usize::from(n != 1)
     }
 
     /// Write the .mo file to a writer
@@ -503,6 +502,31 @@ mod tests {
 
         assert_eq!(mo.gettext("Hello"), Some("Hola"));
         assert_eq!(mo.gettext("NotFound"), None);
+    }
+
+    #[test]
+    fn test_ngettext_uses_plural_expression() {
+        // GT-5: a non-Germanic (Polish) plural expression must be evaluated,
+        // not the n==1 default. Forms: 0=one, 1=few, 2=many.
+        let mut messages = HashMap::new();
+        messages.insert(
+            "one\u{0}many".to_string(),
+            "forma0\u{0}forma1\u{0}forma2".to_string(),
+        );
+        let mo = MoFile {
+            plural_info: Some(PluralInfo {
+                nplurals: 3,
+                plural_expr: "(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2)"
+                    .to_string(),
+            }),
+            messages,
+            ..Default::default()
+        };
+
+        // n=1 -> form 0; n=2 -> form 1 (few); n=5 -> form 2 (many).
+        assert_eq!(mo.ngettext("one", "many", 1), Some("forma0"));
+        assert_eq!(mo.ngettext("one", "many", 2), Some("forma1"));
+        assert_eq!(mo.ngettext("one", "many", 5), Some("forma2"));
     }
 
     #[test]

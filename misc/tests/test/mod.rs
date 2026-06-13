@@ -11,8 +11,10 @@
 use plib::testing::{
     run_test, run_test_with_checker, run_test_with_checker_and_env, run_test_with_env, TestPlan,
 };
+use std::ffi::CString;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::net::UnixListener;
 
 fn test_test(args: &[&str], expected_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -441,4 +443,146 @@ fn test_posix_examples() {
     // String comparisons
     test_test(&["pear", "=", "pear"], 0);
     test_test(&["pear", "=", "grape"], 1);
+}
+
+// ============================================================================
+// Special-file-type and mode-bit primaries (audit PR D coverage)
+// ============================================================================
+
+/// `-c`: character special file. /dev/null is a character device on Linux and
+/// macOS; regular files and directories are not.
+#[test]
+fn test_char_device() {
+    test_test(&["-c", "/dev/null"], 0);
+    test_test(&["-c", "/tmp"], 1);
+    test_test(&["-c", "/nonexistent-xyz"], 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("regular");
+    fs::write(&f, "x").unwrap();
+    test_test(&["-c", f.to_str().unwrap()], 1);
+}
+
+/// `-b`: block special file. No portable path resolves to a block device
+/// without privilege, so only the false cases are asserted (the primary must
+/// return false for non-block files, not error).
+#[test]
+fn test_block_device() {
+    test_test(&["-b", "/dev/null"], 1); // char device, not block
+    test_test(&["-b", "/tmp"], 1);
+    test_test(&["-b", "/nonexistent-xyz"], 1);
+}
+
+/// `-p`: FIFO (named pipe), created with mkfifo(3).
+#[test]
+fn test_fifo() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let c = CString::new(fifo.to_str().unwrap()).unwrap();
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo failed");
+
+    test_test(&["-p", fifo.to_str().unwrap()], 0);
+
+    let reg = dir.path().join("regular");
+    fs::write(&reg, "x").unwrap();
+    test_test(&["-p", reg.to_str().unwrap()], 1);
+}
+
+/// `-S`: socket, created by binding a Unix-domain listener.
+#[test]
+fn test_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("sock");
+    let _listener = UnixListener::bind(&sock).unwrap();
+
+    test_test(&["-S", sock.to_str().unwrap()], 0);
+
+    let reg = dir.path().join("regular");
+    fs::write(&reg, "x").unwrap();
+    test_test(&["-S", reg.to_str().unwrap()], 1);
+}
+
+/// `-g` / `-u`: set-group-ID / set-user-ID bits. Some filesystems strip these
+/// bits on chmod for an unprivileged owner, so the assertion is skipped when
+/// the bit does not actually stick.
+#[test]
+fn test_setgid_setuid() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let gfile = dir.path().join("sgid");
+    fs::write(&gfile, "x").unwrap();
+    fs::set_permissions(&gfile, fs::Permissions::from_mode(0o2755)).unwrap();
+    if fs::metadata(&gfile).unwrap().permissions().mode() & 0o2000 != 0 {
+        test_test(&["-g", gfile.to_str().unwrap()], 0);
+    } else {
+        eprintln!("skipping -g check: setgid bit did not stick on this filesystem");
+    }
+    // A plain file never has the bit.
+    let plain = dir.path().join("plain");
+    fs::write(&plain, "x").unwrap();
+    test_test(&["-g", plain.to_str().unwrap()], 1);
+
+    let ufile = dir.path().join("suid");
+    fs::write(&ufile, "x").unwrap();
+    fs::set_permissions(&ufile, fs::Permissions::from_mode(0o4755)).unwrap();
+    if fs::metadata(&ufile).unwrap().permissions().mode() & 0o4000 != 0 {
+        test_test(&["-u", ufile.to_str().unwrap()], 0);
+    } else {
+        eprintln!("skipping -u check: setuid bit did not stick on this filesystem");
+    }
+    test_test(&["-u", plain.to_str().unwrap()], 1);
+}
+
+/// `-t`: file descriptor is an open terminal. Under the test harness the
+/// inherited descriptors are pipes/files, never a tty, so every case is false;
+/// invalid and non-numeric descriptors are also false (not errors).
+#[test]
+fn test_terminal() {
+    test_test(&["-t", "0"], 1);
+    test_test(&["-t", "1"], 1);
+    test_test(&["-t", "99"], 1); // not an open fd
+    test_test(&["-t", "notanumber"], 1);
+}
+
+/// Set a file's last-modification time (seconds since the epoch).
+fn set_mtime(path: &std::path::Path, secs: i64) {
+    let c = CString::new(path.to_str().unwrap()).unwrap();
+    let tv = libc::timeval {
+        tv_sec: secs as libc::time_t,
+        tv_usec: 0,
+    };
+    let times = [tv, tv]; // [atime, mtime]
+    let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "utimes failed");
+}
+
+/// `-nt` / `-ot`: compare last-modification timestamps, including the rules for
+/// when one operand cannot be resolved.
+#[test]
+fn test_newer_older() {
+    let dir = tempfile::tempdir().unwrap();
+    let older = dir.path().join("older");
+    let newer = dir.path().join("newer");
+    fs::write(&older, "x").unwrap();
+    fs::write(&newer, "x").unwrap();
+    set_mtime(&older, 1_000_000_000);
+    set_mtime(&newer, 2_000_000_000);
+    let (o, n) = (older.to_str().unwrap(), newer.to_str().unwrap());
+    let missing = dir.path().join("missing");
+    let m = missing.to_str().unwrap();
+
+    // Both exist.
+    test_test(&[n, "-nt", o], 0);
+    test_test(&[o, "-nt", n], 1);
+    test_test(&[o, "-ot", n], 0);
+    test_test(&[n, "-ot", o], 1);
+
+    // -nt: true if p1 exists and p2 does not.
+    test_test(&[n, "-nt", m], 0);
+    test_test(&[m, "-nt", n], 1);
+
+    // -ot: true if p2 exists and p1 does not.
+    test_test(&[m, "-ot", n], 0);
+    test_test(&[n, "-ot", m], 1);
 }

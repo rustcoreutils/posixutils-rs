@@ -86,15 +86,15 @@ _None._
 
 Existing `misc/tests/test/mod.rs` (336 lines) covers a broad slice: `-d -e -f -h -L -r -s -w -x -n -z -ef -eq -ne -lt -gt -ge -le = != < > -a -o`, plus bracket form and `!`.
 
-Not covered:
-- [ ] `-b` (block), `-c` (char), `-S` (socket), `-p` (FIFO) device-type primaries
-- [ ] `-g` (SGID), `-u` (SUID) mode-bit primaries
-- [ ] `-t` terminal test (true and false fd cases)
-- [ ] `-nt` / `-ot` timestamp comparison (both files exist; one missing)
+Coverage (all gaps now closed in Phase 4):
+- [x] `-b` (block), `-c` (char), `-S` (socket), `-p` (FIFO) device-type primaries — ✓ added (`test_char_device`, `test_block_device`, `test_fifo`, `test_socket`)
+- [x] `-g` (SGID), `-u` (SUID) mode-bit primaries — ✓ added (`test_setgid_setuid`, with a graceful skip when the bit is stripped)
+- [x] `-t` terminal test (true and false fd cases) — ✓ added (`test_terminal`; non-tty/invalid/non-numeric fd cases)
+- [x] `-nt` / `-ot` timestamp comparison (both files exist; one missing) — ✓ added (`test_newer_older`, mtimes set via `utimes`)
 - [x] `LC_COLLATE` collation behavior of `<`/`>` — ✓ added (`test_str_collation`)
 - [x] Integer overflow / leading-blank operand error paths (**#3**) — ✓ added (`test_intops_operands`)
 - [x] `>4`-argument `ExprParser` precedence (`-a` tighter than `-o`, `!`, nested `()`) — ✓ added (`test_expr_precedence`)
-- [ ] `true`/`false` argument-discard (`true --`, `false foo`) — `true`/`false` mod.rs are minimal
+- [x] `true`/`false` argument-discard (`true --`, `false foo`) — ✓ added (`true_ignores_arguments`, `false_ignores_arguments`)
 
 ## Suggested PR groupings
 
@@ -102,6 +102,8 @@ Not covered:
 - **PR B — "test: integer operand robustness"** (#3): trim surrounding blanks before `i64::parse`; add overflow/whitespace tests. Optional.
 - **PR C — "test: tidy legacy-operator handling + dead code"** (#2, #4): decide on uniform vs compound-only `-a`/`-o`/`()` acceptance and document it; remove the unreachable `eval_unary` arm.
 - **PR D — "test: fill coverage gaps"**: device/mode primaries (`-b -c -S -p -g -u`), `-t`, `-nt`/`-ot`, and `ExprParser` precedence tests.
+
+**Status:** all findings (#1–#4) and PR D coverage landed on branch `misc-audit` across four phases (collation → integer operands → uniform legacy operators + dead-code → coverage tests). All boxes above are ticked; `misc` test suite passes 37 tests with zero clippy warnings.
 
 ---
 

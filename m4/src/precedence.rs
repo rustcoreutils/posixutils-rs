@@ -1,3 +1,12 @@
+//
+// Copyright (c) 2024-2025 Hemi Labs, Inc.
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
 //! Combinators to parse expressions with operator precedence. From
 //! https://github.com/rust-bakery/nom/pull/1362 license is MIT (presumably as it is a contribution
 //! to nom) credit @cenodis

@@ -1,37 +1,216 @@
-#!/bin/bash
+#!/usr/bin/env python3
 #
-# Update copyright years from 2024 to 2025-2026 in all *.rs files
-# within the specified directories.
+# Ensure accurate top-of-file Copyright headers across the tree.
 #
-# Usage: ./scripts/fix-headers dir1 [dir2 ...]
+# For every tracked *.rs file:
+#   * If it already has a Copyright header, EXTEND the end year of each
+#     copyright line to the file's most-recent git commit year (any commit
+#     counts). The existing start year is never changed; ranges render as
+#     "<start>-<end>" (or a single "<year>" when start == end).
+#   * If it has NO header, INSERT the standard MIT header block. Copyright
+#     holder(s) are taken from the directory's prevailing sibling convention
+#     when available, else inferred from the file's dominant git author.
+#     Years come from the file's git history (first..last commit).
 #
+# Usage:
+#   scripts/fix-headers            # dry run: print what would change
+#   scripts/fix-headers --apply    # write changes
+#
+# Run from the repository root.
 
-set -e
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
 
-if [ $# -eq 0 ]; then
-    echo "Usage: $0 dir1 [dir2 ...]" >&2
-    echo "Updates copyright headers from 2024 to 2025-2026 in *.rs files" >&2
-    exit 1
-fi
+APPLY = "--apply" in sys.argv
 
-count=0
+# git author name -> copyright holder name. Hemi Labs developers are attributed
+# to "Hemi Labs, Inc." (their employer holder, per the established headers);
+# the project owner and outside contributors keep their own names.
+HEMI_AUTHORS = {
+    "grisenti", "Luke Frisken", "wandalen", "rishadbaniya", "gcanat",
+    "Joseph Rafael Ferrer", "Andrew Liebenow", "Dmytro Kriuchkov",
+    "copilot-swe-agent[bot]",
+}
+SELF_AUTHORS = {"fox0", "Ian McLinden"}
 
-for dir in "$@"; do
-    if [ ! -d "$dir" ]; then
-        echo "Warning: '$dir' is not a directory, skipping" >&2
-        continue
-    fi
 
-    while IFS= read -r -d '' file; do
-        if grep -iq "copyright \((c) \)\?2024" "$file"; then
-            # Handle "Copyright (c) 2024" -> "Copyright (c) 2025-2026" (case-insensitive)
-            sed -i 's/\(copyright\) ([cC]) 2024/\1 (c) 2025-2026/Ig' "$file"
-            # Handle "Copyright 2024" -> "Copyright 2025-2026" (no "(c)", case-insensitive)
-            sed -i 's/\(copyright\) 2024/\1 2025-2026/Ig' "$file"
-            echo "Updated: $file"
-            ((count++)) || true
-        fi
-    done < <(find "$dir" -name '*.rs' -type f -print0)
-done
+def author_to_holder(author):
+    if author == "Jeff Garzik":
+        return "Jeff Garzik"
+    if author in HEMI_AUTHORS:
+        return "Hemi Labs, Inc."
+    if author in SELF_AUTHORS:
+        return author
+    return "Jeff Garzik"  # conservative default for unknown authors
 
-echo "Updated $count file(s)"
+
+HEADER_SCAN_LINES = 15
+COPYRIGHT_RE = re.compile(
+    r"^(?P<prefix>\s*//\s*)Copyright \(c\) (?P<y1>\d{4})(?:-(?P<y2>\d{4}))? (?P<name>.+?)\s*$"
+)
+
+
+# Paths to leave untouched:
+#   * gettext-rs/ is a temporary mock of the external gettext-rs crate, not
+#     original project source.
+#   * find's rust_file.rs is test-data whose byte size the find `-size` tests
+#     depend on; adding a header would change its size and break them.
+#   * the xgettext test_*.rs files are extractor input fixtures whose source
+#     line numbers are baked into the expected .pot golden files; a header
+#     would shift every line and break the comparisons.
+EXCLUDE_PREFIXES = ("gettext-rs/",)
+EXCLUDE_EXACT = {
+    "file/tests/find/other/rust_file.rs",
+    "i18n/tests/xgettext/test_clap.rs",
+    "i18n/tests/xgettext/test_gettext.rs",
+    "i18n/tests/xgettext/test_ngettext.rs",
+    "i18n/tests/xgettext/test_npgettext.rs",
+    "i18n/tests/xgettext/test_pgettext.rs",
+}
+
+
+def git_files():
+    out = subprocess.check_output(["git", "ls-files", "*.rs"], text=True)
+    files = out.split()
+    return [
+        f
+        for f in files
+        if f not in EXCLUDE_EXACT and not f.startswith(EXCLUDE_PREFIXES)
+    ]
+
+
+def git_author_years(path):
+    """Return (dominant_author, first_year, last_year) from git history."""
+    out = subprocess.check_output(
+        ["git", "log", "--format=%an|%ad", "--date=format:%Y", "--", path],
+        text=True,
+    ).splitlines()
+    authors, years = [], []
+    for line in out:
+        a, _, y = line.partition("|")
+        authors.append(a)
+        years.append(int(y))
+    if not years:
+        return (None, None, None)
+    dom = Counter(authors).most_common(1)[0][0]
+    return (dom, min(years), max(years))
+
+
+def has_header(text):
+    for line in text.splitlines()[:HEADER_SCAN_LINES]:
+        if COPYRIGHT_RE.match(line):
+            return True
+    return False
+
+
+def header_holders(path):
+    """Distinct holder names from a file's header region, in first-seen order."""
+    holders = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh.read().splitlines()[:HEADER_SCAN_LINES]:
+                m = COPYRIGHT_RE.match(line)
+                if m and m.group("name") not in holders:
+                    holders.append(m.group("name"))
+    except (OSError, UnicodeDecodeError):
+        pass
+    return holders
+
+
+def render_years(start, end):
+    return f"{start}" if start == end else f"{start}-{end}"
+
+
+def build_block(holders, start, end):
+    yr = render_years(start, end)
+    lines = ["//"]
+    for h in holders:
+        lines.append(f"// Copyright (c) {yr} {h}")
+    lines += [
+        "//",
+        "// This file is part of the posixutils-rs project covered under",
+        "// the MIT License.  For the full license text, please see the LICENSE",
+        "// file in the root directory of this project.",
+        "// SPDX-License-Identifier: MIT",
+        "//",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    files = git_files()
+
+    # Precompute, per directory, the holder convention of headered siblings.
+    dir_holders = {}
+    for f in files:
+        d = os.path.dirname(f)
+        hs = header_holders(f)
+        if hs:
+            dir_holders.setdefault(d, Counter())[tuple(hs)] += 1
+
+    updated, added, skipped_no_history = [], [], []
+
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            text = fh.read()
+        dom, first, last = git_author_years(f)
+        if last is None:
+            skipped_no_history.append(f)
+            continue
+
+        if has_header(text):
+            # Extend end year of each copyright line; keep start year.
+            out_lines, changed = [], False
+            for i, line in enumerate(text.splitlines(keepends=False)):
+                m = COPYRIGHT_RE.match(line) if i < HEADER_SCAN_LINES else None
+                if m:
+                    start = int(m.group("y1"))
+                    cur_end = int(m.group("y2")) if m.group("y2") else start
+                    new_end = max(cur_end, last)
+                    if new_end != cur_end:
+                        line = (
+                            f"{m.group('prefix')}Copyright (c) "
+                            f"{render_years(start, new_end)} {m.group('name')}"
+                        )
+                        changed = True
+                out_lines.append(line)
+            if changed:
+                newtext = "\n".join(out_lines)
+                if text.endswith("\n"):
+                    newtext += "\n"
+                updated.append(f)
+                if APPLY:
+                    with open(f, "w", encoding="utf-8") as fh:
+                        fh.write(newtext)
+        else:
+            # Insert a header. Prefer the directory's sibling convention.
+            d = os.path.dirname(f)
+            if d in dir_holders:
+                holders = list(dir_holders[d].most_common(1)[0][0])
+                src = "dir"
+            else:
+                holders = [author_to_holder(dom)]
+                src = f"author:{dom}"
+            block = build_block(holders, first, last)
+            added.append((f, render_years(first, last), " + ".join(holders), src))
+            if APPLY:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(block + text)
+
+    print(f"=== {'APPLIED' if APPLY else 'DRY RUN'} ===")
+    print(f"\nExisting headers extended: {len(updated)}")
+    print(f"\nHeaders added: {len(added)}")
+    for f, yr, holders, src in added:
+        print(f"  + {f:48s} {yr:11s} {holders}   [{src}]")
+    if skipped_no_history:
+        print(f"\nSkipped (no git history): {len(skipped_no_history)}")
+        for f in skipped_no_history:
+            print(f"  ? {f}")
+
+
+if __name__ == "__main__":
+    main()

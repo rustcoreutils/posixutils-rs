@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Ian McLinden
+// Copyright (c) 2024-2026 Ian McLinden
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE

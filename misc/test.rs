@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024-2026 Jeff Garzik
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -169,20 +169,13 @@ fn eval_terminal(s: &str) -> bool {
     unsafe { BorrowedFd::borrow_raw(fd).is_terminal() }
 }
 
-fn eval_unary(op_str: &str, s: &str) -> bool {
-    let op = match parse_unary_op(op_str) {
-        Some(p) => p,
-        None => {
-            eprintln!("{}: {}", gettext("unknown operator"), op_str);
-            return false;
-        }
-    };
-    if want_metadata(&op) {
-        eval_unary_path(&op, s)
-    } else if op == UnaryOp::Terminal {
+fn eval_unary(op: &UnaryOp, s: &str) -> bool {
+    if want_metadata(op) {
+        eval_unary_path(op, s)
+    } else if *op == UnaryOp::Terminal {
         eval_terminal(s)
     } else {
-        eval_unary_str(&op, s)
+        eval_unary_str(op, s)
     }
 }
 
@@ -227,26 +220,23 @@ impl EvalResult {
     }
 }
 
+/// Parse an integer operand, tolerating surrounding blanks as historical
+/// `test` implementations do. The diagnostic preserves the original operand.
+/// (audit #3)
+fn parse_int(s: &str) -> Result<i64, EvalResult> {
+    s.trim().parse().map_err(|_| {
+        EvalResult::Error(format!("{}: {}", gettext("integer expression expected"), s))
+    })
+}
+
 fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> EvalResult {
-    let i1: i64 = match s1.parse() {
+    let i1: i64 = match parse_int(s1) {
         Ok(v) => v,
-        Err(_) => {
-            return EvalResult::Error(format!(
-                "{}: {}",
-                gettext("integer expression expected"),
-                s1
-            ))
-        }
+        Err(e) => return e,
     };
-    let i2: i64 = match s2.parse() {
+    let i2: i64 = match parse_int(s2) {
         Ok(v) => v,
-        Err(_) => {
-            return EvalResult::Error(format!(
-                "{}: {}",
-                gettext("integer expression expected"),
-                s2
-            ))
-        }
+        Err(e) => return e,
     };
 
     let result = match op {
@@ -267,12 +257,27 @@ fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> EvalResult {
     }
 }
 
+/// Compare two strings using the current locale's collating sequence
+/// (`LC_COLLATE`), as POSIX requires for the `<` and `>` operators. Falls
+/// back to byte comparison only if a string contains an embedded NUL, which
+/// cannot occur in an argv operand but is guarded against regardless.
+fn strcoll(s1: &str, s2: &str) -> std::cmp::Ordering {
+    match (CString::new(s1), CString::new(s2)) {
+        (Ok(c1), Ok(c2)) => {
+            let r = unsafe { libc::strcoll(c1.as_ptr(), c2.as_ptr()) };
+            r.cmp(&0)
+        }
+        _ => s1.cmp(s2),
+    }
+}
+
 fn eval_binary_str(op: &BinOp, s1: &str, s2: &str) -> bool {
+    use std::cmp::Ordering;
     match op {
         BinOp::StrEq => s1 == s2,
         BinOp::StrNE => s1 != s2,
-        BinOp::StrLT => s1 < s2,
-        BinOp::StrGT => s1 > s2,
+        BinOp::StrLT => strcoll(s1, s2) == Ordering::Less,
+        BinOp::StrGT => strcoll(s1, s2) == Ordering::Greater,
         _ => {
             unreachable!()
         }
@@ -460,9 +465,9 @@ impl<'a> ExprParser<'a> {
         };
 
         // Check for unary operators
-        if parse_unary_op(&first).is_some() {
+        if let Some(unary_op) = parse_unary_op(&first) {
             if let Some(operand) = self.advance() {
-                return if eval_unary(&first, operand) {
+                return if eval_unary(&unary_op, operand) {
                     EvalResult::True
                 } else {
                     EvalResult::False
@@ -493,6 +498,25 @@ impl<'a> ExprParser<'a> {
     }
 }
 
+/// Evaluate an expression using the extended grammar (`!`, `-a`, `-o`, and
+/// `(` `)` grouping). POSIX.1-2024 removed `-a`, `-o`, `(`, and `)` and leaves
+/// such expressions unspecified, so this is a compatibility extension for
+/// historical scripts. It is the fallback for the 3- and 4-argument forms the
+/// count-based algorithm does not assign a meaning, and handles all
+/// expressions with more than four arguments. (audit #2)
+fn eval_with_parser(args: &[String]) -> EvalResult {
+    let mut parser = ExprParser::new(args);
+    let result = parser.parse_or();
+    if parser.remaining() > 0 {
+        return EvalResult::Error(format!(
+            "{}: {}",
+            gettext("unexpected argument"),
+            parser.peek().unwrap_or("")
+        ));
+    }
+    result
+}
+
 /// Evaluate with POSIX-mandated rules for 0-4 arguments
 fn eval_posix_strict(args: &[String]) -> EvalResult {
     match args.len() {
@@ -513,8 +537,8 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
                 } else {
                     EvalResult::True
                 }
-            } else if parse_unary_op(&args[0]).is_some() {
-                if eval_unary(&args[0], &args[1]) {
+            } else if let Some(op) = parse_unary_op(&args[0]) {
+                if eval_unary(&op, &args[1]) {
                     EvalResult::True
                 } else {
                     EvalResult::False
@@ -545,7 +569,9 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
                     return EvalResult::False;
                 }
             }
-            EvalResult::Error(gettext("syntax error").to_string())
+            // Otherwise unspecified by POSIX: fall back to the extended grammar
+            // so legacy forms like `test x -a y` still evaluate. (audit #2)
+            eval_with_parser(args)
         }
 
         4 => {
@@ -557,27 +583,24 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
             if args[0] == "(" && args[3] == ")" {
                 return eval_posix_strict(&args[1..3]);
             }
-            EvalResult::Error(gettext("syntax error").to_string())
+            // Otherwise unspecified by POSIX: fall back to the extended grammar. (audit #2)
+            eval_with_parser(args)
         }
 
-        _ => {
-            // >4 arguments: use XSI expression parser
-            let mut parser = ExprParser::new(args);
-            let result = parser.parse_or();
-            if parser.remaining() > 0 {
-                return EvalResult::Error(format!(
-                    "{}: {}",
-                    gettext("unexpected argument"),
-                    parser.peek().unwrap_or("")
-                ));
-            }
-            result
-        }
+        // >4 arguments: extended grammar (also unspecified by POSIX).
+        _ => eval_with_parser(args),
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
+    // gettext-rs's setlocale operates on its bundled locale state and does not
+    // reliably establish the C library's global locale, which strcoll(3) (used
+    // by the `<` and `>` operators) consults. Set it directly so LC_COLLATE
+    // takes effect. (audit #1)
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+    }
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 

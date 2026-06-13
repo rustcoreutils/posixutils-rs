@@ -1,3 +1,12 @@
+//
+// Copyright (c) 2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
 //! ctags `tags`-file lookup for vi/ex (`-t`, `:tag`, `^]`).
 //!
 //! A tags file has one tab-separated entry per line:

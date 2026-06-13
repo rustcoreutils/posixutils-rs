@@ -47,7 +47,36 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 6 - Audited
 
-(none)
+ - [x] ar (Development)
+ - [x] at (cron cat.)
+ - [x] awk
+ - [x] batch (cron cat.)
+ - [x] bc
+ - [x] cat
+ - [x] cmp
+ - [x] crontab (cron cat.)
+ - [x] dd
+ - [x] ed (Editors)
+ - [x] ex (Editors)
+ - [x] expr
+ - [x] false
+ - [x] file
+ - [x] find
+ - [x] lex (Development)
+ - [x] m4
+ - [x] make
+ - [x] man
+ - [x] more
+ - [x] nm (Development)
+ - [x] od
+ - [x] split
+ - [x] strings
+ - [x] strip (Development)
+ - [x] tee
+ - [x] test
+ - [x] true
+ - [x] vi (Editors)
+ - [x] yacc (Development)
 
 ## Stage 5 - Fully Translated to 2+ languages
 
@@ -60,21 +89,15 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] admin (SCCS)
- - [x] ar (Development)
  - [x] asa
- - [x] at (cron cat.)
- - [x] awk
  - [x] basename
- - [x] bc
  - [x] c99 (Development)
  - [x] cal
  - [x] cflow (Development)
  - [x] cksum
- - [x] cmp
  - [x] comm
  - [x] compress (compress cat.)
  - [x] cp
- - [x] crontab (cron cat.)
  - [x] csplit
  - [x] ctags (Development)
  - [x] cut
@@ -85,13 +108,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] dirname
  - [x] du
  - [x] echo
- - [x] ed (Editors)
- - [x] ex (Editors)
  - [x] expand
- - [x] expr
- - [x] false
- - [x] file
- - [x] find
  - [x] fold
  - [x] fuser
  - [x] gencat (i18n)
@@ -102,24 +119,17 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] head
  - [x] iconv (i18n)
  - [x] join
- - [x] lex (Development)
  - [x] link
  - [x] locale (i18n)
  - [x] localedef (i18n)
  - [x] logger
  - [x] ls
- - [x] m4
  - [x] mailx
- - [x] man
- - [x] make
  - [x] mkdir
- - [x] more
  - [x] msgfmt (i18n)
  - [x] mv
  - [x] ngettext (i18n)
  - [x] nl
- - [x] nm (Development)
- - [x] od
  - [x] paste
  - [x] patch
  - [x] pax
@@ -137,19 +147,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] sed
  - [x] sh
  - [x] sort
- - [x] split
- - [x] strings
- - [x] strip (Development)
  - [x] stty
  - [x] tabs
  - [x] talk (with talkd local daemon)
  - [x] tail
- - [x] test
  - [x] time
  - [x] timeout
  - [x] tput
  - [x] tr
- - [x] true
  - [x] tsort
  - [x] tty
  - [x] uname
@@ -164,25 +169,20 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uustat (UUCP)
  - [x] uux (UUCP)
  - [x] val (SCCS)
- - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
  - [x] who
  - [x] write
- - [x] dd
  - [x] xargs
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
  - [x] lp
  - [x] xgettext (i18n)
- - [x] yacc (Development)
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
- - [x] batch (cron cat.)
- - [x] cat
  - [x] chgrp
  - [x] chmod
  - [x] chown
@@ -200,7 +200,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pwd
  - [x] renice
  - [x] sleep
- - [x] tee
  - [x] touch
 
 ## Stage 1 - Rough draft

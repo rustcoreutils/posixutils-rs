@@ -53,7 +53,7 @@ pub fn remove_empty_lines(input: &str, delimiter_size: usize) -> String {
         if current_char == '\n' {
             if iter.peek() != Some(&'\n') {
                 let lines_delimiter = if nl_count > 1 {
-                    &lines_delimiter_big.clone()
+                    lines_delimiter_big.as_str()
                 } else {
                     "\n"
                 };

@@ -7,8 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Emphasis layer for the term backend: zero-width style markers, cell-accurate
-//! width measurement, and resolution into nroff backspace-overstrike.
+//! Emphasis layer for the term backend: zero-width style markers, character-count
+//! width measurement (ignoring style markers), and resolution into nroff
+//! backspace-overstrike. The width count is per Unicode scalar, not true terminal
+//! cells, so wide/combining characters are not specially weighted.
 
 // Private, zero-width style markers inserted during formatting and resolved by
 // `apply_styling` into nroff backspace-overstrike (or stripped). These control
@@ -21,9 +23,11 @@ fn is_style_marker(c: char) -> bool {
     matches!(c, STYLE_BOLD | STYLE_UL | STYLE_RESET)
 }
 
-/// Display width of `s` in terminal cells, ignoring the zero-width style
+/// Display width of `s` as a Unicode scalar count, ignoring the zero-width style
 /// markers. (Overstrike is applied only after wrapping, so no backspaces are
-/// present here.) For unstyled text this equals `chars().count()`.
+/// present here.) This is not true terminal-cell width — wide/combining
+/// characters are each counted as one. For unstyled text it equals
+/// `chars().count()`.
 pub(crate) fn display_width(s: &str) -> usize {
     s.chars().filter(|&c| !is_style_marker(c)).count()
 }

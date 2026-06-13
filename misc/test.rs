@@ -267,12 +267,27 @@ fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> EvalResult {
     }
 }
 
+/// Compare two strings using the current locale's collating sequence
+/// (`LC_COLLATE`), as POSIX requires for the `<` and `>` operators. Falls
+/// back to byte comparison only if a string contains an embedded NUL, which
+/// cannot occur in an argv operand but is guarded against regardless.
+fn strcoll(s1: &str, s2: &str) -> std::cmp::Ordering {
+    match (CString::new(s1), CString::new(s2)) {
+        (Ok(c1), Ok(c2)) => {
+            let r = unsafe { libc::strcoll(c1.as_ptr(), c2.as_ptr()) };
+            r.cmp(&0)
+        }
+        _ => s1.cmp(s2),
+    }
+}
+
 fn eval_binary_str(op: &BinOp, s1: &str, s2: &str) -> bool {
+    use std::cmp::Ordering;
     match op {
         BinOp::StrEq => s1 == s2,
         BinOp::StrNE => s1 != s2,
-        BinOp::StrLT => s1 < s2,
-        BinOp::StrGT => s1 > s2,
+        BinOp::StrLT => strcoll(s1, s2) == Ordering::Less,
+        BinOp::StrGT => strcoll(s1, s2) == Ordering::Greater,
         _ => {
             unreachable!()
         }
@@ -578,6 +593,13 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
+    // gettext-rs's setlocale operates on its bundled locale state and does not
+    // reliably establish the C library's global locale, which strcoll(3) (used
+    // by the `<` and `>` operators) consults. Set it directly so LC_COLLATE
+    // takes effect. (audit #1)
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+    }
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 

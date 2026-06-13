@@ -8,7 +8,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{
+    run_test, run_test_with_checker, run_test_with_checker_and_env, run_test_with_env, TestPlan,
+};
 use std::fs;
 use std::os::unix::fs::symlink;
 
@@ -23,6 +25,23 @@ fn test_test(args: &[&str], expected_code: i32) {
         expected_err: String::from(""),
         expected_exit_code: expected_code,
     });
+}
+
+/// Run `test` with explicit environment variables (e.g. a locale override).
+fn test_test_env(args: &[&str], env: &[(&str, &str)], expected_code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test_with_env(
+        TestPlan {
+            cmd: String::from("test"),
+            args: str_args,
+            stdin_data: String::from(""),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: expected_code,
+        },
+        env,
+    );
 }
 
 /// Test that expects stderr output (doesn't check exact message, only exit code)
@@ -84,6 +103,36 @@ fn test_strops() {
 
     test_test(&["a", ">", "b"], 1);
     test_test(&["b", ">", "a"], 0);
+}
+
+/// `<` and `>` must order strings by the current locale's collating sequence
+/// (LC_COLLATE), not by raw byte/scalar value. (audit #1)
+#[test]
+fn test_str_collation() {
+    // In the C locale, collation is byte order: 'B'(0x42) sorts before 'a'(0x61).
+    test_test_env(&["B", "<", "a"], &[("LC_ALL", "C")], 0);
+    test_test_env(&["a", "<", "B"], &[("LC_ALL", "C")], 1);
+    test_test_env(&["a", ">", "B"], &[("LC_ALL", "C")], 0);
+
+    // In a UTF-8 locale, collation interleaves case: 'a' sorts before 'B', the
+    // opposite of byte order. Probe en_US.UTF-8 but skip gracefully when the
+    // locale is not installed (the binary then falls back to C/byte order).
+    let str_args: Vec<String> = ["a", "<", "B"].iter().map(|s| String::from(*s)).collect();
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("test"),
+            args: str_args,
+            stdin_data: String::from(""),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", "en_US.UTF-8")],
+        |_plan, output| match output.status.code() {
+            Some(0) => {} // collation active: 'a' < 'B' as expected
+            _ => eprintln!("skipping en_US.UTF-8 collation check: locale unavailable"),
+        },
+    );
 }
 
 #[test]

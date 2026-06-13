@@ -1,3 +1,12 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
 //! Integration tests for the ed line editor.
 //!
 //! These tests verify the ed binary works correctly as a POSIX ed editor,

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2025 fox0
+// Copyright (c) 2025-2026 fox0
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE

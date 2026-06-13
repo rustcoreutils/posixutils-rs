@@ -146,6 +146,29 @@ impl Parser {
         }
     }
 
+    /// Close a partial-explicit block with the closer `name`, given the tokens
+    /// after it. A closer's arguments are text-only (they stop at the first
+    /// callable token, as pest's `text_arg` does); anything from that callable
+    /// onward is a sibling in the enclosing block, not a child of the closer.
+    fn close_with(&mut self, name: &str, after: &[String]) {
+        let (closer, opener_is) = closer_info(name).unwrap();
+        let mut j = 0;
+        while j < after.len() && !is_callable(&after[j]) {
+            j += 1;
+        }
+        let nodes: Vec<Element> = after[..j].iter().cloned().map(Element::Text).collect();
+        self.close_partial(
+            Element::Macro(MacroNode {
+                mdoc_macro: closer,
+                nodes,
+            }),
+            opener_is,
+        );
+        for el in parse_inline_seq(after[j..].to_vec()) {
+            self.push(el);
+        }
+    }
+
     /// Close the nearest `.Eo` enclosure, recording its closing delimiter.
     fn close_eo(&mut self, close: Option<char>) {
         while self.stack.len() > 1
@@ -456,21 +479,12 @@ impl Parser {
                     nodes: parse_inline_seq(head),
                 });
                 if let Some(i) = cut {
-                    let (closer, opener_is) = closer_info(&toks[i]).unwrap();
-                    let node = Element::Macro(MacroNode {
-                        mdoc_macro: closer,
-                        nodes: parse_inline_seq(toks[i + 1..].to_vec()),
-                    });
-                    self.close_partial(node, opener_is);
+                    self.close_with(&toks[i], &toks[i + 1..]);
                 }
             }
             _ if closer_info(name).is_some() => {
-                let (closer, opener_is) = closer_info(name).unwrap();
-                let node = Element::Macro(MacroNode {
-                    mdoc_macro: closer,
-                    nodes: parse_inline_seq(tokenize(rest)),
-                });
-                self.close_partial(node, opener_is);
+                let toks = tokenize(rest);
+                self.close_with(name, &toks);
             }
             _ if is_callable(name) => {
                 let mut tokens = vec![name.to_string()];

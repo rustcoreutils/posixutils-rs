@@ -3216,7 +3216,19 @@ impl MdocFormatter {
                         prev_was_open = false;
                     }
                 },
-                _ => unreachable!("macro can't contain macro node or EOI!"),
+                // Defensive: a nested macro is not expected here, but format its
+                // content rather than panicking — a renderer must be total.
+                Element::Macro(node) => {
+                    let inner = self.format_inline_macro(node);
+                    if !inner.is_empty() {
+                        if !is_first_node {
+                            result.push_str(self.formatting_state.spacing.as_str());
+                        }
+                        result.push_str(&inner);
+                    }
+                    prev_was_open = false;
+                }
+                Element::Eoi => {}
             }
 
             if is_first_node {
@@ -3548,7 +3560,19 @@ impl MdocFormatter {
                         prev_was_open = false;
                     }
                 },
-                _ => unreachable!("macro can't contain macro node or EOI!"),
+                // Defensive: a nested macro is not expected here, but format its
+                // content rather than panicking — a renderer must be total.
+                Element::Macro(node) => {
+                    let inner = self.format_inline_macro(node);
+                    if !inner.is_empty() {
+                        if !is_first_node {
+                            result.push_str(self.formatting_state.spacing.as_str());
+                        }
+                        result.push_str(&inner);
+                    }
+                    prev_was_open = false;
+                }
+                Element::Eoi => {}
             }
 
             if is_first_node {
@@ -3607,7 +3631,19 @@ impl MdocFormatter {
                                         prev_was_open = false;
                                     }
                                 },
-                                _ => unreachable!("macro can't contain macro node or EOI!"),
+                                // Defensive: a nested macro is not expected here, but format its
+                                // content rather than panicking — a renderer must be total.
+                                Element::Macro(node) => {
+                                    let inner = self.format_inline_macro(node);
+                                    if !inner.is_empty() {
+                                        if !is_first_node {
+                                            result.push_str(self.formatting_state.spacing.as_str());
+                                        }
+                                        result.push_str(&inner);
+                                    }
+                                    prev_was_open = false;
+                                }
+                                Element::Eoi => {}
                             }
 
                             if is_first_node {

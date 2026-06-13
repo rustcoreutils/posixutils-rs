@@ -411,11 +411,46 @@ impl<R: Read> PoParser<R> {
                         Some('r') => result.push('\r'),
                         Some('\\') => result.push('\\'),
                         Some('"') => result.push('"'),
-                        Some('0') => result.push('\0'),
+                        Some('a') => result.push('\u{07}'),
+                        Some('b') => result.push('\u{08}'),
+                        Some('f') => result.push('\u{0C}'),
+                        Some('v') => result.push('\u{0B}'),
+                        // Octal escape: \o, \oo, or \ooo (this digit included).
+                        Some(d @ '0'..='7') => {
+                            let mut value = d.to_digit(8).unwrap();
+                            for _ in 0..2 {
+                                match chars.peek() {
+                                    Some(&c) if c.is_digit(8) => {
+                                        value = value * 8 + c.to_digit(8).unwrap();
+                                        chars.next();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            result.push(char::from(value as u8));
+                        }
+                        // Hex escape: \xh or \xhh.
+                        Some('x') => {
+                            let mut value: u32 = 0;
+                            let mut digits = 0;
+                            while digits < 2 {
+                                match chars.peek() {
+                                    Some(&c) if c.is_ascii_hexdigit() => {
+                                        value = value * 16 + c.to_digit(16).unwrap();
+                                        chars.next();
+                                        digits += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if digits == 0 {
+                                return Err(PoError::InvalidEscape(self.line_number, 'x'));
+                            }
+                            result.push(char::from(value as u8));
+                        }
                         Some(c) => {
-                            // Unknown escape - keep as-is
-                            result.push('\\');
-                            result.push(c);
+                            // Unknown escape sequence is an error.
+                            return Err(PoError::InvalidEscape(self.line_number, c));
                         }
                     }
                 }
@@ -458,7 +493,8 @@ impl PoFile {
         parser.parse()
     }
 
-    /// Get the charset from the header
+    /// Get the charset from the header, accepting both the `Content-Type:
+    /// ...; charset=...` form and the bare `charset=...` header line.
     pub fn charset(&self) -> Option<&str> {
         self.header.as_ref().and_then(|h| {
             h.msgstr.first().and_then(|s| {
@@ -469,6 +505,8 @@ impl PoFile {
                                 return Some(charset.trim());
                             }
                         }
+                    } else if let Some(charset) = line.trim().strip_prefix("charset=") {
+                        return Some(charset.trim());
                     }
                 }
                 None
@@ -623,6 +661,33 @@ msgstr "Adios"
         let bye = po.entries.iter().find(|e| e.msgid == "Bye").unwrap();
         assert_eq!(hello.domain, None);
         assert_eq!(bye.domain, Some("other".to_string()));
+    }
+
+    #[test]
+    fn test_escape_octal_hex_and_control() {
+        // \a \b \f \v controls, \101 octal ('A'), \x42 hex ('B').
+        let input = "msgid \"x\"\nmsgstr \"\\a\\b\\f\\v\\101\\x42\"\n";
+        let po = PoFile::parse(input).unwrap();
+        assert_eq!(
+            po.entries[0].msgstr[0],
+            "\u{07}\u{08}\u{0C}\u{0B}AB".to_string()
+        );
+    }
+
+    #[test]
+    fn test_unknown_escape_is_error() {
+        let input = "msgid \"x\"\nmsgstr \"a\\qb\"\n";
+        assert!(matches!(
+            PoFile::parse(input),
+            Err(PoError::InvalidEscape(_, 'q'))
+        ));
+    }
+
+    #[test]
+    fn test_bare_charset_header() {
+        let input = "msgid \"\"\nmsgstr \"\"\n\"charset=UTF-8\\n\"\n";
+        let po = PoFile::parse(input).unwrap();
+        assert_eq!(po.charset(), Some("UTF-8"));
     }
 
     #[test]

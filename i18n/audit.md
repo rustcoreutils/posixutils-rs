@@ -338,40 +338,40 @@ Single-domain `.po` → `.mo` compilation, multi-line string concatenation, fuzz
 
 ### Critical
 - [x] **MF-1 — `domain` directives ignored → wrong output files.** ✓ fixed (Phase 7): the parser now recognizes `domain domainname` directives, tags each `PoEntry` with its domain (default `None` = `messages`), and msgfmt accumulates messages per domain. Without `-o`, one messages object file is written per domain, named after the domain; with `-o`, all domains are merged into the single named file (directives ignored, per spec). Verified: a `.po` with `domain "other"` now yields `messages`+`other` (or `messages.mo`+`other.mo` with `-S`). Spec: each domain section → `domainname.mo`. Fix: accumulate per-domain and write per-domain.
-- [ ] **MF-2 — `-c`/`-v` checks never affect exit status.** `validate_entry` emits every diagnostic with `is_error: false` (`msgfmt.rs:238-300`), so `has_errors` stays false and exit stays 0. Spec: "If an abnormality is detected, the exit status shall be non-zero." Fix: set `is_error: true` for genuine abnormalities.
+- [x] **MF-2 — `-c`/`-v` checks never affect exit status.** ✓ fixed (Phase 8): genuine abnormalities (boundary-newline and c-format mismatches) are now recorded with `is_error: true`, so `has_errors` is set and the process exits 1. Spec: "If an abnormality is detected, the exit status shall be non-zero."
 
 ### Major
 - [x] **MF-3 — `-S` is dead code.** ✓ fixed (Phase 7): the buggy `set_extension`-then-guard logic is gone. Output naming is now domain-based; `apply_suffix` appends `.mo` only when `-S` is set and the name does not already end in `.mo`. Without `-S` the bare domain name is used (POSIX leaves this implementation-defined), so `-S` has an observable effect. It also applies to the `-o` filename. Output naming is input-filename-based, not domain-based (see MF-1).
-- [ ] **MF-4 — `-c` runs without `-v`.** Spec ties the checks to `-c -v` (behavior unspecified for `-c` alone); `validate_entry` is gated on `args.check` only (`msgfmt.rs:152`).
-- [ ] **MF-5 — Newline check is wrong.** Spec: abnormal if one string *starts or ends* with `\n` while the other doesn't. The impl compares *total* newline counts (`msgfmt.rs:246-249`), flagging internal newlines and missing the boundary case.
-- [ ] **MF-6 — Missing C escapes in the `.po` parser.** `\a`, `\b`, `\f`, `\v`, `\ooo` octal, `\xhh` hex are unhandled (`po_file.rs:362-380`); unknown escapes are passed through verbatim instead of erroring.
-- [ ] **MF-7 — Header `charset` only read from `Content-Type:`** (`po_file.rs:421-436`); the spec's bare `charset=utf-8` header form is not recognized.
-- [ ] **MF-8 — `no-c-format` flag ignored** (`msgfmt.rs:269`); the "last flag wins" rule between `c-format`/`no-c-format` is not implemented.
+- [x] **MF-4 — `-c` runs without `-v`.** ✓ fixed (Phase 8): the abnormality checks run only when both `-c` and `-v` are given (`run_checks = args.check && args.verbose`); with just one the behavior is a no-op, per spec.
+- [x] **MF-5 — Newline check is wrong.** ✓ fixed (Phase 8): `boundary_newline_mismatch` flags an abnormality only when exactly one of the strings starts with `\n`, or exactly one ends with `\n` — not on internal-newline count differences.
+- [x] **MF-6 — Missing C escapes in the `.po` parser.** ✓ fixed (Phase 8): `\a`, `\b`, `\f`, `\v`, `\ooo` octal, and `\xhh` hex are decoded; an unknown escape is now a parse error (`InvalidEscape`) instead of being passed through.
+- [x] **MF-7 — Header `charset` only read from `Content-Type:`.** ✓ fixed (Phase 8): `charset()` also recognizes the bare `charset=...` header line.
+- [x] **MF-8 — `no-c-format` flag ignored.** ✓ fixed (Phase 8): `is_c_format` implements the last-flag-wins rule between `c-format` and `no-c-format`.
 
 ### Minor
-- [ ] **MF-9 — c-format check is count-only** — doesn't verify argument *types* differ (spec) (`msgfmt.rs:302-330`).
-- [ ] **MF-10 — `truncate` slices bytes** (`&s[..max_len]`, `msgfmt.rs:334`) — panics on a multibyte boundary in diagnostics.
-- [ ] **MF-11 — `-v` alone prints no statistics** (GNU prints translated/untranslated/fuzzy counts).
-- [ ] **MF-12 — zero operands → clap error**, not a POSIX-idiomatic usage diagnostic (`files` is `required`, `msgfmt.rs:58`).
+- [x] **MF-9 — c-format check is count-only.** ✓ fixed (Phase 8): `format_signatures` compares the ordered list of conversion specifiers by length-modifier + argument-type class, so it catches both a differing count and differing types (`%s` vs `%d`) while treating equivalents (`%d`/`%i`) as the same.
+- [x] **MF-10 — `truncate` slices bytes.** ✓ fixed (Phase 8): `truncate` now counts and takes `chars`, so it never splits a multibyte boundary.
+- [x] **MF-11 — `-v` alone prints no statistics.** ✓ fixed (Phase 8): `-v` prints `N translated messages[, M fuzzy translations][, K untranslated messages].`
+- [x] **MF-12 — zero operands → clap error.** ✓ fixed (Phase 8): `files` is no longer `required`; with no operand msgfmt prints `msgfmt: no input file given` and exits 1.
 
 ## Conformance matrix
 
 ### Options / Operands
 - [x] `-f` (fuzzy skip), `-D` (dir search) CONFORMS (`msgfmt.rs:37-47`, `:203-217`).
-- [x] **`-S` CONFORMS** (MF-3, Phase 7); **`-o` CONFORMS** (MF-1, Phase 7 — merges domains into one file). **`-c`/`-v` PARTIAL** (MF-2/MF-4, Phase 8).
+- [x] **`-S` CONFORMS** (MF-3, Phase 7); **`-o` CONFORMS** (MF-1, Phase 7 — merges domains into one file). **`-c`/`-v` CONFORMS** (MF-2/MF-4, Phase 8 — checks gated on `-c -v`, abnormalities set exit status).
 - [x] `pathname...` multiple operands CONFORMS (`msgfmt.rs:102`); STDIN "Not used" (no `-` form) consistent with spec.
 
 ### Input files (.po grammar)
 - [x] `msgid`/`msgstr`/`msgid_plural`/`msgstr[n]`, multi-line concatenation, `#:`/`#.`/`#,`/`#` comments, fuzzy flag CONFORMS (`po_file.rs:232-336`).
-- [x] **`domain` CONFORMS** (MF-1, Phase 7); **C escapes PARTIAL** (MF-6, Phase 8); **header charset PARTIAL** (MF-7, Phase 8); **`no-c-format` MISSING** (MF-8, Phase 8). `#~` obsolete handling partial.
+- [x] **`domain` CONFORMS** (MF-1, Phase 7); **C escapes CONFORMS** (MF-6, Phase 8); **header charset CONFORMS** (MF-7, Phase 8); **`no-c-format` CONFORMS** (MF-8, Phase 8). `#~` obsolete handling partial.
 
 ### Env / stdout / stderr / output files / exit
 - [ ] **`LC_CTYPE` PARTIAL** (input assumed UTF-8); `NLSPATH`/`LANGUAGE` N/A for the compiler.
 - [x] STDOUT not used / STDERR diagnostics CONFORMS; `.mo` binary format N/A (unspecified).
-- [x] **default output naming CONFORMS** (MF-1/MF-3, Phase 7 — per-domain `domainname[.mo]`); **exit status PARTIAL** (MF-2, Phase 8).
+- [x] **default output naming CONFORMS** (MF-1/MF-3, Phase 7 — per-domain `domainname[.mo]`); **exit status CONFORMS** (MF-2, Phase 8).
 
 ## Test coverage — not covered
-- [ ] Multi-domain `.po` → multiple `.mo` (would have caught MF-1); `-c -v` exit status; `-S` suffix; `\xhh`/`\ooo` escapes; bare `charset=` header.
+- [x] Multi-domain `.po`; `-c -v` exit status; `-c`-without-`-v` no-op; `\xhh`/`\ooo`/control escapes + unknown-escape error; bare `charset=` header; zero-operand diagnostic — now covered by added msgfmt integration tests and po_file unit tests (Phases 7–8).
 
 ---
 

@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::Output;
 use tempfile::TempDir;
 
 /// Create a temporary .po file for testing
@@ -212,6 +213,88 @@ msgstr "Adios"
         data.windows(needle_adios.len()).any(|w| w == needle_adios),
         "merged .mo should contain the 'other'-domain translation (domain not dropped)"
     );
+}
+
+/// MF-2/MF-9: with `-c -v`, a c-format argument-type mismatch is an abnormality
+/// and yields a non-zero exit status.
+#[test]
+fn test_msgfmt_cformat_mismatch_fails() {
+    let po_content = r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#, c-format
+msgid "Hello %s"
+msgstr "Hola %d"
+"#;
+    let (temp_dir, po_path) = create_temp_po_file(po_content);
+    let mo_path = temp_dir.path().join("bad.mo");
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("msgfmt"),
+            args: vec![
+                String::from("-c"),
+                String::from("-v"),
+                String::from("-o"),
+                mo_path.to_str().unwrap().to_string(),
+                po_path.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_plan, output: &Output| {
+            assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("format specifications"), "{stderr:?}");
+        },
+    );
+}
+
+/// MF-4: `-c` without `-v` runs no abnormality checks, so the same input that
+/// fails under `-c -v` compiles successfully (exit 0).
+#[test]
+fn test_msgfmt_check_without_verbose_is_noop() {
+    let po_content = r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#, c-format
+msgid "Hello %s"
+msgstr "Hola %d"
+"#;
+    let (temp_dir, po_path) = create_temp_po_file(po_content);
+    let mo_path = temp_dir.path().join("ok.mo");
+    run_test(TestPlan {
+        cmd: String::from("msgfmt"),
+        args: vec![
+            String::from("-c"),
+            String::from("-o"),
+            mo_path.to_str().unwrap().to_string(),
+            po_path.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+/// MF-12: with no input file operand, msgfmt prints a usage diagnostic and
+/// exits non-zero.
+#[test]
+fn test_msgfmt_no_input_file() {
+    run_test(TestPlan {
+        cmd: String::from("msgfmt"),
+        args: vec![],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::from("msgfmt: no input file given\n"),
+        expected_exit_code: 1,
+    });
 }
 
 /// Test msgfmt with empty .po file

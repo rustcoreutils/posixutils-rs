@@ -169,20 +169,13 @@ fn eval_terminal(s: &str) -> bool {
     unsafe { BorrowedFd::borrow_raw(fd).is_terminal() }
 }
 
-fn eval_unary(op_str: &str, s: &str) -> bool {
-    let op = match parse_unary_op(op_str) {
-        Some(p) => p,
-        None => {
-            eprintln!("{}: {}", gettext("unknown operator"), op_str);
-            return false;
-        }
-    };
-    if want_metadata(&op) {
-        eval_unary_path(&op, s)
-    } else if op == UnaryOp::Terminal {
+fn eval_unary(op: &UnaryOp, s: &str) -> bool {
+    if want_metadata(op) {
+        eval_unary_path(op, s)
+    } else if *op == UnaryOp::Terminal {
         eval_terminal(s)
     } else {
-        eval_unary_str(&op, s)
+        eval_unary_str(op, s)
     }
 }
 
@@ -472,9 +465,9 @@ impl<'a> ExprParser<'a> {
         };
 
         // Check for unary operators
-        if parse_unary_op(&first).is_some() {
+        if let Some(unary_op) = parse_unary_op(&first) {
             if let Some(operand) = self.advance() {
-                return if eval_unary(&first, operand) {
+                return if eval_unary(&unary_op, operand) {
                     EvalResult::True
                 } else {
                     EvalResult::False
@@ -505,6 +498,25 @@ impl<'a> ExprParser<'a> {
     }
 }
 
+/// Evaluate an expression using the extended grammar (`!`, `-a`, `-o`, and
+/// `(` `)` grouping). POSIX.1-2024 removed `-a`, `-o`, `(`, and `)` and leaves
+/// such expressions unspecified, so this is a compatibility extension for
+/// historical scripts. It is the fallback for the 3- and 4-argument forms the
+/// count-based algorithm does not assign a meaning, and handles all
+/// expressions with more than four arguments. (audit #2)
+fn eval_with_parser(args: &[String]) -> EvalResult {
+    let mut parser = ExprParser::new(args);
+    let result = parser.parse_or();
+    if parser.remaining() > 0 {
+        return EvalResult::Error(format!(
+            "{}: {}",
+            gettext("unexpected argument"),
+            parser.peek().unwrap_or("")
+        ));
+    }
+    result
+}
+
 /// Evaluate with POSIX-mandated rules for 0-4 arguments
 fn eval_posix_strict(args: &[String]) -> EvalResult {
     match args.len() {
@@ -525,8 +537,8 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
                 } else {
                     EvalResult::True
                 }
-            } else if parse_unary_op(&args[0]).is_some() {
-                if eval_unary(&args[0], &args[1]) {
+            } else if let Some(op) = parse_unary_op(&args[0]) {
+                if eval_unary(&op, &args[1]) {
                     EvalResult::True
                 } else {
                     EvalResult::False
@@ -557,7 +569,9 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
                     return EvalResult::False;
                 }
             }
-            EvalResult::Error(gettext("syntax error").to_string())
+            // Otherwise unspecified by POSIX: fall back to the extended grammar
+            // so legacy forms like `test x -a y` still evaluate. (audit #2)
+            eval_with_parser(args)
         }
 
         4 => {
@@ -569,22 +583,12 @@ fn eval_posix_strict(args: &[String]) -> EvalResult {
             if args[0] == "(" && args[3] == ")" {
                 return eval_posix_strict(&args[1..3]);
             }
-            EvalResult::Error(gettext("syntax error").to_string())
+            // Otherwise unspecified by POSIX: fall back to the extended grammar. (audit #2)
+            eval_with_parser(args)
         }
 
-        _ => {
-            // >4 arguments: use XSI expression parser
-            let mut parser = ExprParser::new(args);
-            let result = parser.parse_or();
-            if parser.remaining() > 0 {
-                return EvalResult::Error(format!(
-                    "{}: {}",
-                    gettext("unexpected argument"),
-                    parser.peek().unwrap_or("")
-                ));
-            }
-            result
-        }
+        // >4 arguments: extended grammar (also unspecified by POSIX).
+        _ => eval_with_parser(args),
     }
 }
 

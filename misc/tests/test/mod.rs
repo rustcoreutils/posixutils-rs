@@ -334,6 +334,43 @@ fn test_xsi_not_combinations() {
     test_test(&["!", "-d", "/tmp", "-o", "-d", "/"], 0);
 }
 
+/// The legacy `-a`/`-o` operators are accepted uniformly, including the
+/// 3-argument forms (`test x -a y`) that the count-based algorithm leaves
+/// unspecified -- not only inside >4-argument expressions. (audit #2)
+#[test]
+fn test_legacy_operators_uniform() {
+    // 3-argument -a / -o (string operands).
+    test_test(&["x", "-a", "y"], 0); // true AND true
+    test_test(&["x", "-a", ""], 1); // true AND false
+    test_test(&["", "-a", "y"], 1); // false AND true
+    test_test(&["", "-o", "y"], 0); // false OR true
+    test_test(&["x", "-o", ""], 0); // true OR false
+    test_test(&["", "-o", ""], 1); // false OR false
+
+    // 3-argument -a / -o with unary primaries.
+    test_test(&["-d", "/tmp", "-o", ""], 0);
+
+    // Genuinely malformed expressions still error (exit 2).
+    test_test_with_err(&["a", "b", "c"], 2);
+    test_test_with_err(&["(", "a"], 2);
+}
+
+/// Precedence and grouping in the extended (>4-argument) grammar: `-a` binds
+/// tighter than `-o`, `!` binds tightest, and `(`/`)` regroup. (audit, PR D)
+#[test]
+fn test_expr_precedence() {
+    // -z '' (true) -o (-n '' (false) -a -n '' (false)) => true OR false => true
+    test_test(&["-z", "", "-o", "-n", "", "-a", "-n", ""], 0);
+    // (! -n '' (true)) -a -n x (true) => true
+    test_test(&["!", "-n", "", "-a", "-n", "x"], 0);
+    // Parentheses override -a/-o precedence: ( '' -o x ) -a x => true
+    test_test(&["(", "", "-o", "x", ")", "-a", "x"], 0);
+    // ( x -a '' ) -o x => false OR true => true
+    test_test(&["(", "x", "-a", "", ")", "-o", "x"], 0);
+    // x -a '' -o '' => (true AND false) OR false => false
+    test_test(&["x", "-a", "", "-o", ""], 1);
+}
+
 // ============================================================================
 // Integer error handling
 // ============================================================================

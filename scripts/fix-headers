@@ -58,8 +58,18 @@ COPYRIGHT_RE = re.compile(
 #     original project source.
 #   * find's rust_file.rs is test-data whose byte size the find `-size` tests
 #     depend on; adding a header would change its size and break them.
+#   * the xgettext test_*.rs files are extractor input fixtures whose source
+#     line numbers are baked into the expected .pot golden files; a header
+#     would shift every line and break the comparisons.
 EXCLUDE_PREFIXES = ("gettext-rs/",)
-EXCLUDE_EXACT = {"file/tests/find/other/rust_file.rs"}
+EXCLUDE_EXACT = {
+    "file/tests/find/other/rust_file.rs",
+    "i18n/tests/xgettext/test_clap.rs",
+    "i18n/tests/xgettext/test_gettext.rs",
+    "i18n/tests/xgettext/test_ngettext.rs",
+    "i18n/tests/xgettext/test_npgettext.rs",
+    "i18n/tests/xgettext/test_pgettext.rs",
+}
 
 
 def git_files():

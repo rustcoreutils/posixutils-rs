@@ -53,9 +53,11 @@ impl LocaleCategory {
         }
     }
 
-    /// Parse a category name
+    /// Parse a category name. POSIX category names are spelled in upper case;
+    /// matching is exact-case so that, e.g., a lowercase `lc_numeric` is treated
+    /// as a (possibly keyword) name rather than a category.
     pub fn from_name(name: &str) -> Option<LocaleCategory> {
-        match name.to_uppercase().as_str() {
+        match name {
             "LC_CTYPE" => Some(LocaleCategory::LcCtype),
             "LC_COLLATE" => Some(LocaleCategory::LcCollate),
             "LC_MONETARY" => Some(LocaleCategory::LcMonetary),

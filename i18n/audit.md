@@ -236,20 +236,20 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 ### Major
 - [x] **LO-3 — Error paths exit 0.** ✓ fixed (Phase 5): an unknown name is diagnosed (`locale: unknown name "X"`) and `main` exits 1; the `charmap` operand is now handled (LO-4). **✓ verified:** `locale charmap` → `locale: unknown keyword: charmap`, **`exit 0`**; `locale frac_digits` → `unknown keyword`. Spec: `>0` on error. `locale.rs:183-188`.
 - [x] **LO-4 — Reserved `charmap` / `code_set_name` operand unhandled.** ✓ fixed (Phase 5): a `charmap` operand prints `nl_langinfo(CODESET)` (value, or `charmap="..."` with `-k`). Fix: add a `charmap` arm via `nl_langinfo(CODESET)`.
-- [ ] **LO-5 — Numeric keywords double-quoted.** Spec: numeric keyword → `%s=%d` (unquoted). All keywords use `%s="%s"` (`locale.rs:204-206`). **✓ verified:** `locale -k grouping` → `grouping="-1"` (quoted, and the `-1` is a CHAR_MAX-sentinel bug, see LO-8).
-- [ ] **LO-6 — ~30 required keywords missing from dispatch.** `LC_MONETARY` exposes only 3 of ~24 (missing `mon_thousands_sep`, `mon_grouping`, `positive_sign`, `negative_sign`, `int_frac_digits`, `frac_digits`, `p_cs_precedes`, `p_sep_by_space`, `n_cs_precedes`, `n_sep_by_space`, `p_sign_posn`, `n_sign_posn`, and the `int_*` POSIX.1-2008 set); `LC_TIME` missing `abday`/`day`/`abmon`/`mon`/`am_pm`/`t_fmt_ampm`. **✓ verified:** `locale -k frac_digits` → `unknown keyword`. `types.rs` defines the keyword arrays but the query path never consults them.
-- [ ] **LO-7 — `-a`/`-m` not mutually exclusive** and not exclusive with the `[-ck] name…` form; `-a` silently wins (`locale.rs:32-37`). Add clap `conflicts_with`.
+- [x] **LO-5 — Numeric keywords double-quoted.** ✓ fixed (Phase 6): keyword values now carry a `KwVal` kind (`Str`/`List`/`Num`); numeric keywords render as `%s=%d` (unquoted), strings/lists as `%s="%s"`. `locale -k grouping`→`grouping=-1`. Spec: numeric keyword → `%s=%d` (unquoted).
+- [x] **LO-6 — ~30 required keywords missing from dispatch.** ✓ fixed (Phase 6): all 21 POSIX `LC_MONETARY` keywords (incl. the `int_*` set) are read from `localeconv`, and `LC_TIME` `abday`/`day`/`abmon`/`mon`/`am_pm`/`t_fmt_ampm` from `nl_langinfo`. Verified byte-for-byte against glibc for the C and en_US.UTF-8 locales. `types.rs` defines the keyword arrays but the query path never consults them.
+- [x] **LO-7 — `-a`/`-m` not mutually exclusive.** ✓ fixed (Phase 6): clap `conflicts_with_all` makes `-a` exclusive with `-m`/`-c`/`-k`/names, and `-m` exclusive with `-c`/`-k`/names (exit 2 on conflict).
 
 ### Minor
-- [ ] **LO-8 — `grouping` CHAR_MAX sentinel uses `< 127`** instead of `== CHAR_MAX` (`locale.rs:245`), surfacing `-1` (see LO-5).
-- [ ] **LO-9 — No escaping** of `;`, `\`, `"`, control chars in `-k` compound values (`locale.rs:204-206`).
-- [ ] **LO-10 — `-a` self-delegates** to the system `locale -a` when a `locale-archive` exists (`platform.rs:88-99`); non-Linux `-m` returns a fabricated list (`platform.rs:127-131`).
-- [ ] **LO-11 — `from_name` is case-insensitive** for category names (`types.rs:58`); spec expects exact case (harmless superset).
+- [x] **LO-8 — `grouping` CHAR_MAX sentinel uses `< 127`.** ✓ fixed (Phase 6): the sentinel is compared against `libc::c_char::MAX` (correct on both signed- and unsigned-char platforms) in `char_num`/`grouping_str`, rendering "unspecified" as `-1`.
+- [x] **LO-9 — No escaping** of `;`, `\`, `"`, control chars in `-k` compound values. ✓ fixed (Phase 6): `escape_value` escapes them; for compound (`List`) values each element is escaped independently so the `;` separators are preserved. Unit-tested.
+- [x] **LO-10 — `-a` self-delegates** to the system `locale -a` when a `locale-archive` exists; non-Linux `-m` returns a fabricated list. ✓ addressed (Phase 6): the archive enumeration now invokes the system `locale` via an absolute path (`/usr/bin/locale`, `/bin/locale`), never a `$PATH` lookup, so it can never recurse into our own binary. (Parsing the locale-archive binary directly remains out of scope; the non-Linux `-m` fallback list is retained as a last resort.)
+- [x] **LO-11 — `from_name` is case-insensitive** for category names. ✓ fixed (Phase 6): `from_name` now matches exact (upper) case, so a lowercase `lc_numeric` is treated as a (keyword) name, not a category.
 
 ## Conformance matrix
 
 ### Options / Operands
-- [ ] **`-a`/`-m` PARTIAL** (LO-7); **`-c`/`-k` PARTIAL** (LO-5).
+- [x] **`-a`/`-m` CONFORMS** (LO-7, Phase 6 — mutually exclusive); **`-c`/`-k` CONFORMS** (LO-5, Phase 6 — numeric unquoted).
 - [x] No-operand default output (LANG/LC_*/LC_ALL with correct implied-vs-set quoting) CONFORMS (`locale.rs:105-124`, `env.rs:83-106`).
 - [x] **category operand CONFORMS** (LO-2, Phase 5); **`charmap` operand CONFORMS** (LO-4, Phase 5).
 
@@ -258,15 +258,15 @@ The no-operand default output, the `LC_ALL > LC_* > LANG` precedence, and `local
 
 ### Output format
 - [x] `-c` category header, no-`-k` value-only format CONFORMS (`locale.rs:93-95`, `:198-200`).
-- [ ] **`-k` numeric quoting / escaping DIVERGES** (LO-5/LO-9).
+- [x] **`-k` numeric quoting / escaping CONFORMS** (LO-5/LO-9, Phase 6).
 
 ### Keyword coverage / exit status
 - [x] `decimal_point`, `thousands_sep`, `currency_symbol`, `int_curr_symbol`, `mon_decimal_point` CONFORMS (via `localeconv()`).
-- [x] **LC_TIME/LC_MESSAGES now live** (LO-1, Phase 5 via nl_langinfo); **~30 keywords MISSING** (LO-6, Phase 6).
+- [x] **LC_TIME/LC_MESSAGES now live** (LO-1, Phase 5 via nl_langinfo); **full POSIX LC_MONETARY + LC_TIME keyword set** (LO-6, Phase 6).
 - [x] **error exit status CONFORMS** (LO-3, Phase 5) — unknown name exits 1.
 
 ## Test coverage — not covered
-- [ ] `charmap` operand; error exit code; hardcoded-vs-live `LC_TIME`/`LC_MESSAGES`; full `LC_MONETARY` keyword set; numeric-keyword quoting.
+- [x] `charmap` operand; error exit code; live `LC_TIME`; full `LC_MONETARY` keyword set; numeric-keyword quoting; `-k` escaping — now covered by added integration tests (LC_ALL=C) and `escape_value`/`KwVal` unit tests (Phases 5–6).
 
 ---
 

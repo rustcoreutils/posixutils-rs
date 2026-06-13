@@ -225,6 +225,50 @@ fn test_locale_charmap_operand() {
     );
 }
 
+/// LO-5/LO-6: numeric monetary keywords are exposed and printed unquoted
+/// (`name=N`), with the CHAR_MAX sentinel shown as `-1` in the C locale.
+#[test]
+fn test_locale_numeric_keyword_unquoted() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("locale"),
+            args: vec![String::from("-k"), String::from("frac_digits")],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", "C")],
+        |_plan, output: &Output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Unquoted numeric form, not frac_digits="-1".
+            assert_eq!(stdout.trim_end(), "frac_digits=-1", "{stdout:?}");
+        },
+    );
+}
+
+/// LO-6: a previously-missing keyword (e.g. `mon_grouping`) is now recognized
+/// rather than reported as unknown.
+#[test]
+fn test_locale_added_monetary_keyword_recognized() {
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("locale"),
+            args: vec![String::from("-k"), String::from("mon_grouping")],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", "C")],
+        |_plan, output: &Output| {
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.trim_end(), "mon_grouping=-1", "{stdout:?}");
+        },
+    );
+}
+
 /// LO-1: `LC_TIME` keywords reflect the active locale via nl_langinfo. In the C
 /// locale `d_fmt` is `%m/%d/%y`.
 #[test]

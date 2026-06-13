@@ -78,22 +78,31 @@ pub fn list_available_locales() -> Vec<String> {
             }
         }
 
-        // On Linux, also check for locale-archive
+        // On Linux, also enumerate the compiled locales packed into
+        // locale-archive. Parsing the archive binary directly is out of scope,
+        // so the system `locale -a` is consulted — but only via a known
+        // absolute path, never a $PATH lookup, so this never recurses into our
+        // own binary if it happens to be installed as `locale`.
         #[cfg(target_os = "linux")]
         {
             let archive_path = base_path.join("locale-archive");
             if archive_path.exists() {
-                // The locale-archive contains many locales; we'd need to parse it
-                // For now, try to get locales from the system
-                if let Ok(output) = std::process::Command::new("locale").arg("-a").output() {
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        for line in stdout.lines() {
-                            let line = line.trim();
-                            if !line.is_empty() {
-                                locales.insert(line.to_string());
+                for system_locale in ["/usr/bin/locale", "/bin/locale"] {
+                    if !std::path::Path::new(system_locale).exists() {
+                        continue;
+                    }
+                    if let Ok(output) = std::process::Command::new(system_locale).arg("-a").output()
+                    {
+                        if output.status.success() {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            for line in stdout.lines() {
+                                let line = line.trim();
+                                if !line.is_empty() {
+                                    locales.insert(line.to_string());
+                                }
                             }
                         }
+                        break;
                     }
                 }
             }

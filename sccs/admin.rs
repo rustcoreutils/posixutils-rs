@@ -70,17 +70,27 @@ fn get_username() -> String {
     plib::sccsfile::real_login_name()
 }
 
-fn read_input_file(path: Option<&str>) -> io::Result<Vec<String>> {
-    let reader: Box<dyn BufRead> = match path {
+fn read_input_file(path: Option<&str>) -> io::Result<Vec<u8>> {
+    let mut reader: Box<dyn BufRead> = match path {
         Some(p) => Box::new(BufReader::new(File::open(p)?)),
         None => Box::new(BufReader::new(io::stdin())),
     };
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+    Ok(data)
+}
 
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        lines.push(line?);
+/// Whether the initial content must be uuencoded (the `e` flag): non-empty
+/// input that is binary (invalid UTF-8 or contains NUL/SOH, which would corrupt
+/// the s-file format) or lacks a trailing newline — matching CSSC's trigger.
+fn content_needs_encoding(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
     }
-    Ok(lines)
+    if !data.ends_with(b"\n") {
+        return true;
+    }
+    std::str::from_utf8(data).is_err() || data.iter().any(|&b| b == 0x00 || b == 0x01)
 }
 
 fn read_desc_text(path: Option<&str>) -> io::Result<Vec<String>> {
@@ -114,11 +124,11 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
 
 fn create_new_sccs_file(
     path: &Path,
-    content_lines: Vec<String>,
+    content: Vec<u8>,
     initial_sid: Option<&str>,
     comment: Option<&str>,
     desc_text: Vec<String>,
-    flags: Vec<SccsFlag>,
+    mut flags: Vec<SccsFlag>,
     users: Vec<String>,
 ) -> io::Result<()> {
     // Determine initial SID
@@ -149,8 +159,27 @@ fn create_new_sccs_file(
         ),
     };
 
-    // Calculate stats
-    let line_count = content_lines.len() as u32;
+    // Decide whether to store the body uuencoded (binary / no trailing newline).
+    let encoded = content_needs_encoding(&content);
+    let body_lines: Vec<String> = if encoded {
+        flags.push(SccsFlag::Encoded(1));
+        plib::sccsfile::uuencode_sccs(&content)
+    } else {
+        // Plain text: split into lines (drops the trailing newline, no final
+        // empty element), matching historical line-oriented storage.
+        String::from_utf8_lossy(&content)
+            .lines()
+            .map(String::from)
+            .collect()
+    };
+
+    // Calculate stats. For an encoded body the inserted count is the number of
+    // uuencode data lines (excluding the count-0 terminator line).
+    let line_count = if encoded {
+        body_lines.len().saturating_sub(1) as u32
+    } else {
+        body_lines.len() as u32
+    };
     let stats = DeltaStats::new(line_count, 0, 0);
 
     // Create delta entry
@@ -172,7 +201,7 @@ fn create_new_sccs_file(
     // Create body with insert block
     let mut body = Vec::new();
     body.push(BodyRecord::Insert(1));
-    for line in content_lines {
+    for line in body_lines {
         body.push(BodyRecord::Text(line));
     }
     body.push(BodyRecord::End(1));

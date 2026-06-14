@@ -370,6 +370,79 @@ pub fn real_login_name() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Decode an SCCS-uuencoded body back to raw bytes. `lines` are the body text
+/// records (of the applied set) in order; decoding uses the historical
+/// `uuencode` mapping (6-bit value `v` encoded as `v + 0x20`, space for zero),
+/// and a count-0 line terminates the stream.
+pub fn uudecode_sccs(lines: &[String]) -> Vec<u8> {
+    fn dec(c: u8) -> u8 {
+        c.wrapping_sub(0x20) & 0x3f
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let b = line.as_bytes();
+        if b.is_empty() {
+            continue;
+        }
+        let count = dec(b[0]) as usize;
+        if count == 0 {
+            break; // terminator line
+        }
+        let data = &b[1..];
+        let mut produced = 0;
+        let mut i = 0;
+        while produced < count {
+            let c0 = dec(*data.get(i).unwrap_or(&0x20));
+            let c1 = dec(*data.get(i + 1).unwrap_or(&0x20));
+            let c2 = dec(*data.get(i + 2).unwrap_or(&0x20));
+            let c3 = dec(*data.get(i + 3).unwrap_or(&0x20));
+            if produced < count {
+                out.push((c0 << 2) | (c1 >> 4));
+                produced += 1;
+            }
+            if produced < count {
+                out.push((c1 << 4) | (c2 >> 2));
+                produced += 1;
+            }
+            if produced < count {
+                out.push((c2 << 6) | c3);
+                produced += 1;
+            }
+            i += 4;
+            if i >= data.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Encode raw bytes into SCCS-uuencoded body text lines (45 bytes per line),
+/// terminated by a count-0 line, matching historical SCCS / CSSC output.
+pub fn uuencode_sccs(data: &[u8]) -> Vec<String> {
+    fn enc(v: u8) -> u8 {
+        (v & 0x3f) + 0x20
+    }
+    let mut lines = Vec::new();
+    for chunk in data.chunks(45) {
+        let mut line = Vec::with_capacity(1 + chunk.len().div_ceil(3) * 4);
+        line.push(enc(chunk.len() as u8));
+        for grp in chunk.chunks(3) {
+            let b0 = grp[0];
+            let b1 = *grp.get(1).unwrap_or(&0);
+            let b2 = *grp.get(2).unwrap_or(&0);
+            line.push(enc(b0 >> 2));
+            line.push(enc((b0 << 4) | (b1 >> 4)));
+            line.push(enc((b1 << 2) | (b2 >> 6)));
+            line.push(enc(b2));
+        }
+        // Bytes are all in 0x20..=0x5f, so this is always valid UTF-8.
+        lines.push(String::from_utf8(line).unwrap());
+    }
+    lines.push(" ".to_string()); // count-0 terminator
+    lines
+}
+
 impl SccsDateTime {
     /// Create current date/time in the local timezone (honoring `TZ`).
     pub fn now() -> Self {
@@ -1053,6 +1126,14 @@ impl SccsFile {
     // Flag Access
     // =========================================================================
 
+    /// Whether the body is uuencoded (the `e` flag is set non-zero).
+    pub fn is_encoded(&self) -> bool {
+        self.header
+            .flags
+            .iter()
+            .any(|f| matches!(f, SccsFlag::Encoded(n) if *n != 0))
+    }
+
     /// Check if branch flag is set
     pub fn branch_enabled(&self) -> bool {
         self.header
@@ -1698,6 +1779,23 @@ mod tests {
         assert_eq!("1.1".parse::<Sid>().unwrap(), Sid::trunk(1, 1));
         assert_eq!("1.2.3.4".parse::<Sid>().unwrap(), Sid::new(1, 2, 3, 4));
         assert_eq!("2".parse::<Sid>().unwrap(), Sid::new(2, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_uuencode_decode_roundtrip() {
+        // Exact CSSC encoding for this input (space-for-zero uuencode).
+        let data = b"\x00\x01hello";
+        let enc = uuencode_sccs(data);
+        assert_eq!(enc[0], "'  %H96QL;P  ");
+        assert_eq!(enc[1], " "); // count-0 terminator
+        assert_eq!(uudecode_sccs(&enc), data);
+
+        // Round-trip a range of binary payloads of varying lengths.
+        for len in [0usize, 1, 2, 3, 44, 45, 46, 90, 137] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let lines = uuencode_sccs(&payload);
+            assert_eq!(uudecode_sccs(&lines), payload, "len={}", len);
+        }
     }
 
     #[test]

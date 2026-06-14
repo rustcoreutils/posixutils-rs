@@ -438,6 +438,42 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         .map(|s| s.to_string())
         .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string()));
 
+    // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
+    // bytes, with no ID-keyword expansion (the content is opaque).
+    if sccs.is_encoded() {
+        let encoded_lines = sccs.evaluate_body(&applied_set);
+        let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
+
+        if args.to_stdout {
+            io::stdout().write_all(&raw)?;
+        } else {
+            let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Invalid s-file name")
+            })?;
+            fs::write(&gfile_path, &raw)?;
+            let mode = if args.edit { 0o644 } else { 0o444 };
+            fs::set_permissions(&gfile_path, fs::Permissions::from_mode(mode))?;
+        }
+
+        if args.edit {
+            if let Some(ns) = new_sid {
+                create_pfile_entry(sfile_path, &target_sid, &ns)?;
+            }
+        }
+
+        if !args.silent {
+            let line_count = raw.iter().filter(|&&b| b == b'\n').count();
+            let output_stream: &mut dyn Write = if args.to_stdout {
+                &mut io::stderr()
+            } else {
+                &mut io::stdout()
+            };
+            writeln!(output_stream, "{} lines", line_count)?;
+        }
+
+        return Ok(true);
+    }
+
     // Evaluate body
     let suppress_keywords = args.no_keywords || args.edit;
 

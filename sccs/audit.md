@@ -53,14 +53,14 @@ These affect multiple utilities. Per-utility sections reference them by number.
 
 ### Critical
 
-- [ ] **#X1 — Encoded (`e`-flag) bodies are emitted un-decoded → garbage output.**
-  `plib/src/sccsfile.rs:897` (`evaluate_body`) pushes body text lines verbatim
-  and never consults the `Encoded` flag it parses at `:506,547`. CSSC
-  uuencodes the body (and sets `^Af e 1`) for binary files and for sources
-  lacking a trailing newline. Reading such a CSSC file, our `get -p` prints
-  uuencoded garbage (e.g. `%;F]E;VP`). Fix: when the `e` flag is set, uudecode
-  each body text record before applying deltas; on write, encode symmetrically.
-  Behaviorally verified. (Surfaces as `get` #G1.)
+- [x] **#X1 — Encoded (`e`-flag) bodies are emitted un-decoded → garbage output.**
+  ✓ fixed in Phase 3. Added `plib::sccsfile::uudecode_sccs`/`uuencode_sccs`
+  (historical space-for-zero uuencode) and `SccsFile::is_encoded()`. `get` now
+  uudecodes `e`-flag bodies and writes raw bytes (no keyword expansion); `admin`
+  detects binary / no-trailing-newline input and stores it uuencoded with
+  `^Af e 1`. Verified **byte-identical to CSSC** both directions: we read CSSC
+  binary/no-eol files correctly, our encoded files round-trip and pass
+  `cssc get`/`cssc val`. (Surfaces as `get` #G1.)
 
 ### Major
 
@@ -321,8 +321,8 @@ shared-core #X1 (encoded bodies).
 ### Priority issues
 
 #### Critical
-- [ ] **#G1 — CSSC encoded (`e`-flag) bodies emitted as uuencoded garbage.** (#X1)
-  `plib/src/sccsfile.rs:897`. Verified on a no-trailing-newline source.
+- [x] **#G1 — CSSC encoded (`e`-flag) bodies emitted as uuencoded garbage.**
+  ✓ fixed in Phase 3 (#X1): `get` uudecodes `e`-flag bodies to raw bytes.
 
 #### Major
 - [ ] **#G2 — `-c cutoff` MISSING.** `get.rs:24-56`; `get -c…` exit 2. Spec

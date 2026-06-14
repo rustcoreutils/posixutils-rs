@@ -185,9 +185,12 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
         let token = tokens[i];
 
         if token == ">" {
-            // Output redirection - next token is the file
+            // Output redirection: the next token is the target file. The
+            // redirect is NOT passed through to the shell here — `execute_uux`
+            // appends it, pointing at the exec host's work dir for cross-system
+            // delivery so the output is never written to the target path on the
+            // wrong host.
             in_redirect = true;
-            command_parts.push(token.to_string());
             i += 1;
             continue;
         }
@@ -205,13 +208,12 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
                 },
                 path: expand_remote_path(&path),
             });
-            command_parts.push(expand_remote_path(&path));
             in_redirect = false;
             i += 1;
             continue;
         }
 
-        // Check if token starts with > (combined like >file)
+        // Combined redirect like `>file` / `>sys!file`.
         if let Some(rest) = token.strip_prefix('>') {
             let (sys, path) = parse_path_spec(rest);
             output_file = Some(FileRef {
@@ -222,7 +224,6 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
                 },
                 path: expand_remote_path(&path),
             });
-            command_parts.push(format!(">{}", expand_remote_path(&path)));
             i += 1;
             continue;
         }
@@ -268,6 +269,17 @@ fn execute_uux(
 
     // Create working directory
     let work_dir = format!("/tmp/uux_{}", job_id);
+
+    // Resolve the output redirect (if any) up front: where the command should
+    // write on the exec host, and whether the produced file must afterwards be
+    // delivered to another system. An unsupported third-system target fails here
+    // before any work is done.
+    let (redirect_target, delivery) = resolve_output(
+        &parsed.output_file,
+        &parsed.exec_host,
+        exec_local,
+        &work_dir,
+    )?;
 
     if exec_local {
         // Create local working directory
@@ -316,9 +328,15 @@ fn execute_uux(
         }
     }
 
-    // Execute the command
+    // Execute the command, appending the resolved output redirect (if any). The
+    // redirect target is shell-quoted; for cross-system output it points at a
+    // temp under the work dir, never at the target path on the exec host.
     let work_dir_escaped = shell_escape(&work_dir);
-    let full_cmd = format!("cd {} && {}", work_dir_escaped, parsed.command);
+    let mut command = parsed.command.clone();
+    if let Some(ref target) = redirect_target {
+        command.push_str(&format!(" > {}", shell_escape(target)));
+    }
+    let full_cmd = format!("cd {} && {}", work_dir_escaped, command);
 
     let (code, stdout, stderr) = if exec_local {
         // Local execution
@@ -362,12 +380,12 @@ fn execute_uux(
         eprint!("{}", String::from_utf8_lossy(&stderr));
     }
 
-    // On success, deliver the output file to its target system if that differs
-    // from the execution host (the `>` redirect ran on the exec host, so the
-    // file currently lives there). Done before cleanup removes the work dir.
-    let delivery = if code == 0 {
-        match parsed.output_file {
-            Some(ref out_file) => deliver_output(out_file, &parsed.exec_host, &work_dir),
+    // On success, deliver the produced output file to its target system (for a
+    // cross-system redirect it was written to a temp under the exec host's work
+    // dir). Done before cleanup removes the work dir.
+    let delivery_result = if code == 0 {
+        match delivery {
+            Some(ref d) => deliver(d, &parsed.exec_host),
             None => Ok(()),
         }
     } else {
@@ -389,7 +407,7 @@ fn execute_uux(
     if code != 0 {
         return Err(format!("command exited with status {}", code));
     }
-    delivery?;
+    delivery_result?;
 
     // The command's standard output is discarded per POSIX unless redirected.
     let _ = stdout;
@@ -397,56 +415,95 @@ fn execute_uux(
     Ok(())
 }
 
-/// Deliver a `uux` output file from the execution host to the system named by
-/// the redirect target, when that system differs from the exec host. The file
-/// was produced by the `>` redirect on the exec host (relative targets live
-/// under `work_dir`). Returns `Ok(())` when the target is the same host as the
-/// exec host (already in place). A target on a third remote system (neither
-/// local nor the exec host) is not supported in this minimal SSH design.
-fn deliver_output(out_file: &FileRef, exec_host: &str, work_dir: &str) -> Result<(), String> {
-    let out_local = is_local_system(&out_file.system);
-    let exec_local = is_local_system(exec_host);
+/// A pending delivery of a `uux` output file from the execution host's work-dir
+/// temp to the target system after a successful run.
+#[derive(Debug)]
+struct Delivery {
+    /// True to fetch the temp from a remote exec host down to the local target;
+    /// false to send a locally-produced temp up to the remote target system.
+    fetch: bool,
+    /// Path of the produced file on the exec host (a temp under the work dir).
+    tmp: String,
+    /// Target system name (empty for local).
+    system: String,
+    /// Target path on the target system.
+    path: String,
+}
 
-    // Same effective host: the redirect already wrote the file in place.
-    if (out_local && exec_local) || (!out_local && out_file.system == exec_host) {
-        return Ok(());
-    }
-
-    // Exec-host-side path of the produced file (the command ran `cd work_dir`,
-    // so a relative redirect target lives under work_dir).
-    let exec_path = if out_file.path.starts_with('/') {
-        out_file.path.clone()
-    } else {
-        format!("{}/{}", work_dir, out_file.path)
+/// Decide where a `uux` command's `>` redirect should write on the execution
+/// host, and whether the produced file must afterwards be delivered to another
+/// system. Returns `(redirect_target_on_exec_host, optional delivery)`:
+/// - no output redirect → `(None, None)`;
+/// - output on the same host as execution → write directly to the requested
+///   path there, no delivery;
+/// - cross-system (local↔remote) → write to a temp under the exec host's work
+///   dir, then deliver it to the target (so the target path is interpreted only
+///   on the target system, and nothing is left on the exec host);
+/// - output on a third remote system (neither local nor the exec host) → error.
+fn resolve_output(
+    output_file: &Option<FileRef>,
+    exec_host: &str,
+    exec_local: bool,
+    work_dir: &str,
+) -> Result<(Option<String>, Option<Delivery>), String> {
+    let out = match output_file {
+        Some(o) => o,
+        None => return Ok((None, None)),
     };
 
-    if out_local && !exec_local {
-        // Fetch the produced file from the remote exec host to the local target.
-        let local_target = if out_file.path.starts_with('/') {
-            out_file.path.clone()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(&out_file.path).to_string_lossy().to_string()
+    let out_local = is_local_system(&out.system);
+    let same_host = (out_local && exec_local) || (!out_local && out.system == exec_host);
+
+    if same_host {
+        // Write directly to the requested path on the exec host.
+        Ok((Some(out.path.clone()), None))
+    } else if !out_local && !exec_local {
+        // Output on a third remote system: unsupported in the minimal design.
+        Err(format!(
+            "{}: {}",
+            gettext("cross-system output to a third system is not supported"),
+            out.system
+        ))
+    } else {
+        // Cross-system: redirect to a temp in the work dir, deliver afterwards.
+        let tmp = format!("{}/uux_output_file", work_dir);
+        let path = if out_local && !out.path.starts_with('/') {
+            // Local target with a relative path: resolve against the cwd.
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&out.path).to_string_lossy().to_string(),
+                Err(_) => out.path.clone(),
+            }
         } else {
-            out_file.path.clone()
+            out.path.clone()
         };
-        ssh_fetch_file(exec_host, &exec_path, &local_target, true).map_err(|e| {
+        Ok((
+            Some(tmp.clone()),
+            Some(Delivery {
+                fetch: out_local,
+                tmp,
+                system: out.system.clone(),
+                path,
+            }),
+        ))
+    }
+}
+
+/// Carry out a pending [`Delivery`] (the produced file is in `d.tmp` on the
+/// exec host).
+fn deliver(d: &Delivery, exec_host: &str) -> Result<(), String> {
+    if d.fetch {
+        // Remote exec host → local target.
+        ssh_fetch_file(exec_host, &d.tmp, &d.path, true).map_err(|e| {
             format!(
                 "{}: {}",
                 gettext("failed to fetch output file from exec host"),
                 e
             )
         })
-    } else if !out_local && exec_local {
-        // Send the locally-produced file to the remote output system.
-        ssh_send_file(&out_file.system, &exec_path, &out_file.path, true)
-            .map_err(|e| format!("{}: {}", gettext("failed to send output file to remote"), e))
     } else {
-        // Output on a third remote system (neither local nor the exec host).
-        Err(format!(
-            "{}: {}",
-            gettext("cross-system output to a third system is not supported"),
-            out_file.system
-        ))
+        // Local exec → remote target system.
+        ssh_send_file(&d.system, &d.tmp, &d.path, true)
+            .map_err(|e| format!("{}: {}", gettext("failed to send output file to remote"), e))
     }
 }
 
@@ -476,7 +533,9 @@ mod tests {
     fn test_parse_command_with_output_redirect_separate() {
         let result = parse_command_string("host!cmd > output.txt").unwrap();
         assert_eq!(result.exec_host, "host");
-        assert_eq!(result.command, "cmd > output.txt");
+        // The redirect is recorded in output_file, not left in the command
+        // string (execute_uux re-appends it with the right target).
+        assert_eq!(result.command, "cmd");
         assert!(result.output_file.is_some());
         let out = result.output_file.unwrap();
         assert_eq!(out.system, "host"); // defaults to exec host
@@ -487,7 +546,7 @@ mod tests {
     fn test_parse_command_with_output_redirect_combined() {
         let result = parse_command_string("host!cmd >output.txt").unwrap();
         assert_eq!(result.exec_host, "host");
-        assert_eq!(result.command, "cmd >output.txt");
+        assert_eq!(result.command, "cmd");
         assert!(result.output_file.is_some());
         let out = result.output_file.unwrap();
         assert_eq!(out.system, "host");
@@ -524,24 +583,43 @@ mod tests {
     }
 
     #[test]
-    fn test_deliver_output_same_host_is_noop() {
-        // Output target on the same (remote) host as execution: nothing to move.
-        let out = FileRef {
+    fn test_resolve_output_same_host_writes_in_place() {
+        // Output target on the same (remote) host as execution: the command
+        // redirects straight to the requested path; no delivery is scheduled.
+        let out = Some(FileRef {
             system: "exechost".to_string(),
             path: "/p/out".to_string(),
-        };
-        assert!(deliver_output(&out, "exechost", "/tmp/wd").is_ok());
+        });
+        let (redirect, delivery) = resolve_output(&out, "exechost", false, "/tmp/wd").unwrap();
+        assert_eq!(redirect.as_deref(), Some("/p/out"));
+        assert!(delivery.is_none());
     }
 
     #[test]
-    fn test_deliver_output_third_system_is_error() {
+    fn test_resolve_output_cross_system_uses_workdir_temp() {
+        // Output local, execution remote: redirect to a temp under the work dir
+        // (never the target path on the exec host), then fetch it back.
+        let out = Some(FileRef {
+            system: String::new(), // local
+            path: "/p/out".to_string(),
+        });
+        let (redirect, delivery) = resolve_output(&out, "exechost", false, "/tmp/wd").unwrap();
+        assert_eq!(redirect.as_deref(), Some("/tmp/wd/uux_output_file"));
+        let d = delivery.expect("delivery scheduled");
+        assert!(d.fetch, "exec-remote/output-local fetches");
+        assert_eq!(d.tmp, "/tmp/wd/uux_output_file");
+        assert_eq!(d.path, "/p/out");
+    }
+
+    #[test]
+    fn test_resolve_output_third_system_is_error() {
         // Output on a system that is neither local nor the execution host is not
         // supported in the minimal SSH design — a hard error, not a silent skip.
-        let out = FileRef {
+        let out = Some(FileRef {
             system: "thirdsys".to_string(),
             path: "/p/out".to_string(),
-        };
-        let err = deliver_output(&out, "exechost", "/tmp/wd").unwrap_err();
+        });
+        let err = resolve_output(&out, "exechost", false, "/tmp/wd").unwrap_err();
         assert!(
             err.contains("third system"),
             "expected third-system error, got: {err}"

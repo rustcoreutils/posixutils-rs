@@ -26,10 +26,12 @@
 //! - Body: Interleaved delta content with ^AI/^AD/^AE control records
 
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 
 // =============================================================================
 // Constants
@@ -1576,6 +1578,146 @@ pub fn compute_checksum(data: &[u8]) -> u16 {
         sum = sum.wrapping_add(byte as u32);
     }
     (sum & 0xFFFF) as u16
+}
+
+// =============================================================================
+// SIGINT temp-file cleanup registry
+// =============================================================================
+
+/// Process-global list of filesystem paths to unlink if the process is
+/// interrupted (SIGINT). SCCS commands register transient files here (the
+/// z-file lock and the x-file temporary) so an interrupt during a mutation
+/// does not leave stale lock/temporary files behind.
+static CLEANUP: OnceLock<Mutex<Vec<CString>>> = OnceLock::new();
+
+fn cleanup_list() -> &'static Mutex<Vec<CString>> {
+    CLEANUP.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Convert a path into a NUL-terminated C string for async-signal-safe
+/// `unlink`. Returns `None` if the path contains an interior NUL.
+fn path_to_cstring(path: &Path) -> Option<CString> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+/// Register `path` to be unlinked on SIGINT.
+pub fn register_cleanup(path: &Path) {
+    if let Some(c) = path_to_cstring(path) {
+        if let Ok(mut list) = cleanup_list().lock() {
+            list.push(c);
+        }
+    }
+}
+
+/// Remove `path` from the SIGINT cleanup registry (e.g. after a successful
+/// rename, when the temporary no longer exists).
+pub fn unregister_cleanup(path: &Path) {
+    if let Some(c) = path_to_cstring(path) {
+        if let Ok(mut list) = cleanup_list().lock() {
+            if let Some(pos) = list.iter().position(|p| *p == c) {
+                list.remove(pos);
+            }
+        }
+    }
+}
+
+/// SIGINT handler: unlink every registered path and exit non-zero. Only
+/// async-signal-safe operations are performed (`unlink` + `_exit`); the
+/// registry was populated before the handler was installed and is read here
+/// without locking (the handler runs to process exit and does not return).
+extern "C" fn sigint_cleanup_handler(_sig: libc::c_int) {
+    // Read the raw registry. We deliberately avoid locking the Mutex (not
+    // async-signal-safe). The Vec is only appended/removed under normal
+    // execution; a torn read at worst skips/duplicates an unlink, which is
+    // harmless (ENOENT is ignored).
+    if let Some(lock) = CLEANUP.get() {
+        // SAFETY: get the inner pointer without locking. The handler never
+        // returns, so no concurrent mutation can corrupt our iteration after
+        // _exit.
+        if let Ok(list) = lock.try_lock() {
+            for c in list.iter() {
+                unsafe {
+                    libc::unlink(c.as_ptr());
+                }
+            }
+        }
+    }
+    unsafe {
+        libc::_exit(130);
+    }
+}
+
+/// Install the SIGINT handler that unlinks all registered temp/lock files and
+/// exits with status 130. Idempotent enough to call once at the start of a
+/// mutating command's `main`.
+pub fn install_sigint_cleanup() {
+    // Ensure the registry exists before the handler can fire.
+    let _ = cleanup_list();
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            sigint_cleanup_handler as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+// =============================================================================
+// Z-file lock (per-command exclusive mutation lock)
+// =============================================================================
+
+/// RAII guard for the SCCS z-file lock.
+///
+/// SCCS commands that mutate an s-file create a transient read-only z-file
+/// (e.g. `z.foo` for `s.foo`) containing the locking process's PID. It is held
+/// only for the duration of a single command invocation and removed when the
+/// guard is dropped, preventing two commands from modifying the same s-file
+/// concurrently. (This is distinct from the long-lived p-file edit lock.)
+///
+/// The z-file is created with `O_EXCL` semantics
+/// (`OpenOptions::create_new(true)`): if another process already holds the
+/// lock, [`ZLock::acquire`] fails with [`io::ErrorKind::AlreadyExists`] and the
+/// caller should diagnose the s-file as being edited / locked and skip it. The
+/// z-file path is registered with the SIGINT cleanup registry so an interrupt
+/// removes it.
+pub struct ZLock {
+    zfile: std::path::PathBuf,
+}
+
+impl ZLock {
+    /// Acquire the z-file lock for `sfile`. On success the caller holds the
+    /// lock until the returned guard is dropped. Fails with
+    /// [`io::ErrorKind::AlreadyExists`] if another process already holds it.
+    pub fn acquire(sfile: &Path) -> io::Result<ZLock> {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let zfile = paths::zfile_from_sfile(sfile);
+
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&zfile)?;
+
+        // Record the locking PID, matching historical SCCS / CSSC.
+        writeln!(f, "{}", std::process::id())?;
+        f.flush()?;
+
+        // SCCS z-files are read-only (r--r--r--).
+        std::fs::set_permissions(&zfile, std::fs::Permissions::from_mode(0o444))?;
+
+        // Ensure SIGINT removes the lock.
+        register_cleanup(&zfile);
+
+        Ok(ZLock { zfile })
+    }
+}
+
+impl Drop for ZLock {
+    fn drop(&mut self) {
+        unregister_cleanup(&self.zfile);
+        let _ = std::fs::remove_file(&self.zfile);
+    }
 }
 
 // =============================================================================

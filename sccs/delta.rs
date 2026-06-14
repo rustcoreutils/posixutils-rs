@@ -19,7 +19,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
-    SccsFlag, Sid,
+    SccsFlag, Sid, ZLock,
 };
 
 /// True if standard input is a terminal.
@@ -647,6 +647,21 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         return Ok(false);
     }
 
+    // Acquire the per-command z-file lock around the s-file rewrite (POSIX
+    // `shall`). If another SCCS command holds it, report and skip.
+    let _zlock = match ZLock::acquire(sfile_path) {
+        Ok(z) => z,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!(
+                "delta: {}: {}",
+                sfile_path.display(),
+                gettext("being edited")
+            );
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+
     // Find p-file entry
     let requested_sid: Option<Sid> = args
         .sid
@@ -732,14 +747,24 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Add new delta to header (at the beginning - deltas are stored newest first)
     sccs.header.deltas.insert(0, new_delta);
 
-    // Write atomically via x-file
+    // Write atomically via x-file. Register the x-file for SIGINT cleanup
+    // around the write+rename so an interrupt removes the temporary.
     let x_file = paths::xfile_from_sfile(sfile_path);
     let original_perms = fs::metadata(sfile_path)?.permissions();
 
     let serialized = sccs.to_bytes();
-    fs::write(&x_file, &serialized)?;
-    fs::set_permissions(&x_file, original_perms)?;
-    fs::rename(&x_file, sfile_path)?;
+    plib::sccsfile::register_cleanup(&x_file);
+    let res = (|| -> io::Result<()> {
+        fs::write(&x_file, &serialized)?;
+        fs::set_permissions(&x_file, original_perms)?;
+        fs::rename(&x_file, sfile_path)?;
+        Ok(())
+    })();
+    plib::sccsfile::unregister_cleanup(&x_file);
+    if res.is_err() {
+        let _ = fs::remove_file(&x_file);
+    }
+    res?;
 
     // Remove p-file entry
     remove_pfile_entry(sfile_path, &pfile_entry)?;
@@ -758,6 +783,8 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    plib::sccsfile::install_sigint_cleanup();
 
     let args = Args::parse();
 

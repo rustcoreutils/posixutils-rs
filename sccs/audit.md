@@ -102,12 +102,11 @@ These affect multiple utilities. Per-utility sections reference them by number.
 
 ### Minor
 
-- [ ] **#X8 — z-file locking is never taken.** `plib::sccsfile::paths::zfile_from_sfile`
-  exists but no utility calls it. `get -e`, `admin`, `delta`, `rmdel` all
-  mutate s-files / p-files with no lock, contravening the project's race-free
-  principle. Spec marks the z-file "may," so not a hard violation, but two
-  concurrent writers can interleave. Fix: create/remove the z-file around every
-  mutation.
+- [x] **#X8 — z-file locking is never taken.** ✓ Phase 12: added a `ZLock`
+  RAII guard (O_EXCL `create_new`, PID, mode 0444, removed on Drop) acquired by
+  `get -e`/`admin`/`delta`/`rmdel` for the duration of the mutation; a held lock
+  blocks a concurrent command (`<util>: <sfile>: being edited`). Verified no
+  leftover z-file between sequential commands.
 
 - [ ] **#X9 — Hardcoded-English diagnostics; `LC_MESSAGES`/`NLSPATH` inert.**
   Every utility wires `setlocale(LC_ALL,"")` + `textdomain` near `main`, but the
@@ -116,10 +115,10 @@ These affect multiple utilities. Per-utility sections reference them by number.
   Pervasive across `get.rs`, `delta.rs`, `admin.rs`, `prs.rs`, `rmdel.rs`,
   `unget.rs`, `val.rs`, `sccs.rs`. Fix: wrap diagnostic strings in `gettext()`.
 
-- [ ] **#X10 — No SIGINT cleanup of the temp x-file in `delta`/`admin`.** Both
-  write `x.<name>` then atomically rename; an interrupt mid-write orphans it.
-  `delta`'s spec ASYNCHRONOUS EVENTS makes SIGINT cleanup a **shall** (Major for
-  delta, #D5); `admin`'s is "Default" (Minor, #A6). No signal handlers exist.
+- [x] **#X10 — No SIGINT cleanup of the temp x-file in `delta`/`admin`.** ✓
+  Phase 12: `install_sigint_cleanup()` installs a handler that unlinks every
+  registered temp (x-file/z-file) and `_exit`s; `admin`, `delta`, and `rmdel`
+  register their x-file around the write+rename. (Closes #D5 and #A6.)
 
 ---
 
@@ -158,7 +157,7 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 #### Minor
 - [x] **#A5 — Default `-y` committer login from `$USER`, falls back to `"unknown"`.**
   ✓ fixed in Phase 1 via `real_login_name()` (#X4). `admin.rs:69`.
-- [ ] **#A6 — No SIGINT handler; x-file orphaned on interrupt.** (#X10) Spec
+- [x] **#A6 — No SIGINT handler; x-file orphaned on interrupt.** (#X10) Spec ✓ Phase 12 (#X10).
   ASYNCHRONOUS EVENTS is "Default," so Minor; the atomic-rename design still
   leaks `x.file`.
 - [x] **#A7 — `-m mrlist` not consulted on create; `v`-flag-requires-MR not enforced.**
@@ -242,7 +241,7 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
 #### Major
 - [x] **#D4 — `-g list` (ignore deltas) missing.** ✓ Phase 5: `-g` records
   ignored serials as `^Ag` (SID or serial accepted).
-- [ ] **#D5 — No SIGINT handler; x-file not cleaned on interrupt.** (#X10) Spec
+- [x] **#D5 — No SIGINT handler; x-file not cleaned on interrupt.** (#X10) Spec ✓ Phase 12 (#X10).
   ASYNCHRONOUS EVENTS makes this a `shall` for delta. `delta.rs:494-500` writes
   `x.<name>` before rename. Fix: install a handler that unlinks it, exit non-zero.
 - [x] **#D6 — `-` operand not read as stdin list.** ✓ Phase 5 via
@@ -324,7 +323,7 @@ shared-core #X1 (encoded bodies).
 - [x] **#G5 — `-` stdin-list operand.** ✓ Phase 4 via `paths::expand_operands`.
 - [x] **#G6 — Directory operand.** ✓ Phase 4 via `paths::expand_operands`.
 - [x] **#G7 — `-t` (top delta in release).** ✓ Phase 4; matches cssc.
-- [ ] **#G8 — z-file lock never created.** (#X8) `get -e` takes no lock.
+- [x] **#G8 — z-file lock never created.** (#X8) `get -e` takes no lock. ✓ Phase 12 (#X8).
 - [x] **#G9 — `No id keywords` warning.** ✓ Phase 4: emits
   `get: warning: <sfile>: No id keywords.` (matches cssc), escalates to fatal
   when the `i` flag is set, silent when a keyword is present.
@@ -508,7 +507,7 @@ and the rewritten file loses its `0444` read-only mode.
 - [x] **#R4 — Predictable temp path can collide / leak.** `rmdel.rs:115` uses ✓ Phase 9: uses the canonical x-file name.
   `with_extension("tmp")` (world-readable, non-unique; concurrent rmdels race).
   Fix: use the x-file name from `paths::xfile_from_sfile`.
-- [ ] **#R5 — No z-file locking.** (#X8) `rmdel.rs`.
+- [x] **#R5 — No z-file locking.** (#X8) `rmdel.rs`. ✓ Phase 12 (#X8).
 
 ### Detailed conformance matrix
 

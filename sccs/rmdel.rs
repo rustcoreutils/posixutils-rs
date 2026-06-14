@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid};
+use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid, ZLock};
 
 /// rmdel - remove a delta from an SCCS file
 #[derive(Parser)]
@@ -40,6 +40,17 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         eprintln!("{}: not an SCCS file", sfile.display());
         return Ok(false);
     }
+
+    // Acquire the per-command z-file lock around the read-modify-write. If
+    // another SCCS command already holds it, report and skip.
+    let _zlock = match ZLock::acquire(sfile) {
+        Ok(z) => z,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("{}: being edited", sfile.display());
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
 
     // Parse the SCCS file
     let mut sccs = match SccsFile::from_path(sfile) {
@@ -139,14 +150,24 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let contents = sccs.to_bytes();
 
     // Write atomically via the canonical x-file, then rename over the s-file.
+    // Register the x-file for SIGINT cleanup around the write+rename.
     let tmp_path = paths::xfile_from_sfile(sfile);
-    fs::write(&tmp_path, contents)?;
+    plib::sccsfile::register_cleanup(&tmp_path);
+    let res = (|| -> io::Result<()> {
+        fs::write(&tmp_path, contents)?;
 
-    // Restore the SCCS read-only mode (preserve the original, else 0444).
-    let mode = orig_mode.unwrap_or(0o444);
-    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
+        // Restore the SCCS read-only mode (preserve the original, else 0444).
+        let mode = orig_mode.unwrap_or(0o444);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
 
-    fs::rename(&tmp_path, sfile)?;
+        fs::rename(&tmp_path, sfile)?;
+        Ok(())
+    })();
+    plib::sccsfile::unregister_cleanup(&tmp_path);
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    res?;
 
     Ok(true)
 }
@@ -176,6 +197,8 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    plib::sccsfile::install_sigint_cleanup();
 
     let args = Args::parse();
 

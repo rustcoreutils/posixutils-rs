@@ -19,7 +19,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsFile, SccsFlag,
-    SccsHeader, Sid,
+    SccsHeader, Sid, ZLock,
 };
 
 /// admin - create and administer SCCS files
@@ -220,7 +220,49 @@ struct NewFileParams<'a> {
     mr_numbers: Vec<String>,
 }
 
+/// Acquire the per-command z-file lock, mapping the "already locked" case to a
+/// clear diagnostic so the caller's `Err` arm reports the s-file is being
+/// edited rather than a raw "File exists".
+fn acquire_zlock(path: &Path) -> io::Result<ZLock> {
+    ZLock::acquire(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                gettext("being edited (z-file lock held)"),
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// Write `serialized` to the x-file, apply `perms`, and atomically rename over
+/// `path`. The x-file is registered for SIGINT cleanup for the duration of the
+/// write+rename, and removed on error.
+fn write_xfile_atomic(
+    path: &Path,
+    x_file: &Path,
+    serialized: &[u8],
+    perms: fs::Permissions,
+) -> io::Result<()> {
+    plib::sccsfile::register_cleanup(x_file);
+    let res = (|| -> io::Result<()> {
+        fs::write(x_file, serialized)?;
+        fs::set_permissions(x_file, perms)?;
+        fs::rename(x_file, path)?;
+        Ok(())
+    })();
+    plib::sccsfile::unregister_cleanup(x_file);
+    if res.is_err() {
+        let _ = fs::remove_file(x_file);
+    }
+    res
+}
+
 fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
+    // Per-command z-file lock around the create.
+    let _zlock = acquire_zlock(path)?;
+
     let NewFileParams {
         content,
         initial_sid,
@@ -328,14 +370,13 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     let x_file = paths::xfile_from_sfile(path);
     let serialized = sccs.to_bytes();
 
-    fs::write(&x_file, &serialized)?;
-
-    // Set read-only permissions
-    let perms = fs::Permissions::from_mode(0o444);
-    fs::set_permissions(&x_file, perms)?;
-
-    // Rename x-file to s-file
-    fs::rename(&x_file, path)?;
+    // SCCS s-files are read-only (r--r--r--).
+    write_xfile_atomic(
+        path,
+        &x_file,
+        &serialized,
+        fs::Permissions::from_mode(0o444),
+    )?;
 
     Ok(())
 }
@@ -373,6 +414,9 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
 }
 
 fn recompute_checksum(path: &Path) -> io::Result<()> {
+    // Per-command z-file lock around the rewrite.
+    let _zlock = acquire_zlock(path)?;
+
     // Read and parse
     let sccs = SccsFile::from_path(path)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -384,9 +428,7 @@ fn recompute_checksum(path: &Path) -> io::Result<()> {
     // Get original permissions
     let original_perms = fs::metadata(path)?.permissions();
 
-    fs::write(&x_file, &serialized)?;
-    fs::set_permissions(&x_file, original_perms.clone())?;
-    fs::rename(&x_file, path)?;
+    write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
 
     Ok(())
 }
@@ -399,6 +441,9 @@ fn modify_existing_file(
     add_users: Vec<String>,
     remove_users: Vec<String>,
 ) -> io::Result<()> {
+    // Per-command z-file lock around the modify.
+    let _zlock = acquire_zlock(path)?;
+
     // Read existing file
     let mut sccs = SccsFile::from_path(path)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -438,9 +483,7 @@ fn modify_existing_file(
     let original_perms = fs::metadata(path)?.permissions();
 
     let serialized = sccs.to_bytes();
-    fs::write(&x_file, &serialized)?;
-    fs::set_permissions(&x_file, original_perms)?;
-    fs::rename(&x_file, path)?;
+    write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
 
     Ok(())
 }
@@ -449,6 +492,8 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    plib::sccsfile::install_sigint_cleanup();
 
     // Pre-process argv to strip the attached-only options (-i/-t/-y) before
     // clap parses; clap cannot express "attached value only".

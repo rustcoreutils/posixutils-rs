@@ -18,7 +18,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
+use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid, ZLock};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]
@@ -667,8 +667,23 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let target_serial = target.serial;
     let target_sid = target.sid;
 
-    // If editing, compute new SID and check for locks
+    // If editing, acquire the per-command z-file lock (held until this
+    // function returns, then released so a later delta/unget can run), compute
+    // the new SID and check for the p-file edit lock.
+    //
+    // `_zlock` is bound at function scope so the z-file persists across the
+    // early-return (encoded) path below and is removed on every return.
+    let _zlock;
     let new_sid = if args.edit {
+        _zlock = match ZLock::acquire(sfile_path) {
+            Ok(z) => z,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                eprintln!("get: {}: {}", sfile_path.display(), gettext("being edited"));
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+
         let new_sid = compute_new_sid(&sccs, target, args.branch);
 
         // Check for existing edit lock (unless joint edit is allowed)

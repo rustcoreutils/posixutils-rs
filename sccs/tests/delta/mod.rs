@@ -452,3 +452,58 @@ fn delta_p_append_does_not_panic() {
     };
     run_test(plan);
 }
+
+// z-file (per-command lock) is removed after a successful delta, and a
+// pre-existing z-file blocks the mutation (#X8 / #D5).
+#[test]
+fn delta_zfile_removed_after_command() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "zclean", "a\n");
+
+    let zfile = tmp.path().join("z.zclean");
+
+    get_for_editing(&sfile);
+    assert!(
+        !zfile.exists(),
+        "z-file must not persist after get -e returns"
+    );
+
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "add");
+    assert!(
+        !zfile.exists(),
+        "z-file must be removed after delta returns"
+    );
+}
+
+#[test]
+fn delta_blocked_by_existing_zfile() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _pfile, gfile) = setup_sccs_file(&tmp, "zlock", "a\n");
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    // Simulate another command holding the per-command z-file lock.
+    let zfile = tmp.path().join("z.zlock");
+    fs::write(&zfile, "99999\n").unwrap();
+
+    let plan = TestPlan {
+        cmd: String::from("delta"),
+        args: vec!["-yblocked".into(), sfile.to_string_lossy().into()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(
+            !output.status.success(),
+            "delta must fail while z-file lock is held"
+        );
+    });
+
+    // Our manually-created lock must be left intact (delta must not remove a
+    // lock it did not create).
+    assert!(zfile.exists(), "foreign z-file must not be removed");
+}

@@ -64,23 +64,19 @@ These affect multiple utilities. Per-utility sections reference them by number.
 
 ### Major
 
-- [ ] **#X2 — No body-reweave routine; `rmdel` cannot prune a removed delta's text.**
-  `grep -nE 'fn remove_delta|reweave' plib/src/sccsfile.rs` → zero matches.
-  `rmdel` marks the delta-table entry type `R` (correct, matches CSSC) but
-  leaves the removed delta's inserted lines and `^AI/^AE` control block in the
-  body, so the on-disk s-file diverges from CSSC byte-for-byte. Harmless to
-  `get` today (`compute_applied_set` skips `Removed` serials) but a real
-  corruption risk if a later delta's weave interleaves the removed block. Fix:
-  add `SccsFile::remove_delta(serial)` that drops body records enclosed by the
-  removed insert-serial. (Surfaces as `rmdel` #R1.)
+- [x] **#X2 — No body-reweave routine; `rmdel` cannot prune a removed delta's text.**
+  ✓ fixed in Phase 2. Added `SccsFile::remove_delta(serial)`: marks the entry
+  `Removed` and reweaves the body — drops the delta's own `^AI s … ^AE s` block
+  in full, and removes its `^AD s … ^AE s` delete markers while restoring the
+  wrapped text. Verified **byte-identical body to CSSC** and `cssc val` accepts
+  our rmdel'd file. (Surfaces as `rmdel` #R1.)
 
-- [ ] **#X3 — `:FL:` flag listing emits Rust `Debug`, not canonical flag names.**
-  `sccs/prs.rs:394-400` (`format_flags`) uses `format!("{:?}", f)`. Output:
-  `BranchEnabled` / `ModuleName("mymod")` / `QText("QVAL")` /
-  `MrValidation(None)` / `Encoded(0)`; CSSC emits `branch`,
-  `module\tmymod`, `csect name\tQVAL`, `validate MRs`. Verified
-  (`prs -d:FL:` → `BranchEnabled`). Fix: map each `SccsFlag` to its canonical
-  name + `<tab>` + value. (Surfaces as `prs` #P3.)
+- [x] **#X3 — `:FL:` flag listing emits Rust `Debug`, not canonical flag names.**
+  ✓ fixed in Phase 2. Added `SccsFlag::prs_fl_line()` (canonical `name<tab>value`
+  per CSSC, `None` for the `e` flag); `prs::format_flags` now uses it. Verified
+  `branch` / `module\tmod` / `type\tty` / `csect name\tQ` / `validate MRs\t`.
+  (Surfaces as `prs` #P3. Flag *order* follows storage order, which is
+  spec-permitted; the missing trailing newline is the separate #P1.)
 
 - [x] **#X4 — Login name taken from `$USER`/`$LOGNAME`, not `getpwuid(getuid())`.**
   ✓ fixed in Phase 1. Added `plib::sccsfile::real_login_name()` (real-uid
@@ -421,7 +417,8 @@ and exit codes are otherwise solid.
 - [ ] **#P2 — `-r` optional option-argument rejected.** `prs.rs:40` (`Option<String>`
   with a forced value). Verified `prs -r s.f` → "a value is required"; CSSC
   prints `1.3`. Fix: `num_args=0..=1, default_missing_value=""`; empty = latest.
-- [ ] **#P3 — `:FL:` emits Rust Debug.** (#X3) `prs.rs:394-400`.
+- [x] **#P3 — `:FL:` emits Rust Debug.** ✓ fixed in Phase 2 (#X3) via
+  `SccsFlag::prs_fl_line()`; `prs.rs:394`.
 - [ ] **#P4 — `:GB:` (gotten body) unimplemented.** `prs.rs:316` prints literal
   `:GB:`; CSSC reconstructs the latest body. `compute_applied_set`/`evaluate_body`
   already exist. Fix: wire them.
@@ -501,9 +498,9 @@ and the rewritten file loses its `0444` read-only mode.
 ### Priority issues
 
 #### Major
-- [ ] **#R1 — Body weave not rewoven on removal; orphan `^AI/^AE` block + text remain.**
-  (#X2) `rmdel.rs:108-117` only mutates `delta_type`. Verified: removing leaf 1.3
-  leaves `^AI 3 / line5 / ^AE 3` that CSSC strips. Fix: `SccsFile::remove_delta`.
+- [x] **#R1 — Body weave not rewoven on removal; orphan `^AI/^AE` block + text remain.**
+  ✓ fixed in Phase 2 via `SccsFile::remove_delta` (#X2); `rmdel.rs` now calls it.
+  Verified byte-identical to CSSC.
 - [ ] **#R2 — Ownership check is `$LOGNAME` string-compare, not real-uid / file-owner / dir-owner.**
   `rmdel.rs:32-36,64-69`. Spec restricts removal to the delta author, the s-file
   owner, or the directory owner. Ours blocks a legitimate file owner who didn't

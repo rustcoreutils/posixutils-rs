@@ -670,6 +670,32 @@ impl SccsFlag {
             SccsFlag::Unknown(_, s) => s.clone(),
         }
     }
+
+    /// Human-readable description of this flag for the `prs` `:FL:` data
+    /// keyword, matching historical SCCS / CSSC output. Value-bearing flags
+    /// render as `name<tab>value`. Returns `None` for the `e` (encoded) flag,
+    /// which is not part of the `:FL:` listing.
+    pub fn prs_fl_line(&self) -> Option<String> {
+        let s = match self {
+            SccsFlag::BranchEnabled => "branch".to_string(),
+            SccsFlag::Ceiling(n) => format!("ceiling\t{}", n),
+            SccsFlag::DefaultSid(sid) => format!("default SID\t{}", sid),
+            SccsFlag::Encoded(_) => return None,
+            SccsFlag::Floor(n) => format!("floor\t{}", n),
+            SccsFlag::IdKeywordError(_) => "id keywd err/warn".to_string(),
+            SccsFlag::JointEdit => "joint edit".to_string(),
+            SccsFlag::LockedReleases(_) => {
+                format!("locked releases\t{}", self.value_string())
+            }
+            SccsFlag::ModuleName(s) => format!("module\t{}", s),
+            SccsFlag::NullDelta => "null delta".to_string(),
+            SccsFlag::QText(s) => format!("csect name\t{}", s),
+            SccsFlag::ModuleType(s) => format!("type\t{}", s),
+            SccsFlag::MrValidation(s) => format!("validate MRs\t{}", s.clone().unwrap_or_default()),
+            SccsFlag::Unknown(c, val) => format!("{}\t{}", c, val),
+        };
+        Some(s)
+    }
 }
 
 // =============================================================================
@@ -953,6 +979,74 @@ impl SccsFile {
         }
 
         output
+    }
+
+    /// Remove a (leaf) delta: mark its delta-table entry as `Removed` and
+    /// reweave the body so the delta's footprint is undone, matching historical
+    /// SCCS / CSSC `rmdel`. The delta's own inserted block (`^AI s … ^AE s`) is
+    /// dropped in full (control lines and text); each block it deleted
+    /// (`^AD s … ^AE s`) has its control lines dropped but the wrapped text
+    /// restored (un-deleted). The delta-table entry is retained (type `R`) so
+    /// the SID cannot be reused. Callers must ensure the delta is a leaf.
+    pub fn remove_delta(&mut self, serial: u16) {
+        if let Some(d) = self.header.deltas.iter_mut().find(|d| d.serial == serial) {
+            d.delta_type = DeltaType::Removed;
+        }
+
+        let old = std::mem::take(&mut self.body);
+        let mut result = Vec::with_capacity(old.len());
+        let mut i = 0;
+        while i < old.len() {
+            match &old[i] {
+                // Drop this delta's entire insert block, text included.
+                BodyRecord::Insert(s) if *s == serial => {
+                    i += 1;
+                    let mut depth = 0usize;
+                    while i < old.len() {
+                        match &old[i] {
+                            BodyRecord::Insert(_) | BodyRecord::Delete(_) => depth += 1,
+                            BodyRecord::End(_) => {
+                                if depth == 0 {
+                                    i += 1; // consume the matching End and stop
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            BodyRecord::Text(_) => {}
+                        }
+                        i += 1;
+                    }
+                }
+                // Drop this delta's delete markers but keep the wrapped text.
+                BodyRecord::Delete(s) if *s == serial => {
+                    i += 1;
+                    let mut depth = 0usize;
+                    while i < old.len() {
+                        match &old[i] {
+                            BodyRecord::Insert(_) | BodyRecord::Delete(_) => {
+                                depth += 1;
+                                result.push(old[i].clone());
+                            }
+                            BodyRecord::End(_) => {
+                                if depth == 0 {
+                                    i += 1; // drop the matching End and stop
+                                    break;
+                                }
+                                depth -= 1;
+                                result.push(old[i].clone());
+                            }
+                            BodyRecord::Text(_) => result.push(old[i].clone()),
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    result.push(old[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        self.body = result;
     }
 
     // =========================================================================
@@ -1604,6 +1698,75 @@ mod tests {
         assert_eq!("1.1".parse::<Sid>().unwrap(), Sid::trunk(1, 1));
         assert_eq!("1.2.3.4".parse::<Sid>().unwrap(), Sid::new(1, 2, 3, 4));
         assert_eq!("2".parse::<Sid>().unwrap(), Sid::new(2, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_prs_fl_line_canonical() {
+        assert_eq!(
+            SccsFlag::BranchEnabled.prs_fl_line().as_deref(),
+            Some("branch")
+        );
+        assert_eq!(
+            SccsFlag::ModuleName("mod".into()).prs_fl_line().as_deref(),
+            Some("module\tmod")
+        );
+        assert_eq!(
+            SccsFlag::ModuleType("ty".into()).prs_fl_line().as_deref(),
+            Some("type\tty")
+        );
+        assert_eq!(
+            SccsFlag::QText("Q".into()).prs_fl_line().as_deref(),
+            Some("csect name\tQ")
+        );
+        assert_eq!(
+            SccsFlag::MrValidation(None).prs_fl_line().as_deref(),
+            Some("validate MRs\t")
+        );
+        // The encoded flag is not part of the :FL: listing.
+        assert_eq!(SccsFlag::Encoded(0).prs_fl_line(), None);
+    }
+
+    #[test]
+    fn test_remove_delta_reweaves_body() {
+        // Body for: 1.1 inserts a,b,c; 1.2 (serial 2) deletes b and inserts X.
+        let mut f = SccsFile {
+            body: vec![
+                BodyRecord::Insert(1),
+                BodyRecord::Text("a".into()),
+                BodyRecord::Delete(2),
+                BodyRecord::Text("b".into()),
+                BodyRecord::End(2),
+                BodyRecord::Insert(2),
+                BodyRecord::Text("X".into()),
+                BodyRecord::End(2),
+                BodyRecord::Text("c".into()),
+                BodyRecord::End(1),
+            ],
+            ..Default::default()
+        };
+        f.header.deltas.push(DeltaEntry {
+            serial: 2,
+            ..Default::default()
+        });
+
+        f.remove_delta(2);
+
+        // Removing serial 2 reverts to 1.1: insert block dropped, deletion undone.
+        assert_eq!(
+            f.body,
+            vec![
+                BodyRecord::Insert(1),
+                BodyRecord::Text("a".into()),
+                BodyRecord::Text("b".into()),
+                BodyRecord::Text("c".into()),
+                BodyRecord::End(1),
+            ]
+        );
+        // Delta-table entry retained as Removed.
+        assert_eq!(
+            f.find_delta_by_serial(2).unwrap().delta_type,
+            DeltaType::Removed
+        );
     }
 
     #[test]

@@ -103,8 +103,9 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Mark delta as removed
-    sccs.header.deltas[delta_idx].delta_type = DeltaType::Removed;
+    // Mark delta as removed and reweave the body so its footprint is undone.
+    let serial = sccs.header.deltas[delta_idx].serial;
+    sccs.remove_delta(serial);
 
     // Write the modified file back
     let contents = sccs.to_bytes();

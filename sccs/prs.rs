@@ -394,7 +394,7 @@ fn get_keyword_validation(flags: &[SccsFlag]) -> Option<String> {
 fn format_flags(flags: &[SccsFlag]) -> String {
     flags
         .iter()
-        .map(|f| format!("{:?}", f))
+        .filter_map(|f| f.prs_fl_line())
         .collect::<Vec<_>>()
         .join("\n")
 }

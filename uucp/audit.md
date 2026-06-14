@@ -21,6 +21,18 @@ behavioral comparison — and a behavioral oracle would be of limited value
 anyway, since this implementation uses **SSH as the transport** rather than the
 traditional `g`/`f`/`t` protocols + `uucico` daemon.
 
+> **Status (remediated 2026-06-14):** every actionable finding is resolved —
+> fixed (✓, with the implementing phase noted inline) or dispositioned
+> WON'T-FIX/N-A with rationale. The work landed over 5 phases on the
+> `uucp-audit` branch, each gated on `cargo build`/`clippy`/`fmt`/`test`. The
+> Major (#UX1) and the mandated cross-cutting Minors (#G1/#G2/#G3) are fixed;
+> #G4 and #UC1 are fixed; #UC2 is documented WON'T-FIX (single-quoted remote
+> paths; ssh round-trip not justified for a dead protocol). All three utilities
+> are promoted to README **Stage 6 — Audited**. The "Accepted architecture
+> divergences" remain by design. The only box left unchecked is a forward-looking
+> `LC_MESSAGES` translation test (needs a message catalog) — diagnostics are
+> already `gettext()`-wrapped.
+
 ## Framing: deliberately minimal UUCP
 
 The project treats UUCP as a dead/dying protocol: the implementation is meant to
@@ -106,13 +118,15 @@ None.
   owner ignores a spoofed `USER=evil`, and a foreign-owned job cannot be killed
   even when `$USER` is spoofed to match (new `test_uustat_kill_foreign_job_denied`,
   root-guarded).
-- [ ] **#UC2 — Remote `~user` is not expanded; `shell_escape` makes a remote
-  `~` literal.** `common.rs:84-90` (`expand_remote_path`) only rewrites `~/` →
-  PUBDIR for remote targets; a remote `~user/path` is passed through unchanged
-  and then single-quoted by `shell_escape` (`common.rs:383,416`), so the remote
-  shell cannot expand it either. POSIX OPERANDS describes `~user` on the remote
-  system. Fix: resolve `~user` against the remote (or document the limitation);
-  note that single-quoting deliberately defeats remote tilde/glob expansion.
+- [x] ~~**#UC2 — Remote `~user` is not expanded**~~ — WON'T FIX (Phase 5,
+  documented). Remote paths are single-quoted by `shell_escape` before being
+  handed to SSH, which deliberately defeats remote `~`/glob expansion (a security
+  feature — it prevents the remote shell from re-interpreting metacharacters).
+  Resolving a remote `~user` would require an extra `ssh … getent passwd user`
+  round-trip per operand, which is not justified for a dead protocol under the
+  "absolutely minimal" stance. Local `~user` is already resolved, and `~/` →
+  PUBDIR works on both ends. Applications needing a specific remote directory
+  should give an absolute path.
 - [x] **#G4 — Newline-in-filename is not rejected (FUTURE DIRECTIONS).** ✓ Phase 4:
   `uucp` rejects a destination pathname containing an encoded `<newline>` with a
   non-zero exit (new `test_uucp_newline_in_destination_rejected`); `uux` has the
@@ -133,7 +147,7 @@ None.
 - [x] **SSH transport via `ssh -T -o BatchMode=yes`** — `common.rs:357-461`. The
   POSIX "protocol for transfer of files is unspecified," so substituting SSH for
   the `g`/`t` protocols is conformant. No action. (Accepted design.)
-- [ ] **Helper shell-outs to `hostname` / `getent` / `mail`.** `common.rs:129,146,
+- [x] **Helper shell-outs to `hostname` / `getent` / `mail`.** (accepted, no action — minimal design) `common.rs:129,146,
   465`. `is_local_system` runs `hostname` on every call and, if `hostname` is
   absent from `PATH`, returns `false` — treating the local host as remote and
   attempting SSH. Minor robustness; could use libc `gethostname`/`getpwnam`.
@@ -159,7 +173,7 @@ None.
 - [x] `system!path` parsed; empty system = local — `common.rs:73-81`.
 - [x] Destination-is-directory rule (multiple sources or trailing `/` ⇒ append source basename) — `uucp.rs:96,138-151`. Matches "if the destination-file is a directory, the last part of the source-file name shall be used."
 - [x] `~/dest` → PUBDIR (local and remote) — `common.rs:84-121`.
-- [ ] **`~user` remote expansion** (#UC2) — only local `~user` is resolved (via `getent`).
+- [x] ~~**`~user` remote expansion** (#UC2)~~ — WON'T FIX (Phase 5): remote paths are single-quoted before SSH; local `~user` is resolved.
 - [x] Multi-hop route `a!b!path` → diagnostic + exit 1 — `uucp.rs:80-83,113-116`. **DIVERGES (by design):** POSIX says "an attempt is made to send the file via the specified route"; multi-hop store-and-forward routing is obsolete and deliberately unsupported. Accepted.
 - [x] Remote wildcard `?`/`*`/`[...]` → warning, passed literally — `uucp.rs:86-93,120-128`. **DIVERGES (by design):** remote pattern expansion is unsupported (local globbing still happens in the invoking shell before `uucp` sees argv). Accepted.
 
@@ -168,7 +182,7 @@ None.
 - [x] STDOUT carries only the `-j` job ID — `uucp.rs:213,224`. (The spec's "STDOUT: Not used" is overridden by the `-j` option text.)
 - [x] Diagnostics to stderr — `uucp.rs:81,89,114,190,209`.
 - [x] 0 success / >0 error; per-source failure aborts with exit 1 — `uucp.rs:189-193,218-220`.
-- [ ] Diagnostics hardcoded English (#G1).
+- [x] Diagnostics hardcoded English (#G1). ✓ Phase 1.
 
 ## `uux`
 
@@ -198,7 +212,7 @@ None.
 - [x] STDOUT used only for the `-j` ID, `"%s\n"` — `uux.rs:113`.
 - [x] Command stderr is forwarded to our stderr; our own diagnostics to stderr — `uux.rs:383-384,92`.
 - [x] 0 success / >0 error (non-zero command exit ⇒ exit 1) — `uux.rs:119-133,387-389`.
-- [ ] Diagnostics hardcoded English (#G1).
+- [x] Diagnostics hardcoded English (#G1). ✓ Phase 1.
 
 ## `uustat`
 
@@ -219,7 +233,7 @@ None.
 - [x] Per-job output includes ≥ job ID, user, remote system (`jobid\tuser\tsystem`) — `uustat.rs:127`. CONFORMS (format unspecified; required fields present).
 - [x] 0 success / >0 error; missing job under `-k`/`-r` → exit 1 — `uustat.rs:84-87,106-109`.
 - [x] Ownership check via `$USER` (#G3). ✓ Phase 2: real-login + root.
-- [ ] Diagnostics hardcoded English (#G1).
+- [x] Diagnostics hardcoded English (#G1). ✓ Phase 1.
 - Note: because immediate `uucp`/`uux` transfers create no persistent job, the default listing and `-q` are usually empty in practice — only `uucp -r` populates the spool, and those jobs never run (Architecture divergences). This is consistent and not a defect, but means `uustat` is mostly vestigial in the minimal design.
 
 ## Accepted architecture divergences (DIVERGES by design — no action)
@@ -248,7 +262,7 @@ Per the "no more than POSIX requires" directive:
 - [x] **CLI surface is already minimal.** `uucp` exposes exactly `-cCdfjmr -n`,
   `uux` exactly `-jnp` + `-`, `uustat` exactly `-q -k -r -s -u` — every one is
   POSIX-mandated. **There are no non-POSIX options to remove.**
-- [ ] **`UUCP_SPOOL` environment variable is a non-POSIX extension.** `common.rs:43`.
+- [x] **`UUCP_SPOOL` environment variable is a non-POSIX extension.** (KEEP — useful for tests, harmless) `common.rs:43`.
   Harmless and useful (it is what the integration tests use to redirect the
   spool); keep it, but note it is an extension, not POSIX.
 - [x] **The spool/`Job` machinery (`common.rs:155-355`) is the minimal substrate
@@ -268,9 +282,9 @@ list/kill/rejuvenate/filter/conflicts). Gaps that map to findings:
   (null-system ⇒ local) semantics (#UX1). ✓ Phase 3: unit tests added.
 - [ ] No test asserts `LC_MESSAGES` affects diagnostics (#G1) — expected to fail
   until diagnostics are `gettext()`-wrapped.
-- [ ] No test pins the `-j` job-ID semantics for immediate vs `-r` transfers (#UC1).
+- [x] No test pins the `-j` job-ID semantics for immediate vs `-r` transfers (#UC1). ✓ Phase 4 (`test_uustat_with_queued_job` asserts the `-r -j` ID is the listed ID).
 - [x] No test exercises `-k`/`-r` ownership enforcement across users (#G3). ✓ Phase 2.
-- [ ] No test for remote `~user` expansion (#UC2).
+- [x] No test for remote `~user` expansion (#UC2). — N/A (WON'T FIX).
 
 ## Suggested PR groupings
 

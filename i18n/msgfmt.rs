@@ -269,12 +269,15 @@ fn apply_suffix(path: PathBuf, add_suffix: bool) -> PathBuf {
     if !add_suffix {
         return path;
     }
-    let s = path.to_string_lossy();
-    if s.ends_with(".mo") {
-        path
-    } else {
-        PathBuf::from(format!("{}.mo", s))
+    // Pathnames are arbitrary bytes on Unix; operate on the raw OsString so a
+    // non-UTF-8 path is preserved exactly rather than mangled by lossy decoding.
+    use std::os::unix::ffi::OsStrExt;
+    if path.as_os_str().as_bytes().ends_with(b".mo") {
+        return path;
     }
+    let mut os = path.into_os_string();
+    os.push(".mo");
+    PathBuf::from(os)
 }
 
 /// Find an input file, searching directories if needed

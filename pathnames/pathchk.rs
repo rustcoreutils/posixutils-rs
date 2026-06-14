@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::ffi::{CString, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use errno::{errno, set_errno, Errno};
 use gettextrs::gettext;
 use plib::diag;
 
@@ -74,19 +75,25 @@ fn check_path_basic(pathname: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// `None` for a limit means the filesystem reports it as indeterminate
+/// (`pathconf` returned -1 with errno unchanged); that length check is skipped.
 fn check_path_limits(
     pathname: &[u8],
-    max_path: usize,
-    max_name: usize,
+    max_path: Option<usize>,
+    max_name: Option<usize>,
     portable_charset: bool,
 ) -> Result<(), String> {
-    if pathname.len() > max_path {
-        return Err(gettext("pathname too long"));
+    if let Some(max_path) = max_path {
+        if pathname.len() > max_path {
+            return Err(gettext("pathname too long"));
+        }
     }
 
     for comp in components(pathname) {
-        if comp.len() > max_name {
-            return Err(gettext("component too long"));
+        if let Some(max_name) = max_name {
+            if comp.len() > max_name {
+                return Err(gettext("component too long"));
+            }
         }
         if portable_charset && !comp.iter().all(|&b| is_portable_byte(b)) {
             return Err(gettext("component contains non-portable characters"));
@@ -94,6 +101,28 @@ fn check_path_limits(
     }
 
     Ok(())
+}
+
+/// Query a `pathconf` limit. Returns `Ok(Some(n))` for a defined limit,
+/// `Ok(None)` when the limit is indeterminate (the call returns -1 but leaves
+/// errno unchanged), and `Err` on a genuine error (-1 with errno set).
+fn query_pathconf(c: &CStr, name: libc::c_int) -> Result<Option<usize>, String> {
+    set_errno(Errno(0));
+    // SAFETY: `c` is a valid NUL-terminated C string for the lifetime of the call.
+    let value = unsafe { libc::pathconf(c.as_ptr(), name) };
+    if value >= 0 {
+        return Ok(Some(value as usize));
+    }
+    let err = errno();
+    if err.0 == 0 {
+        Ok(None) // indeterminate / no limit
+    } else {
+        Err(format!(
+            "{}: {}",
+            gettext("cannot query path limits"),
+            io::Error::from(err)
+        ))
+    }
 }
 
 /// Find the deepest existing ancestor of `pathname` (the path itself if it
@@ -138,7 +167,7 @@ fn check_searchable(fsh: &Path) -> Result<(), String> {
 }
 
 fn check_path_posix(pathname: &[u8]) -> Result<(), String> {
-    check_path_limits(pathname, POSIX_PATH_MAX, POSIX_NAME_MAX, true)
+    check_path_limits(pathname, Some(POSIX_PATH_MAX), Some(POSIX_NAME_MAX), true)
 }
 
 fn check_path_fs(pathname: &[u8]) -> Result<(), String> {
@@ -146,17 +175,10 @@ fn check_path_fs(pathname: &[u8]) -> Result<(), String> {
     let c = CString::new(fsh.as_os_str().as_bytes())
         .map_err(|_| gettext("pathname contains a NUL byte"))?;
 
-    // SAFETY: `c` is a valid NUL-terminated C string for the lifetime of the calls.
-    let path_max = unsafe { libc::pathconf(c.as_ptr(), libc::_PC_PATH_MAX) };
-    if path_max < 0 {
-        return Err(gettext("cannot determine PATH_MAX"));
-    }
-    let name_max = unsafe { libc::pathconf(c.as_ptr(), libc::_PC_NAME_MAX) };
-    if name_max < 0 {
-        return Err(gettext("cannot determine NAME_MAX"));
-    }
+    let path_max = query_pathconf(&c, libc::_PC_PATH_MAX)?;
+    let name_max = query_pathconf(&c, libc::_PC_NAME_MAX)?;
 
-    check_path_limits(pathname, path_max as usize, name_max as usize, false)?;
+    check_path_limits(pathname, path_max, name_max, false)?;
     check_searchable(&fsh)
 }
 

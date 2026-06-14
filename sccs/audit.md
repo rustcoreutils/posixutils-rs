@@ -89,20 +89,16 @@ These affect multiple utilities. Per-utility sections reference them by number.
   ✓ fixed in Phase 1. `now()` now converts via libc `localtime_r` (honors
   `TZ`). Verified `TZ=UTC0` vs `TZ=HST10` record times 10h apart.
 
-- [ ] **#X6 — `No id keywords` warning never emitted by `get` or `admin`.**
-  `grep -rniE 'no id keyword|cm7' sccs/ plib/` → zero matches. POSIX `get`
-  mandates a warning to stderr when the retrieved text contains no `%…%` ID
-  keyword (and the `i` flag escalates it to a fatal error). CSSC prints
-  `warning: s.x: No id keywords.` from both `admin -i` and `get`; ours is
-  silent in both. Verified. Fix: scan expanded text for keywords; warn (or
-  fail, if `i` flag set). Also implement the `i`-flag escalation.
+- [x] **#X6 — `No id keywords` warning never emitted by `get` or `admin`.**
+  ✓ Phases 4 & 6: both `get` and `admin` now emit
+  `<util>: warning: <sfile>: No id keywords.` for keyword-less non-encoded
+  content (matches cssc), and `get` escalates to a fatal error when the `i`
+  flag is set.
 
-- [ ] **#X7 — `-` (stdin list) and directory operands missing in `get`/`delta`/`admin`.**
-  Spec mandates, for every SCCS utility taking `file...`: a lone `-` operand
-  reads s-file pathnames from stdin; a directory operand processes each `s.*`
-  member (non-SCCS silently skipped). Implemented in `prs`/`sact`/`unget`/`rmdel`;
-  **absent** in `get` (`get.rs:546`), `delta` (`delta.rs:524`), `admin`
-  (`admin.rs:356`). (Surfaces as #G5/#G6, #D6/#D7, #A3/#A4.)
+- [x] **#X7 — `-` (stdin list) and directory operands missing in `get`/`delta`/`admin`.**
+  ✓ Phases 4–6: added `plib::sccsfile::paths::expand_operands` and wired it into
+  `get`, `delta`, and `admin` (it was already present in prs/sact/unget/rmdel).
+  (Surfaces as #G5/#G6, #D6/#D7, #A3/#A4.)
 
 ### Minor
 
@@ -145,25 +141,19 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 ### Priority issues
 
 #### Critical
-- [ ] **#A1 — Optional-arg options `-i`/`-t`/`-y` consume the following operand.**
-  `admin.rs:35,41,44` (`num_args=0..=1, default_missing_value=""`). Spec: these
-  option-arguments "shall not be presented as separate arguments," i.e. a bare
-  `-i` must mean stdin and **not** swallow `s.foo`. Verified: `printf 'x\n' |
-  admin -i s.new` → ours exit 2 ("required arguments were not provided"); CSSC
-  creates `s.new` (exit 0). `admin -t s.foo` (remove desc text) likewise exit 2.
-  Fix: hand-parse so these flags only take an *attached* value (`-ifoo`); bare =
-  stdin/remove/default.
+- [x] **#A1 — Optional-arg options `-i`/`-t`/`-y` consume the following operand.**
+  ✓ Phase 6: argv is pre-scanned (`extract_attached_opts`) so these take an
+  attached value only; a bare `-i`/`-t`/`-y` no longer swallows the operand.
+  Verified `printf 'x' | admin -i s.new` creates `s.new` (exit 0) and attached
+  `-iin.txt` still works.
 
 #### Major
-- [ ] **#A2 — Invalid `-f` flag letters accepted, written as malformed `^Af`.**
-  `admin.rs:114` → `plib/src/sccsfile.rs:586` (`SccsFlag::Unknown` catch-all).
-  `admin -iin -fZ s.z` writes `^Af Z` and exits 0; CSSC: `Unrecognized flag 'Z'`,
-  exit 1. Produces files no conforming reader should accept. Fix: reject any flag
-  char outside the spec set before serializing.
-- [ ] **#A3 — Directory operand unsupported.** (#X7) `admin.rs:356`. Spec: a
-  directory operand processes each `s.*` within; CSSC walks it, ours errors.
-- [ ] **#A4 — `-` stdin-list operand unsupported.** (#X7) Spec: a lone `-`
-  operand reads s-file names from stdin. Never special-cased.
+- [x] **#A2 — Invalid `-f` flag letters accepted, written as malformed `^Af`.**
+  ✓ Phase 6: `parse_flag` rejects any letter outside `{b,c,d,e,f,i,j,l,m,n,q,t,v}`
+  (`admin: Unrecognized flag 'Z'`, exit 1 — matches cssc). plib keeps `Unknown`
+  only for lossless reads of existing files.
+- [x] **#A3 — Directory operand unsupported.** ✓ Phase 6 via `paths::expand_operands`.
+- [x] **#A4 — `-` stdin-list operand unsupported.** ✓ Phase 6 via `paths::expand_operands`.
 
 #### Minor
 - [x] **#A5 — Default `-y` committer login from `$USER`, falls back to `"unknown"`.**
@@ -171,11 +161,14 @@ Directory/`-` operands and the `No id keywords` warning are missing.
 - [ ] **#A6 — No SIGINT handler; x-file orphaned on interrupt.** (#X10) Spec
   ASYNCHRONOUS EVENTS is "Default," so Minor; the atomic-rename design still
   leaks `x.file`.
-- [ ] **#A7 — `-m mrlist` not consulted on create; `v`-flag-requires-MR not enforced.**
-  `admin.rs`. Rare path. Spec wants a diagnostic when `v` set and no MR given.
-- [ ] **#A8 — `c`/`f` ceiling/floor not range-checked (spec cap 9999).**
-  `plib/src/sccsfile.rs:535,549` store any `u16`.
-- [ ] **#A9 — `No id keywords` warning not emitted on `admin -i`.** (#X6)
+- [x] **#A7 — `-m mrlist` not consulted on create; `v`-flag-requires-MR not enforced.**
+  ✓ Phase 6: `-m` records MRs; `v` set with no `-m` errors (`MR number(s) must
+  be supplied.`); `-m` without `v` errors. Matches cssc.
+- [x] **#A8 — `c`/`f` ceiling/floor not range-checked (spec cap 9999).**
+  ✓ Phase 6: `parse_flag` rejects values > 9999.
+- [x] **#A9 — `No id keywords` warning not emitted on `admin -i`.** ✓ Phase 6
+  (#X6): emits `admin: warning: <sfile>: No id keywords.` for non-encoded
+  keyword-less content.
 
 ### Detailed conformance matrix
 

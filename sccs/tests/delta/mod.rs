@@ -18,14 +18,18 @@ fn setup_sccs_file(tmp: &TempDir, name: &str, content: &str) -> (PathBuf, PathBu
     let pfile = tmp.path().join(format!("p.{}", name));
     let gfile = tmp.path().join(name);
 
-    // Create SCCS file
-    run_test(TestPlan {
+    // Create SCCS file. admin warns "No id keywords." on stderr when the body
+    // has no %X% keyword (these fixtures use plain content), so tolerate stderr.
+    let plan = TestPlan {
         cmd: String::from("admin"),
         args: vec![sfile.to_string_lossy().into(), "-i".into()],
         stdin_data: String::from(content),
         expected_out: String::new(),
         expected_err: String::new(),
         expected_exit_code: 0,
+    };
+    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
+        assert!(output.status.success(), "admin create should succeed");
     });
 
     (sfile, pfile, gfile)

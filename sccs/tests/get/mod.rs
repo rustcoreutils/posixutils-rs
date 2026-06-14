@@ -142,7 +142,8 @@ fn get_for_editing() {
         args: vec![sfile.to_string_lossy().into(), "-i".into()],
         stdin_data: String::from("content\n"),
         expected_out: String::new(),
-        expected_err: String::new(),
+        // admin warns when the body has no %X% id keyword.
+        expected_err: format!("admin: warning: {}: No id keywords.\n", sfile.display()),
         expected_exit_code: 0,
     });
 

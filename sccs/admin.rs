@@ -32,17 +32,11 @@ struct Args {
     #[arg(short = 'n', help = gettext("Create a new SCCS file"))]
     new_file: bool,
 
-    #[arg(short = 'i', value_name = "NAME", num_args = 0..=1, default_missing_value = "", help = gettext("Initialize from file (use stdin if no name given)"))]
-    init_file: Option<String>,
-
     #[arg(short = 'r', value_name = "SID", help = gettext("Initial SID for new file"))]
     initial_sid: Option<String>,
 
-    #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "", help = gettext("Comment for initial delta"))]
-    comment: Option<String>,
-
-    #[arg(short = 't', value_name = "NAME", num_args = 0..=1, default_missing_value = "", help = gettext("Descriptive text file"))]
-    desc_text: Option<String>,
+    #[arg(short = 'm', value_name = "MRLIST", help = gettext("MR numbers for initial delta"))]
+    mrlist: Option<String>,
 
     #[arg(short = 'f', value_name = "FLAG", help = gettext("Set flag (can be repeated)"))]
     set_flags: Vec<String>,
@@ -64,6 +58,64 @@ struct Args {
 
     #[arg(required = true, help = gettext("SCCS files to process"))]
     files: Vec<PathBuf>,
+}
+
+/// Attached-only optional-value options (`-i`, `-t`, `-y`).
+///
+/// POSIX requires the optional option-arguments for these options to be
+/// presented attached to the option letter (e.g. `-iinput.txt`), never as a
+/// separate following operand. clap cannot express "attached value only", so we
+/// pre-scan argv and strip these tokens before handing the rest to clap.
+///
+/// Each field is:
+/// - `None`         => option not given;
+/// - `Some(None)`   => bare option given (read stdin / clear text / default
+///   comment);
+/// - `Some(Some(s))` => attached value `s`.
+#[derive(Default)]
+struct AttachedOpts {
+    init_file: Option<Option<String>>,
+    desc_text: Option<Option<String>>,
+    comment: Option<Option<String>>,
+}
+
+/// Split argv into the attached-only options (`-i`/`-t`/`-y`) and the remaining
+/// arguments to be parsed by clap. Recognizes the bare and attached forms; a
+/// bare option never consumes the following argument. Option bundling for these
+/// is not supported (historical admin does not bundle them either).
+fn extract_attached_opts<I>(argv: I) -> (AttachedOpts, Vec<String>)
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut opts = AttachedOpts::default();
+    let mut rest = Vec::new();
+
+    for arg in argv {
+        let slot = match arg.as_str() {
+            "-i" => Some((&mut opts.init_file, None)),
+            "-t" => Some((&mut opts.desc_text, None)),
+            "-y" => Some((&mut opts.comment, None)),
+            _ if arg.starts_with("-i") => Some((&mut opts.init_file, Some(arg[2..].to_string()))),
+            _ if arg.starts_with("-t") => Some((&mut opts.desc_text, Some(arg[2..].to_string()))),
+            _ if arg.starts_with("-y") => Some((&mut opts.comment, Some(arg[2..].to_string()))),
+            _ => None,
+        };
+
+        match slot {
+            Some((field, value)) => *field = Some(value),
+            None => rest.push(arg),
+        }
+    }
+
+    (opts, rest)
+}
+
+/// Split a `-m` mrlist option-argument into individual MR numbers.
+fn attached_mr_list(mrlist: Option<&str>) -> Vec<String> {
+    match mrlist {
+        Some(s) => s.split_whitespace().map(String::from).collect(),
+        None => Vec::new(),
+    }
 }
 
 fn get_username() -> String {
@@ -107,6 +159,11 @@ fn parse_sid(s: &str) -> Result<Sid, String> {
     s.parse::<Sid>().map_err(|e| e.to_string())
 }
 
+/// Flag letters recognized by the `-f` option (POSIX admin spec).
+const VALID_FLAG_CHARS: &[char] = &[
+    'b', 'c', 'd', 'e', 'f', 'i', 'j', 'l', 'm', 'n', 'q', 't', 'v',
+];
+
 fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     if flag_str.is_empty() {
         return Err("Empty flag".to_string());
@@ -119,18 +176,61 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
         ""
     };
 
-    SccsFlag::parse(flag_char, value).map_err(|e| e.to_string())
+    // Reject any flag letter not in the spec set. SccsFlag::parse maps unknown
+    // letters to SccsFlag::Unknown for lossless reads of existing files, but
+    // admin must not write a malformed flag from a bad -f argument.
+    if !VALID_FLAG_CHARS.contains(&flag_char) {
+        return Err(format!("Unrecognized flag '{}'", flag_char));
+    }
+
+    let flag = SccsFlag::parse(flag_char, value).map_err(|e| e.to_string())?;
+
+    // Spec caps ceiling/floor at 9999.
+    match &flag {
+        SccsFlag::Ceiling(n) | SccsFlag::Floor(n) if *n > 9999 => {
+            return Err(format!("value '{}' out of range (max 9999)", n));
+        }
+        _ => {}
+    }
+
+    Ok(flag)
 }
 
-fn create_new_sccs_file(
-    path: &Path,
+/// Whether `data` contains an SCCS identification keyword of the form `%X%`
+/// where X is an uppercase ASCII letter (matching get/delta's keyword set).
+fn content_has_id_keyword(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] == b'%' && data[i + 1].is_ascii_uppercase() && data[i + 2] == b'%' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Inputs for creating a new SCCS file.
+struct NewFileParams<'a> {
     content: Vec<u8>,
-    initial_sid: Option<&str>,
-    comment: Option<&str>,
+    initial_sid: Option<&'a str>,
+    comment: Option<&'a str>,
     desc_text: Vec<String>,
-    mut flags: Vec<SccsFlag>,
+    flags: Vec<SccsFlag>,
     users: Vec<String>,
-) -> io::Result<()> {
+    mr_numbers: Vec<String>,
+}
+
+fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
+    let NewFileParams {
+        content,
+        initial_sid,
+        comment,
+        desc_text,
+        mut flags,
+        users,
+        mr_numbers,
+    } = params;
+
     // Determine initial SID
     let sid = match initial_sid {
         Some(s) => parse_sid(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
@@ -161,6 +261,12 @@ fn create_new_sccs_file(
 
     // Decide whether to store the body uuencoded (binary / no trailing newline).
     let encoded = content_needs_encoding(&content);
+
+    // Warn (non-fatal) when a text body has no SCCS id keyword, matching cssc.
+    if !encoded && !content_has_id_keyword(&content) {
+        eprintln!("admin: warning: {}: No id keywords.", path.display());
+    }
+
     let body_lines: Vec<String> = if encoded {
         flags.push(SccsFlag::Encoded(1));
         plib::sccsfile::uuencode_sccs(&content)
@@ -194,7 +300,7 @@ fn create_new_sccs_file(
         included: Vec::new(),
         excluded: Vec::new(),
         ignored: Vec::new(),
-        mr_numbers: Vec::new(),
+        mr_numbers,
         comments: vec![comment_text],
     };
 
@@ -344,7 +450,16 @@ fn main() -> ExitCode {
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
-    let args = Args::parse();
+    // Pre-process argv to strip the attached-only options (-i/-t/-y) before
+    // clap parses; clap cannot express "attached value only".
+    let (attached, rest) = extract_attached_opts(std::env::args());
+    let args = match Args::try_parse_from(&rest) {
+        Ok(a) => a,
+        Err(e) => {
+            e.print().ok();
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Handle --help manually since we disabled automatic help
     if args.help {
@@ -354,8 +469,8 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // -i implies -n (init_file is Some("") for stdin, Some(path) for file)
-    let creating_new = args.new_file || args.init_file.is_some();
+    // -i implies -n.
+    let creating_new = args.new_file || attached.init_file.is_some();
 
     // Parse flags to add
     let mut add_flags = Vec::new();
@@ -363,10 +478,26 @@ fn main() -> ExitCode {
         match parse_flag(flag_str) {
             Ok(flag) => add_flags.push(flag),
             Err(e) => {
-                eprintln!("admin: {}: {}", gettext("invalid flag"), e);
+                eprintln!("admin: {}", e);
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    // Determine whether the 'v' (MR validation) flag is being set, for -m
+    // consistency checks on create.
+    let setting_v_flag = add_flags
+        .iter()
+        .any(|f| matches!(f, SccsFlag::MrValidation(_)));
+
+    // Parse -m MR numbers (whitespace-separated list).
+    let mr_numbers: Vec<String> = attached_mr_list(args.mrlist.as_deref());
+
+    // -m requires the v flag (spec: "the application shall ensure that the v
+    // flag is set"). Diagnose using cssc-compatible wording.
+    if !mr_numbers.is_empty() && !setting_v_flag {
+        eprintln!("admin: MRs not enabled with 'v' flag, can't use 'm' keyword.");
+        return ExitCode::FAILURE;
     }
 
     // Parse flags to delete
@@ -378,7 +509,12 @@ fn main() -> ExitCode {
 
     let mut exit_code = ExitCode::SUCCESS;
 
-    for file_path in &args.files {
+    // Expand operands: a lone `-` reads s-file names from stdin; a directory
+    // operand expands to its sorted s.* members. The -i stdin-content path is
+    // separate (operands here are never `-` when creating from stdin).
+    let files = paths::expand_operands(&args.files);
+
+    for file_path in &files {
         // Validate file name starts with s.
         if !paths::is_sfile(file_path) {
             eprintln!(
@@ -418,11 +554,13 @@ fn main() -> ExitCode {
                 continue;
             }
 
-            // Read input content
-            let content = match &args.init_file {
-                Some(path) if !path.is_empty() => read_input_file(Some(path)),
-                Some(_) => read_input_file(None), // Empty string means stdin
-                None => Ok(Vec::new()),           // Empty file with -n only
+            // Read input content. init_file: None => -n only (empty body);
+            // Some(None) => bare -i (read stdin); Some(Some(p)) => -ip (file,
+            // or stdin if p is empty).
+            let content = match &attached.init_file {
+                Some(Some(path)) if !path.is_empty() => read_input_file(Some(path)),
+                Some(_) => read_input_file(None),
+                None => Ok(Vec::new()),
             };
 
             let content = match content {
@@ -434,11 +572,10 @@ fn main() -> ExitCode {
                 }
             };
 
-            // Read descriptive text if specified
-            let desc_text = match &args.desc_text {
-                Some(path) if !path.is_empty() => read_desc_text(Some(path)),
-                Some(_) => Ok(Vec::new()), // Empty string means clear
-                None => Ok(Vec::new()),
+            // Read descriptive text if -t specified with a name.
+            let desc_text = match &attached.desc_text {
+                Some(Some(path)) if !path.is_empty() => read_desc_text(Some(path)),
+                _ => Ok(Vec::new()),
             };
 
             let desc_text = match desc_text {
@@ -450,17 +587,35 @@ fn main() -> ExitCode {
                 }
             };
 
-            // Get comment
-            let comment: Option<&str> = args.comment.as_deref();
+            // v flag set on create requires MR numbers via -m.
+            if setting_v_flag && mr_numbers.is_empty() {
+                eprintln!(
+                    "admin: {}: MR number(s) must be supplied.",
+                    file_path.display()
+                );
+                exit_code = ExitCode::FAILURE;
+                continue;
+            }
+
+            // Get comment: bare -y or -ytext both supply an explicit comment
+            // (empty for bare -y); absence yields the default comment.
+            let comment: Option<&str> = match &attached.comment {
+                Some(Some(c)) => Some(c.as_str()),
+                Some(None) => Some(""),
+                None => None,
+            };
 
             if let Err(e) = create_new_sccs_file(
                 file_path,
-                content,
-                args.initial_sid.as_deref(),
-                comment,
-                desc_text,
-                add_flags.clone(),
-                args.add_users.clone(),
+                NewFileParams {
+                    content,
+                    initial_sid: args.initial_sid.as_deref(),
+                    comment,
+                    desc_text,
+                    flags: add_flags.clone(),
+                    users: args.add_users.clone(),
+                    mr_numbers: mr_numbers.clone(),
+                },
             ) {
                 eprintln!("admin: {}: {}", file_path.display(), e);
                 exit_code = ExitCode::FAILURE;
@@ -477,10 +632,11 @@ fn main() -> ExitCode {
                 continue;
             }
 
-            // Get descriptive text if -t specified
-            let desc_text = match &args.desc_text {
-                Some(path) if !path.is_empty() => Some(read_desc_text(Some(path))),
-                Some(_) => Some(Ok(Vec::new())), // Empty string means clear
+            // Get descriptive text if -t specified. -t name replaces; bare -t
+            // (or -t with empty value) removes existing descriptive text.
+            let desc_text = match &attached.desc_text {
+                Some(Some(path)) if !path.is_empty() => Some(read_desc_text(Some(path))),
+                Some(_) => Some(Ok(Vec::new())), // remove
                 None => None,
             };
 

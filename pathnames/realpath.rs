@@ -45,7 +45,19 @@ fn resolve_missing_ok(path: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    resolve_inner(&abs, 0)
+    let resolved = resolve_inner(&abs, 0)?;
+
+    // A trailing <slash> (following a non-slash) requires the path to name a
+    // directory. Linux's realpath(3) reports ENOTDIR for a non-directory with a
+    // trailing slash, but macOS silently strips it and succeeds; enforce the
+    // POSIX behavior consistently so `realpath -E regfile/` fails on both.
+    let bytes = path.as_os_str().as_bytes();
+    let trailing_slash = bytes.len() > 1 && bytes.ends_with(b"/");
+    if trailing_slash && resolved.exists() && !resolved.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+
+    Ok(resolved)
 }
 
 fn resolve_inner(abs: &Path, depth: usize) -> io::Result<PathBuf> {

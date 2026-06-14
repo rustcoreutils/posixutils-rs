@@ -35,8 +35,8 @@ dynamic OS-error text are out of scope (documented inline).
 
 ## `basename`
 
-**Implementation:** `pathnames/basename.rs` (64 lines)
-**Tests:** `pathnames/tests/basename/mod.rs` (70 lines, 5 `#[test]`s)
+**Implementation:** `pathnames/basename.rs`
+**Tests:** `pathnames/tests/basename/mod.rs`
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 2692–2694
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/basename.md`
 
@@ -102,8 +102,8 @@ implemented — so `basename /usr/bin/env env` prints `bin` instead of `env`.
 
 ## `dirname`
 
-**Implementation:** `pathnames/dirname.rs` (52 lines)
-**Tests:** `pathnames/tests/dirname/mod.rs` (82 lines, 6 `#[test]`s)
+**Implementation:** `pathnames/dirname.rs`
+**Tests:** `pathnames/tests/dirname/mod.rs`
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 2852–2854
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/dirname.md`
 
@@ -153,8 +153,8 @@ components (which `PathBuf` does) and forbids removing non-final `..` (which
 
 ## `pathchk`
 
-**Implementation:** `pathnames/pathchk.rs` (155 lines)
-**Tests:** none (no `pathnames/tests/pathchk/`)
+**Implementation:** `pathnames/pathchk.rs`
+**Tests:** `pathnames/tests/pathchk/mod.rs` (added by the fix work; none existed at audit time)
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 3293–3297
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/pathchk.md`
 
@@ -223,8 +223,8 @@ New `pathnames/tests/pathchk/mod.rs` (9 tests):
 
 ## `realpath`
 
-**Implementation:** `pathnames/realpath.rs` (96 lines)
-**Tests:** `pathnames/tests/realpath/mod.rs` (170 lines, 8 `#[test]`s)
+**Implementation:** `pathnames/realpath.rs`
+**Tests:** `pathnames/tests/realpath/mod.rs`
 **Spec:** POSIX.1-2024, Vol. 3 §3, pp. 3375–3377 (first released Issue 8)
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/realpath.md`
 

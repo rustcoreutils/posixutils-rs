@@ -162,3 +162,38 @@ fn unget_silent_mode() {
         },
     );
 }
+
+#[test]
+fn unget_multifile_pathname_header() {
+    // When more than one file is named, each SID is preceded by a "\n%s:\n"
+    // pathname header (POSIX STDOUT format).
+    let tmp = TempDir::new().unwrap();
+    let s1 = create_sccs_file(&tmp, "one", "content\n");
+    let s2 = create_sccs_file(&tmp, "two", "content\n");
+    get_for_editing(&s1);
+    get_for_editing(&s2);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("unget"),
+            args: vec![s1.to_string_lossy().into(), s2.to_string_lossy().into()],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan: &TestPlan, output: &Output| {
+            assert!(output.status.success(), "multi-file unget should succeed");
+            let out = String::from_utf8_lossy(&output.stdout);
+            // Each SID line is preceded by a blank line + "<path>:".
+            assert!(
+                out.contains(&format!("\n{}:\n", s1.display())),
+                "missing header for first file: {out:?}"
+            );
+            assert!(
+                out.contains(&format!("\n{}:\n", s2.display())),
+                "missing header for second file: {out:?}"
+            );
+        },
+    );
+}

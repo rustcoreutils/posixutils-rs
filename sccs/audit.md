@@ -674,16 +674,17 @@ expanded.
 ### Priority issues
 
 #### Major
-- [ ] **#U1 — Multi-file output missing the mandated `\n%s:\n` prefix.** `unget.rs:118-120`.
-  Verified `unget s.f1 s.f2` → ours `1.2\n1.2`; CSSC `\ns.f1:\n1.2\n\ns.f2:\n1.2`.
-  Fix: print `\n<path>:\n` before the SID when `files.len()>1` or operand is
-  `-`/directory.
-- [ ] **#U2 — Directory operand not expanded.** (#X7) `unget.rs:44-49,201-210`.
-  Verified `unget <dir>` → `<dir>: not an SCCS file`; CSSC processes each `s.*`.
+- [x] **#U1 — Multi-file output missing the mandated `\n%s:\n` prefix.** ✓
+  Phase 10: a `\n<path>:\n` header precedes each SID when >1 file / a directory /
+  stdin is named. Byte-identical to cssc; single-file stays a bare SID.
+- [x] **#U2 — Directory operand not expanded.** ✓ Phase 10 via `paths::expand_operands`.
 
 #### Minor
-- [ ] **#U3 — `-` stdin form also misses the pathname prefix.** `unget.rs:180-200` (tie-in with #U1).
-- [ ] **#U4 — Diagnostics lack the `unget:` prefix; hardcoded English (#X9).** `unget.rs:47,54,64,98`.
+- [x] **#U3 — `-` stdin form also misses the pathname prefix.** ✓ Phase 10
+  (covered by the #U1 header gating + `expand_operands`).
+- [ ] **#U4 — Diagnostics lack the `unget:` prefix; hardcoded English (#X9).**
+  Partly done in Phase 10 (operand-loop diagnostics now carry the `unget:`
+  prefix); full `gettext` wrapping deferred to the i18n phase (#X9).
 - [ ] **#U5 — q-file working-copy not used.** `unget.rs:133-143` rewrites the p-file
   directly (non-atomic); spec says the q-file "may" be created — N/A, noted for robustness.
 

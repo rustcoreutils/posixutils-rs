@@ -237,33 +237,29 @@ it from stdin / prompting. The `v`-flag MR-validation `shall` is unimplemented
 ### Priority issues
 
 #### Critical
-- [ ] **#D1 — `-m mrlist` missing entirely.** `delta.rs:27-45` (no `-m` field).
-  Verified `delta -m'bug123' s.f` → exit 2 "unexpected argument"; CSSC records
-  `^Am bug123`. The `^Am` writer already exists in plib. Fix: add the field.
-- [ ] **#D2 — `v` flag (MR validation) not enforced.** `delta.rs:405-513` never
-  inspects `MrValidation`. Spec: when `v` set, `-m` is required and (if valued)
-  the named program validates MRs; non-zero exit aborts. Verified: on a
-  `v`-flagged file with no `-m`, ours commits (exit 0); CSSC: `MR number(s) must
-  be supplied.` exit 1.
-- [ ] **#D3 — Comment never read from stdin when `-y` omitted.** `delta.rs:451-454`
-  (`None => String::new()`, comment "could prompt"). Spec: with no `-y`, prompt
-  `comments? ` (if tty) then read a line from stdin; else read from stdin with no
-  prompt. Verified `echo c | delta s.f` → ours records no `^Ac`; CSSC records
-  `^Ac c`.
+- [x] **#D1 — `-m mrlist` missing entirely.** ✓ Phase 5: `-m` records MRs as
+  `^Am` (verified `delta -m'bug42'` → `^Am bug42`).
+- [x] **#D2 — `v` flag (MR validation) not enforced.** ✓ Phase 5: `v`-flagged
+  file with no `-m` aborts (`delta: s.f: MR number(s) must be supplied.`, exit 1,
+  no delta); a valued `v` program is run and a non-zero exit aborts.
+- [x] **#D3 — Comment never read from stdin when `-y` omitted.** ✓ Phase 5:
+  prompts `comments? ` on a tty, else reads the comment from stdin (verified
+  `echo … | delta` records `^Ac`).
 
 #### Major
-- [ ] **#D4 — `-g list` (ignore deltas) missing.** `delta.rs:27-45`; clap rejects
-  `-g1` (exit 2). Core `^Ag` writer exists; only CLI plumbing missing.
+- [x] **#D4 — `-g list` (ignore deltas) missing.** ✓ Phase 5: `-g` records
+  ignored serials as `^Ag` (SID or serial accepted).
 - [ ] **#D5 — No SIGINT handler; x-file not cleaned on interrupt.** (#X10) Spec
   ASYNCHRONOUS EVENTS makes this a `shall` for delta. `delta.rs:494-500` writes
   `x.<name>` before rename. Fix: install a handler that unlinks it, exit non-zero.
-- [ ] **#D6 — `-` operand not read as stdin list.** (#X7) `delta.rs:524`. (Spec
-  also requires `-y` when the operand is `-`.)
-- [ ] **#D7 — Directory operand not expanded.** (#X7) `delta.rs:524`.
+- [x] **#D6 — `-` operand not read as stdin list.** ✓ Phase 5 via
+  `paths::expand_operands` (`-y` enforced when the operand is `-`).
+- [x] **#D7 — Directory operand not expanded.** ✓ Phase 5 via `paths::expand_operands`.
 
 #### Minor
-- [ ] **#D8 — `-p` uses a non-`diff(1)` format.** `delta.rs:173-235` prints
-  `- old`/`+ new`; historical delta + CSSC emit `diff`-normal hunks.
+- [x] **#D8 — `-p` uses a non-`diff(1)` format.** ✓ Phase 5: now emits
+  `diff`-normal hunks (`2c2`/`<`/`---`/`>`), byte-identical to cssc. Also fixed a
+  pre-existing EOF-append panic in `compute_diff`.
 - [ ] **#D9 — `-r SID` matches old OR new SID; CSSC matches new only.**
   `delta.rs:84-94`. More permissive; can pick the wrong entry when two edits
   share an old SID.

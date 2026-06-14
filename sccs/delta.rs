@@ -11,15 +11,40 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile, Sid,
+    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
+    SccsFlag, Sid,
 };
+
+/// True if standard input is a terminal.
+fn stdin_is_tty() -> bool {
+    io::stdin().is_terminal()
+}
+
+/// Read a single line from standard input, stripping the trailing newline.
+/// Returns an empty string at EOF.
+fn read_stdin_line() -> String {
+    let mut line = String::new();
+    let _ = io::stdin().lock().read_line(&mut line);
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    line
+}
+
+/// Split an MR list on blanks/commas into individual MR numbers.
+fn parse_mr_list(list: &str) -> Vec<String> {
+    list.split([' ', '\t', ','])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
 
 /// delta - make a delta (change) to an SCCS file
 #[derive(Parser)]
@@ -28,8 +53,14 @@ struct Args {
     #[arg(short = 'r', value_name = "SID", help = gettext("SID of delta to create (if multiple edits pending)"))]
     sid: Option<String>,
 
-    #[arg(short = 'y', value_name = "COMMENT", help = gettext("Comment for delta"))]
-    comment: Option<Option<String>>,
+    #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "", help = gettext("Comment for delta"))]
+    comment: Option<String>,
+
+    #[arg(short = 'm', value_name = "MRLIST", num_args = 0..=1, default_missing_value = "", help = gettext("Modification request (MR) numbers for delta"))]
+    mrlist: Option<String>,
+
+    #[arg(short = 'g', value_name = "LIST", help = gettext("List of deltas to ignore at this change level"))]
+    glist: Option<String>,
 
     #[arg(short = 'n', help = gettext("Retain g-file after delta"))]
     keep_gfile: bool,
@@ -139,7 +170,6 @@ fn compute_diff(
     base_lines: &[String],
     new_lines: &[String],
     _new_serial: u16,
-    print_diff: bool,
 ) -> (DeltaStats, Vec<DiffOp>) {
     // Use a simple diff algorithm (Myers or similar would be better, but this works)
     let mut ops = Vec::new();
@@ -165,12 +195,9 @@ fn compute_diff(
             for look_ahead in 1..=10.min(base_lines.len() - i) {
                 if i + look_ahead < base_lines.len() && base_lines[i + look_ahead] == new_lines[j] {
                     // Delete lines from base up to the match
-                    for k in 0..look_ahead {
+                    for _ in 0..look_ahead {
                         ops.push(DiffOp::Delete);
                         deleted += 1;
-                        if print_diff {
-                            println!("- {}", base_lines[i + k]);
-                        }
                     }
                     i += look_ahead;
                     found_match = true;
@@ -179,23 +206,23 @@ fn compute_diff(
             }
 
             if !found_match {
-                // Try to find base_lines[i] in remaining new_lines
+                // Try to find base_lines[i] in remaining new_lines (only when
+                // base still has a line to anchor on).
                 let mut found_insert = false;
-                for look_ahead in 1..=10.min(new_lines.len() - j) {
-                    if j + look_ahead < new_lines.len()
-                        && new_lines[j + look_ahead] == base_lines[i]
-                    {
-                        // Insert lines from new up to the match
-                        for k in 0..look_ahead {
-                            ops.push(DiffOp::Insert(new_lines[j + k].clone()));
-                            inserted += 1;
-                            if print_diff {
-                                println!("+ {}", new_lines[j + k]);
+                if i < base_lines.len() {
+                    for look_ahead in 1..=10.min(new_lines.len() - j) {
+                        if j + look_ahead < new_lines.len()
+                            && new_lines[j + look_ahead] == base_lines[i]
+                        {
+                            // Insert lines from new up to the match
+                            for k in 0..look_ahead {
+                                ops.push(DiffOp::Insert(new_lines[j + k].clone()));
+                                inserted += 1;
                             }
+                            j += look_ahead;
+                            found_insert = true;
+                            break;
                         }
-                        j += look_ahead;
-                        found_insert = true;
-                        break;
                     }
                 }
 
@@ -204,31 +231,19 @@ fn compute_diff(
                         // Replace: delete old, insert new
                         ops.push(DiffOp::Delete);
                         deleted += 1;
-                        if print_diff {
-                            println!("- {}", base_lines[i]);
-                        }
                         ops.push(DiffOp::Insert(new_lines[j].clone()));
                         inserted += 1;
-                        if print_diff {
-                            println!("+ {}", new_lines[j]);
-                        }
                         i += 1;
                         j += 1;
                     } else if i < base_lines.len() {
                         // Delete remaining base lines
                         ops.push(DiffOp::Delete);
                         deleted += 1;
-                        if print_diff {
-                            println!("- {}", base_lines[i]);
-                        }
                         i += 1;
                     } else if j < new_lines.len() {
                         // Insert remaining new lines
                         ops.push(DiffOp::Insert(new_lines[j].clone()));
                         inserted += 1;
-                        if print_diff {
-                            println!("+ {}", new_lines[j]);
-                        }
                         j += 1;
                     }
                 }
@@ -237,6 +252,95 @@ fn compute_diff(
     }
 
     (DeltaStats::new(inserted, deleted, unchanged), ops)
+}
+
+/// Render the diff ops in `diff`-normal format (e.g. `2c2`, `< old`, `---`,
+/// `> new`), matching historical `delta -p` output. Consecutive insert/delete
+/// runs are grouped into a single change ("c"), addition ("a"), or deletion
+/// ("d") hunk.
+fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[DiffOp]) {
+    // Render a single line-range as "a" or "a,b".
+    fn range(start: usize, count: usize) -> String {
+        if count == 0 {
+            // For an addition/deletion at position 0, the range is the line
+            // number *after* which the change applies.
+            start.to_string()
+        } else if count == 1 {
+            start.to_string()
+        } else {
+            format!("{},{}", start, start + count - 1)
+        }
+    }
+
+    let mut bi = 0usize; // 0-based index into base_lines
+    let mut ni = 0usize; // 0-based index into new_lines
+    let mut k = 0usize;
+
+    while k < ops.len() {
+        match &ops[k] {
+            DiffOp::Keep => {
+                bi += 1;
+                ni += 1;
+                k += 1;
+            }
+            DiffOp::Delete | DiffOp::Insert(_) => {
+                // Collect a maximal run of deletes then inserts (a replace),
+                // or just deletes, or just inserts.
+                let del_start = bi;
+                let ins_start = ni;
+                let mut dels: Vec<String> = Vec::new();
+                let mut inss: Vec<String> = Vec::new();
+
+                while k < ops.len() {
+                    match &ops[k] {
+                        DiffOp::Delete => {
+                            dels.push(base_lines[bi].clone());
+                            bi += 1;
+                            k += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                while k < ops.len() {
+                    match &ops[k] {
+                        DiffOp::Insert(_) => {
+                            inss.push(new_lines[ni].clone());
+                            ni += 1;
+                            k += 1;
+                        }
+                        _ => break,
+                    }
+                }
+
+                let nd = dels.len();
+                let np = inss.len();
+                if nd > 0 && np > 0 {
+                    // Change.
+                    println!("{}c{}", range(del_start + 1, nd), range(ins_start + 1, np));
+                    for l in &dels {
+                        println!("< {}", l);
+                    }
+                    println!("---");
+                    for l in &inss {
+                        println!("> {}", l);
+                    }
+                } else if nd > 0 {
+                    // Deletion: lines del_start+1..del_start+nd removed after
+                    // new line ins_start.
+                    println!("{}d{}", range(del_start + 1, nd), ins_start);
+                    for l in &dels {
+                        println!("< {}", l);
+                    }
+                } else if np > 0 {
+                    // Addition: lines added after base line del_start.
+                    println!("{}a{}", del_start, range(ins_start + 1, np));
+                    for l in &inss {
+                        println!("> {}", l);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -400,7 +504,139 @@ fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Re
     Ok(())
 }
 
-fn process_file(args: &Args, sfile_path: &Path) -> io::Result<bool> {
+/// Resolve a comma/space-separated `-g` list into delta serial numbers. Each
+/// token may be a SID (e.g. `1.2`) or a bare serial number. Unknown tokens are
+/// reported and skipped.
+fn resolve_ignore_list(sccs: &SccsFile, list: &str) -> Vec<u16> {
+    let mut serials = Vec::new();
+    for tok in list.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+        if let Ok(sid) = tok.parse::<Sid>() {
+            if let Some(d) = sccs.find_delta_by_sid(&sid) {
+                serials.push(d.serial);
+                continue;
+            }
+        }
+        // Fall back to a bare serial number.
+        if let Ok(serial) = tok.parse::<u16>() {
+            if sccs.find_delta_by_serial(serial).is_some() {
+                serials.push(serial);
+                continue;
+            }
+        }
+        eprintln!("delta: {}: {}", tok, gettext("no such delta"));
+    }
+    serials
+}
+
+/// Determine the MR list for the new delta, honoring the `v` flag.
+///
+/// Returns `Ok(Some(mrs))` with the (possibly empty) MR list to record, or
+/// `Ok(None)` if the delta must be aborted (validation failed / required MR
+/// missing); in the abort case a diagnostic has already been written.
+///
+/// `stdin_consumed` is true when the file operand was `-`, in which case stdin
+/// has already been read for pathnames and may not be used for prompting.
+fn gather_mrs(
+    args: &Args,
+    sccs: &SccsFile,
+    sfile_path: &Path,
+    stdin_consumed: bool,
+) -> io::Result<Option<Vec<String>>> {
+    // Locate the v flag, if any.
+    let v_flag = sccs.header.flags.iter().find_map(|f| match f {
+        SccsFlag::MrValidation(prog) => Some(prog.clone()),
+        _ => None,
+    });
+    let v_set = v_flag.is_some();
+
+    // Source the raw MR list: -m argument, else (if v is set) a prompt/stdin.
+    let raw: Option<String> = match &args.mrlist {
+        Some(s) => Some(s.clone()),
+        None => {
+            if v_set && !stdin_consumed {
+                if stdin_is_tty() {
+                    print!("MRs? ");
+                    io::stdout().flush().ok();
+                }
+                Some(read_stdin_line())
+            } else {
+                None
+            }
+        }
+    };
+
+    let mrs: Vec<String> = raw.as_deref().map(parse_mr_list).unwrap_or_default();
+
+    if !v_set {
+        // MRs are only meaningful when the v flag is set.
+        if args.mrlist.is_some() {
+            eprintln!(
+                "delta: {}: {}",
+                sfile_path.display(),
+                gettext("MR verification ('v') flag not set, MRs are not allowed.")
+            );
+            return Ok(None);
+        }
+        return Ok(Some(Vec::new()));
+    }
+
+    // v flag is set: MRs are required.
+    if mrs.is_empty() {
+        eprintln!(
+            "delta: {}: {}",
+            sfile_path.display(),
+            gettext("MR number(s) must be supplied.")
+        );
+        return Ok(None);
+    }
+
+    // If the v flag names a validation program, run it with the MRs as args.
+    if let Some(prog) = v_flag.flatten() {
+        if !prog.is_empty() {
+            match Command::new(&prog).args(&mrs).status() {
+                Ok(status) if status.success() => {}
+                Ok(_) => {
+                    eprintln!(
+                        "delta: {}: {}",
+                        sfile_path.display(),
+                        gettext("MR validation failed.")
+                    );
+                    return Ok(None);
+                }
+                Err(e) => {
+                    eprintln!("delta: {}: {}: {}", sfile_path.display(), prog, e);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    Ok(Some(mrs))
+}
+
+/// Determine the comment for the new delta.
+///
+/// Uses `-y` if supplied; otherwise prompts on a terminal (or reads stdin
+/// silently when not a terminal). When the operand was `-`, stdin is already
+/// consumed and the comment defaults to empty.
+fn gather_comment(args: &Args, stdin_consumed: bool) -> String {
+    match &args.comment {
+        Some(c) => c.clone(),
+        None => {
+            if stdin_consumed {
+                String::new()
+            } else {
+                if stdin_is_tty() {
+                    print!("comments? ");
+                    io::stdout().flush().ok();
+                }
+                read_stdin_line()
+            }
+        }
+    }
+}
+
+fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Result<bool> {
     // Validate s-file
     if !paths::is_sfile(sfile_path) {
         eprintln!(
@@ -438,18 +674,20 @@ fn process_file(args: &Args, sfile_path: &Path) -> io::Result<bool> {
     let base_lines = reconstruct_base(&sccs, base_serial)?;
 
     // Compute diff
-    let (stats, diff_ops) = compute_diff(
-        &base_lines,
-        &new_lines,
-        sccs.max_serial() + 1,
-        args.print_diff,
-    );
+    let (stats, diff_ops) = compute_diff(&base_lines, &new_lines, sccs.max_serial() + 1);
 
-    // Get comment
-    let comment = match &args.comment {
-        Some(Some(c)) => c.clone(),
-        Some(None) => String::new(), // Empty comment
-        None => String::new(),       // Default empty for now (could prompt)
+    // Gather MRs (honoring the v flag) and the comment. The MR prompt, if any,
+    // must precede the comment prompt.
+    let mrs = match gather_mrs(args, &sccs, sfile_path, stdin_consumed)? {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    let comment = gather_comment(args, stdin_consumed);
+
+    // Resolve -g list (SIDs or serial numbers) into serial numbers to ignore.
+    let ignored = match &args.glist {
+        Some(list) => resolve_ignore_list(&sccs, list),
+        None => Vec::new(),
     };
 
     // Create new delta entry
@@ -464,8 +702,8 @@ fn process_file(args: &Args, sfile_path: &Path) -> io::Result<bool> {
         stats,
         included: Vec::new(),
         excluded: Vec::new(),
-        ignored: Vec::new(),
-        mr_numbers: Vec::new(),
+        ignored,
+        mr_numbers: mrs,
         comments: if comment.is_empty() {
             Vec::new()
         } else {
@@ -473,9 +711,15 @@ fn process_file(args: &Args, sfile_path: &Path) -> io::Result<bool> {
         },
     };
 
-    // Print info
+    // Print info. The new SID is printed first, then (with -p) the diff in
+    // diff-normal format, then the insert/delete/unchanged counts.
     if !args.silent {
-        println!("{}", pfile_entry.new_sid);
+        println!("{}", new_delta.sid);
+    }
+    if args.print_diff {
+        print_normal_diff(&base_lines, &new_lines, &diff_ops);
+    }
+    if !args.silent {
         println!("{} inserted", new_delta.stats.inserted);
         println!("{} deleted", new_delta.stats.deleted);
         println!("{} unchanged", new_delta.stats.unchanged);
@@ -517,10 +761,26 @@ fn main() -> ExitCode {
 
     let args = Args::parse();
 
+    // When the single operand is '-', the spec requires the comment to be
+    // supplied via -y (and the MR list via -m if the v flag is set), since
+    // standard input is consumed reading the list of SCCS pathnames.
+    let stdin_consumed = args.files.len() == 1 && args.files[0].as_os_str() == "-";
+    if stdin_consumed && args.comment.is_none() {
+        eprintln!(
+            "delta: {}",
+            gettext("the -y option is required when the file operand is '-'")
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Expand operands: lone '-' reads pathnames from stdin; directories expand
+    // to their sorted s.* members.
+    let files = paths::expand_operands(&args.files);
+
     let mut exit_code = ExitCode::SUCCESS;
 
-    for file_path in &args.files {
-        match process_file(&args, file_path) {
+    for file_path in &files {
+        match process_file(&args, file_path, stdin_consumed) {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             Err(e) => {

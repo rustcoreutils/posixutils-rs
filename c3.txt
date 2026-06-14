@@ -1,0 +1,29 @@
+uucp/tests/uucp/mod.rs
+Comment on lines +45 to +60
+fn test_uucp_newline_in_destination_rejected() {
+    // POSIX FUTURE DIRECTIONS: a destination pathname containing an encoded
+    // <newline> is rejected with a non-zero exit (the check runs before any
+    // transfer, so the source need not exist).
+    uucp_test_with_checker(&["somesrc", "bad\nname"], |_, output| {
+        assert!(
+            !output.status.success(),
+            "newline in destination should fail"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("newline"),
+            "expected newline diagnostic, got: {stderr}"
+        );
+    });
+}
+Copilot commented 14 minutes ago
+Copilot
+Copilot
+AI
+14 minutes ago
+Medium
+This new test asserts on English diagnostics while the utility now routes messages through gettext() and inherits the process locale via setlocale(LC_ALL, ""). To avoid locale-/catalog-dependent failures, pin the subprocess locale (e.g., LC_ALL=C) for this test invocation.
+
+Suggested changeset 1 (1)
+uucp/tests/uucp/mod.rs
+Copilot uses AI. Check for mistakes.

@@ -1,0 +1,20 @@
+uucp/uux.rs
+Comment on lines +415 to +421
+    // Exec-host-side path of the produced file (the command ran `cd work_dir`,
+    // so a relative redirect target lives under work_dir).
+    let exec_path = if out_file.path.starts_with('/') {
+        out_file.path.clone()
+    } else {
+        format!("{}/{}", work_dir, out_file.path)
+    };
+Copilot commented 14 minutes ago
+Copilot
+Copilot
+AI
+14 minutes ago
+High
+deliver_output() currently assumes the produced file is at out_file.path on the exec host when out_file.path is absolute. If the redirect is adjusted to write a work-dir-local basename for cross-system delivery (so paths are interpreted on the target system only), the exec-host-side path should likewise be computed from that basename under work_dir when delivery is required.
+
+Suggested changeset 1 (1)
+uucp/uux.rs
+Copilot uses AI. Check for mistakes.

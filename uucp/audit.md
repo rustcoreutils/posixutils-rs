@@ -309,4 +309,3 @@ list/kill/rejuvenate/filter/conflicts). Gaps that map to findings:
   implementation.
 - `shell_escape` is the security-critical helper and is sound; SSH command
   construction consistently quotes interpolated values.
-</content>

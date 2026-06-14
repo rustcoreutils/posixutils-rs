@@ -292,6 +292,9 @@ fn test_uustat_kill_foreign_job_denied() {
         .args(["-k", "deadbeef01"])
         .env("UUCP_SPOOL", &env.spool_dir)
         .env("USER", "nonexistent_owner_xyz")
+        // Pin the locale so the stderr substring assertion below is stable
+        // regardless of the host's locale / installed message catalogs.
+        .env("LC_ALL", "C")
         .current_dir(&env.test_dir)
         .output()
         .expect("Failed to run uustat");

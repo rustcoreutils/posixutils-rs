@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 use std::fs;
 use std::io::Write;
 use std::process::Output;
@@ -45,18 +45,23 @@ fn uucp_test_with_checker<F: FnMut(&TestPlan, &Output)>(args: &[&str], checker: 
 fn test_uucp_newline_in_destination_rejected() {
     // POSIX FUTURE DIRECTIONS: a destination pathname containing an encoded
     // <newline> is rejected with a non-zero exit (the check runs before any
-    // transfer, so the source need not exist).
-    uucp_test_with_checker(&["somesrc", "bad\nname"], |_, output| {
-        assert!(
-            !output.status.success(),
-            "newline in destination should fail"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("newline"),
-            "expected newline diagnostic, got: {stderr}"
-        );
-    });
+    // transfer, so the source need not exist). Run via a manual Command with
+    // LC_ALL=C pinned so the stderr substring assertion is stable regardless of
+    // the host locale / installed message catalogs.
+    let output = std::process::Command::new(get_binary_path("uucp"))
+        .args(["somesrc", "bad\nname"])
+        .env("LC_ALL", "C")
+        .output()
+        .expect("Failed to run uucp");
+    assert!(
+        !output.status.success(),
+        "newline in destination should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("newline"),
+        "expected newline diagnostic, got: {stderr}"
+    );
 }
 
 #[test]

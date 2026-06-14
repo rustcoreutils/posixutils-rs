@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::io::{self, BufRead};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -59,10 +60,33 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         }
     };
 
-    // Check ownership - user must own the delta
+    // Check ownership.  Per POSIX, removal of a delta is restricted to:
+    //   1. the user who made the delta,
+    //   2. the owner of the SCCS file, or
+    //   3. the owner of the directory containing the SCCS file.
     let current_user = get_current_user();
-    if sccs.header.deltas[delta_idx].user != current_user {
-        eprintln!("{}: you do not own delta {}", sfile.display(), sid);
+    let current_uid = unsafe { libc::getuid() };
+
+    let is_delta_author = sccs.header.deltas[delta_idx].user == current_user;
+
+    let owns_sfile = fs::metadata(sfile)
+        .map(|m| m.uid() == current_uid)
+        .unwrap_or(false);
+
+    let dir = sfile
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let owns_dir = fs::metadata(dir)
+        .map(|m| m.uid() == current_uid)
+        .unwrap_or(false);
+
+    if !(is_delta_author || owns_sfile || owns_dir) {
+        eprintln!(
+            "{}: you are not permitted to remove delta {}",
+            sfile.display(),
+            sid
+        );
         return Ok(false);
     }
 
@@ -103,6 +127,10 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
+    // Capture the original s-file mode so we can restore the SCCS read-only
+    // (r--r--r--) permissions after the rewrite.
+    let orig_mode = fs::metadata(sfile).map(|m| m.permissions().mode()).ok();
+
     // Mark delta as removed and reweave the body so its footprint is undone.
     let serial = sccs.header.deltas[delta_idx].serial;
     sccs.remove_delta(serial);
@@ -110,9 +138,14 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     // Write the modified file back
     let contents = sccs.to_bytes();
 
-    // Write atomically (to temp file then rename)
-    let tmp_path = sfile.with_extension("tmp");
+    // Write atomically via the canonical x-file, then rename over the s-file.
+    let tmp_path = paths::xfile_from_sfile(sfile);
     fs::write(&tmp_path, contents)?;
+
+    // Restore the SCCS read-only mode (preserve the original, else 0444).
+    let mode = orig_mode.unwrap_or(0o444);
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
+
     fs::rename(&tmp_path, sfile)?;
 
     Ok(true)

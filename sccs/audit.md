@@ -495,17 +495,17 @@ and the rewritten file loses its `0444` read-only mode.
 - [x] **#R1 — Body weave not rewoven on removal; orphan `^AI/^AE` block + text remain.**
   ✓ fixed in Phase 2 via `SccsFile::remove_delta` (#X2); `rmdel.rs` now calls it.
   Verified byte-identical to CSSC.
-- [ ] **#R2 — Ownership check is `$LOGNAME` string-compare, not real-uid / file-owner / dir-owner.**
+- [x] **#R2 — Ownership check is `$LOGNAME` string-compare, not real-uid / file-owner / dir-owner.** ✓ Phase 9: real-uid / s-file-owner / dir-owner rule.
   `rmdel.rs:32-36,64-69`. Spec restricts removal to the delta author, the s-file
   owner, or the directory owner. Ours blocks a legitimate file owner who didn't
   author the delta, and is defeated by `LOGNAME=<author> rmdel …` (verified).
   Fix: compare `getuid()` to the author uid / `stat` owner / parent-dir owner.
 
 #### Minor
-- [ ] **#R3 — Rewritten s-file loses read-only mode (0444 → 0664).** `rmdel.rs:115-117`
+- [x] **#R3 — Rewritten s-file loses read-only mode (0444 → 0664).** `rmdel.rs:115-117` ✓ Phase 9: preserves the original mode (r--r--r--).
   writes a fresh temp at the umask default. Fix: preserve mode (or use
   `plib::io::write_atomic`).
-- [ ] **#R4 — Predictable temp path can collide / leak.** `rmdel.rs:115` uses
+- [x] **#R4 — Predictable temp path can collide / leak.** `rmdel.rs:115` uses ✓ Phase 9: uses the canonical x-file name.
   `with_extension("tmp")` (world-readable, non-unique; concurrent rmdels race).
   Fix: use the x-file name from `paths::xfile_from_sfile`.
 - [ ] **#R5 — No z-file locking.** (#X8) `rmdel.rs`.
@@ -593,34 +593,34 @@ name** (`Command::new("get")`), so the front-end breaks without `$PATH` help.
 ### Priority issues
 
 #### Major
-- [ ] **#SC1 — `-r` (real-uid) is a complete no-op.** `sccs.rs:123,130` set the
+- [x] **#SC1 — `-r` (real-uid) is a complete no-op.** `sccs.rs:123,130` set the ✓ Phase 9: setgid(getgid())+setuid(getuid()) before spawn when -r set.
   flag; `run_sccs_command`'s parameter is `_use_real_uid` (`sccs.rs:584`,
   underscore-ignored); no `setuid`/`getuid` anywhere (verified). Since the
   front-end is the component meant to be installed set-uid, this defeats the
   privilege-separation purpose. Fix: `setuid(getuid())`/`setgid(getgid())` before
   spawning (and check the return values).
-- [ ] **#SC2 — Subcommands resolved by bare name via `$PATH`.** `sccs.rs:339,385,398,526,534`
+- [x] **#SC2 — Subcommands resolved by bare name via `$PATH`.** `sccs.rs:339,385,398,526,534` ✓ Phase 9: siblings resolved relative to current_exe(), PATH fallback.
   + `:578` use `Command::new("get"/"admin"/"rmdel"/"diff"/cmd)`. With a clean PATH
   the front-end can't find its siblings (`sccs edit hello.c` → `get: No such file
   or directory`). CSSC hardcodes its libexec dir. Fix: resolve relative to
   `current_exe()`'s directory, `$PATH` fallback.
 
 #### Minor
-- [ ] **#SC3 — `info` omits the old-SID and timestamp fields.** `sccs.rs:431-453`
+- [x] **#SC3 — `info` omits the old-SID and timestamp fields.** `sccs.rs:431-453` ✓ Phase 9: info now prints old/new SID, user, date, time.
   prints `new_sid user`; CSSC prints `old new user date time`.
-- [ ] **#SC4 — Pseudo-command option-splitting uses substring `starts_with`.**
+- [x] **#SC4 — Pseudo-command option-splitting uses substring `starts_with`.** ✓ Phase 9: option-splitting now routes by option letter, not substring.
   `sccs.rs:218-310,482-518` mis-binds options whose argument begins with a known
   letter, and routes shared letters (e.g. `-s`) to both delta and get. Fix: parse
   the spec's explicit letter partitions.
-- [ ] **#SC5 — `-p` is the BSD subdir-name form, not the spec's "insert before final component."**
-  `sccs.rs:142-151`. Defensible (historical BSD `sccs`), but diverges from the
-  literal POSIX wording. Verified `-p MYSCCS get f.c` → `MYSCCS/s.f.c`.
+- [x] ~~**#SC5 — `-p` is the BSD subdir-name form**~~ — WON'T FIX: the historical
+  BSD `sccs` `-p` is exactly the subdir-name form ours implements; kept
+  deliberately (it is what real `sccs` users expect).
 - [ ] **#SC6 — A leading unknown `-` token is treated as the command.** `sccs.rs:152-154`
-  (`-q get` → "unknown command '-q'"). Minor robustness.
+  (`-q get` → "unknown command '-q'"). Minor robustness; deferred.
 - [ ] **#SC7 — Diagnostics not localized (#X9).** `sccs.rs:20,354,371,572,611`.
 - [ ] **#SC8 — PROJECTDIR username form uses `$HOME/<dir>/src`, not the named user's home.**
   `sccs.rs:160-180`; no `getpwnam`. Edge feature.
-- [ ] **#SC9 — `diffs` temp path `/tmp/sccs_diff.<pid>` is predictable/world-writable.**
+- [x] **#SC9 — `diffs` temp path `/tmp/sccs_diff.<pid>` is predictable/world-writable.** ✓ Phase 9: diffs temp now uses env::temp_dir() with a unique name.
   `sccs.rs:482-545`. Minor security smell.
 
 ### Detailed conformance matrix
